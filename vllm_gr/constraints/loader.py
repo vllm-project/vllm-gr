@@ -55,6 +55,7 @@ class _ReadyCase:
     candidate_count: int
     first_tokens: tuple[int, ...]
     last_tokens: tuple[int, ...]
+    trie_id: int = 0
 
 
 def _validate_loader_inputs(
@@ -93,16 +94,20 @@ def _backend_info(
     )
 
 
-def _readiness_cases(table: ConstraintTable, top_k: int) -> tuple[_ReadyCase, ...]:
+def _readiness_cases(
+    table: ConstraintTable, top_k: int, trie_id: int = 0
+) -> tuple[_ReadyCase, ...]:
     """Copy only bounded readiness data from one real a -> b -> c path."""
 
-    a = int(table.first_token_ids[0])
-    begin1 = int(table.prefix1_offsets[a])
-    end1 = int(table.prefix1_offsets[a + 1])
+    first = table.first_token_ids[table.root_offsets[trie_id] : table.root_offsets[trie_id + 1]]
+    a = int(first[0])
+    row = trie_id * table.metadata.vocab_size + a
+    begin1 = int(table.prefix1_offsets[row])
+    end1 = int(table.prefix1_offsets[row + 1])
     if end1 <= begin1:  # Defensive: canonical validation already guarantees this.
         raise ValueError("constraint Artifact has no step-1 candidate for its first token")
     b = int(table.prefix1_values[begin1])
-    pair_key = a * table.metadata.vocab_size + b
+    pair_key = row * table.metadata.vocab_size + b
     pair_index = int(np.searchsorted(table.prefix1_pair_keys, pair_key))
     if (
         pair_index >= table.prefix1_pair_keys.size
@@ -127,10 +132,11 @@ def _readiness_cases(table: ConstraintTable, top_k: int) -> tuple[_ReadyCase, ..
             candidate_count=count,
             first_tokens=tuple(int(value) for value in values[:selected]),
             last_tokens=tuple(int(value) for value in values[count - selected :]),
+            trie_id=trie_id,
         )
 
     return (
-        ready_case(0, (0, 0, 0), table.first_token_ids),
+        ready_case(0, (0, 0, 0), first),
         ready_case(1, (a, 0, 0), table.prefix1_values[begin1:end1]),
         ready_case(2, (a, b, 0), table.prefix2_values[begin2:end2]),
     )
@@ -245,16 +251,22 @@ def _upload_cuda_backend(
     max_rows: int,
 ) -> tuple[CUDAConstraintBackend, tuple[_ReadyCase, ...]]:
     validate_cuda_sort_capacity(
-        int(table.first_token_ids.size),
+        table.max_first_degree,
         table.metadata.max_prefix1_degree,
         table.metadata.max_prefix2_degree,
     )
-    cases = _readiness_cases(table, max_top_k)
+    cases = tuple(
+        case
+        for trie_id in range(table.metadata.trie_count)
+        for case in _readiness_cases(table, max_top_k, trie_id)
+    )
     device_tables: dict[str, torch.Tensor] = {}
     backend: CUDAConstraintBackend | None = None
     try:
         for name in CONSTRAINT_TABLE_TENSOR_NAMES:
             device_tables[name] = _upload_table_tensor(getattr(table, name), device)
+        if table.metadata.trie_count > 1:
+            device_tables["first_token_offsets"] = _upload_table_tensor(table.root_offsets, device)
         _synchronize_current_cuda_stream(device)
         info = _backend_info(
             table,
@@ -277,6 +289,8 @@ def _upload_cuda_backend(
             prefix2_values=device_tables["prefix2_values"],
             info=info,
             vocab_slice=(offset, end - offset),
+            first_token_offsets=device_tables.get("first_token_offsets"),
+            max_first_degree=table.max_first_degree,
         )
         return backend, cases
     except BaseException:
@@ -462,6 +476,11 @@ def _run_device_readiness(
                 temperatures=temperatures,
                 current_step=case.current_step,
                 top_k=top_k,
+                trie_ids=(
+                    torch.full((rows,), case.trie_id, dtype=torch.int32, device=device)
+                    if backend.info.table_metadata.trie_count > 1
+                    else None
+                ),
             ),
         )
         synchronize(device)
@@ -580,6 +599,8 @@ def load_constraint_backend(
         expected_vocab_size=vocab_size,
         expected_format=config.format,
     )
+    if config.backend is ConstraintTableBackendEnum.NPU and table.metadata.trie_count > 1:
+        raise ValueError("multi-trie Constraint Tables currently support CPU/CUDA only")
     if config.backend is ConstraintTableBackendEnum.CPU:
         info = _backend_info(
             table,

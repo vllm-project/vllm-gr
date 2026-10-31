@@ -13,6 +13,9 @@ unsupported count, insufficient capacity, mismatched budgets, a LEGACY engine --
 delegates to the original handler. Each such decline is logged with its reason,
 because a list that did not batch is otherwise indistinguishable from one that
 did: the response shape is identical either way.
+
+Explicit per-prompt Trie selectors use the same path for a single prompt.
+On a batch decline, selectors follow upstream's per-prompt Beam calls.
 """
 
 from __future__ import annotations
@@ -72,7 +75,10 @@ def _batch_size(serving, request: CompletionRequest) -> int | None:
         count = len(prompt_to_seq(request.prompt))
     except (AttributeError, TypeError):
         return None
-    if count <= 1:
+    # Explicit selectors must stay with their prompts instead of being lost
+    # when the upstream handler creates its per-prompt Beam calls.
+    trie_ids = (getattr(request, "vllm_xargs", None) or {}).get("trie_ids")
+    if count == 0 or (count == 1 and trie_ids is None):
         return None
     return count
 
@@ -225,6 +231,7 @@ async def _create_completion_batched(
         lora_request=lora_request,
         trace_headers=trace_headers,
         session_id=self._get_session_id(request, raw_request),
+        trie_ids=(getattr(request, "vllm_xargs", None) or {}).get("trie_ids"),
     )
     try:
         async with aclosing(generator):
@@ -258,23 +265,57 @@ async def _create_completion_batched(
 async def _decline(
     serving, request: CompletionRequest, raw_request: Request | None, count: int, reason: str
 ) -> object:
-    """Run the original handler and record why this list was not batched."""
+    """Delegate a declined batch while preserving per-prompt selectors."""
     logger.info(
         "Beam batch declined request_id=%s prompts=%d reason=%s",
         request.request_id,
         count,
         reason,
     )
-    return await _original_create_completion(serving, request, raw_request)
+    return await _delegate_completion(serving, request, raw_request)
+
+
+async def _delegate_completion(serving, request, raw_request):
+    from vllm_gr.entrypoints.openai.beam_search_patch import _COMPLETION_TRIE_IDS
+
+    trie_ids = (getattr(request, "vllm_xargs", None) or {}).get("trie_ids")
+    token = _COMPLETION_TRIE_IDS.set(None if trie_ids is None else iter(trie_ids))
+    try:
+        return await _original_create_completion(serving, request, raw_request)
+    finally:
+        _COMPLETION_TRIE_IDS.reset(token)
 
 
 async def create_completion_batch_dispatch(
     self, request: CompletionRequest, raw_request: Request | None = None
 ) -> object:
     """Route a completion request to the batched or the original handler."""
+    trie_ids = (getattr(request, "vllm_xargs", None) or {}).get("trie_ids")
+    if trie_ids is not None:
+        config = GRConfig.from_vllm_config(self.engine_client.vllm_config)
+        if (
+            not request.use_beam_search
+            or request.prompt_embeds is not None
+            or config.beam_execution_mode is not BeamExecutionMode.V1
+        ):
+            return self.create_error_response(
+                "trie_ids require GR Beam completion with token or text prompts",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        if (
+            not isinstance(trie_ids, (list, tuple))
+            or len(trie_ids) != len(prompt_to_seq(request.prompt))
+            or any(type(value) is not int or value < 0 for value in trie_ids)
+        ):
+            return self.create_error_response(
+                "trie_ids must contain one nonnegative integer per prompt",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
     count = _batch_size(self, request)
     if count is None:
-        return await _original_create_completion(self, request, raw_request)
+        return await _delegate_completion(self, request, raw_request)
     sizes = GRConfig.from_vllm_config(self.engine_client.vllm_config).beam_online_batch_sizes
     if count not in sizes:
         return await _decline(

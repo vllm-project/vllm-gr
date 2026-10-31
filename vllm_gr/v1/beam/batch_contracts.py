@@ -49,6 +49,7 @@ class BeamBatchItem(
 ):  # type: ignore[call-arg]
     item_index: int
     request: EngineCoreRequest
+    trie_id: int = 0
 
 
 class BeamBatchParams(
@@ -278,19 +279,18 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
     beam_width = _positive_int("beam_params.beam_width", params.beam_width)
     if beam_width > MAX_BEAM_WIDTH:
         _fail(f"beam_params.beam_width must be <= {MAX_BEAM_WIDTH}, got {beam_width}")
-    if beam_width > MAX_CANDIDATE_WIDTH:
-        # MAX_BEAM_WIDTH is deliberately higher than the candidate ceiling so
-        # the wide-W operators can be exercised, but nothing in this build
-        # samples a candidate width independent of the Beam width: the
-        # executed top-k is still taken from W.  A request wider than the
-        # candidate ceiling therefore describes a K the operators cannot take,
-        # and it would be accepted here and only fail at the first workspace
-        # lookup.  Internal callers build BeamBatchRequest directly and never
-        # pass through GRConfig validation, so the check has to exist here too.
+    if beam_width > MAX_CANDIDATE_WIDTH and params.candidate_width is None:
+        # K follows W when unstated, so an unset K leaves the candidate count
+        # implied at the Beam width.  A Beam wider than the candidate ceiling
+        # would then describe a K the operators cannot take, and it would be
+        # accepted here only to fail at the first workspace lookup.  Internal
+        # callers build BeamBatchRequest directly and never pass through
+        # GRConfig validation, so the check has to exist here too.
         _fail(
-            f"beam_params.beam_width must be <= {MAX_CANDIDATE_WIDTH} "
-            f"({MAX_CANDIDATE_WIDTH}) until the candidate width is wired end to end. "
-            f"got {beam_width}"
+            f"beam_params.beam_width={beam_width} exceeds the candidate width ceiling "
+            f"{MAX_CANDIDATE_WIDTH} while candidate_width is unset; K follows the Beam "
+            "width in that case. Set beam_params.candidate_width to the per-row "
+            "candidate count."
         )
     _positive_int("beam_params.max_tokens", params.max_tokens)
     widths = params.dynamic_beam_widths
@@ -357,36 +357,20 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
                 "beam_params.candidate_width must be <= "
                 f"{MAX_CANDIDATE_WIDTH}, got {candidate_width}"
             )
-        if candidate_width != beam_width:
-            # Same reason as the config-level rejection: this build derives the
-            # executed top-k from the active stage width, so a request that
-            # carries a different K would be accepted here and then silently
-            # run as W.  Internal callers build BeamBatchRequest directly and
-            # never pass through GRConfig validation, so the check has to exist
-            # here too.
-            _fail(
-                f"beam_params.candidate_width must equal beam_params.beam_width "
-                f"({candidate_width} != {beam_width}): this build does not yet "
-                "sample an independent candidate width. Leave candidate_width "
-                "unset to follow the Beam width."
-            )
-    if params.candidate_width is not None and widths is not None:
-        # This build still takes the executed top-k from the active stage
-        # width (``BeamBatchExecutionView.candidate_top_k`` returns
-        # ``output_width``).  A uniform but narrower schedule therefore samples
-        # fewer candidates per row than the request states -- K=4 with
-        # ``(2, 2, 2)`` would run TopK=2 at every stage -- without any error.
-        # Until the engine-wiring layer forwards K to the stages, an explicit K
-        # is only honest when every stage retains exactly that many beams.
-        for index, width in enumerate(widths):
-            if width != candidate_width:
+        # K is forwarded to every stage (``BeamBatchExecutionView.candidate_top_k``
+        # returns it), so a dynamic schedule -- uniform or not -- samples K
+        # candidates per parent and keeps that stage's ``output_width``.  The
+        # only unsupported combination is a stage that retains more beams than
+        # its parents supply candidates; reject it at admission rather than at
+        # the first stage launch.  A per-stage K schedule overrides the scalar
+        # and is bounded by its own ``input_width * K >= output_width`` check.
+        scalar_widths = () if per_parent_beam_widths is not None else (widths or ())
+        for index, width in enumerate(scalar_widths):
+            if width > candidate_width:
                 _fail(
-                    f"beam_params.candidate_width={candidate_width} does not match "
-                    f"dynamic_beam_widths[{index}]={width}: this build derives the "
-                    "executed top-k from the active stage width, so the candidates "
-                    "sampled per row would not be the configured K. Leave "
-                    "candidate_width unset to keep dynamic Beam widths, or set a "
-                    "schedule whose every stage width equals candidate_width."
+                    f"beam_params.candidate_width={candidate_width} is below "
+                    f"dynamic_beam_widths[{index}]={width}: each parent must supply "
+                    "at least as many candidates as the stage retains"
                 )
     seen_stop_ids: set[int] = set()
     for index, token_id in enumerate(params.stop_token_ids):
@@ -453,6 +437,8 @@ def validate_beam_batch_request(request: BeamBatchRequest) -> None:
             )
         if not isinstance(item.request, EngineCoreRequest):
             _fail("item.request must be an EngineCoreRequest")
+        if type(item.trie_id) is not int or item.trie_id < 0:
+            _fail("item.trie_id must be a non-negative integer")
         request_id = _non_empty_string(
             f"items[{expected_index}].request.request_id",
             item.request.request_id,

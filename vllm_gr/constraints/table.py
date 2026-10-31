@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Immutable host representation of the canonical six-table ABI."""
+"""Immutable canonical tables: six persisted tensors in v1, seven in v2."""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
 import numpy as np
+import regex as re
 from numpy.typing import NDArray
 
-from vllm_gr.config.models import CONSTRAINT_TABLE_FORMAT
+from vllm_gr.config.models import (
+    CONSTRAINT_TABLE_FORMAT,
+    MULTI_TRIE_CONSTRAINT_TABLE_FORMAT,
+)
 
 CONSTRAINT_TABLE_TENSOR_NAMES = (
     "first_token_ids",
@@ -39,11 +42,12 @@ class ConstraintTableMetadata:
     max_prefix1_degree: int
     max_prefix2_degree: int
     total_bytes: int
+    trie_count: int = 1
 
 
 @dataclass(frozen=True, slots=True)
 class ConstraintTable:
-    """Six CPU-resident NumPy tensors and their immutable metadata."""
+    """CPU tables with normalized root boundaries, including implicit v1 root 0."""
 
     first_token_ids: NDArray[np.int32]
     prefix1_offsets: NDArray[np.int32]
@@ -52,6 +56,7 @@ class ConstraintTable:
     prefix2_value_offsets: NDArray[np.int32]
     prefix2_values: NDArray[np.int32]
     metadata: ConstraintTableMetadata
+    first_token_offsets: NDArray[np.int32] | None = None
 
     @classmethod
     def _from_immutable_backing(
@@ -65,6 +70,7 @@ class ConstraintTable:
         prefix2_value_offsets: NDArray[np.int32],
         prefix2_values: NDArray[np.int32],
         metadata: ConstraintTableMetadata,
+        first_token_offsets: NDArray[np.int32] | None = None,
     ) -> ConstraintTable:
         """Build loader-owned views over one proven-immutable bytes buffer.
 
@@ -84,6 +90,8 @@ class ConstraintTable:
             "prefix2_value_offsets": prefix2_value_offsets,
             "prefix2_values": prefix2_values,
         }
+        if first_token_offsets is not None:
+            values["first_token_offsets"] = first_token_offsets
         table = object.__new__(cls)
         for name, value in values.items():
             if not isinstance(value, np.ndarray):
@@ -111,13 +119,19 @@ class ConstraintTable:
                 )
             object.__setattr__(table, name, value)
         object.__setattr__(table, "metadata", metadata)
+        if first_token_offsets is None:
+            object.__setattr__(table, "first_token_offsets", _single_root_offsets(first_token_ids))
         return table
 
     def __post_init__(self) -> None:
         # A read-only flag alone can be re-enabled when an ndarray owns its
         # memory. Rebuilding over immutable bytes makes the returned tensors
         # permanently non-writable, matching the legacy resource guarantee.
-        for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+        if self.first_token_offsets is None:
+            object.__setattr__(
+                self, "first_token_offsets", _single_root_offsets(self.first_token_ids)
+            )
+        for name in (*CONSTRAINT_TABLE_TENSOR_NAMES, "first_token_offsets"):
             value = getattr(self, name)
             if not isinstance(value, np.ndarray):
                 raise ValueError(f"constraint table tensor {name} must be a numpy.ndarray")
@@ -127,12 +141,36 @@ class ConstraintTable:
             object.__setattr__(self, name, frozen)
 
     @property
+    def tensor_names(self) -> tuple[str, ...]:
+        """Persisted tensors; legacy v1 omits the implicit single-root boundaries."""
+        return constraint_table_tensor_names(self.metadata.format)
+
+    @property
+    def root_offsets(self) -> NDArray[np.int32]:
+        assert self.first_token_offsets is not None
+        return self.first_token_offsets
+
+    @property
+    def max_first_degree(self) -> int:
+        return int(np.diff(self.root_offsets.astype(np.int64)).max(initial=0))
+
+    @property
     def total_elements(self) -> int:
-        return sum(int(getattr(self, name).size) for name in CONSTRAINT_TABLE_TENSOR_NAMES)
+        return sum(int(getattr(self, name).size) for name in self.tensor_names)
 
     @property
     def total_bytes(self) -> int:
-        return sum(int(getattr(self, name).nbytes) for name in CONSTRAINT_TABLE_TENSOR_NAMES)
+        return sum(int(getattr(self, name).nbytes) for name in self.tensor_names)
+
+
+def constraint_table_tensor_names(format: str) -> tuple[str, ...]:
+    return CONSTRAINT_TABLE_TENSOR_NAMES + (
+        ("first_token_offsets",) if format == MULTI_TRIE_CONSTRAINT_TABLE_FORMAT else ()
+    )
+
+
+def _single_root_offsets(first: NDArray[np.int32]) -> NDArray[np.int32]:
+    return np.frombuffer(np.asarray([0, first.size], dtype=np.int32).tobytes(), dtype=np.int32)
 
 
 def _validate_int(value: object, name: str, *, minimum: int) -> int:
@@ -149,11 +187,16 @@ def validate_constraint_table_metadata(
 ) -> None:
     if not isinstance(metadata, ConstraintTableMetadata):
         raise ValueError("constraint table metadata must be ConstraintTableMetadata")
-    if metadata.format != CONSTRAINT_TABLE_FORMAT:
+    if metadata.format not in (CONSTRAINT_TABLE_FORMAT, MULTI_TRIE_CONSTRAINT_TABLE_FORMAT):
         raise ValueError(
             f"constraint table format must be {CONSTRAINT_TABLE_FORMAT!r}, got {metadata.format!r}"
         )
     _validate_int(metadata.vocab_size, "vocab_size", minimum=1)
+    _validate_int(metadata.trie_count, "trie_count", minimum=1)
+    if metadata.format == CONSTRAINT_TABLE_FORMAT and metadata.trie_count != 1:
+        raise ValueError("constraint_table_v1 requires trie_count=1")
+    if metadata.trie_count * metadata.vocab_size**2 - 1 > np.iinfo(np.int64).max:
+        raise ValueError("constraint table root/SID keys exceed int64 capacity")
     _validate_int(metadata.max_prefix1_degree, "max_prefix1_degree", minimum=0)
     _validate_int(metadata.max_prefix2_degree, "max_prefix2_degree", minimum=0)
     _validate_int(metadata.total_bytes, "total_bytes", minimum=0)
@@ -248,9 +291,10 @@ def _pair_keys_match(
     values: NDArray[np.int32],
     pair_keys: NDArray[np.int64],
     vocab_size: int,
+    trie_id: int = 0,
 ) -> bool:
     for token_value in first:
-        token_id = int(token_value)
+        token_id = trie_id * vocab_size + int(token_value)
         begin = int(offsets[token_id])
         end = int(offsets[token_id + 1])
         base = token_id * vocab_size
@@ -278,6 +322,7 @@ def validate_constraint_table(table: ConstraintTable) -> None:
         "prefix1_pair_keys": np.dtype(np.int64),
         "prefix2_value_offsets": np.dtype(np.int32),
         "prefix2_values": np.dtype(np.int32),
+        "first_token_offsets": np.dtype(np.int32),
     }
     for name, expected_dtype in expected_dtypes.items():
         tensor = getattr(table, name)
@@ -308,9 +353,17 @@ def validate_constraint_table(table: ConstraintTable) -> None:
     pair_keys = table.prefix1_pair_keys
     offsets2 = table.prefix2_value_offsets
     values2 = table.prefix2_values
+    root_offsets = table.root_offsets
+    if root_offsets.shape != (metadata.trie_count + 1,):
+        raise ValueError("first_token_offsets must have trie_count + 1 entries")
+    if int(root_offsets[0]) != 0 or int(root_offsets[-1]) != first.size:
+        raise ValueError("first_token_offsets must cover first_token_ids")
+    _validate_offsets(root_offsets, "first_token_offsets", require_positive=False)
 
-    if offsets1.shape != (vocab_size + 1,):
-        raise ValueError(f"prefix1_offsets must have shape (vocab_size + 1,), got {offsets1.shape}")
+    if offsets1.shape != (metadata.trie_count * vocab_size + 1,):
+        raise ValueError(
+            f"prefix1_offsets must have shape (trie_count * vocab_size + 1,), got {offsets1.shape}"
+        )
     if int(offsets1[0]) != 0 or int(offsets1[-1]) != len(values1):
         raise ValueError("prefix1_offsets must start at zero and end at prefix1_values size")
     if offsets2.shape != (len(values1) + 1,):
@@ -343,19 +396,22 @@ def validate_constraint_table(table: ConstraintTable) -> None:
 
     if first.size == 0:
         raise ValueError("first_token_ids must be non-empty")
-    if not _is_strictly_increasing(first):
-        raise ValueError("first_token_ids must be strictly increasing")
-    if not _active_tokens_match(first, offsets1):
-        raise ValueError(
-            "first_token_ids must exactly match prefix1_offsets tokens with positive degree"
-        )
     if values1.size and not _values_increase_within_buckets(values1, offsets1):
         raise ValueError("prefix1_values must be strictly increasing within each bucket")
+    for trie_id in range(metadata.trie_count):
+        root_first = first[root_offsets[trie_id] : root_offsets[trie_id + 1]]
+        if root_first.size == 0 or not _is_strictly_increasing(root_first):
+            raise ValueError("first_token_ids must be non-empty and strictly increasing per root")
+        root_rows = offsets1[trie_id * vocab_size : (trie_id + 1) * vocab_size + 1]
+        if not _active_tokens_match(root_first, root_rows):
+            raise ValueError(
+                "first_token_ids must exactly match prefix1_offsets tokens with positive degree"
+            )
+        if not _pair_keys_match(root_first, offsets1, values1, pair_keys, vocab_size, trie_id):
+            raise ValueError(
+                "prefix1_pair_keys must equal trie_id * vocab_size**2 + a_id * vocab_size + b_id"
+            )
     if pair_keys.size > 1 and not _is_strictly_increasing(pair_keys):
         raise ValueError("prefix1_pair_keys must be strictly increasing")
-    if values1.size and not _pair_keys_match(first, offsets1, values1, pair_keys, vocab_size):
-        raise ValueError(
-            "prefix1_pair_keys must equal a_id * vocab_size + b_id for each CSR bucket"
-        )
     if values2.size and not _values_increase_within_buckets(values2, offsets2):
         raise ValueError("prefix2_values must be strictly increasing within each bucket")

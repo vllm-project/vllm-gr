@@ -57,7 +57,11 @@ def test_batch_finishes_only_when_all_members_finish_or_any_member_errors():
 
 
 def metadata(
-    stage: int = 0, dispatch: int | None = None, output: bool = True, n: int = 3
+    stage: int = 0,
+    dispatch: int | None = None,
+    output: bool = True,
+    n: int = 3,
+    candidate_width: int | None = None,
 ) -> GRStageMetadata:
     request = _batch_request(n)
     return GRStageMetadata(
@@ -69,7 +73,9 @@ def metadata(
         is_last_stage=output and stage == n - 1,
         input_device_state=GRDeviceStateRef(request.batch_id, stage - 1) if stage else None,
         output_device_state=GRDeviceStateRef(request.batch_id, stage),
-        beam_params=msgspec.structs.replace(request.beam_params, stop_token_ids=()),
+        beam_params=msgspec.structs.replace(
+            request.beam_params, stop_token_ids=(), candidate_width=candidate_width
+        ),
         output_options=request.output_options,
         num_prompt_tokens=7,
         produces_output=output,
@@ -84,26 +90,36 @@ def dispatch(m: GRStageMetadata) -> SimpleNamespace:
     return result
 
 
-def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
+def runtime(dtype=torch.float16, n=3, stop_token_ids=(), candidate_width=None):
     context = BeamAttentionContext(3, 4, 1, 5, 8, 2, torch.device("cuda"), dtype)
+    top_k = 4 if candidate_width is None else candidate_width
     state = BeamSearchState(
         context.decision,
         beam_width=4,
         max_new_tokens=n,
         stop_token_ids=stop_token_ids,
         ignore_stop_tokens=True,
+        candidate_width=top_k,
     )
     # A one-request batch owns request-major state, workspace, and KV row 0.
     slot = context.registry.allocate("session-0", 4, 7)
     session = BeamSearchSession("session-0", slot, context)
     session.begin_session(4, 7, decision_index=0)
     workspace = BeamPostprocessWorkspace.allocate(
-        max_batch=3, beam_width=4, top_k=4, max_decode_steps=5, device="cuda", logits_dtype=dtype
+        max_batch=3,
+        beam_width=4,
+        top_k=top_k,
+        max_decode_steps=5,
+        device="cuda",
+        logits_dtype=dtype,
     )
     runner = BeamSearchRunner(session, state, workspace)
-    beam = BeamBatchSearchRunner((runner,), BeamBatchExecutionView.from_stage_metadata(metadata(n)))
+    beam = BeamBatchSearchRunner(
+        (runner,),
+        BeamBatchExecutionView.from_stage_metadata(metadata(n, candidate_width=candidate_width)),
+    )
     backend, _ = _upload_cuda_backend(
-        make_table(), device=torch.device("cuda"), max_top_k=4, max_rows=4
+        make_table(), device=torch.device("cuda"), max_top_k=max(4, top_k), max_rows=4
     )
     backend._mark_ready()
     worker = SimpleNamespace(
@@ -200,6 +216,9 @@ def admission_worker(
             beam_max_decode_steps=3,
             beam_execution_mode=BeamExecutionMode.V1,
             enable_short_suffix_attention=False,
+            # resolve_candidate_width reads this; None keeps K == W for the
+            # fixture's W=4 workspace.
+            constraint_table=None,
         ),
         constraint_backend=backend,
         kv_cache_config=SimpleNamespace(
@@ -365,6 +384,52 @@ def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
     for pool in owner.beam.session.pools:
         assert pool.unshared_key[1:].eq(123).all()
         assert pool.unshared_value[1:].eq(456).all()
+
+
+@pytest.mark.parametrize("candidate_width", [2, 3, 6, 8])
+def test_decode_stages_sample_k_candidates_per_row_when_k_differs_from_w(
+    candidate_width, monkeypatch
+):
+    """W=4 rows with K < W and K > W: every stage asks the backend for K, not W.
+
+    The kernel-level K != W tests stop at the operators; this drives the
+    stage runner itself through Prefill and two Decode stages, so the wire K,
+    the workspace geometry, the candidate buffers and the completed-result
+    capacity all have to agree for the session to finish.
+    """
+
+    n = 3
+    owner = runtime(n=n, candidate_width=candidate_width)
+    state = owner.beam.state
+    assert state.candidate_width == candidate_width
+    assert state.completed_capacity == candidate_width + (n - 1) * 4 * candidate_width
+    assert tuple(owner.tokens.shape) == (4, candidate_width)
+    requested = []
+    backend_type = type(owner.backend)
+    select = backend_type.select_out_unchecked
+
+    def _record(self, logits, metadata, *args, **kwargs):
+        requested.append((logits.shape[0], metadata.top_k))
+        return select(self, logits, metadata, *args, **kwargs)
+
+    # The backend uses slots, so record at the class rather than the instance.
+    monkeypatch.setattr(backend_type, "select_out_unchecked", _record)
+    results = []
+    for stage in range(n):
+        execution = owner.admit(dispatch(metadata(stage, n=n, candidate_width=candidate_width)))
+        if stage:
+            prepare_binding(owner, execution.entries[0])
+        owner.logits = torch.zeros((1 if stage == 0 else 4, 6), dtype=torch.float16, device="cuda")
+        # Consume each stage before the next admit: the runner has two slots.
+        output = owner.sample().get_output()
+        results.append(getattr(output, GR_WORKER_RESULT_ATTR)["session-0"])
+    assert requested == [(1, candidate_width), (4, candidate_width), (4, candidate_width)]
+    assert [result.stage_index for result in results] == list(range(n))
+    final = results[-1]
+    assert final.finished
+    assert final.terminal_result is not None and final.terminal_result.output is not None
+    assert state.num_generated_tokens.tolist()[0] == n
+    assert 0 < int(state.num_completed[0]) <= state.completed_capacity
 
 
 @pytest.mark.parametrize("graph", [False, True])

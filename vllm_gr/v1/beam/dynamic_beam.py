@@ -259,20 +259,41 @@ class DynamicBeamState:
             raise ValueError("Beam candidates and state must share a device")
 
     def initialize(self, prefill: ConstraintOutput, width: int) -> None:
-        """Seed SA winners without recomputing their local probabilities."""
+        """Seed SA winners without recomputing their local probabilities.
+
+        ``width`` is the survivor count the state keeps (the stage's output
+        width, i.e. ``W``), while the Prefill candidates carry ``K`` columns.
+        The two are independent, so the candidate geometry is validated against
+        its own width and only ``min(W, K)`` beams are seeded: the candidates
+        are score-ordered, so the first ``min(W, K)`` are the winners, and any
+        beams beyond that stay inactive with ``-inf`` scores.
+        """
 
         width = _positive_int("width", width)
         if self.num_generated_tokens:
             raise RuntimeError("dynamic Beam state has already been initialized")
         if width > self.context.max_beams:
             raise ValueError("initial Beam width exceeds the context capacity")
-        self._validate_candidates(prefill, self.batch_size, width)
+        candidate_width = prefill.token_ids.shape[1] if prefill.token_ids.ndim == 2 else 0
+        if candidate_width < 1:
+            raise ValueError("Beam candidates must be a nonempty 2-D tensor")
+        self._validate_candidates(prefill, self.batch_size, candidate_width)
+        live = min(width, candidate_width)
         shape = (self.batch_size, width, self.max_decode_steps)
         sequence = torch.zeros(shape, dtype=torch.int32, device=self.device)
         valid = prefill.valid_mask & torch.isfinite(prefill.logprobs)
-        sequence[:, :, 0].copy_(prefill.token_ids.masked_fill(~valid, 0))
+        sequence[:, :live, 0].copy_(prefill.token_ids[:, :live].masked_fill(~valid[:, :live], 0))
         self.sequence = sequence
-        self.scores = prefill.logprobs.masked_fill(~valid, float("-inf"))
+        scores = torch.full(
+            (self.batch_size, width),
+            float("-inf"),
+            dtype=prefill.logprobs.dtype,
+            device=self.device,
+        )
+        scores[:, :live].copy_(
+            prefill.logprobs[:, :live].masked_fill(~valid[:, :live], float("-inf"))
+        )
+        self.scores = scores
         self.parent_history = torch.zeros_like(sequence)
         self.current_width = width
         self.num_generated_tokens = 1

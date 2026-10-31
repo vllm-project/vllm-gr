@@ -30,10 +30,13 @@ class BeamDecodeGraphSignature:
     batch_size: int
     beam_width: int
     num_model_rows: int
+    prefix_bucket: int = 0
 
     def __post_init__(self) -> None:
         if (
-            type(self.batch_size) is not int
+            type(self.prefix_bucket) is not int
+            or self.prefix_bucket < 0
+            or type(self.batch_size) is not int
             or type(self.beam_width) is not int
             or self.batch_size < 1
             or self.beam_width < 1
@@ -78,12 +81,21 @@ class BeamDecodeGraph:
         entry = self.wrapper.concrete_cudagraph_entries.get(self.descriptor)
         return entry is not None and entry.cudagraph is not None
 
-    def select(self, batch_size: int, beam_width: int) -> BeamDecodeGraph:
-        signature = BeamDecodeGraphSignature(batch_size, beam_width, batch_size * beam_width)
+    def select(self, batch_size: int, beam_width: int, prefix_bucket: int = 0) -> BeamDecodeGraph:
+        signature = BeamDecodeGraphSignature(
+            batch_size, beam_width, batch_size * beam_width, prefix_bucket
+        )
         self.signature = signature
         self.wrapper.concrete_cudagraph_entries = self._registries.setdefault(signature, {})
         self.descriptor = BatchDescriptor(num_tokens=signature.num_model_rows, uniform=True)
         return self
+
+    def discard_geometry(self, batch_size: int, beam_width: int) -> None:
+        """New input storage invalidates every length bucket for this geometry."""
+        for signature in tuple(self._registries):
+            if (signature.batch_size, signature.beam_width) == (batch_size, beam_width):
+                self.select(batch_size, beam_width, signature.prefix_bucket).discard_selected()
+        self.select(batch_size, beam_width)
 
     def discard_selected(self) -> None:
         """Drop a capture whose fixed input addresses cannot be reused."""

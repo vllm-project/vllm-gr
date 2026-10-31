@@ -13,7 +13,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_gr.config import GRConfig
+from vllm_gr.config import GRConfig, resolve_candidate_width
 from vllm_gr.config.models import ConstraintTableBackendEnum
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
@@ -46,9 +46,58 @@ def _get_token_id(tokenizer: Any, token: str | None, name: str) -> int | None:
         raise BeamSearchRequestError(str(exc)) from exc
 
 
+def _resolve_candidate_width(vllm_config: Any, params: Any) -> int:
+    """Resolve K for one request, matching the engine's startup derivation.
+
+    ``constraint_table.candidate_width`` is the single source of truth; when it
+    is unset K follows the beam width (the pre-decoupling behaviour).  Sampling
+    ``logprobs`` must equal K so each beam row yields exactly K candidates.
+    """
+
+    config = GRConfig.from_vllm_config(vllm_config)
+    if config.beam_max_width is None:
+        raise BeamSearchRequestError("beam_search_v1 requires beam.max_width to be configured")
+    candidate_width = resolve_candidate_width(config)
+    max_logprobs = _effective_max_logprobs(vllm_config)
+    if max_logprobs is not None and candidate_width > max_logprobs:
+        raise BeamSearchRequestError(
+            f"candidate width {candidate_width} exceeds max_logprobs {max_logprobs}; "
+            "raise --max-logprobs to at least the candidate width"
+        )
+    return candidate_width
+
+
+def _configured_candidate_width(vllm_config: Any) -> int | None:
+    """Return the explicitly configured K, or ``None`` when K follows W."""
+
+    table = GRConfig.from_vllm_config(vllm_config).constraint_table
+    return None if table is None else table.candidate_width
+
+
+def _effective_max_logprobs(vllm_config: Any) -> int | None:
+    """Return the served logprob budget, matching vLLM's own normalization.
+
+    ``max_logprobs`` is ``-1`` by default, which vLLM's ``SamplingParams``
+    validation treats as "the whole vocabulary", not as a negative limit.
+    Comparing a positive candidate width against the raw sentinel would reject
+    every default deployment, so the sentinel is normalized the same way here.
+    """
+
+    model_config = getattr(vllm_config, "model_config", None)
+    max_logprobs = getattr(model_config, "max_logprobs", None)
+    if not isinstance(max_logprobs, int) or isinstance(max_logprobs, bool):
+        return None
+    if max_logprobs == -1:
+        get_vocab_size = getattr(model_config, "get_vocab_size", None)
+        return int(get_vocab_size()) if callable(get_vocab_size) else None
+    return max_logprobs
+
+
 def _create_request_params(
     params: Any,
     tokenizer: Any,
+    *,
+    vllm_config: Any,
 ) -> tuple[SamplingParams, int | None, int | None]:
     if params.ignore_eos is not True:
         raise BeamSearchRequestError("beam_search_v1 requires ignore_eos=True")
@@ -68,7 +117,7 @@ def _create_request_params(
     if params.ignore_eos:
         stop_token_ids = ()
     sampling_params = SamplingParams(
-        logprobs=params.beam_width,
+        logprobs=_resolve_candidate_width(vllm_config, params),
         max_tokens=decode_steps,
         temperature=params.temperature,
         ignore_eos=params.ignore_eos,
@@ -134,6 +183,17 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
         raise BeamSearchRequestError(
             f"Asynchronous scheduling beam_width must equal the fixed runtime width {max_width}"
         )
+    # K is also an engine-lifetime constant: the Worker prewarms exactly one
+    # postprocess workspace and looks it up by key, so a request carrying a
+    # different candidate width would surface later as a "geometry changed"
+    # error instead of a request-level rejection.
+    candidate_width = resolve_candidate_width(gr_config)
+    carried_width = request.beam_params.candidate_width
+    if carried_width is not None and carried_width != candidate_width:
+        raise BeamSearchRequestError(
+            f"Beam batch candidate_width {carried_width} must equal the configured "
+            f"candidate width {candidate_width}"
+        )
 
     model_config = vllm_config.model_config
     prompt_lengths = []
@@ -165,7 +225,19 @@ def _create_batch_request(
     engine_requests: tuple[EngineCoreRequest, ...],
     params: Any,
     vllm_config: Any,
+    trie_ids: list[int] | tuple[int, ...] | None = None,
 ) -> BeamBatchRequest:
+    if trie_ids is None:
+        trie_ids = (0,) * len(engine_requests)
+    if (
+        not isinstance(trie_ids, (list, tuple))
+        or len(trie_ids) != len(engine_requests)
+        or any(type(trie_id) is not int or trie_id < 0 for trie_id in trie_ids)
+    ):
+        raise BeamSearchRequestError("trie_ids must contain one non-negative integer per prompt")
+    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
+    if str(device).split(":")[0] == "npu" and any(trie_ids):
+        raise BeamSearchRequestError("multi-trie requests currently require CUDA")
     if not engine_requests or engine_requests[0].request_id != session_id:
         raise BeamSearchRequestError(
             "the first EngineCoreRequest.request_id must equal the GR session ID"
@@ -200,6 +272,13 @@ def _create_batch_request(
     stop_token_ids = set(sampling_params.stop_token_ids or ())
     if sampling_params.eos_token_id is not None:
         stop_token_ids.add(sampling_params.eos_token_id)
+    # K (and its logprob budget) was validated when the sampling parameters
+    # were built.  Put it on the wire only when it is *configured*: an unset K
+    # must stay ``None`` so the execution view keeps taking each stage's top-k
+    # from its output width, as it did before K existed.  Writing the derived
+    # ``K == W`` here would make every stage of a shrinking dynamic schedule
+    # select ``W`` candidates.
+    candidate_width = _configured_candidate_width(vllm_config)
     batch_params = BeamBatchParams(
         beam_width=params.beam_width,
         max_tokens=sampling_params.max_tokens,
@@ -213,6 +292,7 @@ def _create_batch_request(
         per_parent_beam_widths=None
         if per_parent_beam_widths is None
         else tuple(per_parent_beam_widths),
+        candidate_width=candidate_width,
     )
     final_width = (
         batch_params.beam_width
@@ -232,7 +312,7 @@ def _create_batch_request(
         protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
         batch_id=session_id,
         items=tuple(
-            BeamBatchItem(item_index=index, request=request)
+            BeamBatchItem(item_index=index, request=request, trie_id=trie_ids[index])
             for index, request in enumerate(engine_requests)
         ),
         beam_params=batch_params,
@@ -256,7 +336,7 @@ class BeamSearchInputProcessor:
             raise BeamSearchRequestError("concurrency_limit must be positive or None")
         tokenizer = llm.get_tokenizer()
         sampling_params, begin_token_id, end_token_id = _create_request_params(
-            call.params, tokenizer
+            call.params, tokenizer, vllm_config=self.engine.vllm_config
         )
         engine_inputs = llm._preprocess_cmpl(call.prompts)
         lora_requests = llm._lora_request_to_seq(call.lora_request, len(engine_inputs))
@@ -281,6 +361,7 @@ class BeamSearchInputProcessor:
             engine_requests=tuple(engine_requests),
             params=call.params,
             vllm_config=self.engine.vllm_config,
+            trie_ids=call.trie_ids,
         )
         self.boundary_token_ids = (begin_token_id, end_token_id)
         return request
@@ -298,7 +379,7 @@ class BeamSearchInputProcessor:
         if not call.prompts:
             raise VLLMValidationError("beam_search_v1 requires at least one prompt")
         sampling_params, begin_token_id, end_token_id = _create_request_params(
-            call.params, tokenizer
+            call.params, tokenizer, vllm_config=self.engine.vllm_config
         )
         # One arrival time and one task set describe the batch, not its
         # members; asking per prompt would spread a single submission over the
@@ -331,6 +412,7 @@ class BeamSearchInputProcessor:
             engine_requests=tuple(engine_requests),
             params=call.params,
             vllm_config=self.engine.vllm_config,
+            trie_ids=call.trie_ids,
         )
         self.boundary_token_ids = (begin_token_id, end_token_id)
         return request

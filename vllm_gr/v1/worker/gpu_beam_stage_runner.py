@@ -19,6 +19,7 @@ import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
+from vllm_gr.config import resolve_candidate_width
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.ops.cuda.unconstrained_topk import (
@@ -327,7 +328,7 @@ class _StageExecutionHooks:
     def prepare_new_adapter(self, view: BeamBatchExecutionView) -> None:
         graph = getattr(self.worker, "_beam_decode_graph", None)
         if graph is not None:
-            graph.select(view.batch_size, view.beam_width).discard_selected()
+            graph.discard_geometry(view.batch_size, view.beam_width)
 
     def decode_graph(self, batch_size: int, beam_width: int) -> Any:
         from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
@@ -346,6 +347,9 @@ class _StageExecutionHooks:
         )
         if graph_enabled:
             graph = self.decode_graph(len(owner.bindings), owner.inputs.width)
+            bucket = getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0)
+            if bucket:
+                graph.select(len(owner.bindings), owner.inputs.width, bucket)
             if not graph.ready:
                 graph.capture(
                     owner._forward_hidden,
@@ -453,6 +457,7 @@ class GPUBeamStageRunner:
         bindings: tuple[BeamRequestBinding, ...],
         backend: CUDAConstraintBackend | None,
         hooks: _StageExecutionHooks | None = None,
+        trie_ids: tuple[int, ...] | None = None,
     ):
         expected = tuple(range(len(bindings)))
         if not bindings or (
@@ -533,14 +538,36 @@ class GPUBeamStageRunner:
         self.hooks.initialize_inputs(self, rows)
         self.constraint_steps = beam.state.num_generated_tokens[:batch_size]
         w = beam.workspace
+        # Candidate geometry is (rows, K): the row count is the beam width and
+        # the column count is the independent candidate width.
+        candidate_width = w.key.top_k
         self.prefixes = w.prefix_token_ids[:batch_size].reshape(rows, -1)
         self.temperatures = w.temperatures[:batch_size].reshape(rows)
-        self.tokens = w.topk_token_ids[:batch_size].reshape(rows, beam.state.beam_width)
-        self.scores = w.topk_scores[:batch_size].reshape(rows, beam.state.beam_width)
-        self.valid = w.topk_valid_mask[:batch_size].reshape(rows, beam.state.beam_width)
+        self.tokens = w.topk_token_ids[:batch_size].reshape(rows, candidate_width)
+        self.scores = w.topk_scores[:batch_size].reshape(rows, candidate_width)
+        self.valid = w.topk_valid_mask[:batch_size].reshape(rows, candidate_width)
         self.counts = w.topk_valid_counts[:batch_size].reshape(rows)
+        self.trie_ids_by_width: dict[int, torch.Tensor] = {}
+        self.configure_trie_ids(trie_ids)
         context._gr_execution_owner = self
         beam.workspace.execution_owner = self
+
+    def configure_trie_ids(self, trie_ids: tuple[int, ...] | None) -> None:
+        """Keep per-width request-major selectors stable across adapter reuse."""
+        if self.backend is None or self.backend.info.table_metadata.trie_count == 1:
+            return
+        if trie_ids is None or len(trie_ids) != len(self.bindings):
+            raise ValueError("multi-trie execution requires one trie_id per request")
+        source = torch.tensor(trie_ids, dtype=torch.int32, device=self.beam.state.device)
+        widths = {1, self.beam.state.beam_width, *(self.beam.layout.dynamic_beam_widths or ())}
+        for width in widths:
+            target = self.trie_ids_by_width.get(width)
+            if target is None:
+                target = torch.empty(
+                    (len(trie_ids) * width,), dtype=torch.int32, device=source.device
+                )
+                self.trie_ids_by_width[width] = target
+            target.view(len(trie_ids), width).copy_(source[:, None])
 
     def admit(self, scheduler_output: Any) -> BeamDispatchExecution:
         if self.closed:
@@ -691,6 +718,9 @@ class GPUBeamStageRunner:
             len(self.bindings),
             self.inputs.width if self.inputs is not None else self.beam.state.beam_width,
         )
+        bucket = getattr(getattr(self, "metadata", None), "prefix_length_bucket", 0)
+        if bucket:
+            graph.select(len(self.bindings), self.inputs.width, bucket)
         graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
         return graph
 
@@ -773,11 +803,35 @@ class GPUBeamStageRunner:
                     raise RuntimeError("GR output stage has no native model logits")
                 layout = BeamBatchExecutionView.from_stage_metadata(m)
                 rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
+                candidate_width = layout.candidate_top_k
                 candidates = (
-                    self.dynamic.candidate_buffers(rows, layout.candidate_top_k)
+                    self.dynamic.candidate_buffers(rows, candidate_width)
                     if self.dynamic is not None
                     else (self.tokens[:rows], self.scores[:rows], self.valid[:rows])
                 )
+                # The backend's unchecked entry point validates nothing: it
+                # addresses outputs as ``row * K + offset`` and skips shape
+                # checks.  A candidate buffer whose column count disagrees with
+                # the requested K would write past its allocation (K < rows of
+                # the view) or leave candidate columns unwritten (K larger).
+                # Check the geometry here, before the launch.
+                expected = (rows, candidate_width)
+                for name, tensor, dtype in (
+                    ("candidate token ids", candidates[0], torch.int32),
+                    ("candidate logprobs", candidates[1], torch.float32),
+                    ("candidate valid mask", candidates[2], torch.bool),
+                ):
+                    if (
+                        tuple(tensor.shape) != expected
+                        or tensor.dtype != dtype
+                        or tensor.device != self.logits.device
+                        or not tensor.is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            f"GR candidate {name} must be contiguous {dtype} "
+                            f"{expected} on {self.logits.device}, got "
+                            f"{tuple(tensor.shape)} {tensor.dtype} {tensor.device}"
+                        )
                 if self.backend is not None:
                     self.backend.select_out_unchecked(
                         self.logits,
@@ -786,6 +840,7 @@ class GPUBeamStageRunner:
                             self.temperatures[:rows],
                             0,
                             layout.candidate_top_k,
+                            trie_ids=self.trie_ids_by_width.get(layout.input_width),
                         ),
                         out_token_ids=candidates[0],
                         out_logprobs=candidates[1],
@@ -1021,6 +1076,7 @@ def get_stage_runner(
     scheduler_output: Any,
     *,
     hooks_type: type[_StageExecutionHooks] = _StageExecutionHooks,
+    for_startup_capture: bool = False,
 ) -> GPUBeamStageRunner:
     """Admit first, then derive the adapter from existing Worker resources."""
     existing = getattr(worker, "_gr_gpu_stage_runner", None)
@@ -1080,7 +1136,9 @@ def get_stage_runner(
         or any(table.device != worker.device for table in backend._tables())
     ):
         raise ValueError("constraint backend is not ready or its model/device binding differs")
-    required_top_k = max(m.beam_params.per_parent_beam_widths or (cfg.beam_max_width,))
+    candidate_width = resolve_candidate_width(cfg)
+    # A request-level per-stage K schedule overrides the configured scalar K.
+    required_top_k = max(m.beam_params.per_parent_beam_widths or (candidate_width,))
     if backend is not None and (
         backend.info.max_rows
         < hooks_type.required_constraint_rows(len(m.request_ids), cfg.beam_max_width)
@@ -1106,7 +1164,7 @@ def get_stage_runner(
         for name in group.layer_names:
             impl = getattr(layers.get(name), "impl", None)
             if not isinstance(impl, BeamAttentionImpl):
-                raise ValueError("persistent GR requires Beam Attention on every KV layer")
+                raise ValueError("persistent GR requires Beam Attention on every KV layer")  # noqa: TRY004
             # Packed beam queries do not preserve sliding-window positions
             # across the prefix/suffix split. No window is stored as (-1, -1).
             if impl.sliding_window != (-1, -1):
@@ -1130,11 +1188,21 @@ def get_stage_runner(
     if getattr(worker, "_beam_sessions", {}):
         raise ValueError("another Beam session owns the Worker")
     workspace = worker._beam_postprocess_workspaces.require(
-        BeamPostprocessWorkspaceKey(
-            cfg.beam_max_width, cfg.beam_max_width, worker.model_config.dtype
-        )
+        BeamPostprocessWorkspaceKey(cfg.beam_max_width, candidate_width, worker.model_config.dtype)
     )
     view = BeamBatchExecutionView.from_stage_metadata(m)
+    trie_count = backend.info.table_metadata.trie_count if backend is not None else 1
+    trie_ids = None
+    if m.session_init is not None:
+        trie_ids = tuple(item.trie_id for item in m.session_init.items)
+        if any(type(root) is not int or not 0 <= root < trie_count for root in trie_ids):
+            raise ValueError("trie_id is outside the loaded constraint table")
+    elif for_startup_capture:
+        # Capture has no user request. Seed the same persistent selector buffers
+        # with Trie 0; real sessions replace their contents before execution.
+        trie_ids = (0,) * view.batch_size
+    elif trie_count > 1:
+        raise ValueError("multi-trie execution requires the initial batch request")
     context = getattr(worker, "_beam_context", None)
     if context is None:
         context = _create_beam_context(worker, cfg, max_batch=max(SUPPORTED_BATCH_SIZES))
@@ -1198,6 +1266,7 @@ def get_stage_runner(
         and existing.beam.state.max_new_tokens == m.beam_params.max_tokens
         and existing.beam.state.stop_token_ids_config == m.beam_params.stop_token_ids
         and existing.beam.state.ignore_stop_tokens_config == m.beam_params.ignore_stop_tokens
+        and existing.beam.state.candidate_width == candidate_width
     )
     if reuse_beam:
         assert existing is not None
@@ -1210,6 +1279,11 @@ def get_stage_runner(
             max_new_tokens=m.beam_params.max_tokens,
             stop_token_ids=m.beam_params.stop_token_ids,
             ignore_stop_tokens=m.beam_params.ignore_stop_tokens,
+            # Completed-result storage is sized from the engine's K (W when K
+            # is unset): the widest candidate row any stage can produce.  With
+            # K unset the view's ``candidate_top_k`` is only this stage's output
+            # width, which would undersize a schedule that widens later.
+            candidate_width=candidate_width,
         )
     if not reuse_adapter and (existing_dynamic is not None or dynamic_requested):
         discard_dynamic_graphs(worker, context)
@@ -1259,12 +1333,15 @@ def get_stage_runner(
         adapter.execution_error = None
         adapter.prepared = None
         adapter.constraint_steps = beam.state.num_generated_tokens[: view.batch_size]
+        adapter.configure_trie_ids(trie_ids)
         context._gr_execution_owner = adapter
         workspace.execution_owner = adapter
     else:
         hooks = hooks_type(worker)
         hooks.prepare_new_adapter(view)
-        adapter = GPUBeamStageRunner(worker, beam, binding_tuple, backend, hooks=hooks)
+        adapter = GPUBeamStageRunner(
+            worker, beam, binding_tuple, backend, hooks=hooks, trie_ids=trie_ids
+        )
     if dynamic_requested:
         if adapter.dynamic is None:
             adapter.dynamic = GPUDynamicBeam(adapter)

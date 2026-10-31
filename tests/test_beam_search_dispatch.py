@@ -37,6 +37,8 @@ def _dispatch(
     monkeypatch: Any,
     params: Any = "params",
     session_id: str | None = None,
+    *,
+    trie_ids: list[int] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     calls: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(serving_engine, "beam_search_v1", _recorder("v1", calls))
@@ -55,6 +57,7 @@ def _dispatch(
                 "lora",
                 {"trace": "id"},
                 session_id=session_id,
+                trie_ids=trie_ids,
             )
         ]
         assert len(outputs) == 1
@@ -107,6 +110,76 @@ def test_dispatch_preserves_native_session_hint_for_both_engines(monkeypatch: An
     for config in (None, {"vllm_gr_beam_execution_mode": "v1"}):
         calls = _dispatch(config, monkeypatch, session_id="caller-session")
         assert calls[0][1]["session_id"] == "caller-session"
+
+
+def test_trie_ids_are_forwarded_only_to_gr(monkeypatch: Any) -> None:
+    calls = _dispatch({"vllm_gr_beam_execution_mode": "v1"}, monkeypatch, trie_ids=[1, 0])
+    assert calls[0][1]["trie_ids"] == [1, 0]
+    with pytest.raises(ValueError, match="trie_ids require GR"):
+        _dispatch(None, monkeypatch, trie_ids=[1])
+
+
+def test_completion_fallback_binds_ids_before_iteration(monkeypatch: Any) -> None:
+    from vllm_gr.entrypoints.openai import completion_batch_patch as completion
+    from vllm_gr.entrypoints.openai.beam_search_patch import _COMPLETION_TRIE_IDS
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(serving_engine, "beam_search_v1", _recorder("v1", calls))
+    serving = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            vllm_config=SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"})
+        )
+    )
+
+    async def upstream(self: Any, request: Any, raw_request: Any) -> list[Any]:
+        generators = []
+        for i in range(3):
+            await asyncio.sleep(0)  # Interleave two requests during splitting.
+            generators.append(beam_search_dispatch(self, i, request.request_id, "params"))
+        return generators
+
+    monkeypatch.setattr(completion, "_original_create_completion", upstream)
+
+    async def run() -> None:
+        requests = [
+            SimpleNamespace(request_id=name, vllm_xargs={"trie_ids": ids})
+            for name, ids in (("a", [0, 1, 2]), ("b", [2, 0, 1]))
+        ]
+        batches = await asyncio.gather(
+            *[completion._delegate_completion(serving, request, None) for request in requests]
+        )
+        assert _COMPLETION_TRIE_IDS.get() is None
+        for generators in batches:
+            for generator in reversed(generators):
+                assert [output async for output in generator] == ["v1"]
+        assert [
+            output async for output in beam_search_dispatch(serving, "default", "c", "params")
+        ] == ["v1"]
+
+    asyncio.run(run())
+    assert [
+        (kwargs["request_id"], kwargs["prompt"], kwargs.get("trie_ids")) for _, kwargs in calls
+    ] == [
+        ("a", 2, [2]),
+        ("a", 1, [1]),
+        ("a", 0, [0]),
+        ("b", 2, [1]),
+        ("b", 1, [0]),
+        ("b", 0, [2]),
+        ("c", "default", None),
+    ]
+
+
+def test_completion_schema_accepts_trie_id_list() -> None:
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+
+    from vllm_gr.entrypoints.openai.beam_search_patch import patch_sampling
+
+    patch_sampling()
+    request = CompletionRequest.model_validate_json(
+        '{"model":"test","prompt":["a","b"],"use_beam_search":true,"vllm_xargs":{"trie_ids":[1,0]}}'
+    )
+    assert request.vllm_xargs["trie_ids"] == [1, 0]
 
 
 def test_legacy_gr_configuration_is_rejected(monkeypatch: Any) -> None:

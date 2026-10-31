@@ -76,6 +76,9 @@ class BeamBatchExecutionView:
     produces_output: bool
     dynamic_beam_widths: tuple[int, ...] | None = None
     per_parent_beam_widths: tuple[int, ...] | None = None
+    # Candidates per beam row (columns), independent of ``beam_width`` (rows).
+    # None keeps the pre-decoupling behaviour, K == beam_width.
+    candidate_width: int | None = None
     row_request_indices: tuple[int, ...] = field(init=False)
     row_beam_indices: tuple[int, ...] = field(init=False)
     prompt_token_offsets: tuple[int, ...] = field(init=False)
@@ -96,6 +99,23 @@ class BeamBatchExecutionView:
                     _fail("dynamic_beam_widths entries must not exceed beam_width")
         if not isinstance(self.produces_output, bool):
             _fail(f"produces_output must be a bool, got {self.produces_output!r}")
+        if self.candidate_width is not None:
+            _positive_int("candidate_width", self.candidate_width)
+            # Every schedule step selects ``output_width`` survivors from the
+            # candidates its parents supply, so K must cover the widest step.
+            # Checked here rather than at the first ``dynamic.select`` so a
+            # mismatched K fails before any device work.  A per-stage K
+            # schedule overrides the scalar and carries its own bound.
+            scalar_widths = (
+                () if self.per_parent_beam_widths is not None else (self.dynamic_beam_widths or ())
+            )
+            for index, active_width in enumerate(scalar_widths):
+                if active_width > self.candidate_width:
+                    _fail(
+                        f"candidate_width {self.candidate_width} is below "
+                        f"dynamic_beam_widths[{index}]={active_width}; each parent "
+                        "must supply at least as many candidates as the stage retains"
+                    )
 
         if not isinstance(self.request_ids, tuple):
             _fail("request_ids must be an immutable tuple")
@@ -174,6 +194,7 @@ class BeamBatchExecutionView:
             produces_output=cast(bool, _attribute(metadata, "produces_output")),
             dynamic_beam_widths=getattr(params, "dynamic_beam_widths", None),
             per_parent_beam_widths=getattr(params, "per_parent_beam_widths", None),
+            candidate_width=getattr(params, "candidate_width", None),
         )
 
         total_prompt_tokens = _positive_int(
@@ -213,10 +234,20 @@ class BeamBatchExecutionView:
 
     @property
     def candidate_top_k(self) -> int:
+        """Candidates produced per parent row: K, not the survivor count.
+
+        This is the column extent of the candidate buffers the sampler fills.
+        A request-level ``per_parent_beam_widths`` schedule gives each stage its
+        own K and takes precedence over the configured scalar K.  Without
+        either, each stage takes its own ``output_width``: taking fewer than
+        the target width per parent can lose global Top-K winners when a
+        schedule expands after an earlier pruning step.
+        """
+
         if self.per_parent_beam_widths is not None:
             return self.per_parent_beam_widths[self.stage_index]
-        # Taking fewer than the target width per parent can lose global Top-K
-        # winners when a schedule expands after an earlier pruning step.
+        if self.candidate_width is not None:
+            return self.candidate_width
         return self.output_width
 
     @property

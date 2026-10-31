@@ -10,7 +10,8 @@ place by the legacy execution adapter.
 
 Wire contract (P2):
 
-- constrained sampling emits fixed-width candidate rows;
+- constrained sampling emits ``[rows, K]`` candidate rows, where K is the
+  candidate width and is independent of the beam width W (``rows == W``);
 - the shared worker-side Beam decision consumes those rows on CUDA or NPU;
 - Beam operators remain outside the current model-forward FULL Graph.
 
@@ -524,6 +525,47 @@ def _constraint_beam_width(mdata: dict[str, Any], req_id: Any) -> int:
     return width
 
 
+def _constraint_candidate_width(
+    runner: Any,
+    mdata: dict[str, Any],
+    req_id: Any,
+    beam_width: int,
+) -> int:
+    """Return the constrained top-k width K (per-row candidates).
+
+    K is independent of the beam width W: candidate geometry is ``(W, K)``.
+    Precedence is metadata, then the engine configuration, and only then the
+    legacy ``K == W``.
+
+    The configuration lookup is what makes a decoupled K reach the operator.
+    ``beam_data`` metadata carries no ``candidate_width`` key today -- no
+    production producer writes one -- so falling straight back to the beam
+    width here would silently sample W candidates per row for every
+    constrained step, and would then trip the ``max_top_k`` capacity gate with
+    the beam width instead of the candidate width.  Mirror
+    ``resolve_candidate_width`` rather than re-deriving the value: the
+    workspace bucket, the admission gate and this operator must agree.
+    """
+
+    width = mdata.get("candidate_width")
+    if width is not None:
+        if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+            raise RuntimeError(
+                f"constrained request {req_id!r} has invalid candidate_width={width!r}; "
+                "expected a positive integer"
+            )
+        return width
+
+    from vllm_gr.config import GRConfig, resolve_candidate_width
+
+    config = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+    if config.beam_max_width is None:
+        # No Beam configuration at all: this is the legacy path the metadata
+        # fallback existed for.
+        return beam_width
+    return resolve_candidate_width(config)
+
+
 def _pack_beam_suffix_prefixes(
     suffix: Any,
     width: int,
@@ -817,6 +859,8 @@ def _try_sample_into_postprocess_workspace(
     width: int,
     backend: Any,
     execution_adapter: Any,
+    *,
+    candidate_width: int | None = None,
 ) -> Any | None:
     """Run CUDA constrained Top-K into a prewarmed workspace, if available."""
 
@@ -827,6 +871,16 @@ def _try_sample_into_postprocess_workspace(
     workspace = get_beam_postprocess_workspace(runner, width)
     if workspace is None or workspace.key.logits_dtype != logits.dtype:
         return None
+    candidate_width = (
+        candidate_width
+        if candidate_width is not None
+        else _constraint_candidate_width(runner, rows[0][3], rows[0][0], width)
+    )
+    if candidate_width != workspace.key.top_k:
+        raise RuntimeError(
+            f"constrained candidate_width {candidate_width} does not match the "
+            f"prewarmed workspace candidate width {workspace.key.top_k}"
+        )
     metadata_inputs = _populate_workspace_constraint_metadata(
         runner,
         rows,
@@ -838,9 +892,9 @@ def _try_sample_into_postprocess_workspace(
     step, prefixes, temperatures = metadata_inputs
     total_rows = logits.shape[0]
     capacity_rows = workspace.max_batch * width
-    out_token_ids = workspace.topk_token_ids.view(capacity_rows, width)[:total_rows]
-    out_logprobs = workspace.topk_scores.view(capacity_rows, width)[:total_rows]
-    out_valid_mask = workspace.topk_valid_mask.view(capacity_rows, width)[:total_rows]
+    out_token_ids = workspace.topk_token_ids.view(capacity_rows, candidate_width)[:total_rows]
+    out_logprobs = workspace.topk_scores.view(capacity_rows, candidate_width)[:total_rows]
+    out_valid_mask = workspace.topk_valid_mask.view(capacity_rows, candidate_width)[:total_rows]
     out_valid_counts = workspace.topk_valid_counts.view(-1)[:total_rows]
     topk_range = "prefill_constraint_topk" if step == 0 else "constraint_topk"
     from vllm_gr.v1.beam.beam_decision import (
@@ -868,13 +922,13 @@ def _try_sample_into_postprocess_workspace(
                     prefix_token_ids=prefixes,
                     temperatures=temperatures,
                     current_step=step,
-                    top_k=width,
+                    top_k=candidate_width,
                 ),
                 out_token_ids=out_token_ids,
                 out_logprobs=out_logprobs,
                 out_valid_mask=out_valid_mask,
                 out_valid_counts=out_valid_counts,
-                out_wire_logprobs=workspace.wire_topk_scores.view(capacity_rows, width)[
+                out_wire_logprobs=workspace.wire_topk_scores.view(capacity_rows, candidate_width)[
                     :total_rows
                 ],
             )
@@ -882,7 +936,7 @@ def _try_sample_into_postprocess_workspace(
             output,
             req_id="<workspace batch>",
             rows=total_rows,
-            width=width,
+            width=candidate_width,
             device=logits.device,
             require_legal_candidate=False,
         )
@@ -908,12 +962,12 @@ def _try_sample_into_postprocess_workspace(
                 sequence_group,
                 temperatures,
                 step,
-                width,
+                candidate_width,
                 out_token_ids=out_token_ids,
                 out_logprobs=out_logprobs,
                 out_valid_mask=out_valid_mask,
                 out_valid_counts=out_valid_counts,
-                out_wire_logprobs=workspace.wire_topk_scores.view(capacity_rows, width)[
+                out_wire_logprobs=workspace.wire_topk_scores.view(capacity_rows, candidate_width)[
                     :total_rows
                 ],
             )
@@ -1065,13 +1119,19 @@ def try_sample_with_constraint_backend(
             "Constraint Table batches are not supported yet (P8)"
         )
     width = next(iter(widths))
+    candidate_width = _constraint_candidate_width(runner, rows[0][3], rows[0][0], width)
 
     if backend is not None:
         info = getattr(backend, "info", None)
         max_top_k = getattr(info, "max_top_k", None)
-        if isinstance(max_top_k, bool) or not isinstance(max_top_k, int) or width > max_top_k:
+        if (
+            isinstance(max_top_k, bool)
+            or not isinstance(max_top_k, int)
+            or candidate_width > max_top_k
+        ):
             raise RuntimeError(
-                f"constrained beam_width {width} exceeds Backend max_top_k {max_top_k!r}"
+                f"constrained candidate_width {candidate_width} exceeds Backend "
+                f"max_top_k {max_top_k!r}"
             )
         max_rows = getattr(info, "max_rows", None)
         if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows <= 0:
@@ -1111,6 +1171,7 @@ def try_sample_with_constraint_backend(
         width,
         backend,
         execution_adapter,
+        candidate_width=candidate_width,
     )
     if workspace_output is not None:
         return workspace_output
@@ -1147,7 +1208,7 @@ def try_sample_with_constraint_backend(
             runner,
             logits,
             rows,
-            width,
+            candidate_width,
             execution_adapter,
         )
         if adapter_rows != expected_rows:
@@ -1181,14 +1242,14 @@ def try_sample_with_constraint_backend(
                 prefix_token_ids=prefixes,
                 temperatures=temperatures,
                 current_step=next(iter(steps)),
-                top_k=width,
+                top_k=candidate_width,
             ),
         )
         _validate_direct_backend_output(
             output,
             req_id="<canonical batch>",
             rows=logits.shape[0],
-            width=width,
+            width=candidate_width,
             device=logits.device,
             require_legal_candidate=logits.device.type != "cuda",
         )
@@ -1208,14 +1269,14 @@ def try_sample_with_constraint_backend(
                 prefix_token_ids=prefixes,
                 temperatures=temperatures,
                 current_step=step,
-                top_k=width,
+                top_k=candidate_width,
             ),
         )
         _validate_direct_backend_output(
             output,
             req_id=req_id,
             rows=row_count,
-            width=width,
+            width=candidate_width,
             device=logits.device,
             require_legal_candidate=logits.device.type != "cuda",
         )
@@ -1266,13 +1327,14 @@ def apply_constrained_sample_override(
             "mixed-width Constraint Table batches are not supported yet (P8)"
         )
     width = next(iter(widths))
+    candidate_width = _constraint_candidate_width(runner, rows[0][3], rows[0][0], width)
 
     adapter = get_or_create_execution_adapter(runner)
     top_tokens, top_logprobs, valid_mask, global_rows = run_constrained_partition(
-        runner, logits, rows, width, adapter
+        runner, logits, rows, candidate_width, adapter
     )
     patch_sampler_output_for_constrained(
-        sampler_output, global_rows, top_tokens, top_logprobs, valid_mask, width
+        sampler_output, global_rows, top_tokens, top_logprobs, valid_mask, candidate_width
     )
 
 
@@ -1320,21 +1382,21 @@ def build_constrained_sampler_output(
     Asynchronous scheduling sampler short-circuit (``model_runner_v1`` decode path):
     when every sampling row is constrained, the sampler's log_softmax +
     topk + gather_logprobs is dead work — the operator already produces the
-    fixed-width ``W`` candidates the beam decision consumes.  This builds
+    fixed-width ``K`` candidates the beam decision consumes.  This builds
     the final sampler output from the operator result in one pass.
 
     Shape contract (matches ``patch_sampler_output_for_constrained``):
-    ``logprob_token_ids``/``logprobs`` are ``[rows, W]`` with the top-1
-    candidate in column 0 (``_select_candidates`` takes the ``n_cols == W``
-    branch); ``sampled_token_ids`` is ``[rows, 1]`` int32; ranks are all 1
-    (the top-1 candidate is rank 1 by definition).
+    ``logprob_token_ids``/``logprobs`` are ``[rows, K]`` with the top-1
+    candidate in column 0; ``sampled_token_ids`` is ``[rows, 1]`` int32;
+    ranks are all 1 (the top-1 candidate is rank 1 by definition).
     """
     from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 
     width = next(iter({mdata["beam_width"] for _, _, _, mdata in rows}))
+    candidate_width = _constraint_candidate_width(runner, rows[0][3], rows[0][0], width)
     adapter = get_or_create_execution_adapter(runner)
     top_tokens, top_logprobs, valid_mask, _ = run_constrained_partition(
-        runner, logits, rows, width, adapter
+        runner, logits, rows, candidate_width, adapter
     )
 
     num_rows = top_tokens.shape[0]

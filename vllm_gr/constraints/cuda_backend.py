@@ -34,6 +34,8 @@ class CUDAConstraintBackend:
 
     __slots__ = (
         "_first_token_ids",
+        "_first_token_offsets",
+        "_max_first_degree",
         "_info",
         "_prefix1_offsets",
         "_prefix1_pair_keys",
@@ -55,13 +57,21 @@ class CUDAConstraintBackend:
         prefix2_values: torch.Tensor,
         info: ConstraintBackendInfo,
         vocab_slice: tuple[int, int] | None = None,
+        first_token_offsets: torch.Tensor | None = None,
+        max_first_degree: int = 0,
     ) -> None:
         validate_cuda_sort_capacity(
-            int(first_token_ids.numel()),
+            max_first_degree
+            if info.table_metadata.trie_count > 1
+            else int(first_token_ids.numel()),
             info.table_metadata.max_prefix1_degree,
             info.table_metadata.max_prefix2_degree,
         )
         self._first_token_ids: torch.Tensor | None = first_token_ids
+        self._first_token_offsets = first_token_offsets
+        self._max_first_degree = max_first_degree
+        if info.table_metadata.trie_count > 1 and first_token_offsets is None:
+            raise ValueError("multi-trie CUDA tables require first_token_offsets")
         self._prefix1_offsets: torch.Tensor | None = prefix1_offsets
         self._prefix1_values: torch.Tensor | None = prefix1_values
         self._prefix1_pair_keys: torch.Tensor | None = prefix1_pair_keys
@@ -132,7 +142,21 @@ class CUDAConstraintBackend:
                     f"CUDA constraint backend requires CUDA logits, got {logits.device}"
                 )
         tables = self._tables()
+        trie_kwargs = {}
+        if self._info.table_metadata.trie_count > 1:
+            if metadata.trie_ids is None:
+                raise ValueError("multi-trie CUDA selection requires trie_ids")
+            trie_kwargs = {
+                "trie_ids": metadata.trie_ids,
+                "first_token_offsets": self._first_token_offsets,
+                "max_first_degree": self._max_first_degree,
+            }
         if validate:
+            if (
+                self._first_token_offsets is not None
+                and self._first_token_offsets.device != logits.device
+            ):
+                raise RuntimeError("root offsets must share logits.device")
             for table in tables:
                 if table.device != logits.device:
                     raise RuntimeError(
@@ -154,6 +178,7 @@ class CUDAConstraintBackend:
                 *op_args,
                 vocab_offset=vocab_offset,
                 table_vocab_size=table_vocab_size,
+                **trie_kwargs,
             )
         else:
             token_ids, logprobs, valid_mask, valid_counts = outputs
@@ -178,6 +203,7 @@ class CUDAConstraintBackend:
                 valid_mask,
                 valid_counts,
                 **launch_kwargs,
+                **trie_kwargs,
             )
         if not build_output:
             # Fixed-address (V1 Worker) path: the fused kernel now outputs
@@ -287,6 +313,7 @@ class CUDAConstraintBackend:
         if self._state is _BackendState.CLOSED:
             return
         self._first_token_ids = None
+        self._first_token_offsets = None
         self._prefix1_offsets = None
         self._prefix1_values = None
         self._prefix1_pair_keys = None

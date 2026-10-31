@@ -5,6 +5,8 @@
 
 from collections import deque
 from queue import Queue
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import msgspec
 import pytest
@@ -28,7 +30,10 @@ from vllm_gr.v1.beam.batch_contracts import (
 )
 from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, GRSessionStatus
 from vllm_gr.v1.engine.core import _handle_submit_gr_session
-from vllm_gr.v1.engine.engine_core_patch import apply_engine_core_request_patches
+from vllm_gr.v1.engine.engine_core_patch import (
+    apply_engine_core_request_patches,
+    make_patched_engine_init,
+)
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_BATCH_RESULT_ATTR,
     GR_RETIRE_OUTPUT_ATTR,
@@ -94,6 +99,66 @@ def assert_one_error(core, name, client=3):
     assert rejection.failure.code == ADMISSION_REJECTED_CODE
     assert rejection.failure.message.strip()
     assert core.output_queue.empty()
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("via_socket", [False, True])
+def test_invalid_trie_rejected_before_native_add_and_engine_remains_usable(core, count, via_socket):
+    core._gr_trie_count = core.scheduler._gr_trie_count = count
+    bad = batch("bad-trie")
+    bad = msgspec.structs.replace(
+        bad, items=(msgspec.structs.replace(bad.items[0], trie_id=count),)
+    )
+    if via_socket:
+        core._handle_submit_gr_session(bad)
+        assert core.input_queue.empty()
+    else:
+        core._handle_client_request(EngineCoreRequestType.SUBMIT_GR_SESSION, bad)
+    assert_one_error(core, "bad-trie")
+    assert not core.scheduler.requests
+    assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+    good = batch("good-trie")
+    good = msgspec.structs.replace(
+        good, items=(msgspec.structs.replace(good.items[0], trie_id=count - 1),)
+    )
+    core._handle_submit_gr_session(good)
+    core._process_input_queue()
+    complete(core, "good-trie")
+
+
+@pytest.mark.parametrize("counts", [[1], [2, 2], [1, 2], [], [0]])
+def test_engine_startup_publishes_live_trie_count(counts):
+    from vllm_gr.v1.engine.core import loaded_constraint_trie_count
+
+    engine = SimpleNamespace()
+
+    def original(self):
+        self.vllm_config = SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"})
+        self.scheduler = SimpleNamespace()
+        self.model_executor = SimpleNamespace(collective_rpc=Mock(return_value=counts))
+
+    initialize = make_patched_engine_init(original)
+    assert make_patched_engine_init(initialize) is initialize
+    if not counts or len(set(counts)) != 1 or counts[0] < 1:
+        with pytest.raises(RuntimeError, match="Trie count"):
+            initialize(engine)
+        assert not hasattr(engine, "_gr_trie_count")
+    else:
+        initialize(engine)
+        assert engine._gr_trie_count == engine.scheduler._gr_trie_count == counts[0]
+        engine.model_executor.collective_rpc.assert_called_once_with(loaded_constraint_trie_count)
+
+
+def test_worker_reports_loaded_table_not_configuration():
+    from vllm_gr.v1.engine.core import loaded_constraint_trie_count
+
+    runner = SimpleNamespace(constraint_backend=None)
+    worker = SimpleNamespace(model_runner=runner)
+    assert loaded_constraint_trie_count(worker) == 1
+    runner.constraint_backend = SimpleNamespace(
+        info=SimpleNamespace(table_metadata=SimpleNamespace(trie_count=3))
+    )
+    assert loaded_constraint_trie_count(worker) == 3
 
 
 def worker_receipt(scheduler, scheduled):

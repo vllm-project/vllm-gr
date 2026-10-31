@@ -25,6 +25,7 @@ class OfflineBeamSearchRequest:
     use_tqdm: bool = False
     concurrency_limit: int | None = None
     output_mode: Literal["full", "compact"] = "compact"
+    trie_ids: list[int] | tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.output_mode not in ("full", "compact"):
@@ -47,6 +48,7 @@ class OnlineBeamSearchRequest:
     trace_headers: Any = None
     priority: int = 0
     data_parallel_rank: int | None = None
+    trie_ids: list[int] | tuple[int, ...] | None = None
 
     # Native caller affinity hint, distinct from the internal Beam batch/session ID.
     session_id: str | None = None

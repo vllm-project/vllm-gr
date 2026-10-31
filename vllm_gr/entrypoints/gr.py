@@ -161,6 +161,7 @@ class GRLLM(LLM):
         lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
+        trie_ids: list[int] | tuple[int, ...] | None = None,
         *,
         output_mode: Literal["full"],
     ) -> list["BeamSearchOutput"]: ...
@@ -173,6 +174,7 @@ class GRLLM(LLM):
         lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
+        trie_ids: list[int] | tuple[int, ...] | None = None,
         *,
         output_mode: Literal["compact"] = "compact",
     ) -> list["CompactBeamSearchOutput"]: ...
@@ -184,6 +186,7 @@ class GRLLM(LLM):
         lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
+        trie_ids: list[int] | tuple[int, ...] | None = None,
         *,
         output_mode: Literal["full", "compact"] = "compact",
     ) -> list["BeamSearchOutput"] | list["CompactBeamSearchOutput"]:
@@ -211,6 +214,7 @@ class GRLLM(LLM):
             use_tqdm=use_tqdm,
             concurrency_limit=concurrency_limit,
             output_mode=output_mode,
+            trie_ids=trie_ids,
         )
         return cast(
             list["BeamSearchOutput"] | list["CompactBeamSearchOutput"],

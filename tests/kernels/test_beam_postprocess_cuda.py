@@ -1094,3 +1094,75 @@ def test_fixed_postprocess_1000_calls_have_stable_device_memory() -> None:
     assert torch.accelerator.memory_allocated() == allocated_before
     assert torch.accelerator.memory_reserved() == reserved_before
     assert tuple(tensor.data_ptr() for tensor in workspace.device_tensors()) == addresses
+
+
+@pytest.mark.parametrize(("beam_width", "candidate_width"), [(8, 4), (1024, 256)])
+def test_prefill_decision_zero_pads_inactive_beam_parents(
+    beam_width: int,
+    candidate_width: int,
+) -> None:
+    """Prefill only seeds min(W, K) live beams; the tail must be parent 0.
+
+    EngineCore's engine-driven self-advance rejects any negative parent index,
+    so the legacy ``-1`` tail made every prefill -> step0 transition fall back
+    to the frontend path.  K < W is exactly the case that exposes the tail.
+    """
+    from vllm_gr.config import ConstraintBackend, ConstraintTableConfig, GRConfig
+
+    workspace = BeamPostprocessWorkspace.allocate(
+        max_batch=1,
+        beam_width=beam_width,
+        top_k=candidate_width,
+        max_decode_steps=3,
+        device="cuda",
+        logits_dtype=torch.float16,
+    )
+    pool = BeamPostprocessWorkspacePool()
+    pool.add(workspace)
+    table = ConstraintTableConfig(
+        max_top_k=candidate_width,
+        enabled=True,
+        path="/tmp/catalog.json",
+        artifact_digest="sha256:" + "0" * 64,
+        tokenizer_digest="sha256:" + "0" * 64,
+        candidate_width=candidate_width,
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cuda"),
+        model_config=SimpleNamespace(dtype=torch.float16),
+        _beam_postprocess_workspaces=pool,
+        _vllm_gr_config=GRConfig(
+            catalog_path="/tmp/catalog.json",
+            constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+            beam_max_width=beam_width,
+            constraint_table=table,
+            beam_worker_decision=True,
+        ),
+        _current_beam_info={
+            "beam_data": {
+                "s": {
+                    "is_constraint_prefill": True,
+                    "beam_width": beam_width,
+                    "candidate_width": candidate_width,
+                }
+            }
+        },
+    )
+    token_ids = torch.arange(candidate_width, dtype=torch.int32, device="cuda").view(1, -1) + 1000
+    scores = torch.linspace(-1.0, -2.0, candidate_width, device="cuda").view(1, -1)
+    sampler = SimpleNamespace(
+        logprobs_tensors=SimpleNamespace(logprob_token_ids=token_ids, logprobs=scores)
+    )
+
+    decision = beam_decision._run_cuda_prefill_decision(runner, sampler)
+
+    assert decision is not None
+    live = min(beam_width, candidate_width)
+    assert decision["stage"] == "prefill"
+    assert decision["out_token_ids"].shape == (1, beam_width)
+    assert torch.equal(decision["out_token_ids"][0, :live], token_ids[0, :live])
+    assert torch.equal(decision["out_log_probs"][0, :live], scores[0, :live])
+    # Inactive tail: no token, -inf score and -- critically -- no negative parent.
+    assert torch.all(decision["out_token_ids"][0, live:] == 0)
+    assert torch.all(decision["out_log_probs"][0, live:] == -float("inf"))
+    assert torch.all(decision["out_token_index"] == 0)

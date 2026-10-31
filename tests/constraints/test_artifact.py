@@ -61,7 +61,12 @@ def test_artifact_round_trip_and_reproducible_bytes(tmp_path: Path) -> None:
     assert first.read_bytes() == second.read_bytes()
     assert first_digest == second_digest
     assert first_digest == _digest(first.read_bytes())
+    data = first.read_bytes()
+    header_size = int.from_bytes(data[:8], "little")
+    header = json.loads(data[8 : 8 + header_size])
+    assert header["__metadata__"] == _metadata()
     loaded = _load(first, first_digest)
+    assert loaded.metadata.trie_count == 1
     assert loaded.metadata.artifact_digest == first_digest
     for name in CONSTRAINT_TABLE_TENSOR_NAMES:
         assert np.array_equal(getattr(loaded, name), getattr(table, name))

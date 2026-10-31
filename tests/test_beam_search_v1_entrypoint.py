@@ -86,8 +86,11 @@ def test_v1_flow_closes_after_execution_failure() -> None:
 
 
 @pytest.mark.parametrize("output_mode", [None, "full", "compact"])  # type: ignore[misc]
+@pytest.mark.parametrize("trie_ids", [None, [1]])  # type: ignore[misc]
 def test_grllm_v1_entry_uses_new_frontend(
-    monkeypatch: pytest.MonkeyPatch, output_mode: Literal["full", "compact"] | None
+    monkeypatch: pytest.MonkeyPatch,
+    output_mode: Literal["full", "compact"] | None,
+    trie_ids: list[int] | None,
 ) -> None:
     from vllm_gr.entrypoints.gr import GRLLM
 
@@ -108,6 +111,7 @@ def test_grllm_v1_entry_uses_new_frontend(
         object(),
         use_tqdm=True,
         concurrency_limit=4,
+        trie_ids=trie_ids,
         **({"output_mode": output_mode} if output_mode is not None else {}),
     )
 
@@ -115,6 +119,7 @@ def test_grllm_v1_entry_uses_new_frontend(
     assert result[0].use_tqdm is True
     assert result[0].concurrency_limit == 4
     assert result[0].output_mode == (output_mode or "compact")
+    assert result[0].trie_ids == trie_ids
 
 
 @pytest.mark.parametrize("fail_shutdown", [False, True])  # type: ignore[misc]

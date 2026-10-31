@@ -142,6 +142,43 @@ def test_remote_model_requires_revision_before_loading() -> None:
         )
 
 
+def test_build_tries_manifest_uses_relative_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(from_pretrained=lambda *a, **kw: _tokenizer())  # type: ignore[attr-defined]
+    transformers.AutoConfig = SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda *a, **kw: SimpleNamespace(vocab_size=20)
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    for index, c in enumerate((3, 5)):
+        (tmp_path / f"trie{index}.json").write_text(
+            json.dumps(compile_relations_json([["1", "2", str(c)]]))
+        )
+    manifest = tmp_path / "tries.json"
+    manifest.write_text(
+        json.dumps({"tries": [{"trie_id": i, "triples_path": f"trie{i}.json"} for i in range(2)]})
+    )
+    output = tmp_path / "tries.safetensors"
+    digest, tokenizer_digest, vocab = build_constraint_table(
+        triples_path=None,
+        multi_trie_manifest_path=manifest,
+        model=str(tmp_path),
+        revision=None,
+        output_path=output,
+    )
+    loaded = load_constraint_table_artifact(
+        output,
+        expected_digest=digest,
+        expected_tokenizer_digest=tokenizer_digest,
+        expected_vocab_size=vocab,
+        expected_format="constraint_table_v2",
+    )
+    assert loaded.root_offsets.tolist() == [0, 1, 2]
+    assert loaded.prefix1_pair_keys.tolist() == [22, 422]
+    assert loaded.prefix2_values.tolist() == [3, 5]
+
+
 def test_symbolic_remote_revision_is_resolved_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

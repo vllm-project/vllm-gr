@@ -74,6 +74,7 @@ class BeamAttentionMetadata:
     prefix_seqlens_kv_device: torch.Tensor | None = None
     prefix_max_q_len: int = 0
     prefix_max_seq_len: int = 0
+    prefix_length_bucket: int = 0
     prefix_block_table: torch.Tensor | None = None
     prefix_seqlens_q_cpu: list | None = None
     prefix_cu_seqlens_q_cpu: list | None = None
@@ -239,13 +240,56 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
     ) -> BeamAttentionMetadata:
         """Build a fresh metadata description over stable device storage each step.
 
-        The GPU V1 adapter uses the existing FA2 incremental path (no AOT
-        schedule). Both eager and graph use block-aligned model/pool bounds.
+        Native execution uses block-aligned model/pool bounds. A matching
+        measured profile enables bounded prefix-length graph buckets.
         """
         rows = len(layout["positions"])
         batch = len(layout["prefix_lengths"])
         width = rows // batch
         blocks = views["blocks"].view(batch, -1)
+        from vllm_gr.v1.attention.backends.beam_prefix_policy import (
+            PrefixShape,
+            available_prefix_versions,
+            device_fingerprint,
+            explicit_fa_version,
+            multi_processor_count,
+            policy_mode,
+            prefix_bucket,
+            resolve_prefix_plan,
+        )
+
+        bucket = 0
+        if not envs.VLLM_BATCH_INVARIANT and policy_mode() != "off":
+            candidate = prefix_bucket(max(layout["prefix_lengths"]), block_size, max_model_len)
+            versions = available_prefix_versions(blocks.device.index)
+            explicit = explicit_fa_version()
+            plan = None
+            if versions:
+                plan = resolve_prefix_plan(
+                    PrefixShape(
+                        batch=batch,
+                        width=width,
+                        length=candidate,
+                        heads=num_heads,
+                        kv_heads=num_kv_heads,
+                        dim=session.context.pools[0].unshared_key.shape[-1],
+                        dtype=str(session.context.dtype),
+                        block_size=block_size,
+                    ),
+                    # An explicit choice decides the backend; otherwise the best
+                    # supported one (FA3/FA4) keeps its own split-K heuristic and
+                    # does not need a length-scoped graph bound.
+                    default_version=explicit if explicit is not None else max(versions),
+                    fingerprint=device_fingerprint(blocks.device.index),
+                    supported_versions=versions,
+                    sm_count=multi_processor_count(blocks.device.index),
+                    explicit_version=explicit,
+                )
+            if plan is not None and plan.segments > 1:
+                pages = (candidate + block_size - 1) // block_size
+                chunk = max(1, (pages + plan.segments - 1) // plan.segments)
+                if chunk * plan.segments <= blocks.shape[1]:
+                    bucket = candidate
         return BeamAttentionMetadata(
             num_actual_tokens=rows,
             num_reqs=batch,
@@ -265,7 +309,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_cu_seqlens_q_device=views["query"],
             prefix_seqlens_kv_device=views["prefix_lengths"],
             prefix_max_q_len=width,
-            prefix_max_seq_len=((max_model_len + block_size - 1) // block_size) * block_size,
+            prefix_max_seq_len=bucket
+            or ((max_model_len + block_size - 1) // block_size) * block_size,
+            prefix_length_bucket=bucket,
             prefix_block_table=blocks,
             prefix_seqlens_q_cpu=[width] * batch,
             prefix_cu_seqlens_q_cpu=list(layout["query"]),

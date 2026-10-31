@@ -163,6 +163,14 @@ def test_mixed_cascade_keeps_prefix_suffix_on_fa2(
 
     monkeypatch.setattr(beam_attn_gpu, "flash_attn_varlen_func", flash)
     monkeypatch.setattr(beam_attn_gpu, "merge_attn_states", lambda *args: None)
+
+    # This CPU routing test uses nonempty prefixes; device-state repair is
+    # covered by the attention kernel tests.
+    def clear_empty(state: Any, cu_q: torch.Tensor, lengths: torch.Tensor) -> Any:
+        assert torch.all(lengths > 0)
+        return state
+
+    monkeypatch.setattr(beam_attn_gpu, "clear_empty_prefix_states", clear_empty)
     monkeypatch.setattr(
         beam_attn_gpu, "extract_suffix_kv", lambda *args: (torch.zeros(1), torch.zeros(1))
     )
@@ -203,27 +211,38 @@ def test_mixed_cascade_keeps_prefix_suffix_on_fa2(
 
 
 @pytest.mark.parametrize("policy", [{}, {"vllm_gr_prefill_flash_attn_version": 3}])
+@pytest.mark.parametrize("decode_version", [2, 3, 4])
+@pytest.mark.parametrize("short_suffix", [False, True])
 def test_initialization_preserves_global_decode_config(
     monkeypatch: pytest.MonkeyPatch,
     policy: dict[str, Any],
     flash_backend: ModuleType,
+    decode_version: int,
+    short_suffix: bool,
 ) -> None:
     import vllm.config
 
     config = SimpleNamespace(
-        attention_config=SimpleNamespace(flash_attn_version=2),
-        additional_config=policy,
+        attention_config=SimpleNamespace(flash_attn_version=decode_version),
+        additional_config={
+            "vllm_gr_beam_max_width": 128,
+            "vllm_gr_enable_short_suffix_attention": short_suffix,
+            **policy,
+        },
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
     monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", False)
     monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: beam_attn_gpu)
-    monkeypatch.setattr(beam_attn_gpu, "get_flash_attn_version", lambda **kwargs: 2)
+    monkeypatch.setattr(beam_attn_gpu, "get_flash_attn_version", lambda **kwargs: decode_version)
     impl = beam_attn.BeamAttentionImpl(16, 128, 128**-0.5, 8, None, None, "auto")
-    assert impl.prefill_flash_attn_version == 3
-    assert impl.vllm_flash_attn_version == 2
-    assert config.attention_config.flash_attn_version == 2
+    assert impl.prefill_flash_attn_version == (
+        3 if policy or decode_version == 2 else decode_version
+    )
+    assert impl.vllm_flash_attn_version == decode_version
+    assert config.attention_config.flash_attn_version == decode_version
+    assert impl.supports_quant_query_input is (not short_suffix)
 
 
 def test_omitted_prefill_policy_defaults_to_auto() -> None:

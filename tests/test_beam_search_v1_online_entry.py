@@ -41,6 +41,7 @@ def _run(
     calls: list[Any] | None = None,
     *,
     session_id: str | None = None,
+    trie_ids: list[int] | None = None,
 ) -> list[str]:
     """Drive one online V1 request; return the GC freezes it asked for.
 
@@ -64,6 +65,7 @@ def _run(
             request_id="request-id",
             params=client_params,
             session_id=session_id,
+            trie_ids=trie_ids,
         ):
             pass
 
@@ -134,6 +136,13 @@ def test_caller_session_hint_is_preserved_separately_from_request_id() -> None:
     _run("prompt", _client_params(ignore_eos=True), calls, session_id="caller-session")
     assert calls[0].session_id == "caller-session"
     assert calls[0].request_id == "request-id"
+
+
+def test_trie_ids_travel_separately_from_search_params() -> None:
+    calls: list[Any] = []
+    _run(["first", "second"], _client_params(ignore_eos=False), calls, trie_ids=[1, 0])
+    assert calls[0].trie_ids == [1, 0]
+    assert calls[0].prompts == ("first", "second")
 
 
 def test_the_frontend_heap_is_frozen_once_the_engine_has_answered() -> None:

@@ -16,6 +16,11 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 
+from vllm_gr.v1.attention.backends.beam_attention_state import (
+    AttentionState,
+    clear_empty_prefix_states,
+    normalize_flash_attn_state,
+)
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
 )
@@ -299,7 +304,15 @@ def validate_short_suffix_attention(
     alibi_slopes: torch.Tensor | None,
     sinks: torch.Tensor | None,
 ) -> None:
-    """Validate static layer semantics once, before graph capture/execution."""
+    """Validate static layer semantics once, before graph capture/execution.
+
+    ``fa_version`` only gates the *prefix* backend that produced the incoming
+    state: normalization already made FA2/FA3/FA4 states interchangeable. The
+    fused suffix arithmetic never follows it -- ``merge_short_suffix_attention``
+    picks its kernel from shape/dtype alone and keeps FA2's intermediate rounding
+    as the reference for every version (asserted by
+    ``test_fused_suffix_uses_the_fa2_emulating_kernel_for_every_prefix_backend``).
+    """
     if (
         num_kv_heads <= 0
         or num_heads % num_kv_heads
@@ -309,8 +322,10 @@ def validate_short_suffix_attention(
             "Short suffix attention requires integral GQA groups and a "
             "FlashAttention-compatible head size (multiple of 8, at most 256)"
         )
-    if fa_version != 2:
-        raise ValueError("Short suffix attention currently requires FlashAttention 2 prefix states")
+    if fa_version not in (2, 3, 4):
+        raise ValueError(
+            "Short suffix attention requires an available FlashAttention 2, 3 or 4 backend"
+        )
     if (
         sliding_window not in (None, (-1, -1), [-1, -1])
         or softcap
@@ -337,6 +352,154 @@ def _is_pure_beam_decode(attn_metadata: BeamAttentionMetadata, beam_width: int) 
         and attn_metadata.num_prefix_indices == beam_width
         and attn_metadata.num_actual_tokens == beam_width
     )
+
+
+def prefix_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: BeamAttentionMetadata,
+    *,
+    scale: float,
+    fa_version: int,
+    sliding_window_size: list[int] | tuple[int, int] | None,
+    logits_soft_cap: float,
+    alibi_slopes: torch.Tensor | None = None,
+    s_aux: torch.Tensor | None = None,
+    plan: Any = None,
+) -> AttentionState:
+    """Compute a canonical state; suffix fusion is independent of the plan."""
+    from vllm_gr.v1.attention.backends.beam_prefix_policy import (
+        available_prefix_versions,
+        device_fingerprint,
+        multi_processor_count,
+    )
+
+    plain = (
+        attn_metadata.prefix_block_table is not None
+        and alibi_slopes is None
+        and s_aux is None
+        and not logits_soft_cap
+        and sliding_window_size in (None, (-1, -1), [-1, -1])
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and key_cache.dtype == query.dtype == value_cache.dtype
+    )
+    # Only a bucketed call carries a meaningful prefix length: without a length
+    # bucket ``prefix_max_seq_len`` is the model bound, so deriving a plan from it
+    # would segment a 1K prefix as if it were 8K (measured: 5% slower on
+    # 1024/B1/W128).
+    if (
+        plan is None
+        and plain
+        and attn_metadata.max_num_splits == 0
+        and getattr(attn_metadata, "prefix_length_bucket", 0)
+    ):
+        from vllm.config import get_current_vllm_config_or_none
+
+        from vllm_gr.v1.attention.backends.beam_prefix_policy import (
+            PrefixShape,
+            resolve_prefix_plan,
+        )
+
+        widths = attn_metadata.prefix_seqlens_q_cpu
+        if widths and all(w == attn_metadata.prefix_max_q_len for w in widths):
+            config = get_current_vllm_config_or_none()
+            explicit = config.attention_config.flash_attn_version if config else None
+            shape = PrefixShape(
+                batch=len(widths),
+                width=widths[0],
+                length=attn_metadata.prefix_max_seq_len,
+                heads=query.shape[1],
+                kv_heads=key_cache.shape[-2],
+                dim=query.shape[2],
+                dtype=str(query.dtype),
+                block_size=key_cache.shape[1],
+            )
+            plan = resolve_prefix_plan(
+                shape,
+                default_version=fa_version,
+                fingerprint=device_fingerprint(query.device.index),
+                supported_versions=available_prefix_versions(query.device.index),
+                sm_count=multi_processor_count(query.device.index),
+                explicit_version=explicit,
+                batch_invariant=envs.VLLM_BATCH_INVARIANT,
+            )
+            if plan is not None and plan.segments > 1:
+                # A segment layout may never address pages the graph did not
+                # allocate; drop the plan instead of raising inside capture.
+                pages = -(-attn_metadata.prefix_max_seq_len // key_cache.shape[1])
+                chunk = max(1, -(-pages // plan.segments))
+                columns = attn_metadata.prefix_block_table.shape[1]
+                if chunk * plan.segments > columns:
+                    plan = None
+    scheduler = attn_metadata.prefix_scheduler_metadata
+    splits = _num_splits(attn_metadata.max_num_splits)
+    if plan is not None:
+        if not plain:
+            raise ValueError("Prefix plans require plain paged FP16/BF16 attention")
+        if envs.VLLM_BATCH_INVARIANT:
+            from vllm_gr.v1.attention.backends.beam_prefix_policy import PrefixPlan
+
+            plan = PrefixPlan(fa_version, 1)
+        fa_version, splits = plan.fa_version, plan.num_splits
+        # A schedule belongs to one backend/split configuration. Never reuse
+        # an AOT schedule built for the layer's original plan.
+        scheduler = None
+        if plan.segments > 1:
+            from vllm_gr.v1.attention.backends.beam_prefix_segmented import (
+                segmented_prefix,
+            )
+
+            return segmented_prefix(
+                query,
+                key_cache,
+                value_cache,
+                cu_query=attn_metadata.prefix_cu_seqlens_q_device,
+                lengths=attn_metadata.prefix_seqlens_kv_device,
+                block_table=attn_metadata.prefix_block_table,
+                max_query=attn_metadata.prefix_max_q_len,
+                max_length=attn_metadata.prefix_max_seq_len,
+                scale=scale,
+                fa_version=fa_version,
+                segments=plan.segments,
+                flash=flash_attn_varlen_func,
+            )
+    out, lse = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=attn_metadata.prefix_cu_seqlens_q_device,
+        seqused_k=attn_metadata.prefix_seqlens_kv_device,
+        max_seqlen_q=attn_metadata.prefix_max_q_len,
+        max_seqlen_k=attn_metadata.prefix_max_seq_len,
+        softmax_scale=scale,
+        causal=False,
+        alibi_slopes=alibi_slopes,
+        window_size=sliding_window_size,
+        block_table=attn_metadata.prefix_block_table,
+        softcap=logits_soft_cap,
+        return_softmax_lse=True,
+        fa_version=fa_version,
+        scheduler_metadata=scheduler,
+        num_splits=splits,
+        s_aux=s_aux,
+    )
+
+    state = normalize_flash_attn_state(
+        out,
+        lse,
+        fa_version=fa_version,
+        num_kv_heads=key_cache.shape[-2],
+        max_query_len=attn_metadata.prefix_max_q_len,
+        paged_kv=attn_metadata.prefix_block_table is not None,
+    )
+    if attn_metadata.prefix_block_table is not None:
+        state = clear_empty_prefix_states(
+            state,
+            attn_metadata.prefix_cu_seqlens_q_device,
+            attn_metadata.prefix_seqlens_kv_device,
+        )
+    return state
 
 
 def cascade_attention(
@@ -394,24 +557,16 @@ def cascade_attention(
         else:
             beam_query = query[attn_metadata.prefix_indices]
 
-        prefix_out, prefix_lse = flash_attn_varlen_func(
-            q=beam_query,
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=attn_metadata.prefix_cu_seqlens_q_device,
-            seqused_k=attn_metadata.prefix_seqlens_kv_device,
-            max_seqlen_q=attn_metadata.prefix_max_q_len,
-            max_seqlen_k=attn_metadata.prefix_max_seq_len,
-            softmax_scale=scale,
-            causal=False,
-            alibi_slopes=alibi_slopes,
-            window_size=sliding_window_size,
-            block_table=attn_metadata.prefix_block_table,
-            softcap=logits_soft_cap,
-            return_softmax_lse=True,
+        prefix_out, prefix_lse = prefix_attention(
+            beam_query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            scale=scale,
             fa_version=vllm_flash_attn_version,
-            scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
-            num_splits=_num_splits(attn_metadata.max_num_splits),
+            sliding_window_size=sliding_window_size,
+            logits_soft_cap=logits_soft_cap,
+            alibi_slopes=alibi_slopes,
             s_aux=s_aux,
         )
 
@@ -553,19 +708,13 @@ def cascade_attention(
                 num_splits=_num_splits(0),
             )
 
-        # FA2 GQA de-swizzle: with grouped-query attention (group_size > 1) and a
-        # single query token, flash-attention returns softmax_lse laid out as
-        # [num_kv_heads, group_size, num_tokens] instead of [num_heads, num_tokens].
-        # Transpose back so merge_attn_states sees the per-head layout. FA3 already
-        # returns the head layout, and the prefix call (max_q > 1) is unaffected.
-        group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
-        if attn_metadata.suffix_max_q_len == 1 and group_size > 1 and vllm_flash_attn_version != 3:
-            suffix_lse = (
-                suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
-                .transpose(1, 2)
-                .contiguous()
-                .view(attn_metadata.num_heads, -1)
-            )
+        suffix_out, suffix_lse = normalize_flash_attn_state(
+            suffix_out,
+            suffix_lse,
+            fa_version=vllm_flash_attn_version,
+            num_kv_heads=attn_metadata.num_kv_heads,
+            max_query_len=attn_metadata.suffix_max_q_len,
+        )
 
         out = torch.empty_like(beam_query)
         merge_attn_states(out, prefix_out, prefix_lse, suffix_out, suffix_lse)

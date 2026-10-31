@@ -40,15 +40,16 @@ class ConstraintMetadata:
     over the complete shared logits window so candidate scores are
     comparable across parent rows.
 
-    Value-domain validation intentionally remains at the request boundary.
-    Inspecting a device tensor here would synchronize every NPU ``select``;
-    this Backend boundary therefore validates only its structural ABI.
+    Temperatures are validated at the request boundary. Checked Backend calls
+    also validate root ID ranges, which synchronizes when IDs are on a device.
+    Worker admission validates IDs once; unchecked sampling skips this check.
     """
 
     prefix_token_ids: torch.Tensor  # int32 [rows, 3]
     temperatures: torch.Tensor  # float32 [1] or [rows]
     current_step: int  # 0 / 1 / 2
     top_k: int
+    trie_ids: torch.Tensor | None = None  # int32 [rows], validated at admission
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,11 +87,12 @@ def validate_select_inputs(
     *,
     expected_logits_vocab_size: int | None = None,
 ) -> None:
-    """Validate the common structural ABI without copying or device sync.
+    """Validate the common ABI and explicit root ID ranges.
 
     In particular, the caller must have already established that temperature
     values are finite and non-negative as documented by
-    :class:`ConstraintMetadata`.
+    :class:`ConstraintMetadata`. Root range validation may synchronize a device;
+    the prevalidated Worker sampling path does not call this function.
     """
 
     if not isinstance(metadata, ConstraintMetadata):
@@ -103,6 +105,19 @@ def validate_select_inputs(
         raise ValueError(f"logits dtype must be fp16/bf16/fp32, got {logits.dtype}")
 
     rows, vocab_size = logits.shape
+    if metadata.trie_ids is not None:
+        roots = metadata.trie_ids
+        if (
+            roots.shape != (rows,)
+            or roots.dtype != torch.int32
+            or roots.device != logits.device
+            or not roots.is_contiguous()
+        ):
+            raise ValueError("trie_ids must be contiguous int32 [rows] on logits.device")
+        if bool(((roots < 0) | (roots >= info.table_metadata.trie_count)).any()):
+            raise ValueError("trie_id is outside the constraint table")
+    elif info.table_metadata.trie_count > 1:
+        raise ValueError("multi-trie selection requires trie_ids")
     if not 1 <= rows <= info.max_rows:
         raise ValueError(f"logits rows must be in [1, {info.max_rows}], got {rows}")
     expected_vocab = (

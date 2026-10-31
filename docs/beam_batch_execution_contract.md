@@ -229,16 +229,20 @@ path correct; it also gates the raw Beam operators, so the constant and the
 kernels move as one. Widths above 256 take the hierarchical path; the fused
 `O(W**2)` merge kernels stay gated on `K == W` and `W in {64, 128, 256}`.
 
-The raised ceiling is an *operator* ceiling, not yet a serving one. The startup
-scalar `constraint_table.candidate_width` still must equal `beam_max_width`
-at parsing and is capped at 256; it is not wired into candidate generation.
-A served `beam_max_width` above 256 is therefore rejected at parse time;
-only the kernels and their tests reach widths 512 and 1024 today. Keep
-`beam_max_width <= 256` until that wiring lands.
+On CUDA the serving path consumes `K` end to end: the sampler is asked for `K`
+logprobs per row, the postprocess workspace is keyed by `(W, K)`, and every
+stage's selection takes `K` candidates per parent. A `beam_max_width` above 256
+therefore needs an explicit `candidate_width`; left unset, `K` follows `W` and
+exceeds the 256 candidate ceiling, which is rejected at parse time. With a
+dynamic schedule, a configured `K` must be at least every stage width and is the
+top-k of every stage. An unset `K` is not written onto the request: each stage
+keeps taking its own output width as top-k, exactly as before `K` existed, and
+the sampler, workspace and `BeamSearchState` are sized from `W`. NPU still
+requires `K == W` and raises for any other combination.
 
-CUDA V1 requests can independently configure each stage's per-parent `K` with
-`per_parent_beam_widths` through the dynamic execution path. Without that
-request schedule, candidate generation still follows the retained stage W.
+CUDA V1 requests can additionally configure each stage's per-parent `K` with
+`per_parent_beam_widths` through the dynamic execution path; such a request
+schedule overrides the configured `K` (see the candidate boundary below).
 
 Unconstrained V1 generation has its own configuration and budget checks; it
 does not require a catalog artifact. NPU dynamic widths must satisfy their
@@ -264,18 +268,23 @@ Bootstrap uses `P=1`. Decode uses `P=num_active_beams`, with
 
 `K` is modelled as an independent dimension of `W` throughout this contract,
 with `1 <= K <= MAX_CANDIDATE_WIDTH`. Without `per_parent_beam_widths`,
-candidate generation uses `K=W_out`. CUDA requests may configure a per-stage
-candidate schedule: bootstrap requires `K_1=W_1`, and later stages require
-`W_i <= W_(i-1)*K_i`. Both W and K remain limited to 256 in this build.
+candidate generation uses the configured `K`, or `K=W_out` when it is unset.
+CUDA requests may configure a per-stage candidate schedule: bootstrap requires
+`K_1=W_1`, and later stages require `W_i <= W_(i-1)*K_i`. Every `K_i` is
+limited to 256, so a request schedule needs `W_1 <= 256`.
 An explicit request schedule uses dynamic selection, which flattens the
 `P*K` candidate pool and selects W winners.
 
-An explicit `per_parent_beam_widths` schedule overrides the startup scalar
-`constraint_table.candidate_width`, including when W varies by stage. The
-startup scalar still must equal `beam_max_width` at configuration parsing;
-it is not wired into candidate generation by this change. Without a request
-K schedule, the existing behavior and startup-K/dynamic-W restrictions remain.
-Backend admission checks the actual request K schedule against `max_top_k`.
+An explicit `per_parent_beam_widths` schedule overrides the configured
+`constraint_table.candidate_width` stage by stage, including when W varies by
+stage, and is validated on its own (`input_width * K >= output_width`). Backend
+admission checks the actual request K schedule against `max_top_k`. Without a
+request K schedule, a configured `K` is the top-k of every stage and must be at
+least every dynamic stage width; an unset `K` keeps each stage's output width.
+
+The constrained Top-K, the postprocess workspace, and `BeamSearchState`
+capacity are all sized from `K`; rows stay `W`. `K != W` takes the hierarchical
+selection path.
 
 Both candidate adapters provide FP32 local log probabilities. The selection
 core does not compute softmax.

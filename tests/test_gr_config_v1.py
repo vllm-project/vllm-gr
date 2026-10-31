@@ -515,7 +515,8 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
     result = arg_utils_gr.create_engine_config(engine_args)
 
     assert result.attention_config.backend is AttentionBackendEnum.CUSTOM
-    assert result.attention_config.flash_attn_version == (2 if device == "cuda" else None)
+    # Suffix fusion must leave hardware-dependent prefix selection automatic.
+    assert result.attention_config.flash_attn_version is None
     assert result.additional_config[GR_CONFIG_KEY]["attention_backend"] == "CUSTOM"
     assert result.additional_config[GR_CONFIG_KEY]["constraint_table"]["backend"] == device
 

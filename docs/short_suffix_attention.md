@@ -7,7 +7,7 @@ FP32, and merges them
 with the prefix attention output and natural-log LSE. It writes the final
 attention output directly.
 
-The prefix FlashAttention call and persistent KV writes are unchanged.
+Prefix attention exposes canonical out + FP32 natural-log LSE states; persistent KV writes are unchanged.
 The fast path removes packed suffix copies, suffix FlashAttention,
 intermediate suffix outputs, FA2 GQA LSE conversion, and a separate merge.
 It supports CUDA graph replay: the step and active mask are device inputs,
@@ -17,7 +17,7 @@ so changing slots at a fixed tensor geometry reuses the compiled kernel.
 A CUDA graph captures its scalar slot argument; step and mask remain mutable
 device inputs during replay.
 
-The dispatch is restricted to pure incremental FA2 decode and unwindowed
+The dispatch is restricted to pure incremental decode and unwindowed
 attention without ALiBi, softcap, or sinks. Head dimensions of 64/128/256 use
 the FA2-aligned MMA fast path; other head sizes that FlashAttention 2 accepts
 (a multiple of 8, at most 256) use the generic Triton merge kernel.
@@ -41,24 +41,24 @@ Omitting it or setting it to `True` enables fusion. The typed `GRConfig`
 exposes the same boolean field; the legacy additional-config key is
 `vllm_gr_enable_short_suffix_attention`. Do not mix canonical and legacy keys.
 
-With fusion enabled on CUDA CUSTOM Beam engines, an unspecified
-`attention_config.flash_attn_version` resolves to `2`. An explicit version
-other than `2` raises an error; select FA2 or disable fusion. Opting out
-preserves normal FlashAttention version selection. NPU engines and engines
-without an active Beam pool do not activate this optimization.
+With fusion enabled, `attention_config.flash_attn_version` retains vLLM's
+hardware-dependent selection; supported explicit FA2/FA3/FA4 overrides remain
+valid. Suffix fusion does not force FA2. See [prefix optimization](beam_prefix_optimization.md)
+for optional measured per-shape plans. NPU engines and engines without an active
+Beam pool do not activate this optimization.
 
 Enabling requires a positive pool capacity and an explicit maximum beam width.
 Model/context initialization validates CUDA, head dimensions, GQA grouping,
-dtype, FA2 prefix states and absence of window/softcap/ALiBi/sinks. Unsupported
+dtype, canonical prefix states and absence of window/softcap/ALiBi/sinks. Unsupported
 static configurations raise an error before execution; explicitly disable
 fusion for those configurations.
 
 At runtime, the GPU dispatcher uses the fused kernel only for pure beam decode
 batches with one query per beam. Mixed standard/beam batches, prefix
-recomputation and other batch shapes use the existing packed-suffix, FA2 and
+recomputation and other batch shapes use the existing packed-suffix and
 merge path without raising a metadata error. Fixed-membership multi-request
 decode batches remain eligible: the check uses the session's flattened
-`B * beam_width` rows. Prefix/prefill execution is unchanged.
+`B * beam_width` rows. Prefill selection is independent of decode prefix plans.
 
 Restart the engine when changing the configuration so CUDA graphs capture
 the selected implementation. CUDA graph enablement is independent.

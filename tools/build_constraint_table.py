@@ -9,9 +9,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler
@@ -73,11 +74,12 @@ def _resolve_model_revision(model: str, revision: str | None) -> str | None:
 
 def build_constraint_table(
     *,
-    triples_path: str | Path,
+    triples_path: str | Path | None,
     model: str,
     revision: str | None,
     output_path: str | Path,
     trust_remote_code: bool = False,
+    multi_trie_manifest_path: str | Path | None = None,
 ) -> tuple[str, str, int]:
     """Compile triples and return artifact digest, tokenizer digest, and vocab.
 
@@ -85,6 +87,9 @@ def build_constraint_table(
     immutable commit before loading.  It may be omitted only for an existing
     local model directory, which callers must preserve as an immutable build
     input if they require reproducibility.
+
+    Provide either ``triples_path`` for one Trie or ``multi_trie_manifest_path``
+    for a JSON manifest listing each Trie's triples document.
     """
 
     resolved_revision = _resolve_model_revision(model, revision)
@@ -101,7 +106,9 @@ def build_constraint_table(
     if type(vocab_size) is not int or vocab_size <= 0:
         raise ValueError(f"model {model!r} does not expose a positive integer vocab_size")
 
-    triples_file = Path(triples_path)
+    if (triples_path is None) == (multi_trie_manifest_path is None):
+        raise ValueError("provide exactly one of --triples or --tries")
+    triples_file = Path(triples_path if triples_path is not None else multi_trie_manifest_path)
     try:
         with triples_file.open("r", encoding="utf-8") as input_file:
             document: Any = json.load(input_file)
@@ -111,18 +118,43 @@ def build_constraint_table(
         raise ValueError("constraint triples document must be a JSON object")
 
     tokenizer_digest = compute_tokenizer_digest(tokenizer)
-    table = ConstraintTableArtifactCompiler(
+    compiler = ConstraintTableArtifactCompiler(
         tokenizer,
         vocab_size,
         tokenizer_digest=tokenizer_digest,
-    ).compile(document)
+    )
+    if multi_trie_manifest_path is None:
+        table = compiler.compile(document)
+    else:
+        tries = document.get("tries")
+        if not isinstance(tries, list) or not tries:
+            raise ValueError("tries manifest must contain a non-empty tries list")
+        documents = []
+        for trie_id, trie in enumerate(tries):
+            if (
+                not isinstance(trie, dict)
+                or type(trie.get("trie_id")) is not int
+                or trie["trie_id"] != trie_id
+                or not isinstance(trie.get("triples_path"), str)
+                or not trie["triples_path"]
+            ):
+                raise ValueError("tries must have consecutive trie_id values and triples_path")
+            source = triples_file.parent / trie["triples_path"]
+            with source.open(encoding="utf-8") as stream:
+                trie_document = json.load(stream)
+            if not isinstance(trie_document, dict):
+                raise ValueError("trie triples document must be a JSON object")
+            documents.append(trie_document)
+        table = compiler.compile_tries(documents)
     artifact_digest = save_constraint_table_artifact(table, output_path)
     return artifact_digest, tokenizer_digest, vocab_size
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--triples", required=True, help="Constraint triples JSON")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--triples", help="Constraint triples JSON (v1)")
+    source.add_argument("--tries", help="Multi-Trie triples manifest JSON (v2)")
     parser.add_argument("--model", required=True, help="Model ID or local path")
     parser.add_argument(
         "--revision",
@@ -146,8 +178,9 @@ def main() -> int:
             revision=args.revision,
             output_path=args.output,
             trust_remote_code=args.trust_remote_code,
+            multi_trie_manifest_path=args.tries,
         )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         logger.error("%s", exc)
         return 1
     print(f"artifact_digest: {artifact_digest}")

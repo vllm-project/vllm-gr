@@ -90,7 +90,10 @@ def test_success_publishes_only_after_release_and_sync(
     monkeypatch.delenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, raising=False)
     worker, owner, graph, stream, health = capture_runtime
     assert startup.capture_async_forward(worker, hooks_type=hooks_type)
-    assert cast(Mock, stages.get_stage_runner).call_args.kwargs == {"hooks_type": hooks_type}
+    assert cast(Mock, stages.get_stage_runner).call_args.kwargs == {
+        "hooks_type": hooks_type,
+        "for_startup_capture": True,
+    }
     decode = owner.prepare_cpu.call_args.args[0]
     assert decode.kv_blocks == ((0,),)
     assert decode.beam_params.max_tokens == 2

@@ -363,9 +363,27 @@ class BeamPostprocessWorkspacePool:
         return sum(workspace.device_memory_bytes for workspace in self._buckets.values())
 
 
+def _workspace_candidate_width(runner: Any, beam_width: int) -> int:
+    """Resolve K for a workspace lookup, falling back to the legacy K == W."""
+
+    from vllm_gr.config import GRConfig, resolve_candidate_width
+
+    try:
+        config = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+    except (AttributeError, TypeError, ValueError):
+        return beam_width
+    if config.beam_max_width is None:
+        return beam_width
+    try:
+        return resolve_candidate_width(config)
+    except ValueError:
+        return beam_width
+
+
 def get_beam_postprocess_workspace(
     runner: Any,
     beam_width: int,
+    candidate_width: int | None = None,
 ) -> BeamPostprocessWorkspace | None:
     """Return an exact prewarmed CUDA bucket, never allocating on a miss."""
 
@@ -378,7 +396,9 @@ def get_beam_postprocess_workspace(
     dtype = getattr(getattr(runner, "model_config", None), "dtype", None)
     if not isinstance(dtype, torch.dtype):
         return None
-    key = BeamPostprocessWorkspaceKey(beam_width, beam_width, dtype)
+    if candidate_width is None:
+        candidate_width = _workspace_candidate_width(runner, beam_width)
+    key = BeamPostprocessWorkspaceKey(beam_width, candidate_width, dtype)
     try:
         return pool.require(key)
     except KeyError:
@@ -662,7 +682,10 @@ def cuda_prefill_postprocess_enabled(
     if gr_cfg.constraint_backend != ConstraintBackend.CONSTRAINT_TABLE:
         return False
     workspace = get_beam_postprocess_workspace(runner, int(beam_width))
-    return workspace is not None and workspace.max_batch >= int(batch_size)
+    if workspace is None or workspace.max_batch < int(batch_size):
+        return False
+    # The fused prefill postprocess kernels flatten candidates as W-by-W.
+    return workspace.key.top_k == int(beam_width)
 
 
 def cuda_decode_postprocess_enabled(
@@ -687,7 +710,10 @@ def cuda_decode_postprocess_enabled(
     ):
         return False
     workspace = get_beam_postprocess_workspace(runner, beam_width)
-    return workspace is not None and rows // beam_width <= workspace.max_batch
+    if workspace is None or rows // beam_width > workspace.max_batch:
+        return False
+    # The fused decode kernels flatten candidates as W-by-W.
+    return workspace.key.top_k == beam_width
 
 
 def _xllm_decode_mode_active() -> bool:
@@ -920,9 +946,12 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
     """Publish constrained prefill winners from the CUDA worker.
 
     Constraint prefill has one candidate row and no ``BeamSearchSession`` yet.
-    The backend row is already deterministically ordered, so its W entries are
-    the first W beam survivors (all with parent 0).  Publishing them through
-    the canonical result channel avoids the remaining frontend NumPy select.
+    The backend row is already deterministically ordered, so its first
+    ``min(W, K)`` entries are the first beam survivors (all with parent 0);
+    beams beyond that stay inactive (``-inf`` score / 0 parent: prefill parents
+    are zero by definition and EngineCore's engine-driven self-advance rejects
+    any negative index).  Publishing them through the canonical result channel
+    avoids the remaining frontend NumPy select.
 
     The decode session initializes independently from its first per-parent
     candidate matrix; prefill scores must not seed its persistent buffers.
@@ -964,6 +993,16 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
         return None
     if not _cuda_worker_decision_width_supported(width):
         return None
+    candidate_width = mdata.get("candidate_width")
+    if candidate_width is None:
+        # No metadata producer writes ``candidate_width`` today.  Resolve it the
+        # same way the workspace bucket does rather than falling back to the
+        # beam width: a decoupled K would otherwise be published as W.
+        candidate_width = _workspace_candidate_width(runner, width)
+    if isinstance(candidate_width, bool) or not isinstance(candidate_width, int):
+        return None
+    if candidate_width < 1:
+        return None
 
     lp_tensors = getattr(sampler_output, "logprobs_tensors", None)
     token_ids = getattr(lp_tensors, "logprob_token_ids", None)
@@ -974,8 +1013,12 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
         or token_ids.ndim != 2
         or scores.shape != token_ids.shape
         or token_ids.shape[0] != 1
-        or token_ids.shape[1] < width
     ):
+        return None
+    # One survivor per score-ordered candidate column; with K < W only K beams
+    # are live after prefill, matching the bootstrap kernel's K < W tail.
+    live = min(width, candidate_width, token_ids.shape[1])
+    if live < 1:
         return None
 
     workspace = get_beam_postprocess_workspace(runner, width)
@@ -983,13 +1026,21 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
         out_ids = workspace.selected_token_ids[:1]
         out_scores = workspace.selected_scores[:1]
         out_parents = workspace.selected_parent_ids[:1]
-        out_ids.copy_(token_ids[:, :width])
-        out_scores.copy_(scores[:, :width])
-        out_parents.zero_()
     else:
-        out_ids = token_ids[:, :width].to(dtype=torch.int32).contiguous()
-        out_scores = scores[:, :width].to(dtype=torch.float32).contiguous()
-        out_parents = torch.zeros_like(out_ids, dtype=torch.int32)
+        device = token_ids.device
+        out_ids = torch.empty((1, width), dtype=torch.int32, device=device)
+        out_scores = torch.empty((1, width), dtype=torch.float32, device=device)
+        out_parents = torch.empty((1, width), dtype=torch.int32, device=device)
+    out_ids[:, :live].copy_(token_ids[:, :live])
+    out_scores[:, :live].copy_(scores[:, :live])
+    out_parents[:, :live].zero_()
+    if live < width:
+        out_ids[:, live:].zero_()
+        out_scores[:, live:].fill_(-float("inf"))
+        # Prefill parents are zero by definition, and EngineCore's engine-driven
+        # self-advance rejects any negative parent index.  A -1 tail would make
+        # every prefill->step0 transition fall back to the frontend path.
+        out_parents[:, live:].zero_()
     return {
         "out_token_ids": out_ids,
         "out_token_index": out_parents,
@@ -1029,15 +1080,19 @@ def init_beam_decision_state(
     if width == 0 or n_rows == 0 or n_rows % width != 0:
         return
     batch = n_rows // width
-    # [B, W, W]: the last dim holds the top-candidate ordering per beam.
+    # [B, W, K]: the last dim holds the top-candidate ordering per beam, and K
+    # is the candidate width, which is independent of the beam width.
     # Column-0 views are already contiguous per-row, and the dtype guards
     # keep the constrained path (int32 ids / float32 probs straight from
     # rec_constrained_topk) copy-free — the profiled ~12ms-per-copy host
     # stalls (aclnnInplaceCopyGetWorkspaceSize) came from casting first and
     # copying the cast result; matching dtypes lets copy_ take the
     # contiguous fast path directly.
-    best_token = top_tokens.reshape(batch, width, width)[:, :, 0]
-    best_score = top_logprobs.reshape(batch, width, width)[:, :, 0]
+    candidate_width = top_tokens.shape[1]
+    if candidate_width < 1:
+        return
+    best_token = top_tokens.reshape(batch, width, candidate_width)[:, :, 0]
+    best_score = top_logprobs.reshape(batch, width, candidate_width)[:, :, 0]
     if best_token.dtype is not bufs.sequence.dtype:
         best_token = best_token.to(bufs.sequence.dtype)
     if best_score.dtype is not bufs.beam_scores.dtype:
@@ -1099,12 +1154,15 @@ def _select_candidates(
     width: int,
     v2_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Extract ``[B*W, W]`` (token_ids int32, probs fp32) from sampler output.
+    """Extract ``[B*W, K]`` (token_ids int32, probs fp32) from sampler output.
+
+    ``width`` here is the candidate width ``K`` (columns per beam), which is
+    independent of the beam width ``W``. The row count is always ``B * W``.
 
     The sampler logprob tensors carry ``[rows, max_logprobs + 1]`` with the
     sampled token in column 0; the constrained override already replaced the
-    constrained rows with the fixed-width ``W`` operator output.  For
-    unconstrained rows we drop the sampled-token column to get exactly ``W``
+    constrained rows with the fixed-width ``K`` operator output.  For
+    unconstrained rows we drop the sampled-token column to get exactly ``K``
     candidates per beam.
 
     ``v2_layout`` selects an explicit layout contract instead of inferring it
@@ -1133,8 +1191,8 @@ def _select_candidates(
         return None
     if token_ids.shape[0] != logprobs.shape[0]:
         return None
-    # Constrained rows already have width == W; unconstrained rows have
-    # width == max_logprobs + 1.  Use min() so slicing can't overflow.
+    # Constrained rows already have K columns; unconstrained rows have
+    # max_logprobs + 1.  Use min() so slicing can't overflow.
     n_cols = min(token_ids.shape[1], logprobs.shape[1])
     if v2_layout:
         # Pure top-K: every column is a candidate (no sampled column to drop).
@@ -1167,8 +1225,14 @@ def _select_candidates_into(
     workspace: BeamPostprocessWorkspace,
     v2_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
-    """Normalize sampler candidates into fixed CUDA workspace buffers."""
+    """Normalize sampler candidates into fixed CUDA workspace buffers.
 
+    ``width`` is the candidate width ``K`` (columns per beam); the buffer row
+    count stays ``max_batch * W`` from the workspace's beam width.
+    """
+
+    if width != workspace.key.top_k:
+        return None
     lp_tensors = getattr(sampler_output, "logprobs_tensors", None)
     if lp_tensors is None:
         return None
@@ -1203,11 +1267,11 @@ def _select_candidates_into(
         return None
 
     rows = source_tokens.shape[0]
-    capacity_rows = workspace.max_batch * width
+    capacity_rows = workspace.max_batch * workspace.key.beam_width
     if rows > capacity_rows:
         return None
-    out_tokens = workspace.topk_token_ids.view(capacity_rows, width)[:rows]
-    out_scores = workspace.topk_scores.view(capacity_rows, width)[:rows]
+    out_tokens = workspace.topk_token_ids.view(capacity_rows, workspace.key.top_k)[:rows]
+    out_scores = workspace.topk_scores.view(capacity_rows, workspace.key.top_k)[:rows]
     if source_tokens.data_ptr() != out_tokens.data_ptr() or source_tokens.dtype != torch.int32:
         out_tokens.copy_(source_tokens)
     if source_scores.data_ptr() != out_scores.data_ptr() or source_scores.dtype != torch.float32:
@@ -1215,9 +1279,9 @@ def _select_candidates_into(
 
     out_mask: torch.Tensor | None = None
     if source_mask is not None:
-        if tuple(source_mask.shape) != (rows, width):
+        if tuple(source_mask.shape) != (rows, workspace.key.top_k):
             return None
-        out_mask = workspace.topk_valid_mask.view(capacity_rows, width)[:rows]
+        out_mask = workspace.topk_valid_mask.view(capacity_rows, workspace.key.top_k)[:rows]
         if source_mask.data_ptr() != out_mask.data_ptr():
             out_mask.copy_(source_mask)
     return out_tokens, out_scores, out_mask
@@ -1482,7 +1546,8 @@ def _run_cuda_decision_out(
 
     bufs = session.context.decision
     beam_width = session.beam_width
-    if beam_width != workspace.key.beam_width or top_tokens.shape[1] != workspace.key.top_k:
+    candidate_width = workspace.key.top_k
+    if beam_width != workspace.key.beam_width or top_tokens.shape[1] != candidate_width:
         return None
     if top_tokens.shape[0] % beam_width != 0:
         return None
@@ -1504,7 +1569,9 @@ def _run_cuda_decision_out(
     selected_sequence = workspace.next_sequence[:batch]
     selected_flat = workspace.selected_flat_indices[:batch]
     scratch = workspace.selection_scratch
-    deferred_status = bool(candidate_counts is not None)
+    # The worker fusion kernels flatten candidates as W-by-W, which is exact
+    # only while K == W (and K <= MAX_CANDIDATE_WIDTH therefore bounds W here).
+    deferred_status = bool(candidate_counts is not None) and candidate_width == beam_width
     status = workspace.prefill_staging[:batch]
     payload = workspace.prefill_staging[workspace.max_batch :]
     if deferred_status:
@@ -1537,7 +1604,7 @@ def _run_cuda_decision_out(
             top_probs,
             sequence,
             step,
-            beam_width,
+            candidate_width,
             selected_ids,
             selected_parents,
             selected_scores,
@@ -1692,10 +1759,13 @@ def run_beam_decision(
     if device_type == "cuda" and not _cuda_worker_decision_width_supported(width):
         return None
     workspace = get_beam_postprocess_workspace(runner, width) if device_type == "cuda" else None
+    # Candidate width K is independent of the beam width W; the sampler emits
+    # one row per beam and K columns per row.
+    candidate_width = _workspace_candidate_width(runner, width)
     candidates = (
-        _select_candidates_into(sampler_output, width, workspace, v2_layout=v2_layout)
+        _select_candidates_into(sampler_output, candidate_width, workspace, v2_layout=v2_layout)
         if workspace is not None
-        else _select_candidates(sampler_output, width, v2_layout=v2_layout)
+        else _select_candidates(sampler_output, candidate_width, v2_layout=v2_layout)
     )
     if candidates is None:
         return None
@@ -1740,6 +1810,15 @@ def run_beam_decision(
             result_width,
         )
 
+    # The fused xllm decision operators hard-code K == W. Raise here, outside
+    # the defensive fallback below, so an unsupported geometry cannot be
+    # silently absorbed by the PyTorch reference.
+    if device_type.startswith("npu") and candidate_width != width:
+        raise NotImplementedError(
+            "NPU beam decision requires candidate_width == beam_width, got "
+            f"candidate_width={candidate_width}, beam_width={width}"
+        )
+
     try:
         from vllm_gr.ops.npu import beam_ops
 
@@ -1781,11 +1860,11 @@ def run_beam_decision_candidates(
     if (
         top_tokens.ndim != 2
         or top_probs.shape != top_tokens.shape
-        or top_tokens.shape[1] != width
+        or top_tokens.shape[1] < 1
         or top_tokens.shape[0] == 0
         or top_tokens.shape[0] % width
     ):
-        raise ValueError("Beam candidates must have shape [B*W, W]")
+        raise ValueError("Beam candidates must have shape [B*W, K] with K >= 1")
     if top_tokens.dtype is not torch.int32 or top_probs.dtype is not torch.float32:
         raise ValueError("Beam candidates must use int32 token IDs and float32 scores")
     if session.context.decision.worker_decode_steps == 0:
@@ -1800,6 +1879,11 @@ def run_beam_decision_candidates(
 
         if not beam_ops.is_available():
             raise RuntimeError("NPU Beam decision operators are unavailable")
+        if top_tokens.shape[1] != width:
+            raise NotImplementedError(
+                "NPU beam decision requires candidate_width == beam_width, got "
+                f"candidate_width={top_tokens.shape[1]}, beam_width={width}"
+            )
         decision = _run_npu_decision(session, top_tokens, top_probs, is_last_step, result_width)
     else:
         decision = _run_torch_decision(session, top_tokens, top_probs, is_last_step, result_width)

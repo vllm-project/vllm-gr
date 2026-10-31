@@ -61,6 +61,7 @@ def _runtime(
     batch=1,
     state_index=0,
     physical_steps=None,
+    candidate_width=None,
 ):
     context = BeamAttentionContext(
         batch, width, 1, physical_steps or steps, 8, 2, torch.device("cuda"), dtype
@@ -71,6 +72,7 @@ def _runtime(
         max_new_tokens=steps,
         stop_token_ids=stops,
         ignore_stop_tokens=ignore,
+        candidate_width=candidate_width,
     )
     slot = context.registry.allocate("s", width, 0)
     session = BeamSearchSession("s", slot, context)
@@ -79,7 +81,7 @@ def _runtime(
     workspace = BeamPostprocessWorkspace.allocate(
         max_batch=1,
         beam_width=width,
-        top_k=width,
+        top_k=width if candidate_width is None else candidate_width,
         max_decode_steps=physical_steps or steps,
         device="cuda",
         logits_dtype=dtype,
@@ -736,6 +738,53 @@ def test_width_boundaries_and_final_candidate_history(width):
     for index, (tokens, score, parents, reason, tie) in enumerate(completed):
         parent, rank = divmod(index, width)
         assert tokens == (100, 1000 + parent, 1000 + parent * width + rank)
+        assert parents == (0, 0, parent)
+        assert score == 0
+        assert reason == FINISH_LENGTH
+        assert tie == index
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("steps", [1, 3])
+def test_candidate_width_above_beam_width_completes_every_candidate(dtype, steps):
+    """W=8, K=64: every finishing candidate fits in the completed buffer.
+
+    With ``ignore_stop_tokens`` and finite candidates, a Prefill-only session
+    finishes all K Prefill candidates and a three-step session finishes all
+    W * K candidates of its last step.  The pre-decoupling bound
+    ``W + (N-1) * W**2`` held 8 and 136 slots and reported ERROR_CAPACITY.
+    Equal scores make the order the tie-break index, as in the K == W case.
+    """
+    width, k = 8, 64
+    runner = _runtime(width=width, steps=steps, dtype=dtype, ignore=True, candidate_width=k)
+    state = runner.state
+    assert state.completed_capacity == k + (steps - 1) * width * k
+    prefill_tokens: NDArray[np.int32] = np.arange(k, dtype=np.int32)[None] + 100
+    decode_tokens: NDArray[np.int32] = np.arange(width * k, dtype=np.int32).reshape(width, k) + 1000
+    runner.initialize_from_prefill(*_gpu(prefill_tokens, np.zeros((1, k), dtype=np.float32)))
+    decode = _gpu(decode_tokens, np.zeros((width, k), dtype=np.float32))
+    for _ in range(steps - 1):
+        runner.advance(*decode)
+    assert state.error_code.cpu().item() == 0
+    assert state.is_finished.cpu().item()
+    completed = _completed(state)
+    if steps == 1:
+        assert len(completed) == k
+        for index, (tokens, score, parents, reason, tie) in enumerate(completed):
+            assert (tokens, score, parents, reason, tie) == (
+                (100 + index,),
+                0,
+                (0,),
+                FINISH_LENGTH,
+                index,
+            )
+        return
+    assert len(completed) == width * k
+    for index, (tokens, score, parents, reason, tie) in enumerate(completed):
+        # Step 1 keeps parent 0's first W candidates; the last step finishes
+        # all K candidates of each of those W parents.
+        parent, rank = divmod(index, k)
+        assert tokens == (100, 1000 + parent, 1000 + parent * k + rank)
         assert parents == (0, 0, parent)
         assert score == 0
         assert reason == FINISH_LENGTH

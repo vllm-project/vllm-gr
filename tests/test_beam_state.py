@@ -41,6 +41,47 @@ def test_state_aliases_existing_storage_and_accounts_only_new_memory() -> None:
     assert state.device_memory_bytes == sum(t.numel() * t.element_size() for t in owned)
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("beam_width", "candidate_width", "max_new_tokens", "expected"),
+    [
+        (4, None, 8, 4 + 7 * 16),  # unset K follows W: the historical bound
+        (4, 4, 8, 4 + 7 * 16),  # explicit K == W is identical
+        (4, 64, 1, 64),  # prefill contributes one row's candidates
+        (4, 64, 3, 64 + 2 * 4 * 64),  # multi-step: W rows of K per step
+        (4, 2, 3, 2 + 2 * 4 * 2),  # K < W still holds every finishing candidate
+    ],
+)
+def test_completed_capacity_covers_every_finishing_candidate(
+    beam_width: int,
+    candidate_width: int | None,
+    max_new_tokens: int,
+    expected: int,
+) -> None:
+    """Every finishing candidate appends one record, so K is part of the bound.
+
+    The pre-decoupling bound ``W + (N-1) * W**2`` assumed K == W; with ``K > W``
+    a session overflows the completed buffer at the first step and the state
+    reports ERROR_CAPACITY instead of producing a result.
+    """
+    state = BeamSearchState(
+        _decision(),
+        beam_width=beam_width,
+        max_new_tokens=max_new_tokens,
+        candidate_width=candidate_width,
+    )
+
+    assert state.completed_capacity == expected
+    assert state.completed_token_ids.shape == (2, expected)
+    resolved = beam_width if candidate_width is None else candidate_width
+    assert state.candidate_width == resolved
+
+
+def test_beam_state_rejects_a_non_positive_candidate_width() -> None:
+    for bad in (0, -1, True):
+        with pytest.raises(ValueError, match="candidate_width"):
+            BeamSearchState(_decision(), beam_width=4, max_new_tokens=8, candidate_width=bad)
+
+
 def test_reset_preserves_other_rows_configuration_and_addresses() -> None:
     decision = _decision()
     state = BeamSearchState(decision, beam_width=4, max_new_tokens=8, stop_token_ids=(7, 9))

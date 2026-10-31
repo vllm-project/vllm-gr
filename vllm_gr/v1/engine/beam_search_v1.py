@@ -15,6 +15,7 @@ from typing import Any, Protocol, cast
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
+from vllm_gr.config import MAX_BEAM_WIDTH
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
@@ -58,11 +59,11 @@ def _validate_gr_generation_params(params: BeamBatchParams) -> None:
         raise ValueError("Constraint Table does not support catalog_strategy")
     if (
         type(params.beam_width) is not int
-        or not 1 <= params.beam_width <= 256
+        or not 1 <= params.beam_width <= MAX_BEAM_WIDTH
         or type(params.max_tokens) is not int
         or params.max_tokens < 1
     ):
-        raise ValueError("Asynchronous scheduling requires W in [1, 256] and N >= 1")
+        raise ValueError(f"Asynchronous scheduling requires W in [1, {MAX_BEAM_WIDTH}] and N >= 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,9 +75,10 @@ class GRExecutionCapacity:
     dispatches_per_session: int = 2
 
     def __post_init__(self) -> None:
-        if type(self.beam_width) is not int or not 1 <= self.beam_width <= 256:
+        if type(self.beam_width) is not int or not 1 <= self.beam_width <= MAX_BEAM_WIDTH:
             raise ValueError(
-                "Asynchronous scheduling requires a fixed physical beam width in [1, 256]"
+                "Asynchronous scheduling requires a fixed physical beam width in "
+                f"[1, {MAX_BEAM_WIDTH}]"
             )
         if (
             type(self.active_sessions) is not int
@@ -180,26 +182,22 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
         raise ValueError("dynamic beam widths and result widths require CUDA or NPU beam_search_v1")
 
 
-def _reject_explicit_candidate_width_with_dynamic_schedule(
+def _reject_candidate_width_below_dynamic_schedule(
     gr_config: Any,
     params: BeamBatchParams,
 ) -> None:
-    """Reject conflicting startup K and dynamic W when no request K overrides it.
+    """A configured K must cover every dynamic stage width.
 
-    An explicit request-level K schedule takes precedence over the startup
-    scalar. Without one, retain the existing startup-K/dynamic-W restriction.
+    An explicit request-level ``per_parent_beam_widths`` schedule takes
+    precedence over the configured scalar and is validated on its own.
 
-    A configured ``constraint_table.candidate_width`` is a fixed promise about
-    the per-row candidate count, but the executed top-k is derived from the
-    active stage width.  ``[4, 2, 1]`` therefore samples 4, then 2, then 1
-    candidates per row, and a *uniform but narrower* schedule such as
-    ``(2, 2, 2)`` against K=4 silently samples 2 at every stage.  Both are
-    rejected until the engine-wiring layer forwards K to the stages.
-
-    The check has to live here rather than in the request contract: the
-    explicit K is a *configuration* field and the frontend never copies it into
-    ``BeamBatchParams``, so a request-only guard would never fire.  Leaving K
-    unset keeps dynamic Beam widths working exactly as before.
+    K is forwarded to every stage, so each stage samples K candidates per
+    parent and keeps its own ``output_width``: ``K=4`` with ``(2, 2, 2)`` runs
+    TopK=4 and retains 2.  The one unsupported combination is a stage that
+    retains more beams than its parents supply candidates.  This reads the
+    *configured* K so the rejection is a request-level error at admission
+    instead of a contract failure deep in the worker.  Leaving K unset keeps
+    dynamic Beam widths working exactly as before.
     """
 
     if params.per_parent_beam_widths is not None:
@@ -211,21 +209,22 @@ def _reject_explicit_candidate_width_with_dynamic_schedule(
     configured = getattr(table, "candidate_width", None)
     if configured is None:
         return
-    if all(width == configured for width in widths):
-        return
-    raise ValueError(
-        "vllm-gr constraint_table.candidate_width="
-        f"{configured} does not match dynamic_beam_widths schedule {tuple(widths)}: "
-        "this build derives the executed top-k from the active stage width, so each "
-        "stage would sample a different number of candidates per row than the "
-        "configured K. Leave candidate_width unset to keep dynamic Beam widths, or "
-        "set a schedule whose every stage width equals candidate_width."
-    )
+    for index, width in enumerate(widths):
+        if width > configured:
+            raise ValueError(
+                f"vllm-gr constraint_table.candidate_width={configured} is below "
+                f"dynamic_beam_widths[{index}]={width}: each parent must supply at "
+                "least as many candidates as the stage retains"
+            )
 
 
-def validate_gr_request(request: BeamBatchRequest, *, config: Any = None) -> None:
+def validate_gr_request(
+    request: BeamBatchRequest, *, config: Any = None, trie_count: int | None = None
+) -> None:
     """Validate shared V1 semantics before native ADD or Worker allocation."""
     validate_beam_batch_request(request)
+    if trie_count is not None and any(item.trie_id >= trie_count for item in request.items):
+        raise ValueError("trie_id is outside the loaded constraint table")
     if len(request.items) not in SUPPORTED_BEAM_BATCH_SIZES:
         raise ValueError(
             "beam_search_v1 supports batch sizes "
@@ -263,7 +262,7 @@ def validate_gr_request(request: BeamBatchRequest, *, config: Any = None) -> Non
             raise ValueError(
                 f"Decode steps {max_tokens} exceed runtime limit {gr_config.beam_max_decode_steps}"
             )
-        _reject_explicit_candidate_width_with_dynamic_schedule(gr_config, request.beam_params)
+        _reject_candidate_width_below_dynamic_schedule(gr_config, request.beam_params)
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,14 +598,14 @@ def validate_dispatch(
         capacity.validate(params)
         if (
             type(params.beam_width) is not int
-            or not 1 <= params.beam_width <= 256
+            or not 1 <= params.beam_width <= MAX_BEAM_WIDTH
             or type(params.max_tokens) is not int
             or params.max_tokens < 1
             or not math.isfinite(params.temperature)
             or params.temperature < 0
             or params.constraint_resource_id != DEFAULT_CONSTRAINT_RESOURCE_ID
         ):
-            raise ValueError("GR requires W in [1, 256], N >= 1 and valid generation params")
+            raise ValueError(f"GR requires W in [1, {MAX_BEAM_WIDTH}] and valid generation params")
         if not 0 <= m.stage_index < params.max_tokens:
             raise ValueError("GR logical stage exceeds generation budget")
         if m.output_device_state != GRDeviceStateRef(key, m.stage_index):

@@ -43,6 +43,8 @@ async def beam_search_v1(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
     session_id: str | None = None,
+    *,
+    trie_ids: list[int] | tuple[int, ...] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
     """Submit one online V1 request and yield terminal outputs only.
 
@@ -95,6 +97,7 @@ async def beam_search_v1(
         priority=priority,
         data_parallel_rank=rank,
         session_id=session_id,
+        trie_ids=trie_ids,
     )
     outputs = await run_beam_search_v1_async(
         create_online_beam_search_v1_client(self),

@@ -18,6 +18,12 @@ from vllm.v1.engine import (
 logger = init_logger(__name__)
 
 
+def loaded_constraint_trie_count(worker: Any) -> int:
+    """Read the validated, live table once through the executor startup RPC."""
+    backend = getattr(worker.model_runner, "constraint_backend", None)
+    return backend.info.table_metadata.trie_count if backend is not None else 1
+
+
 def is_gr_session_retired(self: Any, session_id: str) -> bool:
     """Ordered Core-thread query; never block the thread that drains BatchQueue."""
     return session_id not in getattr(self.scheduler, "_gr_v1_sessions", {})
@@ -51,7 +57,11 @@ def _handle_submit_gr_session(self, batch_request) -> None:
     try:
         from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
 
-        validate_gr_request(batch_request, config=getattr(self, "vllm_config", None))
+        validate_gr_request(
+            batch_request,
+            config=getattr(self, "vllm_config", None),
+            trie_count=getattr(self, "_gr_trie_count", None),
+        )
     except ValueError as error:
         # A malformed batch is a request rejection, not a preprocessing fault.
         if getattr(self, "output_queue", None) is None:
@@ -85,7 +95,11 @@ def _admit_gr_session(self, batch_request) -> None:
             validate_gr_request,
         )
 
-        validate_gr_request(batch_request, config=getattr(self, "vllm_config", None))
+        validate_gr_request(
+            batch_request,
+            config=getattr(self, "vllm_config", None),
+            trie_count=getattr(self, "_gr_trie_count", None),
+        )
     except ValueError as error:
         # The request is answerable, so it must not take the preprocessing
         # error path: that one logs a traceback and sends a bare

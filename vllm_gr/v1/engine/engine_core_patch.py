@@ -28,6 +28,29 @@ _GR_SCHEDULE_PATCH_DEPTH_ATTR = "_vllm_gr_schedule_patch_depth"
 UPSTREAM_PROCESS_INPUT_SOCKETS = None
 
 
+def make_patched_engine_init(original):
+    """Publish the loaded table's immutable capacity before accepting requests."""
+    if getattr(original, "_gr_trie_capacity_patch", False):
+        return original
+
+    @wraps(original)
+    def initialize(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        from vllm_gr.config import BeamExecutionMode, GRConfig
+        from vllm_gr.v1.engine.core import loaded_constraint_trie_count
+
+        config = GRConfig.from_vllm_config(self.vllm_config)
+        if config.beam_execution_mode is not BeamExecutionMode.V1:
+            return
+        counts = self.model_executor.collective_rpc(loaded_constraint_trie_count)
+        if not counts or any(type(n) is not int or n < 1 or n != counts[0] for n in counts):
+            raise RuntimeError("Workers disagree on the loaded constraint table Trie count")
+        self._gr_trie_count = self.scheduler._gr_trie_count = counts[0]
+
+    initialize._gr_trie_capacity_patch = True
+    return initialize
+
+
 def make_patched_process_engine_step(original_step):
     """Preserve V1 progress-aware backoff while forwarding native outputs."""
 
@@ -140,6 +163,8 @@ def apply_engine_core_request_patches() -> None:
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
     register_engine_core_request_types()
+
+    EngineCore.__init__ = make_patched_engine_init(EngineCore.__init__)
 
     EngineCore.is_gr_session_retired = is_gr_session_retired
     EngineCore._handle_submit_gr_session = _handle_submit_gr_session

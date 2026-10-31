@@ -132,7 +132,11 @@ def merge_short_suffix_attention(
 ) -> None:
     """Merge one query/beam with the valid pool suffix and a prefix attention state.
 
-    Prefix LSE is natural-log, [query_heads, beams], in canonical head order.
+    Consumes the backend-independent AttentionState contract: prefix output is
+    [beams, query_heads, head_dim]; LSE is FP32 natural-log [query_heads, beams]
+    in canonical head order. Either infinite LSE sentinel denotes no prefix.
+    The prefix may come from FA2, FA3 or FA4; the tiny-pool suffix arithmetic
+    remains FA2-compatible independently of the prefix producer.
     The caller dispatches only plain, unwindowed attention without softcap,
     ALiBi or sinks. Key/value pools have identical strides and independent
     beam histories. Tiny CUDA FP16/BF16 pools preserve FA2's intermediate rounding

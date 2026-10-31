@@ -118,10 +118,16 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
                     "canonical constraint_table.enabled=true requires "
                     "beam_max_width to be configured"
                 )
-            if max_rows > table_config.max_top_k:
+            # Rows are bounded by the beam width; each row's candidate count is
+            # the independent candidate width K, which is what the table's
+            # top_k bound actually limits.
+            from vllm_gr.config import resolve_candidate_width
+
+            candidate_width = resolve_candidate_width(gr_config)
+            if candidate_width > table_config.max_top_k:
                 raise ValueError(
-                    "beam_max_width must be <= constraint_table.max_top_k "
-                    f"for canonical constraint sampling, got {max_rows} > "
+                    "candidate_width must be <= constraint_table.max_top_k "
+                    f"for canonical constraint sampling, got {candidate_width} > "
                     f"{table_config.max_top_k}"
                 )
 

@@ -398,6 +398,72 @@ def test_batch_preserves_native_session_hint_precedence(
     assert serving.beam_calls[0]["request_id"] == "cmpl-request-0"
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("count", "overrides"), [(1, {}), (3, {}), (4, {}), (1, {"stream": True})]
+)
+def test_explicit_trie_ids_allow_fallback(
+    make_serving: Callable[..., _BatchSelf],
+    make_request: Callable[..., Any],
+    delegate: list[Any],
+    count: int,
+    overrides: dict[str, Any],
+) -> None:
+    serving = make_serving(
+        engine_inputs=list(range(count)), prompt_lengths=dict.fromkeys(range(count), 10)
+    )
+    trie_ids = [index % 2 for index in range(count)]
+    request = make_request(prompt=["a"] * count, vllm_xargs={"trie_ids": trie_ids}, **overrides)
+    result = asyncio.run(create_completion_batch_dispatch(serving, request))
+    if count == 3 or overrides:
+        assert result == "original"
+        assert delegate == [request]
+        assert not serving.beam_calls
+    else:
+        assert not delegate
+        assert result == f"response-for-{count}"
+        assert serving.beam_calls[0]["trie_ids"] == trie_ids
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "trie_ids", [[0], [0, -1, 0], [0, True, 0], "0,1,0"]
+)
+def test_invalid_selectors_are_rejected_before_fallback(
+    make_serving: Callable[..., _BatchSelf],
+    make_request: Callable[..., Any],
+    delegate: list[Any],
+    trie_ids: Any,
+) -> None:
+    serving = make_serving()
+    request = make_request(prompt=["a"] * 3, vllm_xargs={"trie_ids": trie_ids})
+    assert asyncio.run(create_completion_batch_dispatch(serving, request)) == "error-response"
+    assert not delegate
+    assert not serving.beam_calls
+
+
+def test_fallback_resets_selectors_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+    make_serving: Callable[..., _BatchSelf],
+    make_request: Callable[..., Any],
+) -> None:
+    from vllm_gr.entrypoints.openai.beam_search_patch import _COMPLETION_TRIE_IDS
+
+    async def fail(*args: Any) -> None:
+        assert next(_COMPLETION_TRIE_IDS.get()) == 1
+        raise RuntimeError("upstream failure")
+
+    monkeypatch.setattr(patch_module, "_original_create_completion", fail)
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="upstream failure"):
+            await create_completion_batch_dispatch(
+                make_serving(),
+                make_request(prompt=["a"] * 3, vllm_xargs={"trie_ids": [1, 0, 1]}),
+            )
+        assert _COMPLETION_TRIE_IDS.get() is None
+
+    asyncio.run(run())
+
+
 def test_a_render_that_disagrees_with_the_count_is_a_server_fault(
     make_serving: Callable[..., _BatchSelf], make_request: Callable[..., Any]
 ) -> None:

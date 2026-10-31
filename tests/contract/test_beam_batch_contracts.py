@@ -215,6 +215,34 @@ def test_per_parent_beam_widths_require_matching_bootstrap_width() -> None:
         )
 
 
+def test_per_parent_beam_widths_override_the_configured_candidate_width() -> None:
+    """A per-stage K schedule replaces the scalar K and its stage-width bound.
+
+    ``candidate_width=2`` alone cannot serve ``(4, 2, 1)``: the first stage
+    retains 4 beams.  A request schedule ``(4, 2, 1)`` supplies its own K per
+    stage and is bounded by ``W_i <= W_(i-1) * K_i`` instead.
+    """
+    options = _options(num_return_sequences=1)
+    with pytest.raises(BeamContractError, match="is below dynamic_beam_widths"):
+        validate_beam_batch_request(
+            _request(
+                beam_params=_params(beam_width=4, dynamic_beam_widths=(4, 2, 1), candidate_width=2),
+                output_options=options,
+            )
+        )
+    validate_beam_batch_request(
+        _request(
+            beam_params=_params(
+                beam_width=4,
+                dynamic_beam_widths=(4, 2, 1),
+                candidate_width=2,
+                per_parent_beam_widths=(4, 2, 1),
+            ),
+            output_options=options,
+        )
+    )
+
+
 def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() -> None:
     with pytest.raises(BeamContractError, match="unique"):
         validate_beam_batch_request(_request(beam_params=_params(stop_token_ids=(2, 2))))
@@ -226,79 +254,92 @@ def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() 
         validate_beam_batch_request(_request(output_options=_options(num_return_sequences=3)))
 
 
-def test_request_beam_width_is_capped_by_the_candidate_ceiling() -> None:
-    """A direct request cannot ask for a width the config layer rejects.
+def test_request_beam_width_above_the_candidate_ceiling_requires_an_explicit_k() -> None:
+    """A wide Beam needs an explicit K, because K follows W when unset.
 
-    ``MAX_BEAM_WIDTH`` (1024) is deliberately higher than
-    ``MAX_CANDIDATE_WIDTH`` (256) so the wide-``W`` operators can be exercised,
-    but this build still samples one candidate per beam row.  A request above
-    the candidate ceiling therefore describes a K no prewarmed workspace can
-    hold; accepting it only defers the failure to the first workspace lookup.
+    ``MAX_BEAM_WIDTH`` (1024) is higher than ``MAX_CANDIDATE_WIDTH`` (256).  An
+    unset K implies the candidate count at the Beam width, which the operators
+    cannot take, so the request is rejected here rather than at the first
+    workspace lookup.  Stating K independently makes the wide Beam valid.
     """
     assert MAX_BEAM_WIDTH > MAX_CANDIDATE_WIDTH
 
     validate_beam_batch_request(_request(beam_params=_params(beam_width=MAX_CANDIDATE_WIDTH)))
-    with pytest.raises(BeamContractError, match="must be <= 256"):
+    with pytest.raises(BeamContractError, match="candidate_width is unset"):
         validate_beam_batch_request(
             _request(beam_params=_params(beam_width=MAX_CANDIDATE_WIDTH + 1))
         )
-    with pytest.raises(BeamContractError, match="must be <= 256"):
+    with pytest.raises(BeamContractError, match="candidate_width is unset"):
         validate_beam_batch_request(_request(beam_params=_params(beam_width=512)))
 
+    # Stating K lifts the restriction: a wide Beam with a legal K is admitted.
+    validate_beam_batch_request(
+        _request(
+            beam_params=_params(beam_width=512, candidate_width=MAX_CANDIDATE_WIDTH),
+            output_options=_options(num_return_sequences=512),
+        )
+    )
 
-def test_explicit_candidate_width_must_match_the_beam_width() -> None:
-    """An internal request cannot carry a K the build will not execute.
 
-    ``GRConfig`` rejects ``candidate_width != beam_max_width``, but a caller
-    that constructs ``BeamBatchRequest`` directly never passes through that
-    validation.  The executed top-k comes from the active stage width, so an
-    unchecked K here is accepted and then silently run as W.
+def test_explicit_candidate_width_may_differ_from_the_beam_width() -> None:
+    """The engine now executes K, so a decoupled K is a valid request.
+
+    ``GRConfig`` accepts ``candidate_width != beam_max_width`` and every
+    workspace, operator launch and decision state is keyed by K, so the request
+    contract must admit it too instead of pinning K to W.
     """
-    with pytest.raises(BeamContractError, match="must equal beam_params.beam_width"):
-        validate_beam_batch_request(_request(beam_params=_params(candidate_width=1)))
-    with pytest.raises(BeamContractError, match="must equal beam_params.beam_width"):
-        validate_beam_batch_request(_request(beam_params=_params(beam_width=8, candidate_width=4)))
-
-    # Restating today's behaviour (K == W) and leaving K unset both pass.
+    validate_beam_batch_request(_request(beam_params=_params(beam_width=8, candidate_width=4)))
     validate_beam_batch_request(_request(beam_params=_params(candidate_width=2)))
     validate_beam_batch_request(_request(beam_params=_params(candidate_width=None)))
+    # K still has its own operator ceiling.
+    with pytest.raises(BeamContractError, match="candidate_width must be <="):
+        validate_beam_batch_request(
+            _request(beam_params=_params(beam_width=512, candidate_width=1024))
+        )
 
 
-def test_explicit_candidate_width_must_match_every_dynamic_stage_width() -> None:
-    """A stated K is only honest when every stage retains exactly K beams.
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("schedule", "returned"),
+    [((2, 2, 2), 2), ((4, 2, 1), 1), ((4, 4, 4), 4)],
+)
+def test_explicit_candidate_width_accepts_dynamic_schedules_it_covers(
+    schedule: tuple[int, ...], returned: int
+) -> None:
+    """K and a dynamic schedule describe different things and can coexist.
 
-    ``BeamBatchExecutionView.candidate_top_k`` still returns the active stage
-    width in this build, so a *uniform but narrower* schedule silently samples
-    fewer candidates per row than the request states: K=4 with ``(2, 2, 2)``
-    runs TopK=2 at every stage and no error is raised.  Non-uniform schedules
-    fail the same way, one stage at a time.
+    Every stage samples K candidates per parent and keeps its own width, so
+    K=4 covers ``(2, 2, 2)``, ``(4, 2, 1)`` and ``(4, 4, 4)`` alike.  The
+    review of #525 found K=4 / ``(2, 2, 2)`` silently ran TopK=2; the
+    execution-view test pins that it now runs TopK=4.
     """
-    for schedule in ((2, 2, 2), (4, 2, 1)):
-        with pytest.raises(BeamContractError, match="does not match"):
-            validate_beam_batch_request(
-                _request(
-                    beam_params=_params(
-                        beam_width=4,
-                        candidate_width=4,
-                        dynamic_beam_widths=schedule,
-                    ),
-                    output_options=_options(num_return_sequences=1),
-                )
+    validate_beam_batch_request(
+        _request(
+            beam_params=_params(beam_width=4, candidate_width=4, dynamic_beam_widths=schedule),
+            output_options=_options(num_return_sequences=returned),
+        )
+    )
+
+
+def test_explicit_candidate_width_below_a_dynamic_stage_is_rejected() -> None:
+    """A stage cannot retain more beams than its parents supply candidates."""
+    with pytest.raises(BeamContractError, match="is below dynamic_beam_widths"):
+        validate_beam_batch_request(
+            _request(
+                beam_params=_params(beam_width=4, candidate_width=2, dynamic_beam_widths=(4, 2, 1)),
+                output_options=_options(num_return_sequences=1),
             )
-    # A schedule whose every stage retains exactly K still works.
-    validate_beam_batch_request(
-        _request(
-            beam_params=_params(beam_width=4, candidate_width=4, dynamic_beam_widths=(4, 4, 4)),
-            output_options=_options(num_return_sequences=4),
         )
-    )
-    # And dynamic schedules keep their original behaviour with K unset.
-    validate_beam_batch_request(
-        _request(
-            beam_params=_params(beam_width=4, dynamic_beam_widths=(4, 2, 1)),
-            output_options=_options(num_return_sequences=1),
+
+
+def test_dynamic_schedules_keep_their_behaviour_with_k_unset() -> None:
+    """With K unset, dynamic schedules behave exactly as before."""
+    for schedule, returned in (((4, 2, 1), 1), ((2, 2, 2), 2), ((4, 4, 4), 4)):
+        validate_beam_batch_request(
+            _request(
+                beam_params=_params(beam_width=4, dynamic_beam_widths=schedule),
+                output_options=_options(num_return_sequences=returned),
+            )
         )
-    )
 
 
 def test_limits_are_separate_from_protocol_and_check_batch_geometry() -> None:

@@ -17,17 +17,20 @@ from typing import Any, BinaryIO, cast
 import numpy as np
 from numpy.typing import NDArray
 
-from vllm_gr.config.models import CONSTRAINT_TABLE_FORMAT
+from vllm_gr.config.models import (
+    CONSTRAINT_TABLE_FORMAT,
+    MULTI_TRIE_CONSTRAINT_TABLE_FORMAT,
+)
 from vllm_gr.config.validation import (
     validate_artifact_digest,
     validate_constraint_table_format,
     validate_tokenizer_digest,
 )
 from vllm_gr.constraints.table import (
-    CONSTRAINT_TABLE_TENSOR_NAMES,
     MAX_CONSTRAINT_TABLE_BYTES,
     ConstraintTable,
     ConstraintTableMetadata,
+    constraint_table_tensor_names,
     validate_constraint_table,
 )
 
@@ -43,6 +46,7 @@ _ARTIFACT_METADATA_KEYS = frozenset(
 _MAX_SAFETENSORS_HEADER_BYTES = 1024 * 1024
 _MAX_ARTIFACT_BYTES = MAX_CONSTRAINT_TABLE_BYTES + _MAX_SAFETENSORS_HEADER_BYTES + 8
 _TENSOR_DTYPES: dict[str, tuple[str, np.dtype[Any]]] = {
+    "first_token_offsets": ("I32", np.dtype(np.int32)),
     "first_token_ids": ("I32", np.dtype(np.int32)),
     "prefix1_offsets": ("I32", np.dtype(np.int32)),
     "prefix1_values": ("I32", np.dtype(np.int32)),
@@ -115,8 +119,11 @@ def _load_artifact_header(data: bytes) -> tuple[dict[str, str], dict[str, object
         not isinstance(key, str) or not isinstance(value, str) for key, value in metadata.items()
     ):
         raise ValueError("constraint table artifact must contain string safetensors metadata")
-    missing = sorted(_ARTIFACT_METADATA_KEYS - set(metadata))
-    unknown = sorted(set(metadata) - _ARTIFACT_METADATA_KEYS)
+    expected_keys = _ARTIFACT_METADATA_KEYS
+    if metadata.get("format") == MULTI_TRIE_CONSTRAINT_TABLE_FORMAT:
+        expected_keys = expected_keys | {"trie_count"}
+    missing = sorted(expected_keys - set(metadata))
+    unknown = sorted(set(metadata) - expected_keys)
     if missing or unknown:
         raise ValueError(
             f"constraint table artifact metadata mismatch: missing={missing}, unknown={unknown}"
@@ -132,8 +139,9 @@ def _load_immutable_tensors(
     """Validate tensor descriptors and return zero-copy views over ``data``."""
 
     tensor_names = set(header) - {"__metadata__"}
-    missing_tensors = sorted(set(CONSTRAINT_TABLE_TENSOR_NAMES) - tensor_names)
-    extra_tensors = sorted(tensor_names - set(CONSTRAINT_TABLE_TENSOR_NAMES))
+    names = constraint_table_tensor_names(cast(dict[str, str], header["__metadata__"])["format"])
+    missing_tensors = sorted(set(names) - tensor_names)
+    extra_tensors = sorted(tensor_names - set(names))
     if missing_tensors or extra_tensors:
         raise ValueError(
             "constraint table artifact tensor mismatch: "
@@ -144,7 +152,7 @@ def _load_immutable_tensors(
     descriptors: dict[str, tuple[np.dtype[Any], int, int, int]] = {}
     intervals: list[tuple[int, int, str]] = []
     total_bytes = 0
-    for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+    for name in names:
         descriptor = header[name]
         if not isinstance(descriptor, dict) or set(descriptor) != {
             "dtype",
@@ -210,7 +218,7 @@ def _load_immutable_tensors(
         )
 
     tensors: dict[str, NDArray[Any]] = {}
-    for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+    for name in names:
         dtype, element_count, start, _ = descriptors[name]
         tensors[name] = np.frombuffer(
             data,
@@ -286,6 +294,7 @@ def load_constraint_table_artifact(
         prefix1_pair_keys=tensors["prefix1_pair_keys"],
         prefix2_value_offsets=tensors["prefix2_value_offsets"],
         prefix2_values=tensors["prefix2_values"],
+        first_token_offsets=tensors.get("first_token_offsets"),
         metadata=ConstraintTableMetadata(
             format=metadata["format"],
             artifact_digest=actual_digest,
@@ -294,6 +303,11 @@ def load_constraint_table_artifact(
             max_prefix1_degree=_metadata_int(metadata, "max_prefix1_degree", minimum=0),
             max_prefix2_degree=_metadata_int(metadata, "max_prefix2_degree", minimum=0),
             total_bytes=total_bytes,
+            trie_count=(
+                _metadata_int(metadata, "trie_count", minimum=1)
+                if metadata["format"] == MULTI_TRIE_CONSTRAINT_TABLE_FORMAT
+                else 1
+            ),
         ),
     )
     validate_constraint_table(table)
@@ -308,6 +322,8 @@ def _build_artifact_header(table: ConstraintTable) -> bytes:
         "max_prefix1_degree": str(table.metadata.max_prefix1_degree),
         "max_prefix2_degree": str(table.metadata.max_prefix2_degree),
     }
+    if table.metadata.format == MULTI_TRIE_CONSTRAINT_TABLE_FORMAT:
+        metadata["trie_count"] = str(table.metadata.trie_count)
     # safetensors.numpy.save currently routes metadata through a hash map, so
     # repeated calls can emit a different JSON-key order and therefore a
     # different whole-file digest. Build the small safetensors header directly
@@ -315,7 +331,7 @@ def _build_artifact_header(table: ConstraintTable) -> bytes:
     # padded to an 8-byte boundary as required by the format.
     header: dict[str, object] = {"__metadata__": metadata}
     offset = 0
-    for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+    for name in table.tensor_names:
         tensor = getattr(table, name)
         dtype_name, expected_dtype = _TENSOR_DTYPES[name]
         if tensor.dtype != expected_dtype or not tensor.flags.c_contiguous:
@@ -343,7 +359,7 @@ def _build_artifact_header(table: ConstraintTable) -> bytes:
 def _artifact_chunks(table: ConstraintTable, header_bytes: bytes) -> Iterator[bytes | memoryview]:
     yield len(header_bytes).to_bytes(8, "little", signed=False)
     yield header_bytes
-    for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+    for name in table.tensor_names:
         yield memoryview(getattr(table, name)).cast("B")
 
 

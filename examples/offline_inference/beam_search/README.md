@@ -136,7 +136,8 @@ constraint_table:
 | --- | --- |
 | `enabled` | Must be `true` for V1 |
 | `backend` | `cuda` or `npu`, matching the device |
-| `max_top_k` | Candidate capacity; use the configured Beam width |
+| `max_top_k` | Candidate capacity; must be at least the candidate width |
+| `candidate_width` | Candidates per Beam row (1..256); omit to follow the Beam width. Required when the Beam width exceeds 256 |
 | `path` | Constraint Table `.safetensors` artifact |
 | `format` | Must be `constraint_table_v1` |
 | `artifact_digest` | Digest printed by `build_constraint_table.py` |
@@ -156,7 +157,7 @@ legacy `vllm_gr_*` keys in `additional_config`.
 | `max_model_len` | Must cover the prompt plus effective generation budget |
 | `max_num_batched_tokens` | Must cover the prompt when chunked Prefill is disabled |
 | `max_num_seqs` | The example sets it to the fixed Beam width |
-| `max_logprobs` | Must be large enough for the configured Beam width |
+| `max_logprobs` | Must be at least the candidate width (`candidate_width`) |
 | `enforce_eager` | `false` allows graph execution |
 
 ### Request parameters
@@ -208,6 +209,165 @@ On NPU, `--generated-steps 1` completes in Prefill, so a zero Decode
 the requested Beam graph shape to be captured and replayed. The `fallbacks`
 counter means Beam FULL graph was not used: native FULL is rejected, while
 native PIECEWISE/NONE is retained. It does not count exclusively eager forwards.
+
+### Optional thinking before SID generation
+
+The same `--prompt` file can be used in three modes:
+
+| Options | Execution |
+| --- | --- |
+| Neither thinking flag | Existing direct constrained SID Beam Search |
+| `--enable-thinking` | Ordinary full-vocabulary LLM generation only; no catalog or SID Beam phase |
+| `--cot` | Ordinary thinking generation, followed by constrained SID Beam Search |
+
+`--cot` and `--enable-thinking` are mutually exclusive. Both require a model
+that supports the requested thinking behavior. The combined mode also requires
+dedicated `<think>` and `</think>` tokenizer tokens and a compatible SID catalog.
+It exposes a checkpoint's capabilities; it does not add reasoning proficiency
+to a checkpoint that was not trained for it.
+
+#### NPU setup and commands
+
+Run from the repository root in the configured vLLM-Ascend environment. Set
+`ASCEND_ENV` to the installed CANN environment script, and replace the model and
+prompt paths. All three examples below use the same input file.
+
+```bash
+ASCEND_ENV=/absolute/path/to/CANN/set_env.sh
+source "$ASCEND_ENV"
+# Preserve paths installed by CANN, including the Python acl module.
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export ASCEND_RT_VISIBLE_DEVICES=0
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_USE_V2_MODEL_RUNNER=0
+export USE_TF=0
+
+MODEL=/absolute/path/to/OneRec_Qwen3_1.7B
+CATALOG=tools/AB_Tests/constraints/video_constraint_triples.json
+PROMPT=/absolute/path/to/recommendation_prompt.txt
+BATCH_SIZE=1
+mkdir -p results/cot
+python -c "import acl; print(acl.__file__)"
+```
+
+Set `BATCH_SIZE=4` to run four requests instead. This CLI repeats the supplied
+input for each row, with independent row cache salts in the combined workflow.
+It does not accept a separate thinking prompt.
+
+Direct SID Beam Search, with the existing fixed-length input preparation:
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --catalog "$CATALOG" --prompt "$PROMPT" \
+  --constraint-backend npu --execution eager \
+  --batch-size "$BATCH_SIZE" --beam-width 128 \
+  --input-len 128 --generated-steps 3 --print-beams 5
+```
+
+Ordinary thinking-only generation with constraints disabled. Plain text uses the
+model's chat template; serialized Qwen chat retains its existing messages and
+opens the terminal thinking prefix as described below. `--max-tokens` limits the
+complete generated continuation, including any thinking and final answer:
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --prompt "$PROMPT" \
+  --constraint-backend npu --execution eager \
+  --batch-size "$BATCH_SIZE" --enable-thinking \
+  --max-tokens 1024 --max-model-len 8192 \
+  --temperature 0 --top-p 1 --top-k -1 \
+  --output-json "results/cot/thinking_b${BATCH_SIZE}.json"
+```
+
+Thinking followed by SID Beam Search:
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --catalog "$CATALOG" --prompt "$PROMPT" \
+  --constraint-backend npu --execution eager \
+  --batch-size "$BATCH_SIZE" --beam-width 128 --generated-steps 3 \
+  --cot --cot-max-tokens 1024 --max-model-len 8192 \
+  --temperature 0 --top-p 1 --top-k -1 --print-beams 5 \
+  --output-json "results/cot/beam_b${BATCH_SIZE}.json"
+```
+
+#### Input, budget and handoff contract
+
+Both thinking modes retain the complete input and ignore `--input-len`. Plain
+input uses the model's chat template. If that template emits a terminal empty
+`<think>...</think>` span, both modes reopen it without changing earlier token
+IDs. Thinking-only otherwise retains the template's output; the combined CoT
+mode additionally opens a missing thinking tag and rejects nonempty, already
+closed template reasoning rather than deleting it.
+
+Qwen-style serialized ChatML is accepted either as text with real line breaks,
+or as one complete JSON string whose decoded value is ChatML. JSON is decoded
+exactly once, only for a string beginning with `<|im_start|>` (apart from leading
+whitespace); other plain text, including quoted text, is kept as plain text.
+Both modes preserve the existing messages, open the terminal empty assistant/
+thinking prefix, and change only a terminal `/no_think` directive to `/think`.
+This serialized path requires dedicated `<think>` and `</think>` tokenizer
+tokens. Nonempty final assistant content is rejected rather than silently
+removed. Input files are never modified.
+
+Legacy bare single-line ChatML containing literal `\n` is rejected: there is no
+safe way to distinguish escaped separators from body text such as `C:\new` or
+an intentional literal `\n`. This includes the existing
+`tests/resources/single_one_rec_prompt.txt` fixture when used directly in a
+thinking mode. Supply the intended conversation with real line breaks, or
+serialize that intended text with `json.dumps` instead of globally replacing
+backslashes. For example:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+chatml = (
+    "<|im_start|>user\n"
+    r"Keep the path C:\new and the literal \n unchanged."
+    "\n/no_think<|im_end|>\n<|im_start|>assistant\n"
+)
+Path("thinking_chatml.json").write_text(
+    json.dumps(chatml, ensure_ascii=False), encoding="utf-8"
+)
+PY
+```
+
+Pass `--prompt thinking_chatml.json` in either thinking mode. JSON encodes a
+structural newline as `\n` and a body backslash as `\\`, so the path and literal
+escape above survive decoding unchanged. The direct SID Beam mode keeps its
+existing fixed-length preparation and literal file-text encoding; it does not
+apply this thinking-input JSON decoding or normalization.
+
+`--cot-max-tokens` defaults to 1024 and applies only to the thinking phase.
+`--generated-steps` remains the SID generation budget. The full input, thinking
+budget, separator and SID boundary positions must fit `--max-model-len`; the
+actual handed-off length is checked again before Beam dispatch.
+
+The default `--cot-on-limit error` requires the model to emit `</think>` before
+starting Beam. An unclosed span, including EOS without `</think>`, fails the
+whole batch before the SID phase. To explicitly continue after the thinking
+budget is exhausted, add `--cot-on-limit truncate` to the combined command.
+Only an actual length-budget stop permits this policy: every generated token
+is retained, a closing token is appended, and the report records
+`thinking_truncated=true` and `forced_close=true`. This is forced closure,
+not a naturally completed thought. Other incomplete stop conditions still fail.
+
+The SID phase receives the original input token IDs, the thinking continuation
+IDs and a separator. It does not decode and re-encode the continuation. Both
+phases use one loaded engine, but have separate cache salts: this version
+hands off token IDs and performs a fresh Beam Prefill, without cross-phase KV
+reuse. The JSON output includes raw generated thinking IDs, effective handed-off
+IDs, truncation status, per-row context lengths and final Beam results.
+
+These are functional examples, with no performance threshold or recommendation
+quality improvement claimed. Optional existing timing/profiling arguments are
+diagnostics. Change `--execution eager` to `--execution graph` to request the
+existing NPU graph path; normal runtime fallbacks remain applicable. A graph
+configuration or a SID Decode replay does not prove FULL Prefill replay, and
+this feature does not extend Prefill graph coverage. CUDA hardware validation
+of the combined workflow is not included.
 
 ### NPU graph correctness regression
 

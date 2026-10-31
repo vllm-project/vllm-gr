@@ -23,7 +23,7 @@ from vllm_gr.constraints.validity import valid_mask_from_counts
 
 
 class CPUConstraintBackend:
-    """Keep all six canonical tensors on Host for the Backend lifetime."""
+    """Keep canonical constraint tables on Host for the Backend lifetime."""
 
     __slots__ = ("_closed", "_info", "_table")
 
@@ -45,23 +45,31 @@ class CPUConstraintBackend:
         self,
         prefixes: NDArray[np.int32],
         current_step: int,
+        trie_ids: NDArray[np.int32] | None = None,
     ) -> list[NDArray[np.int32]]:
+        """Query validated inputs; None IDs use the single-Trie fast path."""
         table = self._require_table()
         rows = prefixes.shape[0]
         if current_step == 0:
-            return [table.first_token_ids] * rows
+            if trie_ids is None:
+                return [table.first_token_ids] * rows
+            return [
+                table.first_token_ids[table.root_offsets[r] : table.root_offsets[r + 1]]
+                for r in trie_ids
+            ]
 
         vocab_size = table.metadata.vocab_size
         empty1 = table.prefix1_values[:0]
         if current_step == 1:
             allowed: list[NDArray[np.int32]] = []
-            for raw_a in prefixes[:, 0]:
+            for index, raw_a in enumerate(prefixes[:, 0]):
                 a = int(raw_a)
                 if not 0 <= a < vocab_size:
                     allowed.append(empty1)
                     continue
-                begin = int(table.prefix1_offsets[a])
-                end = int(table.prefix1_offsets[a + 1])
+                row = a if trie_ids is None else int(trie_ids[index]) * vocab_size + a
+                begin = int(table.prefix1_offsets[row])
+                end = int(table.prefix1_offsets[row + 1])
                 allowed.append(table.prefix1_values[begin:end])
             return allowed
 
@@ -69,12 +77,13 @@ class CPUConstraintBackend:
         # key. Otherwise values such as (-1, vocab + b) can alias (0, b).
         empty2 = table.prefix2_values[:0]
         result: list[NDArray[np.int32]] = []
-        for raw_a, raw_b in prefixes[:, :2]:
+        for index, (raw_a, raw_b) in enumerate(prefixes[:, :2]):
             a, b = int(raw_a), int(raw_b)
             if not (0 <= a < vocab_size and 0 <= b < vocab_size):
                 result.append(empty2)
                 continue
-            pair_key = a * vocab_size + b
+            row = a if trie_ids is None else int(trie_ids[index]) * vocab_size + a
+            pair_key = row * vocab_size + b
             position = int(np.searchsorted(table.prefix1_pair_keys, pair_key))
             if (
                 position >= table.prefix1_pair_keys.size
@@ -92,13 +101,17 @@ class CPUConstraintBackend:
         logits: torch.Tensor,
         metadata: ConstraintMetadata,
     ) -> ConstraintOutput:
-        self._require_table()
+        table = self._require_table()
         validate_select_inputs(logits, metadata, self._info)
 
-        # Prefixes are the only request data needed on Host. Raw logits never
-        # leave their device, and the canonical tensors never leave Host.
+        # Copy prefixes and multi-Trie selectors to Host. Raw logits never
+        # leave their device, and single-Trie queries need no selector array.
         prefixes = metadata.prefix_token_ids.detach().to(device="cpu").numpy()
-        allowed = self._allowed_ids(prefixes, metadata.current_step)
+        trie_ids = None
+        if table.metadata.trie_count > 1:
+            assert metadata.trie_ids is not None  # Checked by validate_select_inputs.
+            trie_ids = metadata.trie_ids.detach().cpu().numpy()
+        allowed = self._allowed_ids(prefixes, metadata.current_step, trie_ids)
         candidate_width = max(
             metadata.top_k,
             max((int(ids.size) for ids in allowed), default=0),

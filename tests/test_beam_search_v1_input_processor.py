@@ -320,14 +320,69 @@ def test_offline_inputs_preserve_caller_formed_batch_order(batch_size: int) -> N
     assert len({item.request.request_id for item in request.items}) == batch_size
 
 
-def test_explicit_candidate_width_rejects_a_non_uniform_dynamic_schedule() -> None:
-    """A configured fixed K and a shrinking schedule contradict each other.
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("independent_k", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "trie_ids", [None, [0, 1], [1, 1], (1, 0), [True, 0], [-1, 0], [None, 1], [0]]
+)
+def test_per_prompt_trie_selection(trie_ids: Any, online: bool, independent_k: bool) -> None:
+    engine = _make_engine()
+    params = BeamSearchParams(
+        beam_width=2,
+        max_tokens=3,
+        ignore_eos=True,
+        per_parent_beam_widths=[2, 1, 1] if independent_k else None,
+    )
 
-    ``constraint_table.candidate_width`` promises one per-row candidate count,
-    but the executed top-k follows the active stage width, so ``[2, 2, 1]``
-    silently ignores the configured K after the first stage.  The guard has to
-    read the *configuration* field: the frontend never copies it into
-    ``BeamBatchParams``, so a request-only check would never fire.
+    def prepare() -> BeamBatchRequest:
+        processor = BeamSearchInputProcessor(engine)
+        if online:
+            serving = SimpleNamespace(
+                input_processor=SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+            )
+            call = OnlineBeamSearchRequest(
+                prompts=([1, 2], [3, 4]),
+                request_id="external-id",
+                params=params,
+                trie_ids=trie_ids,
+            )
+            return asyncio.run(processor.process_online_inputs(serving, call))
+        engine.get_supported_tasks = lambda: ("generate",)
+        llm = SimpleNamespace(
+            get_tokenizer=lambda: SimpleNamespace(eos_token_id=2),
+            _preprocess_cmpl=lambda prompts: prompts,
+            _lora_request_to_seq=lambda lora, size: [lora] * size,
+        )
+        offline_call = OfflineBeamSearchRequest(
+            prompts=[[1, 2], [3, 4]], params=params, trie_ids=trie_ids
+        )
+        return processor.process_offline_inputs(llm, offline_call)
+
+    if trie_ids is not None and (
+        len(trie_ids) != 2 or any(type(trie_id) is not int or trie_id < 0 for trie_id in trie_ids)
+    ):
+        with pytest.raises(BeamSearchRequestError, match="trie_ids"):
+            prepare()
+    else:
+        request = prepare()
+        assert [item.trie_id for item in request.items] == (
+            [0, 0] if trie_ids is None else list(trie_ids)
+        )
+        assert request.beam_params.per_parent_beam_widths == ((2, 1, 1) if independent_k else None)
+
+
+def test_configured_candidate_width_reaches_the_request_under_dynamic_schedules() -> None:
+    """A configured K is carried through, whatever the dynamic schedule.
+
+    Each stage selects its own ``output_width`` survivors out of the K
+    candidates its parents supply, so a schedule needs only
+    ``K >= max(stage widths)``.  The #525 review found a uniform but narrower
+    schedule silently ran TopK at the stage width; the public frontend must now
+    hand the worker K itself and ask the sampler for K logprobs per row.
+
+    An unset K must not be derived onto the wire: it stays ``None`` so every
+    stage keeps its pre-decoupling top-k (its own output width), while the
+    sampler still returns ``W`` logprobs per row as before.
     """
 
     def _config(candidate_width: int | None) -> dict[str, Any]:
@@ -336,7 +391,7 @@ def test_explicit_candidate_width_rejects_a_non_uniform_dynamic_schedule() -> No
             additional["vllm_gr"]["constraint_table"]["candidate_width"] = candidate_width
         return additional
 
-    def _submit(candidate_width: int | None, dynamic_widths: list[int] | None) -> None:
+    def _submit(candidate_width: int | None, dynamic_widths: list[int] | None) -> BeamBatchRequest:
         engine = _make_engine(additional_config=_config(candidate_width))
         # Offline construction is synchronous; the shared fixture's AsyncMock
         # would hand a coroutine to the engine request.
@@ -357,18 +412,74 @@ def test_explicit_candidate_width_rejects_a_non_uniform_dynamic_schedule() -> No
                 dynamic_beam_widths=dynamic_widths,
             ),
         )
-        BeamSearchInputProcessor(engine).process_offline_inputs(llm, request)
+        return BeamSearchInputProcessor(engine).process_offline_inputs(llm, request)
 
-    # Configured K with stage widths that retain less than K: rejected,
-    # because the executed top-k still follows the active stage width.
-    with pytest.raises(BeamSearchRequestError, match="does not match"):
-        _submit(2, [2, 2, 1])
-    with pytest.raises(BeamSearchRequestError, match="does not match"):
-        _submit(2, [1, 1, 1])
-    # Every stage retaining exactly K: accepted.
-    _submit(2, [2, 2, 2])
-    # No configured K: dynamic schedules keep working exactly as before.
-    _submit(None, [2, 2, 1])
+    def _assert_k(request: Any, wire: int | None, logprobs: int) -> None:
+        # The worker reads K from the wire params, and the sampler is asked for
+        # K logprobs per row -- the two places K has to arrive intact.
+        assert request.beam_params.candidate_width == wire
+        for item in request.items:
+            assert item.request.sampling_params.logprobs == logprobs
+
+    # Configured K plus a uniform but narrower schedule: K, not the stage width.
+    # The #525 review observed K=2 / (1, 1, 1) running TopK=1; it must carry 2.
+    _assert_k(_submit(2, [1, 1, 1]), 2, 2)
+    # Configured K plus a shrinking schedule: K covers every stage.
+    _assert_k(_submit(2, [2, 2, 1]), 2, 2)
+    # Configured K plus a schedule that retains exactly K: unchanged.
+    _assert_k(_submit(2, [2, 2, 2]), 2, 2)
+    # No configured K: nothing on the wire, so each stage takes its own output
+    # width as top-k; the sampler still returns W logprobs, as before.
+    for widths in ([2, 2, 1], [1, 1, 1], None):
+        request = _submit(None, widths)
+        _assert_k(request, None, 2)
+        if widths is not None:
+            params = request.beam_params
+            assert params.dynamic_beam_widths == tuple(widths)
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("max_logprobs", "accepted"),
+    [
+        (-1, True),  # vLLM's default sentinel means "the whole vocabulary"
+        (0, False),
+        (1, False),  # K == 2 does not fit
+        (2, True),
+        (16, True),
+    ],
+)
+def test_request_logprob_budget_matches_vllm_sentinel_semantics(
+    max_logprobs: int, accepted: bool
+) -> None:
+    """``max_logprobs=-1`` is vLLM's sentinel, not a negative limit.
+
+    ``SamplingParams._validate_logprobs`` normalizes it to the vocabulary size
+    before comparing; comparing a positive candidate width against the raw
+    sentinel rejected every default deployment, K == W included.
+    """
+    engine = _make_engine()
+    # Offline construction is synchronous; the shared fixture's AsyncMock would
+    # hand a coroutine to the engine request.
+    engine.get_supported_tasks = lambda: ("generate",)
+    engine.vllm_config.model_config.max_logprobs = max_logprobs
+    engine.vllm_config.model_config.get_vocab_size = lambda: 128
+    tokenizer = SimpleNamespace(eos_token_id=2, convert_tokens_to_ids=lambda token: 7)
+    llm = SimpleNamespace(
+        get_tokenizer=lambda: tokenizer,
+        _preprocess_cmpl=lambda prompts: prompts,
+        _lora_request_to_seq=lambda lora, size: [lora] * size,
+    )
+    request = OfflineBeamSearchRequest(
+        prompts=[[1, 2]],
+        params=BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+    )
+    processor = BeamSearchInputProcessor(engine)
+
+    if accepted:
+        processor.process_offline_inputs(llm, request)
+        return
+    with pytest.raises(BeamSearchRequestError, match="exceeds max_logprobs"):
+        processor.process_offline_inputs(llm, request)
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]

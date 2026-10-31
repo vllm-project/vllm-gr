@@ -212,8 +212,19 @@ class NPUEagerBeamStageRunner:
         width = execution.beam_width
         candidates = self.prefill_candidates
         initial_scores = candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf"))
-        context.decision.sequence[: execution.batch_size, :width, 0].copy_(candidates.token_ids)
-        context.decision.beam_scores[: execution.batch_size, :width].copy_(initial_scores)
+        # Candidates carry K columns while the decision state is W-wide, and the
+        # two are independent.  The candidates are score-ordered, so the first
+        # min(W, K) are the survivors; beams beyond that stay inactive with
+        # -inf scores (0 token id, since Prefill parents are zero by definition).
+        candidate_width = candidates.token_ids.shape[1]
+        live = min(width, candidate_width)
+        sequence = context.decision.sequence[: execution.batch_size, :width, 0]
+        scores = context.decision.beam_scores[: execution.batch_size, :width]
+        sequence[:, :live].copy_(candidates.token_ids[:, :live])
+        scores[:, :live].copy_(initial_scores[:, :live])
+        if live < width:
+            sequence[:, live:].zero_()
+            scores[:, live:].fill_(float("-inf"))
         context.decision.worker_decode_steps = 1
         self.parent_history = (
             torch.zeros_like(context.decision.sequence) if self._needs_parent_history() else None
@@ -276,6 +287,8 @@ class NPUEagerBeamStageRunner:
         metadata = self._metadata(scheduler_output)
         session_init = getattr(metadata, "session_init", None)
         if session_init is not None:
+            if any(item.trie_id != 0 for item in session_init.items):
+                raise ValueError("NPU currently supports trie_id=0 only")
             if plan.execution.kind != "prefill" or self.session_request is not None:
                 raise ValueError("NPU session_init must appear once on Prefill")
             self.session_request = session_init

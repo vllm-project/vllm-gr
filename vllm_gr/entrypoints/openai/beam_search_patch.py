@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -15,9 +16,12 @@ if TYPE_CHECKING:
 _ADMISSION_REJECTION_PATCH_MARKER = "_vllm_gr_admission_rejection_patch"
 _CLIENT_REQUEST_ID_PATCH_MARKER = "_vllm_gr_client_request_id_patch"
 _SUBMIT_REQUEST_ID_PATCH_MARKER = "_vllm_gr_submit_request_id_patch"
+_COMPLETION_TRIE_IDS: ContextVar[Iterator[int] | None] = ContextVar(
+    "completion_trie_ids", default=None
+)
 
 
-async def beam_search_dispatch(
+def beam_search_dispatch(
     self,
     prompt: EngineInput | Sequence[EngineInput],
     request_id: str,
@@ -25,6 +29,8 @@ async def beam_search_dispatch(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
     session_id: str | None = None,
+    *,
+    trie_ids: list[int] | tuple[int, ...] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
     """Adapt upstream OpenAI Beam calls to GR V1 or native non-GR inference.
 
@@ -35,6 +41,11 @@ async def beam_search_dispatch(
 
     ``prompt`` may be a sequence when a caller submits one fixed V1 batch.
     """
+    # Capture at generator creation, not iteration: upstream may consume the
+    # per-prompt generators concurrently or after returning a streaming response.
+    selectors = _COMPLETION_TRIE_IDS.get()
+    if trie_ids is None and selectors is not None:
+        trie_ids = [next(selectors)]
     from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 
     from vllm_gr.config import BeamExecutionMode, GRConfig
@@ -64,7 +75,12 @@ async def beam_search_dispatch(
                 parameter="per_parent_beam_widths",
             )
         impl = BeamSearchOnlineMixin.beam_search
-    async for output in impl(
+    trie_kwargs = {}
+    if trie_ids is not None:
+        if gr_config.beam_execution_mode is not BeamExecutionMode.V1:
+            raise ValueError("trie_ids require GR beam_search_v1")
+        trie_kwargs["trie_ids"] = trie_ids
+    return impl(
         self,
         prompt=prompt,
         request_id=request_id,
@@ -72,8 +88,8 @@ async def beam_search_dispatch(
         lora_request=lora_request,
         trace_headers=trace_headers,
         session_id=session_id,
-    ):
-        yield output
+        **trie_kwargs,
+    )
 
 
 def patch_beam_search():
@@ -187,6 +203,7 @@ def patch_client_request_id():
 
 
 def patch_sampling():
+    from pydantic import StrictInt
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 
@@ -201,6 +218,12 @@ def patch_sampling():
 
     ChatCompletionRequest.to_beam_search_params = to_beam_search_params
     CompletionRequest.to_beam_search_params = to_beam_search_params
+    # Upstream xargs only accepts scalars; the GR completion extension also
+    # carries per-input selectors and per-stage widths as integer lists.
+    CompletionRequest.model_fields["vllm_xargs"].annotation = (
+        dict[str, str | int | float | list[StrictInt]] | None
+    )
+    CompletionRequest.model_rebuild(force=True)
 
 
 def patch_engine_core_process_entrypoint() -> None:

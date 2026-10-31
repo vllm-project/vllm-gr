@@ -368,8 +368,9 @@ def test_cuda_loader_rejects_unsupported_table_degree_before_upload() -> None:
 
 
 @pytest.mark.parametrize("offset", [0, 129])  # type: ignore[misc]
+@pytest.mark.parametrize("multi_trie", [False, True])  # type: ignore[misc]
 def test_canonical_worker_enables_vocab_slice_before_first_forward(
-    tmp_path: Path, offset: int
+    tmp_path: Path, offset: int, multi_trie: bool
 ) -> None:
     from unittest.mock import MagicMock
 
@@ -390,9 +391,18 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     tokenizer.get_vocab.return_value = {str(i): i for i in range(256)}
     tokenizer.convert_tokens_to_ids.side_effect = lambda values: [int(v) for v in values]
     triples = [[str(offset + i) for i in row] for row in [(1, 3, 0), (1, 3, 8), (2, 4, 7)]]
-    table = ConstraintTableArtifactCompiler(
+    compiler = ConstraintTableArtifactCompiler(
         tokenizer, 256, tokenizer_digest="sha256:" + "b" * 64
-    ).compile(compile_relations_json(triples))
+    )
+    document = compile_relations_json(triples)
+    if multi_trie:
+        second = compile_relations_json(
+            [[str(int(token) + 16) for token in row] for row in triples]
+        )
+        table = compiler.compile_tries([document, second])
+    else:
+        table = compiler.compile(document)
+    slice_size = 25 if multi_trie else 9
     path = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(table, path)
     config = GRConfig(
@@ -403,6 +413,7 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
             path=str(path),
             artifact_digest=digest,
             tokenizer_digest=table.metadata.tokenizer_digest,
+            format=table.metadata.format,
             max_top_k=2,
         ),
     )
@@ -431,7 +442,7 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     shutdown = make_shutdown_with_constraint_backend()
     try:
         load(runner)
-        assert runner.model[0]._gr_vocab_slice == (offset, 9)
+        assert runner.model[0]._gr_vocab_slice == (offset, slice_size)
         assert get_vocab_slice_config()[:2] == (None, None)
         # Exercise the existing projection with the worker-derived configuration.
         torch.manual_seed(0)
@@ -448,14 +459,14 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
             },
         )()
         sliced_logits = runner.model[0]._get_logits(hidden, head, None)
-        assert sliced_logits.shape == (2, 9)
+        assert sliced_logits.shape == (2, slice_size)
         torch.testing.assert_close(
-            sliced_logits, full_logits[:, offset : offset + 9], atol=2e-3, rtol=2e-3
+            sliced_logits, full_logits[:, offset : offset + slice_size], atol=2e-3, rtol=2e-3
         )
         # All three steps must preserve global token IDs and the validity mask.
         # The scoring contract normalizes over the logits window that was
         # actually computed: full_logits uses the full window, sliced_logits
-        # uses the 9-token slice window.  The two normalize over different
+        # uses the shared slice window. The two normalize over different
         # domains, so their absolute logprobs legitimately differ; each must
         # match the shared full-window implementation over its own window.
         from vllm_gr.constraints.scoring import score_selected_tokens
@@ -463,11 +474,19 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
         for step in range(3):
             metadata = ConstraintMetadata(
                 prefix_token_ids=torch.tensor(
-                    [[offset + 1, offset + 3, 0]] * 2, dtype=torch.int32, device="cuda"
+                    [
+                        [offset + 1, offset + 3, 0],
+                        [offset + (17 if multi_trie else 1), offset + (19 if multi_trie else 3), 0],
+                    ],
+                    dtype=torch.int32,
+                    device="cuda",
                 ),
                 temperatures=torch.ones(1, device="cuda"),
                 current_step=step,
                 top_k=2,
+                trie_ids=(
+                    torch.tensor([0, 1], dtype=torch.int32, device="cuda") if multi_trie else None
+                ),
             )
             expected = runner.constraint_backend.select(full_logits, metadata)
             actual = runner.constraint_backend.select(sliced_logits, metadata)
@@ -490,7 +509,7 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
             torch.testing.assert_close(expected.logprobs, full_ref, atol=2e-3, rtol=2e-3)
         # A reload must clear the old slice before constructing the next model.
         load(runner)
-        assert runner.model[0]._gr_vocab_slice == (offset, 9)
+        assert runner.model[0]._gr_vocab_slice == (offset, slice_size)
         assert get_vocab_slice_config()[:2] == (None, None)
     finally:
         shutdown(runner)

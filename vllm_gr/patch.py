@@ -276,6 +276,7 @@ def _validate_engine_core_request_patch() -> str | None:
 
     valid = (
         getattr(EngineCore, "_handle_submit_gr_session", None) is _handle_submit_gr_session
+        and getattr(EngineCore.__init__, "_gr_trie_capacity_patch", False)
         and getattr(EngineCoreProc, "_handle_submit_gr_session", None) is _handle_submit_gr_session
         and getattr(EngineCore, "is_gr_session_retired", None) is is_gr_session_retired
         and getattr(EngineCoreProc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)

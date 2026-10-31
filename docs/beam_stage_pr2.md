@@ -22,8 +22,10 @@ prompt KV. Subsequent invocations execute W physical model rows using the
 existing model, Beam Attention context, registry and PR1 runner. Tokens,
 scores, parents, histories, counters and completion records remain on GPU.
 
-Supported execution is B=1, one active session, TP/PP/DP=1, fixed W<=256,
-effective N in {1,2,3}, FP16/BF16 and a loaded canonical CUDA Constraint Table.
+Supported execution is B=1, one active session, TP/PP/DP=1, fixed W<=1024 with
+candidate width K<=256 (K defaults to W; the fused W-way merge only applies
+while K==W and W in {64,128,256}), effective N in {1,2,3}, FP16/BF16 and a
+loaded canonical CUDA Constraint Table.
 The effective budget includes the first Prefill output; begin/end adjustments
 already made by A2 are never applied again. Initial chunked Prefill and native
 Prefix Cache are supported. Generated-state recompute, heterogeneous/mixed
@@ -40,7 +42,7 @@ views expose terminal device state for the future A5 consumer.
 | Physical execution | Immutable dispatch entries with metadata, model row offset and count |
 | Stage identity | A3 session/dispatch/stage references, independent of physical/resource rows |
 | Dynamic Beam state | Existing `[Bcap,W,...]` state with per-row generated, Decode, active, finished, error and completed counters |
-| Candidates and prefixes | Existing workspace `[Bcap,W,W]` and `[Bcap,W,3]` tensors |
+| Candidates and prefixes | Existing workspace `[Bcap,W,K]` and `[Bcap,W,3]` tensors |
 | Attention dynamic values | Execution-local mask, positions, suffix offsets and context step scalar populated from the selected state row |
 | Shared selection/KV scratch | Explicit context and workspace execution owner; storage capacity never grants concurrency |
 | Control snapshots | Two dispatch slots, one entry per dispatch, three int32 fields per entry |
