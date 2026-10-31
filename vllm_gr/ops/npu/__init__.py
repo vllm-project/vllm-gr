@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Reserved NPU operator namespace.
+"""NPU operator namespace.
 
 Ascend fused operators are supplied by the vendor runtime (xllm-ops built
 for the CANN 9.2.0 base image). Their registration contract is validated

@@ -41,8 +41,9 @@ Installing the vendor stack with plain pip is not a supported alternative:
 
 - Triton-Ascend is not published on PyPI.
 - The torch build used by the image has no public PyPI distribution.
-- Every opencv 4.13+ wheel declares `numpy>=2`, while triton-ascend
-  declares `numpy==1.26.4`; no single pip resolution can satisfy both.
+- Every opencv wheel for Python 3.9+ declares `numpy>=2`, while
+  triton-ascend declares `numpy==1.26.4`; no single pip resolution can
+  satisfy both.
 
 See the [vllm-ascend v0.30.0rc2 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.30.0rc2).
 
@@ -112,7 +113,7 @@ python -c "from vllm_gr._env_check import check_environment; print(check_environ
 validated image is assembled stepwise, so pip never re-validates the final
 combination, and two classes of pre-existing reports are expected:
 
-- Declaration conflict: the image's opencv-python-headless 4.13 declares
+- Declaration conflict: the image's opencv-python-headless 5.x wheel declares
   `numpy>=2` while triton-ascend 3.6.0 declares `numpy==1.26.4`. The
   conflict is metadata-only at runtime: the image's cv2 binary is built
   against numpy 2 headers and is ABI-compatible with the installed numpy

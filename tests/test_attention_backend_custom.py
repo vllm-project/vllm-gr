@@ -230,6 +230,23 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
             )
         assert reasons == []
 
+    def test_backend_pins_ascend_kv_cache_shape(self):
+        """vLLM 0.30 dropped the base-class method; the NPU runner calls it."""
+        from vllm import envs as vllm_envs
+
+        from vllm_gr.v1.attention.backends import beam_attn
+
+        def shape_for(layout):
+            with mock.patch.object(vllm_envs, "VLLM_KV_CACHE_LAYOUT", layout):
+                return beam_attn.BeamAttentionBackend.get_kv_cache_shape(8, 128, 2, 64)
+
+        # Default (unset) and the token-major NHD view.
+        assert shape_for(None) == (2, 8, 128, 2, 64)
+        assert shape_for("NHD") == (2, 8, 128, 2, 64)
+        # Head-major layouts switch the block/head axes, matching vllm-ascend.
+        assert shape_for("HND") == (2, 8, 2, 128, 64)
+        assert shape_for("LBHNC") == (2, 8, 2, 128, 64)
+
     def test_impl_accepts_vllm_sinks_keyword(self):
         """Attention forwards extra implementation arguments as ``sinks``."""
         import inspect

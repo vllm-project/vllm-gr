@@ -13,11 +13,46 @@ from collections.abc import Callable, Sequence
 import pytest
 
 
+def _innermost(target: Callable[..., object]) -> Callable[..., object]:
+    """Follow wrapper chains down to the function that owns the real signature.
+
+    ``inspect.unwrap`` only follows ``__wrapped__``, which well-behaved wrappers
+    set via ``functools.wraps``. Some third-party wrappers installed at import
+    time do not: vllm-ascend's profiling-chunk patch replaces
+    ``EngineCore.__init__`` with a plain closing function
+    (``def _patched_engine_core_init(self, *args, **kwargs)``) that only closes
+    over ``original_init``. Importing ``vllm.entrypoints.launchers.cli_args``
+    installs it as a module-level side effect, so whether these contract checks
+    see the upstream signature depends on what ran earlier in the process.
+    Resolve that shape too, so the contract stays order-independent and still
+    describes the upstream API vllm-gr patches.
+    """
+    current = target
+    for _ in range(10):
+        wrapped = getattr(current, "__wrapped__", None)
+        if wrapped is not None:
+            current = wrapped
+            continue
+        try:
+            nonlocals = inspect.getclosurevars(current).nonlocals
+        except TypeError:
+            break
+        originals = [
+            value
+            for name, value in nonlocals.items()
+            if name.startswith("original") and callable(value)
+        ]
+        if len(originals) != 1:
+            break
+        current = originals[0]
+    return current
+
+
 def _assert_parameter_prefix(
     target: Callable[..., object],
     expected: Sequence[str],
 ) -> None:
-    parameters = list(inspect.signature(inspect.unwrap(target)).parameters)
+    parameters = list(inspect.signature(_innermost(target)).parameters)
     assert parameters[: len(expected)] == list(expected)
 
 

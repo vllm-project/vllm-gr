@@ -53,8 +53,9 @@ def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tens
     cpu_positions = None
     if hasattr(runner, "positions") and runner.positions is not None:
         if isinstance(runner.positions, torch.Tensor):
-            # The historical vLLM-Ascend runner uses a plain device tensor in
-            # PCP paths; retain this shape until the 0.30 NPU path is validated.
+            # The Ascend runner uses a plain device tensor in PCP paths;
+            # accepted as-is because that path keeps its own pinned host
+            # buffer, resolved below.
             gpu_positions = runner.positions
         else:
             gpu_positions = getattr(runner.positions, "gpu", None)

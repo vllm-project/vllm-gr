@@ -248,6 +248,32 @@ patches:
     contract: npu-spawn-start-method
     removal_condition: upstream _maybe_force_spawn() covers NPU (or delegates to the platform interface)
 
+  - id: GR-PATCH-018
+    owner: vllm_gr/v1/ascend_compat.py
+    installer: vllm_gr.v1.ascend_compat.apply_penalties_warmup_oom_guard
+    activation: NPUWorker init_device runs in the child process and the native penalties warmup callable is present
+    validator_or_test:
+      - vllm_gr.v1.ascend_compat.apply_penalties_warmup_oom_guard return value
+      - NPU end-to-end benchmark gate (engine startup at --max_num_seqs 2048)
+    process_roles: [npu_worker]
+    target: vllm_ascend.model_executor.warmup.kernel_warmup.penalties_triton_warmup
+    risk: medium
+    contract: npu-penalties-warmup-oom
+    removal_condition: vllm-ascend sizes the warmup dummies from the available NPU budget, or vllm-gr no longer runs a large vocabulary beside the KV cache
+
+  - id: GR-PATCH-019
+    owner: vllm_gr/v1/ascend_compat.py
+    installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer
+    activation: create_engine_config runs on the NPU platform; re-asserted on every call
+    validator_or_test:
+      - vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer return value
+      - NPU EngineCore startup (vllm-ascend AscendConfig pydantic extra="forbid")
+    process_roles: [main, engine_core]
+    target: vllm.v1.engine.core.EngineCoreProc.run_engine_core and vllm_ascend.ascend_config.init_ascend_config
+    risk: high
+    contract: ascend-config-additional-config-keys
+    removal_condition: vllm-ascend's AscendConfig accepts unknown additional_config keys, or vllm-gr stops carrying its configuration in additional_config
+
 # IDs are retained here when the installer and its legacy surface have been removed.
 retired_patches:
   - id: GR-PATCH-006

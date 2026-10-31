@@ -60,6 +60,8 @@ aligned with it.
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
 | GR-PATCH-016 | `vllm_gr/npu_spawn_patch.py` | `vllm_gr.npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
+| GR-PATCH-018 | `vllm_gr/v1/ascend_compat.py` | `apply_penalties_warmup_oom_guard` | NPUWorker `init_device` runs and the native penalties warmup is present | installer result; NPU startup at `--max_num_seqs 2048` | NPU worker |
+| GR-PATCH-019 | `vllm_gr/v1/ascend_compat.py` | `apply_engine_core_config_sanitizer` | `create_engine_config` on the NPU platform, re-asserted per call | installer result; NPU EngineCore startup | main, EngineCore |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -341,6 +343,55 @@ aligned with it.
   in the process that is about to create worker subprocesses.
 - Removal condition: upstream `_maybe_force_spawn()` covers NPU (or delegates the
   decision to the platform interface).
+
+### GR-PATCH-018 — Ascend Penalties Warmup OOM Guard
+
+- Source / Installer: `vllm_gr/v1/ascend_compat.py`
+- Orchestration: `vllm_gr/v1/ascend_compat.py::patch_npu_worker_init_device`
+- Target: `vllm_ascend.model_executor.warmup.kernel_warmup.penalties_triton_warmup`
+- Mutation: module attribute replacement
+- Platform / process role: NPU worker
+- Risk: Medium
+- Behavior: wraps the native warmup so an NPU `OutOfMemoryError` skips the
+  penalties JIT warmup instead of aborting engine startup, then empties the
+  allocator cache and logs the skipped stage. Because vllm-ascend >= 0.30 runs
+  the warmup after the KV cache has taken the memory budget, its
+  `max_num_seqs x padded_vocab` dummy tensors exceed the remaining budget at the
+  benchmark server's `--max_num_seqs 2048`. Requests without penalties — which
+  includes every vllm-gr beam request — never execute those kernels, so only
+  the JIT warmup is lost. Any other exception propagates unchanged.
+- Installation guards: no-op when the module is absent, when the native callable
+  is missing, or when the wrapper is already installed; installation is
+  idempotent.
+- Removal condition: vllm-ascend sizes the warmup dummies from the available
+  NPU budget, or vllm-gr no longer runs a large vocabulary beside the KV cache.
+
+### GR-PATCH-019 — Ascend additional_config Sanitizer
+
+- Source / Installer: `vllm_gr/v1/ascend_compat.py`
+- Orchestration: `vllm_gr/engine/arg_utils_gr.py::create_engine_config`
+- Targets:
+    - `vllm.v1.engine.core.EngineCoreProc.run_engine_core` (process-global
+      staticmethod replacement)
+    - `vllm_ascend.ascend_config.init_ascend_config` (function replacement)
+- Mutation: entrypoint wrapper plus function wrapper
+- Platform / process role: main, EngineCore
+- Risk: High
+- Behavior: strips the canonical `vllm_gr` key and legacy `vllm_gr_*` keys from
+  `additional_config` before vllm-ascend validates it, then delegates to
+  vllm-ascend's own entrypoint so `init_ascend_config` still runs. Stripped keys
+  are stashed in `vllm_gr.config.parser` and merged back on the read path, so
+  parsing is identical to the untouched configuration. vllm-ascend's
+  `AscendConfig` uses pydantic `extra="forbid"` and is initialised in the
+  spawned child before the vllm-gr plugin loads, and it is called again from
+  `NPUWorker.__init__` on a possibly re-serialized config — hence both the
+  entrypoint and the function wrapper.
+- Installation guards: NPU platform only; wrapper installation is idempotent,
+  and the entrypoint is re-asserted by identity check on every
+  `create_engine_config` because each `EngineArgs` round-trip reloads the
+  general plugins and reinstalls their wrappers.
+- Removal condition: vllm-ascend's `AscendConfig` accepts unknown
+  `additional_config` keys, or vllm-gr stops carrying its configuration there.
 
 ## Benchmark-only Runtime Mutations
 

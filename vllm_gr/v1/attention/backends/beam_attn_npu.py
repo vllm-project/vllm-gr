@@ -694,9 +694,9 @@ def prefill_attention_bsnd(
     Nq = attn_metadata.num_heads
     Nkv = attn_metadata.num_kv_heads
     D = query.shape[-1]
-    # 20261020: GQA: Q/out [B,P,Nq,D], K/V [B,P,Nkv,D]
-    # 20261019: Ported v4 fix; historical note: 20261008 reshape can preserve a strided QKV slice; FIA requires
-    # contiguous inputs. The output must alias the caller's buffer, never a reshape copy.
+    # GQA: Q/out [B,P,Nq,D], K/V [B,P,Nkv,D]. FIA requires contiguous inputs;
+    # reshaping a strided QKV slice can preserve the stride, so materialize
+    # explicitly. The output must alias the caller's buffer, never a copy.
     q_bsnd = query.reshape(B, P, Nq, D).contiguous()
     k_bsnd = key.reshape(B, P, Nkv, D).contiguous()
     v_bsnd = value.reshape(B, P, Nkv, D).contiguous()

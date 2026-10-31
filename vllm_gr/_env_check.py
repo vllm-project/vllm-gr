@@ -206,7 +206,7 @@ def check_opencv_env() -> None:
             "opencv distribution. On CUDA/CPU reinstall "
             "opencv-python-headless>=4.13.0; on Ascend restore the "
             "opencv-python-headless supplied by the vendor image instead: "
-            "opencv 4.13+ wheels declare numpy>=2 and conflict with the "
+            "current opencv releases declare numpy>=2 and conflict with the "
             "Ascend numpy pin."
         )
 

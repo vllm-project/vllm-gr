@@ -202,7 +202,7 @@ class TestRuntimeResolution(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertFalse(json.loads(output.read_text())["ok"])
 
-    def test_pending_npu_pin_does_not_prevent_cuda_resolution(self) -> None:
+    def test_unset_triton_pin_does_not_prevent_cuda_resolution(self) -> None:
         path = self.repo / "vllm_gr/_env_check.py"
         path.write_text(
             path.read_text().replace(

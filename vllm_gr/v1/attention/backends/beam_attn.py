@@ -707,9 +707,16 @@ class BeamAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
-        # Ascend allocates the KV cache as a (key, value) pair; the leading "2"
-        # splits the token-major NHD block view, matching vllm-ascend's default
-        # (non-LBHNC/HND) layout.
+        # vLLM 0.30 dropped this from the base class; vllm-ascend's NPU runner
+        # calls it on the selected backend to size the pooled K/V cache, so the
+        # shape must match what the Ascend kernels and this module's gather
+        # helpers expect: a leading "2" that splits K from V, then a
+        # token-major block view. Mirror vllm-ascend's own layout switch so an
+        # explicit VLLM_KV_CACHE_LAYOUT=LBHNC/HND stays consistent with it.
+        from vllm import envs as vllm_envs
+
+        if vllm_envs.VLLM_KV_CACHE_LAYOUT in ("LBHNC", "HND"):
+            return (2, num_blocks, num_kv_heads, block_size, head_size)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
