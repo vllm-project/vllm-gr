@@ -155,6 +155,27 @@ def test_per_parent_beam_widths_controls_per_parent_candidate_width() -> None:
         assert view.candidate_top_k == expected
 
 
+def test_candidate_top_k_clamps_to_output_width() -> None:
+    """A parent cannot contribute more survivors than the stage keeps."""
+
+    view = BeamBatchExecutionView(
+        session_id="session",
+        dispatch_id=1,
+        stage_index=1,
+        kind="decode",
+        decode_step=0,
+        owner_generation=0,
+        request_ids=("request",),
+        num_prompt_tokens_by_request=(128,),
+        beam_width=4,
+        produces_output=True,
+        dynamic_beam_widths=(4, 1, 1),
+        per_parent_beam_widths=(4, 4, 4),
+    )
+    assert view.output_width == 1
+    assert view.candidate_top_k == 1
+
+
 def _context(packed: bool) -> Any:
     context = SimpleNamespace(
         max_batch=3,

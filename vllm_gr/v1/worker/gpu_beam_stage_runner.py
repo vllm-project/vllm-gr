@@ -22,10 +22,14 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm_gr.config import resolve_candidate_width
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
-from vllm_gr.ops.cuda.unconstrained_topk import (
-    UnconstrainedTopKScratch,
-    allocate_unconstrained_topk_scratch,
-    unconstrained_topk_out,
+from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+    MCarryTopKScratch as UnconstrainedTopKScratch,
+)
+from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+    allocate_mcap_topk_scratch as allocate_unconstrained_topk_scratch,
+)
+from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+    unconstrained_topk_mcap_out as unconstrained_topk_out,
 )
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,

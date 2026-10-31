@@ -69,6 +69,7 @@ def _local_beam_topk_kernel(
     HAS_VALID_MASK: tl.constexpr,
     BLOCK: tl.constexpr,
     MASK_INVALID_INDICES: tl.constexpr = False,
+    SELECT_BLOCK: tl.constexpr = 0,
 ):
     request = tl.program_id(0)
     tile = tl.program_id(1)
@@ -98,13 +99,36 @@ def _local_beam_topk_kernel(
     )
     score = cumulative + candidate_score
     packed = _pack_score_flat(score, flat, candidate_valid if MASK_INVALID_INDICES else lane_valid)
-    sorted_pairs = tl.sort(packed, descending=False)
-    selected_scores = _unpack_score(sorted_pairs)
-    selected_flat = (sorted_pairs & 0x00000000FFFFFFFF).to(tl.int32)
-    output_mask = offsets < select_width
-    output = request * scratch_stride + tile * select_width + offsets
-    tl.store(local_scores + output, selected_scores, mask=output_mask)
-    tl.store(local_flat_indices + output, selected_flat, mask=output_mask)
+    if SELECT_BLOCK > 0 and SELECT_BLOCK < BLOCK:
+        # Only the best ``select_width`` lanes survive, so a bitonic Top-K of
+        # the packed keys is cheaper than sorting the whole list.  Packed keys
+        # are unique for live candidates and the retained set/order is
+        # identical to the full sort.
+        retained = tl.arange(0, SELECT_BLOCK)
+        if SELECT_BLOCK == 1:
+            # Triton Top-K reduces K=1 to a scalar that its final reshape
+            # cannot handle.  The smallest packed key preserves the same order.
+            ranked = tl.min(packed, axis=0, keep_dims=True)
+        else:
+            ranked = ~tl.topk(~packed, SELECT_BLOCK)
+        output_mask = retained < select_width
+        output = request * scratch_stride + tile * select_width + retained
+        tl.store(local_scores + output, _unpack_score(ranked), mask=output_mask)
+        tl.store(
+            local_flat_indices + output,
+            (ranked & 0x00000000FFFFFFFF).to(tl.int32),
+            mask=output_mask,
+        )
+    else:
+        sorted_pairs = tl.sort(packed, descending=False)
+        output_mask = offsets < select_width
+        output = request * scratch_stride + tile * select_width + offsets
+        tl.store(local_scores + output, _unpack_score(sorted_pairs), mask=output_mask)
+        tl.store(
+            local_flat_indices + output,
+            (sorted_pairs & 0x00000000FFFFFFFF).to(tl.int32),
+            mask=output_mask,
+        )
 
 
 @triton.jit(
@@ -123,13 +147,14 @@ def _merge_beam_topk_kernel(
     select_width,
     scratch_stride,
     BLOCK: tl.constexpr,
+    FAN_IN: tl.constexpr = 2,
 ):
     request = tl.program_id(0)
     output_list = tl.program_id(1)
     offsets = tl.arange(0, BLOCK)
-    source_list = output_list * 2 + offsets // select_width
+    source_list = output_list * FAN_IN + offsets // select_width
     source_rank = offsets % select_width
-    valid = (offsets < 2 * select_width) & (source_list < list_count)
+    valid = (offsets < FAN_IN * select_width) & (source_list < list_count)
     source = request * scratch_stride + source_list * select_width + source_rank
     score = tl.load(input_scores + source, mask=valid, other=-float("inf"))
     flat = tl.load(input_flat_indices + source, mask=valid, other=-1)
@@ -883,6 +908,7 @@ def _hierarchical_topk_out(
         required_slots=required_slots,
     )
     validity = candidate_valid_mask if candidate_valid_mask is not None else top_logprobs
+    select_block = triton.next_power_of_2(selection_width)
     _local_beam_topk_kernel[(batch_size, list_count)](
         cumulative_logprobs,
         top_logprobs,
@@ -896,6 +922,10 @@ def _hierarchical_topk_out(
         HAS_VALID_MASK=candidate_valid_mask is not None,
         BLOCK=local_block,
         MASK_INVALID_INDICES=mask_invalid_indices,
+        # When a list is wider than the selection, keep only the winners
+        # (bitonic Top-K) instead of sorting every lane.  0 keeps the plain
+        # sort for the square W == K case.
+        SELECT_BLOCK=select_block if select_block < local_block else 0,
         # A wider selection (a beam width above 256) makes one local list span
         # more than 256 lanes; add a tier so the per-thread register load of
         # the in-block sort does not explode.  Widths <= 256 are unchanged.
@@ -905,9 +935,14 @@ def _hierarchical_topk_out(
     input_indices = scratch.local_flat_indices
     output_scores = scratch.merge_scores
     output_indices = scratch.merge_flat_indices
-    merge_block = triton.next_power_of_2(2 * selection_width)
+    # Merge several lists per level while keeping one CTA's candidate set
+    # bounded at 2048 lanes: 8-way for a 256-wide selection, 4-way at 512,
+    # binary at 1024.  Fewer levels means fewer launches and fewer full passes
+    # over the survivor set.
+    fan_in = max(2, min(8, 2048 // select_block))
+    merge_block = triton.next_power_of_2(fan_in * selection_width)
     while list_count > 1:
-        next_count = (list_count + 1) // 2
+        next_count = (list_count + fan_in - 1) // fan_in
         _merge_beam_topk_kernel[(batch_size, next_count)](
             input_scores,
             input_indices,
@@ -917,9 +952,10 @@ def _hierarchical_topk_out(
             selection_width,
             scratch_stride,
             BLOCK=merge_block,
+            FAN_IN=fan_in,
             # Same tier rationale as the local list: one merge spans
-            # ``2 * selection_width`` lanes, i.e. 1024 at a beam width of 512
-            # and 2048 at 1024.  Widths <= 256 are unchanged.
+            # ``fan_in * selection_width`` lanes, i.e. 1024 at a beam width of
+            # 512 and 2048 at 1024.  Widths <= 256 are unchanged.
             num_warps=16 if merge_block >= 1024 else (8 if merge_block >= 256 else 4),
         )
         input_scores, output_scores = output_scores, input_scores

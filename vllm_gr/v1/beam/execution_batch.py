@@ -117,6 +117,31 @@ class BeamBatchExecutionView:
                         "must supply at least as many candidates as the stage retains"
                     )
 
+        if self.per_parent_beam_widths is not None:
+            per_parent = _immutable_tuple("per_parent_beam_widths", self.per_parent_beam_widths)
+            if len(per_parent) not in (1, 2, 3) or self.stage_index >= len(per_parent):
+                _fail("per_parent_beam_widths must cover every stage in a 1/2/3-step session")
+            for index, candidate_width in enumerate(per_parent):
+                _positive_int(f"per_parent_beam_widths[{index}]", candidate_width)
+            if self.dynamic_beam_widths is not None and len(per_parent) != len(
+                self.dynamic_beam_widths
+            ):
+                _fail(
+                    "per_parent_beam_widths and dynamic_beam_widths must describe the same stages"
+                )
+            # Fail at construction instead of executing an impossible schedule:
+            # a stage expands ``input_width`` parents into ``candidate_width``
+            # candidates each, so it can never produce more than
+            # ``input_width * candidate_width`` survivors.
+            active_candidates = per_parent[self.stage_index]
+            if self.input_width * active_candidates < self.output_width:
+                _fail(
+                    f"per_parent_beam_widths[{self.stage_index}]={active_candidates} cannot "
+                    f"fill output_width={self.output_width} from input_width="
+                    f"{self.input_width} parents; raise the per-parent width or lower the "
+                    "output width"
+                )
+
         if not isinstance(self.request_ids, tuple):
             _fail("request_ids must be an immutable tuple")
         if not self.request_ids:
@@ -245,9 +270,15 @@ class BeamBatchExecutionView:
         """
 
         if self.per_parent_beam_widths is not None:
-            return self.per_parent_beam_widths[self.stage_index]
+            # A parent can contribute at most ``output_width`` survivors, so a
+            # wider per-parent request only buys work whose result can never be
+            # selected.  Clamping keeps the full-vocabulary Top-K proportional
+            # to the width that is actually retained.
+            return min(self.per_parent_beam_widths[self.stage_index], self.output_width)
         if self.candidate_width is not None:
             return self.candidate_width
+        # Taking fewer than the target width per parent can lose global Top-K
+        # winners when a schedule expands after an earlier pruning step.
         return self.output_width
 
     @property
