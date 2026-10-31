@@ -229,6 +229,49 @@ def test_cli_confirmed_failure_preserves_reports(
     assert "FAILED" in (tmp_path / "b4_repeat_summary.md").read_text(encoding="utf-8")
 
 
+def test_cli_warning_mode_reports_screening_regression_without_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    candidate, result, _, _ = summarize(tmp_path, 10)
+    candidate["calibration_sid_recall32"] = {
+        task: [run["tasks"][task]["recall@32"] for run in result["runs"]] for task in TASKS
+    }
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(candidate), encoding="utf-8")
+    _set_sid_recall(tmp_path, 1, "video", 0.038)
+    monkeypatch.setenv("V1_RECALL_BASELINE_FILE", str(baseline))
+    monkeypatch.setenv("V1_RECALL_BASELINE_FAILURE_MODE", "warning")
+    monkeypatch.setattr(
+        sys, "argv", ["v1_recall_summary", "--result-dir", str(tmp_path), "--repeats", "1"]
+    )
+
+    main()
+
+    repeated = json.loads((tmp_path / "b4_repeat_summary.json").read_text(encoding="utf-8"))
+    assert repeated["baseline_failure_mode"] == "warning"
+    assert repeated["confirmation_required"] is True
+    assert repeated["confirmation_skipped"] is True
+    assert repeated["baseline_failures"] == []
+    assert len(repeated["baseline_warnings"]) == 1
+    summary = (tmp_path / "b4_repeat_summary.md").read_text(encoding="utf-8")
+    assert "Baseline check: WARNING (non-blocking)." in summary
+    assert "confirmation runs were skipped" in summary
+    assert "::warning title=Beam V1 Recall baseline::" in capsys.readouterr().out
+
+
+def test_cli_rejects_unknown_baseline_failure_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    monkeypatch.setenv("V1_RECALL_BASELINE_FAILURE_MODE", "ignore")
+    monkeypatch.setattr(
+        sys, "argv", ["v1_recall_summary", "--result-dir", str(tmp_path), "--repeats", "1"]
+    )
+    with pytest.raises(SystemExit, match="must be one of: blocking, warning"):
+        main()
+
+
 def test_graph_profile_comes_from_metrics_and_requires_b4_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -241,7 +284,7 @@ def test_graph_profile_comes_from_metrics_and_requires_b4_replay(
     metrics["graph_runtime"]["dispatches"] = {"fallback:4:no_graph": 250}
     path.write_text(json.dumps(metrics), encoding="utf-8")
     with pytest.raises(ValueError, match="B=4 graph execution"):
-        summarize(tmp_path, 1)
+        summarize(tmp_path, 1, baseline_failure_mode="warning")
 
 
 def test_different_tasks_dipping_in_different_rounds_do_not_fail(

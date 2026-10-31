@@ -32,6 +32,9 @@ def context(
     draft: bool = False,
     label: str = "",
     event: str = "pull_request",
+    number: int = 481,
+    head_ref: str = "feature",
+    head_repo: str = "owner/vllm-gr",
 ) -> Any:
     return namespace(
         {
@@ -45,7 +48,7 @@ def context(
                 "action": action,
                 "label": {"name": label},
                 "pull_request": {
-                    "number": 481,
+                    "number": number,
                     "draft": draft,
                     "labels": [
                         {"name": name}
@@ -53,6 +56,10 @@ def context(
                         if present
                     ],
                     "base": {"ref": "decode_graph", "sha": "base-sha"},
+                    "head": {
+                        "ref": head_ref,
+                        "repo": {"full_name": head_repo},
+                    },
                 },
             },
         }
@@ -204,6 +211,34 @@ class TestReadyLabelCI(unittest.TestCase):
                 set(self.scheduled(workflow, github)),
                 set(workflow["jobs"]) - {"beam-performance-ab-only", "resolve-ab-freshness"},
             )
+
+    def test_recall_warning_mode_is_scoped_to_upgrade_pr(self) -> None:
+        steps = self.workflows["pre-commit.yml"]["jobs"]["decode-benchmark"]["steps"]
+        recall = next(
+            step
+            for step in steps
+            if step.get("name") == "Gate Beam V1 B=4 OneRec Recall on fixed samples"
+        )
+        expression = recall["env"]["V1_RECALL_BASELINE_FAILURE_MODE"]
+        upgrade_pr = context(
+            number=529,
+            head_ref="upgrade_version",
+            head_repo="parallel-star8/vllm-gr",
+        )
+        self.assertEqual(evaluate(expression, upgrade_pr), "warning")
+        self.assertEqual(evaluate(expression, context(number=529)), "blocking")
+        self.assertEqual(
+            evaluate(
+                expression,
+                context(
+                    number=529,
+                    head_ref="upgrade_version",
+                    head_repo="someone-else/vllm-gr",
+                ),
+            ),
+            "blocking",
+        )
+        self.assertEqual(evaluate(expression, context()), "blocking")
 
     def test_label_edits_do_not_cancel_unrelated_runs(self) -> None:
         for workflow in self.workflows.values():
