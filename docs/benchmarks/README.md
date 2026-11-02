@@ -16,6 +16,7 @@ OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchma
 - [Evaluation](#evaluation)
 - [Troubleshooting](#troubleshooting)
 - [Video-100 CI accuracy gate](parent_score_gate.md)
+- [Beam V1 five-task Recall gate](beam_v1_recall_gate.md)
 
 ## Overview
 
