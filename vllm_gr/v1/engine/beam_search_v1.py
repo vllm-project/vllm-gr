@@ -158,11 +158,49 @@ def validate_gr_execution_runtime(config: Any) -> None:
 
 def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
     """Reject unavailable adapters without importing a device runtime."""
+    from vllm_gr.config import GRConfig
+
     device = getattr(getattr(config, "device_config", None), "device", None)
     if device is not None and str(device).split(":")[0] not in ("cuda", "npu"):
         raise ValueError(
             "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
         )
+    gr_config = GRConfig.from_vllm_config(config)
+    if gr_config.beam_sid_stage_vocab and (device is None or str(device).split(":")[0] != "npu"):
+        raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
+    if device is not None and str(device).split(":")[0] == "npu":
+        from vllm_gr.config.models import CONSTRAINT_TABLE_MAX_DECODE_STEPS
+
+        if gr_config.constrained_generation is False:
+            # The existing NPU decision/KV operators have only been validated
+            # for the three-stage suffix. Full-vocabulary selection must not
+            # accidentally admit CUDA's arbitrary generation horizons.
+            if gr_config.beam_max_decode_steps > CONSTRAINT_TABLE_MAX_DECODE_STEPS or (
+                request is not None
+                and request.beam_params.max_tokens > CONSTRAINT_TABLE_MAX_DECODE_STEPS
+            ):
+                raise ValueError("NPU unconstrained beam_search_v1 supports 1..3 generated tokens")
+            table = gr_config.constraint_table
+            configured_k = None if table is None else table.candidate_width
+            candidate_widths: tuple[int | None, ...] = (configured_k,)
+            if request is not None:
+                candidate_widths += (request.beam_params.candidate_width,)
+            for candidate_width in candidate_widths:
+                if candidate_width is not None and (
+                    candidate_width != gr_config.beam_max_width
+                    or (
+                        request is not None
+                        and request.beam_params.dynamic_beam_widths is not None
+                        and any(
+                            width != candidate_width
+                            for width in request.beam_params.dynamic_beam_widths
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "NPU unconstrained beam_search_v1 requires candidate_width "
+                        "to match each stage's beam width"
+                    )
     if (
         request is not None
         and request.beam_params.per_parent_beam_widths is not None

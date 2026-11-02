@@ -75,6 +75,9 @@ and execution choices. Benchmark gates additionally require local dataset and
 catalog paths plus a resolved benchmark policy; see
 [benchmark instructions](docs/benchmarks/README.md).
 
+For full-vocabulary Beam selection without a catalog, see
+[unconstrained Beam Search V1 on NPU](docs/npu_unconstrained_beam.md).
+
 ## Uninstall
 
 ```bash

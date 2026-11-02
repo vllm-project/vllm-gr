@@ -1,0 +1,330 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="misc"
+"""CPU references for catalog-free NPU Beam admission and candidate scoring."""
+
+from __future__ import annotations
+
+import math
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
+
+import pytest
+import torch
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
+
+from vllm_gr.constraints.backend import ConstraintOutput
+from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
+from vllm_gr.v1.beam.batch_contracts import (
+    BEAM_BATCH_PROTOCOL_VERSION,
+    BeamBatchItem,
+    BeamBatchParams,
+    BeamBatchRequest,
+    BeamOutputOptions,
+)
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.worker.npu_beam_stage_adapter import (
+    NPUEagerStagePlan,
+    validate_npu_eager_capabilities,
+)
+from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
+
+
+def _scalar_reference(
+    row: list[float], temperature: float, top_k: int
+) -> tuple[list[int], list[float]]:
+    """Enumerate the full finite vocabulary, independently of device TopK."""
+    temperature = temperature if temperature > 0.0 else 1.0
+    finite = [
+        (index, value / temperature) for index, value in enumerate(row) if math.isfinite(value)
+    ]
+    if not finite:
+        return [], []
+    maximum = max(value for _, value in finite)
+    normalizer = math.log(math.fsum(math.exp(value - maximum) for _, value in finite))
+    ordered = sorted(finite, key=lambda pair: (-pair[1], pair[0]))[:top_k]
+    return (
+        [index for index, _ in ordered],
+        [(value - maximum) - normalizer for _, value in ordered],
+    )
+
+
+def _assert_matches_reference(
+    result: ConstraintOutput, logits: torch.Tensor, temperatures: torch.Tensor, top_k: int
+) -> None:
+    assert (
+        result.token_ids.shape
+        == result.logprobs.shape
+        == result.valid_mask.shape
+        == (
+            logits.shape[0],
+            top_k,
+        )
+    )
+    assert result.token_ids.dtype == torch.int32
+    assert result.logprobs.dtype == torch.float32
+    assert result.valid_mask.dtype == torch.bool
+    assert (
+        result.token_ids.device
+        == result.logprobs.device
+        == result.valid_mask.device
+        == logits.device
+    )
+    rows = logits.float().cpu().tolist()
+    scales = temperatures.float().cpu().reshape(-1).tolist()
+    for row, values in enumerate(rows):
+        ids, scores = _scalar_reference(values, scales[0 if len(scales) == 1 else row], top_k)
+        live = len(ids)
+        assert result.token_ids[row, :live].cpu().tolist() == ids
+        torch.testing.assert_close(
+            result.logprobs[row, :live].cpu(), torch.tensor(scores), rtol=1e-5, atol=2e-5
+        )
+        assert result.valid_mask[row].cpu().tolist() == [True] * live + [False] * (top_k - live)
+        assert torch.isneginf(result.logprobs[row, live:]).all()
+        assert (result.token_ids[row, live:] == 0).all()
+        assert not torch.isnan(result.logprobs).any()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("vocab_size,top_k", [(17, 1), (17, 17), (17, 32), (1031, 3)])
+@pytest.mark.parametrize("broadcast_temperature", [False, True])
+def test_full_vocab_scores_match_scalar_enumeration(
+    dtype: torch.dtype, vocab_size: int, top_k: int, broadcast_temperature: bool
+) -> None:
+    logits = torch.randn((3, vocab_size), generator=torch.Generator().manual_seed(408)).to(dtype)
+    # Exact ties, including a Top1 cutoff, must have reproducible token ordering.
+    logits[0].zero_()
+    temperatures = torch.tensor([0.75] if broadcast_temperature else [0.0, 0.5, 2.0])
+    result = select_unconstrained_candidates(logits, temperatures, top_k)
+    _assert_matches_reference(result, logits, temperatures, top_k)
+
+
+def test_scores_are_normalized_before_candidate_truncation() -> None:
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0], [-1.0, -2.0, -3.0, -4.0]])
+    temperatures = torch.ones(2)
+    narrow = select_unconstrained_candidates(logits, temperatures, 1)
+    wide = select_unconstrained_candidates(logits, temperatures, 4)
+    _assert_matches_reference(narrow, logits, temperatures, 1)
+    torch.testing.assert_close(narrow.logprobs[:, 0], wide.logprobs[:, 0], rtol=0, atol=0)
+    assert (narrow.logprobs < 0).all(), "Top1 must retain the full-vocabulary denominator"
+
+
+@pytest.mark.parametrize("top_k", [1, 4, 8])
+def test_nonfinite_logits_never_become_candidates_or_poison_finite_rows(top_k: int) -> None:
+    logits = torch.tensor(
+        [
+            [float("nan"), float("inf"), -float("inf"), 1.0, 0.0],
+            [-float("inf"), float("nan"), float("inf"), -float("inf"), float("nan")],
+            [0.0, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ]
+    )
+    temperatures = torch.tensor([0.0, 1.0, 0.5])
+    _assert_matches_reference(
+        select_unconstrained_candidates(logits, temperatures, top_k), logits, temperatures, top_k
+    )
+
+
+def test_candidate_selection_accepts_row_padding_without_host_tensor_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = torch.randn((4, 23), generator=torch.Generator().manual_seed(1708))
+    logits, temperatures = storage[:, :17], torch.tensor([0.0, 0.5, 1.0, 2.0])
+    original = storage.clone()
+
+    def forbid_host_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("candidate selection must not read tensor values on the host")
+
+    with monkeypatch.context() as guard:
+        for name in ("cpu", "item", "tolist"):
+            guard.setattr(torch.Tensor, name, forbid_host_read)
+        result = select_unconstrained_candidates(logits, temperatures, 8)
+    _assert_matches_reference(result, logits, temperatures, 8)
+    torch.testing.assert_close(storage, original, rtol=0, atol=0)
+
+
+def _prefill_runner(batch_size: int, constrained: bool) -> NPUEagerBeamStageRunner:
+    execution = BeamBatchExecutionView(
+        session_id="catalog-free-session",
+        dispatch_id=0,
+        stage_index=0,
+        kind="prefill",
+        decode_step=None,
+        owner_generation=1,
+        request_ids=tuple(f"request-{index}" for index in range(batch_size)),
+        num_prompt_tokens_by_request=(2,) * batch_size,
+        beam_width=2,
+        produces_output=True,
+    )
+    plan = NPUEagerStagePlan(
+        execution,
+        (2,) * batch_size,
+        batch_size * 2,
+        tuple(2 * index + 1 for index in range(batch_size)),
+        tuple(range(batch_size)),
+        None,
+    )
+    metadata = SimpleNamespace(
+        beam_params=SimpleNamespace(temperature=0.5), is_last_stage=False, output_device_state=None
+    )
+    worker = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(constrained_generation=constrained),
+        _current_scheduler_output=SimpleNamespace(
+            gr_stage_metadata={execution.session_id: metadata}
+        ),
+        execute_model_state=object(),
+        kv_connector_output=object(),
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.worker, stage.pending_plan, stage.execution_error = worker, plan, None
+    stage.logits = torch.arange(batch_size * 7, dtype=torch.float32).view(batch_size, 7) / 10
+    stage.attention_batch = None
+    return stage
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_catalog_free_prefill_uses_full_vocab_without_constraint_state(
+    batch_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage = _prefill_runner(batch_size, constrained=False)
+    assert stage.logits is not None
+    logits = stage.logits.clone()
+    # A leftover backend must not override explicit unconstrained generation.
+    stage.worker.constraint_backend = SimpleNamespace(
+        select=Mock(side_effect=AssertionError("catalog-free selection queried the backend"))
+    )
+    monkeypatch.setattr(
+        stage, "_constraint_prefixes", Mock(side_effect=AssertionError("unexpected prefix access"))
+    )
+    output = stage.sample()
+    assert stage.prefill_candidates is not None
+    _assert_matches_reference(stage.prefill_candidates, logits, torch.full((batch_size,), 0.5), 2)
+    assert stage.latest_token_ids is stage.prefill_candidates.token_ids
+    assert stage.handoff is not None
+    receipt = output.gr_worker_results["catalog-free-session"]
+    assert not receipt.finished and not receipt.resources_released
+    assert receipt.owner_generation == 1 and receipt.terminal_result is None
+    stage.worker.constraint_backend.select.assert_not_called()
+    assert stage.pending_plan is stage.logits is None
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_constrained_prefill_keeps_backend_scores_and_prefix_metadata(batch_size: int) -> None:
+    stage = _prefill_runner(batch_size, constrained=True)
+    ids = torch.tensor([[5, 1]] * batch_size, dtype=torch.int32)
+    candidates = ConstraintOutput(
+        ids, torch.full((batch_size, 2), -2.5), torch.ones_like(ids).bool()
+    )
+    backend = SimpleNamespace(
+        info=SimpleNamespace(max_rows=batch_size), select=Mock(return_value=candidates)
+    )
+    stage.worker.constraint_backend = backend
+    stage.sample()
+    backend.select.assert_called_once()
+    metadata = backend.select.call_args.args[1]
+    assert metadata.prefix_token_ids.shape == (batch_size, 3)
+    assert metadata.current_step == 0 and metadata.top_k == 2
+    torch.testing.assert_close(metadata.temperatures, torch.full((batch_size,), 0.5))
+    assert stage.prefill_candidates is candidates
+
+
+@pytest.mark.parametrize(
+    "eager,steps,expected", [(True, 3, False), (False, 1, False), (False, 3, True)]
+)
+def test_unconstrained_startup_selects_the_existing_npu_graph_adapter(
+    eager: bool, steps: int, expected: bool
+) -> None:
+    from vllm_gr.v1.worker.gr_startup import _capture_enabled
+
+    worker = SimpleNamespace(
+        device="npu",
+        model_config=SimpleNamespace(enforce_eager=eager),
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=True)),
+        _vllm_gr_config=SimpleNamespace(
+            constrained_generation=False,
+            beam_worker_decision=True,
+            beam_max_width=2,
+            beam_max_decode_steps=steps,
+            beam_graph_enabled=True,
+            constraint_table=None,
+        ),
+    )
+    assert _capture_enabled(worker) is expected
+
+
+def test_npu_generation_capacity_is_checked_before_worker_state_is_allocated() -> None:
+    from vllm_gr.config import GRConfig
+
+    config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device="npu"))
+    GRConfig(
+        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=4
+    ).write_to_vllm_config(config)
+    worker = SimpleNamespace(
+        device="npu",
+        use_async_scheduling=True,
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        parallel_config=None,
+        vllm_config=config,
+    )
+    with pytest.raises(ValueError, match="NPU.*3|NPU.*three"):
+        validate_npu_eager_capabilities(worker)
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize("candidate_width", [None, 2, 4])
+@pytest.mark.parametrize("widths", [None, (1, 2, 1)])
+def test_native_request_candidate_width_is_checked_at_device_admission(
+    device: str, candidate_width: int | None, widths: tuple[int, ...] | None
+) -> None:
+    from vllm_gr.config import GRConfig
+    from vllm_gr.v1.engine.beam_search_v1 import (
+        validate_gr_device_config,
+        validate_gr_request,
+    )
+
+    config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device=device))
+    GRConfig(
+        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=3
+    ).write_to_vllm_config(config)
+    native = EngineCoreRequest(
+        request_id="native-candidate-width",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=3, temperature=0.0, ignore_eos=True),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    request = BeamBatchRequest(
+        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+        batch_id=native.request_id,
+        items=(BeamBatchItem(0, native),),
+        beam_params=BeamBatchParams(
+            beam_width=2,
+            max_tokens=3,
+            temperature=0.0,
+            stop_token_ids=(),
+            ignore_stop_tokens=True,
+            candidate_width=candidate_width,
+            dynamic_beam_widths=widths,
+        ),
+        output_options=BeamOutputOptions(1, True, True, False),
+    )
+    # The wire payload is structurally valid even when it carries an NPU-only
+    # unsupported K. Native submission must reject it before a Worker starts.
+    validate_gr_request(request, config=config)
+    unsupported = candidate_width is not None and (candidate_width != 2 or widths is not None)
+    if device == "npu" and unsupported:
+        with pytest.raises(ValueError, match="candidate_width.*beam width"):
+            validate_gr_device_config(config, request)
+    else:
+        validate_gr_device_config(config, request)
+
+
+def test_npu_device_validation_accepts_partial_non_beam_config() -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
+
+    validate_gr_device_config(SimpleNamespace(device_config=SimpleNamespace(device="npu")))

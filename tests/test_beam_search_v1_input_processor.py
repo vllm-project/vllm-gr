@@ -679,21 +679,82 @@ def test_cuda_constrained_request_rejects_budget_beyond_table_depth() -> None:
     engine.submit_gr_session.assert_not_called()
 
 
-def test_npu_unconstrained_request_is_rejected_before_submission() -> None:
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("steps", [1, 2, 3])  # type: ignore[misc]
+@pytest.mark.parametrize("widths", [None, [1, 2, 1]])  # type: ignore[misc]
+def test_npu_unconstrained_request_needs_no_constraint_artifact(
+    online: bool, steps: int, widths: list[int] | None
+) -> None:
     canonical = _canonical_gr_config(enabled=False, backend="npu")
     canonical["constrained_generation"] = False
+    # No stale path/digests should be needed in a catalog-free deployment.
+    canonical["constraint_table"] = {"enabled": False, "backend": "npu", "max_top_k": 4}
     engine = _make_engine(additional_config={"vllm_gr": canonical})
     engine.vllm_config.device_config = SimpleNamespace(device="npu")
 
-    with pytest.raises(BeamSearchRequestError, match="requires CUDA"):
+    request = _prepare_request(
+        engine,
+        [1, 2],
+        BeamSearchParams(
+            beam_width=2,
+            max_tokens=steps,
+            ignore_eos=True,
+            dynamic_beam_widths=None if widths is None else widths[:steps],
+            result_width=1,
+        ),
+        online=online,
+    )
+
+    assert request.beam_params.max_tokens == steps
+    assert request.beam_params.dynamic_beam_widths == (
+        None if widths is None else tuple(widths[:steps])
+    )
+    assert request.output_options.num_return_sequences == 1
+    assert request.items[0].request.sampling_params.logprobs == 2
+
+
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+def test_npu_unconstrained_request_rejects_unsupported_generation_length(online: bool) -> None:
+    canonical = _canonical_gr_config(enabled=False, backend="npu")
+    canonical["constrained_generation"] = False
+    canonical["beam"]["max_decode_steps"] = 4
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device="npu")
+
+    with pytest.raises(BeamSearchRequestError, match="NPU.*3|NPU.*three"):
         _prepare_request(
             engine,
             [1, 2],
-            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
-            online=True,
+            BeamSearchParams(beam_width=2, max_tokens=4, ignore_eos=True),
+            online=online,
         )
 
     engine.submit_gr_session.assert_not_called()
+
+
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "candidate_width,widths,accepted",
+    [(2, None, True), (2, [2, 2, 2], True), (4, None, False), (2, [1, 2, 1], False)],
+)
+def test_npu_unconstrained_candidate_capacity_matches_retained_stage_widths(
+    online: bool, candidate_width: int, widths: list[int] | None, accepted: bool
+) -> None:
+    canonical = _canonical_gr_config(enabled=False, backend="npu")
+    canonical["constrained_generation"] = False
+    canonical["constraint_table"]["candidate_width"] = candidate_width
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device="npu")
+    params = BeamSearchParams(
+        beam_width=2, max_tokens=3, ignore_eos=True, dynamic_beam_widths=widths
+    )
+    if accepted:
+        request = _prepare_request(engine, [1, 2], params, online=online)
+        assert request.beam_params.candidate_width == candidate_width
+    else:
+        with pytest.raises(BeamSearchRequestError, match="candidate_width.*beam width"):
+            _prepare_request(engine, [1, 2], params, online=online)
+        engine.submit_gr_session.assert_not_called()
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]

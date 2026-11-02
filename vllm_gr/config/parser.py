@@ -27,6 +27,7 @@ from vllm_gr.config.validation import (
     validate_beam_max_decode_steps,
     validate_beam_max_width,
     validate_beam_online_batch_sizes,
+    validate_beam_sid_stage_vocab,
     validate_beam_worker_decision,
     validate_candidate_width,
     validate_catalog_path,
@@ -65,6 +66,7 @@ NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
 BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
 BEAM_ENGINE_DRIVEN_KEY: Final = "vllm_gr_beam_engine_driven"
 BEAM_EXECUTION_MODE_KEY: Final = "vllm_gr_beam_execution_mode"
+BEAM_SID_STAGE_VOCAB_KEY: Final = "vllm_gr_beam_sid_stage_vocab"
 CONSTRAINED_GENERATION_KEY: Final = "vllm_gr_constrained_generation"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
@@ -86,6 +88,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         BEAM_WORKER_DECISION_KEY,
         BEAM_ENGINE_DRIVEN_KEY,
         BEAM_EXECUTION_MODE_KEY,
+        BEAM_SID_STAGE_VOCAB_KEY,
         CONSTRAINED_GENERATION_KEY,
     }
 )
@@ -105,6 +108,7 @@ _BEAM_KEYS: Final = frozenset(
         "worker_decision",
         "engine_driven",
         "execution_mode",
+        "sid_stage_vocab",
     }
 )
 _CONSTRAINT_TABLE_KEYS: Final = frozenset(
@@ -225,6 +229,7 @@ def gr_config_from_mapping(
         beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
         beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
         beam_execution_mode=validate_beam_execution_mode(beam_raw.get("execution_mode")),
+        beam_sid_stage_vocab=validate_beam_sid_stage_vocab(beam_raw.get("sid_stage_vocab", False)),
         schema_version=validate_schema_version(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
@@ -286,6 +291,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         beam["worker_decision"] = config.beam_worker_decision
     if config.beam_execution_mode is not None:
         beam["execution_mode"] = config.beam_execution_mode.value
+    if config.beam_sid_stage_vocab:
+        beam["sid_stage_vocab"] = True
 
     constraint_table: dict[str, object] = {
         "enabled": table.enabled,
@@ -417,6 +424,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_execution_mode=validate_beam_execution_mode(
             additional_config.get(BEAM_EXECUTION_MODE_KEY)
         ),
+        beam_sid_stage_vocab=validate_beam_sid_stage_vocab(
+            additional_config.get(BEAM_SID_STAGE_VOCAB_KEY, False)
+        ),
         constrained_generation=validate_constrained_generation(
             additional_config.get(CONSTRAINED_GENERATION_KEY)
         ),
@@ -445,6 +455,7 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     vocab_slice_size = validate_vocab_slice_size(gr_config.vocab_slice_size)
     npu_decode_execution = validate_npu_decode_execution(gr_config.npu_decode_execution)
     constrained_generation = validate_constrained_generation(gr_config.constrained_generation)
+    beam_sid_stage_vocab = validate_beam_sid_stage_vocab(gr_config.beam_sid_stage_vocab)
 
     if catalog_path is None:
         additional_config.pop(CATALOG_PATH_KEY, None)
@@ -541,6 +552,10 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(BEAM_EXECUTION_MODE_KEY, None)
     else:
         additional_config[BEAM_EXECUTION_MODE_KEY] = gr_config.beam_execution_mode.value
+    if beam_sid_stage_vocab:
+        additional_config[BEAM_SID_STAGE_VOCAB_KEY] = True
+    else:
+        additional_config.pop(BEAM_SID_STAGE_VOCAB_KEY, None)
 
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:

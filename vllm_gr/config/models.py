@@ -207,6 +207,9 @@ class GRConfig:
     beam_online_batch_sizes: tuple[int, ...] = DEFAULT_ONLINE_BATCH_SIZES
     """Online batching policy and default CUDA capture sizes, not engine capacity."""
 
+    beam_sid_stage_vocab: bool = False
+    """Opt into catalog-free NPU SA/SB/SC domains and stage-local probabilities."""
+
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
@@ -218,6 +221,7 @@ class GRConfig:
             validate_beam_max_decode_steps,
             validate_beam_max_width,
             validate_beam_online_batch_sizes,
+            validate_beam_sid_stage_vocab,
             validate_beam_worker_decision,
             validate_catalog_path,
             validate_constrained_generation,
@@ -309,6 +313,20 @@ class GRConfig:
         object.__setattr__(
             self, "beam_execution_mode", validate_beam_execution_mode(self.beam_execution_mode)
         )
+        object.__setattr__(
+            self, "beam_sid_stage_vocab", validate_beam_sid_stage_vocab(self.beam_sid_stage_vocab)
+        )
+        if self.beam_sid_stage_vocab and (
+            self.constrained_generation is not False
+            or self.beam_execution_mode is not BeamExecutionMode.V1
+            or self.beam_worker_decision is not True
+            or self.beam_max_decode_steps > CONSTRAINT_TABLE_MAX_DECODE_STEPS
+        ):
+            raise ValueError(
+                "beam.sid_stage_vocab requires constrained_generation=False, "
+                "beam.execution_mode='v1', beam.worker_decision=True, and "
+                "beam.max_decode_steps <= 3"
+            )
         validate_enable_short_suffix_attention(self.enable_short_suffix_attention)
         validate_prefill_flash_attn_version(self.prefill_flash_attn_version)
         if (
@@ -363,6 +381,7 @@ class GRConfig:
             or self.constrained_generation is not None
             or self.beam_worker_decision is not None
             or self.beam_execution_mode is not None
+            or self.beam_sid_stage_vocab
         )
 
     @classmethod

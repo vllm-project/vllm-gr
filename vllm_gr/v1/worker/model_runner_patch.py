@@ -39,6 +39,7 @@ def close_constraint_backend(runner: object) -> None:
     # Detach first so no concurrent observer can discover a Backend while it is
     # being closed, and so repeated shutdown/load calls are naturally idempotent.
     runner.constraint_backend = None
+    cast(Any, runner)._gr_npu_sid_stage_vocab = None
     projection = getattr(runner, "_gr_npu_stage_projection", None)
     if projection is not None:
         cast(Any, runner)._gr_npu_stage_projection = None
@@ -114,6 +115,37 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
         try:
             gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
             if gr_config.constrained_generation is False:
+                if gr_config.beam_sid_stage_vocab:
+                    if str(getattr(self, "device", "")).split(":")[0] != "npu":
+                        raise ValueError("beam.sid_stage_vocab currently requires NPU")
+                    from vllm.tokenizers import cached_tokenizer_from_config
+
+                    from vllm_gr.ops.npu.sid_stage_vocab import build_sid_stage_vocab
+                    from vllm_gr.ops.npu_stage_logits import (
+                        install_npu_sid_stage_projection,
+                    )
+
+                    tokenizer = cached_tokenizer_from_config(self.model_config)
+                    if tokenizer is None:
+                        raise ValueError("beam.sid_stage_vocab requires tokenizer initialization")
+                    stage_vocab = build_sid_stage_vocab(
+                        tokenizer, _runner_vocab_size(self), self.device
+                    )
+                    projection = install_npu_sid_stage_projection(self, stage_vocab)
+                    # Publish only after both maps and optional projection are
+                    # ready. The maps also own the full-head reference path
+                    # when stage projection is explicitly disabled.
+                    self._gr_npu_sid_stage_vocab = stage_vocab
+                    self._gr_npu_stage_projection = projection
+                    self.model_memory_usage = int(getattr(self, "model_memory_usage", 0)) + (
+                        stage_vocab.device_memory_bytes
+                        + (projection.device_memory_bytes if projection is not None else 0)
+                    )
+                    logger.info(
+                        "NPU catalog-free SID vocabulary ready: stage sizes=%s, projection=%s",
+                        tuple(int(ids.numel()) for ids in stage_vocab.stage_token_ids),
+                        "sliced" if projection is not None else "full",
+                    )
                 return result
             table_config = gr_config.constraint_table
             if table_config is None or not table_config.enabled:
@@ -207,6 +239,7 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
                     self.model_memory_usage += projection.device_memory_bytes
             return result
         except BaseException:
+            self._gr_npu_sid_stage_vocab = None
             projection = getattr(self, "_gr_npu_stage_projection", None)
             if projection is not None:
                 self._gr_npu_stage_projection = None

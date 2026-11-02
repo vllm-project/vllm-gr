@@ -22,6 +22,7 @@ from vllm_gr.v1.engine.beam_search_v1 import (
     GRExecutionCapacity,
     GRStageKind,
     GRStageMetadata,
+    validate_gr_device_config,
     validate_gr_execution_runtime,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
@@ -131,8 +132,10 @@ def _capture_enabled(worker: Any) -> bool:
             "Beam V1 requires worker decisions, fixed width and either an enabled "
             "canonical table or constrained_generation=False"
         )
-    if unconstrained and str(worker.device).split(":")[0] != "cuda":
-        raise ValueError("unconstrained Beam V1 requires CUDA")
+    if unconstrained and str(worker.device).split(":")[0] not in ("cuda", "npu"):
+        raise ValueError("unconstrained Beam V1 requires CUDA or NPU")
+    if unconstrained and str(worker.device).split(":")[0] == "npu":
+        validate_gr_device_config(worker.vllm_config)
     # A one-token session completes in Prefill and never replays a Decode graph.
     return (
         not worker.model_config.enforce_eager
