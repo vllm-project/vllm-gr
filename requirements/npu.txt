@@ -14,5 +14,6 @@ numpy==1.26.4
 # (4.13+ and the image's 5.x wheel) declare numpy>=2 for Python 3.9+ and
 # cannot coexist with that pin. The rc2 vendor image supplies a cv2 build
 # compatible with NumPy 1.26.4; vllm-gr imports it during its environment
-# sanity check but does not replace the vendor package. Because pip does not
-# track that dependency, `pip check` is not a validity criterion here.
+# sanity check but does not replace the vendor package. The image has known
+# metadata conflicts; retain `pip check` output and verify actual imports
+# and startup as described in docs/quickstart-ascend.md.

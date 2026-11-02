@@ -662,7 +662,7 @@ def update_graph_params(
     return True
 
 
-# 20261019: Fixed-shape nonpaged FIA; no changes to latest TND task/update ordering.
+# Fixed-shape nonpaged FIA; TND retains its task/update ordering.
 def prefill_attention_bsnd(
     output: torch.Tensor,
     query: torch.Tensor,
@@ -671,7 +671,7 @@ def prefill_attention_bsnd(
     attn_metadata: BeamAttentionMetadata,
     scale: float,
 ) -> None:
-    """v4.1 BSND prefill attention: shape-bound FIA, no per-layer host update.
+    """BSND prefill attention: shape-bound FIA, no per-layer host update.
 
     Q/output are laid out [B,P,Nq,D] and K/V [B,P,Nkv,D] from the current
     layer's QKV projection; the per-request lengths live entirely in the
@@ -679,7 +679,7 @@ def prefill_attention_bsnd(
     Padding keys k>=L_i are causal-masked against every real query q<L_i,
     so no dynamic padding mask is needed (pad rows are discarded downstream).
     """
-    # 20261019: Scratch lifetime follows the captured metadata, not module globals.
+    # Scratch lifetime follows the captured metadata, not module globals.
     resources = attn_metadata.bsnd_resources
     resources.setdefault("workspaces", {})
     resources.setdefault("lses", {})

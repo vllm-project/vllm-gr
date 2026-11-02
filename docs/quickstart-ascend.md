@@ -41,9 +41,9 @@ Installing the vendor stack with plain pip is not a supported alternative:
 
 - Triton-Ascend is not published on PyPI.
 - The torch build used by the image has no public PyPI distribution.
-- Every opencv wheel for Python 3.9+ declares `numpy>=2`, while
-  triton-ascend declares `numpy==1.26.4`; no single pip resolution can
-  satisfy both.
+- The image's opencv distribution declares `numpy>=2`, while its
+  triton-ascend distribution declares `numpy==1.26.4`; those particular
+  metadata requirements cannot both be satisfied by a pip resolver.
 
 See the [vllm-ascend v0.30.0rc2 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.30.0rc2).
 
@@ -105,27 +105,30 @@ python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); pri
 ```bash
 python -c "import vllm_gr; print(vllm_gr.__version__)"
 python -c "from vllm_gr._env_check import check_environment; print(check_environment())"
+python -c "import numpy, cv2; print('numpy', numpy.__version__, 'cv2', cv2.__version__)"
 ```
 
 ## Dependency checking on Ascend
 
-`python -m pip check` is not a validity criterion on this platform. The
-validated image is assembled stepwise, so pip never re-validates the final
-combination, and two classes of pre-existing reports are expected:
+Keep the output of `python -m pip check` as an environment diagnostic. The
+validated image has known metadata conflicts, so that command alone cannot
+establish whether this vendor runtime works. Recorded reports include:
 
 - Declaration conflict: the image's opencv-python-headless 5.x wheel declares
   `numpy>=2` while triton-ascend 3.6.0 declares `numpy==1.26.4`. The
-  conflict is metadata-only at runtime: the image's cv2 binary is built
-  against numpy 2 headers and is ABI-compatible with the installed numpy
-  1.26.4, and vllm loads cv2 lazily with a placeholder fallback.
+  successful runtime validation used the vendor-supplied cv2 build. Confirm
+  its actual import with NumPy 1.26.4; a version declaration or vLLM's lazy
+  import fallback is not evidence of binary compatibility.
 - Metadata drift: the image's vllm-ascend metadata declares slightly older
   companions (triton-ascend 3.2.2, torch-npu 2.10.0.post4) than the image
   actually ships (3.6.0, post7).
 
-On Ascend the acceptance criterion for a vllm-gr environment is therefore
-that it runs correctly inside the validated vendor image, not pip-level
-dependency consistency; the latter is unreachable while Triton-Ascend is
-not published on PyPI.
+Treat these recorded vendor-image discrepancies separately from new missing
+or incompatible dependencies. Validate runtime versions, direct numpy/cv2
+imports, custom operator loading, and inference inside the selected image.
+Do not ignore unrelated `pip check` errors or replace vendor packages merely
+to silence the known reports. Package availability on PyPI and consistency
+of installed package metadata are separate questions.
 
 ## Quick Start
 

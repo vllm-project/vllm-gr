@@ -109,12 +109,11 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         )
         self._update_stream: Any = None
         self.entries: dict[int, Any] = {}
-        # 20261019: Opt-in configuration read once per runner; empty means TND only.
+        # Opt-in configuration is read once per runner; empty means TND only.
         self._BSND_CAPTURE_SPECS = parse_bsnd_capture_specs(
             os.getenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", ""), self.buckets
         )
         self.bsnd_entries: dict[tuple[int, int], Any] = {}
-        self._bsnd_debug_sync = False
         self._replays_by_bucket: dict[int, int] = {}
         # FIA workspace shared across every layer AND every bucket: only one
         # prefill graph executes at a time (sequential batches, sequential
@@ -225,7 +224,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             )
 
     def _prepare_capture_buffers(self, buf: PrefillBucketBuffers, bucket: int, runner: Any) -> None:
-        # 20261019: Allocate int32 NPU slots once before any BSND/TND capture.
+        # Allocate int32 NPU slots once before any BSND/TND capture.
         # Allocate once: replacing these tensors invalidates the earlier graph's inputs.
         if not getattr(buf, "_npu_capture_inputs_prepared", False):
             if getattr(runner, "uses_mrope", False):
@@ -371,7 +370,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
 
         from tqdm import tqdm
 
-        # 20261019: Capture BSND first, preserving latest TND capture/update implementation.
+        # Capture BSND first; TND retains its capture/update ordering.
         self.capture_bsnd_graphs(runner)
         graph_pool = torch.npu.graph_pool_handle()
         sorted_buckets = sorted(self.buckets, reverse=True)
@@ -409,7 +408,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                         )
                     torch.npu.synchronize()
             except Exception as e:
-                # 20261019: Do not continue with BSND graphs after a failed device capture.
+                # Do not continue with BSND graphs after a failed device capture.
                 if self._BSND_CAPTURE_SPECS:
                     raise
                 logger.warning(
@@ -586,10 +585,8 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         graph.replay()
         return buf.output_bufs[1]
 
-    # 20261019: BSND-only additions; latest TND replay remains update-before-replay.
-
     def match_bsnd_bucket(self, num_reqs: int, max_len: int) -> tuple[int, int] | None:
-        # 20261019: Choose the smallest successfully captured fitting shape, not env order.
+        # Choose the smallest successfully captured fitting shape, not env order.
         for T, B in self._BSND_CAPTURE_SPECS:
             if B == num_reqs and T // B >= max_len and self.has_bsnd_captured_graph(T, B):
                 return T, B
@@ -648,7 +645,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         kwargs (input_layout="BSND", no seq-lens lists, no block_table) are
         shape-bound, so replay needs no per-layer host update.
         """
-        # 20261019: No allocation/capture when disabled; resources are graph-owned.
+        # No allocation/capture when disabled; resources are graph-owned.
         if not self._BSND_CAPTURE_SPECS or not is_prefill_graph_enabled():
             return
         if not is_npu_available():
@@ -666,7 +663,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         from tqdm import tqdm
 
         graph_pool = torch.npu.graph_pool_handle()
-        # 20261020: Keep BSND resources on this runner-owned bucket.
+        # Keep BSND resources on this runner-owned bucket.
         # Do not add NPU-only fields to the common bucket definition.
         for T, B in tqdm(
             list(self._BSND_CAPTURE_SPECS), desc="Capturing NPU graphs (prefill BSND)"
@@ -709,14 +706,14 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                     # index conversion is needed after graph.replay().
                     compact_output = torch.empty_like(output)
             except Exception as e:
-                # 20261019: Propagate device/capture failures through the startup hook.
+                # Propagate device/capture failures through the startup hook.
                 raise RuntimeError(f"BSND capture failed for {(T, B)}; restart required") from e
 
             buf.bsnd_captured_graphs[B] = graph
             buf.bsnd_output_bufs[B] = output
             buf.bsnd_compact_output_bufs[B] = compact_output
             buf.bsnd_static_attn_metadatas[B] = meta
-            # 20261019: Ported v4 fix; historical note: 20261008 Hold and validate the actual captured inputs.
+            # Hold and validate the actual captured inputs.
             capture_inputs = {
                 name: getattr(buf, name)
                 for name in ("input_ids_buf", "positions_buf", "slot_mapping_buf")
@@ -758,12 +755,6 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                     f"BSND ({T}, {B}) captured input changed: {name}; recapture is required"
                 )
 
-    def _bsnd_debug_checkpoint(self, phase: str, T: int, B: int) -> None:
-        if self._bsnd_debug_sync:
-            logger.warning("BSND debug (%d,%d): synchronizing %s", T, B, phase)
-            torch.npu.synchronize()
-            logger.warning("BSND debug (%d,%d): %s OK", T, B, phase)
-
     def execute_model_prefill_bsnd(
         self,
         T: int,
@@ -773,7 +764,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         slot_mapping: torch.Tensor | None,
         token_counts: list[int],
     ) -> torch.Tensor | None:
-        """v4.1 replay: per-request scatter into [i*P, i*P+L_i), replay, gather.
+        """Scatter each request into [i*P, i*P+L_i), replay, then compact.
 
         Padding rows carry pad_token / position 0 / slot -1; the causal mask
         already isolates them (pad key k>=L_i > q is causal-masked), so no
@@ -790,7 +781,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             or slot_mapping is None
         ):
             return None
-        # 20261019: Validate packed extents before launching any copies.
+        # Validate packed extents before launching any copies.
         actual = sum(token_counts)
         if input_ids.ndim != 1 or input_ids.shape[0] < actual:
             return None
@@ -802,10 +793,9 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         if len(token_counts) != B or any(c <= 0 or c > P for c in token_counts):
             return None
 
-        # 20261019: Ported v4 fix; historical note: 20261008 Check before any device work; never replay stale pointers.
+        # Check before any device work; never replay stale pointers.
         self._validate_bsnd_capture_inputs(buf, T, B)
-        self._bsnd_debug_checkpoint("before input preparation", T, B)
-        # 20261020: Initialize padding before copying the real request regions.
+        # Initialize padding before copying the real request regions.
         buf.input_ids_buf.fill_(buf.pad_token_id)
         if buf.positions_buf.ndim == 1:
             buf.positions_buf.fill_(0)
@@ -830,24 +820,21 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             o += L_i
 
         graph = buf.bsnd_captured_graphs[B]
-        self._bsnd_debug_checkpoint("after input preparation", T, B)
         graph.replay()
-        self._bsnd_debug_checkpoint("after graph replay", T, B)
 
         # Avoid Python-list advanced indexing: it may synchronously upload an
         # index tensor after replay, waiting for the entire preceding graph.
         out = buf.bsnd_output_bufs[B]
         compact_output = buf.bsnd_compact_output_bufs[B]
         self._compact_bsnd_output(out, compact_output, P, token_counts)
-        self._bsnd_debug_checkpoint("after gather", T, B)
         return compact_output
 
     @staticmethod
     def _compact_bsnd_output(out, compact_output, P: int, token_counts: list[int]) -> None:
         """Same-stream D2D copies; source and destination must not alias.
 
-        Only the first sum(token_counts) rows are valid, as in the old output.
-        This removes index H2D, not the device dependency on graph completion.
+        Only the first sum(token_counts) rows are valid. Copies follow graph
+        completion on the replay stream without uploading an index tensor.
         """
         offset = 0
         for row, count in enumerate(token_counts):
@@ -879,7 +866,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             )
 
 
-# 20261019: Parsing is dependency-free and deterministic; no implicit B=4 enablement.
+# Parsing is dependency-free and deterministic; no implicit B=4 enablement.
 def parse_bsnd_capture_specs(raw: str, buckets) -> tuple[tuple[int, int], ...]:
     specs = set()
     for item in raw.split(";"):

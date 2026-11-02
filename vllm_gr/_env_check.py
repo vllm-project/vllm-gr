@@ -20,7 +20,7 @@ _SUPPORTED_VLLM_VERSION = "0.30.0"
 _SUPPORTED_VLLM_ASCEND_VERSION = "0.30.0rc2"
 # The rc2 vendor image ships triton-ascend 3.6.0+dev...; _public_version()
 # strips the "+dev..." local suffix, so pinning the public 3.6.0 matches it.
-_SUPPORTED_TRITON_ASCEND_VERSION: str | None = "3.6.0"
+_SUPPORTED_TRITON_ASCEND_VERSION = "3.6.0"
 
 _OPENCV_PKGS = [
     "opencv-python",
@@ -117,13 +117,6 @@ def check_ascend_environment(*, require_npu_platform: bool = False) -> dict[str,
     and can overwrite its files. Import the Ascend backend as the authoritative
     check of the module that Python will actually use.
     """
-    if _SUPPORTED_TRITON_ASCEND_VERSION is None:
-        raise RuntimeError(
-            "Ascend support is not enabled in this build: the supported "
-            "Triton-Ascend version is unset. The GR NPU path requires the "
-            "validated vLLM-Ascend / Triton-Ascend pair; see "
-            "docs/quickstart-ascend.md for the installation procedure."
-        )
     report = check_runtime_versions(require_ascend=True)
 
     triton_ascend_version = _distribution_version("triton-ascend")

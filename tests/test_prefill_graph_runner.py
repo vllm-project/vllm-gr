@@ -16,7 +16,7 @@ from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 def _force_non_npu(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
 
-    # 20261020: Isolate unit-test bucket grids from deployment BSND capture specs.
+    # Isolate unit-test bucket grids from deployment BSND capture specs.
     monkeypatch.delenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", raising=False)
     monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: False)
 
@@ -1262,7 +1262,6 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     assert events == ["native"]
 
 
-# 20261020: Test the real constructor with explicitly scoped BSND configuration.
 def test_npu_bsnd_config_defaults_off() -> None:
     from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
 

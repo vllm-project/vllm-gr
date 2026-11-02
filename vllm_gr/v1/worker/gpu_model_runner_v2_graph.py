@@ -93,9 +93,8 @@ def make_patched_capture_model_v2(_orig_capture_model):
             manager = self.cudagraph_manager
             if profile_only and isinstance(manager, GRPrefillCudaGraphManager):
                 # GR's token/request grid has nonuniform per-graph costs.
-                # Two native FULL samples underestimated the measured plan by
-                # 28% even after accounting for Decode. Measure the full GR
-                # plan in the native throwaway pool; leave its sample list
+                # Measure the full GR plan in the native throwaway pool
+                # rather than extrapolating two FULL samples. Leave its sample list
                 # empty so native extrapolation returns the measured total.
                 manager._max_full_descs_to_capture = None
                 manager._capture_mem_samples = None

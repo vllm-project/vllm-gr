@@ -8,9 +8,8 @@ vLLM calls ``load_general_plugins()`` in every process (main, EngineCore subproc
 Worker subprocess), which discovers and executes this entry point.
 
 This module is the formal runtime initialization boundary for vllm-gr.
-After removing the GR adapter / recommend runtime, its only responsibility
-is to apply the vLLM monkey patches needed by the OneRec beam-search path
-(catalog-constrained generation).
+It checks runtime compatibility and installs the patches for Beam Search,
+sliced vocabulary projection, Ascend integration, and Pangu weight loading.
 """
 
 import logging

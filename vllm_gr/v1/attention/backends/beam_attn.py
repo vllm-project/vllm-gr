@@ -554,7 +554,6 @@ class BeamAttentionImpl(AttentionImpl):
         """Streamlined fast-path for pure prefill execution in Full Graph mode."""
         platform_execution = _get_platform_execution_module()
 
-        # Port only BSND routing; preserve latest decode and TND implementations.
         # Validate the captured layout before submitting even the cache write.
         # A BSND dummy has no block table and cannot fall through to paged TND.
         use_bsnd = NPU_DEVICE and getattr(attn_metadata, "prefill_fia_layout", "TND") == "BSND"
@@ -588,10 +587,7 @@ class BeamAttentionImpl(AttentionImpl):
             ):
                 raise ValueError("BSND prefill does not support this attention configuration")
 
-        if isinstance(kv_cache, tuple):
-            key_cache, value_cache = kv_cache
-        else:
-            key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache = self._kv_cache_views(kv_cache)
 
         if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
             k_scale = None if NPU_DEVICE else getattr(layer, "_k_scale", None)

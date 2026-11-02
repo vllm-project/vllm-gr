@@ -709,7 +709,7 @@ def create_engine_config(self, usage_context=None, headless=False):
     # process *before* the vllm-gr plugin loads. Install the GR-key sanitizer
     # here -- after origin_create_engine_config and every general plugin, and
     # before EngineCoreClient spawns the process -- so it is the outermost
-    # entrypoint and strips GR keys before vllm-ascend's init_ascend_config.
+    # entrypoint and filters GR keys during vllm-ascend's init_ascend_config.
     if _is_npu_platform():
         from vllm.v1.engine.core import EngineCoreProc
 

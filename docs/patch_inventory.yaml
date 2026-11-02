@@ -11,7 +11,8 @@ current_runtime:
   npu:
     vllm: "0.30.0"
     vllm_ascend: "0.30.0rc2"
-    status: validated
+    validation_baseline_commit: "43bc85f9b375281452d0af7005dc9fa752f43884"
+    status: baseline_validated_config_refactor_requires_npu_revalidation
 
 patches:
   - id: GR-PATCH-000
@@ -46,7 +47,7 @@ patches:
     validator_or_test:
       - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
     process_roles: [worker]
-    target: vllm_ascend.worker.worker_v1.NPUWorker.init_device (re-exported by worker.worker)
+    target: vllm_ascend.worker.worker.NPUWorker.init_device
     risk: high
     contract: null
     removal_condition: stable NPU worker initialization installs compatibility before ModelRunner construction
@@ -229,7 +230,7 @@ patches:
       - tests/test_sliced_logits.py
       - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
     process_roles: [worker]
-    target: LogitsProcessor and Sampler
+    target: LogitsProcessor, Sampler.gather_logprobs, and V2 compute_topk_scores (defining module and sampler import bindings)
     risk: medium
     contract: sliced-vocabulary-projection
     removal_condition: vLLM exposes stable output-projection and logprob-width hooks
@@ -263,16 +264,33 @@ patches:
 
   - id: GR-PATCH-019
     owner: vllm_gr/v1/ascend_compat.py
-    installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer
-    activation: create_engine_config runs on the NPU platform; re-asserted on every call
+    installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer and patch_npu_worker_init_device
+    activation: NPU engine configuration and worker plugin initialization; entrypoint re-asserted on every create_engine_config call
     validator_or_test:
       - vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer return value
+      - tests/test_ascend_compat.py::test_ascend_config_filter_preserves_engine_identity_and_gr_config
+      - tests/test_ascend_compat.py::test_ascend_config_filter_restores_mapping_on_native_failure
+      - tests/test_ascend_compat.py::test_ascend_entry_installs_filter_before_delegating
+      - tests/test_ascend_compat.py::test_worker_installs_config_filter_before_constructor
       - NPU EngineCore startup (vllm-ascend AscendConfig pydantic extra="forbid")
-    process_roles: [main, engine_core]
+    process_roles: [main, engine_core, worker]
     target: vllm.v1.engine.core.EngineCoreProc.run_engine_core and vllm_ascend.ascend_config.init_ascend_config
     risk: high
     contract: ascend-config-additional-config-keys
     removal_condition: vllm-ascend's AscendConfig accepts unknown additional_config keys, or vllm-gr stops carrying its configuration in additional_config
+
+  - id: GR-PATCH-020
+    owner: vllm_gr/pangu_compat.py
+    installer: vllm_gr.pangu_compat.apply_pangu_tied_embeddings_patch
+    activation: runtime initialization; wrapper preserves ties only for PanguEmbeddedForCausalLM with tie_word_embeddings enabled
+    validator_or_test:
+      - tests/test_pangu_compat.py
+      - tests/test_patch_initialization.py::test_runtime_patch_order_preserves_ascend_initialization
+    process_roles: [main, engine_core, worker]
+    target: vllm.config.ModelConfig.maybe_untie_word_embeddings
+    risk: high
+    contract: pangu-tied-embeddings
+    removal_condition: upstream distinguishes Pangu's zero-filled lm_head placeholder from an independent projection weight
 
 # IDs are retained here when the installer and its legacy surface have been removed.
 retired_patches:

@@ -4,6 +4,7 @@
 """Compatibility patches for vLLM-Ascend integration points."""
 
 import logging
+from functools import wraps
 from typing import Any, cast
 
 import torch
@@ -88,27 +89,6 @@ def apply_ascend_attention_backend_patch(force: bool = False) -> int:
     return 1
 
 
-def _try_import_npu_worker() -> Any | None:
-    """Import the v1 NPUWorker class from vllm-ascend.
-
-    Current vllm-ascend defines ``NPUWorker`` in ``worker.worker_v1``; older
-    builds exposed it from ``worker.worker``.  Try both, returning ``None``
-    when neither is importable.
-    """
-    for module_path in (
-        "vllm_ascend.worker.worker_v1",
-        "vllm_ascend.worker.worker",
-    ):
-        try:
-            module = __import__(module_path, fromlist=["NPUWorker"])
-            worker_cls = getattr(module, "NPUWorker", None)
-            if worker_cls is not None:
-                return worker_cls
-        except (ImportError, AttributeError):
-            continue
-    return None
-
-
 def patch_npu_worker_init_device() -> int:
     """Run vllm-gr patch installation before NPUWorker device initialization."""
     global _NPU_WORKER_PATCH_APPLIED
@@ -116,17 +96,20 @@ def patch_npu_worker_init_device() -> int:
     if not is_npu_platform() or _NPU_WORKER_PATCH_APPLIED:
         return 0
 
-    # The v1 NPUWorker lives in worker_v1 in current vllm-ascend; older builds
-    # expose it from worker.  Try the v1 path first, then fall back.
-    NPUWorker = _try_import_npu_worker()
-    if NPUWorker is None:
+    try:
+        from vllm_ascend.worker.worker import NPUWorker
+    except ImportError:
         logger.warning(
-            "Failed to import NPUWorker from vllm_ascend.worker.worker_v1 or "
+            "Failed to import NPUWorker from "
             "vllm_ascend.worker.worker; the vllm-gr delayed NPU patch retry "
             "hook was not installed for this attempt."
         )
         return 0
 
+    # Spawned workers load plugins before constructing NPUWorker, whose
+    # __init__ validates Ascend config before init_device can run. Install
+    # the filter here too; a fresh worker cannot inherit EngineCore's patch.
+    _install_init_ascend_config_sanitizer()
     original_init_device = NPUWorker.init_device
 
     def _patched_init_device(self: Any) -> Any:
@@ -214,25 +197,41 @@ def apply_penalties_warmup_oom_guard() -> int:
 
 
 def _install_init_ascend_config_sanitizer() -> None:
-    """Wrap init_ascend_config so no call site ever sees vllm-gr keys.
+    """Filter GR keys only during native Ascend configuration validation.
 
-    vllm-ascend calls init_ascend_config from both the EngineCore entrypoint
-    (patch_engine_core) and NPUWorker.__init__, and the VllmConfig may be
-    re-serialized between those sites -- restoring the GR key that the
-    entrypoint sanitizer already stripped. Wrapping the function itself makes
-    every call strip the key first, which is process-local and idempotent.
+    EngineCore and NPUWorker both initialize the Ascend config. Keep their
+    VllmConfig identity (used by the native config cache) and restore its
+    original mapping after each synchronous call, including failures. GR
+    parsing and serialization then use the same config on every platform.
     """
     import sys
 
     import vllm_ascend.ascend_config as ascend_config_mod
 
+    from vllm_gr.config.parser import GR_CONFIG_KEY, GR_CONFIG_KEY_PREFIX
+
     original = ascend_config_mod.init_ascend_config
     if getattr(original, "_vllm_gr_sanitized", False):
         return
 
+    @wraps(original)
     def _patched_init_ascend_config(vllm_config: Any) -> Any:
-        _strip_gr_additional_config(vllm_config)
-        return original(vllm_config)
+        additional = getattr(vllm_config, "additional_config", None)
+        if not isinstance(additional, dict):
+            return original(vllm_config)
+        filtered = {
+            key: value
+            for key, value in additional.items()
+            if key != GR_CONFIG_KEY
+            and not (isinstance(key, str) and key.startswith(GR_CONFIG_KEY_PREFIX))
+        }
+        if len(filtered) == len(additional):
+            return original(vllm_config)
+        vllm_config.additional_config = filtered
+        try:
+            return original(vllm_config)
+        finally:
+            vllm_config.additional_config = additional
 
     _patched_init_ascend_config._vllm_gr_sanitized = True  # type: ignore[attr-defined]
     ascend_config_mod.init_ascend_config = _patched_init_ascend_config
@@ -249,57 +248,19 @@ def _install_init_ascend_config_sanitizer() -> None:
             mod.init_ascend_config = _patched_init_ascend_config
 
 
-def _strip_gr_additional_config(vllm_config: Any) -> None:
-    """Strip GR keys from ``additional_config`` before Ascend validation.
-
-    vllm-ascend's EngineCore entrypoint calls ``init_ascend_config`` in the
-    spawned child *before* the vllm-gr plugin loads, so the canonical
-    ``vllm_gr`` key (and legacy ``vllm_gr_*`` keys) would be rejected by
-    AscendConfig's pydantic ``extra="forbid"``.  The child owns a private copy
-    of the config, so removing the keys here is process-local; they are stashed
-    for ``parse_gr_config`` to merge back on the read path.
-    """
-    from vllm_gr.config.parser import (
-        GR_CONFIG_KEY,
-        GR_CONFIG_KEY_PREFIX,
-        stash_stripped_gr_additional,
-    )
-
-    additional = getattr(vllm_config, "additional_config", None)
-    if not isinstance(additional, dict):
-        return
-    gr_keys = {
-        key: value
-        for key, value in additional.items()
-        if key == GR_CONFIG_KEY or (isinstance(key, str) and key.startswith(GR_CONFIG_KEY_PREFIX))
-    }
-    if not gr_keys:
-        return
-    stash_stripped_gr_additional(gr_keys)
-    for key in gr_keys:
-        del additional[key]
-
-
 def _sanitize_engine_core_entry(
     *args,
     dp_rank: int = 0,
     local_dp_rank: int = 0,
     **kwargs,
 ):
-    """Outer EngineCore entrypoint that sanitizes GR keys before Ascend init.
+    """Install the config filter before the child's first Ascend init call.
 
     Installed on ``EngineCoreProc.run_engine_core`` after vllm-ascend's own
     wrapper, so this function is what multiprocessing pickles as the child's
-    target.  It strips GR keys, then delegates to vllm-ascend's entrypoint so
-    ``init_ascend_config`` still runs -- on a clean ``additional_config`` --
-    preserving the child's Ascend config singleton.
+    target. Delegate to the native Ascend entrypoint with the original
+    config; only its validation call sees the filtered mapping.
     """
-    vllm_config = kwargs.get("vllm_config")
-    if vllm_config is not None:
-        _strip_gr_additional_config(vllm_config)
-
-    # init_ascend_config is also called from NPUWorker.__init__ on a
-    # possibly-re-serialized config; wrap it so every call strips GR keys.
     _install_init_ascend_config_sanitizer()
 
     from vllm_ascend.patch.platform.patch_engine_core import (

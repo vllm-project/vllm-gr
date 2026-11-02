@@ -6,7 +6,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -199,6 +199,8 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     import vllm_gr.patch as runtime_patch
 
     monkeypatch.setattr(ascend_compat, "_NPU_WORKER_PATCH_APPLIED", False)
+    install_filter = mock.Mock()
+    monkeypatch.setattr(ascend_compat, "_install_init_ascend_config_sanitizer", install_filter)
     monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: False)
     monkeypatch.delitem(sys.modules, "vllm_ascend.worker.worker", raising=False)
     assert ascend_compat.patch_npu_worker_init_device() == 0
@@ -207,6 +209,7 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: True)
     monkeypatch.setitem(sys.modules, "vllm_ascend.worker.worker", None)
     assert ascend_compat.patch_npu_worker_init_device() == 0
+    install_filter.assert_not_called()
 
     events: list[str] = []
     raise_from_original = False
@@ -231,6 +234,7 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
 
     assert ascend_compat.patch_npu_worker_init_device() == 1
     assert ascend_compat.patch_npu_worker_init_device() == 0
+    install_filter.assert_called_once_with()
     assert worker_class().init_device() == "ready"
     assert events == ["re_apply", "original"]
 
@@ -247,3 +251,166 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     with pytest.raises(RuntimeError, match="init failed"):
         worker_class().init_device()
     assert events == ["re_apply", "original"]
+
+
+def _install_fake_ascend_config(
+    monkeypatch: pytest.MonkeyPatch, initialize: Any, *, install: bool = True
+) -> tuple[Any, Any]:
+    package = ModuleType("vllm_ascend")
+    package.__path__ = []
+    config_module = ModuleType("vllm_ascend.ascend_config")
+    setattr(config_module, "init_ascend_config", initialize)
+    setattr(package, "ascend_config", config_module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend", package)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ascend_config", config_module)
+    entry = ModuleType("vllm_ascend.patch.platform.patch_engine_core")
+    setattr(entry, "init_ascend_config", initialize)
+    worker = ModuleType("vllm_ascend.worker.worker")
+    setattr(worker, "init_ascend_config", initialize)
+    monkeypatch.setitem(sys.modules, entry.__name__, entry)
+    monkeypatch.setitem(sys.modules, worker.__name__, worker)
+    if not install:
+        return initialize, entry
+    ascend_compat._install_init_ascend_config_sanitizer()
+    assert entry.init_ascend_config is config_module.init_ascend_config
+    assert worker.init_ascend_config is config_module.init_ascend_config
+    ascend_compat._install_init_ascend_config_sanitizer()
+    assert entry.init_ascend_config is config_module.init_ascend_config
+    return config_module.init_ascend_config, entry
+
+
+def test_worker_installs_config_filter_before_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.config.parser import parse_gr_config
+
+    config = SimpleNamespace(additional_config={"vllm_gr_beam_max_width": 8})
+    seen: list[Any] = []
+
+    def initialize(received: Any) -> None:
+        assert received.additional_config == {}
+        seen.append(received)
+
+    # A fresh worker process has no filter installed by EngineCore.
+    _install_fake_ascend_config(monkeypatch, initialize, install=False)
+    worker_module = sys.modules["vllm_ascend.worker.worker"]
+
+    class NPUWorker:
+        def __init__(self) -> None:
+            worker_module.init_ascend_config(config)
+
+        def init_device(self) -> None:
+            raise AssertionError("config validation precedes device initialization")
+
+    setattr(worker_module, "NPUWorker", NPUWorker)
+    monkeypatch.setattr(ascend_compat, "_NPU_WORKER_PATCH_APPLIED", False)
+    monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: True)
+    assert ascend_compat.patch_npu_worker_init_device() == 1
+    NPUWorker()
+    assert seen == [config]
+    assert parse_gr_config(config).beam_max_width == 8
+
+
+@pytest.mark.parametrize("canonical", [False, True])  # type: ignore[misc]
+def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
+    monkeypatch: pytest.MonkeyPatch, canonical: bool
+) -> None:
+    from copy import deepcopy
+
+    from vllm_gr.config.parser import parse_gr_config
+
+    seen: list[Any] = []
+
+    def initialize(config: Any) -> str:
+        assert config.additional_config == {"refresh": True}
+        seen.append(config)
+        return "native-config"
+
+    initialize_filtered, _ = _install_fake_ascend_config(monkeypatch, initialize)
+    configs = []
+    for width in (4, 8):
+        additional: dict[str, Any] = {"refresh": True}
+        if canonical:
+            additional["vllm_gr"] = {
+                "schema_version": 1,
+                "beam": {"execution_mode": "v1", "max_width": width},
+                "constraint_table": {"max_top_k": width},
+            }
+        else:
+            additional.update(vllm_gr_beam_execution_mode="v1", vllm_gr_beam_max_width=width)
+        config = SimpleNamespace(additional_config=additional)
+        before = deepcopy(additional)
+        expected = parse_gr_config(config)
+        assert initialize_filtered(config) == "native-config"
+        assert seen[-1] is config
+        assert config.additional_config is additional
+        assert additional == before
+        assert parse_gr_config(config) == expected
+        assert parse_gr_config(deepcopy(config)) == expected
+        configs.append(config)
+
+    # Initializing another engine cannot change a previous engine or a
+    # completely ordinary config in the same process.
+    assert [parse_gr_config(config).beam_max_width for config in configs] == [4, 8]
+    assert parse_gr_config(SimpleNamespace(additional_config={})).beam_max_width is None
+
+
+def test_ascend_config_filter_restores_mapping_on_native_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    additional = {"vllm_gr_beam_max_width": 4, "unknown_vendor_key": True}
+    config = SimpleNamespace(additional_config=additional)
+
+    def initialize(received: Any) -> None:
+        assert received is config
+        # Unknown vendor options still reach native validation.
+        assert received.additional_config == {"unknown_vendor_key": True}
+        raise ValueError("native validation failed")
+
+    initialize_filtered, _ = _install_fake_ascend_config(monkeypatch, initialize)
+    with pytest.raises(ValueError, match="native validation failed"):
+        initialize_filtered(config)
+    assert config.additional_config is additional
+    assert additional["vllm_gr_beam_max_width"] == 4
+
+
+@pytest.mark.parametrize("additional", [None, {}, {"refresh": True}])  # type: ignore[misc]
+def test_ascend_config_filter_leaves_ordinary_config_untouched(
+    monkeypatch: pytest.MonkeyPatch, additional: Any
+) -> None:
+    config = SimpleNamespace(additional_config=additional)
+
+    def initialize(received: Any) -> object:
+        assert received is config
+        assert received.additional_config is additional
+        return config
+
+    initialize_filtered, _ = _install_fake_ascend_config(monkeypatch, initialize)
+    assert initialize_filtered(config) is config
+
+
+def test_ascend_entry_installs_filter_before_delegating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(additional_config={"vllm_gr_beam_max_width": 4})
+
+    def initialize(received: Any) -> None:
+        assert received is config
+        assert received.additional_config == {}
+
+    _, entry = _install_fake_ascend_config(monkeypatch, initialize)
+
+    def native_entry(*args: Any, **kwargs: Any) -> str:
+        assert args == ("socket-address",)
+        assert kwargs == {"vllm_config": config, "dp_rank": 2, "local_dp_rank": 1}
+        entry.init_ascend_config(config)
+        assert config.additional_config == {"vllm_gr_beam_max_width": 4}
+        return "ready"
+
+    setattr(entry, "_run_engine_core_patch_func", native_entry)
+    assert (
+        ascend_compat._sanitize_engine_core_entry(
+            "socket-address", vllm_config=config, dp_rank=2, local_dp_rank=1
+        )
+        == "ready"
+    )

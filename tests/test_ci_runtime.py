@@ -23,6 +23,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestRuntimeResolution(unittest.TestCase):
+    def test_shipped_runtime_declarations_match_both_platforms(self) -> None:
+        self.assertEqual(
+            runtime.declarations(ROOT, "cuda"),
+            {"vllm": "0.30.0", "vllm-gr": "0.30.0"},
+        )
+        self.assertEqual(
+            runtime.declarations(ROOT, "npu"),
+            {
+                "vllm": "0.30.0",
+                "vllm-gr": "0.30.0",
+                "vllm-ascend": "0.30.0rc2",
+                "triton-ascend": "3.6.0",
+            },
+        )
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -202,12 +217,12 @@ class TestRuntimeResolution(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertFalse(json.loads(output.read_text())["ok"])
 
-    def test_unset_triton_pin_does_not_prevent_cuda_resolution(self) -> None:
+    def test_missing_vendor_declaration_does_not_prevent_cuda_resolution(self) -> None:
         path = self.repo / "vllm_gr/_env_check.py"
         path.write_text(
             path.read_text().replace(
                 '_SUPPORTED_TRITON_ASCEND_VERSION = "3.2.1"',
-                "_SUPPORTED_TRITON_ASCEND_VERSION: str | None = None",
+                "",
             )
         )
         self.assertEqual(runtime.resolve(self.repo, "cuda")["expected"]["vllm"], "0.29.0")

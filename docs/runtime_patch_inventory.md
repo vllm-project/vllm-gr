@@ -23,9 +23,12 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 
 The current CUDA release candidate targets vLLM 0.30.0 and has completed GPU
 functional, packaging, and performance validation. Its release-level precision
-decision remains open. The Ascend 0.30.0rc2 runtime completed NPU validation
+decision remains open. The Ascend 0.30.0rc2 baseline at
+`43bc85f9b375281452d0af7005dc9fa752f43884` completed NPU validation
 (unit, integration, eager/graph end-to-end, dynamic beam, prefill graphs, and
-benchmark gates); optional integrations such as LMCache remain unvalidated.
+benchmark gates). The subsequent config-filter refactor has host regression
+coverage and still requires NPU startup and inference revalidation. Optional
+integrations such as LMCache remain unvalidated.
 
 ## Risk Levels
 
@@ -61,7 +64,8 @@ aligned with it.
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
 | GR-PATCH-016 | `vllm_gr/npu_spawn_patch.py` | `vllm_gr.npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
 | GR-PATCH-018 | `vllm_gr/v1/ascend_compat.py` | `apply_penalties_warmup_oom_guard` | NPUWorker `init_device` runs and the native penalties warmup is present | installer result; NPU startup at `--max_num_seqs 2048` | NPU worker |
-| GR-PATCH-019 | `vllm_gr/v1/ascend_compat.py` | `apply_engine_core_config_sanitizer` | `create_engine_config` on the NPU platform, re-asserted per call | installer result; NPU EngineCore startup | main, EngineCore |
+| GR-PATCH-019 | `vllm_gr/v1/ascend_compat.py` | `apply_engine_core_config_sanitizer`, `patch_npu_worker_init_device` | NPU engine configuration and worker plugin initialization | Ascend config preservation and initialization tests; NPU startup | main, EngineCore, worker |
+| GR-PATCH-020 | `vllm_gr/pangu_compat.py` | `apply_pangu_tied_embeddings_patch` | runtime initialization; tied Pangu models only | Pangu compatibility and patch initialization tests | main, EngineCore, worker |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -95,8 +99,7 @@ aligned with it.
 
 - Source: `vllm_gr/v1/ascend_compat.py`
 - Orchestration: `vllm_gr/patch.py`
-- Target: `vllm_ascend.worker.worker_v1.NPUWorker.init_device`, re-exported by
-  `vllm_ascend.worker.worker`
+- Target: `vllm_ascend.worker.worker.NPUWorker.init_device`
 - Mutation: lifecycle method wrapper
 - Platform: NPU
 - Risk: High
@@ -325,6 +328,8 @@ aligned with it.
     - `LogitsProcessor.__init__`
     - `LogitsProcessor._get_logits`
     - `Sampler.gather_logprobs`
+    - `vllm.v1.worker.gpu.sample.logprob.compute_topk_scores` and its bindings
+      in the V2 sampler and rejection sampler
 - Risk: Medium
 - Activation: hooks are installed during runtime initialization; sliced projection is
   used only when a valid vocabulary slice is configured.
@@ -370,28 +375,49 @@ aligned with it.
 
 - Source / Installer: `vllm_gr/v1/ascend_compat.py`
 - Orchestration: `vllm_gr/engine/arg_utils_gr.py::create_engine_config`
+  and worker plugin initialization through `vllm_gr/patch.py::_apply_patches`
 - Targets:
     - `vllm.v1.engine.core.EngineCoreProc.run_engine_core` (process-global
       staticmethod replacement)
     - `vllm_ascend.ascend_config.init_ascend_config` (function replacement)
 - Mutation: entrypoint wrapper plus function wrapper
-- Platform / process role: main, EngineCore
+- Platform / process role: NPU; main, EngineCore, worker
 - Risk: High
-- Behavior: strips the canonical `vllm_gr` key and legacy `vllm_gr_*` keys from
-  `additional_config` before vllm-ascend validates it, then delegates to
-  vllm-ascend's own entrypoint so `init_ascend_config` still runs. Stripped keys
-  are stashed in `vllm_gr.config.parser` and merged back on the read path, so
-  parsing is identical to the untouched configuration. vllm-ascend's
+- Behavior: installs a filter before delegating to vllm-ascend's own
+  entrypoint. During each synchronous `init_ascend_config` call, the canonical
+  `vllm_gr` key and legacy `vllm_gr_*` keys are excluded from its validation
+  mapping. The original `additional_config` mapping is restored in `finally`,
+  including on failure. The native config cache retains the original
+  `VllmConfig` identity; GR parsing and process serialization retain all GR
+  parameters without process-global configuration storage. vllm-ascend's
   `AscendConfig` uses pydantic `extra="forbid"` and is initialised in the
-  spawned child before the vllm-gr plugin loads, and it is called again from
-  `NPUWorker.__init__` on a possibly re-serialized config — hence both the
-  entrypoint and the function wrapper.
+  EngineCore child before the vllm-gr plugin loads. Separate worker processes
+  load plugins before `NPUWorker.__init__`, which also validates this config.
+  The worker hook installs the function wrapper at plugin load time so fresh
+  workers do not depend on inheriting EngineCore's patched modules.
 - Installation guards: NPU platform only; wrapper installation is idempotent,
   and the entrypoint is re-asserted by identity check on every
   `create_engine_config` because each `EngineArgs` round-trip reloads the
   general plugins and reinstalls their wrappers.
 - Removal condition: vllm-ascend's `AscendConfig` accepts unknown
   `additional_config` keys, or vllm-gr stops carrying its configuration there.
+
+### GR-PATCH-020 — Pangu Tied Embeddings
+
+- Source / Installer: `vllm_gr/pangu_compat.py::apply_pangu_tied_embeddings_patch`
+- Orchestration: `vllm_gr/patch.py::_apply_patches`
+- Target: `vllm.config.ModelConfig.maybe_untie_word_embeddings`
+- Platforms / process roles: GPU and NPU; main, EngineCore, worker
+- Risk: High
+- Behavior: preserves tied embeddings for `PanguEmbeddedForCausalLM` when the
+  checkpoint config declares `tie_word_embeddings`. The official checkpoint's
+  zero-filled `lm_head.weight` is a placeholder; treating it as an independent
+  head produces zero logits. Other architectures and untied Pangu models keep
+  the native loader decision.
+- Validation: `tests/test_pangu_compat.py` covers model scope and idempotence;
+  `tests/test_patch_initialization.py` checks installation order.
+- Removal condition: upstream distinguishes the placeholder from independent
+  projection weights while loading the official Pangu checkpoint.
 
 ## Benchmark-only Runtime Mutations
 

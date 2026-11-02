@@ -4,11 +4,16 @@
 import hashlib
 import json
 import statistics
+from functools import cache
 from pathlib import Path
+from typing import cast
 
+import numpy as np
 import pytest
+from safetensors.numpy import save
 
 from benchmarks.beam_search.v1_performance_ab import (
+    artifact_workload_digest,
     combine_retry_results,
     compare,
     should_retry,
@@ -18,23 +23,42 @@ BASE_SHA = "a" * 40
 PR_SHA = "b" * 40
 
 
-def write_artifact(root: Path, tokenizer_digest: str, value: int = 1) -> str:
-    payload = value.to_bytes(4, "little", signed=True)
-    header = json.dumps(
-        {
-            "__metadata__": {
+@cache
+def artifact_bytes(tokenizer_digest: str, value: int) -> bytes:
+    # Repeated passes reuse one immutable artifact. Re-serialization may
+    # change safetensors metadata order and therefore the whole-file digest.
+    return cast(
+        bytes,
+        save(
+            {"values": np.array([value], dtype=np.int32)},
+            metadata={
                 "format": "constraint_table_v1",
                 "tokenizer_digest": tokenizer_digest,
                 "vocab_size": "16",
             },
-            "values": {"dtype": "I32", "shape": [1], "data_offsets": [0, len(payload)]},
-        },
-        separators=(",", ":"),
-    ).encode()
-    header += b" " * (-len(header) % 8)
-    artifact = len(header).to_bytes(8, "little") + header + payload
-    (root / "constraint_table.safetensors").write_bytes(artifact)
-    return "sha256:" + hashlib.sha256(artifact).hexdigest()
+        ),
+    )
+
+
+def write_artifact(root: Path, tokenizer_digest: str, value: int = 1) -> str:
+    payload = artifact_bytes(tokenizer_digest, value)
+    (root / "constraint_table.safetensors").write_bytes(payload)
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def test_artifact_workload_rejects_trailing_payload_even_with_matching_digest(
+    tmp_path: Path,
+) -> None:
+    write_artifact(tmp_path, "tokenizer")
+    path = tmp_path / "constraint_table.safetensors"
+    with path.open("ab") as stream:
+        stream.write(b"unclaimed payload")
+    setup = {
+        "artifact_digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+        "tokenizer_digest": "tokenizer",
+    }
+    with pytest.raises(ValueError, match="invalid safetensors artifact"):
+        artifact_workload_digest(tmp_path, setup)
 
 
 def rewrite_artifact_identity(root: Path, tokenizer_digest: str, value: int = 1) -> None:

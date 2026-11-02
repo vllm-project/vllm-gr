@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Runtime installer for sliced-vocabulary logits projection."""
 
+from functools import wraps
+
 import torch
 from vllm.logger import init_logger
 
@@ -14,6 +16,22 @@ from vllm_gr.ops.sliced_logits import (
 logger = init_logger(__name__)
 
 _SLICED_LOGITS_PATCHED = False
+
+
+def _make_clamped_v2_topk(original):
+    # Late importers may already bind the patched defining-module function.
+    # Reuse it rather than stacking another wrapper for every import site.
+    if getattr(original, "_vllm_gr_clamped_topk", False):
+        return original
+
+    @wraps(original)
+    def compute_topk_scores(logits, num_logprobs, *args, **kwargs):
+        if logits is not None and torch.is_tensor(logits) and logits.numel() > 0:
+            num_logprobs = min(num_logprobs, logits.size(-1))
+        return original(logits, num_logprobs, *args, **kwargs)
+
+    compute_topk_scores._vllm_gr_clamped_topk = True
+    return compute_topk_scores
 
 
 def _restore_vocab_slice_config() -> None:
@@ -107,14 +125,6 @@ def apply_sliced_logits_patch() -> bool:
         # namespace (``from ... import compute_topk_scores``), so the clamp
         # must be installed on every importer's binding, not just the defining
         # module.
-        def _make_clamped_v2_topk(original_v2_topk):
-            def patched_compute_topk_scores(logits, num_logprobs, *args, **kwargs):
-                if logits is not None and torch.is_tensor(logits) and logits.numel() > 0:
-                    num_logprobs = min(num_logprobs, logits.size(-1))
-                return original_v2_topk(logits, num_logprobs, *args, **kwargs)
-
-            return patched_compute_topk_scores
-
         try:
             from vllm.v1.worker.gpu.sample import logprob as v2_logprob
 

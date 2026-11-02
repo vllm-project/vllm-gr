@@ -11,7 +11,7 @@ import ast
 import unittest
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -165,6 +165,7 @@ class BSNDRegressions(unittest.TestCase):
             prefill_flash_attn_version=None,
             prefill_attention=lambda **kw: calls.append(("tnd", kw)),
         )
+        owner._kv_cache_views = MethodType(extract(BACKEND, "_kv_cache_views", {}), owner)
         meta = SimpleNamespace(
             prefill_fia_layout="BSND",
             num_reqs=4,
@@ -321,8 +322,6 @@ class BSNDRegressions(unittest.TestCase):
             {
                 "torch": FakeTorch,
                 "torch_npu": npu,
-                "_BSNB_WORKSPACE_CACHE": {},
-                "_BSNB_LSE_CACHE": {},
             },
         )
         device = SimpleNamespace(index=0)
@@ -352,7 +351,6 @@ class BSNDRegressions(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
-# 20261019: Additional migration contracts against the latest source and bootstrap.
 class BSNDContracts(unittest.TestCase):
     def test_specs_disabled_sorted_and_validated(self) -> None:
         parse = extract(RUNNER, "parse_bsnd_capture_specs", {})
@@ -391,7 +389,6 @@ class BSNDContracts(unittest.TestCase):
         self.assertIsNone(select(runner, scheduled, graph, 4))
 
 
-# 20261019: Exercise the actual latest model-forward wrapper with host doubles.
 class ForwardRouting(unittest.TestCase):
     def exercise(
         self,

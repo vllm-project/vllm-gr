@@ -56,69 +56,46 @@ def artifact_workload_digest(root: Path, setup: dict[str, Any]) -> str:
     changes. Validate both runtime identities locally, then compare the stable
     metadata and tensor payload across the A/B environments.
     """
+    from safetensors import SafetensorError, safe_open
+
     path = root / "constraint_table.safetensors"
     try:
-        data = path.read_bytes()
+        with path.open("rb") as stream:
+            actual_digest = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
     except FileNotFoundError as exc:
         raise ValueError(f"missing constraint_table.safetensors in {root}") from exc
     expected_digest = setup.get("artifact_digest")
-    actual_digest = "sha256:" + hashlib.sha256(data).hexdigest()
     if expected_digest != actual_digest:
         raise ValueError(f"artifact digest mismatch in {root}")
-    if len(data) < 8:
-        raise ValueError(f"invalid safetensors artifact in {root}")
-    header_size = int.from_bytes(data[:8], "little")
-    payload_start = 8 + header_size
-    if header_size <= 0 or payload_start > len(data):
-        raise ValueError(f"invalid safetensors header in {root}")
-    try:
-        header = json.loads(data[8:payload_start])
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid safetensors header in {root}") from exc
-    if not isinstance(header, dict):
-        raise ValueError(f"invalid safetensors header in {root}")
-    metadata = header.pop("__metadata__", {})
-    if not isinstance(metadata, dict):
-        raise ValueError(f"invalid safetensors metadata in {root}")
-    if metadata.get("tokenizer_digest") != setup.get("tokenizer_digest"):
-        raise ValueError(f"tokenizer digest mismatch in {root}")
-
     workload = hashlib.sha256()
-    stable_metadata = {key: value for key, value in metadata.items() if key != "tokenizer_digest"}
-    workload.update(
-        json.dumps(stable_metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    )
-    for name in sorted(header):
-        tensor = header[name]
-        if not isinstance(tensor, dict):
-            raise ValueError(f"invalid safetensors tensor {name!r} in {root}")
-        dtype = tensor.get("dtype")
-        shape = tensor.get("shape")
-        offsets = tensor.get("data_offsets")
-        if (
-            not isinstance(dtype, str)
-            or not isinstance(shape, list)
-            or any(
-                isinstance(size, bool) or not isinstance(size, int) or size < 0 for size in shape
+    try:
+        # Reuse the format reader's dtype, shape and offset validation. Load
+        # one tensor at a time; the whole-file digest above streams the bytes.
+        with safe_open(path, framework="numpy") as artifact:
+            metadata = artifact.metadata() or {}
+            if metadata.get("tokenizer_digest") != setup.get("tokenizer_digest"):
+                raise ValueError(f"tokenizer digest mismatch in {root}")
+            stable_metadata = {
+                key: value for key, value in metadata.items() if key != "tokenizer_digest"
+            }
+            workload.update(
+                json.dumps(stable_metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
             )
-            or not isinstance(offsets, list)
-            or len(offsets) != 2
-            or any(isinstance(offset, bool) or not isinstance(offset, int) for offset in offsets)
-        ):
-            raise ValueError(f"invalid safetensors tensor {name!r} in {root}")
-        begin, end = offsets
-        if begin < 0 or end < begin or payload_start + end > len(data):
-            raise ValueError(f"invalid safetensors offsets for {name!r} in {root}")
-        descriptor = {
-            "name": name,
-            "dtype": dtype,
-            "shape": shape,
-            "size": end - begin,
-        }
-        workload.update(
-            json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        )
-        workload.update(data[payload_start + begin : payload_start + end])
+            for name in sorted(artifact.keys()):
+                view = artifact.get_slice(name)
+                tensor = artifact.get_tensor(name)
+                descriptor = {
+                    "name": name,
+                    "dtype": view.get_dtype(),
+                    "shape": view.get_shape(),
+                    "size": tensor.nbytes,
+                }
+                workload.update(
+                    json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                )
+                workload.update(tensor.tobytes())
+    except SafetensorError as exc:
+        raise ValueError(f"invalid safetensors artifact in {root}: {exc}") from exc
     return "sha256:" + workload.hexdigest()
 
 

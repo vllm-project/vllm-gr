@@ -497,6 +497,24 @@ def test_native_quantized_head_dtype_rejection() -> None:
         processor(head, torch.randn(2, 32))
 
 
+def test_v2_topk_clamp_reuses_an_already_wrapped_import() -> None:
+    from vllm_gr.ops.sliced_logits_patch import _make_clamped_v2_topk
+
+    calls = []
+
+    def native(logits: torch.Tensor, num_logprobs: int, *, logits_mode: bool) -> Any:
+        calls.append((num_logprobs, logits_mode))
+        return logits.topk(num_logprobs, dim=-1)
+
+    early_import = _make_clamped_v2_topk(native)
+    late_import = _make_clamped_v2_topk(early_import)
+    assert late_import is early_import
+    logits = torch.tensor([[1.0, 3.0, 2.0]])
+    actual = late_import(logits, 8, logits_mode=True)
+    torch.testing.assert_close(actual.values, torch.tensor([[3.0, 2.0, 1.0]]))
+    assert calls == [(3, True)]
+
+
 @pytest.mark.parametrize("logits_mode", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("width", [1, 7])  # type: ignore[misc]
 @pytest.mark.parametrize("num_logprobs", [0, 1, 5])  # type: ignore[misc]
