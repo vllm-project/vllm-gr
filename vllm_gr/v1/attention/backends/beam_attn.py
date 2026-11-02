@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -19,8 +20,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
-from vllm.v1.kv_cache_interface import is_quantized_kv_cache
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
@@ -113,6 +113,17 @@ def _get_platform_execution_module() -> ModuleType:
 
 class BeamAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+
+    def _kv_cache_views(
+        self, kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(kv_cache, tuple):
+            return kv_cache
+        # vLLM 0.30 allocates a logical [B, H, N, K+V] view, with
+        # layout-dependent strides. The kernels consume [B, N, H, D]
+        # views into that same allocation, including interleaved layers.
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        return key_cache, value_cache
 
     @staticmethod
     def update_graph_params(
@@ -335,12 +346,7 @@ class BeamAttentionImpl(AttentionImpl):
 
         platform_execution = _get_platform_execution_module()
 
-        # NPU provides kv_cache as a tuple (key_cache, value_cache);
-        # GPU provides a stacked tensor [2, num_blocks, ...]
-        if isinstance(kv_cache, tuple):
-            key_cache, value_cache = kv_cache[0], kv_cache[1]
-        else:
-            key_cache, value_cache = kv_cache.unbind(0)
+        key_cache, value_cache = self._kv_cache_views(kv_cache)
 
         # --- Incremental decode path for beam decode ---
         # When is_beam_decode is True and beam_session is available,
@@ -548,7 +554,6 @@ class BeamAttentionImpl(AttentionImpl):
         """Streamlined fast-path for pure prefill execution in Full Graph mode."""
         platform_execution = _get_platform_execution_module()
 
-        # Port only BSND routing; preserve latest decode and TND implementations.
         # Validate the captured layout before submitting even the cache write.
         # A BSND dummy has no block table and cannot fall through to paged TND.
         use_bsnd = NPU_DEVICE and getattr(attn_metadata, "prefill_fia_layout", "TND") == "BSND"
@@ -582,10 +587,7 @@ class BeamAttentionImpl(AttentionImpl):
             ):
                 raise ValueError("BSND prefill does not support this attention configuration")
 
-        if isinstance(kv_cache, tuple):
-            key_cache, value_cache = kv_cache[0], kv_cache[1]
-        else:
-            key_cache, value_cache = kv_cache.unbind(0)
+        key_cache, value_cache = self._kv_cache_views(kv_cache)
 
         if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
             k_scale = None if NPU_DEVICE else getattr(layer, "_k_scale", None)
@@ -679,6 +681,40 @@ class BeamAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
 
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # Preserve the Ascend-compatible block size that
+        # _apply_npu_default_block_size pins onto the running config (128).
+        # vLLM 0.30's platform hook otherwise resolves an unspecified size back
+        # to a 16-multiple geometry that the Ascend kernels and prefix-caching
+        # block tables cannot represent.
+        from vllm.config.vllm import get_current_vllm_config_or_none
+
+        current = get_current_vllm_config_or_none()
+        if current is not None and cls.supports_block_size(current.cache_config.block_size):
+            return current.cache_config.block_size
+        return super().get_preferred_block_size(default_block_size)
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "",
+    ) -> tuple[int, ...]:
+        # vLLM 0.30 dropped this from the base class; vllm-ascend's NPU runner
+        # calls it on the selected backend to size the pooled K/V cache, so the
+        # shape must match what the Ascend kernels and this module's gather
+        # helpers expect: a leading "2" that splits K from V, then a
+        # token-major block view. Mirror vllm-ascend's own layout switch so an
+        # explicit VLLM_KV_CACHE_LAYOUT=LBHNC/HND stays consistent with it.
+        from vllm import envs as vllm_envs
+
+        if vllm_envs.VLLM_KV_CACHE_LAYOUT in ("LBHNC", "HND"):
+            return (2, num_blocks, num_kv_heads, block_size, head_size)
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
+
     @staticmethod
     def get_name() -> str:
         return "CUSTOM"
@@ -699,28 +735,18 @@ class BeamAttentionBackend(AttentionBackend):
     def get_builder_cls() -> type["BeamAttentionMetadataBuilder"]:
         return BeamAttentionMetadataBuilder
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(include_num_layers_dimension: bool = False) -> tuple[int, ...]:
-        cache_layout = get_kv_cache_layout()
-        if cache_layout == "NHD" and include_num_layers_dimension:
-            return (2, 0, 1, 3, 4, 5)
-        elif cache_layout == "NHD":
-            return (0, 1, 2, 3, 4)
-        elif cache_layout == "HND" and include_num_layers_dimension:
-            return (2, 4, 0, 1, 3, 5)
-        elif cache_layout == "HND":
-            return (0, 1, 3, 2, 4)
-        raise ValueError(f"Unknown cache layout format {cache_layout}.")
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # Cache writes, FlashAttention and suffix gathering consume strides.
+        # Prefer token-major storage, matching the former NHD default.
+        return (
+            KVCacheLayout.LBNHC,
+            KVCacheLayout.LBHNC,
+            KVCacheLayout.BLNHC,
+            KVCacheLayout.BLHNC,
+            KVCacheLayout.BHLNC,
+            KVCacheLayout.LHBNC,
+        )
 
     @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
@@ -772,6 +798,7 @@ class BeamAttentionBackend(AttentionBackend):
         use_mla,
         has_sink,
         use_sparse,
+        use_mm_prefix,
         device_capability,
     ) -> str | None:
         if not NPU_DEVICE:
@@ -795,4 +822,6 @@ class BeamAttentionBackend(AttentionBackend):
             return "No MLA support."
         if use_sparse:
             return "No sparse support."
+        if use_mm_prefix:
+            return "No multimodal prefix support."
         return None

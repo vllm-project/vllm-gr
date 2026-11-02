@@ -88,10 +88,14 @@ def install_numpy_staging() -> None:
         self._staged_write_contents.extend(values)
         self._staged_write_cu_lens.append(len(self._staged_write_contents))
 
-    def async_tensor_h2d(data: Any, dtype: Any, device: Any, *args: Any, **kwargs: Any) -> Any:
+    def async_tensor_h2d(data: Any, *args: Any, **kwargs: Any) -> Any:
         if isinstance(data, NumpyStagedContents):
-            return array_h2d(data.array(), dtype, device)
-        return original_h2d(data, dtype, device, *args, **kwargs)
+            data = data.array()
+            # vLLM 0.30 accepts arrays directly. Keep received read-only storage
+            # out of torch.from_numpy, which exposes writable Tensor access.
+            if not data.flags.writeable:
+                data = data.copy()
+        return original_h2d(data, *args, **kwargs)
 
     setattr(stage_write, "_gr_numpy_tokens", True)
     cls.stage_write = stage_write  # type: ignore[method-assign]

@@ -36,6 +36,32 @@ Beam candidate ordering, so equality across these geometries is not guaranteed.
 Use the existing precision gate and record replay/fallback counts on the matching
 workload before attributing accuracy or performance results to the padded path.
 
+## Independent-engine reduction policy
+
+CUDA ModelRunner V1 engines using `beam.execution_mode=v1` and Inductor now
+default `compilation_config.inductor_compile_config.dynamic_scale_rblock` to
+`false`. The native compilation configuration includes this choice in its cache
+identity. Existing explicit values take precedence; ModelRunner V2, NPU and
+non-Beam engines keep their own defaults.
+
+With the same OneRec inputs, weights and AOT artifact, Inductor could select
+either a 64-element or a 128-element reduction block for the generated Q/K norm
+and RoPE kernel. Selecting each existing binary reproduced the two previously
+observed candidate/score sequences exactly. Differences were already present in
+Prefill, before Beam candidate selection. The default disables that dynamic
+block-size adjustment while retaining compilation and CUDA graph replay.
+
+This policy addresses the observed independent-engine mismatch. It does not
+guarantee invariance across batch shapes, GPUs or compiler versions. Explicitly
+setting `dynamic_scale_rblock=true` restores the original tuning behavior and is
+outside this consistency guarantee. Business Recall and performance need their
+own acceptance measurements on the resulting candidate.
+
+The existing `test_onerec_v1_completion_batch_online` ST retains exact ordered
+candidate and score comparisons between independent offline and online
+engines. The test observers record dispatch and lifecycle events without GPU
+tensor readback or profiler instrumentation.
+
 ## Historical correctness and lifecycle results
 
 The following configurations were compared with exact ordered device-state

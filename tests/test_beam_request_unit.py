@@ -27,7 +27,7 @@ def _sub_patch_preserves_greedy_validation() -> None:
 
     try:
         SamplingParams(temperature=0.0, n=2)
-    except ValueError as exc:
+    except VLLMValidationError as exc:
         assert "n must be 1 when using greedy sampling" in str(exc)
     else:
         raise AssertionError("GR disabled vLLM greedy sampling validation")

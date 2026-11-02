@@ -24,7 +24,7 @@ def patch_grpc_server():
     """
     from grpc_health.v1 import health_pb2
     from grpc_reflection.v1alpha import reflection, reflection_pb2
-    from vllm.entrypoints import grpc_server as upstream
+    from vllm.entrypoints.launchers import grpc_server as upstream
 
     # Reflection must describe our extended schema, not the original schema
     # imported into the default pool by the upstream runtime dependencies.

@@ -56,22 +56,15 @@ def _remove_model_bytecode_hooks(runner: object) -> None:
     if model is None:
         return
 
-    from torch._dynamo.convert_frame import _bytecode_hooks
     from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 
-    # vLLM 0.22 registers bound methods but discards their RemovableHandles.
-    # The global registry then keeps the model/weights alive after shutdown,
-    # even after gc.unfreeze()/collect(). AOT loading can register duplicates.
-    # CUDAGraphWrapper forwards modules() to the underlying model. Remove all
-    # native hooks for those modules before native shutdown drops self.model;
-    # hooks for other engines or unrelated callbacks must remain registered.
-    module_ids = {id(module) for module in model.modules()}
-    for key, hook in tuple(_bytecode_hooks.items()):
-        if (
-            id(getattr(hook, "__self__", None)) in module_ids
-            and getattr(hook, "__func__", None) is TorchCompileWithNoGuardsWrapper.bytecode_hook
-        ):
-            _bytecode_hooks.pop(key, None)
+    # vLLM 0.30 keeps each Dynamo RemovableHandle on its compile wrapper and
+    # exposes cleanup(). GPUModelRunner.shutdown drops self.model without
+    # calling it, so release the callbacks before native shutdown. The model's
+    # modules() traversal also works through CUDAGraphWrapper.
+    for module in model.modules():
+        if isinstance(module, TorchCompileWithNoGuardsWrapper):
+            module.cleanup()
 
 
 def _runner_vocab_size(runner: object) -> int:
@@ -393,7 +386,7 @@ def apply_worker_patches() -> None:
             runner_class._vllm_gr_native_bookkeeping = runner_class._bookkeeping_sync
         # Pure-prefill graph interception: replays captured prefill graphs for
         # prompt batches inside _model_forward (installed on both platforms;
-        # the runner classes expose _model_forward on vllm 0.22.1).
+        # the vLLM 0.30 runner classes expose this method).
         model_forward_patch = getattr(platform_module, "make_patched_model_forward", None)
         if model_forward_patch is not None and hasattr(runner_class, "_model_forward"):
             runner_class._model_forward = model_forward_patch(runner_class._model_forward)

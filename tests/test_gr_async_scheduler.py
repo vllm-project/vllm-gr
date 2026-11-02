@@ -3,7 +3,8 @@
 # pytest decorators are untyped in the mypy-only pre-commit environments.
 # mypy: disable-error-code="misc,no-untyped-def,var-annotated,no-untyped-call"
 import asyncio
-from types import SimpleNamespace
+from contextlib import nullcontext
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import msgspec
@@ -11,6 +12,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.engine import (
     EngineCoreOutput,
@@ -142,14 +144,20 @@ def _scheduler_output() -> SimpleNamespace:
     return SimpleNamespace(num_scheduled_tokens={"session-0": 1})
 
 
-def test_scheduler_patch_processes_subclass_super_chain_once(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "call_style", ["default", "positional_false", "positional_true", "keyword_true"]
+)
+@pytest.mark.parametrize("raise_error", [False, True])
+def test_scheduler_patch_processes_subclass_super_chain_once(
+    monkeypatch, call_style, raise_error
+) -> None:
     """A platform Scheduler subclass may delegate to an already-patched base."""
 
     from vllm.v1.core.sched import scheduler as scheduler_module
 
     from vllm_gr.v1.engine import gr_async_scheduler
 
-    native_calls: list[str] = []
+    native_calls: list[tuple[str, bool]] = []
     retirement_calls: list[object] = []
 
     class BaseScheduler:
@@ -178,8 +186,10 @@ def test_scheduler_patch_processes_subclass_super_chain_once(monkeypatch) -> Non
         def update_from_output(self, *args, **kwargs):
             return {}
 
-        def schedule(self):
-            native_calls.append("base")
+        def schedule(self, throttle_prefills=False):
+            native_calls.append(("base", throttle_prefills))
+            if raise_error:
+                raise RuntimeError("native schedule failure")
             return SimpleNamespace(
                 num_scheduled_tokens={},
                 total_num_scheduled_tokens=0,
@@ -195,9 +205,9 @@ def test_scheduler_patch_processes_subclass_super_chain_once(monkeypatch) -> Non
     apply_scheduler_patch()
 
     class BalanceScheduler(BaseScheduler):
-        def schedule(self):
-            native_calls.append("balance")
-            return super().schedule()
+        def schedule(self, throttle_prefills=False):
+            native_calls.append(("balance", throttle_prefills))
+            return super().schedule(throttle_prefills)
 
     monkeypatch.setattr(scheduler_module, "Scheduler", BalanceScheduler)
     apply_scheduler_patch()
@@ -205,11 +215,25 @@ def test_scheduler_patch_processes_subclass_super_chain_once(monkeypatch) -> Non
     scheduler = BalanceScheduler()
     original_get_computed_blocks = scheduler.kv_cache_manager.get_computed_blocks
     original_cache_blocks = scheduler.kv_cache_manager.coordinator.cache_blocks
-    output = scheduler.schedule()
+    expected_throttle = call_style in ("positional_true", "keyword_true")
+    with (
+        pytest.raises(RuntimeError, match="native schedule failure")
+        if raise_error
+        else nullcontext()
+    ):
+        if call_style == "default":
+            output = scheduler.schedule()
+        elif call_style == "keyword_true":
+            output = scheduler.schedule(throttle_prefills=True)
+        else:
+            output = scheduler.schedule(expected_throttle)
 
-    assert native_calls == ["balance", "base"]
-    assert retirement_calls == [output]
-    assert output.gr_stage_metadata == {}
+    assert native_calls == [("balance", expected_throttle), ("base", expected_throttle)]
+    if raise_error:
+        assert retirement_calls == []
+    else:
+        assert retirement_calls == [output]
+        assert output.gr_stage_metadata == {}
     assert not hasattr(scheduler, "_vllm_gr_schedule_patch_depth")
     assert scheduler.kv_cache_manager.get_computed_blocks is original_get_computed_blocks
     assert scheduler.kv_cache_manager.coordinator.cache_blocks is original_cache_blocks
@@ -277,7 +301,10 @@ def test_caller_formed_batch_publishes_kv_blocks_in_member_order(
     assert metadata.request_ids == ("session-0", "session-0:1")
     assert metadata.kv_blocks == ((11, 12), (21,))
     assert [block.block_id for block in touched] == [11, 12, 21]
-    assert [block.block_id for block in session._kv_dispatch_leases[0]] == [12, 11, 21]
+    assert [[block.block_id for block in group] for group in session._kv_dispatch_leases[0]] == [
+        [12, 11],
+        [21],
+    ]
 
 
 def test_caller_formed_batch_rejects_effective_scheduling_budget() -> None:
@@ -458,9 +485,9 @@ def test_early_finish_stops_issue_and_drains_already_queued_stage() -> None:
     native_request.is_finished = lambda: False
     finished: list[tuple[str, object]] = []
 
-    def finish_requests(request_id: str, status: object) -> list[tuple[str, int]]:
+    def finish_requests(request_id: str, status: object) -> list[Any]:
         finished.append((request_id, status))
-        return [(request_id, 0)]
+        return [native_request]
 
     scheduler.finish_requests = finish_requests
     result: dict[int, Any] = {}
@@ -502,10 +529,10 @@ def test_unexpected_native_termination_drains_before_delivering_failure() -> Non
             if metadata.stage_index != 0:
                 return {0: EngineCoreOutputs(outputs=[])}
 
-            self.requests.pop("session-0")
+            finished_request = self.requests.pop("session-0")
             _sync_gr_sessions_after_native_finish(
                 self,
-                [("session-0", 0)],
+                [finished_request],
                 SimpleNamespace(name="FINISHED_STOPPED"),
             )
             return {
@@ -713,7 +740,7 @@ def test_native_abort_all_result_cleans_unscheduled_gr_session() -> None:
 
     _sync_gr_sessions_after_native_finish(
         scheduler,
-        [(session.session_id, 0)],
+        [scheduler.requests[session.session_id]],
         SimpleNamespace(name="FINISHED_ABORTED"),
     )
 
@@ -743,7 +770,7 @@ def test_native_abort_overrides_a_pending_gr_terminal_result() -> None:
 
     _sync_gr_sessions_after_native_finish(
         scheduler,
-        [(session.session_id, 0)],
+        [scheduler.requests[session.session_id]],
         SimpleNamespace(name="FINISHED_ABORTED"),
     )
 
@@ -763,7 +790,7 @@ def test_internal_gr_finalization_preserves_the_pending_terminal_result() -> Non
 
     _sync_gr_sessions_after_native_finish(
         scheduler,
-        [(session.session_id, 0)],
+        [scheduler.requests[session.session_id]],
         SimpleNamespace(name="FINISHED_ERROR"),
     )
 
@@ -1002,6 +1029,7 @@ def test_native_kv_dispatch_lease_survives_abort_until_receipt() -> None:
 @pytest.mark.parametrize("shared_prefix", [False, True])
 @pytest.mark.parametrize("status", [GRSessionStatus.ABORTED, GRSessionStatus.FINISHING])
 @pytest.mark.parametrize("native_block_ids", [False, True])
+@pytest.mark.parametrize("cache_pattern", ["uncached", "cached", "mixed"])
 def test_dispatch_lease_preserves_native_eviction_order(
     num_groups: int,
     num_leases: int,
@@ -1009,6 +1037,7 @@ def test_dispatch_lease_preserves_native_eviction_order(
     shared_prefix: bool,
     status: GRSessionStatus,
     native_block_ids: bool,
+    cache_pattern: str,
 ) -> None:
     def resources() -> tuple[BlockPool, list[Any], list[Any]]:
         pool = BlockPool(num_gpu_blocks=3 * num_groups + 2, enable_caching=True, hash_block_size=16)
@@ -1018,11 +1047,22 @@ def test_dispatch_lease_preserves_native_eviction_order(
             [blocks[start + 2], blocks[start], blocks[start + 1]]
             for start in range(0, len(blocks), 3)
         ]
+        for group_id, group in enumerate(groups):
+            for index, block in enumerate(group):
+                if cache_pattern == "cached" or (cache_pattern == "mixed" and index == 0):
+                    block_hash = make_block_hash_with_group_id(
+                        BlockHash(block.block_id.to_bytes(32, "big")), group_id
+                    )
+                    block.set_block_hash(block_hash)
+                    pool.cached_block_hash_to_block.insert(block_hash, block)
         if shared_prefix:
             pool.touch([groups[0][0]])
         managers = [
             SimpleNamespace(
-                req_to_blocks={"session-0": group}, num_cached_block={}, block_pool=pool
+                req_to_blocks={"session-0": group},
+                num_cached_block={},
+                _partial_hit_reqs={},
+                block_pool=pool,
             )
             for group in groups
         ]
@@ -1030,6 +1070,9 @@ def test_dispatch_lease_preserves_native_eviction_order(
 
     def native_free(managers: list[Any]) -> None:
         for manager in managers:
+            manager.pop_blocks_for_free = MethodType(
+                SingleTypeKVCacheManager.pop_blocks_for_free, manager
+            )
             SingleTypeKVCacheManager.free(manager, "session-0")
 
     reference, _, reference_managers = resources()

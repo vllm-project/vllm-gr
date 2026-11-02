@@ -105,7 +105,8 @@ def test_async_scheduling_prefill_reuses_existing_padded_graph_without_runtime_c
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "invalid", ["ids", "positions", "inputs_embeds", "intermediate_tensors"]
+    "invalid",
+    ["ids", "positions", "mismatched_padding", "inputs_embeds", "intermediate_tensors"],
 )
 def test_async_prefill_padding_preserves_input_guards(
     monkeypatch: pytest.MonkeyPatch, invalid: str
@@ -136,6 +137,8 @@ def test_async_prefill_padding_preserves_input_guards(
         ids = ids[:3]
     elif invalid == "positions":
         positions = positions[None, :]
+    elif invalid == "mismatched_padding":
+        ids = torch.zeros(8, dtype=torch.int32)
     else:
         kwargs[invalid] = object()
     wrapped = gpu_patch.make_patched_model_forward(lambda *a, **k: "eager")
@@ -160,13 +163,15 @@ def test_async_scheduling_prefill_never_initializes_a_graph_runner_during_reques
     assert gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(runner) == "eager"
 
 
+@pytest.mark.parametrize("padding", [0, 4])  # type: ignore[misc]
 def test_batch_session_prefill_selects_exact_four_request_graph(
     monkeypatch: pytest.MonkeyPatch,
+    padding: int,
 ) -> None:
     request_ids = ("r0", "r1", "r2", "r3")
     scheduled_tokens = dict.fromkeys(request_ids, 1)
-    tokens = torch.arange(4, dtype=torch.int32)
-    positions = torch.arange(4)
+    tokens = torch.arange(4 + padding, dtype=torch.int32)
+    positions = torch.arange(4 + padding)
     hidden = object()
     calls: list[str] = []
 
@@ -249,7 +254,7 @@ def test_batch_session_prefill_rejects_partial_or_reordered_requests(
     assert eager_calls == [True]
 
 
-def test_gpu_prepare_preserves_order_and_two_item_contract(
+def test_gpu_prepare_preserves_order_and_three_item_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
@@ -266,16 +271,16 @@ def test_gpu_prepare_preserves_order_and_two_item_contract(
         self: Any,
         scheduler_output: Any,
         num_scheduled_tokens: Any,
-    ) -> tuple[object, object]:
+    ) -> tuple[object, object, int]:
         assert self._current_beam_info["req_ids"] == []
         events.append("original")
-        return original_logits, spec_metadata
+        return original_logits, spec_metadata, 5
 
     wrapped = gpu_patch.make_patched_prepare_inputs(original)
     assert gpu_patch.make_patched_prepare_inputs(wrapped) is wrapped
 
     ordinary = wrapped(runner, SimpleNamespace(beam_data={}), [1])
-    assert ordinary == (original_logits, spec_metadata)
+    assert ordinary == (original_logits, spec_metadata, 5)
     assert events == ["original"]
 
     assert runner._current_scheduler_output.beam_data == {}

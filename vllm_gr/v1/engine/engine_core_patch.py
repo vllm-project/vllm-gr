@@ -342,7 +342,7 @@ def _expand_gr_abort_request_ids(scheduler, request_ids, finished_status):
 
 
 def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished_status) -> None:
-    """Mirror native finish results into GR state using consumed request IDs."""
+    """Mirror the native finished Request objects into GR session state."""
     from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
 
     status_name = getattr(finished_status, "name", "")
@@ -350,7 +350,8 @@ def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished
     request_sessions = getattr(scheduler, "_gr_v1_request_sessions", {})
     gr_finalizing_ids = getattr(scheduler, _GR_FINALIZING_IDS_ATTR, ())
     gr_native_update_ids = getattr(scheduler, _GR_NATIVE_UPDATE_IDS_ATTR, ())
-    for req_id, _client_index in finished_requests:
+    for request in finished_requests:
+        req_id = request.request_id
         session = sessions.get(request_sessions.get(req_id, req_id))
         if session is None:
             continue
@@ -504,7 +505,7 @@ def apply_scheduler_patch():
     _original_schedule = Scheduler.schedule
 
     @wraps(_original_schedule)
-    def patched_schedule(self):
+    def patched_schedule(self, throttle_prefills: bool = False):
         # Some platform plugins replace Scheduler with a subclass whose
         # schedule() delegates to super().schedule(). If both implementations
         # were patched, that produces nested GR wrappers around one native
@@ -513,7 +514,7 @@ def apply_scheduler_patch():
         # subclass' normal super() chain without processing the output twice.
         schedule_patch_depth = getattr(self, _GR_SCHEDULE_PATCH_DEPTH_ATTR, 0)
         if schedule_patch_depth:
-            return _original_schedule(self)
+            return _original_schedule(self, throttle_prefills=throttle_prefills)
 
         # Cache only real prompt KV for V1: generated tokens are device-owned
         # placeholders. Ordinary requests retain native cache semantics.
@@ -537,7 +538,7 @@ def apply_scheduler_patch():
         setattr(self, _GR_SCHEDULE_PATCH_DEPTH_ATTR, schedule_patch_depth + 1)
         try:
             with gr_admission(self):
-                output = _original_schedule(self)
+                output = _original_schedule(self, throttle_prefills=throttle_prefills)
 
             gr_stages = {}
             sessions = getattr(self, "_gr_v1_sessions", {})

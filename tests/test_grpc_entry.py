@@ -152,6 +152,7 @@ def test_beam_options_map_to_execution_and_output_contracts(result_width: int | 
 def test_vocabulary_validation_matches_native_input_processor(
     binary: bool, tokenizer_max: int | None, token_id: int, accepted: bool
 ) -> None:
+    from vllm.exceptions import VLLMValidationError
     from vllm.v1.engine.input_processor import InputProcessor
 
     backend = engine()
@@ -185,7 +186,7 @@ def test_vocabulary_validation_matches_native_input_processor(
         batch, _ = servicer.build_batch([request])
         assert batch.items[0].request.prompt_token_ids[0] == token_id
     else:
-        with pytest.raises(ValueError, match="vocabulary"):
+        with pytest.raises(VLLMValidationError, match="vocabulary"):
             native_validate()
         with pytest.raises(ValueError, match="vocabulary"):
             servicer.build_batch([request])
@@ -670,7 +671,7 @@ def test_upstream_startup_keeps_health_reflection_stats_and_cleanup_order(
     pytest.importorskip("smg_grpc_servicer")
     from grpc_health.v1 import health_pb2, health_pb2_grpc
     from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
-    from vllm.entrypoints import grpc_server as upstream
+    from vllm.entrypoints.launchers import grpc_server as upstream
 
     from vllm_gr.entrypoints.beam_search_v1.client import _ASYNC_CLEANUP_TASKS
     from vllm_gr.entrypoints.grpc.serve import patch_grpc_server

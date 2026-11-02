@@ -4,9 +4,9 @@
 from logging import Logger
 from string import Template
 
-import vllm.entrypoints.utils
-import vllm.envs as envs
-from vllm.entrypoints.utils import current_formatter_type
+from vllm import envs
+from vllm.entrypoints.serve.utils import api_utils
+from vllm.logger import current_formatter_type
 
 
 def _log_version_and_model(lgr: Logger, version: str, model_name: str) -> None:
@@ -44,4 +44,4 @@ def _log_version_and_model(lgr: Logger, version: str, model_name: str) -> None:
 
 
 def patch_banner():
-    vllm.entrypoints.utils.log_version_and_model = _log_version_and_model
+    api_utils.log_version_and_model = _log_version_and_model

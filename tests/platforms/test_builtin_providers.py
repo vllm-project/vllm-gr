@@ -124,12 +124,12 @@ def test_cuda_environment_check_validates_platform_and_versions(
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
 
-    report = {"vllm": "0.22.1"}
+    report = {"vllm": "0.30.0"}
     check_versions = mock.Mock(return_value=report)
     monkeypatch.setattr(_env_check, "check_runtime_versions", check_versions)
 
     assert cuda.CUDA_BACKEND.check_environment() == {
-        "vllm": "0.22.1",
+        "vllm": "0.30.0",
         "platform": "cuda",
     }
     check_versions.assert_called_once_with()

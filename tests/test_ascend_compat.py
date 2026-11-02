@@ -154,32 +154,21 @@ def test_selector_installation_is_idempotent_and_force_uses_original(
     )
 
 
-def test_custom_backend_applies_required_kv_cache_layout(
+def test_custom_backend_import_failure_is_not_swallowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm.v1.attention.backends import utils
+    import vllm.v1.attention.selector as selector
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
-
-    set_layout = mock.Mock()
-    monkeypatch.setattr(utils, "set_kv_cache_layout", set_layout)
-    monkeypatch.setattr(
-        BeamAttentionBackend,
-        "get_required_kv_cache_layout",
-        staticmethod(lambda: "NHD"),
+    monkeypatch.setitem(sys.modules, "vllm_gr.v1.attention.backends.beam_attn", None)
+    native_backend, native_selector = _install_selector_patch(monkeypatch)
+    assert (
+        selector._cached_get_attn_backend(AttentionBackendEnum.FLASH_ATTN, "config")
+        is native_backend
     )
-
-    assert ascend_compat._get_custom_beam_backend() is BeamAttentionBackend
-    set_layout.assert_called_once_with("NHD")
-
-    set_layout.reset_mock()
-    monkeypatch.setattr(
-        BeamAttentionBackend,
-        "get_required_kv_cache_layout",
-        staticmethod(lambda: None),
-    )
-    assert ascend_compat._get_custom_beam_backend() is BeamAttentionBackend
-    set_layout.assert_not_called()
+    native_selector.assert_called_once()
+    with pytest.raises(ModuleNotFoundError, match="beam_attn"):
+        selector._cached_get_attn_backend(AttentionBackendEnum.CUSTOM, "config")
 
 
 def _install_fake_npu_worker(

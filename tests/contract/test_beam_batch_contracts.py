@@ -55,10 +55,6 @@ def _engine_request(
         cache_salt=None,
         data_parallel_rank=None,
     )
-    # vLLM 0.22.1 has no eos_token_id field. Keep local collection useful when
-    # an older developer environment still requires it.
-    if "eos_token_id" in EngineCoreRequest.__struct_fields__:
-        values["eos_token_id"] = None
     return EngineCoreRequest(**values)
 
 

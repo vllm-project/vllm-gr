@@ -354,13 +354,14 @@ def test_forward_preserves_cache_and_attention_arguments(
     impl.sinks = torch.empty(1)
     impl.alibi_slopes = torch.empty(2)
 
-    key_cache = torch.zeros(2, 2)
-    value_cache = torch.ones(2, 2)
+    impl.head_size = 8
+    key_cache = torch.zeros(2, 16, 2, 8)
+    value_cache = torch.ones_like(key_cache)
     kv_cache: Any
     if tuple_cache:
         kv_cache = (key_cache, value_cache)
     else:
-        kv_cache = torch.stack((key_cache, value_cache))
+        kv_cache = torch.cat((key_cache, value_cache), dim=-1).transpose(1, 2)
 
     key = torch.empty(1)
     value = torch.empty(1)
@@ -481,6 +482,7 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
     impl.alibi_slopes = None
 
     query = torch.zeros(2, 4, 8, dtype=torch.float16)
+    impl.head_size = 8
     key = torch.arange(2 * 2 * 8, dtype=torch.float16).reshape(2, 2, 8)
     value = key + 100
     output = torch.empty_like(query)
@@ -511,7 +513,7 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
         query=query,
         key=key,
         value=value,
-        kv_cache=torch.stack((key_cache, value_cache)),
+        kv_cache=torch.cat((key_cache, value_cache), dim=-1).transpose(1, 2),
         attn_metadata=metadata,
         output=output,
     )

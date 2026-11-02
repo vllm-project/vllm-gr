@@ -9,9 +9,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler

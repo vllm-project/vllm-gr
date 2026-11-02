@@ -5,7 +5,7 @@
 
 After the driver compiles a
 :class:`~vllm_gr.constraints.compiler.ConstraintTableResource`, it broadcasts it
-to every worker via ``EngineCore.collective_rpc`` (vLLM 0.22.1
+to every worker via ``EngineCore.collective_rpc`` (vLLM 0.30.0
 ``v1/engine/core.py``).  The worker method ``set_gr_constraint_resources`` is
 mounted by :mod:`vllm_gr.constraints.worker_inject` during worker
 ``init_device``.
@@ -62,7 +62,7 @@ def _resolve_collective(
     if not callable(collective):
         raise TypeError(
             f"engine core of type {type(engine_core).__name__} has no "
-            f"{method_name}; vLLM 0.22.1 v1 EngineCore is required"
+            f"{method_name}; vLLM 0.30.0 v1 EngineCore is required"
         )
     return collective
 

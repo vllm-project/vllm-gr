@@ -17,7 +17,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCore, EngineCoreProc, EngineShutdownState
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from tests.test_async_scheduling_scheduler import receipt, release_receipt
 from tests.test_async_scheduling_scheduler import scheduler as _scheduler_fixture
@@ -29,7 +29,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputSequence,
     BeamRequestOutput,
 )
-from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus
+from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, GRSessionStatus
 from vllm_gr.v1.engine.core import _handle_submit_gr_session
 from vllm_gr.v1.engine.engine_core_patch import (
     apply_engine_core_request_patches,
@@ -40,6 +40,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_RETIRE_OUTPUT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
     GRAdmissionError,
+    consume_gr_retirement,
 )
 
 scheduler = _scheduler_fixture
@@ -325,6 +326,55 @@ def test_public_abort_finishes_all_gr_batch_members(core):
     assert not core.scheduler.requests
     assert not getattr(core.scheduler, "_gr_v1_sessions", {})
     assert not getattr(core.scheduler, "_gr_v1_request_sessions", {})
+
+
+@pytest.mark.parametrize("selector", ["member", "generator", "all"])
+@pytest.mark.parametrize("in_flight", [False, True])
+def test_native_finish_returns_entire_gr_batch_and_drains_before_release(core, selector, in_flight):
+    request = _multi_batch_request()
+    scheduler = core.scheduler
+    pool = scheduler.kv_cache_manager.block_pool
+    initial_free = pool.get_num_free_blocks()
+    core._handle_submit_gr_session(request)
+    core._process_input_queue()
+    members = dict(scheduler.requests)
+    session = scheduler._gr_v1_sessions[request.batch_id]
+    pending = [scheduler.schedule(), scheduler.schedule()] if in_flight else []
+    request_ids = {
+        "member": "session-0:1",
+        "generator": (name for name in ("missing", "session-0:1", "session-0:1")),
+        "all": None,
+    }[selector]
+
+    finished = scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    assert {item.request_id for item in finished} == set(members)
+    assert len(finished) == 2
+    assert all(isinstance(item, Request) and item is members[item.request_id] for item in finished)
+    assert all(item.status is RequestStatus.FINISHED_ABORTED for item in finished)
+    assert not scheduler.requests
+    assert not scheduler.running
+    assert not scheduler.waiting
+    assert not scheduler.skipped_waiting
+    assert session.status is GRSessionStatus.ABORTED
+    assert scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED) == []
+
+    if in_flight:
+        assert session.resource_status is GRResourceStatus.DRAINING
+        assert pool.get_num_free_blocks() < initial_free
+        for scheduled in pending:
+            scheduler.update_from_output(scheduled, receipt(scheduled))
+        assert not session._kv_dispatch_leases
+        assert session.resource_status is GRResourceStatus.DRAINING
+        retirement = scheduler.schedule()
+        scheduler.update_from_output(retirement, release_receipt(retirement))
+        # Duplicate completion must not free another generation's resources.
+        assert consume_gr_retirement(scheduler, retirement, release_receipt(retirement)) is None
+    assert session.resource_status is GRResourceStatus.CLOSED
+    assert pool.get_num_free_blocks() == initial_free
+    assert not scheduler._gr_v1_sessions
+    assert not scheduler._gr_v1_request_sessions
+    assert getattr(scheduler, "_gr_owner", None) is None
 
 
 def test_native_abort_all_preserves_none_sentinel(core):

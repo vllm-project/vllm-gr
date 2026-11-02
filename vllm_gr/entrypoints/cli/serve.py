@@ -7,8 +7,11 @@ import argparse
 
 from vllm.entrypoints.cli.serve import ServeSubcommand
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.launchers.cli_args import (
+    make_arg_parser,
+    validate_parsed_serve_args,
+)
+from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 DESCRIPTION = """Launch a local OpenAI-compatible API server for vllm-gr.

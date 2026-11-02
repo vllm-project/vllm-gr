@@ -3,6 +3,7 @@
 """Check V1 caller batching, suffix decoding and E2E measurement boundaries."""
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
@@ -64,6 +65,96 @@ def test_accuracy_rejects_mismatched_output_counts() -> None:
             run_offline_v1_inference(
                 engine, ["prompt"], SimpleNamespace(beam_width=2, max_tokens=5), 1
             )
+
+
+@pytest.mark.parametrize("eager", [False, True])  # type: ignore[misc]
+def test_accuracy_cli_selects_engine_execution_mode(
+    monkeypatch: pytest.MonkeyPatch, eager: bool
+) -> None:
+    import transformers
+
+    import benchmarks.open_one_rec.one_rec_acc_test as benchmark
+    from vllm_gr.config import BeamExecutionMode
+
+    class EngineReached(Exception):
+        pass
+
+    def engine(**kwargs: Any) -> None:
+        assert kwargs["enforce_eager"] is eager
+        assert kwargs["async_scheduling"] is True
+        raise EngineReached
+
+    monkeypatch.setattr(
+        "vllm_gr.config.parser.load_gr_config",
+        lambda _: SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1, beam_max_width=128),
+    )
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        benchmark, "DataLoaderWrapper", lambda **kw: SimpleNamespace(load_data=lambda **kw: {})
+    )
+    monkeypatch.setattr(benchmark, "GRLLM", engine)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["accuracy", "--task-type", "video", "--vllm-gr-config", "config.json"]
+        + (["--enforce-eager"] if eager else []),
+    )
+    with pytest.raises(EngineReached):
+        benchmark.main()
+
+
+@pytest.mark.parametrize("template_kwargs", [None, {"enable_thinking": False}])  # type: ignore[misc]
+def test_accuracy_http_forwards_template_options(
+    monkeypatch: pytest.MonkeyPatch, template_kwargs: dict[str, Any] | None
+) -> None:
+    import benchmarks.open_one_rec.one_rec_acc_test as benchmark
+
+    payloads = []
+
+    def post(url: str, **kwargs: Any) -> Any:
+        payloads.append(kwargs["json"])
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"choices": [{"message": {"content": "result"}}]},
+        )
+
+    monkeypatch.setattr(benchmark.requests, "post", post)
+    content = "a question with enough content to satisfy the transcript coverage guard " * 2
+    prompt = f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+    outputs = benchmark.run_api_inference(
+        [prompt],
+        "model",
+        "http://localhost/unused",
+        "EMPTY",
+        {},
+        max_concurrency=1,
+        chat_template_kwargs=template_kwargs,
+    )
+    assert outputs[0].outputs[0].text == "result"
+    assert payloads[0]["messages"] == [{"role": "user", "content": content}]
+    if template_kwargs is None:
+        assert "chat_template_kwargs" not in payloads[0]
+    else:
+        assert payloads[0]["chat_template_kwargs"] == template_kwargs
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "options,message",
+    [
+        (["--endpoint", "/v1/chat/completions", "--enforce-eager"], "on the server"),
+        (["--endpoint", "/v1/chat/completions", "--chat-template-kwargs", "[]"], "JSON object"),
+        (["--chat-template-kwargs", "{}"], "only to online"),
+    ],
+)
+def test_accuracy_cli_rejects_misleading_execution_options(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any, options: list[str], message: str
+) -> None:
+    import benchmarks.open_one_rec.one_rec_acc_test as benchmark
+
+    monkeypatch.setattr(sys, "argv", ["accuracy", "--task-type", "video", *options])
+    with pytest.raises(SystemExit, match="2"):
+        benchmark.main()
+    assert message in capsys.readouterr().err
 
 
 def test_e2e_includes_lazy_text_and_uses_only_v1(monkeypatch: Any) -> None:

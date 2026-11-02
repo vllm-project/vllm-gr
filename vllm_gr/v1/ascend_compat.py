@@ -32,14 +32,9 @@ def is_npu_platform() -> bool:
 
 
 def _get_custom_beam_backend() -> type:
-    """Return the registered Beam backend and apply its required cache layout."""
+    """Load CUSTOM on demand; the engine core resolves its supported layouts."""
     from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
 
-    required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
-    if required_layout is not None:
-        from vllm.v1.attention.backends.utils import set_kv_cache_layout
-
-        set_kv_cache_layout(required_layout)
     return cast(type[Any], BeamAttentionBackend)
 
 
@@ -57,15 +52,6 @@ def apply_ascend_attention_backend_patch(force: bool = False) -> int:
         return 0
 
     try:
-        import vllm_gr.v1.attention.backends.beam_attn  # noqa: F401
-    except Exception:
-        return 0
-
-    if not AttentionBackendEnum.CUSTOM.is_overridden():
-        _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
-        return 0
-
-    try:
         import vllm.v1.attention.selector as selector_mod
     except ImportError:
         return 0
@@ -79,6 +65,9 @@ def apply_ascend_attention_backend_patch(force: bool = False) -> int:
         attn_selector_config: Any,
         num_heads: int | None = None,
     ) -> Any:
+        # Do not import an unselected backend during plugin initialization.
+        # If CUSTOM is selected, propagate its original import/registration
+        # error instead of swallowing it and reporting "not registered" later.
         if backend == AttentionBackendEnum.CUSTOM:
             return _get_custom_beam_backend()
 

@@ -26,11 +26,9 @@ from contextlib import aclosing
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorResponse,
-    RequestResponseMetadata,
-)
-from vllm.entrypoints.utils import get_max_tokens
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 from vllm.renderers.inputs.preprocess import prompt_to_seq
 
 from vllm_gr.config import BeamExecutionMode, GRConfig
@@ -232,6 +230,7 @@ async def _create_completion_batched(
         params=batch_params,
         lora_request=lora_request,
         trace_headers=trace_headers,
+        session_id=self._get_session_id(request, raw_request),
         trie_ids=(getattr(request, "vllm_xargs", None) or {}).get("trie_ids"),
     )
     try:
@@ -401,6 +400,7 @@ def _validate_completion_batch_patch() -> str | None:
             "_extract_prompt_text",
             "_log_inputs",
             "_get_trace_headers",
+            "_get_session_id",
             "beam_search",
         )
         if not hasattr(OpenAIServingCompletion, name)

@@ -229,7 +229,14 @@ def shutdown_sync_engine(engine: Any) -> None:
     if engine_core is not None:
         core_shutdown = getattr(engine_core, "shutdown", None)
         if callable(core_shutdown):
-            core_shutdown()
+            # vLLM 0.30 enforces the drain deadline in the parent process
+            # manager. Omitting it silently uses the five-second cleanup
+            # default, even when EngineCore was configured to drain longer.
+            # Zero means abort requests, not eliminate the existing sync
+            # frontend's best-effort resource-cleanup window.
+            config = getattr(engine, "vllm_config", None)
+            timeout = getattr(config, "shutdown_timeout", 0) or None
+            core_shutdown(timeout=timeout)
             return
 
     logger.warning(

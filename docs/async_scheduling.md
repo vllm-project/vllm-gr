@@ -1,6 +1,6 @@
 # Asynchronous scheduling
 
-Asynchronous scheduling runs Beam Search V1 on the native vLLM 0.22.1 `execute_model → sample_tokens`
+Asynchronous scheduling runs Beam Search V1 on the native vLLM 0.30.0 `execute_model → sample_tokens`
 interface. The next dispatch can prepare inputs and submit GPU work after the
 preceding sampling submission, before EngineCore consumes its receipt.
 

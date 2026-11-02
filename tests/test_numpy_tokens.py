@@ -103,13 +103,46 @@ def test_native_request_and_scheduler_data_stay_array_backed():
     np.testing.assert_array_equal(item.request.prompt_token_ids, [1, 2, 3])
     with pytest.raises(ValueError, match="capacity"):
         request.append_output_token_ids(7)
-    scheduled = NewRequestData.from_request(request, ([1],), request._all_token_ids)
+    scheduled = NewRequestData.from_request(
+        request, ([1],), request._all_token_ids, uses_mrope=False
+    )
     assert isinstance(scheduled.prompt_token_ids, np.ndarray)
     assert isinstance(scheduled.prefill_token_ids, np.ndarray)
     np.testing.assert_array_equal(scheduled.prefill_token_ids, [1, 2, 3, 4, 5, 6])
     # Native non-GR request construction is not changed by the scoped hook.
     ordinary = Request.from_engine_core_request(native([1, 2]), None)
     assert type(ordinary._all_token_ids) is list
+
+
+@pytest.mark.parametrize("uses_mrope", [False, True])
+def test_scheduler_data_preserves_native_mrope_metadata(uses_mrope):
+    from vllm.multimodal.inputs import (
+        MultiModalBatchedField,
+        MultiModalFeatureSpec,
+        MultiModalFieldElem,
+        MultiModalKwargsItem,
+        PlaceholderRange,
+    )
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.request import Request
+
+    install_numpy_scheduler_data()
+    request = Request.from_engine_core_request(native([1, 2, 3]), None)
+    grid = MultiModalFieldElem(torch.tensor([1, 2, 2]), MultiModalBatchedField(keep_on_cpu=True))
+    data = MultiModalKwargsItem(
+        grid=grid,
+        pixels=MultiModalFieldElem(torch.ones(1), MultiModalBatchedField()),
+    )
+    request.mm_features = [
+        MultiModalFeatureSpec(data, "image", "cached-image", PlaceholderRange(0, 1))
+    ]
+    request.num_computed_tokens = 1
+    scheduled = NewRequestData.from_request(request, ([1],), uses_mrope=uses_mrope)
+    if uses_mrope:
+        assert scheduled.mm_features[0].data == {"grid": grid}
+    else:
+        assert scheduled.mm_features[0].data is None
+    assert request.mm_features[0].data is data
 
 
 def test_hashes_match_list_path_for_cold_warm_incremental_and_salt():
@@ -164,7 +197,8 @@ def test_worker_detaches_arrays_without_python_token_lists():
     np.testing.assert_array_equal(prompt, [1, 2, 3])
 
 
-def test_native_v2_staging_batches_arrays_and_keeps_kernel_write_order(monkeypatch):
+@pytest.mark.parametrize("array_backed", [False, True])
+def test_native_v2_staging_batches_arrays_and_keeps_kernel_write_order(monkeypatch, array_backed):
     from vllm.v1.worker.gpu import buffer_utils
 
     install_numpy_staging()
@@ -177,10 +211,12 @@ def test_native_v2_staging_batches_arrays_and_keeps_kernel_write_order(monkeypat
     staged._staged_write_cu_lens = []
     pool = SimpleNamespace(copy_to_uva=lambda values: torch.tensor(values, dtype=torch.int32))
     staged.write_indices = staged.write_starts = staged.write_cu_lens = pool
+    staged.write_contents = None
 
     class Kernel:
         def __getitem__(self, grid):
-            def apply(output, stride, indices, starts, contents, lengths, **kwargs):
+            def apply(output, stride, indices, starts, contents, lengths, group_ids, **kwargs):
+                assert group_ids is None and not kwargs["MULTI_GROUP"]
                 previous = 0
                 for index, start, stop in zip(indices, starts, lengths):
                     count = int(stop) - previous
@@ -190,10 +226,12 @@ def test_native_v2_staging_batches_arrays_and_keeps_kernel_write_order(monkeypat
             return apply
 
     monkeypatch.setattr(buffer_utils, "_apply_write_kernel", Kernel())
-    staged.stage_write(0, 0, np.array([1, 2, 3], dtype=np.int64))
-    staged.stage_write(1, 2, np.array([4, 5], dtype=np.int64))
+    first = np.array([1, 2, 3], dtype=np.int64) if array_backed else [1, 2, 3]
+    second = np.array([4, 5], dtype=np.int64) if array_backed else [4, 5]
+    staged.stage_write(0, 0, first)
+    staged.stage_write(1, 2, second)
     staged.stage_write(0, 1, [9])  # Native write after an array write.
-    assert isinstance(staged._staged_write_contents, NumpyStagedContents)
+    assert isinstance(staged._staged_write_contents, NumpyStagedContents) == array_backed
     staged.apply_write()
     torch.testing.assert_close(staged.gpu[0, :3], torch.tensor([1, 9, 3], dtype=torch.int32))
     torch.testing.assert_close(staged.gpu[1, 2:4], torch.tensor([4, 5], dtype=torch.int32))
@@ -201,6 +239,23 @@ def test_native_v2_staging_batches_arrays_and_keeps_kernel_write_order(monkeypat
     np.testing.assert_array_equal(
         array_h2d(np.array([7, 8], dtype=np.int64), torch.int32, "cpu").numpy(), [7, 8]
     )
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_native_v2_array_transfer_preserves_output_buffer(readonly):
+    from vllm.v1.worker.gpu import buffer_utils
+
+    install_numpy_staging()
+    source = np.array([3, 7], dtype=np.int32)
+    if readonly:
+        source = np.frombuffer(source.tobytes(), dtype=source.dtype)
+    contents = NumpyStagedContents(source.dtype)
+    contents.extend(source)
+    output = torch.empty(2, dtype=torch.int64)
+    result = buffer_utils.async_tensor_h2d(contents, "cpu", out=output)
+    assert result is output
+    torch.testing.assert_close(output, torch.tensor([3, 7], dtype=torch.int64))
+    assert source.flags.writeable != readonly
 
 
 def test_native_v1_input_batch_copies_arrays_in_bulk():
@@ -211,10 +266,10 @@ def test_native_v1_input_batch_copies_arrays_in_bulk():
         max_model_len=32,
         max_num_batched_tokens=32,
         device=torch.device("cpu"),
-        pin_memory=False,
         vocab_size=64,
         block_sizes=[16],
         kernel_block_sizes=[16],
+        max_num_blocks_per_req=[2],
     )
     source = np.array([1, 2, 3, 4], dtype=np.int64)
     state = CachedRequestState(

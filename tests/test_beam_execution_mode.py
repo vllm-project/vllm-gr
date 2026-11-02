@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -132,6 +133,64 @@ def test_mode_override_rejects_empty_string(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: False)
     with pytest.raises(ValueError, match="execution_mode"):
         arg_utils_gr.create_engine_config(SimpleNamespace(beam_execution_mode=""))
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "device_type,use_v2,mode,backend,expected_default",
+    [
+        ("cuda", False, "v1", "inductor", False),
+        ("cuda", True, "v1", "inductor", None),
+        ("cuda", False, None, "inductor", None),
+        ("cuda", False, "v1", "eager", None),
+        ("npu", False, "v1", "inductor", None),
+        ("cpu", False, "v1", "inductor", None),
+    ],
+)
+@pytest.mark.parametrize("override", [None, True, False])  # type: ignore[misc]
+def test_v1_reduction_policy_scope_overrides_and_cache_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
+    use_v2: bool,
+    mode: str | None,
+    backend: str,
+    expected_default: bool | None,
+    override: bool | None,
+) -> None:
+    from vllm.config import CompilationConfig
+
+    from vllm_gr.engine import arg_utils_gr
+
+    settings = {"combo_kernels": True}
+    if override is not None:
+        settings["dynamic_scale_rblock"] = override
+    compilation = CompilationConfig(backend=backend, inductor_compile_config=settings)
+    previous = dict(compilation.inductor_compile_config)
+    original_hash = compilation.compute_hash()
+    config = SimpleNamespace(
+        additional_config={},
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        use_v2_model_runner=use_v2,
+        compilation_config=compilation,
+    )
+    monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
+    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: device_type == "cuda")
+    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: device_type == "npu")
+    args = SimpleNamespace(beam_execution_mode=mode)
+    assert arg_utils_gr.create_engine_config(args) is config
+    expected = override if override is not None else expected_default
+    assert compilation.inductor_compile_config == (
+        previous if expected is None else previous | {"dynamic_scale_rblock": expected}
+    )
+    changed = override is None and expected_default is not None
+    assert (compilation.compute_hash() != original_hash) is changed
+    # Public JSON compilation settings and repeated setup retain the cache key.
+    restored = CompilationConfig(
+        backend=backend,
+        inductor_compile_config=json.loads(json.dumps(compilation.inductor_compile_config)),
+    )
+    assert restored.compute_hash() == compilation.compute_hash()
+    arg_utils_gr.create_engine_config(args)
+    assert compilation.compute_hash() == restored.compute_hash()
 
 
 # Exercise each admission branch; non-V2 and non-Beam paths ignore V2 policy.

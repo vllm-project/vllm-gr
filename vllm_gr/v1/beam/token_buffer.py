@@ -101,10 +101,11 @@ def install_numpy_scheduler_data() -> None:
         request: Any,
         block_ids: Any,
         prefill_token_ids: Any = None,
+        uses_mrope: bool = False,
     ) -> Any:
         if isinstance(prefill_token_ids, NumpyTokenBuffer):
             prefill_token_ids = prefill_token_ids.copy()
-        return original(cls, request, block_ids, prefill_token_ids)
+        return original(cls, request, block_ids, prefill_token_ids, uses_mrope=uses_mrope)
 
     setattr(from_request, "_gr_numpy_tokens", True)
     NewRequestData.from_request = classmethod(  # type: ignore[method-assign,assignment]

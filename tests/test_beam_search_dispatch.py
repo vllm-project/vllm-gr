@@ -10,8 +10,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
-from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.exceptions import VLLMValidationError
 
 from vllm_gr.entrypoints.gr import GRLLM
@@ -36,6 +36,7 @@ def _dispatch(
     additional: dict[str, Any] | None,
     monkeypatch: Any,
     params: Any = "params",
+    session_id: str | None = None,
     *,
     trie_ids: list[int] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -49,7 +50,14 @@ def _dispatch(
         outputs = [
             output
             async for output in beam_search_dispatch(
-                serving, "prompt", "request-id", params, "lora", {"trace": "id"}, trie_ids=trie_ids
+                serving,
+                "prompt",
+                "request-id",
+                params,
+                "lora",
+                {"trace": "id"},
+                session_id=session_id,
+                trie_ids=trie_ids,
             )
         ]
         assert len(outputs) == 1
@@ -68,6 +76,7 @@ def test_v1_dispatch_preserves_upstream_arguments(monkeypatch: Any) -> None:
                 "params": "params",
                 "lora_request": "lora",
                 "trace_headers": {"trace": "id"},
+                "session_id": None,
             },
         )
     ]
@@ -95,6 +104,12 @@ def test_v1_dispatch_preserves_explicit_per_parent_widths(
     calls = _dispatch({"vllm_gr_beam_execution_mode": "v1"}, monkeypatch, params)
     assert calls[0][0] == "v1"
     assert calls[0][1]["params"] is params
+
+
+def test_dispatch_preserves_native_session_hint_for_both_engines(monkeypatch: Any) -> None:
+    for config in (None, {"vllm_gr_beam_execution_mode": "v1"}):
+        calls = _dispatch(config, monkeypatch, session_id="caller-session")
+        assert calls[0][1]["session_id"] == "caller-session"
 
 
 def test_trie_ids_are_forwarded_only_to_gr(monkeypatch: Any) -> None:
@@ -181,8 +196,8 @@ def test_patch_is_idempotent_and_keeps_native_mixin(monkeypatch: Any) -> None:
     native = BeamSearchOnlineMixin.beam_search
     patch_beam_search()
     patch_beam_search()
-    assert OpenAIServing.beam_search is beam_search_dispatch
-    assert OpenAIServing.beam_search_v1 is serving_engine.beam_search_v1
+    assert GenerateBaseServing.beam_search is beam_search_dispatch
+    assert GenerateBaseServing.beam_search_v1 is serving_engine.beam_search_v1
     assert BeamSearchOnlineMixin.beam_search is native
     assert _validate_openai_beam_search_patch() is None
     assert _dispatch(None, monkeypatch)[0][0] == "native"

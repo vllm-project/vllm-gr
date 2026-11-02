@@ -161,7 +161,7 @@ def make_load_model_with_beam_postprocess_workspace(original):
 
 
 def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
-    """Wrap the GPU two-item ``_prepare_inputs`` contract."""
+    """Preserve native logits indices, spec metadata and maximum sampling width."""
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
         return _orig_prepare_inputs
 
@@ -173,17 +173,19 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
         logits_indices = try_prepare_gr_prefill_inputs(self, scheduler_output, num_scheduled_tokens)
         if logits_indices is None:
-            logits_indices, spec_decode_metadata = _orig_prepare_inputs(
+            logits_indices, spec_decode_metadata, max_num_sampled_tokens = _orig_prepare_inputs(
                 self, scheduler_output, num_scheduled_tokens
             )
         else:
             spec_decode_metadata = None
+            # The single-request Prefill fast path excludes speculative tokens.
+            max_num_sampled_tokens = 1
 
         # GPU attention metadata is built after _prepare_inputs returns.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        return logits_indices, spec_decode_metadata
+        return logits_indices, spec_decode_metadata, max_num_sampled_tokens
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
@@ -728,16 +730,17 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                     bucket = p_runner.match_bucket(total_tokens)
                     reason = "no_matching_bucket" if bucket is None else "graph_not_captured"
                     if gr_stages:
-                        # Reuse the same padded geometry and static buffers as
-                        # legacy Prefill. The runner keeps the real Attention
-                        # lengths and masks padded KV slots. Async scheduling
-                        # adds no exact-bucket requirement; adapters and invalid
-                        # live input shapes still fall back to the original path.
+                        # Native preprocessing may pad these 1D tensors to a
+                        # compilation bucket. Only their scheduled prefix is
+                        # live: the Prefill runner copies that prefix, preserves
+                        # real Attention lengths, and masks its own padded KV
+                        # slots. Native padding must not determine GR's bucket.
                         if (
                             input_ids is None
-                            or tuple(input_ids.shape) != (total_tokens,)
+                            or input_ids.ndim != 1
+                            or input_ids.shape[0] < total_tokens
                             or positions is None
-                            or tuple(positions.shape) != (total_tokens,)
+                            or tuple(positions.shape) != tuple(input_ids.shape)
                             or kwargs.get("inputs_embeds") is not None
                             or kwargs.get("intermediate_tensors") is not None
                         ):

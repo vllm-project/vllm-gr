@@ -87,6 +87,11 @@ class _BatchSelf:
     def _maybe_get_adapters(self, request: Any) -> None:
         del request
 
+    _get_session_id = staticmethod(OpenAIServingCompletion._get_session_id)
+
+    async def _get_trace_headers(self, headers: Any) -> None:
+        del headers
+
     def _extract_prompt_len(self, engine_input: int) -> int:
         return self.prompt_lengths[engine_input]
 
@@ -157,6 +162,8 @@ def make_request() -> Callable[..., Any]:
             "max_tokens": 5,
             "truncate_prompt_tokens": None,
             "request_id": "request-0",
+            "session_id": None,
+            "vllm_xargs": None,
             "to_beam_search_params": lambda tokens, _defaults: {"max_tokens": tokens},
         }
         fields.update(overrides)
@@ -350,7 +357,7 @@ def test_different_lengths_can_share_the_real_generation_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the real formula the budget is the request's, not the length's."""
-    from vllm.entrypoints.utils import get_max_tokens
+    from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 
     serving = make_serving(prompt_lengths={0: 10, 1: 20, 2: 30, 3: 40})
     monkeypatch.setattr(patch_module, "get_max_tokens", get_max_tokens)
@@ -359,6 +366,36 @@ def test_different_lengths_can_share_the_real_generation_budget(
 
     assert len(serving.beam_calls) == 1
     assert serving.beam_calls[0]["params"]["max_tokens"] == 5
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "body, header, extra, expected",
+    [
+        ("body", "header", "extra", "body"),
+        (None, "header", "extra", "header"),
+        (None, None, "extra", "extra"),
+        (None, None, None, None),
+    ],
+)
+def test_batch_preserves_native_session_hint_precedence(
+    serving: _BatchSelf,
+    make_request: Callable[..., Any],
+    body: str | None,
+    header: str | None,
+    extra: str | None,
+    expected: str | None,
+) -> None:
+    from starlette.requests import Request
+
+    headers = [] if header is None else [(b"x-session-id", header.encode())]
+    raw = Request({"type": "http", "headers": headers})
+    request = make_request(session_id=body, vllm_xargs={"session_id": extra})
+
+    result = asyncio.run(create_completion_batch_dispatch(serving, request, raw))
+
+    assert result == "response-for-4"
+    assert serving.beam_calls[0]["session_id"] == expected
+    assert serving.beam_calls[0]["request_id"] == "cmpl-request-0"
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -561,7 +598,7 @@ def restore_route() -> Any:
         patch_module._original_create_completion = original
 
 
-def test_the_patch_installs_verifies_and_is_idempotent(restore_route: Any) -> None:  # noqa: ARG001
+def test_the_patch_installs_verifies_and_is_idempotent(restore_route: Any) -> None:
     patch_completion_batch()
 
     assert OpenAIServingCompletion._create_completion is create_completion_batch_dispatch

@@ -51,6 +51,10 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         call_order.append("npu_spawn")
         return 1
 
+    def apply_pangu() -> bool:
+        call_order.append("pangu")
+        return True
+
     def apply_attention(force: bool = False) -> int:
         call_order.append("attention")
         return 1
@@ -63,6 +67,11 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         call_order.append("beam")
         return 1
 
+    monkeypatch.setattr(
+        runtime_patch.pangu_compat,
+        "apply_pangu_tied_embeddings_patch",
+        apply_pangu,
+    )
     monkeypatch.setattr(
         runtime_patch.npu_spawn_patch,
         "apply_npu_spawn_patch",
@@ -84,8 +93,8 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_beam,
     )
 
-    assert runtime_patch._apply_patches(force=True) == 4
-    assert call_order == ["npu_spawn", "attention", "npu_worker", "beam"]
+    assert runtime_patch._apply_patches(force=True) == 5
+    assert call_order == ["pangu", "npu_spawn", "attention", "npu_worker", "beam"]
 
 
 def test_optional_patch_count_tracks_actual_installation(

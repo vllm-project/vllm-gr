@@ -19,7 +19,7 @@ from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
     CompletionResponse,
 )
-from vllm.entrypoints.openai.engine import protocol as engine_protocol
+from vllm.entrypoints.serve.engine import protocol as engine_protocol
 
 from vllm_gr.entrypoints.openai.beam_search_patch import patch_sampling
 from vllm_gr.sampling_params import BeamSearchParams

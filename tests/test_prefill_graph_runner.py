@@ -16,7 +16,7 @@ from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 def _force_non_npu(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
 
-    # 20261020: Isolate unit-test bucket grids from deployment BSND capture specs.
+    # Isolate unit-test bucket grids from deployment BSND capture specs.
     monkeypatch.delenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", raising=False)
     monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: False)
 
@@ -1053,9 +1053,9 @@ def test_gpu_replay_falls_back_when_kvlen_exceeds_bound() -> None:
 
 
 @pytest.mark.parametrize("async_stage", [False, True])  # type: ignore[misc]
-@pytest.mark.parametrize("native_padding", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("native_padding", ["none", "bucket", "larger"])  # type: ignore[misc]
 def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
-    monkeypatch: pytest.MonkeyPatch, async_stage: bool, native_padding: bool
+    monkeypatch: pytest.MonkeyPatch, async_stage: bool, native_padding: str
 ) -> None:
     """Both dispatch paths replay padded buffers with the real Attention extent."""
     from types import SimpleNamespace
@@ -1147,14 +1147,11 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
         runner.seq_lens[0] = length
         live_table.fill_(index + 1)
         bucket = 1024 if length <= 1024 else 1152
-        input_length = bucket if native_padding else length
+        input_length = {"none": length, "bucket": bucket, "larger": bucket + 128}[native_padding]
         ids = torch.full((input_length,), index + 7, dtype=torch.int32)
         ids[length:].fill_(999)
         positions = torch.arange(input_length)
         buf = graph_runner.buffers[bucket]
-        if async_stage and input_length != length:
-            assert wrapped(runner, ids, positions) == "fallback"
-            continue
         assert wrapped(runner, ids, positions) is buf.output_bufs[1]
         assert graph_runner.last_replay_reason == "replay"
         assert torch.equal(buf.input_ids_buf[:length], ids[:length])
@@ -1167,13 +1164,13 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
         assert buf.seq_lens_buf[0].item() == length
         assert torch.equal(buf.block_table_buf, live_table)
         assert pointers() == addresses
-    assert replays == ([1024] if async_stage and native_padding else [1024, 1024, 1152, 1024])
+    assert replays == [1024, 1024, 1152, 1024]
     if async_stage:
         fallback = patch.make_patched_model_forward(lambda *args, **kwargs: "fallback")
         assert fallback(runner, ids[:899], positions) == "fallback"
         assert fallback(runner, ids, positions[:899]) == "fallback"
         assert fallback(runner, ids[None, :], positions) == "fallback"
-        assert replays == ([1024] if async_stage and native_padding else [1024, 1024, 1152, 1024])
+        assert replays == [1024, 1024, 1152, 1024]
 
 
 def test_prefill_runner_init_propagates_allocation_failure(
@@ -1265,7 +1262,6 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     assert events == ["native"]
 
 
-# 20261020: Test the real constructor with explicitly scoped BSND configuration.
 def test_npu_bsnd_config_defaults_off() -> None:
     from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
 

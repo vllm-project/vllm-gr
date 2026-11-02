@@ -672,9 +672,8 @@ def create_engine_config(self, usage_context=None, headless=False):
         or canonical_input is not None
         or retired_input_present
     ):
-        # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
-        # forbidden. Keep GR-only values in VllmConfig.additional_config so
-        # that they also survive process serialization.
+        # vLLM config classes forbid undeclared fields. Keep GR-only values in
+        # VllmConfig.additional_config so they survive process serialization.
         if canonical_source:
             write_canonical_gr_config(config, effective_gr_config)
         else:
@@ -690,11 +689,25 @@ def create_engine_config(self, usage_context=None, headless=False):
         from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
 
         validate_gr_execution_config(config)
+        compilation = getattr(config, "compilation_config", None)
+        if (
+            _is_cuda_platform()
+            and not getattr(config, "use_v2_model_runner", False)
+            and compilation is not None
+            and compilation.backend == "inductor"
+        ):
+            # Inductor can benchmark an extra, halved reduction block on each
+            # AOT load. Q/K norm rounding then changes across independent
+            # engines, including Beam candidate order and scores. Keep the
+            # compiled reduction geometry; record this in the native config
+            # so the AOT cache key includes it. Explicit overrides still win.
+            compilation.inductor_compile_config.setdefault("dynamic_scale_rblock", False)
+
     return config
 
 
 def patch_add_cli_args() -> None:
-    EngineArgs.add_cli_args = add_cli_args
+    EngineArgs.add_cli_args = staticmethod(add_cli_args)
     EngineArgs.create_engine_config = create_engine_config
     EngineArgs.from_cli_args = classmethod(from_cli_args)
     EngineArgs.__init__ = _init_engine_args

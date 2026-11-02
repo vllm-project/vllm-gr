@@ -14,6 +14,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+# vllm-ascend >= 0.30 swaps LogitsProcessor for AscendLogitsProcessor, whose
+# _get_logits routes by lm_head.parallel_mode before projecting. A sliced
+# proxy keeps its complete sliced vocabulary locally (tp_size=1, no
+# vocabulary-parallel communication), so it must present the replicated mode
+# instead of the source head's sharded one. Stacks without the enum are
+# unaffected: nothing on those code paths reads the attribute.
+try:
+    from vllm_ascend.ops.vocab_parallel_embedding import VocabParallelMode
+
+    _REPLICATED_PARALLEL_MODE: Any = VocabParallelMode.REPLICATED
+except ImportError:  # CUDA/CPU installations do not provide vllm-ascend
+    _REPLICATED_PARALLEL_MODE = None
+
 logger = init_logger("vllm.ops.sliced_logits")
 
 # Global configuration variables for static offset mode
@@ -23,7 +36,7 @@ _QUANT_GROUP_SIZE: int = 128
 
 
 class SlicedLMHeadProxy(nn.Module):
-    """Lightweight proxy object for quantized lm_head apply."""
+    """Local unquantized projection over cached, contiguous sliced weights."""
 
     def __init__(self, original_lm_head, sliced_weight, sliced_num_embeddings):
         super().__init__()
@@ -33,6 +46,12 @@ class SlicedLMHeadProxy(nn.Module):
         self.quant_method = getattr(original_lm_head, "quant_method", None)
         self.num_embeddings_per_partition = sliced_num_embeddings
         self.org_vocab_size = sliced_num_embeddings
+        self.tp_size = 1
+        if _REPLICATED_PARALLEL_MODE is not None:
+            # Routes AscendLogitsProcessor to its normal (no-communication)
+            # projection branch; the sharded modes would assume vocabulary
+            # parallelism the proxy does not participate in.
+            self.parallel_mode = _REPLICATED_PARALLEL_MODE
 
 
 def set_vocab_slice_config(
@@ -111,13 +130,17 @@ def compute_sliced_logits(
     quant_group_size: int = 128,
     logits_processor: Optional[Any] = None,
     orig_get_logits: Optional[Any] = None,
-) -> torch.Tensor:
+    skip_gather: bool = False,
+) -> Optional[torch.Tensor]:
     """
     Computes logits using pre-sliced, contiguous vocabulary projection weights for unquantized models,
     or via a safe logits-post-slicing fallback for quantized models.
     The quantized fallback projects the full vocabulary, then copies the selected
     logits into contiguous storage; it does not reduce LM-head projection work.
-    Fully optimized for torch.compile and CUDA graph execution.
+    Processor calls that require TP gathering also use full projection before
+    slicing, so every rank participates with the original shard shape. With
+    skip_gather (or without a processor), the result is the rank-local overlap
+    with the requested global window.
     """
     cfg_offset, cfg_slice_size, _ = get_vocab_slice_config()
     off = offset if offset is not None else cfg_offset
@@ -126,9 +149,13 @@ def compute_sliced_logits(
     if off is None or sz is None:
         raise ValueError("Vocabulary slice offset and slice_size must be specified.")
 
-    # Safe fallback for quantized models where weight slicing is unsupported/unsafe
-    if not is_supported_unquantized_lm_head(lm_head):
-        if not getattr(lm_head, "_quant_slice_fallback_warned", False):
+    use_processor = logits_processor is not None and orig_get_logits is not None
+    unquantized = is_supported_unquantized_lm_head(lm_head)
+    needs_tp_gather = use_processor and not skip_gather and getattr(lm_head, "tp_size", 1) > 1
+    # Quantized weights cannot be sliced safely. Uneven sliced TP shards cannot
+    # use the original equal-width collective, including ranks with no overlap.
+    if not unquantized or needs_tp_gather:
+        if not unquantized and not getattr(lm_head, "_quant_slice_fallback_warned", False):
             logger.info(
                 "vllm_gr: Quantized lm_head detected (%s). Sliced weight optimization "
                 "is disabled for quantized models; using safe output-logits slicing fallback.",
@@ -136,8 +163,10 @@ def compute_sliced_logits(
             )
             lm_head._quant_slice_fallback_warned = True
 
-        if logits_processor is not None and orig_get_logits is not None:
-            full_logits = orig_get_logits(logits_processor, hidden_states, lm_head, embedding_bias)
+        if use_processor:
+            full_logits = orig_get_logits(
+                logits_processor, hidden_states, lm_head, embedding_bias, skip_gather
+            )
         else:
             quant_method = getattr(lm_head, "quant_method", None)
             if quant_method is not None:
@@ -146,7 +175,13 @@ def compute_sliced_logits(
                 full_logits = F.linear(hidden_states, lm_head.weight, embedding_bias)
 
         if full_logits is not None and full_logits.numel() > 0:
-            return full_logits[..., off : off + sz].contiguous()
+            if use_processor and not skip_gather:
+                start, end = off, off + sz
+            else:
+                rank_start, rank_end = get_rank_vocab_bounds(lm_head)
+                start = max(off, rank_start) - rank_start
+                end = max(start, min(off + sz, rank_end) - rank_start)
+            return full_logits[..., start:end].contiguous()
         return full_logits
 
     rank_start, rank_end = get_rank_vocab_bounds(lm_head)
@@ -160,7 +195,8 @@ def compute_sliced_logits(
         # Rank has no overlap with the requested global slice range
         batch_shape = hidden_states.shape[:-1]
         empty_shape = (*batch_shape, 0)
-        return torch.empty(empty_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        dtype = getattr(logits_processor, "head_dtype", None) or hidden_states.dtype
+        return torch.empty(empty_shape, dtype=dtype, device=hidden_states.device)
 
     local_start = inter_start - rank_start
     local_end = inter_end - rank_start
@@ -206,8 +242,13 @@ def compute_sliced_logits(
         )
 
     proxy = lm_head._sliced_proxy
-    if logits_processor is not None and orig_get_logits is not None:
-        logits = orig_get_logits(logits_processor, hidden_states, proxy, lm_head._sliced_bias)
+    if use_processor:
+        # This projection is local even when the original head is TP-sharded.
+        # Let upstream _apply_head honor head_dtype, then remove our alignment
+        # padding below rather than trimming against the original vocabulary.
+        logits = orig_get_logits(
+            logits_processor, hidden_states, proxy, lm_head._sliced_bias, skip_gather=True
+        )
     else:
         quant_method = getattr(lm_head, "quant_method", None)
         if quant_method is not None:

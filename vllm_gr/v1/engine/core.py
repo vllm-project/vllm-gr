@@ -191,11 +191,10 @@ def process_input_sockets(
 
     import msgspec
     import zmq
+    from vllm.multimodal.cache import MultiModalCacheMissError
     from vllm.utils.network_utils import make_zmq_socket
-    from vllm.v1.engine import (
-        EngineCoreReadyResponse,
-        EngineCoreRequest,
-    )
+    from vllm.v1.engine import EngineCoreRequest
+    from vllm.v1.fault_tolerance.engine_core_sentinel import FT_UTILITY_METHOD
 
     from vllm_gr.v1.engine.codec import (
         build_engine_core_decoders,
@@ -228,12 +227,8 @@ def process_input_sockets(
 
         # Register sockets with poller.
         poller = zmq.Poller()
-        ready_response = EngineCoreReadyResponse(
-            max_model_len=self.vllm_config.model_config.max_model_len,
-            num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
-            dp_stats_address=self.frontend_stats_publish_address,
-            dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
-        )
+        # Upstream owns the complete post-initialization configuration schema.
+        ready_response = self._make_ready_response()
         ready_payload = msgspec.msgpack.encode(ready_response)
         for input_socket in input_sockets:
             input_socket.send(ready_payload)
@@ -263,6 +258,9 @@ def process_input_sockets(
                     req: EngineCoreRequest = decoded_payload
                     try:
                         request = self.preprocess_add_request(req)
+                    except MultiModalCacheMissError as error:
+                        self._handle_mm_cache_miss(req, error)
+                        continue
                     except Exception:
                         self._handle_request_preproc_error(req)
                         continue
@@ -272,6 +270,13 @@ def process_input_sockets(
                     # busy-loop handler preprocesses and admits every member
                     # before native scheduling can run.
                     request = decoded_payload
+
+                elif request_type == EngineCoreRequestType.UTILITY:
+                    request = decoded_payload
+                    client_idx, call_id, method, args = request
+                    if method == FT_UTILITY_METHOD:
+                        self.ft_sentinel.handle_command(client_idx, call_id, args[0])
+                        continue
 
                 else:
                     request = decoded_payload

@@ -89,9 +89,9 @@ class GRLLM(LLM):
                 "constraint_table artifact."
             )
         beam_max_width = validate_beam_max_width(beam_max_width)
-        # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
-        # vllm-gr default before LLM.__init__ constructs VllmConfig so the V1
-        # beam-search worker patches remain active.
+        # Apply the vllm-gr ModelRunner policy before LLM.__init__ constructs
+        # VllmConfig. This keeps V1 as the default and preserves an explicit
+        # V2 opt-in for the adapted beam_search_v1 path.
         from vllm_gr._env_check import configure_model_runner_default
 
         configure_model_runner_default()

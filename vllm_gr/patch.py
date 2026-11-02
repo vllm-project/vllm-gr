@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm_gr import lmcache_patch, npu_spawn_patch
+from vllm_gr import lmcache_patch, npu_spawn_patch, pangu_compat
 from vllm_gr.ops import sliced_logits_patch
 from vllm_gr.v1 import ascend_compat
 
@@ -89,18 +89,18 @@ def _validate_flat_logprobs_patch() -> str | None:
 
 
 def _validate_beam_search_dispatch_patch() -> str | None:
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 
     from vllm_gr.entrypoints.openai.beam_search_patch import beam_search_dispatch
 
     return _verified(
-        OpenAIServing.beam_search is beam_search_dispatch,
-        "OpenAIServing.beam_search does not reference the GR dispatcher",
+        GenerateBaseServing.beam_search is beam_search_dispatch,
+        "GenerateBaseServing.beam_search does not reference the GR dispatcher",
     )
 
 
 def _validate_admission_rejection_patch() -> str | None:
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 
     from vllm_gr.entrypoints.openai.beam_search_patch import (
         _ADMISSION_REJECTION_PATCH_MARKER,
@@ -108,18 +108,18 @@ def _validate_admission_rejection_patch() -> str | None:
 
     return _verified(
         getattr(
-            getattr(OpenAIServing, "_raise_if_error", None),
+            getattr(GenerateBaseServing, "_raise_if_error", None),
             _ADMISSION_REJECTION_PATCH_MARKER,
             False,
         ),
-        "OpenAIServing._raise_if_error does not reference the GR admission-rejection wrapper",
+        "GenerateBaseServing._raise_if_error does not reference the GR admission-rejection wrapper",
     )
 
 
 def _validate_client_request_id_patch() -> str | None:
     """Verify the two sites that pair a caller's name with the engine's."""
 
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    from vllm.entrypoints.serve.engine.serving import BaseServing
     from vllm.v1.engine.output_processor import OutputProcessor
 
     from vllm_gr.entrypoints.openai.beam_search_patch import (
@@ -129,11 +129,11 @@ def _validate_client_request_id_patch() -> str | None:
 
     return _verified(
         getattr(
-            getattr(OpenAIServing, "_base_request_id", None),
+            getattr(BaseServing, "_base_request_id", None),
             _CLIENT_REQUEST_ID_PATCH_MARKER,
             False,
         ),
-        "OpenAIServing._base_request_id does not reference the GR client-request-id wrapper",
+        "BaseServing._base_request_id does not reference the GR client-request-id wrapper",
     ) or _verified(
         getattr(
             getattr(OutputProcessor, "add_request", None),
@@ -529,6 +529,9 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
 def _apply_patches(force: bool = False) -> int:
     """Apply all runtime patches needed by vllm-gr."""
+    # ModelConfig construction happens before model loading, so preserve the
+    # official Pangu tied-weight layout at the earliest runtime boundary.
+    pangu_count = int(pangu_compat.apply_pangu_tied_embeddings_patch())
     # Install the NPU-aware spawn guard before anything can create worker
     # processes, so engine startup inherits the corrected start-method choice.
     npu_spawn_count = int(npu_spawn_patch.apply_npu_spawn_patch())
@@ -538,7 +541,7 @@ def _apply_patches(force: bool = False) -> int:
     # vllm_ascend.ops first, avoiding an import-order cycle through device_op.
     npu_worker_count = ascend_compat.patch_npu_worker_init_device()
     beam_count = _apply_gr_beam_patches(force=force)
-    return npu_spawn_count + ascend_attn_count + npu_worker_count + beam_count
+    return pangu_count + npu_spawn_count + ascend_attn_count + npu_worker_count + beam_count
 
 
 def re_apply_patches() -> int:

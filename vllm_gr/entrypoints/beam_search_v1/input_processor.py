@@ -398,6 +398,7 @@ class BeamSearchInputProcessor:
                 trace_headers=call.trace_headers,
                 priority=call.priority,
                 data_parallel_rank=call.data_parallel_rank,
+                session_id=call.session_id,
             )
             _prepare_prompt(engine_request, begin_token_id)
             self.engine.input_processor.assign_request_id(engine_request)

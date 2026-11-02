@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import gc
 import weakref
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -223,18 +223,21 @@ def test_shutdown_releases_model_bytecode_hooks_only(shutdown_fails: bool) -> No
     from torch._dynamo.convert_frame import _bytecode_hooks, register_bytecode_hook
     from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 
+    class CompiledLayer(
+        torch.nn.Linear,  # type: ignore[misc]
+        TorchCompileWithNoGuardsWrapper,  # type: ignore[misc]
+    ):
+        pass
+
     runner = _runner()
-    runner.model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    runner.model = torch.nn.Sequential(CompiledLayer(2, 2))
     layer_ref = weakref.ref(runner.model[0])
     weight_ref = weakref.ref(runner.model[0].weight)
-    other_model = torch.nn.Linear(2, 2)
-    hook_fn = TorchCompileWithNoGuardsWrapper.bytecode_hook
-    # AOT loading can register the same model's hook more than once.
-    owned = [
-        register_bytecode_hook(MethodType(hook_fn, runner.model[0])),
-        register_bytecode_hook(MethodType(hook_fn, runner.model[0])),
-    ]
-    foreign = register_bytecode_hook(MethodType(hook_fn, other_model))
+    owned = register_bytecode_hook(runner.model[0].bytecode_hook)
+    runner.model[0]._bytecode_hook_handle = owned
+    other_model = CompiledLayer(2, 2)
+    foreign = register_bytecode_hook(other_model.bytecode_hook)
+    other_model._bytecode_hook_handle = foreign
     unrelated = register_bytecode_hook(lambda old, new: None)
 
     def native_shutdown(self: SimpleNamespace) -> None:
@@ -253,11 +256,11 @@ def test_shutdown_releases_model_bytecode_hooks_only(shutdown_fails: bool) -> No
         gc.collect()
         assert layer_ref() is None
         assert weight_ref() is None
-        assert all(handle.id not in _bytecode_hooks for handle in owned)
+        assert owned.id not in _bytecode_hooks
         assert _bytecode_hooks[foreign.id].__self__ is other_model
         assert unrelated.id in _bytecode_hooks
     finally:
-        for handle in (*owned, foreign, unrelated):
+        for handle in (owned, foreign, unrelated):
             handle.remove()
 
 
@@ -326,6 +329,7 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
     if current_platform.device_type == "npu":
         pytest.skip("CUDA vocabulary projection slicing is not used on Ascend NPU")
 
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
     from vllm_gr.config import ConstraintTableBackendEnum
@@ -349,11 +353,13 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
         return logits
 
     def weights(runner: Any) -> str:
-        runner.model = torch.nn.Sequential(LogitsProcessor(32000))
+        with set_current_vllm_config(VllmConfig()):
+            runner.model = torch.nn.Sequential(LogitsProcessor(32000))
         runner.model[0]._gather_logits = gather
         return "loaded"
 
     head = torch.nn.Linear(8, 256, bias=False)
+    head.tp_size = 2
     head.quant_method = SimpleNamespace(
         apply=lambda layer, hidden, bias=None: torch.nn.functional.linear(
             hidden, layer.weight, bias
@@ -383,6 +389,7 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
     if current_platform.device_type == "npu":
         pytest.skip("CUDA vocabulary projection slicing is not used on Ascend NPU")
 
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
     from vllm_gr.config import ConstraintTableBackendEnum
@@ -402,7 +409,8 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
 
     def weights(runner: Any) -> None:
         runner.model_memory_usage = 0
-        runner.model = torch.nn.Sequential(LogitsProcessor(32000))
+        with set_current_vllm_config(VllmConfig()):
+            runner.model = torch.nn.Sequential(LogitsProcessor(32000))
         runner.model[0]._gather_logits = lambda logits: logits
 
     load = make_load_model_with_constraint_backend(weights)
@@ -415,6 +423,7 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
         load(b)
         load(full)
         head = torch.nn.Linear(8, 256, bias=False)
+        head.tp_size = 1
         head.quant_method = type(
             "UnquantizedEmbeddingMethod",
             (),
