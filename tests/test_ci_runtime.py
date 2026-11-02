@@ -97,6 +97,38 @@ class TestRuntimeResolution(unittest.TestCase):
                     runtime.resolve(self.repo, "cuda")
                 path.write_text(original)
 
+    def test_annotated_guards_preserve_npu_declarations(self) -> None:
+        expected = runtime.declarations(self.repo, "npu")
+        path = self.repo / "vllm_gr/_env_check.py"
+        original = path.read_text()
+        for name in runtime.GUARDS.values():
+            with self.subTest(name=name):
+                target = f"{name} = "
+                self.assertEqual(original.count(target), 1)
+                path.write_text(original.replace(target, f"{name}: str | None = "))
+                self.assertEqual(runtime.declarations(self.repo, "npu"), expected)
+        path.write_text(original)
+
+    def test_source_tree_fallback_must_match_without_importing_version_module(self) -> None:
+        path = self.repo / "vllm_gr/version.py"
+        original = (
+            "try:\n    from ._version import __version__\n"
+            'except ImportError:\n    __version__ = "0.29.0"\n'
+            'raise RuntimeError("version module must not execute")\n'
+        )
+        path.write_text(original)
+        self.assertEqual(runtime.declarations(self.repo, "cuda")["vllm-gr"], "0.29.0")
+        path.write_text(original.replace("0.29.0", "0.30.0"))
+        with self.assertRaisesRegex(ValueError, "source-tree fallback version.*does not match"):
+            runtime.declarations(self.repo, "cuda")
+
+    def test_source_tree_fallback_invalidates_runtime_cache(self) -> None:
+        path = self.repo / "vllm_gr/version.py"
+        path.write_text('__version__ = "0.29.0"\n')
+        original = runtime.resolve(self.repo, "cuda")["cache_key"]
+        path.write_text(path.read_text() + "# Changed version module.\n")
+        self.assertNotEqual(original, runtime.resolve(self.repo, "cuda")["cache_key"])
+
     def test_unpinned_runtime_fails(self) -> None:
         path = self.repo / "requirements/cuda.txt"
         path.write_text(path.read_text().replace("vllm==", "vllm>="))

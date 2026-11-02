@@ -680,13 +680,13 @@ def test_gather_shared_blocks_bounds_fixed_width_table() -> None:
 
     The NPU metadata builder allocates the prefix block table at
     ``max_model_len // block_size`` columns, so a short prefix leaves most
-    columns as padding. The gather must slice them off: copying them scales
-    with ``max_model_len`` rather than with the real prefix, which is what
-    the review measured (0.5 MiB at table width 1 vs 128 MiB at width 256
-    for a single live block).
+    columns as padding. The gather must slice them off so the copy scales
+    with the real prefix instead of ``max_model_len``.
     """
     num_blocks, block, heads, head_dim = 16, 4, 2, 8
-    pool = torch.zeros(num_blocks, 2, block, heads, head_dim, dtype=torch.float32, device=DEVICE)
+    pool = torch.arange(
+        num_blocks * 2 * block * heads * head_dim, dtype=torch.float32, device=DEVICE
+    ).reshape(num_blocks, 2, block, heads, head_dim)
     key_cache, value_cache = pool[:, 0], pool[:, 1]
 
     # One live block per request, but a fixed-width table of 8 columns.
@@ -697,7 +697,7 @@ def test_gather_shared_blocks_bounds_fixed_width_table() -> None:
     unbounded_key, _, unbounded_table = beam_attn_npu_xllm._gather_shared_blocks(
         key_cache, value_cache, table, 0
     )
-    bounded_key, _, bounded_table = beam_attn_npu_xllm._gather_shared_blocks(
+    bounded_key, bounded_value, bounded_table = beam_attn_npu_xllm._gather_shared_blocks(
         key_cache, value_cache, table, 1
     )
 
@@ -710,6 +710,8 @@ def test_gather_shared_blocks_bounds_fixed_width_table() -> None:
     assert bounded_table[:, 0].tolist() == [0, 1]
     assert bounded_key[0].equal(pool[0, 0])
     assert bounded_key[1].equal(pool[5, 0])
+    assert bounded_value[0].equal(pool[0, 1])
+    assert bounded_value[1].equal(pool[5, 1])
 
     # A bound at or above the table width is a no-op, not a truncation.
     full_key, _, full_table = beam_attn_npu_xllm._gather_shared_blocks(

@@ -185,17 +185,15 @@ def _gather_shared_blocks(
     block_size`` columns, but the tail columns are padding.  Slicing them
     off before flattening reduces the gather size from O(max_model_len /
     block_size) to O(actual_prefix_len / block_size).
+    A zero bound retains the full table width for graph capture or callers
+    without a tighter prefix bound.
 
     The remapped table ``row * width + col`` matches the flatten order of
     the gather, so the kernel sees exactly the blocks the original table
     named.
     """
     width = block_table.shape[1]
-    active = (
-        block_table[:, :max_valid_cols]
-        if 0 < max_valid_cols < width
-        else block_table
-    )
+    active = block_table[:, :max_valid_cols] if 0 < max_valid_cols < width else block_table
     flat = active.reshape(-1)
     base = interleaved_pool_base(key_cache, value_cache)
     if base is not None:
@@ -269,27 +267,19 @@ def _xllm_incremental_decode(
     if step_count is None:
         step_count = step + 1  # dev is 0-based; kernel takes 1-based count
 
-    # Gather only the shared-prefix blocks the table references — in eager and
-    # under ACL-graph capture alike — never the whole interleaved pool.
+    # When a shared-prefix table is available, gather its blocks in both
+    # eager and ACL-graph capture to avoid copying the whole interleaved pool.
     #
-    # The previous split copied the entire pool with ``.contiguous()`` under
-    # capture, on the assumption that replay needs the copy's shape and its
-    # destination addresses to be invariant. Only the shape has to be. Copying
-    # the whole pool costs O(num_blocks) per layer per step; with a 20.73 GiB
-    # pool that dominates decode latency and produced the 3.58x graph
-    # regression reported on 910B1.
-    #
-    # Capture must keep a shape that never varies between replays, so it
-    # bounds the gather by the fixed table width (``max_model_len //
-    # block_size``, constant for the process and already baked into the
-    # captured block-table view). Eager has no such constraint and bounds by
-    # ``max_prefix_blocks_count`` — the columns the longest prefix in this
-    # batch actually needs — which is what removes the padding copies for
-    # short prefixes.
+    # Capture uses the fixed table width so the gather shape stays constant
+    # across prefix lengths. Its input buffers and captured intermediates must
+    # retain stable addresses; replay reads updated block IDs from the same
+    # metadata buffer. The graph owns the captured allocation lifetime, so
+    # this does not require copying every block in the KV pool.
+    # Eager can use ``max_prefix_blocks_count`` to omit padding columns.
     shared_table = attn_metadata.prefix_block_table
     if shared_table is not None:
-        max_valid_cols = 0 if _npu_stream_capturing() else getattr(
-            attn_metadata, "max_prefix_blocks_count", 0
+        max_valid_cols = (
+            0 if _npu_stream_capturing() else getattr(attn_metadata, "max_prefix_blocks_count", 0)
         )
         shared_key, shared_value, shared_table = _gather_shared_blocks(
             key_cache,
