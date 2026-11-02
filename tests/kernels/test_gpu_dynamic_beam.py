@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exercise real CUDA selection, control/D2H, width changes and graph replay."""
 
+import gc
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -57,6 +58,11 @@ def test_admission_rejects_later_candidate_width_beyond_backend_capacity(per_par
 def test_dynamic_stage_execution_and_reuse(
     widths, per_parent_beam_widths, graph, batch, constrained
 ):
+    # Earlier parameterizations leave worker/graph reference cycles behind.
+    # If cyclic GC destroys one of those CUDAGraphs while this test's stream is
+    # capturing, the capture is invalidated with cudaErrorStreamCaptureInvalidated.
+    # Drain them deterministically before any capture starts.
+    gc.collect()
     worker = admission_worker()
     from tests.constraints.test_table import make_table
     from vllm_gr.constraints.loader import _upload_cuda_backend

@@ -145,6 +145,25 @@ def test_v1_startup_batch_override_does_not_change_v2(
     owner.release.assert_called_once()
 
 
+@pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
+def test_prefix_calibration_precedes_decode_capture(
+    capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch, v2: bool
+) -> None:
+    from vllm_gr.v1.attention.backends import beam_prefix_calibrate as calibrate
+
+    events: list[str] = []
+    initialize = Mock(side_effect=lambda worker: events.append("calibration"))
+    capture = Mock(side_effect=lambda *args, **kwargs: events.append("capture"))
+    monkeypatch.setattr(calibrate, "ensure_prefix_calibration", initialize)
+    monkeypatch.setattr(startup, "_capture_batch", capture)
+    worker = capture_runtime[0]
+    entry = capture_multibatch_forward if v2 else startup.capture_async_forward
+
+    assert entry(worker)
+    initialize.assert_called_once_with(worker)
+    assert events == ["calibration", "capture"]
+
+
 @pytest.mark.parametrize("raw", ["0", "9", "-1", "1.5", "invalid", ""])  # type: ignore[misc]
 def test_invalid_startup_capture_batch_size(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
     monkeypatch.setenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, raw)
