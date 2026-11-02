@@ -673,3 +673,47 @@ def test_xllm_mixed_std_beam_batch_falls_back_to_cascade() -> None:
     assert xllm_out.float().abs().sum() > 0
 
     session.end_session()
+
+
+def test_gather_shared_blocks_bounds_fixed_width_table() -> None:
+    """The eager gather copies only the block-table columns a prefix uses.
+
+    The NPU metadata builder allocates the prefix block table at
+    ``max_model_len // block_size`` columns, so a short prefix leaves most
+    columns as padding. The gather must slice them off: copying them scales
+    with ``max_model_len`` rather than with the real prefix, which is what
+    the review measured (0.5 MiB at table width 1 vs 128 MiB at width 256
+    for a single live block).
+    """
+    num_blocks, block, heads, head_dim = 16, 4, 2, 8
+    pool = torch.zeros(num_blocks, 2, block, heads, head_dim, dtype=torch.float32, device=DEVICE)
+    key_cache, value_cache = pool[:, 0], pool[:, 1]
+
+    # One live block per request, but a fixed-width table of 8 columns.
+    table = torch.zeros(2, 8, dtype=torch.int32, device=DEVICE)
+    table[0, 0] = 0
+    table[1, 0] = 5
+
+    unbounded_key, _, unbounded_table = beam_attn_npu_xllm._gather_shared_blocks(
+        key_cache, value_cache, table, 0
+    )
+    bounded_key, _, bounded_table = beam_attn_npu_xllm._gather_shared_blocks(
+        key_cache, value_cache, table, 1
+    )
+
+    # Only the referenced blocks are copied when the bound is applied.
+    assert bounded_key.shape[0] == table.shape[0] * 1
+    assert unbounded_key.shape[0] == table.shape[0] * table.shape[1]
+    assert tuple(bounded_table.shape) == (table.shape[0], 1)
+
+    # The remapped table must still point at the same real blocks.
+    assert bounded_table[:, 0].tolist() == [0, 1]
+    assert bounded_key[0].equal(pool[0, 0])
+    assert bounded_key[1].equal(pool[5, 0])
+
+    # A bound at or above the table width is a no-op, not a truncation.
+    full_key, _, full_table = beam_attn_npu_xllm._gather_shared_blocks(
+        key_cache, value_cache, table, table.shape[1]
+    )
+    assert full_key.shape[0] == table.shape[0] * table.shape[1]
+    assert tuple(full_table.shape) == tuple(table.shape)

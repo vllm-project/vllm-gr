@@ -38,7 +38,7 @@ def _load_setup_module() -> ModuleType:
     [
         (
             "cpu",
-            {"msgspec", "regex", "safetensors>=0.4.5", "PyYAML>=6.0"},
+            {"msgspec", "regex", "safetensors>=0.6.2", "PyYAML>=6.0"},
             {"msgspec", "regex", "safetensors", "pyyaml"},
             {"vllm"},
         ),
@@ -47,7 +47,7 @@ def _load_setup_module() -> ModuleType:
             {
                 "msgspec",
                 "regex",
-                "safetensors>=0.4.5",
+                "safetensors>=0.6.2",
                 "PyYAML>=6.0",
                 "vllm==0.30.0",
             },
@@ -56,7 +56,7 @@ def _load_setup_module() -> ModuleType:
         ),
         (
             "npu",
-            {"msgspec", "regex", "safetensors>=0.4.5", "PyYAML>=6.0"},
+            {"msgspec", "regex", "safetensors>=0.6.2", "PyYAML>=6.0"},
             {"msgspec", "regex", "safetensors", "pyyaml"},
             {"vllm"},
         ),

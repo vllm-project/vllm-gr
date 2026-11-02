@@ -36,12 +36,19 @@ def digest(value: Any) -> str:
 
 
 def literal(path: Path, name: str) -> str:
-    values = [
-        node.value
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
-    ]
+    values = []
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            values.append(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+            and node.value is not None
+        ):
+            values.append(node.value)
     if len(values) != 1 or not isinstance(values[0], ast.Constant):
         raise ValueError(f"{path}: expected one literal assignment to {name}")
     value = values[0].value
@@ -76,10 +83,42 @@ def declarations(repo: Path, device: str) -> dict[str, str]:
         or pins != [f"vllm=={base}"]
     ):
         raise ValueError("vLLM guard, CUDA pin, GR base and SCM fallback versions must agree")
+    _check_version_fallback(repo, base)
     expected = {"vllm": base, "vllm-gr": base}
     if device == "npu":
         expected.update({key: guards[key] for key in ("vllm-ascend", "triton-ascend")})
     return expected
+
+
+def _check_version_fallback(repo: Path, base: str) -> None:
+    """Pin ``vllm_gr/version.py``'s source-tree fallback to the declared base.
+
+    ``version.py`` carries the same version twice (the warning text and the
+    ``__version__`` fallback) for development installs that have no
+    ``_version.py``.  It is not otherwise derived from ``setup.py``, so without
+    this check a tree can build a wheel advertising a different version than
+    the one every other declaration agrees on.
+    """
+    path = repo / "vllm_gr/version.py"
+    if not path.is_file():
+        return
+    # The fallback lives inside the ``except ImportError`` handler, so walk the
+    # whole tree rather than only module-level statements.
+    found = {
+        node.value.value
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    if not found:
+        raise ValueError(f"{path}: no literal __version__ fallback found")
+    if found != {base}:
+        raise ValueError(
+            f"{path}: source-tree fallback version {sorted(found)} does not match "
+            f"the declared base {base}"
+        )
 
 
 def source_digest(repo: Path) -> str:
@@ -87,6 +126,7 @@ def source_digest(repo: Path) -> str:
         "setup.py",
         "pyproject.toml",
         "vllm_gr/_env_check.py",
+        "vllm_gr/version.py",
         "tools/ci/resolve_runtime.py",
         ".pre-commit-config.yaml",
     )
@@ -105,9 +145,14 @@ def source_digest(repo: Path) -> str:
             if path.is_file()
         }
     )
-    return digest(
-        {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}
-    )
+    # Synthetic fixtures (and pre-upgrade commits) may not carry every file;
+    # digest whatever this tree actually has.
+    digests = {
+        name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for name, path in paths.items()
+        if path.is_file()
+    }
+    return digest(digests)
 
 
 def inventory() -> dict[str, str]:

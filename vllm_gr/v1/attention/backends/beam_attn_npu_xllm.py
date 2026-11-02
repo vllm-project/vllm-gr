@@ -154,8 +154,8 @@ def _npu_stream_capturing() -> bool:
     try:
         return bool(torch_npu.npu.is_current_stream_capturing())
     except Exception:
-        # Unknown capture state: assume capture so the address-stable
-        # full-pool path is taken.
+        # Unknown capture state: assume capture so the captured-shape path is
+        # taken.
         return True
 
 
@@ -163,6 +163,7 @@ def _gather_shared_blocks(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_table: torch.Tensor,
+    max_valid_cols: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gather only the shared-prefix blocks the block table references.
 
@@ -178,13 +179,24 @@ def _gather_shared_blocks(
     proportional to the blocks the table references rather than to the
     pool.
 
+    ``max_valid_cols`` is ``attn_metadata.max_prefix_blocks_count``: the
+    number of block-table columns actually needed by the longest prefix in
+    this batch.  The fixed-width buffer is allocated at ``max_model_len //
+    block_size`` columns, but the tail columns are padding.  Slicing them
+    off before flattening reduces the gather size from O(max_model_len /
+    block_size) to O(actual_prefix_len / block_size).
+
     The remapped table ``row * width + col`` matches the flatten order of
     the gather, so the kernel sees exactly the blocks the original table
-    named. Table entries beyond a request's ``seqlens_kv`` are never
-    dereferenced by the kernel, so padded or stale fixed-buffer columns
-    only add harmless extra gather rows.
+    named.
     """
-    flat = block_table.reshape(-1)
+    width = block_table.shape[1]
+    active = (
+        block_table[:, :max_valid_cols]
+        if 0 < max_valid_cols < width
+        else block_table
+    )
+    flat = active.reshape(-1)
     base = interleaved_pool_base(key_cache, value_cache)
     if base is not None:
         gathered = base.index_select(0, flat)
@@ -196,7 +208,7 @@ def _gather_shared_blocks(
         gathered_value = value_cache.index_select(0, flat)
     remapped_table = torch.arange(
         flat.numel(), dtype=block_table.dtype, device=block_table.device
-    ).reshape(block_table.shape)
+    ).reshape(active.shape)
     return gathered_key, gathered_value, remapped_table
 
 
@@ -257,24 +269,39 @@ def _xllm_incremental_decode(
     if step_count is None:
         step_count = step + 1  # dev is 0-based; kernel takes 1-based count
 
-    # Gather only the referenced shared blocks whenever this decode is not
-    # being captured into an ACL graph. Fixed-buffer metadata does not by
-    # itself imply capture — eager NPU decodes carry fixed buffers too — so
-    # the capture state is the discriminator: taking the full-pool copy in
-    # eager makes every layer of every step pay tens of GB for the tens of
-    # blocks the table names. Under capture the full-pool ``.contiguous()``
-    # is kept: its captured shape and destination addresses must never vary
-    # between replays.
-    if attn_metadata.prefix_block_table is not None and not _npu_stream_capturing():
+    # Gather only the shared-prefix blocks the table references — in eager and
+    # under ACL-graph capture alike — never the whole interleaved pool.
+    #
+    # The previous split copied the entire pool with ``.contiguous()`` under
+    # capture, on the assumption that replay needs the copy's shape and its
+    # destination addresses to be invariant. Only the shape has to be. Copying
+    # the whole pool costs O(num_blocks) per layer per step; with a 20.73 GiB
+    # pool that dominates decode latency and produced the 3.58x graph
+    # regression reported on 910B1.
+    #
+    # Capture must keep a shape that never varies between replays, so it
+    # bounds the gather by the fixed table width (``max_model_len //
+    # block_size``, constant for the process and already baked into the
+    # captured block-table view). Eager has no such constraint and bounds by
+    # ``max_prefix_blocks_count`` — the columns the longest prefix in this
+    # batch actually needs — which is what removes the padding copies for
+    # short prefixes.
+    shared_table = attn_metadata.prefix_block_table
+    if shared_table is not None:
+        max_valid_cols = 0 if _npu_stream_capturing() else getattr(
+            attn_metadata, "max_prefix_blocks_count", 0
+        )
         shared_key, shared_value, shared_table = _gather_shared_blocks(
             key_cache,
             value_cache,
-            attn_metadata.prefix_block_table,
+            shared_table,
+            max_valid_cols,
         )
     else:
+        # No paged shared prefix in this batch: the kernel still needs
+        # contiguous buffers, and there is no table to gather through.
         shared_key = key_cache.contiguous()
         shared_value = value_cache.contiguous()
-        shared_table = attn_metadata.prefix_block_table
 
     out = beam_ops.x_attention(
         beam_query,
