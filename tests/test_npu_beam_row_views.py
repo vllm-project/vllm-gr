@@ -64,6 +64,35 @@ def _metadata(rows: int) -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize("interleaved", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("max_valid_cols", [0, 1, 2, 8, 10])  # type: ignore[misc]
+def test_shared_prefix_gather_preserves_key_value_and_block_routing(
+    row_module: ModuleType, interleaved: bool, max_valid_cols: int
+) -> None:
+    """Exercise the real gather on CPU; native graph replay needs an NPU."""
+    pool = torch.arange(16 * 2 * 4 * 2 * 8, dtype=torch.float32).reshape(16, 2, 4, 2, 8)
+    key, value = pool[:, 0], pool[:, 1]
+    if not interleaved:
+        key, value = key.contiguous(), value.contiguous()
+    table = torch.tensor([[5, 2, 7, 7, 7, 7, 7, 7], [3, 5, 7, 7, 7, 7, 7, 7]], dtype=torch.int32)
+    width = min(max_valid_cols, table.shape[1]) if max_valid_cols > 0 else table.shape[1]
+    for iteration in range(2):
+        if iteration:
+            # Fixed-shape inputs can change their referenced blocks and data.
+            table[:, 0] = torch.tensor([9, 1], dtype=table.dtype)
+            key.add_(1000)
+            value.sub_(1000)
+        gathered_key, gathered_value, remapped = row_module._gather_shared_blocks(
+            key, value, table, max_valid_cols
+        )
+        assert gathered_key.shape[0] == table.shape[0] * width
+        assert gathered_value.shape == gathered_key.shape
+        assert gathered_key.is_contiguous() and gathered_value.is_contiguous()
+        assert remapped.shape == (table.shape[0], width)
+        torch.testing.assert_close(gathered_key[remapped.long()], key[table[:, :width].long()])
+        torch.testing.assert_close(gathered_value[remapped.long()], value[table[:, :width].long()])
+
+
 def test_npu_dense_identity_rows_share_original_storage(
     row_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:

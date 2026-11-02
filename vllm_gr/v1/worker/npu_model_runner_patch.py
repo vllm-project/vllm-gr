@@ -106,7 +106,6 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
-            num_scheduled_tokens_compressed_list,
         ) = out
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
@@ -116,7 +115,6 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
-            num_scheduled_tokens_compressed_list,
         )
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
@@ -1045,7 +1043,7 @@ make_patched_determine_batch_execution_and_padding = (
 
 #  Read actual packed row order; do not modify latest stage/decode hooks.
 def _select_bsnd_spec(runner, scheduler_output, p_runner, num_reqs):
-    """v4.1 BSND eligibility: no-history full-prompt + per-request length fit.
+    """BSND eligibility: complete prompts without history, fitting each row.
 
     Every scheduled request must have num_computed_tokens == 0 (its full
     prompt is scheduled in this batch) and max_len <= P of a captured (T,B)
@@ -1104,7 +1102,7 @@ def make_patched_model_forward_npu(_orig_model_forward):
         **model_kwargs,
     ):
         scheduler_output = getattr(self, "_current_scheduler_output", None)
-        # 20261019: BSND/TND graph wrapper cannot consume non-token model payloads.
+        # BSND/TND graph wrappers cannot consume non-token model payloads.
         if intermediate_tensors is not None or inputs_embeds is not None or model_kwargs:
             return _orig_model_forward(
                 self,
@@ -1136,7 +1134,7 @@ def make_patched_model_forward_npu(_orig_model_forward):
                 )
 
             if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
-                # 20261019: Optional BSND before latest TND; preserve compact logits indices.
+                # Try optional BSND before TND; preserve compact logits indices.
                 # Each request must be a complete prompt without cached history.
                 bsnd_spec = None
                 if getattr(p_runner, "has_bsnd_captured_graph", None) is not None:
@@ -1239,7 +1237,7 @@ def capture_prefill_graphs(runner) -> None:
         torch.npu.synchronize()
         runner._prefill_graphs_captured = True
     except Exception:
-        # 20261019: Never swallow an enabled BSND startup/capture failure.
+        # Propagate startup/capture failures when BSND is enabled.
         import os
 
         if os.getenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", "").strip():

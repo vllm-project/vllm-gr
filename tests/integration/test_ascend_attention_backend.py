@@ -37,6 +37,7 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
     import vllm.v1.attention.selector as selector_mod
     from vllm.config import AttentionConfig, VllmConfig, set_current_vllm_config
     from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_ascend.ascend_config import clear_ascend_config, init_ascend_config
     from vllm_ascend.utils import register_ascend_customop
 
     from vllm_gr._env_check import check_ascend_environment
@@ -56,22 +57,50 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
     # GPU Triton and are incompatible with Triton-Ascend; they are unrelated to
     # the native Ascend kernels covered here, so report them as unavailable
     # while the registration modules are imported.
-    with mock.patch(
-        "vllm.utils.import_utils.has_triton_kernels",
-        return_value=False,
-    ):
-        register_ascend_customop()
-    ascend_compat.apply_ascend_attention_backend_patch(force=True)
-    ascend_compat._ASCEND_ORIGINAL_CACHED_GET_ATTN.cache_clear()
+    #
+    # register_ascend_customop() writes process-global state (vLLM's
+    # op_registry_oot and vllm-ascend's _ASCEND_CUSTOMOP_IS_REIGISTERED) that
+    # nothing later in the process undoes. Leaving it installed makes every
+    # subsequent LogitsProcessor construction in the same pytest process
+    # resolve to AscendLogitsProcessor, whose _get_logits reads
+    # lm_head.parallel_mode — an attribute the CPU fakes in other test modules
+    # do not model. Restore both so the registration stays local to this test.
+    from vllm.model_executor.custom_op import op_registry_oot
+    from vllm_ascend import utils as ascend_utils
 
-    selector_config = AttentionSelectorConfig(
-        head_size=64,
-        dtype=torch.float16,
-        kv_cache_dtype=None,
-        block_size=config.cache_config.block_size,
-    )
-    with set_current_vllm_config(config):
-        backend = selector_mod._cached_get_attn_backend(None, selector_config)
+    saved_registry = dict(op_registry_oot)
+    saved_flag = ascend_utils._ASCEND_CUSTOMOP_IS_REIGISTERED
+    try:
+        with mock.patch(
+            "vllm.utils.import_utils.has_triton_kernels",
+            return_value=False,
+        ):
+            register_ascend_customop()
+        ascend_compat.apply_ascend_attention_backend_patch(force=True)
+        ascend_compat._ASCEND_ORIGINAL_CACHED_GET_ATTN.cache_clear()
+
+        selector_config = AttentionSelectorConfig(
+            head_size=64,
+            dtype=torch.float16,
+            kv_cache_dtype=None,
+            block_size=config.cache_config.block_size,
+        )
+        with set_current_vllm_config(config):
+            # Engine startup runs NPUPlatform.check_and_update_config, whose
+            # step 5 initializes the Ascend config before any backend
+            # selection; rc2's get_attn_backend_cls reads rl_config from it
+            # during FA3 validation before falling back to the registered
+            # plugin backend. Mirror that ordering, then restore the unset
+            # state for the rest of the process.
+            init_ascend_config(config)
+            try:
+                backend = selector_mod._cached_get_attn_backend(None, selector_config)
+            finally:
+                clear_ascend_config()
+    finally:
+        op_registry_oot.clear()
+        op_registry_oot.update(saved_registry)
+        ascend_utils._ASCEND_CUSTOMOP_IS_REIGISTERED = saved_flag
 
     assert backend is not BeamAttentionBackend
     assert backend.__module__.startswith("vllm_ascend.")

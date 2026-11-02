@@ -361,7 +361,7 @@ class NPUEagerBeamStageRunner:
         original: Callable[..., Any],
         scheduler_output: Any,
         num_scheduled_tokens: Any,
-    ) -> tuple[Any, Any, int, Any]:
+    ) -> tuple[Any, Any, int]:
         plan = self.pending_plan
         if plan is None or scheduler_output is not self.worker._current_scheduler_output:
             return original(self.worker, scheduler_output, num_scheduled_tokens)
@@ -384,7 +384,7 @@ class NPUEagerBeamStageRunner:
         if self.worker._current_beam_info is not None:
             self.worker._current_beam_info["req_ids"] = list(execution.request_ids)
         out = original(self.worker, prepared_output, prepared_counts)
-        logits_indices, spec_metadata, total, compressed = out
+        logits_indices, spec_metadata, total = out
         if execution.kind == "decode" and total != plan.model_token_count:
             raise RuntimeError(
                 "NPU Decode input preparation did not preserve the physical "
@@ -415,7 +415,7 @@ class NPUEagerBeamStageRunner:
             )
             total = plan.model_token_count
         logits_indices = _materialize_logits_indices(self.worker, list(plan.logits_indices))
-        return logits_indices, spec_metadata, total, compressed
+        return logits_indices, spec_metadata, total
 
     @torch.inference_mode()
     def sample(self, grammar_output: Any = None) -> Any:

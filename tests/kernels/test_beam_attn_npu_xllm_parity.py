@@ -358,10 +358,18 @@ def test_cascade_execution_batch_matches_individual_requests(
         batch.end_session()
 
 
+@pytest.mark.parametrize("cache_layout", ["contiguous", "interleaved"])  # type: ignore[misc]
 @pytest.mark.parametrize("beam_width", [2, 4])  # type: ignore[misc]
 @pytest.mark.parametrize("decode_step", [0, 1, 3, 7])  # type: ignore[misc]
-def test_xllm_incremental_matches_cascade(beam_width: int, decode_step: int) -> None:
-    """x_attention fused path vs cascade incremental path, allclose."""
+def test_xllm_incremental_matches_cascade(
+    beam_width: int, decode_step: int, cache_layout: str
+) -> None:
+    """x_attention fused path vs cascade incremental path, allclose.
+
+    ``interleaved`` mirrors the vllm-ascend 0.30 pool allocation (K/V
+    interleaved per block, per-layer views non-contiguous), exercising the
+    pool-base gather in the xllm shared-prefix path.
+    """
     torch.manual_seed(beam_width * 100 + decode_step)
     prefix_len = 256  # 2 full blocks; no remainder-block std spill
     scale = 1.0 / math.sqrt(HEAD_DIM)
@@ -398,12 +406,24 @@ def test_xllm_incremental_matches_cascade(beam_width: int, decode_step: int) -> 
 
     # Paged shared prefix KV.
     blocks_per_req = prefix_len // BLOCK_SIZE
-    key_cache = (
+    key_cache_cpu = (
         torch.randn(blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * scale
-    ).to(DEVICE)
-    value_cache = (
+    )
+    value_cache_cpu = (
         torch.randn(blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * scale
-    ).to(DEVICE)
+    )
+    if cache_layout == "interleaved":
+        # vllm-ascend 0.30 layout: one [N, 2, block, H, D] allocation with
+        # the per-layer K/V views as its strided halves.
+        pool_kv = torch.zeros(blocks_per_req, 2, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE)
+        pool_kv[:, 0] = key_cache_cpu
+        pool_kv[:, 1] = value_cache_cpu
+        pool_kv = pool_kv.to(DEVICE)
+        key_cache, value_cache = pool_kv[:, 0], pool_kv[:, 1]
+        assert not key_cache.is_contiguous()
+    else:
+        key_cache = key_cache_cpu.to(DEVICE)
+        value_cache = value_cache_cpu.to(DEVICE)
     block_tables = torch.arange(blocks_per_req, dtype=torch.int32).unsqueeze(0)
 
     query = (torch.randn(beam_width, NUM_HEADS, HEAD_DIM, dtype=DTYPE) * scale).to(DEVICE)
@@ -653,3 +673,49 @@ def test_xllm_mixed_std_beam_batch_falls_back_to_cascade() -> None:
     assert xllm_out.float().abs().sum() > 0
 
     session.end_session()
+
+
+def test_gather_shared_blocks_bounds_fixed_width_table() -> None:
+    """The eager gather copies only the block-table columns a prefix uses.
+
+    The NPU metadata builder allocates the prefix block table at
+    ``max_model_len // block_size`` columns, so a short prefix leaves most
+    columns as padding. The gather must slice them off so the copy scales
+    with the real prefix instead of ``max_model_len``.
+    """
+    num_blocks, block, heads, head_dim = 16, 4, 2, 8
+    pool = torch.arange(
+        num_blocks * 2 * block * heads * head_dim, dtype=torch.float32, device=DEVICE
+    ).reshape(num_blocks, 2, block, heads, head_dim)
+    key_cache, value_cache = pool[:, 0], pool[:, 1]
+
+    # One live block per request, but a fixed-width table of 8 columns.
+    table = torch.zeros(2, 8, dtype=torch.int32, device=DEVICE)
+    table[0, 0] = 0
+    table[1, 0] = 5
+
+    unbounded_key, _, unbounded_table = beam_attn_npu_xllm._gather_shared_blocks(
+        key_cache, value_cache, table, 0
+    )
+    bounded_key, bounded_value, bounded_table = beam_attn_npu_xllm._gather_shared_blocks(
+        key_cache, value_cache, table, 1
+    )
+
+    # Only the referenced blocks are copied when the bound is applied.
+    assert bounded_key.shape[0] == table.shape[0] * 1
+    assert unbounded_key.shape[0] == table.shape[0] * table.shape[1]
+    assert tuple(bounded_table.shape) == (table.shape[0], 1)
+
+    # The remapped table must still point at the same real blocks.
+    assert bounded_table[:, 0].tolist() == [0, 1]
+    assert bounded_key[0].equal(pool[0, 0])
+    assert bounded_key[1].equal(pool[5, 0])
+    assert bounded_value[0].equal(pool[0, 1])
+    assert bounded_value[1].equal(pool[5, 1])
+
+    # A bound at or above the table width is a no-op, not a truncation.
+    full_key, _, full_table = beam_attn_npu_xllm._gather_shared_blocks(
+        key_cache, value_cache, table, table.shape[1]
+    )
+    assert full_key.shape[0] == table.shape[0] * table.shape[1]
+    assert tuple(full_table.shape) == tuple(table.shape)

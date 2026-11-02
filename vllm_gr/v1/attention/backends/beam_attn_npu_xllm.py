@@ -26,6 +26,9 @@ from vllm_gr.v1.attention.backends import beam_attn_npu
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
 )
+from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
+    interleaved_pool_base,
+)
 from vllm_gr.v1.beam.npu_execution_batch import restore_npu_cache_pool_layout
 
 # Fail fast when the mode selects this module but the operator library is
@@ -141,6 +144,72 @@ def cache_unshared_kv(
     )
 
 
+def _npu_stream_capturing() -> bool:
+    """Whether an ACL graph capture is running on the current stream.
+
+    Mirrors the discriminator vllm-ascend's own backends use to route between
+    capture-safe and eager execution paths (``torch.npu.NPUGraph`` capture is
+    stream-capture based).
+    """
+    try:
+        return bool(torch_npu.npu.is_current_stream_capturing())
+    except Exception:
+        # Unknown capture state: assume capture so the captured-shape path is
+        # taken.
+        return True
+
+
+def _gather_shared_blocks(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    max_valid_cols: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather only the shared-prefix blocks the block table references.
+
+    x_attention reads its shared key/value buffers through a block table,
+    so only the referenced blocks need to be contiguous. On the 0.30
+    K/V-interleaved layout the per-layer cache views are strided halves of
+    one pool, and on such non-contiguous sources ``index_select``
+    materializes the entire pool before selecting (same cost as
+    ``.contiguous()``), defeating the point of the gather. The gather
+    therefore runs against the contiguous pool base reconstructed by
+    ``interleaved_pool_base``; caches that are already contiguous take the
+    direct per-tensor ``index_select`` fallback. Either way the copy is
+    proportional to the blocks the table references rather than to the
+    pool.
+
+    ``max_valid_cols`` is ``attn_metadata.max_prefix_blocks_count``: the
+    number of block-table columns actually needed by the longest prefix in
+    this batch.  The fixed-width buffer is allocated at ``max_model_len //
+    block_size`` columns, but the tail columns are padding.  Slicing them
+    off before flattening reduces the gather size from O(max_model_len /
+    block_size) to O(actual_prefix_len / block_size).
+    A zero bound retains the full table width for graph capture or callers
+    without a tighter prefix bound.
+
+    The remapped table ``row * width + col`` matches the flatten order of
+    the gather, so the kernel sees exactly the blocks the original table
+    named.
+    """
+    width = block_table.shape[1]
+    active = block_table[:, :max_valid_cols] if 0 < max_valid_cols < width else block_table
+    flat = active.reshape(-1)
+    base = interleaved_pool_base(key_cache, value_cache)
+    if base is not None:
+        gathered = base.index_select(0, flat)
+        gathered_key = gathered[:, 0].contiguous()
+        gathered_value = gathered[:, 1].contiguous()
+    else:
+        # Contiguous or non-interleaved caches: direct per-tensor gather.
+        gathered_key = key_cache.index_select(0, flat)
+        gathered_value = value_cache.index_select(0, flat)
+    remapped_table = torch.arange(
+        flat.numel(), dtype=block_table.dtype, device=block_table.device
+    ).reshape(active.shape)
+    return gathered_key, gathered_value, remapped_table
+
+
 def _xllm_incremental_decode(
     output: torch.Tensor,
     query: torch.Tensor,
@@ -182,8 +251,9 @@ def _xllm_incremental_decode(
     unshared_value = beam_pool.unshared_value[slot, :beam_width]
 
     # Shared prefix KV length: fixed-address device buffer when the metadata
-    # builder runs with fixed buffers (graph path); CPU-list -> fresh tensor
-    # otherwise (eager path).
+    # builder runs with fixed buffers (the NPU default whenever beam_max_width
+    # is configured, eager decodes included); CPU-list -> fresh tensor
+    # otherwise.
     seqlens_kv = getattr(attn_metadata, "prefix_seqlens_kv_device", None)
     if seqlens_kv is None:
         seqlens_kv = torch.tensor(
@@ -197,13 +267,39 @@ def _xllm_incremental_decode(
     if step_count is None:
         step_count = step + 1  # dev is 0-based; kernel takes 1-based count
 
+    # When a shared-prefix table is available, gather its blocks in both
+    # eager and ACL-graph capture to avoid copying the whole interleaved pool.
+    #
+    # Capture uses the fixed table width so the gather shape stays constant
+    # across prefix lengths. Its input buffers and captured intermediates must
+    # retain stable addresses; replay reads updated block IDs from the same
+    # metadata buffer. The graph owns the captured allocation lifetime, so
+    # this does not require copying every block in the KV pool.
+    # Eager can use ``max_prefix_blocks_count`` to omit padding columns.
+    shared_table = attn_metadata.prefix_block_table
+    if shared_table is not None:
+        max_valid_cols = (
+            0 if _npu_stream_capturing() else getattr(attn_metadata, "max_prefix_blocks_count", 0)
+        )
+        shared_key, shared_value, shared_table = _gather_shared_blocks(
+            key_cache,
+            value_cache,
+            shared_table,
+            max_valid_cols,
+        )
+    else:
+        # No paged shared prefix in this batch: the kernel still needs
+        # contiguous buffers, and there is no table to gather through.
+        shared_key = key_cache.contiguous()
+        shared_value = value_cache.contiguous()
+
     out = beam_ops.x_attention(
         beam_query,
-        key_cache,
-        value_cache,
+        shared_key,
+        shared_value,
         unshared_key,
         unshared_value,
-        attn_metadata.prefix_block_table,
+        shared_table,
         seqlens_kv,
         step_count,
         0.0,  # auto 1/sqrt(head_dim), validated above

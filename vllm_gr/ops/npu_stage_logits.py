@@ -214,7 +214,11 @@ class NPUStageProjection:
         return True
 
     def _get_logits(
-        self, hidden_states: torch.Tensor, lm_head: Any, embedding_bias: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: Any,
+        embedding_bias: torch.Tensor | None,
+        skip_gather: bool = False,
     ) -> torch.Tensor | None:
         if self.update_active or self.update_failed:
             raise RuntimeError(
@@ -247,10 +251,10 @@ class NPUStageProjection:
             reason = "different_weight"
         if reason is not None:
             self.fallback_counts[reason] += 1
-            return self._original(hidden_states, lm_head, embedding_bias)
+            return self._original(hidden_states, lm_head, embedding_bias, skip_gather)
         stage_index = cast(int, stage)
         bias = self._stage_biases[stage_index] if embedding_bias is not None else None
-        logits = self._original(hidden_states, self._proxies[stage_index], bias)
+        logits = self._original(hidden_states, self._proxies[stage_index], bias, skip_gather)
         if logits is not None and logits.shape[-1] != self.vocab_size:
             raise RuntimeError("NPU stage LM head returned an unexpected projection width")
         self.projection_counts[stage_index] += 1

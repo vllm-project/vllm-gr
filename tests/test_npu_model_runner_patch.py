@@ -191,26 +191,25 @@ def test_npu_prefill_preparation_preserves_cached_geometry() -> None:
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker, stage.pending_plan = worker, plan
     hidden = torch.arange(900)
-    spec_metadata, compressed = object(), object()
+    spec_metadata = object()
 
     def native(self: Any, output: Any, native_counts: Any) -> tuple[Any, ...]:
         assert self is worker and output is scheduled and native_counts is counts
         assert tuple(r.num_computed_tokens for r in output.scheduled_new_reqs) == (128, 0, 512, 256)
-        return object(), spec_metadata, 900, compressed
+        return object(), spec_metadata, 900
 
-    logits, spec, total, returned_compressed = stage.prepare_inputs(native, scheduled, counts)
+    logits, spec, total = stage.prepare_inputs(native, scheduled, counts)
     assert hidden[logits.long()].tolist() == [128, 513, 514, 899]
-    assert spec is spec_metadata and returned_compressed is compressed and total == 900
+    assert spec is spec_metadata and total == 900
     assert counts.tolist() == [129, 385, 1, 385]
 
 
-def test_npu_prepare_unproxies_and_preserves_four_item_contract(
+def test_npu_prepare_unproxies_and_preserves_native_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     input_batch = SimpleNamespace(req_ids=["request"])
     proxy = InputBatchProxy(input_batch, ["request"], [0], [0])
     spec_metadata = object()
-    compressed = object()
     runner = SimpleNamespace(
         input_batch=proxy,
         _current_beam_info={"req_ids": []},
@@ -221,21 +220,21 @@ def test_npu_prepare_unproxies_and_preserves_four_item_contract(
         self: Any,
         scheduler_output: Any,
         num_scheduled_tokens: Any,
-    ) -> tuple[object, object, int, object]:
+    ) -> tuple[object, object, int]:
         assert self.input_batch is input_batch
         assert self._current_beam_info["req_ids"] is input_batch.req_ids
-        return object(), spec_metadata, 7, compressed
+        return object(), spec_metadata, 7
 
     monkeypatch.setattr(npu_patch, "_beam_remap_inputs", lambda *args: [3])
     wrapped = npu_patch.make_patched_prepare_inputs(original)
     assert npu_patch.make_patched_prepare_inputs(wrapped) is wrapped
 
     ordinary = wrapped(runner, SimpleNamespace(beam_data={}), [1])
-    assert ordinary[1:] == (spec_metadata, 7, compressed)
+    assert ordinary[1:] == (spec_metadata, 7)
 
     runner.input_batch = proxy
     runner._current_beam_info["req_ids"] = []
-    logits, returned_spec, total, returned_compressed = wrapped(
+    logits, returned_spec, total = wrapped(
         runner,
         SimpleNamespace(beam_data={"request": {}}),
         [1],
@@ -244,7 +243,6 @@ def test_npu_prepare_unproxies_and_preserves_four_item_contract(
     assert logits.tolist() == [3]
     assert returned_spec is spec_metadata
     assert total == 7
-    assert returned_compressed is compressed
 
 
 def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
@@ -1892,10 +1890,10 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> 
         }
         assert counts.dtype == np.int32
         assert torch.from_numpy(counts).tolist() == [3, 3]
-        return object(), object(), 6, object()
+        return object(), object(), 6
 
     counts = np.asarray([1, 1], dtype=np.int32)
-    logits, _, total, _ = stage.prepare_inputs(original, runtime_output, counts)
+    logits, _, total = stage.prepare_inputs(original, runtime_output, counts)
 
     assert counts.tolist() == [1, 1]
     assert scheduler_output.num_scheduled_tokens == {
@@ -2002,7 +2000,7 @@ def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch
 def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mirror Ascend 0.22.1rc1 call order using the real GR dispatch and NPU hooks."""
+    """Mirror the 0.30.0rc2 first-decode call order through the real GR hooks."""
     from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
     from vllm_gr.v1.worker import model_runner_common as common
@@ -2061,7 +2059,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
         assert torch.from_numpy(counts).tolist() == [3, 3]
         assert scheduled.total_num_scheduled_tokens == 6
         seen.append("physical_inputs")
-        return object(), None, int(counts.sum()), None
+        return object(), None, int(counts.sum())
 
     worker._prepare_inputs = npu_patch.make_patched_prepare_inputs(prepare).__get__(worker)
 
@@ -2083,7 +2081,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
         self._update_states(runtime)
         counts = np.asarray(list(runtime.num_scheduled_tokens.values()), dtype=np.int32)
         maximum = int(counts.max())
-        logits_indices, _, total, _ = self._prepare_inputs(runtime, counts)
+        logits_indices, _, total = self._prepare_inputs(runtime, counts)
         assert total == 6 and logits_indices.tolist() == list(range(6))
         _, descriptor, *_ = self._determine(
             num_tokens=runtime.total_num_scheduled_tokens,

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import sys
 import weakref
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -14,6 +13,7 @@ from typing import Any
 import pytest
 import torch
 import torch.nn.functional as F
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -28,20 +28,24 @@ from vllm_gr.ops.npu_stage_logits import (
 )
 
 
+def _make_logits_processor(vocab_size: int) -> LogitsProcessor:
+    # vLLM 0.30 CustomOps read the current config at construction time (same
+    # pattern as tests/test_sliced_logits.py::_native_processor).
+    with set_current_vllm_config(VllmConfig()):
+        return LogitsProcessor(vocab_size)
+
+
 @pytest.fixture
 def context(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
-    # The Ascend processor can be installed by earlier integration tests.
-    # This TP=1 CPU fixture has no engine-wide Ascend config. Disable TP
-    # and reduced sampling locally, keeping the real projection/processor.
-    ascend_logits = sys.modules.get("vllm_ascend.ops.vocab_parallel_embedding")
-    if ascend_logits is not None:
-        monkeypatch.setattr(ascend_logits, "lmhead_tp_enable", lambda: False)
-        monkeypatch.setattr(
-            ascend_logits,
-            "get_ascend_config",
-            lambda: SimpleNamespace(enable_reduce_sample=False),
-        )
-    processor = LogitsProcessor(384)
+    # Earlier NPU integration tests register AscendLogitsProcessor as the
+    # out-of-tree LogitsProcessor, and vllm-ascend 0.30 dispatches it by
+    # lm_head.parallel_mode — an attribute these CPU fakes do not model.
+    # Keep the wrapper-logic tests on the native processor; the Ascend
+    # dispatch has its own coverage below.
+    from vllm.model_executor.custom_op import op_registry_oot
+
+    monkeypatch.delitem(op_registry_oot, "LogitsProcessor", raising=False)
+    processor = _make_logits_processor(384)
     monkeypatch.setattr(processor, "_gather_logits", lambda logits: logits)
     generator = torch.Generator().manual_seed(41)
     head = SimpleNamespace(
@@ -129,6 +133,74 @@ def test_three_stage_projection_preserves_original_processor_semantics(
     assert snapshot["fallback_counts"] == {}
 
 
+def test_stage_projection_routes_replicated_mode_under_ascend_dispatch(
+    context: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Survive the AscendLogitsProcessor swap installed by engine startup.
+
+    vllm-ascend 0.30 registers AscendLogitsProcessor as the out-of-tree
+    LogitsProcessor; its _get_logits routes by lm_head.parallel_mode before
+    projecting. The sliced proxy presents the replicated mode, so both the
+    fast path (proxy head) and the fallback (source head) take the normal
+    projection branch instead of failing on a missing attribute.
+    """
+    pytest.importorskip("vllm_ascend")
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.custom_op import op_registry_oot
+    from vllm_ascend.ops.vocab_parallel_embedding import (
+        AscendLogitsProcessor,
+        VocabParallelMode,
+    )
+
+    # Model the source head the way a real TP=1 replicated Ascend head looks.
+    generator = torch.Generator().manual_seed(41)
+    head = SimpleNamespace(
+        weight=torch.randn(384, 8, generator=generator),
+        bias=torch.randn(384, generator=generator),
+        quant_method=UnquantizedEmbeddingMethod(),
+        tp_size=1,
+        parallel_mode=VocabParallelMode.REPLICATED,
+    )
+    # The out-of-tree entry decides the class at instantiation time, so it
+    # only has to be present while the processor is constructed.
+    with monkeypatch.context() as scoped:
+        scoped.setitem(op_registry_oot, "LogitsProcessor", AscendLogitsProcessor)
+        with set_current_vllm_config(VllmConfig()):
+            processor = LogitsProcessor(384)
+    assert isinstance(processor, AscendLogitsProcessor)
+    plan = SimpleNamespace(execution=SimpleNamespace(stage_index=0, num_execution_rows=2))
+    runner = SimpleNamespace(
+        model=SimpleNamespace(lm_head=head, modules=lambda: iter([processor])),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+            lora_config=None,
+            speculative_config=None,
+        ),
+        lora_config=None,
+        _gr_npu_stage_plan=plan,
+        _gr_npu_stage_runner=SimpleNamespace(pending_plan=plan),
+    )
+    backend = SimpleNamespace(
+        stage_vocab=SimpleNamespace(vocab_size=128, stage_token_ids=context.ids),
+        info=SimpleNamespace(table_metadata=SimpleNamespace(vocab_size=384)),
+    )
+    projection = install_npu_stage_projection(runner, backend)
+    assert projection is not None
+    hidden = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 20
+    try:
+        actual = processor.forward(head, hidden, head.bias)
+        expected = F.linear(hidden, head.weight, head.bias)[:, context.ids[0].tolist()]
+        assert actual.shape == (2, 128)
+        torch.testing.assert_close(actual[:, : context.ids[0].numel()], expected)
+        # Without an active plan the same Ascend processor falls back to the
+        # full-vocabulary projection through the source head.
+        runner._gr_npu_stage_runner = SimpleNamespace(pending_plan=None)
+        fallback = processor.forward(head, hidden, head.bias)
+        torch.testing.assert_close(fallback, F.linear(hidden, head.weight, head.bias))
+    finally:
+        projection.close()
+
+
 def test_steady_state_reuses_prepared_weights(
     context: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -148,6 +220,30 @@ def test_steady_state_reuses_prepared_weights(
                 assert ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias).shape == (2, 128)
     assert tuple(weight.data_ptr() for weight in projection.stage_weights) == pointers
     assert projection.projection_counts == [2, 2, 2]
+
+
+def test_skip_gather_is_forwarded_for_compact_and_fallback_projection(context: Any) -> None:
+    ctx = context
+    projection = _install(ctx)
+    original = projection._original
+    calls = []
+
+    def observed_original(
+        hidden_states: torch.Tensor,
+        lm_head: Any,
+        embedding_bias: torch.Tensor | None,
+        skip_gather: bool = False,
+    ) -> torch.Tensor | None:
+        calls.append(skip_gather)
+        return original(hidden_states, lm_head, embedding_bias, skip_gather)
+
+    projection._original = observed_original
+    compact = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias, skip_gather=True)
+    assert compact.shape == (2, 128)
+    ctx.runner._gr_npu_stage_plan = None
+    fallback = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias, skip_gather=True)
+    assert fallback.shape == (2, 384)
+    assert calls == [True, True]
 
 
 @pytest.mark.parametrize(
@@ -266,7 +362,7 @@ def test_install_rejects_unsupported_configs_without_changing_processor(
     elif case == "no_processor":
         ctx.processors.clear()
     elif case == "multiple_processors":
-        ctx.processors.append(LogitsProcessor(384))
+        ctx.processors.append(_make_logits_processor(384))
     assert install_npu_stage_projection(ctx.runner, ctx.backend) is None
     assert ctx.processor._get_logits == original
     assert "_get_logits" not in vars(ctx.processor)
@@ -385,7 +481,7 @@ def test_ineligible_runner_is_rejected_before_projection_allocation(
     elif case == "quantized":
         ctx.head.quant_method = SimpleNamespace()
     else:
-        ctx.processors.append(LogitsProcessor(384))
+        ctx.processors.append(_make_logits_processor(384))
 
     def forbidden(*args: Any, **kwargs: Any) -> None:
         pytest.fail("An unsupported runner must not allocate compact projection weights")

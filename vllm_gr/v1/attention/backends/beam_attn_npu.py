@@ -77,12 +77,17 @@ def reshape_and_cache(
     v_scale: torch.Tensor | None,
 ) -> None:
     del kv_cache_dtype, k_scale, v_scale
-    torch_npu._npu_reshape_and_cache(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping,
+    # vLLM 0.30 allocates the KV cache with K/V interleaved per block, so the
+    # per-layer [B, N, H, D] key/value views are non-contiguous. The older
+    # _npu_reshape_and_cache requires contiguous caches; the paged-attention
+    # scatter used by vllm-ascend 0.30 handles the strided block layout.
+    torch_npu.npu_scatter_pa_kv_cache(
+        key=key.contiguous(),
+        value=value.contiguous(),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=slot_mapping.contiguous(),
+        cache_mode="Norm",
     )
 
 
@@ -657,7 +662,7 @@ def update_graph_params(
     return True
 
 
-# 20261019: Fixed-shape nonpaged FIA; no changes to latest TND task/update ordering.
+# Fixed-shape nonpaged FIA; TND retains its task/update ordering.
 def prefill_attention_bsnd(
     output: torch.Tensor,
     query: torch.Tensor,
@@ -666,7 +671,7 @@ def prefill_attention_bsnd(
     attn_metadata: BeamAttentionMetadata,
     scale: float,
 ) -> None:
-    """v4.1 BSND prefill attention: shape-bound FIA, no per-layer host update.
+    """BSND prefill attention: shape-bound FIA, no per-layer host update.
 
     Q/output are laid out [B,P,Nq,D] and K/V [B,P,Nkv,D] from the current
     layer's QKV projection; the per-request lengths live entirely in the
@@ -674,7 +679,7 @@ def prefill_attention_bsnd(
     Padding keys k>=L_i are causal-masked against every real query q<L_i,
     so no dynamic padding mask is needed (pad rows are discarded downstream).
     """
-    # 20261019: Scratch lifetime follows the captured metadata, not module globals.
+    # Scratch lifetime follows the captured metadata, not module globals.
     resources = attn_metadata.bsnd_resources
     resources.setdefault("workspaces", {})
     resources.setdefault("lses", {})
@@ -689,9 +694,9 @@ def prefill_attention_bsnd(
     Nq = attn_metadata.num_heads
     Nkv = attn_metadata.num_kv_heads
     D = query.shape[-1]
-    # 20261020: GQA: Q/out [B,P,Nq,D], K/V [B,P,Nkv,D]
-    # 20261019: Ported v4 fix; historical note: 20261008 reshape can preserve a strided QKV slice; FIA requires
-    # contiguous inputs. The output must alias the caller's buffer, never a reshape copy.
+    # GQA: Q/out [B,P,Nq,D], K/V [B,P,Nkv,D]. FIA requires contiguous inputs;
+    # reshaping a strided QKV slice can preserve the stride, so materialize
+    # explicitly. The output must alias the caller's buffer, never a copy.
     q_bsnd = query.reshape(B, P, Nq, D).contiguous()
     k_bsnd = key.reshape(B, P, Nkv, D).contiguous()
     v_bsnd = value.reshape(B, P, Nkv, D).contiguous()

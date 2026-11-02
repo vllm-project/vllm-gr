@@ -148,8 +148,9 @@ def _enpu_first_capture_pending(forward_context: Any, descriptor: Any) -> bool:
     """
     if getattr(forward_context, "capturing", None) is not False:
         return False
-    model = getattr(forward_context, "model_instance", None)
-    wrapper = getattr(model, "cudagraph_wrapper", None)
+    # vllm-ascend 0.30 replaces the model with its ACLGraphWrapper, so the
+    # forward-context model instance is already the native graph owner.
+    wrapper = getattr(forward_context, "model_instance", None)
     if (
         not isinstance(wrapper, ACLGraphWrapper)
         or wrapper.runtime_mode != CUDAGraphMode.FULL
@@ -207,8 +208,7 @@ def _select_workspace(
     already captured by older graphs. Capacity is never inferred from T.
     Sharing stays within the same native wrapper and its serialized forwards.
     """
-    model = getattr(context, "model_instance", None)
-    wrapper = getattr(model, "cudagraph_wrapper", None)
+    wrapper = getattr(context, "model_instance", None)
     if not isinstance(wrapper, ACLGraphWrapper) or wrapper.runtime_mode != CUDAGraphMode.FULL:
         _fail("workspace sharing requires the actual native FULL graph wrapper")
     candidate = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(**workspace_kwargs)
