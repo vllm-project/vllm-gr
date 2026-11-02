@@ -84,6 +84,11 @@ def capture_multibatch_forward(worker: Any, *, allow_eager_fallback: bool = True
         raise RuntimeError(
             "Asynchronous scheduling startup encountered an incomplete capture state"
         )
+    from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
+        ensure_prefix_calibration,
+    )
+
+    ensure_prefix_calibration(worker)
     failures = {}
     for batch in batches:
         error = _capture_batch(

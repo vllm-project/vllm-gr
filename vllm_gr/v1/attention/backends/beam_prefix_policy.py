@@ -329,8 +329,38 @@ def _device_key(device: dict[str, Any]) -> str:
     return f"{device.get('name')}-{device.get('sm_count')}-{device.get('cuda')}"
 
 
+# Populated only during worker startup. Requests neither insert entries nor
+# consult the filesystem; immutable coefficients live for the worker process.
+_runtime_calibrations: dict[tuple[str, str], PrefixCalibration] = {}
+
+
+def _calibration_key(device: dict[str, Any], geometry: dict[str, Any]) -> tuple[str, str]:
+    return (
+        json.dumps(device, sort_keys=True, default=str),
+        json.dumps(geometry, sort_keys=True, default=str),
+    )
+
+
+def remember_calibration(
+    device: dict[str, Any],
+    geometry: dict[str, Any],
+    calibration: PrefixCalibration | None,
+) -> None:
+    """Publish a startup result for this device and geometry in the worker."""
+    key = _calibration_key(device, geometry)
+    if calibration is None:
+        _runtime_calibrations.pop(key, None)
+    else:
+        _runtime_calibrations[key] = calibration
+
+
+def get_calibration(device: dict[str, Any], geometry: dict[str, Any]) -> PrefixCalibration | None:
+    """Look up startup coefficients in memory; a miss keeps native attention."""
+    return _runtime_calibrations.get(_calibration_key(device, geometry))
+
+
 def load_calibration(device: dict[str, Any], geometry: dict[str, Any]) -> PrefixCalibration | None:
-    """Return the cached calibration for this device+geometry, if any."""
+    """Read persisted calibration during startup, never on a serving request."""
     import yaml
 
     try:
@@ -422,7 +452,7 @@ def resolve_prefix_plan(
         return None
     if 2 not in supported_versions:
         return None
-    calibration = load_calibration(
+    calibration = get_calibration(
         fingerprint,
         {
             "heads": shape.heads,
