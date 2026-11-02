@@ -166,6 +166,79 @@ def test_repeated_gate_rejects_changed_sample_identity(
         summarize(tmp_path, 10)
 
 
+@pytest.mark.parametrize("calibration_repeats", [3, 10])  # type: ignore[misc]
+def test_declared_calibration_count_keeps_screening_and_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calibration_repeats: int
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    candidate, result, _, _ = summarize(tmp_path, calibration_repeats)
+    candidate["source_ci"] = {"calibration_repeats": calibration_repeats}
+    candidate["calibration_sid_recall32"] = {
+        task: [run["tasks"][task]["recall@32"] for run in result["runs"]] for task in TASKS
+    }
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(candidate), encoding="utf-8")
+    floor = min(candidate["calibration_sid_recall32"]["video"])
+    _set_sid_recall(tmp_path, 1, "video", floor)
+    _, result, summary, failures = summarize(tmp_path, 1, baseline)
+    assert not failures and not result["confirmation_required"]
+    assert result["baseline_calibration_repeats"] == calibration_repeats
+    assert f"from {calibration_repeats} calibration measurements" in summary
+    for run in (1, 2, 3):
+        _set_sid_recall(tmp_path, run, "video", floor - 0.001)
+    _, result, _, failures = summarize(tmp_path, 1, baseline)
+    assert not failures and result["confirmation_required"]
+    _, _, _, failures = summarize(tmp_path, 3, baseline)
+    assert len(failures) == 1 and failures[0].startswith("video:")
+
+
+@pytest.mark.parametrize("calibration_repeats", [0, 1, 2, True, 3.0, "3"])  # type: ignore[misc]
+def test_invalid_calibration_count_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calibration_repeats: object
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    candidate, result, _, _ = summarize(tmp_path, 3)
+    candidate["source_ci"] = {"calibration_repeats": calibration_repeats}
+    candidate["calibration_sid_recall32"] = {
+        task: [run["tasks"][task]["recall@32"] for run in result["runs"]] for task in TASKS
+    }
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(candidate), encoding="utf-8")
+    with pytest.raises(ValueError, match="at least three calibration measurements"):
+        summarize(tmp_path, 1, baseline)
+
+
+def test_calibration_samples_must_match_declared_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    candidate, result, _, _ = summarize(tmp_path, 3)
+    candidate["source_ci"] = {"calibration_repeats": 3}
+    candidate["calibration_sid_recall32"] = {
+        task: [run["tasks"][task]["recall@32"] for run in result["runs"]] for task in TASKS
+    }
+    candidate["calibration_sid_recall32"]["ad"].pop()
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(candidate), encoding="utf-8")
+    with pytest.raises(ValueError, match="ad: invalid historical SID calibration"):
+        summarize(tmp_path, 1, baseline)
+
+
+def test_committed_baseline_uses_measured_upgrade_calibration() -> None:
+    path = Path(__file__).resolve().parents[1] / "benchmarks/beam_search/v1_recall_b4_baseline.json"
+    baseline = json.loads(path.read_text(encoding="utf-8"))
+    count = baseline["source_ci"]["calibration_repeats"]
+    assert count >= 3
+    assert baseline["runtime_provenance"]["vllm"] == "0.30.0"
+    assert baseline["runtime_provenance"]["accelerator"] == "NVIDIA A100-PCIE-40GB"
+    assert baseline["source_ci"]["workflow_run_id"] == 41385992758
+    for task in TASKS:
+        values = baseline["calibration_sid_recall32"][task]
+        assert len(values) == count
+        assert values[0] == baseline["tasks"][task]["recall@32"]
+        assert len(baseline["tasks"][task]["sample_ids"]) == 1000
+
+
 def test_cli_writes_repeat_artifacts_and_step_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

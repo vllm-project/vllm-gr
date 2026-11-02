@@ -23,12 +23,18 @@ The current implementation targets inference scenarios and does not aim for full
 
 ## Installation
 
-**Install vLLM 0.22.1 first (and vLLM-Ascend 0.22.1rc1 on NPU), then
-`pip install vllm-gr`.** This release targets that API pair only. Platform
-dependencies are auto-detected by `setup.py` — no `[gpu]` / `[npu]` extras
+The current CUDA release candidate targets **vLLM 0.30.0**. A CUDA install of
+`vllm-gr` resolves that exact vLLM version through `requirements/cuda.txt`;
+platform dependencies are selected by `setup.py`, so no `[gpu]` extra is
 needed.
 
-For detailed instructions, see [quickstart](docs/quickstart.md) or [quick start ascend](docs/quickstart-ascend.md).
+The Ascend path targets vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2 and completed
+NPU runtime validation on that vendor stack. The environment guard pins the
+validated vLLM-Ascend/Triton-Ascend pair; the vendor runtime comes from the
+base image. See the [Ascend installation guide](docs/quickstart-ascend.md) for
+the installation procedure, runtime requirements, and execution contract.
+
+For the validated CUDA installation path, see [quickstart](docs/quickstart.md).
 
 ## Unified self-validation
 
@@ -58,7 +64,10 @@ documented in [benchmarks/qwen/README.md](benchmarks/qwen/README.md).
 - For gRPC beam generation with binary token inputs, see the
   [gRPC and NumPy upgrade guide](docs/grpc_numpy_upgrade.md).
 
-## NPU Serving with Constraint Tables
+## NPU Serving
+
+The following is the serving configuration contract for the validated NPU
+stack (vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2).
 
 Use a canonical `--vllm-gr-config` file with `beam.execution_mode: v1` and
 `constraint_table.backend: npu`. Build the `.safetensors` artifact with the
@@ -70,8 +79,8 @@ then the [online V1 example](examples/online_serving/beam_search/README.md).
 The old frontend `--catalog-path` injection flow is retired; a triples JSON
 is an artifact build input, not a replacement for the canonical configuration.
 
-The [NPU quickstart](docs/quickstart-ascend.md) describes the Ascend environment
-and execution choices. Benchmark gates additionally require local dataset and
+The [NPU installation guide](docs/quickstart-ascend.md) records the runtime
+requirements and execution choices. Benchmark gates additionally require local dataset and
 catalog paths plus a resolved benchmark policy; see
 [benchmark instructions](docs/benchmarks/README.md).
 

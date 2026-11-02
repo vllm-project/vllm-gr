@@ -175,18 +175,27 @@ def test_offline_rejects_import_from_another_checkout(
         gate.run_offline(argparse.Namespace(), "prompt", {"cases": []})
 
 
-def test_shared_driver_imports_each_selected_runtime(tmp_path: Path) -> None:
+def test_shared_driver_imports_each_selected_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     script = Path(__file__).parent / "system/run_beam_v1_performance.sh"
+    # A git hook exports repository-local variables to pytest. They must not
+    # redirect these synthetic commits to the caller's repository or index.
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "caller.git"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "caller.index"))
+    repo_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     roots = [tmp_path / "base", tmp_path / "candidate"]
     for root in roots:
         (root / "vllm_gr").mkdir(parents=True)
         (root / "vllm_gr/__init__.py").write_text(f"SOURCE = {root.name!r}\n", encoding="utf-8")
-        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "init", "-q", str(root)], env=repo_env, check=True)
         subprocess.run(
             [
                 "git",
                 "-C",
                 str(root),
+                "-c",
+                "core.hooksPath=/dev/null",
                 "-c",
                 "user.name=Test",
                 "-c",
@@ -196,6 +205,7 @@ def test_shared_driver_imports_each_selected_runtime(tmp_path: Path) -> None:
                 "-qm",
                 "test",
             ],
+            env=repo_env,
             check=True,
         )
     driver = roots[1] / "benchmarks/beam_search/driver.py"
@@ -215,7 +225,7 @@ def test_shared_driver_imports_each_selected_runtime(tmp_path: Path) -> None:
     for root in roots:
         output = root / "results"
         env = {
-            **os.environ,
+            **repo_env,
             "V1_PERF_REPO_ROOT": str(root),
             "V1_PERF_DRIVER": str(driver),
             "V1_PERF_OUTPUT_DIR": str(output),

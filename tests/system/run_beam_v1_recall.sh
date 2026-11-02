@@ -10,7 +10,6 @@ model="${VLLM_GR_TEST_MODEL:-OpenOneRec/OneRec-1.7B}"
 revision="${V1_RECALL_MODEL_REVISION:-cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b}"
 triples="${V1_RECALL_TRIPLES_PATH:-$repo_root/generated_data/recall_constraints/sid2pid_triples.json}"
 triples_iid="${V1_RECALL_TRIPLES_IID_PATH:-$repo_root/generated_data/recall_constraints/sid2iid_triples.json}"
-
 for path in "$dataset/sid2pid.json" "$dataset/sid2iid.json" "$triples" "$triples_iid"; do
   if [[ ! -f "$path" ]]; then
     echo "Missing OneRec accuracy input: $path" >&2
@@ -19,6 +18,8 @@ for path in "$dataset/sid2pid.json" "$dataset/sid2iid.json" "$triples" "$triples
 done
 
 mkdir -p "$output_dir"
+artifact_dir="$output_dir/artifacts"
+mkdir -p "$artifact_dir"
 git rev-parse HEAD > "$output_dir/commit.txt"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv \
@@ -88,6 +89,7 @@ run_group() {
       "${model_revision_args[@]}" \
       --dataset-path "$dataset" \
       --catalog-path "$group_triples" \
+      --constraint-artifact "$artifact_dir/$group.safetensors" \
       --task-types "$@" \
       --num-prompts 1000 \
       --batch-size 4 \
@@ -135,6 +137,7 @@ print("yes" if json.load(open(sys.argv[1], encoding="utf-8"))["confirmation_requ
 PY
 )"
   if [[ "$needs_confirmation" == yes ]]; then
+    repeat_count=3
     run_once 2
     run_once 3
     summarize_runs 3

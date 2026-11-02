@@ -1,4 +1,10 @@
-# LMCache support for vllm-gr
+# LMCache Integration Status
+
+> **0.30 release status:** LMCache is an experimental integration and is not
+> included in the default CUDA dependencies. The bundled adapter reaches into
+> LMCache and vLLM internals and has not been validated with the vLLM 0.30.0
+> upgrade. There is currently no supported LMCache version pin. Validate a
+> chosen LMCache/vLLM pair independently before enabling this integration.
 
 ## Overview
 
@@ -32,7 +38,7 @@ LMCache typically operates through a **Controller-Worker** model. The workers (i
 
 ### LMCache and vllm-gr overview
 
- vllm-gr supports LMCache in 2 modes of operation:
+The bundled adapter is intended for two LMCache modes:
 
  1. Standalone: each vllm-gr process uses LMCache to store KVC in RAM. KV chunks are not shared with other vllm-gr processes.
  2. Controller+P2P: In this mode all vllm-gr processes are connected to a central controller via network (UDS on local server or TCP/IP between servers). Controller doesn't store KVC chunks, it only stores the knowledge of which vllm-gr process holds each KVC chunk.
@@ -41,9 +47,8 @@ LMCache typically operates through a **Controller-Worker** model. The workers (i
  Other modes are not supported since:
  a. LMCache MP (Multi-Process) mode: in this mode LMCache runs as a standalone server process that multiple vLLM instances connect to over ZMQ. This allows all vLLM processes on the same node to share a single L1 cache, maximizing KV cache reuse, providing process isolation, and enabling independent scaling of cache and inference resources (Multiprocess Mode docs, Architecture Guide).
  In this mode lmcache.server process can store KVC chunks in process's memory, in shared memory (/dev/shm/) or on RAMdisk (/mnt/lmcache/).
- LMCache MP mode is not part of the vLLM 0.22.1 compatibility gate for
- this release; validate the LMCache/vLLM wire-protocol combination before
- enabling it in production.
+ LMCache MP mode is outside the current compatibility gate; validate the
+ LMCache/vLLM wire-protocol combination before enabling it.
  b. RAMdisk: In this mode there is no LMCache process involved (neither controller nor server).
  In this mode all vllm-gr processes are configured to store KVC chunks in a shared RAMdisk (/mnt/lmcache/).
  This mode works well but performance is very low (e.g.: TTFT is high).
@@ -52,13 +57,14 @@ LMCache typically operates through a **Controller-Worker** model. The workers (i
 
 ### Install lmcache
 
-LMCache is included automatically on the CUDA install path (`requirements/cuda.txt`). If you installed with `VLLM_GR_TARGET_DEVICE=cpu` or need to reinstall:
+`requirements/cuda.txt` intentionally does not install LMCache, and this
+project does not define a `[lmcache]` extra. After selecting and validating an
+LMCache release against vLLM 0.30.0, install that release separately in the
+same environment. Record the exact package version and source revision with
+the validation results.
 
-```bash
-pip install lmcache==0.4.1
-# or
-pip install "vllm-gr[lmcache]"
-```
+The commands below are configuration examples for future compatibility work;
+they do not establish release support by themselves.
 
 ### Run standalone vllm-gr with lmcache
 

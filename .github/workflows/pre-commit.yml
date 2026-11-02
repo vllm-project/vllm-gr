@@ -634,7 +634,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          # A/B checks that the event base is an ancestor of the merge's first
+          # parent. The base can advance after the event, so retain its history.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:

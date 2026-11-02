@@ -160,6 +160,7 @@ def run_api_inference(
     api_key: str,
     gen_config: dict[str, Any],
     max_concurrency: int | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> list[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
@@ -176,6 +177,8 @@ def run_api_inference(
         "n": gen_config.get("num_return_sequences", 1),
         "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
     }
+    if chat_template_kwargs is not None:
+        api_params["chat_template_kwargs"] = chat_template_kwargs
 
     def _send_request(prompt):
         response = None
@@ -249,6 +252,16 @@ def main():
     parser.add_argument("--n", type=int, help="Beam width to use if beam search is enabled.")
     parser.add_argument("--vllm-gr-config", help="Canonical V1 config JSON; required offline")
     parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable offline engine graphs; for online testing set this on the server",
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=json.loads,
+        help='Online chat template JSON object, e.g. {"enable_thinking": false}',
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         choices=(1, 2, 4),
@@ -296,6 +309,13 @@ def main():
         help="Online request concurrency; offline V1 uses --batch-size",
     )
     args = parser.parse_args()
+    if args.enforce_eager and args.endpoint:
+        parser.error("Online Eager mode requires --enforce-eager on the server")
+    if args.chat_template_kwargs is not None:
+        if not isinstance(args.chat_template_kwargs, dict):
+            parser.error("--chat-template-kwargs must be a JSON object")
+        if not args.endpoint:
+            parser.error("--chat-template-kwargs applies only to online requests")
 
     # 1. Load Configuration
     if args.gr:
@@ -365,6 +385,7 @@ def main():
             "trust_remote_code": True,
             "vllm_gr_config": config,
             "async_scheduling": True,
+            "enforce_eager": args.enforce_eager,
             "enable_chunked_prefill": False,
             "max_model_len": 8192,
             "max_num_batched_tokens": 8192 * args.batch_size,
@@ -411,6 +432,7 @@ def main():
             args.api_key,
             gen_config,
             max_concurrency=args.max_concurrency,
+            chat_template_kwargs=args.chat_template_kwargs,
         )
         gen_end = time.perf_counter()
     else:

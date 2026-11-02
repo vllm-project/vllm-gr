@@ -58,11 +58,8 @@ def _sampling_params() -> SamplingParams:
     return SamplingParams(max_tokens=4, temperature=1.0)
 
 
-def test_native_request_payload_schema() -> None:
-    # Guard against upstream vLLM EngineCoreRequest field schema changes.
-    assert EngineCoreRequest.__struct_fields__ == ENGINE_CORE_REQUEST_FIELDS
-
-    request = EngineCoreRequest(
+def _native_request() -> EngineCoreRequest:
+    return EngineCoreRequest(
         request_id="request-0",
         prompt_token_ids=[1, 2],
         mm_features=None,
@@ -74,6 +71,13 @@ def test_native_request_payload_schema() -> None:
         data_parallel_rank=None,
         session_id="native-session",
     )
+
+
+def test_native_request_payload_schema() -> None:
+    # Guard against upstream vLLM EngineCoreRequest field schema changes.
+    assert EngineCoreRequest.__struct_fields__ == ENGINE_CORE_REQUEST_FIELDS
+
+    request = _native_request()
     encoded = msgspec.msgpack.encode([request])
 
     raw_payload = msgspec.msgpack.decode(encoded)
@@ -289,12 +293,9 @@ def test_input_socket_control_and_error_routes(monkeypatch, implementation, coor
     from vllm.v1.engine import FinishReason
     from vllm.v1.fault_tolerance.engine_core_sentinel import FT_UTILITY_METHOD
 
-    from tests.test_gr_async_scheduler import _batch_request
-
     with _socket_loop(monkeypatch, implementation, coordinator=coordinator) as transport:
         engine = transport.engine
-        request = _batch_request().items[0].request
-        request.session_id = "native-session"
+        request = _native_request()
         request.current_wave = 7
         request.client_index = 1
         transport.send(EngineCoreRequestType.ADD, request, frontend=1)

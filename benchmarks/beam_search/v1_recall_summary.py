@@ -195,6 +195,7 @@ def summarize(root, repeats, baseline_path=None):
     failures = []
     baseline = None
     floors = None
+    calibration_repeats = None
     suspected_tasks = []
     if baseline_path is not None:
         baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
@@ -212,7 +213,15 @@ def summarize(root, repeats, baseline_path=None):
             raise ValueError("invalid B=4 1000-sample Recall baseline")
         calibration = baseline.get("calibration_sid_recall32")
         if not isinstance(calibration, dict) or set(calibration) != set(TASKS):
-            raise ValueError("baseline must contain ten historical SID results per task")
+            raise ValueError("baseline must contain SID calibration results for every task")
+        source_ci = baseline.get("source_ci", {})
+        if not isinstance(source_ci, dict):
+            raise ValueError("baseline source_ci must be an object")
+        # Legacy baselines without provenance used ten measurements. New
+        # calibrations declare their actual count; never duplicate samples.
+        calibration_repeats = source_ci.get("calibration_repeats", 10)
+        if type(calibration_repeats) is not int or calibration_repeats < 3:
+            raise ValueError("baseline must declare at least three calibration measurements")
         floors = {}
         for task in TASKS:
             expected = baseline["tasks"][task]
@@ -222,7 +231,7 @@ def summarize(root, repeats, baseline_path=None):
             values = calibration[task]
             if (
                 not isinstance(values, list)
-                or len(values) != 10
+                or len(values) != calibration_repeats
                 or any(
                     not isinstance(value, (int, float))
                     or not math.isfinite(value)
@@ -253,6 +262,7 @@ def summarize(root, repeats, baseline_path=None):
         "task_variability": variability,
         "baseline_file": str(baseline_path) if baseline_path is not None else None,
         "baseline_sid_recall32_floors": floors,
+        "baseline_calibration_repeats": calibration_repeats,
         "suspected_tasks": suspected_tasks,
         "confirmation_required": confirmation_required,
         "confirmation_runs": 3 if baseline is not None else None,
@@ -271,7 +281,7 @@ def summarize(root, repeats, baseline_path=None):
             "The candidate file records the initial measurement. No Recall floor is configured."
             if baseline_path is None
             else "The committed SID baseline is each task's minimum Recall@32 "
-            "from ten calibration measurements on fixed samples. A result below "
+            f"from {calibration_repeats} calibration measurements on fixed samples. A result below "
             "it triggers two fresh confirmation runs. The gate fails only if "
             "all three measurements for the same task are below that baseline."
         ),

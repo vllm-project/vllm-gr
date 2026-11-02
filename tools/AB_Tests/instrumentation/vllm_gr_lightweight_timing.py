@@ -186,7 +186,7 @@ def install() -> None:
         return
     _INSTALLED = True
 
-    # vLLM 0.22 ships both the established GPUModelRunner and ModelRunner V2.
+    # vLLM 0.30 ships both the established GPUModelRunner and ModelRunner V2.
     # OneRec currently selects the established runner; instrument both so a
     # future runtime switch does not silently produce an empty diagram.
     runner_classes: list[type] = []
