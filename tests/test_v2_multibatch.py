@@ -17,7 +17,6 @@ def test_prefill_restores_member_order_without_reordering_native_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm.utils import torch_utils
-    from vllm.v1.worker.gpu import input_batch
 
     logical = ("a", "b", "c", "d")
     native = ("d", "b", "c", "a")
@@ -35,20 +34,20 @@ def test_prefill_restores_member_order_without_reordering_native_state(
             hidden_states=torch.arange(10)[:, None], input_batch=batch
         ),
         req_states=SimpleNamespace(num_computed_tokens=SimpleNamespace(gpu=object())),
+        postprocess_num_computed_tokens=Mock(),
     )
-    post = Mock()
-    monkeypatch.setattr(input_batch, "post_update_pool", post)
     monkeypatch.setattr(
         torch_utils, "async_tensor_h2d", lambda x, dtype, device: torch.tensor(x, dtype=dtype)
     )
     scheduled = SimpleNamespace(gr_stage_metadata={"a": SimpleNamespace(request_ids=logical)})
+    state = worker.execute_model_state
     result = V2StageExecutionHooks(worker).prefill_logits(lambda *args: None, scheduled)
     expected = {"a": 9, "b": 2, "c": 5, "d": 0}
     assert result[:, 0].tolist() == [expected[r] for r in logical]
     assert batch.req_ids == list(native)
-    post.assert_called_once_with(
-        batch.idx_mapping, worker.req_states.num_computed_tokens.gpu, batch.query_start_loc
-    )
+    worker.postprocess_num_computed_tokens.assert_called_once_with(batch)
+    assert worker.execute_model_state is None
+    worker.execute_model_state = state
     scheduled.gr_stage_metadata["a"].request_ids = ("a", "a", "c", "d")
     with pytest.raises(ValueError, match="one logit row"):
         V2StageExecutionHooks(worker).prefill_logits(lambda *args: None, scheduled)

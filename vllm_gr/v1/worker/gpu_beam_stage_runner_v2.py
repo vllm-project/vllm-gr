@@ -188,6 +188,7 @@ def try_add_gr_prefill_request(worker: Any, scheduler_output: Any) -> bool:
         prompt_len=len(request.prompt_token_ids),
         all_token_ids=request.prefill_token_ids,
         num_computed_tokens=request.num_computed_tokens,
+        max_tokens=params.max_tokens,
     )
     req_index = worker.req_states.req_id_to_index[request.req_id]
     worker.model_state.add_request(req_index, request)
@@ -365,8 +366,6 @@ class V2StageExecutionHooks(_StageExecutionHooks):
     def prefill_logits(
         self, original: Any, scheduler_output: Any, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
-        from vllm.v1.worker.gpu.input_batch import post_update_pool
-
         worker = self.worker
         from contextlib import nullcontext
 
@@ -387,6 +386,9 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             raise RuntimeError(
                 "native GR Prefill must publish hidden states through execute_model_state"
             )
+        # GR consumes this forward instead of the native sampler. Release the
+        # pending native state so a later sampler cannot consume stale logits.
+        worker.execute_model_state = None
         # Same contract as the native V2 sampler
         # (``GPUModelRunner.sample``: ``hidden_states[input_batch.logits_indices]``,
         # unconditional).  A Host-side bounds check on ``logits_indices`` would
@@ -413,8 +415,8 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             native_rows = {request_id: row for row, request_id in enumerate(native_ids)}
             order = async_tensor_h2d(
                 [native_rows[request_id] for request_id in request_ids],
-                torch.long,
-                worker.device,
+                device=worker.device,
+                dtype=torch.long,
             )
             indices = indices[order]
         # Restore only the sampled rows. Native request/KV order remains intact.
@@ -426,11 +428,7 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         # Every prefill chunk consumes its actual query length (not graph
         # padding), even when it produces no Beam output. Generated token
         # history remains owned by GR, so use the count-only native update.
-        post_update_pool(
-            state.input_batch.idx_mapping,
-            worker.req_states.num_computed_tokens.gpu,
-            state.input_batch.query_start_loc,
-        )
+        worker.postprocess_num_computed_tokens(batch)
         return logits
 
     def prefill_stage_fence(self) -> None:

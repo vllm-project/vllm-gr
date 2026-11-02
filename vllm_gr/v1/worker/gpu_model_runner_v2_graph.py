@@ -4,14 +4,73 @@
 
 from __future__ import annotations
 
+import gc
 from functools import wraps
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
 _WORKER_V2_GRAPH_PATCH_MARKER = "_vllm_gr_beam_capture_v2_patch"
+_WORKER_V2_KV_PATCH_MARKER = "_vllm_gr_beam_kv_v2_patch"
+_WORKER_V2_PROFILE_PATCH_MARKER = "_vllm_gr_beam_profile_v2_patch"
+logger = init_logger(__name__)
+
+
+def make_patched_initialize_kv_cache_v2(original):
+    """Publish the GR plan before the native profiler snapshots its manager."""
+    if getattr(original, _WORKER_V2_KV_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def initialize_kv_cache(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        if _get_gr_config(self).beam_max_width is not None:
+            from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
+                install_prefill_graph_manager_v2,
+            )
+
+            install_prefill_graph_manager_v2(self)
+        return result
+
+    setattr(initialize_kv_cache, _WORKER_V2_KV_PATCH_MARKER, True)
+    return initialize_kv_cache
+
+
+def make_patched_profile_cudagraph_memory_v2(original):
+    """Keep native temporary KV/pool orchestration and retire GR resources too."""
+    if getattr(original, _WORKER_V2_PROFILE_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def profile_cudagraph_memory(self, *args, **kwargs):
+        if _get_gr_config(self).beam_max_width is None:
+            return original(self, *args, **kwargs)
+        # Profiling is a startup operation. Never discard a serving owner or
+        # a graph bound to the real KV cache if called out of order.
+        if (
+            getattr(self, "_gr_gpu_stage_runner", None) is not None
+            or getattr(self, "_beam_decode_graph", None) is not None
+        ):
+            raise RuntimeError("V2 graph memory profiling requires an unbound GR runtime")
+        context = getattr(self, "_beam_context", None)
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+
+            # Native teardown has dropped its KV/Prefill bindings. GR Decode
+            # retains attention metadata and inputs until these owners close.
+            close_v2_runtime(self)
+            if context is None and hasattr(self, "_beam_context"):
+                del self._beam_context
+            gc.collect()
+            torch.accelerator.empty_cache()
+
+    setattr(profile_cudagraph_memory, _WORKER_V2_PROFILE_PATCH_MARKER, True)
+    return profile_cudagraph_memory
 
 
 def make_patched_capture_model_v2(_orig_capture_model):
@@ -21,19 +80,48 @@ def make_patched_capture_model_v2(_orig_capture_model):
 
     @wraps(_orig_capture_model)
     def patched_capture_model(self, *args, **kwargs):
+        profile_only = kwargs.get("profile_only", False)
         # The Engine admits only beam_search_v1 for V2 Beam engines. The
         # execution layer checks whether Beam is enabled, not its protocol.
         if _get_gr_config(self).beam_max_width is not None:
             from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
+                GRPrefillCudaGraphManager,
                 install_prefill_graph_manager_v2,
             )
 
             install_prefill_graph_manager_v2(self)
+            manager = self.cudagraph_manager
+            if profile_only and isinstance(manager, GRPrefillCudaGraphManager):
+                # GR's token/request grid has nonuniform per-graph costs.
+                # Measure the full GR plan in the native throwaway pool
+                # rather than extrapolating two FULL samples. Leave its sample list
+                # empty so native extrapolation returns the measured total.
+                manager._max_full_descs_to_capture = None
+                manager._capture_mem_samples = None
             res = _orig_capture_model(self, *args, **kwargs)
 
             self._gr_async_decode_graph_capture_failed = False
             self._gr_async_decode_graph_capture_error = None
-            capture_multibatch_forward(self)
+            before_decode = torch.accelerator.get_memory_info()[0]
+            from vllm.compilation import monitor
+
+            capturing_enabled = monitor.cudagraph_capturing_enabled
+            try:
+                capture_multibatch_forward(self)
+            finally:
+                # Beam's local capture closes its window. Profiling runs
+                # inside native startup, which still needs to capture later.
+                if profile_only:
+                    monitor.set_cudagraph_capturing_enabled(capturing_enabled)
+            decode_bytes = before_decode - torch.accelerator.get_memory_info()[0]
+            res += decode_bytes
+            logger.info(
+                "GR V2 graph memory (%s): Decode and fixed state %.2f GiB, "
+                "Prefill plus Decode %.2f GiB",
+                "profile" if profile_only else "actual",
+                decode_bytes / (1 << 30),
+                res / (1 << 30),
+            )
         else:
             # No Beam resources configured: preserve ordinary native V2.
             res = _orig_capture_model(self, *args, **kwargs)
@@ -46,7 +134,8 @@ def make_patched_capture_model_v2(_orig_capture_model):
             freeze_gc_after_graph_capture,
         )
 
-        freeze_gc_after_graph_capture(self)
+        if not profile_only:
+            freeze_gc_after_graph_capture(self)
         return res
 
     setattr(patched_capture_model, _WORKER_V2_GRAPH_PATCH_MARKER, True)

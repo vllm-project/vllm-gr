@@ -30,21 +30,46 @@ def _native_worker(prompt, computed=0, capacity=2):
     worker.use_dcp = False
     worker.input_buffers = InputBuffers(capacity, 64, worker.device)
     worker.req_states = RequestState(capacity, 16, 64, 0, 512, worker.device)
-    worker.req_states.add_request("session-0", len(prompt), prompt, computed)
+    worker.req_states.add_request("session-0", len(prompt), prompt, computed, max_tokens=3)
     worker.req_states.apply_staged_writes()
     worker.block_tables = SimpleNamespace(apply_staged_writes=Mock())
     worker.encoder_cache = None
     worker.prompt_logprobs_worker = None
     worker.lora_state = SimpleNamespace(remove_request=Mock())
     worker.sampler = None
+    worker.pooling_runner = None
+    worker.pp_handler = None
+    worker.adaptive_verification = None
+    worker.fast_prefill = None
+    worker.pcp_manager = None
+    worker.decode_query_len = 1
+    worker.model_config = SimpleNamespace(rswa_window=None)
+    worker.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1, remove_request=Mock())
     worker.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
     return worker
 
 
 @pytest.mark.parametrize("cached", [0, 2, 7])
-def test_full_prefill_advances_native_state_without_counting_padding(monkeypatch, cached):
+@pytest.mark.parametrize("specialized", [False, True])
+def test_full_prefill_advances_native_state_without_counting_padding(
+    monkeypatch, cached, specialized
+):
     prompt = list(range(10, 18))
     worker = _native_worker(prompt, cached)
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    if specialized:
+        from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+        worker.model_state = DefaultModelState.__new__(DefaultModelState)
+        worker.model_state.rope_state = None
+        worker.use_pp = False
+        worker.dp_size = 1
+        worker.supports_mm_inputs = False
+        worker.is_encoder_decoder = False
+        worker.is_pooling_model = False
+        worker.lora_config = None
+        worker.speculative_config = None
+        worker.max_num_tokens = 64
     hooks = V2StageExecutionHooks(worker)
     req_index = worker.req_states.req_id_to_index["session-0"]
     observed = []
@@ -56,7 +81,22 @@ def test_full_prefill_advances_native_state_without_counting_padding(monkeypatch
         count = scheduled.total_num_scheduled_tokens
         # Padding must not advance the request's logical token count.
         desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 8, 1)
-        batch = runner.prepare_inputs(scheduled, desc)
+        batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
+        if specialized:
+            from vllm_gr.v1.worker.gpu_prefill_inputs import (
+                try_prepare_gr_prefill_inputs_v2,
+            )
+
+            batch = try_prepare_gr_prefill_inputs_v2(runner, scheduled, batch_state, desc)
+            assert batch is not None
+            assert batch.has_prefill and batch.is_prefilling_np.tolist() == [True]
+            assert batch.num_computed_tokens_np.tolist() == [cached]
+            assert batch.prefill_len_np.tolist() == [len(prompt)]
+            assert batch.num_computed_prefill_tokens_np.tolist() == [cached]
+            assert batch.input_ids.data_ptr() == runner.input_buffers.input_ids.data_ptr()
+        else:
+            batch = runner.prepare_inputs(scheduled, batch_state, desc)
+        assert batch.is_padding.tolist() == [False] * count + [True] * (8 - count)
         ids = batch.input_ids[:count].clone()
         positions = batch.positions[:count].clone()
         observed.append((ids, positions))
@@ -73,7 +113,9 @@ def test_full_prefill_advances_native_state_without_counting_padding(monkeypatch
 
     count = len(prompt) - cached
     scheduled = SchedulerOutput.make_empty()
-    scheduled.gr_stage_metadata = {"session-0": metadata()}
+    from dataclasses import replace
+
+    scheduled.gr_stage_metadata = {"session-0": replace(metadata(), num_prompt_tokens=len(prompt))}
     scheduled.num_scheduled_tokens = {"session-0": count}
     scheduled.total_num_scheduled_tokens = count
     scheduled.scheduled_cached_reqs.req_ids = ["session-0"]
@@ -81,6 +123,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(monkeypatch
     scheduled.scheduled_cached_reqs.new_block_ids = [None]
     with monkeypatch.context() as guard:
         logits = hooks.prefill_logits(native_prefill, scheduled)
+    assert worker.execute_model_state is None
     assert logits.flatten().tolist() == [float(prompt[-1])]
     ids, positions = observed[0]
     assert ids.tolist() == prompt[cached:]
@@ -109,7 +152,7 @@ def test_terminal_output_retires_native_v2_request():
     worker.lora_state.remove_request.assert_called_once_with("session-0")
 
     # The request row can be admitted again after the fused terminal cleanup.
-    worker.req_states.add_request("next-session", 1, [1], 0)
+    worker.req_states.add_request("next-session", 1, [1], 0, max_tokens=3)
     assert worker.req_states.num_reqs == 1
 
 
@@ -121,10 +164,10 @@ def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
     prompts = {"a": [101] * 9, "b": [202] * 2, "c": [303] * 7, "d": [404] * 5}
     for request_id in ("unused-x", "a", "unused-y", "b", "c"):
         tokens = prompts.get(request_id, [1])
-        states.add_request(request_id, len(tokens), tokens, 0)
+        states.add_request(request_id, len(tokens), tokens, 0, max_tokens=3)
     worker._remove_request("unused-x")
     worker._remove_request("unused-y")
-    states.add_request("d", 5, prompts["d"], 0)
+    states.add_request("d", 5, prompts["d"], 0, max_tokens=3)
     states.apply_staged_writes()
     scheduled = SchedulerOutput.make_empty()
     scheduled.num_scheduled_tokens = {r: len(tokens) for r, tokens in prompts.items()}
@@ -139,8 +182,9 @@ def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
     }
 
     def native_prefill(runner, scheduled):
+        batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
         batch = runner.prepare_inputs(
-            scheduled, BatchExecutionDescriptor(CUDAGraphMode.FULL, 24, 4)
+            scheduled, batch_state, BatchExecutionDescriptor(CUDAGraphMode.FULL, 24, 4)
         )
         assert batch.req_ids == ["b", "d", "c", "a"]
         runner.execute_model_state = SimpleNamespace(

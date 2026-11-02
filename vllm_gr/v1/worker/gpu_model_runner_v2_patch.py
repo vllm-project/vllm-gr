@@ -100,11 +100,13 @@ def make_patched_prepare_inputs_v2(_orig_prepare_inputs):
         return _orig_prepare_inputs
 
     @wraps(_orig_prepare_inputs)
-    def patched_prepare_inputs(self, scheduler_output, batch_desc):
-        batch = try_prepare_gr_prefill_inputs_v2(self, scheduler_output, batch_desc)
+    def patched_prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+        batch = try_prepare_gr_prefill_inputs_v2(
+            self, scheduler_output, batch_req_state, batch_desc
+        )
         if batch is not None:
             return batch
-        return _orig_prepare_inputs(self, scheduler_output, batch_desc)
+        return _orig_prepare_inputs(self, scheduler_output, batch_req_state, batch_desc)
 
     setattr(patched_prepare_inputs, _WORKER_V2_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
@@ -181,6 +183,22 @@ def _apply_v2_runner_patches() -> None:
             )
 
             runner_class.capture_model = make_patched_capture_model_v2(capture_model)
+
+        from vllm_gr.v1.worker.gpu_model_runner_v2_graph import (
+            make_patched_initialize_kv_cache_v2,
+            make_patched_profile_cudagraph_memory_v2,
+        )
+
+        initialize_kv_cache = getattr(runner_class, "initialize_kv_cache", None)
+        if callable(initialize_kv_cache):
+            runner_class.initialize_kv_cache = make_patched_initialize_kv_cache_v2(
+                initialize_kv_cache
+            )
+        profile_cudagraph_memory = getattr(runner_class, "profile_cudagraph_memory", None)
+        if callable(profile_cudagraph_memory):
+            runner_class.profile_cudagraph_memory = make_patched_profile_cudagraph_memory_v2(
+                profile_cudagraph_memory
+            )
 
         logger.info("%s V2 hooks patched successfully.", runner_name)
 

@@ -51,6 +51,39 @@ There is no new environment switch or duplicated Beam state machine.
 
 ## Configuration and scope
 
+### vLLM 0.30 integration
+
+V2 remains experimental and requires explicit opt-in; the default runner is V1.
+The adapter consumes the native `BatchReqState`, preserves the native request
+order and padding fields, and advances Prefill counts through
+`postprocess_num_computed_tokens`. GR consumes and clears the pending native
+forward state before producing its own Beam output.
+
+The Prefill manager uses the 0.30 `capture() -> None` contract and keeps its
+captured graphs in the native registry. Capture capacity follows the native
+dummy batch's evenly distributed token counts. Ordinary requests retain the
+native input preparation and sampling paths.
+
+Graph memory profiling uses the same GR Prefill plan as startup and includes
+Decode graphs and their fixed state. GR's token/request grid has nonuniform
+capture costs, so its complete plan is measured in the native temporary pool
+instead of extrapolating two FULL samples. This adds startup capture work.
+The adapter retires temporary Decode graphs, inputs, owners and newly created
+Beam context before real initialization. It preserves the enclosing capture
+window and does not freeze the serving heap during profiling.
+
+The worker applies this budget when
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1`. This does not add a profiling pass
+when upstream skips it (for example, native `cudagraph_mode=NONE` or an explicit
+KV cache byte budget); those configurations need their own memory allowance.
+Memory estimates remain configuration dependent and are not a performance
+baseline.
+
+Functional tests use `shutdown_timeout=10` and assert EngineCore exits with
+code zero; inference success alone does not establish clean shutdown.
+
+### Supported configuration
+
 Use the Beam configuration and Constraint Table artifact described in the
 [asynchronous quickstart](onerec_v1_async_quickstart.md). Set
 `VLLM_USE_V2_MODEL_RUNNER=1` before importing vLLM, and submit the complete
@@ -99,6 +132,7 @@ state and actual CUDA replay check request order and storage reuse.
 | Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
 | Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |
 | Existing public protocol, generation steps and scheduler integration | `tests/st/test_onerec_v1_scheduler_st.py`, `tests/st/test_modelrunner_v2_stage_parity_st.py` |
+| Unconstrained B=1/4, V1/V2 Eager, default Graph and explicit FULL Prefill | `tests/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1` |
 | Real-model multi-batch execution and V1 baseline comparison | `tests/st/model_runner_policy_isolation.py` (manual CLI) |
 | Real video business accuracy and cross-B comparison | `tests/st/onerec_multibatch_accuracy.py` (manual CLI) |
 
@@ -136,6 +170,28 @@ not a required identity in this probe. Different shapes can change BF16
 scores and candidate order. Use the real-data evaluator below to enforce the
 benchmark's business thresholds and record cross-B differences separately.
 
+### Unconstrained generation
+
+The existing offline test also runs without a Constraint Table, using the
+configured `max_top_k` capacity. Run its six isolated engine configurations:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
+python -m pytest --run-slow -q \
+  tests/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1
+```
+
+The matrix covers V1/V2 with Eager, default Graph and an explicit FULL Prefill
+grid. Each engine processes B=1 and B=4 with W=128. The FULL cases require
+actual Prefill replay at 1024 tokens and at 4102 tokens padded to 4224;
+enabling graph mode alone does not establish FULL Prefill coverage. The test
+uses V1's GR Prefill grid and V2's native token capture list respectively.
+It checks runner identity, Decode execution, candidate structure and scores,
+request retirement and clean EngineCore shutdown. V2 graph cases also reject
+request-time capture. Results are saved in each pytest temporary directory's
+`unconstrained.json`. This is a functional check, with no cross-mode numerical
+identity or business accuracy claim.
+
 ## Reproduce the real-data accuracy run
 
 Set `VLLM_GR_TEST_MODEL`, `DATASET_PATH` and `CATALOG_PATH` as in the system
@@ -161,3 +217,19 @@ loader and evaluator, and records source fingerprints, configuration, raw
 candidates, per-sample metrics and graph counters. Exit code zero means that
 the structural checks and business thresholds passed; inspect the recorded
 cross-batch comparisons separately.
+
+## Online functional validation
+
+The shared `tests/st/test_onerec_v1_scheduler_st.py` suite explicitly
+parameterizes ModelRunner V1 and V2. The V1 in its filename and public
+`beam_search_v1` API names denotes the GR protocol, not a runner override.
+Select `test_onerec_v1_completion_batch_online` with `-k v2` to exercise
+independent offline and real HTTP engines at B=1/2/4 and B=1/3/7.
+The paired engines use the same fixed KV capacity.
+
+V2 probes observe native input preparation and completed Prefill FULL replays;
+they also reject request-time capture, Decode eager fallback and residual
+native requests or pending sampling output. The HTTP suite covers ordered
+candidates and scores, concurrent sessions, waiting/active TCP disconnects,
+recovery and EngineCore shutdown. These fixed-input checks do not replace
+business accuracy or performance acceptance.
