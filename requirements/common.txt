@@ -1,13 +1,18 @@
 # vllm-gr shared requirements (all platforms).
-# vllm / torch / vllm-ascend are provided by the base environment.
+# Platform runtimes are declared by the device-specific requirements file or,
+# for vendor-managed environments, supplied by the selected base image.
+#
+# numpy and opencv are deliberately not listed here: opencv 4.13+ wheels
+# require numpy>=2, while the Ascend stack pins numpy==1.26.4 through
+# triton-ascend. The two majors are therefore irreconcilable in one shared
+# list, so each platform declares its own pair.
 
 msgspec
+regex
 pandas>=3.0.0
 requests>=2.32.0
 scikit-learn>=1.8.0
 pyarrow==23.0.0
 tqdm>=4.66.0
-opencv-python-headless>=4.13.0
-numpy==2.2.6
-safetensors>=0.4.5
+safetensors>=0.6.2
 PyYAML>=6.0

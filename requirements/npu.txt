@@ -1,1 +1,19 @@
+# NPU shared dependencies only. The vendor runtime — vLLM 0.30.0,
+# vLLM-Ascend 0.30.0rc2, triton-ascend 3.6.0, torch/torch-npu 2.10, CANN
+# 9.2.0 — is supplied by the base image (validated on
+# quay.io/ascend/vllm-ascend:v0.30.0rc2), and the xllm-ops operator library
+# must be built for that image's CANN version. vllm_gr._env_check pins the
+# validated vLLM-Ascend/Triton-Ascend pair at startup.
 -r common.txt
+
+# Match the validated vendor image: triton-ascend 3.6.0 declares numpy==1.26.4
+# exactly (omitting the pin lets pip silently resolve numpy 2.x instead), so
+# the Ascend runtime stays on numpy 1.26.4.
+numpy==1.26.4
+# opencv is intentionally absent: the opencv releases used on this stack
+# (4.13+ and the image's 5.x wheel) declare numpy>=2 for Python 3.9+ and
+# cannot coexist with that pin. The rc2 vendor image supplies a cv2 build
+# compatible with NumPy 1.26.4; vllm-gr imports it during its environment
+# sanity check but does not replace the vendor package. The image has known
+# metadata conflicts; retain `pip check` output and verify actual imports
+# and startup as described in docs/quickstart-ascend.md.

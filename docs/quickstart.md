@@ -33,6 +33,10 @@ pip --version
 
 3. **Install vllm-gr**
 
+The CUDA package contract pins `vllm==0.30.0`. The platform-specific
+requirements are selected automatically; do not install a different vLLM
+version into the same environment.
+
 For standard installation:
 
 ```bash
@@ -52,7 +56,10 @@ python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); pri
 python -m pip check
 ```
 
-Platform dependencies come from the shared `requirements/common.txt`; there are no CUDA-only extras. See [the NPU installation guide](quickstart-ascend.md) for Ascend setup.
+Shared dependencies come from `requirements/common.txt`, while CUDA adds the
+vLLM runtime from `requirements/cuda.txt`. There is no CUDA extra. The Ascend
+path is validated on the vLLM-Ascend 0.30.0rc2 vendor image; see the
+[Ascend installation guide](quickstart-ascend.md) before attempting an NPU environment.
 
 > **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
 

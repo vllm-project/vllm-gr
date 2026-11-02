@@ -1,1 +1,6 @@
 -r common.txt
+
+# Match the CUDA platform pair so the CPU path does not introduce a second
+# numpy behaviour to reason about.
+numpy==2.2.6
+opencv-python-headless>=4.13.0

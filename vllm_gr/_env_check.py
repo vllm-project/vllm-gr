@@ -16,9 +16,11 @@ import os
 
 logger = logging.getLogger("vllm_gr.env_check")
 
-_SUPPORTED_VLLM_VERSION = "0.22.1"
-_SUPPORTED_VLLM_ASCEND_VERSION = "0.22.1rc1"
-_SUPPORTED_TRITON_ASCEND_VERSION = "3.2.1"
+_SUPPORTED_VLLM_VERSION = "0.30.0"
+_SUPPORTED_VLLM_ASCEND_VERSION = "0.30.0rc2"
+# The rc2 vendor image ships triton-ascend 3.6.0+dev...; _public_version()
+# strips the "+dev..." local suffix, so pinning the public 3.6.0 matches it.
+_SUPPORTED_TRITON_ASCEND_VERSION = "3.6.0"
 
 _OPENCV_PKGS = [
     "opencv-python",
@@ -33,10 +35,9 @@ def configure_model_runner_default() -> None:
     """Default vllm-gr processes to the V1 model runner.
 
     The GR beam-search worker patches target the V1 GPU/NPU model runner
-    lifecycle by default.  vLLM 0.22 enables ModelRunner V2 automatically for
-    supported models such as Qwen3, which bypasses those patches and can
-    silently produce incorrect beam-search results.  Set the environment
-    default before vLLM constructs its configuration.
+    lifecycle by default. vLLM can enable ModelRunner V2 automatically for
+    supported models such as Qwen3, so set the environment default before
+    vLLM constructs its configuration.
 
     An explicit ``VLLM_USE_V2_MODEL_RUNNER=1`` (or any truthy spelling) is
     preserved as an opt-in experimental path: the V2 runner is
@@ -102,7 +103,7 @@ def check_runtime_versions(*, require_ascend: bool = False) -> dict[str, str]:
         raise RuntimeError(
             "Unsupported vLLM-Ascend version: "
             f"found {ascend_version}, required {_SUPPORTED_VLLM_ASCEND_VERSION}. "
-            "This vllm-gr build relies on the native 0.22 YuanRong and hybrid KV-pool APIs."
+            "The Ascend runtime must match the version declared by this GR build."
         )
     versions["vllm-ascend"] = ascend_version
     return versions
@@ -194,26 +195,35 @@ def check_opencv_env() -> None:
         raise RuntimeError(
             f"Multiple opencv packages detected: {pkg_list}\n"
             "They all provide cv2 and conflict with each other.\n"
-            f"Fix: pip uninstall {' '.join(others)} -y && "
-            "pip install --no-cache-dir opencv-python-headless>=4.13.0"
+            f"Fix: pip uninstall {' '.join(others)} -y, then keep exactly one "
+            "opencv distribution. On CUDA/CPU reinstall "
+            "opencv-python-headless>=4.13.0; on Ascend restore the "
+            "opencv-python-headless supplied by the vendor image instead: "
+            "current opencv releases declare numpy>=2 and conflict with the "
+            "Ascend numpy pin."
         )
 
     # numpy 2.x ABI vs cv2 compiled against numpy 1.x
     import numpy as np
 
-    if np.lib.NumpyVersion(np.__version__) < "2.0.0":
-        return
+    numpy_major_2 = np.lib.NumpyVersion(np.__version__) >= "2.0.0"
 
     try:
         import cv2  # noqa: F401
     except ImportError as exc:
         msg = str(exc).lower()
         if "numpy" in msg or "multiarray" in msg:
+            if numpy_major_2:
+                raise ImportError(
+                    f"cv2 was compiled against NumPy 1.x but NumPy {np.__version__} "
+                    "is installed (ABI incompatible).\n"
+                    "Fix: pip install --force-reinstall --no-cache-dir "
+                    "opencv-python-headless>=4.13.0"
+                ) from exc
             raise ImportError(
-                f"cv2 was compiled against NumPy 1.x but NumPy {np.__version__} "
-                "is installed (ABI incompatible).\n"
-                "Fix: pip install --force-reinstall --no-cache-dir "
-                "opencv-python-headless>=4.13.0"
+                f"cv2 failed to import against NumPy {np.__version__} "
+                "(numpy ABI mismatch).\n"
+                "Fix: reinstall the cv2 provider supplied by the platform image."
             ) from exc
     except Exception:
         pass

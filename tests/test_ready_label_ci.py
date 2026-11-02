@@ -32,6 +32,9 @@ def context(
     draft: bool = False,
     label: str = "",
     event: str = "pull_request",
+    number: int = 481,
+    head_ref: str = "feature",
+    head_repo: str = "owner/vllm-gr",
 ) -> Any:
     return namespace(
         {
@@ -45,7 +48,7 @@ def context(
                 "action": action,
                 "label": {"name": label},
                 "pull_request": {
-                    "number": 481,
+                    "number": number,
                     "draft": draft,
                     "labels": [
                         {"name": name}
@@ -53,6 +56,10 @@ def context(
                         if present
                     ],
                     "base": {"ref": "decode_graph", "sha": "base-sha"},
+                    "head": {
+                        "ref": head_ref,
+                        "repo": {"full_name": head_repo},
+                    },
                 },
             },
         }
