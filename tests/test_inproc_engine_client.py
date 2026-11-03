@@ -237,6 +237,24 @@ def test_a_rejected_async_submission_leaves_no_frontend_state() -> None:
     assert states == {}
 
 
+def _ordinary_request() -> Any:
+    """A native request before vLLM assigns its external and internal IDs."""
+    from vllm import SamplingParams
+    from vllm.v1.engine import EngineCoreRequest
+
+    return EngineCoreRequest(
+        request_id="session-0",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=3, temperature=0.0, ignore_eos=True),
+        pooling_params=None,
+        arrival_time=1.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+
 def _native_request_ids() -> Any:
     from vllm.v1.engine.input_processor import InputProcessor
 
@@ -265,7 +283,9 @@ def _dead_mp_core() -> Any:
     async def add_request_async(request: Any) -> None:
         raise EngineDeadError()
 
-    return SimpleNamespace(add_request=add_request, add_request_async=add_request_async)
+    return SimpleNamespace(
+        add_request=add_request, add_request_async=add_request_async, shutdown=lambda **kwargs: None
+    )
 
 
 @pytest.mark.parametrize("n", [1, 2])  # type: ignore[misc]
@@ -273,7 +293,6 @@ def _dead_mp_core() -> Any:
 def test_ordinary_requests_to_a_dead_engine_leave_no_frontend_state(make_core: Any, n: int) -> None:
     from vllm.v1.engine.llm_engine import LLMEngine
 
-    from tests.test_gr_async_scheduler import _batch_request
     from vllm_gr.v1.engine.core_client_patch import apply_async_llm_patches
 
     apply_async_llm_patches()
@@ -283,7 +302,7 @@ def test_ordinary_requests_to_a_dead_engine_leave_no_frontend_state(make_core: A
     engine.engine_core = make_core()
 
     for _ in range(3):
-        request = _batch_request().items[0].request
+        request = _ordinary_request()
         request.sampling_params.n = n
         with pytest.raises(EngineDeadError):
             engine.add_request(request.request_id, request, request.sampling_params)
@@ -293,18 +312,18 @@ def test_ordinary_requests_to_a_dead_engine_leave_no_frontend_state(make_core: A
 def test_ordinary_async_requests_to_a_dead_engine_leave_no_frontend_state() -> None:
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    from tests.test_gr_async_scheduler import _batch_request
     from vllm_gr.v1.engine.core_client_patch import apply_async_llm_patches
 
     apply_async_llm_patches()
     engine = object.__new__(AsyncLLM)
     engine.output_processor = _output_processor()
     engine.engine_core = _dead_mp_core()
+    engine.scheduler_config = SimpleNamespace(max_num_queued_reqs=None, max_num_queued_tokens=None)
     engine.log_requests = False
 
     async def run() -> None:
         for _ in range(3):
-            request = _batch_request().items[0].request
+            request = _ordinary_request()
             _native_request_ids().assign_request_id(request)
             with pytest.raises(EngineDeadError):
                 await engine._add_request(request, None, None, 0, None)
@@ -316,7 +335,6 @@ def test_ordinary_async_requests_to_a_dead_engine_leave_no_frontend_state() -> N
 def test_frontend_rollback_keeps_a_live_registration_on_other_errors() -> None:
     from vllm.v1.engine.llm_engine import LLMEngine
 
-    from tests.test_gr_async_scheduler import _batch_request
     from vllm_gr.v1.engine.core_client_patch import apply_async_llm_patches
 
     def reject(request: Any) -> None:
@@ -327,7 +345,7 @@ def test_frontend_rollback_keeps_a_live_registration_on_other_errors() -> None:
     engine.output_processor = _output_processor()
     engine.input_processor = _native_request_ids()
     engine.engine_core = SimpleNamespace(add_request=reject)
-    request = _batch_request().items[0].request
+    request = _ordinary_request()
     with pytest.raises(ValueError, match="not a dead engine"):
         engine.add_request(request.request_id, request, request.sampling_params)
     # Native behavior: only a dead engine triggers the rollback.

@@ -24,7 +24,7 @@ class TestBenchmarkBranchPolicy(unittest.TestCase):
         )
         self.assertEqual(
             step["env"]["POLICY_TARGET_BRANCH"],
-            "${{ github.base_ref || github.ref_name }}",
+            "${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name }}",
         )
         # Execute the workflow's actual selection logic with stubbed NPU probing.
         # GPU selection must not require nvidia-smi or any model-specific probe.
@@ -65,7 +65,7 @@ printf '%s\\n' "$device" "$board_id"
                 )
                 actual_device, board = result.stdout.splitlines()
                 self.assertEqual(actual_device, device)
-                enabled = branch == "decode_graph"
+                enabled = branch in {"decode_graph", "main"}
                 expected_board = hardware_board
                 if enabled:
                     expected_board = f"decode_graph_{device}"

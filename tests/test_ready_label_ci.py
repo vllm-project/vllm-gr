@@ -35,6 +35,7 @@ def context(
     number: int = 481,
     head_ref: str = "feature",
     head_repo: str = "owner/vllm-gr",
+    base_ref: str = "decode_graph",
 ) -> Any:
     return namespace(
         {
@@ -55,7 +56,7 @@ def context(
                         for name, present in (("ready", ready), ("abtest", abtest))
                         if present
                     ],
-                    "base": {"ref": "decode_graph", "sha": "base-sha"},
+                    "base": {"ref": base_ref, "sha": "base-sha"},
                     "head": {
                         "ref": head_ref,
                         "repo": {"full_name": head_repo},
@@ -424,7 +425,10 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         ab_fresh: bool = False,
         ab_passed: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        step = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]["steps"][0]
+        steps = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]["steps"]
+        step = next(
+            item for item in steps if item.get("name") == "Require every blocking check to pass"
+        )
         github = github or context()
         env = {
             key: str(
@@ -438,6 +442,108 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             capture_output=True,
             text=True,
         )
+
+    def test_main_and_decode_graph_have_equivalent_ab_routing(self) -> None:
+        workflow = self.workflows["pre-commit.yml"]
+        gate = workflow["jobs"]["benchmark-blocking"]
+        group = workflow["concurrency"]["group"]
+        cancel = workflow["concurrency"]["cancel-in-progress"]
+        for base in ("main", "decode_graph"):
+            with self.subTest(base=base):
+                full = context("synchronize", ready=True, base_ref=base)
+                ready = context("labeled", ready=True, label="ready", base_ref=base)
+                ab_only = context("labeled", ready=True, abtest=True, label="abtest", base_ref=base)
+                removed = context("unlabeled", ready=True, label="abtest", base_ref=base)
+                self.assertNotEqual(render(group, full), render(group, ab_only))
+                self.assertFalse(evaluate(cancel, ab_only))
+                self.assertEqual(
+                    self.scheduled(workflow, ab_only),
+                    ["beam-performance-ab-only", "benchmark-blocking"],
+                )
+                self.assertEqual(render(gate["name"], ab_only), "Beam V1 performance A/B gate")
+                self.assertEqual(self.scheduled(workflow, removed), [])
+                for status, expected in (("success", 0), ("failure", 1), ("skipped", 1)):
+                    results = dict.fromkeys(gate["needs"], "skipped")
+                    results["beam-performance-ab-only"] = status
+                    self.assertEqual(self.run_gate(results, ab_only).returncode, expected)
+                unready_update = context("synchronize", ready=False, abtest=True, base_ref=base)
+                self.assertEqual(self.scheduled(workflow, unready_update), ["benchmark-blocking"])
+                self.assertEqual(
+                    render(gate["name"], unready_update), "Beam V1 performance A/B gate"
+                )
+                self.assertEqual(
+                    self.run_gate(
+                        dict.fromkeys(gate["needs"], "skipped"), unready_update
+                    ).returncode,
+                    1,
+                )
+                for event in (full, ready):
+                    for fresh in (False, True):
+                        running = self.scheduled(workflow, event, ab_fresh=fresh)
+                        self.assertIn("resolve-ab-freshness", running)
+                        self.assertIn("benchmark-policy", running)
+                        self.assertIn("pre-commit", running)
+                        self.assertIn("decode-benchmark", running)
+                        self.assertIn("pangu-offline", running)
+                        self.assertIn("pangu-online", running)
+                        self.assertEqual("beam-performance-ab-only" in running, not fresh)
+                        results = {
+                            need: "success" if need in running else "skipped"
+                            for need in gate["needs"]
+                        }
+                        self.assertEqual(
+                            self.run_gate(
+                                results, event, ab_fresh=fresh, ab_passed=fresh
+                            ).returncode,
+                            0,
+                        )
+                        if fresh:
+                            self.assertEqual(
+                                self.run_gate(results, event, ab_fresh=True).returncode, 1
+                            )
+                for event in (
+                    context("opened", ready=False, base_ref=base),
+                    context("unlabeled", ready=False, label="ready", base_ref=base),
+                    context("converted_to_draft", draft=True, base_ref=base),
+                ):
+                    self.assertEqual(self.scheduled(workflow, event), ["benchmark-blocking"])
+                    self.assertEqual(
+                        self.run_gate(dict.fromkeys(gate["needs"], "skipped"), event).returncode, 1
+                    )
+
+    def test_recall_and_decode_benchmark_cover_both_target_branches_and_devices(self) -> None:
+        steps = self.workflows["pre-commit.yml"]["jobs"]["decode-benchmark"]["steps"]
+        by_name = {step.get("name"): step for step in steps}
+        recall_steps = (
+            "Cache OneRec Recall constraint tables",
+            "Build OneRec Recall constraint tables",
+            "Gate Beam V1 B=4 OneRec Recall on fixed samples",
+            "Upload Beam V1 Recall measurements",
+        )
+        for branch in ("main", "decode_graph", "feature"):
+            for device in ("gpu", "npu"):
+                for event in ("pull_request", "workflow_dispatch"):
+                    with self.subTest(branch=branch, device=device, event=event):
+                        github = context(event=event, base_ref=branch)
+                        if event == "workflow_dispatch":
+                            github.ref_name = branch
+                            github.event.pull_request.base.ref = ""
+                        else:
+                            github.ref_name = "481/merge"
+                        expect_recall = branch in {"main", "decode_graph"} and device == "gpu"
+                        for name in recall_steps:
+                            condition = (
+                                by_name[name]["if"]
+                                .replace("env.BENCHMARK_DEVICE", repr(device))
+                                .replace(
+                                    "steps.cache-recall-constraints.outputs.cache-hit", "'false'"
+                                )
+                            )
+                            self.assertEqual(bool(evaluate(condition, github)), expect_recall, name)
+                        benchmark = by_name["Execute decode benchmark gates"]["if"].replace(
+                            "env.BENCHMARK_DEVICE", repr(device)
+                        )
+                        self.assertEqual(bool(evaluate(benchmark, github)), not expect_recall)
 
     def test_unready_and_draft_events_fail_required_gate(self) -> None:
         workflow = self.workflows["pre-commit.yml"]

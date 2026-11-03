@@ -1,6 +1,6 @@
 # Beam V1 five-task Recall gate
 
-The GPU `decode_graph` CI gate uses
+The GPU CI gate for `main` and `decode_graph` uses
 [v1_recall_b4_baseline.json](../../benchmarks/beam_search/v1_recall_b4_baseline.json)
 as its accepted accuracy reference. It measures OneRec-1.7B with ModelRunner V1,
 Graph execution, batch size 4, beam width 128, temperature 0.6, and 1000 fixed
@@ -61,8 +61,10 @@ evaluation formula, dataset, graph execution requirement, or failure mode.
 The A100 calibration does not establish identical absolute metrics on L20 or
 NPU. The separate [Video-100 gate](parent_score_gate.md), Pangu offline/online
 accuracy thresholds, and performance thresholds keep their existing policies.
-The `decode_graph` GPU workflow reads this Recall baseline from its checked-out
-candidate; the Video-100/Pangu YAML policy continues to come from the PR base.
+The GPU workflow reads this Recall baseline from its checked-out candidate; the
+Video-100/Pangu YAML policy continues to come from the PR base. On `main` and
+`decode_graph`, NPU runs retain the Video-100 benchmark instead of this GPU-only
+Recall gate.
 
 ## Local validation
 
