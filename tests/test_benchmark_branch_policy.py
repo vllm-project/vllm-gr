@@ -65,7 +65,7 @@ printf '%s\\n' "$device" "$board_id"
                 )
                 actual_device, board = result.stdout.splitlines()
                 self.assertEqual(actual_device, device)
-                enabled = branch == "decode_graph"
+                enabled = branch in {"decode_graph", "main"}
                 expected_board = hardware_board
                 if enabled:
                     expected_board = f"decode_graph_{device}"

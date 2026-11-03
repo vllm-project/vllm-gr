@@ -1,8 +1,9 @@
 # Video-100 accuracy gate
 
-This prerequisite unifies GPU and NPU CI accuracy floors for `decode_graph` to
-accommodate corrected parent cumulative scores. It does not change inference
-code, disable checks, or change the effective thresholds on `main`.
+This policy accommodates corrected parent cumulative scores. PRs targeting
+`main` or `decode_graph` share the same policy profile. On those branches, NPU
+CI runs the Video-100 gate; GPU CI runs the separate five-task
+[Beam V1 Recall gate](beam_v1_recall_gate.md).
 
 ## Effective checks
 
@@ -12,8 +13,8 @@ offline and online accuracy separately against the same minimum thresholds:
 
 | Target branch / runner | pass@1 minimum | pass@32 minimum | recall@32 minimum |
 | --- | ---: | ---: | ---: |
-| `decode_graph` / any GPU or NPU | 0.05 | 0.21 | 0.030 |
-| `main` or other branches / any GPU or NPU | 0.09 | 0.29 | 0.04 |
+| `main` or `decode_graph` / any GPU or NPU | 0.05 | 0.21 | 0.030 |
+| Other branches / any GPU or NPU | 0.09 | 0.29 | 0.04 |
 
 Every metric must meet its minimum; equality passes. An accuracy value below
 its minimum fails with exit code `86`. For example, the reported offline
@@ -68,7 +69,7 @@ not exact beam-list equivalence or correctness of the shared constraint scorer.
 The workflow retains its existing device detection: `npu-smi` selects NPU;
 otherwise the benchmark device is GPU. No GPU model lookup is required.
 PR runs use `github.base_ref` as the target branch; push and manual runs use
-`github.ref_name`. Runs targeting `decode_graph` select a logical policy key in
+`github.ref_name`. Runs targeting `main` or `decode_graph` select a logical policy key in
 the existing board-override schema:
 
 | Device | Policy selector |
@@ -82,15 +83,15 @@ also reuses its existing performance overrides: TTFT 280, online elapsed 20 s,
 and offline elapsed 25 s. Other devices keep the default performance thresholds.
 
 On other branches, GPUs retain `unknown` and NPUs retain their detected board
-ID. A PR from `decode_graph` into `main` therefore still uses the original
-floors. Pangu policy and performance modes are unchanged. All three accuracy
-metrics remain blocking. If another board-specific performance override is
-added later, its `decode_graph` profile must preserve that override as well.
+ID. Pangu policy and performance modes are unchanged. All three Video-100
+accuracy metrics remain blocking wherever that gate runs. If another
+board-specific performance override is added later, the logical profile must
+preserve that override as well.
 
-This policy affects all GPU and NPU PRs targeting `decode_graph`, not only the
-parent-score PR. The YAML override itself is not branch-aware; branch isolation
-is enforced by the workflow before policy resolution. Legacy workflows without
-these selectors retain the old accuracy floors.
+This policy affects all GPU and NPU PRs targeting `main` or `decode_graph`, not
+only the parent-score PR. The YAML override itself is not branch-aware; branch
+selection is enforced by the workflow before policy resolution. Legacy workflows
+without these selectors retain the old accuracy floors.
 
 ## Rollout order
 
@@ -98,9 +99,9 @@ CI continues fetching the policy YAML and resolver from the PR target's
 `base.sha`; the candidate YAML is only linted. This PR cannot self-approve its
 new floors by reading head-owned policy.
 
-1. Land this policy and workflow prerequisite on `decode_graph`.
-2. Update the parent-score PR's base to include it, then rerun CI. This makes
-   the target-owned overrides available without bypassing blocking checks.
+The logical selectors and floors were first landed on `decode_graph` and are
+also present on `main`. Any future change to the policy still requires updating
+the target branch before its PRs can use that change.
 
 Changing only the candidate YAML does not change the thresholds for that PR's
 run. Do not switch to head-owned policy to make the prerequisite pass.
