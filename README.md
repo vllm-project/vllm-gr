@@ -38,19 +38,26 @@ For the validated CUDA installation path, see [quickstart](docs/quickstart.md).
 
 ## Unified self-validation
 
-Recommended local validation command:
+For code changes, start with [Contributing](CONTRIBUTING.md) and the
+[development navigation](docs/development.md). Use the
+[validation guide](docs/tools/README.md#validation-levels) to select checks.
+For full local runtime validation in a prepared accelerator environment:
 
 ```bash
 ./tools/run_test.sh
 ```
 
-The runner acquires an available accelerator and executes the repository's
-pre-commit and test gates. See [Development Utils Manual](docs/tools/README.md)
-for environment and model-cache options.
+The runner selects an available accelerator and runs the platform-specific
+validation path. See [Development utilities](docs/tools/README.md) for CUDA/NPU
+behavior, environment prerequisites, and model-cache options.
 
 Refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark-related test cases.
 The standalone offline `beam_search_v1` performance and timeline benchmark is
 documented in [benchmarks/qwen/README.md](benchmarks/qwen/README.md).
+
+Shared AI coding instructions are in [AGENTS.md](AGENTS.md), imported by
+[CLAUDE.md](CLAUDE.md). See [AI tool integration](docs/agent_instructions.md)
+for loading checks and guidance maintenance.
 
 ## Executing
 

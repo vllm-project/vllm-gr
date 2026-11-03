@@ -1,111 +1,134 @@
-# Development Utils Manual
+# Development utilities and validation
 
-This document introduces a set of development utilities to automate hardware allocation and streamline the local development workflow.
+Run commands from the repository root. Use the
+[development navigation](../development.md#select-regression-coverage) to locate
+coverage and [Pre-commit setup](../PRE_COMMIT.md) for hook commands and scope.
 
-## Utility Specifications
+## Validation levels
 
-- [Resource Helper](#resource-helper)
-- [Pre-commit tester](#pre-commit-tester)
-- [GitHub Actions tester](#github-actions-tester)
-- [Export branch](#export-branch)
+Choose the smallest relevant checks first, then add the device/system coverage
+needed for the behavior being changed. Report exactly what ran. Passing a
+targeted check does not satisfy every CI gate.
 
-### Resource Helper
+| Level | Entry point | Requirements and evidence |
+| --- | --- | --- |
+| Documentation | Explicit Markdown, character, typo, and whitespace hooks | No accelerator; also check local links and commands |
+| Other pre-commit hooks | `SKIP=run-tests pre-commit run --all-files` | Prepared hook environments; explicitly excludes pytest |
+| Targeted regression | `python -m pytest -q <test-file-or-node>` | Dependencies and fixtures of the selected tests; inspect device checks |
+| Kernel/integration | Selected `tests/kernels/` or `tests/integration/` files | Matching CUDA or Ascend runtime and a usable device |
+| Model/system | Selected `tests/st/` files or documented probes | Device, model snapshot, configuration/artifact, and any test data |
+| Local full test runner | `./tools/run_test.sh` | Available accelerator, installed runtime, model dependencies; platform behavior below |
+| Wheel smoke | `tools/run_wheel_smoke_test.sh` | Build tooling; validates installed wheel metadata/imports outside the checkout |
+| Benchmark acceptance | `tests/system/` scripts and CI workflow | Fixed inputs, resolved branch/device policy, and saved results |
 
-A collection of functions to manage local GPU pool resource sharing.  
-Resource sharing assumes all users of the local server use this procedure.
+### Documentation and selected hooks
 
-- **get_gpu** `[alloc]` - Search for a free GPU.  
-  `alloc` - Maximum allocated RAM in MB (default: 4).
+Use the [documentation checklist](../PRE_COMMIT.md#documentation-checks) for
+Markdown changes and [hook scope](../PRE_COMMIT.md#choose-the-scope) for other
+edits. Explicit hook IDs avoid launching the full pytest suite.
 
-**Returns:** GPU ID (blocks until a GPU is free).
+### Regression design
 
-```bash
-source ./tools/resource.sh
-id=$(get_gpu 5) # Scans for a free GPU with at most 5 MB allocated RAM.
-```
+Extend the existing suite for the affected behavior. For a bug fix, reproduce
+it before the change when the environment permits, then verify the same case
+afterward. Test externally visible results and lifecycle effects through the
+real entry point where practical. Small contract tests and mocks can isolate a
+boundary, but cannot establish device execution or serving correctness.
 
-- **get_gpus** \<`num`\> [`alloc`] - get number of gpus  
-    `num` - number of requested GPUs  
-    `alloc` - most allocated RAM in MB (default 4)
+For lifecycle changes, cover error/cancellation cleanup as well as completion.
+Use deterministic inputs where possible and follow the existing numerical
+parity contract. Do not replace a failing assertion with a skip, retry, looser
+tolerance, or weaker benchmark threshold merely to obtain a passing run.
 
-Returns: comma separated list of available gpu's , search  until found
+### Targeted tests and dependencies
 
-```bash
-source ./tools/resource.sh
-ids=$(get_gpus 3 4) # Scans for 3 free GPU's with at most 4 MB allocated RAM.
-CUDA_VISIBLE_DEVICES=$ids ./run_some_tests.sh
-```
+The root `tests/conftest.py` resets sliced-logits state through an autouse
+fixture that imports Torch and vLLM. Host-oriented tests are therefore not
+necessarily runnable with only pytest or a CPU package install. Some test
+modules also import runtime/kernel dependencies during collection.
 
-- **lock_gpu** \<`id`\> - preserve  a gpu (by allocating some memory to it)  
-    `id` - GPU id
+Slow tests are skipped unless `--run-slow` is supplied. Device/model skips have
+their own conditions. Neither omitting `--run-slow` nor running `--collect-only`
+turns the entire suite into a dependency-free host check. Do not bypass shared
+fixtures to make a runtime test appear supported.
 
-Returns: pid of preserving memory process
-
-``` bash
-source ./tools/resource.sh
-id=$(get_gpu 4)
-pid=$(lock_gpu $id)  
-```
-
-- **lock gpus** \<`ids`\> - preserve number of gpus from the given comma separated list.  
-`ids` - comma separated list of GPU id
-
-Returns : Comma separated of pids of preserved memory processes
-
-``` bash
-source ./tools/resource.sh
-# default permitted idle GPU allocation is 4MB
-ids=$(get_gpus)
-pids=$(lock_gpus $ids)  
-```
-
-- **unlock_gpu** \<pid\> - unlock preserved gpu
-pid - process id of holding preserved memory process
+After locating coverage, run the selected files or pytest node IDs in the
+installed development runtime. For example, for initialization changes:
 
 ```bash
-source ./tools/resource.sh
-id=$(get_gpu 4)
-pid=$(lock_gpu $id)
-CUDA_VISIBLE_DEVICES=$id do_something.sh
-unlock_gpu $pid  #unlock gpu by killing its allocator process
+python -m pytest -q tests/test_patch_initialization.py
 ```
 
-- **unlock_gpus** <`pids`> - unlock preserved gpus  
-`pids` - comma separated list of process id of holding preserved memory processes
+Packaging tests intentionally have a separate invocation that excludes the
+runtime conftest, matching the wheel smoke script:
 
 ```bash
-source ./tools/resource.sh
-ids=$(get_gpus 3)
-pids=$(lock_gpus $ids)
-CUDA_VISIBLE_DEVICES=$ids do_something
-unlock_gpus $pids # unlock gpus by killing its allocator processes
+python -m pytest --confcutdir=tests/packaging -q tests/packaging/test_install_metadata.py
 ```
 
-### Pre-commit tester
+That command requires pytest, setuptools, and packaging, but does not establish
+inference support. Check the [coverage map](../development.md#select-regression-coverage)
+for the tests associated with other code areas.
 
-Run full pre-commit test including unit tests. It uses get_gpu, lock_gpu and unlock_gpu  
-This script assumes:
+### Device and model tests
 
-- pre-commit package is installed, if not please install with:
+Select a device allocated for the run and use the matching installed runtime.
+The following examples use device 0; change it to the assigned device. Run
+CUDA and NPU examples in their respective environments.
 
-    ``` bash
-    pip install pre-commit
-    ```
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q tests/kernels/test_rec_constrained_topk_cuda.py
+ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest -q tests/constraints/test_npu_backend_integration.py
+```
 
-    Refer to [pre-commit](https://github.com/pre-commit/pre-commit) for tool description and installation instruction
+For OneRec system tests, `VLLM_GR_TEST_MODEL` can point to a local directory
+containing `config.json`, tokenizer files, and weights. `HF_HUB_OFFLINE=1`
+prevents Hugging Face fallback downloads; it does not make other setup scripts
+offline. An example CUDA system run is:
 
-- vllm-gr is installed, see [quickstart](../quickstart.md).
+```bash
+VLLM_GR_TEST_MODEL=/path/to/OneRec-1.7B \
+HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
+python -m pytest --run-slow -q tests/st/test_onerec_v1_scheduler_st.py
+```
 
-Run test with:
+For NPU end-to-end coverage, use
+`tests/st/test_onerec_v1_npu_e2e.py` with `--run-slow`, the Ascend runtime,
+xllm-ops, and `ASCEND_RT_VISIBLE_DEVICES`. Pangu tests use `PANGU1B_MODEL_PATH`
+or `PANGU_MODEL_PATH`; see the [Pangu guide](../../examples/offline_inference/pangu1b/README.md).
+Missing prerequisites may cause skips or failures depending on the test.
+
+Use the [runner isolation probe](../modelrunner_v2_multibatch.md#reproduce-the-execution-regression)
+for V1/V2 batch-switch and graph lifecycle changes. Launch runner/configuration
+comparisons in fresh processes. Record actual replay/fallback counters and
+clean shutdown, not only returned candidates.
+
+### Local full test runner
 
 ```bash
 ./tools/run_test.sh
 ```
 
-The OneRec integration tests use `OpenOneRec/OneRec-1.7B` by default. To use
-a model downloaded to a regular local directory, set `VLLM_GR_TEST_MODEL` to
-the directory containing `config.json` and the model weights. Set
-`HF_HUB_OFFLINE=1` as well to prevent fallback network access:
+The current script performs these steps:
+
+1. Runs `tests/development/test_resource.sh`, which probes allocation/locking.
+2. Sources `tools/resource.sh` and selects an available accelerator. Detection
+   uses the presence of `npu-smi`; otherwise it follows the CUDA path. Selection
+   can wait for an idle device and is not an exclusive reservation for the suite.
+3. On CUDA, runs `pre-commit run --all-files` with the selected device, including
+   the `run-tests` hook.
+4. On NPU, probes/builds xllm-ops through `tools/install_xllm_ops.sh`, loads the
+   custom operator environment, sets spawn-related variables, and directly runs
+   `tools/pre_commit/run_tests.sh`. This branch does not run the other pre-commit
+   hooks; run them separately when needed.
+
+Both paths reach the full slow suite described in
+[pre-commit scope](../PRE_COMMIT.md#choose-the-scope). The NPU installer may
+clone/build dependencies when they are unavailable, so
+prepare the vendor image and operator library before using this as a test gate.
+This runner is not the full set of standalone CI benchmarks.
+
+For a locally cached OneRec model:
 
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec-1.7B \
@@ -113,38 +136,104 @@ HF_HUB_OFFLINE=1 \
 ./tools/run_test.sh
 ```
 
-### Github Actions tester
+Pass `--wheel` to append the wheel smoke test after successful test execution.
+The runner chooses its own device; for a specific preallocated device, use the
+targeted commands or direct test script with the corresponding visibility
+variable and prepared environment.
 
-Execute a full workflows execution. Its create an empty environment via docker and perform all workflows define in .github/workflows.
-This script assume act is installed on system. Please refer to   [nektos act](https://github.com/nektos/act) for tool information and perquisites and check  [act installation](https://nektosact.com/installation/) for installation details.
-
->[!NOTE]
-HuggingFace token (HF_TOKEN) need to be supplied because workflow include OpenOneRec dataset downloading.
-Refer to [hugging-face](https://huggingface.co/settings/tokens) for instruction to get a token,
+### Packaging
 
 ```bash
-HF_TOKEN=<xxxx>   ./tools/run_act.sh
+VLLM_GR_TARGET_DEVICE=cpu ./tools/run_wheel_smoke_test.sh --python python3
 ```
 
-### Export branch
+Use `cuda` or `npu` for the other metadata targets. The script builds a wheel,
+installs it with `--no-deps` into a temporary directory, checks import origin
+and dependency metadata outside the source checkout, and runs packaging tests.
+It does not validate accelerator inference. Its build helper installs build
+tools and replaces `build/`, `dist/`, and generated package metadata; preserve
+any build artifacts needed for comparison before running it.
 
-A script to clean up the branch history before a Pull Request
-Automatically Squashes all commits into a single clean commit.
+### Benchmark acceptance
 
-**usage:**
+Use [benchmark setup](../benchmarks/README.md) and the relevant gate guide before
+invoking `tests/system/run_benchmark_and_verify.sh`,
+`tests/system/run_beam_v1_recall.sh`, or the Beam performance/A/B scripts.
+These require additional datasets, catalogs, model paths, and policy settings.
+Pangu acceptance has separate offline/online scripts.
+
+Policies are resolved through `.github/benchmark-gate.yaml`, `tools/ci/`, and the
+workflow; target branch and device matter. See the
+[Video-100 policy](../benchmarks/parent_score_gate.md),
+[Recall baseline](../benchmarks/beam_v1_recall_gate.md), and
+[A/B utilities](../../tools/AB_Tests/README.md). Preserve the accepted thresholds
+and input identity. Historical results only apply to their recorded revision
+and configuration.
+
+Keep functional, graph replay, accuracy, and performance evidence distinct.
+For device results retain the code revision/import origin, runtime versions,
+device, model/tokenizer/artifact identity, runner and graph settings, exact
+command, and output location. Report skips and unavailable coverage explicitly.
+
+## Resource helper
+
+Source `tools/resource.sh` from the root. It delegates to `resource-npu.sh` when
+`npu-smi` is present. Device selection does not reserve the returned device.
+
+| Function | Arguments and result |
+| --- | --- |
+| `get_gpu` | `[memory_mb] [timeout_seconds]`; one available device ID |
+| `get_gpus` | `[count] [memory_mb] [timeout_seconds]`; comma-separated IDs |
+| `lock_gpu` / `lock_gpus` | Device ID(s); returns PID(s) of CUDA memory-holding processes or NPU sleep stubs |
+| `unlock_gpu` / `unlock_gpus` | PID(s) returned by the matching lock call; stops those processes |
+
+On CUDA, memory-holding locks provide an advisory signal to cooperating callers;
+they are not an atomic scheduler reservation. On NPU, `lock_npu` and `lock_npus`
+are non-reserving stubs that only start background `sleep` processes. They do not
+allocate NPU memory, so `get_npu` and `get_npus` can select the same device again,
+even when all callers use these helpers. Shared NPU runs require an external
+scheduler or reservation mechanism that holds the device for the entire workload.
+`ASCEND_RT_VISIBLE_DEVICES` controls visibility; it does not reserve a device.
+
+Timeout 0 means no deadline. CUDA selection defaults to 16 MiB; single NPU
+selection defaults to 3000 MiB. Supply explicit thresholds when sharing devices
+across different environments. For example, select a CUDA device within 30 seconds:
 
 ```bash
-git pull upstream main                 # update from main branch
-git commit -a                          # commit merges, conflicts etc.
-./tools/export_changes.sh              # create a new branch with 1 commit
-git commit -a                          # commit the changes
-git push origin HEAD:<your pr>         # push to PR branch
+source ./tools/resource.sh
+device_id=$(get_gpu 18 30) || exit 1
+CUDA_VISIBLE_DEVICES="$device_id" python -m pytest -q tests/kernels/test_rec_constrained_topk_cuda.py
 ```
 
-Script can be called with 2 arguments: remote_branch_name and commit_message which simplify the use to:
+Callers own the cleanup of processes returned by the lock helpers. Do not use
+device-wide process cleanup to reclaim another developer's work. The CI cleanup
+path validates CUDA device mapping before acting; consult
+`tools/ci/check_cuda_device_mapping.py` and `tools/ci/gpu_process_guard.py` when
+changing that behavior.
 
-**usage:**
+## GitHub Actions tester
 
-``` bash
-./tools/export_changes.sh remote_branch_name "commit_message"
+`tools/run_act.sh` invokes `act` with Docker's NVIDIA runtime, selects and locks
+a GPU, maps the local cache, and supplies `HF_TOKEN` when it is already set in
+the environment. It requires Docker, `act`, the relevant image, and workflow
+inputs. Its current container setup is CUDA-specific; it is not an NPU runner.
+
+```bash
+./tools/run_act.sh
 ```
+
+Local emulation does not prove GitHub event, label, artifact, or hosted-runner
+behavior. Use the [CI workflow description](../../CONTRIBUTING.md#pull-request-ci)
+when interpreting the result.
+
+## Export branch
+
+`tools/export_changes.sh` is a history-export utility, not a validation step.
+With no arguments it checks out/resets `export-branch` from `upstream/main` and
+applies the committed difference, excluding `trc`. With both remote branch and
+commit message arguments, it also commits and force-pushes to `origin` before
+returning to the original ref. It requires a clean tracked worktree and does
+not include uncommitted work in the exported difference.
+
+Use it only for an intended history export after reviewing the script and target
+branch. Ordinary documentation or test work does not require this utility.
