@@ -116,6 +116,33 @@ def test_full_request_to_numpy_batch(binary: bool) -> None:
     assert batch.items[0].request.external_req_id == "id-0"
 
 
+@pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("trie_id", [None, 0, 1, 2**32 - 1])  # type: ignore[misc]
+def test_per_input_trie_selector_wire_and_batch_mapping(binary: bool, trie_id: int | None) -> None:
+    request = message(binary=binary)
+    if trie_id is not None:
+        request.trie_id = trie_id
+    decoded = pb.GenerateRequest.FromString(request.SerializeToString())
+    assert decoded.HasField("trie_id") == (trie_id is not None)
+    batch, _ = BeamVllmEngineServicer(engine(), 0.0).build_batch([decoded])
+    assert batch.items[0].trie_id == (0 if trie_id is None else trie_id)
+
+
+@pytest.mark.parametrize("trie_id", [0, 1])  # type: ignore[misc]
+def test_npu_trie_selector_matches_http_validation(trie_id: int) -> None:
+    backend = engine()
+    backend.vllm_config = SimpleNamespace(device_config=SimpleNamespace(device="npu:0"))
+    request = message()
+    request.trie_id = trie_id
+    servicer = BeamVllmEngineServicer(backend, 0.0)
+    if trie_id:
+        with pytest.raises(ValueError, match="multi-trie requests currently require CUDA"):
+            servicer.build_batch([request])
+    else:
+        batch, _ = servicer.build_batch([request])
+        assert batch.items[0].trie_id == 0
+
+
 @pytest.mark.parametrize("result_width", [None, 1, 2])  # type: ignore[misc]
 def test_beam_options_map_to_execution_and_output_contracts(result_width: int | None) -> None:
     servicer = BeamVllmEngineServicer(engine(), 0.0)
@@ -335,6 +362,77 @@ async def connection() -> AsyncIterator[tuple[Any, SimpleNamespace, list[Any], A
             yield rpc.VllmEngineStub(channel), backend, submitted, servicer
     finally:
         await server.stop(0)
+
+
+@pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("method", ["Generate", "GenerateBatch"])  # type: ignore[misc]
+def test_trie_selection_over_grpc(binary: bool, method: str) -> None:
+    async def run() -> None:
+        async with connection() as (stub, backend, submitted, servicer):
+            if method == "Generate":
+                request = message(binary=binary)
+                request.trie_id = 1
+                replies = [reply async for reply in stub.Generate(request, timeout=5)]
+                assert len(replies) == 2
+                assert [item.trie_id for item in submitted[0].items] == [1]
+            else:
+                requests = [message(i, binary=binary) for i in range(4)]
+                requests[1].trie_id = 1
+                requests[2].trie_id = 0
+                requests[3].trie_id = 1
+                reply = await stub.GenerateBatch(
+                    pb.BatchGenerateRequest(requests=requests), timeout=5
+                )
+                assert [item.request_id for item in reply.items] == [f"id-{i}" for i in range(4)]
+                assert [item.trie_id for item in submitted[0].items] == [0, 1, 0, 1]
+            backend.release_gr_session.assert_awaited_once()
+            assert not servicer._beam_tasks
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("trie_count", [1, 2])  # type: ignore[misc]
+@pytest.mark.parametrize("method", ["Generate", "GenerateBatch"])  # type: ignore[misc]
+def test_invalid_trie_uses_core_admission_and_service_recovers(
+    trie_count: int, method: str
+) -> None:
+    from queue import Queue
+
+    from vllm_gr.v1.engine.core import _handle_submit_gr_session
+
+    async def run() -> None:
+        async with connection() as (stub, backend, submitted, servicer):
+            original_submit = backend.submit_gr_session
+            core = SimpleNamespace(_gr_trie_count=trie_count, input_queue=Queue())
+
+            async def submit(request: Any) -> Any:
+                # Exercise the real Core admission boundary against the loaded count.
+                _handle_submit_gr_session(core, request)
+                return await original_submit(request)
+
+            backend.submit_gr_session = submit
+            request = message()
+            request.trie_id = trie_count
+
+            async def invoke() -> Any:
+                if method == "Generate":
+                    return [reply async for reply in stub.Generate(request, timeout=5)]
+                return await stub.GenerateBatch(
+                    pb.BatchGenerateRequest(requests=[request]), timeout=5
+                )
+
+            with pytest.raises(grpc.aio.AioRpcError) as caught:
+                await invoke()
+            assert caught.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+            assert "trie_id is outside the loaded constraint table" in caught.value.details()
+            assert not submitted and core.input_queue.empty()
+            assert not servicer._beam_tasks
+            request.ClearField("trie_id")
+            await invoke()
+            assert len(submitted) == 1 and submitted[0].items[0].trie_id == 0
+            assert not core.input_queue.empty()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("encoding", ["binary", "repeated", "mixed"])  # type: ignore[misc]

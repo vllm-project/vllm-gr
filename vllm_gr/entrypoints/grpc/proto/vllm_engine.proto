@@ -4,6 +4,7 @@
 // GR extensions (original package, service, field numbers and methods retained):
 // - TokenizedInput.input_ids_i64_le = 3: optional binary int64 prompt.
 // - GenerateRequest.beam_search = 8: GR beam parameters.
+// - GenerateRequest.trie_id = 9: optional per-input Trie selector.
 // - GenerateComplete.cumulative_logprob = 12, parent_beam_indices = 13.
 // - VllmEngine.GenerateBatch and BeamSearchOptions, BatchGenerateRequest,
 //   BatchGenerateItem, BeamBatchOutput, BatchGenerateResponse messages.
@@ -169,6 +170,10 @@ message MultimodalInputs {
 message GenerateRequest {
   // Required for GR generation; existing fields remain wire-compatible.
   BeamSearchOptions beam_search = 8;
+  // Index in the loaded constraint table; omitted selects Trie 0.
+  // Each GenerateBatch member can select a different Trie. Multi-Trie execution
+  // currently requires CUDA; IDs are validated against the loaded resources.
+  optional uint32 trie_id = 9;
   string request_id = 1;
 
   // Prompt input

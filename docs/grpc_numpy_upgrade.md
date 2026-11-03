@@ -24,9 +24,12 @@ through Engine Core and Worker staging. The code baseline is `decode_graph`.
   GR Generate, GenerateBatch and Abort are supported. The servicer inherits
   upstream HealthCheck, GetModelInfo and GetServerInfo; Embed remains disabled.
   GetTokenizer remains UNIMPLEMENTED, as in the pinned upstream version.
-- gRPC currently uses Trie 0 for every input. Unlike Python/HTTP, the protocol
-  does not yet expose a per-input `trie_id`, so a batch cannot select different
-  Tries. The next version will add per-input Trie selection in a separate PR.
+- `GenerateRequest.trie_id` selects a Trie for each input; omitted selects Trie 0.
+  `GenerateBatch` members can select different Tries while sharing beam/output
+  options. Multi-Trie execution requires CUDA and a multi-Trie constraint table;
+  Engine Core validates IDs against the loaded table before admission. A single
+  Trie or unconstrained deployment accepts only ID 0. Nonzero IDs on NPU are
+  rejected, matching Python/HTTP.
 - Patch bindings and the servicer during upstream gRPC startup. Upstream owns
   engine/listener initialization, standard health, reflection, keepalive,
   statistics and shutdown. GR supplies extended-schema reflection and drains
