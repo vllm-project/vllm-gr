@@ -542,6 +542,33 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                         )
                         self.assertEqual(bool(evaluate(benchmark, github)), not expect_recall)
 
+    def test_abtest_label_outside_the_ab_scope_cannot_fail_the_gate(self) -> None:
+        """A label event the routing does not cover must not fail the gate.
+
+        ``on.pull_request.branches`` and the A/B scope are two separate lists.
+        Adding a branch to the trigger without adding it to the scope used to
+        turn an ``abtest`` label event into a failed required check under the
+        same name as the real validation gate, which masked a passing run.
+        """
+        workflow = self.workflows["pre-commit.yml"]
+        gate = workflow["jobs"]["benchmark-blocking"]
+        out_of_scope = context(
+            "labeled", ready=True, abtest=True, label="abtest", base_ref="feature"
+        )
+        self.assertEqual(self.scheduled(workflow, out_of_scope), [])
+        for base in ("main", "decode_graph"):
+            with self.subTest(base=base):
+                in_scope = context(
+                    "labeled", ready=True, abtest=True, label="abtest", base_ref=base
+                )
+                self.assertEqual(
+                    self.scheduled(workflow, in_scope),
+                    ["beam-performance-ab-only", "benchmark-blocking"],
+                )
+                self.assertEqual(
+                    render(gate["name"], in_scope), "Beam V1 performance A/B gate"
+                )
+
     def test_unready_and_draft_events_fail_required_gate(self) -> None:
         workflow = self.workflows["pre-commit.yml"]
         gate = workflow["jobs"]["benchmark-blocking"]

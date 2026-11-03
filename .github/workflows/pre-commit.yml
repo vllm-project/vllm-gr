@@ -992,6 +992,9 @@ jobs:
 
   benchmark-blocking:
     # Ignored label events must not replace the required check with a skipped one.
+    # An abtest event only gates branches the A/B routing covers: if one is ever
+    # added to the trigger filter without joining that scope, the event must skip
+    # the gate instead of failing it under the real validation gate's name.
     name: >-
       ${{ github.event_name == 'pull_request' &&
           (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
@@ -1024,7 +1027,9 @@ jobs:
        (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
        github.event.label.name == 'ready' ||
        (github.event.label.name == 'abtest' &&
-        github.event.action == 'labeled'))
+        github.event.action == 'labeled' &&
+        (github.event.pull_request.base.ref == 'decode_graph' ||
+         github.event.pull_request.base.ref == 'main')))
     runs-on: ubuntu-latest
     steps:
       - name: Require every blocking check to pass
