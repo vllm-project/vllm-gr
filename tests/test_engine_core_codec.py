@@ -56,15 +56,15 @@ def test_decode_whole_gr_batch(batch_size: int) -> None:
     for original, item in zip(source.items, decoded.items, strict=True):
         assert isinstance(item.request, EngineCoreRequest)
         tokens = item.request.prompt_token_ids
-        assert isinstance(tokens, np.ndarray) and tokens.dtype == np.int64
-        assert tokens.flags.c_contiguous
-        np.testing.assert_array_equal(tokens, original.request.prompt_token_ids)
+        assert isinstance(tokens, list)
+        assert all(type(token) is int for token in tokens)
+        assert tokens == list(original.request.prompt_token_ids)
 
 
 def test_native_add_payload() -> None:
     source = _batch_request().items[0].request
     values = {name: getattr(source, name) for name in EngineCoreRequest.__struct_fields__}
-    values["prompt_token_ids"] = source.prompt_token_ids.tolist()
+    values["prompt_token_ids"] = list(source.prompt_token_ids)
     request = EngineCoreRequest(**values)
     decoded = decode_engine_core_payload(
         build_engine_core_decoders(None), EngineCoreRequestType.ADD, _frames(request)

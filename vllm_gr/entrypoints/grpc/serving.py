@@ -44,7 +44,14 @@ class BeamVllmEngineServicer(VllmEngineServicer):
         self.client = AsyncBeamSearchClient(engine_client=engine)
         self._beam_tasks = {}
 
-    def decode_tokens(self, tokenized):
+    def decode_tokens(self, tokenized) -> list[int]:
+        """Return prompt tokens in the engine's native list representation.
+
+        The packed-bytes field is the gRPC fast path: ``np.frombuffer`` views it
+        without copying, and the array is materialized exactly once here. Keeping
+        the engine on lists is deliberate -- every scheduled step touches tokens
+        element by element, where an ndarray costs several times a list.
+        """
         if tokenized.HasField("input_ids_i64_le"):
             if tokenized.input_ids:
                 raise ValueError("input_ids and input_ids_i64_le are mutually exclusive")
@@ -53,12 +60,8 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                 raise ValueError(
                     "input_ids_i64_le must be nonempty with byte length divisible by 8"
                 )
-            tokens = np.frombuffer(raw, dtype="<i8")
-        else:
-            # upb's native __array__ conversion avoids an intermediate Python list.
-            # This still copies into NumPy-owned storage, unlike the binary view.
-            tokens = np.asarray(tokenized.input_ids, dtype=np.int64)
-        return tokens
+            return np.frombuffer(raw, dtype="<i8").tolist()
+        return list(tokenized.input_ids)
 
     def build_batch(self, messages):
         if not messages:
@@ -126,7 +129,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                     tokens = tokens[-length:]
                 else:
                     tokens = tokens[:length]
-            if not tokens.size or tokens.min() < 0:
+            if not tokens or min(tokens) < 0:
                 raise ValueError("token IDs must be nonempty and nonnegative")
             # Match native InputProcessor: tokenizer-only IDs may exceed the
             # model vocabulary; skip this upper-bound check without a tokenizer.
@@ -134,7 +137,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                 max_token_id = max(
                     tokenizer.max_token_id, self.engine.model_config.get_vocab_size() - 1
                 )
-                if tokens.max() > max_token_id:
+                if max(tokens) > max_token_id:
                     raise ValueError("token IDs are out of vocabulary")
             if len(tokens) + source.max_tokens > self.engine.model_config.max_model_len:
                 raise ValueError("prompt plus generation exceeds model length")

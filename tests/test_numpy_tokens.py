@@ -42,76 +42,12 @@ def native(tokens):
     )
 
 
-@pytest.mark.parametrize("binary", [False, True])
-def test_batch_keeps_canonical_arrays_without_copying_or_changing_flags(binary):
-    source = np.array([1, 2, 3], dtype=np.int64)
-    if binary:
-        source = np.frombuffer(source.tobytes(), dtype="<i8")
-    writable = source.flags.writeable
-    native_request = native(source)
-    values = {
-        field: getattr(native_request, field) for field in EngineCoreRequest.__struct_fields__
-    }
-    item = BeamBatchItem(0, BeamEngineCoreRequest(**values))
-    assert item.request.prompt_token_ids is source
-    assert source.flags.writeable == writable
 
 
-def test_legacy_list_input_converts_to_array_at_batch_boundary():
-    request = BeamBatchItem(0, native([1, 2, 3])).request
-    assert isinstance(request, BeamEngineCoreRequest)
-    assert request.prompt_token_ids.dtype == np.int64
-    np.testing.assert_array_equal(request.prompt_token_ids, [1, 2, 3])
-    assert request.external_req_id == "id"
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        None,
-        np.array([], dtype=np.int64),
-        np.ones((2, 2), dtype=np.int64),
-        np.array([1.5]),
-        np.array([True]),
-        np.array([-1], dtype=np.int64),
-        np.array([2**63], dtype=np.uint64),
-        np.arange(8, dtype=np.int64)[::2],
-    ],
-)
-def test_contract_still_rejects_invalid_prompt_arrays(value):
-    from tests.test_gr_async_scheduler import _batch_request
-    from vllm_gr.v1.beam.batch_contracts import validate_beam_batch_request
-
-    request = _batch_request()
-    request.items[0].request.prompt_token_ids = value
-    with pytest.raises(ValueError, match="contiguous nonnegative int64"):
-        validate_beam_batch_request(request)
 
 
-def test_native_request_and_scheduler_data_stay_array_backed():
-    from vllm.v1.core.sched.output import NewRequestData
-    from vllm.v1.request import Request
-
-    install_numpy_request_factory()
-    install_numpy_scheduler_data()
-    item = BeamBatchItem(0, native([1, 2, 3]))
-    request = Request.from_engine_core_request(item.request, None)
-    assert isinstance(request._all_token_ids, NumpyTokenBuffer)
-    request.append_output_token_ids(4)
-    request.append_output_token_ids([5, 6])
-    np.testing.assert_array_equal(request.all_token_ids.copy(), [1, 2, 3, 4, 5, 6])
-    np.testing.assert_array_equal(item.request.prompt_token_ids, [1, 2, 3])
-    with pytest.raises(ValueError, match="capacity"):
-        request.append_output_token_ids(7)
-    scheduled = NewRequestData.from_request(
-        request, ([1],), request._all_token_ids, uses_mrope=False
-    )
-    assert isinstance(scheduled.prompt_token_ids, np.ndarray)
-    assert isinstance(scheduled.prefill_token_ids, np.ndarray)
-    np.testing.assert_array_equal(scheduled.prefill_token_ids, [1, 2, 3, 4, 5, 6])
-    # Native non-GR request construction is not changed by the scoped hook.
-    ordinary = Request.from_engine_core_request(native([1, 2]), None)
-    assert type(ordinary._all_token_ids) is list
 
 
 @pytest.mark.parametrize("uses_mrope", [False, True])
@@ -145,32 +81,6 @@ def test_scheduler_data_preserves_native_mrope_metadata(uses_mrope):
     assert request.mm_features[0].data is data
 
 
-def test_hashes_match_list_path_for_cold_warm_incremental_and_salt():
-    from vllm.utils.hashing import sha256
-    from vllm.v1.core import kv_cache_utils as kv
-    from vllm.v1.request import Request
-
-    from vllm_gr.v1.engine.engine_core_patch import apply_kv_hash_memo_patch
-
-    if getattr(kv, "NONE_HASH", None) is None:
-        kv.init_none_hash(sha256)
-    apply_kv_hash_memo_patch()
-    hasher = kv.get_request_block_hasher(4, sha256)
-    tokens = list(range(10))
-    for salt in (None, "different-model-features"):
-        for _ in range(2):
-            plain = native(tokens)
-            plain.cache_salt = salt
-            array = BeamBatchItem(0, plain).request
-            expected = Request.from_engine_core_request(plain, hasher)
-            actual = initialize_numpy_request(array, hasher)
-            assert actual.block_hashes == expected.block_hashes
-            actual.append_output_token_ids([10, 11])
-            expected.append_output_token_ids([10, 11])
-            assert actual.block_hashes == expected.block_hashes
-            np.testing.assert_array_equal(
-                actual.all_token_ids.copy(), expected.all_token_ids.copy()
-            )
 
 
 def test_worker_detaches_arrays_without_python_token_lists():
@@ -287,3 +197,35 @@ def test_native_v1_input_batch_copies_arrays_in_bulk():
     np.testing.assert_array_equal(batch.token_ids_cpu[index, :4], source)
     assert batch.num_prompt_tokens[index] == 4
     assert batch.remove_request("id") is not None
+
+
+def _canonical_request(tokens):
+    """Build a BeamEngineCoreRequest directly, as an ingress adapter would."""
+    base = native(tokens)
+    values = {name: getattr(base, name) for name in EngineCoreRequest.__struct_fields__}
+    return BeamEngineCoreRequest(**values)
+
+
+def test_batch_boundary_keeps_python_lists():
+    item = BeamBatchItem(0, native([1, 2, 3]))
+    assert isinstance(item.request, BeamEngineCoreRequest)
+    assert item.request.prompt_token_ids == [1, 2, 3]
+    assert all(type(token) is int for token in item.request.prompt_token_ids)
+
+
+def test_array_prompt_is_materialized_once_to_a_list():
+    request = _canonical_request(np.arange(4, dtype=np.int64))
+    assert isinstance(request.prompt_token_ids, list)
+    assert request.prompt_token_ids == [0, 1, 2, 3]
+    assert all(type(token) is int for token in request.prompt_token_ids)
+
+
+def test_missing_external_id_is_filled_from_the_request_id():
+    request = _canonical_request([1])
+    assert request.external_req_id == request.request_id
+
+
+def test_numpy_request_adapter_falls_back_for_list_prompts():
+    adapted = initialize_numpy_request(native([1, 2, 3]), None)
+    assert not isinstance(adapted._all_token_ids, NumpyTokenBuffer)
+    assert list(adapted.all_token_ids) == [1, 2, 3]

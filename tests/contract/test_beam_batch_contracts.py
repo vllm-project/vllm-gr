@@ -180,7 +180,7 @@ def test_request_rejects_embedding_only_prompt() -> None:
     engine_request = _engine_request("request-0", None)
     engine_request.prompt_embeds = torch.ones((2, 8), dtype=torch.float32)
     request = _request(items=(BeamBatchItem(0, engine_request),))
-    with pytest.raises(BeamContractError, match="nonempty contiguous nonnegative int64"):
+    with pytest.raises(BeamContractError, match="nonempty token list"):
         validate_beam_batch_request(request)
 
 

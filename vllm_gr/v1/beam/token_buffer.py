@@ -60,6 +60,10 @@ def initialize_numpy_request(request: Any, block_hasher: Any) -> Any:
 
     original = getattr(Request, "_gr_numpy_original", Request.from_engine_core_request.__func__)
     native = original(Request, request, None)
+    if not isinstance(getattr(native, "_all_token_ids", None), np.ndarray):
+        # List-backed prompt (the engine's default): nothing to adapt.
+        native._block_hasher = block_hasher
+        return native
     native._all_token_ids = NumpyTokenBuffer(native._all_token_ids, native.max_tokens)
     native.all_token_ids = ConstantList(native._all_token_ids)
     native._block_hasher = block_hasher
@@ -79,7 +83,9 @@ def install_numpy_request_factory() -> None:
     setattr(Request, "_gr_numpy_original", original)
 
     def from_engine_core_request(cls: Any, request: Any, block_hasher: Any) -> Any:
-        if isinstance(request, BeamEngineCoreRequest):
+        if isinstance(request, BeamEngineCoreRequest) and isinstance(
+            request.prompt_token_ids, np.ndarray
+        ):
             return initialize_numpy_request(request, block_hasher)
         return original(cls, request, block_hasher)
 

@@ -71,7 +71,9 @@ def _prompt_boundaries(
         else:
             original = prepared
         prepared_prompts.append(prepared)
-        original_prompts.append(original.tolist())
+        original_prompts.append(
+            original.tolist() if hasattr(original, "tolist") else list(original)
+        )
     return prepared_prompts, original_prompts, begin_token_id, end_token_id
 
 
@@ -126,7 +128,12 @@ class _V1BeamTailMaterializer:
             self._shared_prompt = _can_share_prompt_decode(self._tokenizer, self._prepared)
         if self._shared_prompt:
             if self._prompt_text is None:
-                self._prompt_text = fast_decode(self._tokenizer, self._prepared.tolist())
+                self._prompt_text = fast_decode(
+                    self._tokenizer,
+                    self._prepared.tolist()
+                    if hasattr(self._prepared, "tolist")
+                    else list(self._prepared),
+                )
             text = self._prompt_text + fast_decode(self._tokenizer, suffix)
         else:
             text = fast_decode(self._tokenizer, full)

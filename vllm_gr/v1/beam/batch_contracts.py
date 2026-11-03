@@ -42,11 +42,15 @@ class BeamContractError(ValueError):
 
 
 class BeamEngineCoreRequest(EngineCoreRequest):
-    """GR native request with one canonical ndarray prompt wire field."""
+    """GR native request; tokens stay in the native list representation."""
 
-    prompt_token_ids: np.ndarray  # type: ignore[assignment,type-arg]
+    prompt_token_ids: list[int]  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        tokens = self.prompt_token_ids
+        if tokens is not None and not isinstance(tokens, list):
+            # Only the gRPC ingress may hand over an array; the engine keeps lists.
+            self.prompt_token_ids = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
         if self.external_req_id is None:
             self.external_req_id = self.request_id
 
@@ -63,16 +67,22 @@ class BeamBatchItem(
     trie_id: int = 0
 
     def __post_init__(self) -> None:
-        # Existing frontend/native input processors may still produce lists.
-        # Convert exactly once when crossing into the GR request contract.
+        # Existing frontend/native input processors may still produce plain
+        # requests; lift them into the GR contract without changing the token
+        # representation (the engine keeps native Python lists).
         if isinstance(self.request, EngineCoreRequest) and not isinstance(
             self.request, BeamEngineCoreRequest
         ):
             values = {
                 name: getattr(self.request, name) for name in EngineCoreRequest.__struct_fields__
             }
-            if values["prompt_token_ids"] is not None:
-                values["prompt_token_ids"] = np.asarray(values["prompt_token_ids"], dtype=np.int64)
+            if values["prompt_token_ids"] is not None and not isinstance(
+                values["prompt_token_ids"], list
+            ):
+                tokens = values["prompt_token_ids"]
+                values["prompt_token_ids"] = (
+                    tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+                )
             converted = BeamEngineCoreRequest(**values)
             msgspec.structs.force_setattr(self, "request", converted)
 
@@ -472,15 +482,8 @@ def validate_beam_batch_request(request: BeamBatchRequest) -> None:
             _fail("item request_id values must be unique within a batch")
         request_ids.add(request_id)
         tokens = item.request.prompt_token_ids
-        if (
-            not isinstance(tokens, np.ndarray)
-            or tokens.dtype != np.int64
-            or tokens.ndim != 1
-            or not tokens.flags.c_contiguous
-            or tokens.size == 0
-            or tokens.min() < 0
-        ):
-            _fail("GR prompt_token_ids must be a nonempty contiguous nonnegative int64 array")
+        if not tokens or not isinstance(tokens, list):
+            _fail("GR prompt_token_ids must be a nonempty token list")
         if item.request.sampling_params is None:
             _fail("Beam batch items require sampling_params")
         if item.request.pooling_params is not None:
