@@ -45,7 +45,14 @@ def _snapshot(value: Any) -> Any:
 class NPUForwardTrace:
     """Observe the runner boundary outside compiled/captured model code."""
 
-    def __init__(self, runner: Any, get_context: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        runner: Any,
+        get_context: Callable[[], Any],
+        *,
+        expected_batch_size: int = 2,
+        record_cold: bool = False,
+    ) -> None:
         self.runner = runner
         self.events: list[dict[str, Any]] = []
         original = runner._model_forward
@@ -69,8 +76,8 @@ class NPUForwardTrace:
             compilation = runner.vllm_config.compilation_config
             descriptor = getattr(context, "batch_descriptor", None)
             padded = bound["num_tokens_padded"]
-            if execution.batch_size != 2 or not 0 < padded <= 512:
-                raise RuntimeError("forward tracing only supports the bounded B=2 test")
+            if execution.batch_size != expected_batch_size or not 0 < padded <= 512:
+                raise RuntimeError("forward tracing received an unexpected or unbounded shape")
             event = dict(
                 stage=execution.stage_index,
                 kind=execution.kind,
@@ -89,6 +96,19 @@ class NPUForwardTrace:
                 model_wrapper=type(runner.model).__name__,
             )
             if execution.kind == "prefill":
+                if record_cold:
+                    scheduled = runner._current_scheduler_output
+                    event["cold_rows"] = [
+                        {
+                            "num_computed_tokens": int(
+                                runner.requests[request_id].num_computed_tokens
+                            ),
+                            "prompt_tokens": len(runner.requests[request_id].prompt_token_ids),
+                            "scheduled_tokens": int(scheduled.num_scheduled_tokens[request_id]),
+                        }
+                        for request_id in execution.request_ids
+                    ]
+                    event["scheduled_total"] = int(scheduled.total_num_scheduled_tokens)
                 # Values are the real arguments, not reconstructed prompt IDs.
                 for field in ("input_ids", "positions"):
                     tensor = bound.get(field)

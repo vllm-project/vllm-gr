@@ -8,6 +8,8 @@ exact Prefill bucket 256, and strict same-B ordered tokens/scores. It retains
 native compilation, Beam FULL Decode, repeats and B=2 -> B=1 -> B=2 reuse.
 VLLM_GR_TEST_PADDED_PREFILL=1 selects the original 129+161-token case with
 caller-configured buckets, preserving the known padding precision reproducer.
+An independent B=4 test compares two engines on four distinct cold 128-token
+requests, requiring exact outputs and actual Prefill/Decode FULL execution.
 Only small forward metadata is observed; no operator hooks or tensor dumps.
 """
 
@@ -29,21 +31,25 @@ import torch
 
 from tests.st.npu_beam_diagnostics import NPUForwardTrace
 
+
+def _npu_test_unavailable(reason: str) -> None:
+    if os.environ.get("VLLM_GR_TARGET_DEVICE") == "npu":
+        pytest.fail(f"required NPU ST runtime is unavailable: {reason}", pytrace=False)
+    pytest.skip(reason, allow_module_level=True)
+
+
 try:
     import torch_npu  # noqa: F401
 except (ImportError, RuntimeError) as exc:
-    pytest.skip(f"torch-npu is not installed: {exc}", allow_module_level=True)
+    _npu_test_unavailable(f"torch-npu is not installed: {exc}")
 
 if not hasattr(torch, "npu") or not torch.npu.is_available():
-    pytest.skip("Ascend NPU is unavailable", allow_module_level=True)
+    _npu_test_unavailable("Ascend NPU is unavailable")
 
-from vllm_gr.ops.npu import beam_ops
+from vllm_gr.ops.npu import beam_ops  # noqa: E402
 
 if not beam_ops.is_available():
-    pytest.skip(
-        f"xllm Beam operators are unavailable: {beam_ops.unavailable_reason()}",
-        allow_module_level=True,
-    )
+    _npu_test_unavailable(f"xllm Beam operators are unavailable: {beam_ops.unavailable_reason()}")
 
 _BEAM_WIDTH = 8
 _BEGIN_TOKEN = "<|sid_begin|>"
@@ -88,11 +94,12 @@ def _comparison_prompts(tokenizer: Any, *, exact_prefill: bool) -> list[list[int
     return prompts
 
 
-def _assert_exact_prefill(prefill: dict[str, Any], label: str) -> None:
-    assert prefill["actual_tokens"] == prefill["padded_tokens"] == 256, label
-    assert prefill["input_ids_shape"] == prefill["positions_shape"] == [256], label
-    assert prefill["attention"]["query_start_loc"] == [0, 128, 256], label
-    assert prefill["attention"]["seq_lens"] == [128, 128], label
+def _assert_exact_prefill(prefill: dict[str, Any], label: str, *, batch_size: int = 2) -> None:
+    total = batch_size * 128
+    assert prefill["actual_tokens"] == prefill["padded_tokens"] == total, label
+    assert prefill["input_ids_shape"] == prefill["positions_shape"] == [total], label
+    assert prefill["attention"]["query_start_loc"] == list(range(0, total + 1, 128)), label
+    assert prefill["attention"]["seq_lens"] == [128] * batch_size, label
     replay = prefill["gr_prefill_replay_delta"]
     if prefill["enforce_eager"]:
         assert prefill["compilation_mode"] == "NONE" and not replay, label
@@ -100,8 +107,29 @@ def _assert_exact_prefill(prefill: dict[str, Any], label: str) -> None:
         assert prefill["compilation_mode"] == "VLLM_COMPILE", label
         assert prefill["skip_compiled"] is False, label
         # The outer runner's runtime mode alone does not prove GR Prefill replay.
-        assert replay == {"256": 1}, f"{label}: expected exact Prefill replay, got {replay}"
-    print(f"NPU exact Prefill: {label}; actual=256; bucket=256; replay={replay}", flush=True)
+        assert replay == {str(total): 1}, f"{label}: expected exact Prefill replay, got {replay}"
+    print(
+        f"NPU exact Prefill: {label}; actual={total}; bucket={total}; replay={replay}", flush=True
+    )
+
+
+def _assert_b4_graph_trace(events: list[dict[str, Any]], *, graph: bool) -> None:
+    assert [event["stage"] for event in events] == [0, 1, 2], "incomplete B=4 model trace"
+    assert [event["kind"] for event in events] == ["prefill", "decode", "decode"]
+    prefill = events[0]
+    _assert_exact_prefill(prefill, "cold B=4 Prefill", batch_size=4)
+    assert (
+        prefill["cold_rows"]
+        == [{"num_computed_tokens": 0, "prompt_tokens": 128, "scheduled_tokens": 128}] * 4
+    )
+    assert prefill["scheduled_total"] == 512
+    assert prefill["enforce_eager"] is (not graph)
+    for event in events[1:]:
+        assert event["actual_tokens"] == 32, "B=4/W=8 must decode all 32 Beam rows"
+        assert event["runtime_mode"] == ("FULL" if graph else "NONE")
+        assert event["enforce_eager"] is (not graph)
+    if not graph:
+        assert all(event["runtime_mode"] == "NONE" for event in events)
 
 
 def _build_constraint_artifact(
@@ -287,12 +315,19 @@ class OneRecNPUGraphTestWorkerExtension:
     def onerec_npu_graph_context_signature(self) -> tuple[int, tuple[int, ...]]:
         return _graph_context_signature(self)
 
-    def onerec_npu_trace_start(self) -> None:
+    def onerec_npu_trace_start(
+        self, expected_batch_size: int = 2, record_cold: bool = False
+    ) -> None:
         from vllm.forward_context import get_forward_context
 
         if getattr(self, "_onerec_trace", None) is not None:
             raise RuntimeError("an NPU forward trace is already active")
-        self._onerec_trace = NPUForwardTrace(getattr(self, "model_runner"), get_forward_context)
+        self._onerec_trace = NPUForwardTrace(
+            getattr(self, "model_runner"),
+            get_forward_context,
+            expected_batch_size=expected_batch_size,
+            record_cold=record_cold,
+        )
 
     def onerec_npu_trace_stop(self) -> list[dict[str, Any]]:
         if self._onerec_trace is None:
@@ -309,8 +344,11 @@ def _run_traced_case(
     prompts: list[list[int]],
     legal: set[tuple[int, int, int]],
     label: str,
+    *,
+    record_cold: bool = False,
+    exact_prefill: bool | None = None,
 ) -> tuple[list[Any], list[dict[str, Any]]]:
-    llm.collective_rpc("onerec_npu_trace_start")
+    llm.collective_rpc("onerec_npu_trace_start", args=(len(prompts), record_cold))
     try:
         outputs = _run_case(
             llm,
@@ -318,7 +356,9 @@ def _run_traced_case(
             prompts,
             legal,
             steps=3,
-            cache_salts=[f"{label}-row-{row}" for row in range(len(prompts))],
+            cache_salts=(
+                None if record_cold else [f"{label}-row-{row}" for row in range(len(prompts))]
+            ),
         )
     finally:
         events = llm.collective_rpc("onerec_npu_trace_stop")[0]
@@ -334,8 +374,8 @@ def _run_traced_case(
     assert prefill["input_ids"][:actual] == expected_tokens, label
     assert prefill["positions"][:actual] == expected_positions, label
     assert len(set(prefill["input_request_ids"])) == len(prompts), label
-    if not _padded_prefill_requested(os.environ):
-        _assert_exact_prefill(prefill, label)
+    if exact_prefill or (exact_prefill is None and not _padded_prefill_requested(os.environ)):
+        _assert_exact_prefill(prefill, label, batch_size=len(prompts))
     return outputs, events
 
 
@@ -623,8 +663,134 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
         print("NPU graph correctness: B=2 -> B=1 -> B=2 and N=1 passed", flush=True)
 
 
-def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
-    env = _graph_test_environment(os.environ) if graph else dict(os.environ)
+def _b4_test_environment(env: Mapping[str, str]) -> dict[str, str]:
+    result = dict(env)
+    for key in (
+        "VLLM_GR_TEST_PADDED_PREFILL",
+        "VLLM_GR_PREFILL_GRAPH_KV_BOUND",
+        "VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS",
+    ):
+        result.pop(key, None)
+    result.update(
+        VLLM_GR_TARGET_DEVICE="npu",
+        VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
+        VLLM_GR_PREFILL_GRAPH_BUCKETS="512",
+        VLLM_GR_PREFILL_GRAPH_BUCKET_STEP="128",
+        VLLM_GR_PREFILL_GRAPH_MAX_BUCKET="512",
+        VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS="4",
+        VLLM_GR_NPU_FUSED_FFN="0",
+        VLLM_ASCEND_ENABLE_NZ="0",
+        VLLM_USE_BREAKABLE_CUDAGRAPH="0",
+    )
+    return result
+
+
+def _run_b4_full_graph(work_dir: Path) -> None:
+    from vllm_gr.entrypoints.gr import GRLLM
+
+    model = os.environ.get("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
+    artifact = work_dir / "onerec_v1_npu_b4_constraints.safetensors"
+    tokenizer, digest, tokenizer_digest, legal = _build_constraint_artifact(model, artifact)
+    prompts = [_prompt_tokens(tokenizer, 127 + 32 * row)[:127] for row in range(4)]
+    assert [len(prompt) for prompt in prompts] == [127] * 4
+    assert len({tuple(prompt) for prompt in prompts}) == 4, "B=4 needs distinct prompt content"
+    config: dict[str, Any] = {
+        "schema_version": 1,
+        "attention_backend": "CUSTOM",
+        "beam": {
+            "execution_mode": "v1",
+            "worker_decision": True,
+            "max_width": _BEAM_WIDTH,
+            "max_decode_steps": 3,
+            "graph_batch_size": 4,
+        },
+        "constraint_table": {
+            "enabled": True,
+            "backend": "npu",
+            "max_top_k": _BEAM_WIDTH,
+            "path": str(artifact),
+            "format": "constraint_table_v1",
+            "artifact_digest": digest,
+            "tokenizer_digest": tokenizer_digest,
+        },
+    }
+    engine_kwargs = dict(
+        model=model,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        seed=0,
+        vllm_gr_config=config,
+        async_scheduling=True,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=False,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        max_num_seqs=_BEAM_WIDTH,
+        max_logprobs=_BEAM_WIDTH,
+        block_size=128,
+        gpu_memory_utilization=0.5,
+        worker_extension_cls="tests.st.test_onerec_v1_npu_e2e.OneRecNPUGraphTestWorkerExtension",
+    )
+    reference = None
+    results = []
+    for graph in (False, True):
+        config["beam"]["graph_enabled"] = graph
+        with GRLLM(**engine_kwargs, enforce_eager=not graph) as llm:
+            if graph:
+                initial = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
+                assert [4, _BEAM_WIDTH] in [list(shape) for shape in initial["captured_shapes"]]
+                signature = llm.collective_rpc("onerec_npu_graph_context_signature")[0]
+            for repeat in range(2):
+                label = f"b4-{'full' if graph else 'eager'}-{repeat}"
+                before = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
+                outputs, events = _run_traced_case(
+                    llm,
+                    tokenizer,
+                    prompts,
+                    legal,
+                    label,
+                    record_cold=True,
+                    exact_prefill=True,
+                )
+                _assert_b4_graph_trace(events, graph=graph)
+                after = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
+                assert after["full_dispatches"] - before["full_dispatches"] == (2 if graph else 0)
+                assert after["fallbacks"] - before["fallbacks"] == (0 if graph else 2)
+                reasons = {
+                    key: value - before["fallback_reasons"].get(key, 0)
+                    for key, value in after["fallback_reasons"].items()
+                    if value != before["fallback_reasons"].get(key, 0)
+                }
+                assert reasons == ({} if graph else {"graph_disabled": 2})
+                packed = [
+                    [
+                        (
+                            list(seq.tokens),
+                            float(seq.cum_logprob),
+                            seq.finish_reason,
+                            seq.stop_reason,
+                        )
+                        for seq in output.sequences
+                    ]
+                    for output in outputs
+                ]
+                if reference is None:
+                    reference = packed
+                assert packed == reference, f"{label}: B=4 ordered tokens/scores/finish differ"
+                if graph:
+                    assert llm.collective_rpc("onerec_npu_graph_context_signature")[0] == signature
+                results.append(dict(label=label, trace=events, before=before, after=after))
+                print(f"NPU B=4 exact comparison passed: {label}; stats={after}", flush=True)
+    (work_dir / "b4-full-graph-result.json").write_text(
+        json.dumps(dict(model=model, beam_width=_BEAM_WIDTH, results=results), indent=2) + "\n"
+    )
+
+
+def _run_subprocess(tmp_path: Path, *, graph: bool = False, b4: bool = False) -> None:
+    if b4:
+        env = _b4_test_environment(os.environ)
+    else:
+        env = _graph_test_environment(os.environ) if graph else dict(os.environ)
     env.update(
         USE_TF="0",
         VLLM_USE_V2_MODEL_RUNNER="0",
@@ -634,6 +800,8 @@ def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
     command = [sys.executable, "-m", "tests.st.test_onerec_v1_npu_e2e", str(tmp_path)]
     if graph:
         command.append("--graph")
+    if b4:
+        command.append("--b4")
     with subprocess.Popen(
         command,
         cwd=Path(__file__).parents[2],
@@ -641,7 +809,9 @@ def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
         start_new_session=True,
     ) as process:
         try:
-            assert process.wait(timeout=600) == 0, "NPU Beam V1 E2E subprocess failed"
+            assert process.wait(timeout=900 if b4 else 600) == 0, (
+                "NPU Beam V1 E2E subprocess failed"
+            )
         finally:
             if process.poll() is None:
                 if os.name == "posix":
@@ -667,5 +837,15 @@ def test_onerec_v1_npu_graph_shape_switch(tmp_path: Path) -> None:
     _run_subprocess(tmp_path, graph=True)
 
 
+@pytest.mark.npu_integration
+@pytest.mark.slow
+@pytest.mark.timeout(960)
+def test_onerec_v1_npu_b4_full_graph(tmp_path: Path) -> None:
+    _run_subprocess(tmp_path, b4=True)
+
+
 if __name__ == "__main__":
-    _run_npu_e2e(Path(sys.argv[1]), graph="--graph" in sys.argv[2:])
+    if "--b4" in sys.argv[2:]:
+        _run_b4_full_graph(Path(sys.argv[1]))
+    else:
+        _run_npu_e2e(Path(sys.argv[1]), graph="--graph" in sys.argv[2:])
