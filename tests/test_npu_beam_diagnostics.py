@@ -187,3 +187,72 @@ def test_forward_probe_observes_real_arguments_and_restores(
     assert event["actual_tokens"] == 4 and event["padded_tokens"] == 6
     assert event["gr_prefill_replay_delta"] == {"6": 1}
     json.dumps(events, allow_nan=False)
+
+
+@pytest.mark.parametrize("batch_size,input_len", [(1, 1024), (4, 1024), (1, 4096), (4, 4096)])
+def test_forward_probe_long_bound_and_cold_scheduler(batch_size: int, input_len: int) -> None:
+    total = batch_size * input_len
+    request_ids = [f"r{row}" for row in range(batch_size)]
+    context = SimpleNamespace(cudagraph_runtime_mode="NONE", skip_compiled=False, attn_metadata={})
+
+    class Runner:
+        def _model_forward(self, num_tokens_padded: int, input_ids: Any, positions: Any) -> Any:
+            return input_ids
+
+    runner: Any = Runner()
+    runner.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode="NONE", cudagraph_mode="NONE", cudagraph_capture_sizes=[]
+        )
+    )
+    runner.model_config = SimpleNamespace(enforce_eager=True)
+    runner.model = None
+    runner.input_batch = SimpleNamespace(req_ids=request_ids)
+    runner._gr_npu_stage_plan = SimpleNamespace(
+        execution=SimpleNamespace(
+            batch_size=batch_size, stage_index=0, kind="prefill", request_ids=request_ids
+        ),
+        model_token_count=total,
+    )
+    runner.requests = {
+        rid: SimpleNamespace(num_computed_tokens=0, prompt_token_ids=[1] * input_len)
+        for rid in request_ids
+    }
+    runner._current_scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={rid: input_len for rid in request_ids},
+        total_num_scheduled_tokens=total,
+    )
+    trace = NPUForwardTrace(
+        runner,
+        lambda: context,
+        expected_batch_size=batch_size,
+        max_padded_tokens=total,
+        record_cold=True,
+    )
+    inputs = torch.arange(total)
+    try:
+        with pytest.raises(RuntimeError, match="unexpected or unbounded"):
+            runner._model_forward(total + 1, inputs, inputs)
+        assert runner._model_forward(total, inputs, inputs) is inputs
+    finally:
+        events = trace.finish()
+    assert len(events) == 1
+    assert events[0]["input_ids"] == list(range(total))
+    assert events[0]["scheduled_total"] == total
+    assert (
+        events[0]["cold_rows"]
+        == [{"num_computed_tokens": 0, "prompt_tokens": input_len, "scheduled_tokens": input_len}]
+        * batch_size
+    )
+    assert "_model_forward" not in vars(runner)
+
+
+@pytest.mark.parametrize("batch_size,max_tokens", [(0, 512), (9, 512), (1, 0)])
+def test_forward_probe_rejects_unbounded_configuration(batch_size: int, max_tokens: int) -> None:
+    with pytest.raises(ValueError, match="bounded"):
+        NPUForwardTrace(
+            SimpleNamespace(),
+            lambda: None,
+            expected_batch_size=batch_size,
+            max_padded_tokens=max_tokens,
+        )
