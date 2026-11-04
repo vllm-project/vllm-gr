@@ -197,9 +197,17 @@ def _gather_shared_blocks(
     flat = active.reshape(-1)
     base = interleaved_pool_base(key_cache, value_cache)
     if base is not None:
-        gathered = base.index_select(0, flat)
-        gathered_key = gathered[:, 0].contiguous()
-        gathered_value = gathered[:, 1].contiguous()
+        # Gather K blocks followed by V blocks into one contiguous allocation.
+        # Selecting [block, K/V] first would leave strided halves and require
+        # copying both gathered tensors again before x_attention can read them.
+        block_indices = flat
+        if flat.dtype == torch.int32 and base.shape[0] > (torch.iinfo(torch.int32).max + 1) // 2:
+            block_indices = flat.to(torch.int64)
+        key_indices = block_indices * 2
+        packed_indices = torch.cat((key_indices, key_indices + 1))
+        packed = base.view(-1, *base.shape[2:]).index_select(0, packed_indices)
+        gathered_key = packed[: flat.numel()]
+        gathered_value = packed[flat.numel() :]
     else:
         # Contiguous or non-interleaved caches: direct per-tensor gather.
         gathered_key = key_cache.index_select(0, flat)

@@ -93,6 +93,78 @@ def test_shared_prefix_gather_preserves_key_value_and_block_routing(
         torch.testing.assert_close(gathered_value[remapped.long()], value[table[:, :width].long()])
 
 
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])  # type: ignore[misc]
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])  # type: ignore[misc]
+@pytest.mark.parametrize("max_valid_cols", [0, 2])  # type: ignore[misc]
+def test_interleaved_shared_gather_owns_disjoint_contiguous_key_value_views(
+    row_module: ModuleType,
+    batch_size: int,
+    dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    max_valid_cols: int,
+) -> None:
+    """Value's offset view must preserve routing and never alias paged KV.
+
+    This validates CPU storage math, including nonzero source offsets. The
+    native x_attention operator still needs its own NPU parity/replay check.
+    """
+    generator = torch.Generator().manual_seed(17)
+    pool = torch.randn(18, 2, 4, 2, 8, generator=generator).to(dtype)
+    layer_pool = pool[3:15]
+    key, value = layer_pool[:, 0], layer_pool[:, 1]
+    assert key.storage_offset() > 0
+    table = torch.tensor(
+        [[5, 2, 5, 11], [0, 9, 4, 4], [8, 3, 1, 10], [11, 2, 0, 7]][:batch_size],
+        dtype=index_dtype,
+    )
+    width = max_valid_cols or table.shape[1]
+    reference_key = key.index_select(0, table[:, :width].reshape(-1))
+    reference_value = value.index_select(0, table[:, :width].reshape(-1))
+    source_before = layer_pool.clone()
+
+    gathered_key, gathered_value, remapped = row_module._gather_shared_blocks(
+        key, value, table, max_valid_cols
+    )
+
+    torch.testing.assert_close(gathered_key, reference_key, rtol=0, atol=0)
+    torch.testing.assert_close(gathered_value, reference_value, rtol=0, atol=0)
+    assert gathered_key.dtype == dtype and gathered_value.dtype == dtype
+    assert gathered_key.is_contiguous() and gathered_value.is_contiguous()
+    assert gathered_key.untyped_storage().data_ptr() == gathered_value.untyped_storage().data_ptr()
+    assert gathered_key.untyped_storage().data_ptr() != pool.untyped_storage().data_ptr()
+    assert gathered_key.storage_offset() == 0
+    assert gathered_value.storage_offset() == gathered_key.numel()
+    assert remapped.dtype == index_dtype
+    torch.testing.assert_close(
+        gathered_key[remapped.long()], key[table[:, :width].long()], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        gathered_value[remapped.long()], value[table[:, :width].long()], rtol=0, atol=0
+    )
+
+    # The two offset views must not overlap, and neither may mutate paged KV.
+    gathered_key.zero_()
+    torch.testing.assert_close(gathered_value, reference_value, rtol=0, atol=0)
+    torch.testing.assert_close(layer_pool, source_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("interleaved", [False, True])  # type: ignore[misc]
+def test_shared_gather_preserves_empty_batch(row_module: ModuleType, interleaved: bool) -> None:
+    pool = torch.arange(8 * 2 * 4 * 2 * 8, dtype=torch.float32).reshape(8, 2, 4, 2, 8)
+    key, value = pool[:, 0], pool[:, 1]
+    if not interleaved:
+        key, value = key.contiguous(), value.contiguous()
+    table = torch.empty((0, 4), dtype=torch.int32)
+
+    gathered_key, gathered_value, remapped = row_module._gather_shared_blocks(key, value, table, 0)
+
+    assert gathered_key.shape == gathered_value.shape == (0, 4, 2, 8)
+    assert gathered_key.is_contiguous() and gathered_value.is_contiguous()
+    assert remapped.shape == table.shape
+    assert remapped.dtype == table.dtype
+
+
 def test_npu_dense_identity_rows_share_original_storage(
     row_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -349,3 +421,126 @@ def test_npu_packed_qkv_views_still_materialize_gather(dtype: torch.dtype, batch
         assert selected.is_contiguous()
         assert selected.untyped_storage().data_ptr() != tensor.untyped_storage().data_ptr()
         torch.testing.assert_close(selected, tensor[metadata.prefix_indices], rtol=0, atol=0)
+
+
+@pytest.mark.npu_integration  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "batch_size,beam_width,heads,kv_heads",
+    [(1, 128, 16, 8), (4, 128, 16, 8), (1, 32, 8, 8), (4, 32, 8, 8)],
+)
+def test_npu_shared_gather_attention_and_graph_replay_are_exact(
+    batch_size: int, beam_width: int, heads: int, kv_heads: int
+) -> None:
+    """Check offset K/V views at the real custom-op and ACL graph boundary.
+
+    The control keeps the old gather-then-two-copies layout. Both arms gather
+    a fixed 32-column table, including duplicate and out-of-order block IDs,
+    and must consume changing shared KV and table values on every replay.
+    """
+    _torch_npu, module = _native_modules()
+    from vllm_gr.ops.npu import beam_ops
+
+    dtype, device = torch.bfloat16, torch.device("npu")
+    rows, dim = batch_size * beam_width, 128
+    num_blocks, block_size, table_width = 7, 128, 32
+    torch.manual_seed(1907 + batch_size)
+    storage = torch.randn(10, 2, block_size, kv_heads, dim, dtype=dtype, device=device) * 0.1
+    shared_pool = storage[2:9]
+    shared_key, shared_value = shared_pool[:, 0], shared_pool[:, 1]
+    assert shared_key.storage_offset() > 0
+    table_cpu = (
+        torch.arange(batch_size * table_width, dtype=torch.int32).reshape(batch_size, table_width)
+        * 3
+        + 1
+    ) % num_blocks
+    table_cpu[:, :3] = torch.tensor(
+        [[5, 2, 5], [3, 1, 3], [6, 0, 2], [1, 6, 1]][:batch_size], dtype=torch.int32
+    )
+    table = table_cpu.to(device)
+    lengths_cpu = torch.tensor([127, 128, 129, 257][:batch_size], dtype=torch.int32)
+    lengths = lengths_cpu.to(device)
+    blocks = torch.arange(batch_size, dtype=torch.int32, device=device)
+    step = torch.ones(1, dtype=torch.int32, device=device)
+    query = torch.randn(rows, heads, dim, dtype=dtype, device=device) * 0.1
+    key = torch.randn(rows, kv_heads, dim, dtype=dtype, device=device) * 0.1
+    value = torch.randn_like(key) * 0.1
+    pools = [
+        (
+            torch.zeros(batch_size, beam_width, kv_heads, 3, dim, dtype=dtype, device=device),
+            torch.zeros(batch_size, beam_width, kv_heads, 3, dim, dtype=dtype, device=device),
+        )
+        for _ in range(2)
+    ]
+
+    def gather(mode: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if mode == 1:
+            return cast(
+                tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                module._gather_shared_blocks(shared_key, shared_value, table, 0),
+            )
+        flat = table.reshape(-1)
+        gathered = shared_pool.index_select(0, flat)
+        remapped = torch.arange(flat.numel(), dtype=table.dtype, device=device).reshape(table.shape)
+        return gathered[:, 0].contiguous(), gathered[:, 1].contiguous(), remapped
+
+    def run(mode: int) -> torch.Tensor:
+        gathered_key, gathered_value, remapped = gather(mode)
+        pool_key, pool_value = pools[mode]
+        beam_ops.cache_unshared_kv(pool_key, pool_value, key, value, blocks, step)
+        return beam_ops.x_attention(
+            query,
+            gathered_key,
+            gathered_value,
+            pool_key.view(rows, kv_heads, 3, dim),
+            pool_value.view(rows, kv_heads, 3, dim),
+            remapped,
+            lengths,
+            step,
+        )
+
+    with torch.inference_mode():
+        control = gather(0)
+        candidate = gather(1)
+        assert candidate[0].is_contiguous() and candidate[1].is_contiguous()
+        assert candidate[1].storage_offset() == candidate[0].numel() > 0
+        for expected, actual in zip(control, candidate):
+            torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+        for mode in (0, 1):
+            for _ in range(2):
+                run(mode)
+        torch.npu.synchronize()
+
+        graphs, outputs = [], []
+        for mode in (0, 1):
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                output = run(mode)
+            graphs.append(graph)
+            outputs.append(output)
+        inputs = (shared_pool, table, lengths, query, key, value, step)
+        addresses = tuple(tensor.data_ptr() for tensor in inputs)
+        for iteration in range(3):
+            shared_pool.copy_(torch.randn_like(shared_pool) * (0.1 + iteration * 0.03))
+            table.copy_((table_cpu + 2 * iteration + 1) % num_blocks)
+            if batch_size == 1:
+                lengths.fill_((127, 129, 257)[iteration])
+            else:
+                lengths.copy_(lengths_cpu.roll(iteration))
+            query.copy_(torch.randn_like(query) * 0.1)
+            key.copy_(torch.randn_like(key) * 0.1)
+            value.copy_(torch.randn_like(value) * 0.1)
+            step.fill_(1 + iteration % 2)
+
+            for expected, actual in zip(gather(0), gather(1)):
+                torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+            eager_control, eager_candidate = run(0), run(1)
+            for graph in graphs:
+                graph.replay()
+            torch.npu.synchronize()
+
+            assert addresses == tuple(tensor.data_ptr() for tensor in inputs)
+            torch.testing.assert_close(eager_control, eager_candidate, rtol=0, atol=0)
+            torch.testing.assert_close(outputs[0], eager_control, rtol=0, atol=0)
+            torch.testing.assert_close(outputs[1], eager_control, rtol=0, atol=0)
+            for expected, actual in zip(pools[0], pools[1]):
+                torch.testing.assert_close(expected, actual, rtol=0, atol=0)
