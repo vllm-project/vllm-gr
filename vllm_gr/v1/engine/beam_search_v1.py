@@ -51,6 +51,10 @@ class GRResourceStatus(str, Enum):
     CLOSED = "closed"
 
 
+class GRDeviceRequestError(ValueError):
+    """A request cannot run on an otherwise supported device configuration."""
+
+
 def _validate_gr_generation_params(params: BeamBatchParams) -> None:
     """Validate V1 generation semantics without constructing physical capacity."""
     if params.ignore_stop_tokens is not True:
@@ -156,13 +160,31 @@ def validate_gr_execution_runtime(config: Any) -> None:
         raise ValueError("Asynchronous scheduling does not support quantization")
 
 
+def validate_npu_unconstrained_runner(config: Any) -> None:
+    """Check the catalog-free NPU adapter before model or request allocation."""
+    from vllm_gr.v1.engine.npu_admission import (
+        validate_npu_unconstrained_runner as validate_runner,
+    )
+
+    validate_runner(config)
+
+
 def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
     """Reject unavailable adapters without importing a device runtime."""
+    from vllm_gr.config import GRConfig
+
     device = getattr(getattr(config, "device_config", None), "device", None)
     if device is not None and str(device).split(":")[0] not in ("cuda", "npu"):
         raise ValueError(
             "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
         )
+    gr_config = GRConfig.from_vllm_config(config)
+    if gr_config.beam_sid_stage_vocab and (device is None or str(device).split(":")[0] != "npu"):
+        raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
+    if device is not None and str(device).split(":")[0] == "npu":
+        from vllm_gr.v1.engine.npu_admission import validate_npu_device_config
+
+        validate_npu_device_config(config, gr_config, request)
     if (
         request is not None
         and request.beam_params.per_parent_beam_widths is not None
@@ -677,6 +699,7 @@ def validate_dispatch(
 
 __all__ = [
     "GRAsyncSchedulerInterface",
+    "GRDeviceRequestError",
     "GRDeviceStateRef",
     "GREngineCoreInterface",
     "GRExecutionCapacity",
@@ -695,4 +718,5 @@ __all__ = [
     "validate_gr_execution_config",
     "validate_gr_execution_runtime",
     "validate_gr_request",
+    "validate_npu_unconstrained_runner",
 ]

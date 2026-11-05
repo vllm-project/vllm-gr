@@ -90,6 +90,7 @@ def _admit_gr_session(self, batch_request) -> None:
     engine_requests = tuple(item.request for item in batch_request.items)
     try:
         from vllm_gr.v1.engine.beam_search_v1 import (
+            GRDeviceRequestError,
             validate_gr_device_config,
             validate_gr_execution_config,
             validate_gr_request,
@@ -117,7 +118,11 @@ def _admit_gr_session(self, batch_request) -> None:
         # engine started with the wrong settings is a server fault, not
         # something the caller can fix by resending.
         validate_gr_execution_config(self.vllm_config)
-        validate_gr_device_config(self.vllm_config)
+        device = getattr(getattr(self.vllm_config, "device_config", None), "device", None)
+        if str(device).split(":")[0] == "npu":
+            validate_gr_device_config(self.vllm_config, batch_request)
+        else:
+            validate_gr_device_config(self.vllm_config)
         if self.batch_queue is None or self.batch_queue_size < 2:
             raise RuntimeError("beam_search_v1 requires a non-blocking EngineCore batch queue")
         preprocessed_batch = []
@@ -128,6 +133,16 @@ def _admit_gr_session(self, batch_request) -> None:
             # The Worker separately detaches every mutable field it retains.
             owned_request.sampling_params = copy(engine_request.sampling_params)
             preprocessed_batch.append(self.preprocess_add_request(owned_request))
+    except GRDeviceRequestError as error:
+        # Device-specific request limits have the same answerable rejection
+        # contract as shared validation. Deployment faults still use the
+        # preprocessing handler below.
+        if getattr(self, "output_queue", None) is None:
+            from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
+
+            raise GRAdmissionError(str(error)) from error
+        send_gr_rejection(self, engine_requests[0], str(error))
+        return
     except Exception:
         handler = getattr(self, "_handle_request_preproc_error", None)
         if handler is None:

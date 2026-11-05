@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E402
 
 
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+# Skip before importing CUDA-only dependencies or newer vLLM GPU APIs.
+if os.environ.get("VLLM_GR_TARGET_DEVICE", "").lower() == "npu" or not torch.cuda.is_available():
+    pytest.skip("CUDA is required for this test.", allow_module_level=True)
+
 from vllm.config import CacheConfig, VllmConfig
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.utils import record_kv_cache_layout

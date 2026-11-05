@@ -329,6 +329,32 @@ def install_npu_stage_projection(runner: Any, backend: Any) -> NPUStageProjectio
     return projection
 
 
+def install_npu_sid_stage_projection(runner: Any, stage_vocab: Any) -> NPUStageProjection | None:
+    """Optionally project tokenizer SID families without a catalog Backend.
+
+    Disabling the projection through VLLM_GR_NPU_STAGE_LM_HEAD=0 retains
+    the stage-format semantics: candidate selection then masks full logits.
+    The same owner handles ordinary/dummy fallback and native weight updates.
+    """
+    parts = _supported_projection_parts(runner)
+    if parts is None:
+        return None
+    if stage_vocab.vocab_size >= stage_vocab.full_vocab_size:
+        return None
+    lm_head, processor = parts
+    if lm_head.weight.shape[0] < stage_vocab.full_vocab_size:
+        raise ValueError("SID stage vocabulary exceeds the loaded LM-head vocabulary")
+    projection = NPUStageProjection(runner, processor, lm_head, stage_vocab)
+    projection.install()
+    logger.info(
+        "NPU SID stage LM head ready: full vocabulary=%d, compact vocabulary=%d, stage sizes=%s",
+        stage_vocab.full_vocab_size,
+        projection.vocab_size,
+        projection.stage_token_counts,
+    )
+    return projection
+
+
 def _runner_projection(runner: Any) -> NPUStageProjection | None:
     projection = getattr(runner, "_gr_npu_stage_projection", None)
     return projection if projection is not None and not projection.closed else None

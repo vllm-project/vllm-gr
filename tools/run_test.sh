@@ -25,26 +25,36 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# test development suite
-./tests/development/test_resource.sh
-# test pre-commit
+if [ -n "${CONDA_PREFIX:-}" ]; then
+    export LD_LIBRARY_PATH=${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}
+    export PATH=${CONDA_PREFIX}/bin:${PATH:-}
+fi
+
 source "./tools/resource.sh"
 if [ "${npu_state:-}" == "true" ]; then
+    export VLLM_GR_TARGET_DEVICE=npu
+    # Jenkins must validate the same vendor Python that will run pytest.
+    # Installing the NPU GR extra does not upgrade the vendor runtime.
+    npu_runtime_spec=$(mktemp "${TMPDIR:-/tmp}/vllm-gr-npu-runtime.XXXXXX")
+    if ! python3 tools/ci/resolve_runtime.py resolve --device npu --output "$npu_runtime_spec"; then
+        rm -f -- "$npu_runtime_spec"
+        echo "NPU test runtime is incompatible with this checkout. Select the matching vendor environment before running this gate; see docs/quickstart-ascend.md." >&2
+        exit 1
+    fi
+    rm -f -- "$npu_runtime_spec"
     mem_th=3000
 else
     mem_th=18
 fi
 
+# test development suite only after checking the NPU vendor runtime
+./tests/development/test_resource.sh
+# test pre-commit
 idle_gpu=$(get_gpu $mem_th)
 rc=$?
 if [ $rc -ne 0 ] || [ -z "$idle_gpu" ]; then
     echo "No GPUs found that are 0% utilized, using < 16MiB memory, and error-free. (exit code: $rc)"
     exit 1
-fi
-
-if [ -n "${CONDA_PREFIX:-}" ]; then
-    export LD_LIBRARY_PATH=${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}
-    export PATH=${CONDA_PREFIX}/bin:${PATH:-}
 fi
 
 echo "running on device $idle_gpu"

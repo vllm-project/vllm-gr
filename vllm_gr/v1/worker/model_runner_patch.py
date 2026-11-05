@@ -349,6 +349,12 @@ def apply_worker_patches() -> None:
                 load_model, max_batch=constraint_max_batch
             )
 
+        platform_load_patcher = getattr(platform_module, "make_patched_load_model", None)
+        if platform_load_patcher is not None and callable(
+            getattr(runner_class, "load_model", None)
+        ):
+            runner_class.load_model = platform_load_patcher(runner_class.load_model)
+
         reload_patcher = getattr(platform_module, "make_patched_reload_weights", None)
         reload_weights = getattr(runner_class, "reload_weights", None)
         if reload_patcher is not None and callable(reload_weights):
@@ -369,6 +375,10 @@ def apply_worker_patches() -> None:
             runner_class.shutdown = make_shutdown_with_constraint_backend(
                 shutdown if callable(shutdown) else None
             )
+
+        platform_shutdown_patcher = getattr(platform_module, "make_patched_shutdown", None)
+        if platform_shutdown_patcher is not None:
+            runner_class.shutdown = platform_shutdown_patcher(runner_class.shutdown)
 
         runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
         update_states_patch = getattr(platform_module, "make_patched_update_states", None)

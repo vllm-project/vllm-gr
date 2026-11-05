@@ -110,6 +110,38 @@ python -c "import numpy, cv2; print('numpy', numpy.__version__, 'cv2', cv2.__ver
 
 ## Dependency checking on Ascend
 
+### Jenkins test runtime
+
+`tools/run_test.sh` checks the active NPU Python against the versions declared
+by the checkout before running resource tests, selecting a device or loading
+custom operators. The check uses `tools/ci/resolve_runtime.py`, as the GitHub
+Actions runtime setup does. It reports the required and installed versions
+and fails when they disagree.
+
+An older Jenkins job or Conda environment named `vllm-gr-0.22` or
+`xGr-install-22` does not become a 0.30 runtime after installing this
+repository. The NPU extra intentionally leaves the vendor stack to the base
+environment. Run the job inside the validated vendor image described above,
+and ensure `CONDA_PREFIX`, `PATH` and the CANN environment all select that
+same runtime. Do not copy an old CANN custom-operator build into the new
+image; rebuild it for the image's CANN version.
+
+Before installing GR or launching the gate, the selected Python can check
+the base environment without importing vLLM or allocating an NPU:
+
+```bash
+python3 tools/ci/resolve_runtime.py resolve --device npu \
+  --output /tmp/vllm-gr-npu-runtime.json
+VLLM_GR_TARGET_DEVICE=npu python3 -m pip install -e ".[dev]" --no-build-isolation
+bash tools/run_test.sh
+```
+
+GPU-only attention tests skip on the NPU target before importing CUDA-only
+vLLM APIs. That device boundary does not make an older vendor runtime
+compatible; the runtime check remains required.
+
+### Vendor package metadata
+
 Keep the output of `python -m pip check` as an environment diagnostic. The
 validated image has known metadata conflicts, so that command alone cannot
 establish whether this vendor runtime works. Recorded reports include:

@@ -624,6 +624,15 @@ def create_engine_config(self, usage_context=None, headless=False):
             beam_worker_decision=worker_decision,
         )
 
+    if (
+        effective_gr_config.constrained_generation is False
+        and effective_gr_config.beam_max_width is not None
+        and _is_npu_platform()
+    ):
+        from vllm_gr.v1.engine.beam_search_v1 import validate_npu_unconstrained_runner
+
+        validate_npu_unconstrained_runner(config)
+
     if effective_gr_config.constrained_generation is False:
         from vllm_gr.ops.sliced_logits import set_vocab_slice_config
 

@@ -1911,9 +1911,8 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> 
 def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import gpu_beam_stage_runner
-    from vllm_gr.v1.worker import model_runner_common as common
-    from vllm_gr.v1.worker import npu_beam_stage_runner
+    import vllm_gr.v1.worker.model_runner_common as common
+    from vllm_gr.v1.worker import gpu_beam_stage_runner, npu_beam_stage_runner
 
     output = object()
     stage = SimpleNamespace(execute=Mock(return_value=output))
@@ -2711,7 +2710,7 @@ def test_npu_parent_history_follows_output_options_through_session(
 
     worker = SimpleNamespace(
         device=torch.device("cpu"),
-        _vllm_gr_config=object(),
+        _vllm_gr_config=SimpleNamespace(constrained_generation=True),
         _gr_npu_graph_context=context,
         _gr_npu_beam_graph_shapes={(batch_size, 3)},
         constraint_backend=SimpleNamespace(

@@ -33,6 +33,7 @@ from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRRetireMetadata,
     GRRetireResult,
+    GRStageMetadata,
     GRWorkerResult,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import (
@@ -424,30 +425,37 @@ class NPUEagerBeamStageRunner:
         plan = self.pending_plan
         if grammar_output is not None or plan is None or self.logits is None:
             raise RuntimeError("NPU GR sample requires one pending stage and no grammar")
-        metadata = ConstraintMetadata(
-            prefix_token_ids=self._constraint_prefixes(plan),
-            temperatures=torch.full(
-                (plan.execution.num_execution_rows,),
-                float(
-                    self._metadata(self.worker._current_scheduler_output).beam_params.temperature
+        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+        stage_metadata = self._metadata(self.worker._current_scheduler_output)
+        if _get_gr_config(self.worker).constrained_generation is False:
+            candidates = self._select_unconstrained_candidates(
+                self.logits.contiguous(), stage_metadata
+            )
+        else:
+            metadata = ConstraintMetadata(
+                prefix_token_ids=self._constraint_prefixes(plan),
+                temperatures=torch.full(
+                    (plan.execution.num_execution_rows,),
+                    float(stage_metadata.beam_params.temperature),
+                    dtype=torch.float32,
+                    device=self.logits.device,
                 ),
-                dtype=torch.float32,
-                device=self.logits.device,
-            ),
-            current_step=plan.execution.stage_index,
-            top_k=plan.execution.candidate_top_k,
-        )
-        backend = getattr(self.worker, "constraint_backend", None)
-        if backend is None or not callable(getattr(backend, "select", None)):
-            raise RuntimeError("NPU GR requires a loaded canonical constraint backend")
-        candidates = self._select_constraint_candidates(backend, self.logits.contiguous(), metadata)
+                current_step=plan.execution.stage_index,
+                top_k=plan.execution.candidate_top_k,
+            )
+            backend = getattr(self.worker, "constraint_backend", None)
+            if backend is None or not callable(getattr(backend, "select", None)):
+                raise RuntimeError("NPU GR requires a loaded canonical constraint backend")
+            candidates = self._select_constraint_candidates(
+                backend, self.logits.contiguous(), metadata
+            )
         expected = (
             plan.execution.num_execution_rows,
             plan.execution.candidate_top_k,
         )
         if tuple(candidates.token_ids.shape) != expected:
-            raise RuntimeError("NPU constraint backend returned an invalid candidate shape")
-        stage_metadata = self._metadata(self.worker._current_scheduler_output)
+            raise RuntimeError("NPU candidate selection returned an invalid candidate shape")
         is_last = bool(stage_metadata.is_last_stage)
         terminal_result = None
         execution = plan.execution
@@ -543,6 +551,52 @@ class NPUEagerBeamStageRunner:
         self.worker.execute_model_state = None
         self.worker.kv_connector_output = None
         return output
+
+    def _select_unconstrained_candidates(
+        self,
+        logits: torch.Tensor,
+        metadata: GRStageMetadata,
+    ) -> ConstraintOutput:
+        """Select full-vocabulary candidates without catalog or prefix state."""
+        from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
+
+        plan = self.pending_plan
+        if plan is None:
+            raise RuntimeError("NPU candidate selection requires a pending stage")
+        temperatures = torch.full(
+            (plan.execution.num_execution_rows,),
+            float(metadata.beam_params.temperature),
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+        if getattr(_get_gr_config(self.worker), "beam_sid_stage_vocab", False):
+            from vllm_gr.ops.npu.sid_stage_vocab import select_sid_stage_candidates
+
+            stage_vocab = getattr(self.worker, "_gr_npu_sid_stage_vocab", None)
+            if stage_vocab is None:
+                raise RuntimeError("NPU SID stage selection requires loaded tokenizer stage maps")
+            compact = logits.shape[-1] != stage_vocab.full_vocab_size
+            if compact:
+                projection = getattr(self.worker, "_gr_npu_stage_projection", None)
+                if (
+                    projection is None
+                    or projection.closed
+                    or logits.shape[-1] != stage_vocab.vocab_size
+                ):
+                    raise RuntimeError(
+                        "NPU SID stage selection received unsupported compact logits"
+                    )
+            return select_sid_stage_candidates(
+                logits,
+                temperatures,
+                plan.execution.candidate_top_k,
+                plan.execution.stage_index,
+                stage_vocab,
+                compact_logits=compact,
+            )
+        return select_unconstrained_candidates(logits, temperatures, plan.execution.candidate_top_k)
 
     def _select_constraint_candidates(
         self,

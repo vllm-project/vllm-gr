@@ -158,8 +158,8 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     unconstrained = gr_config.constrained_generation is False
     device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
     device_type = str(device).split(":")[0]
-    if unconstrained and device_type != "cuda":
-        raise BeamSearchRequestError("unconstrained beam_search_v1 requires CUDA")
+    if unconstrained and device_type not in ("cuda", "npu"):
+        raise BeamSearchRequestError("unconstrained beam_search_v1 requires CUDA or NPU")
     required_backend = (
         ConstraintTableBackendEnum.NPU if device_type == "npu" else ConstraintTableBackendEnum.CUDA
     )

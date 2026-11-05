@@ -336,6 +336,11 @@ def validate_npu_eager_capabilities(worker: object) -> None:
     model = getattr(worker, "model_config", None)
     if device_type != "npu":
         raise ValueError("NPU eager Beam execution requires an NPU worker")
+    config = getattr(worker, "vllm_config", None)
+    if config is not None:
+        from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
+
+        validate_gr_device_config(config)
     if not bool(getattr(worker, "use_async_scheduling", False)):
         raise ValueError("fixed Batch Session execution requires async scheduling")
     context_parallel = (

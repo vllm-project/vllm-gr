@@ -179,6 +179,19 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
         discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
     )
+    platform_hooks: list[str] = []
+    if platform_module_name == model_runner_patch._NPU_PATCH_MODULE:
+
+        def install_platform_load(original: Any) -> Any:
+            platform_hooks.append("load")
+            return original
+
+        def install_platform_shutdown(original: Any) -> Any:
+            platform_hooks.append("shutdown")
+            return original
+
+        platform_module.make_patched_load_model = install_platform_load
+        platform_module.make_patched_shutdown = install_platform_shutdown
     monkeypatch.setattr(
         model_runner_patch,
         "_get_active_platform_module",
@@ -208,6 +221,10 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
     # In-place weight reloads do not rebuild the tokenizer/vocab-bound Backend.
     assert Runner.reload_weights is reload_weights
     assert model_runner_patch.is_worker_runner_patched(Runner)
+    expected_hooks = ["load", "shutdown"] if expected_max_batch > 1 else []
+    assert platform_hooks == expected_hooks
+    model_runner_patch.apply_worker_patches()
+    assert platform_hooks == expected_hooks
 
 
 def test_npu_module_exports_sample_tokens_alias() -> None:

@@ -22,6 +22,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm_gr.ops.npu_stage_logits import (
     NPUStageProjection,
     can_install_npu_stage_projection,
+    install_npu_sid_stage_projection,
     install_npu_stage_projection,
     install_npu_stage_weight_update_hooks,
     make_npu_stage_reload_weights,
@@ -133,8 +134,9 @@ def test_three_stage_projection_preserves_original_processor_semantics(
     assert snapshot["fallback_counts"] == {}
 
 
+@pytest.mark.parametrize("sid_domain", [False, True])
 def test_stage_projection_routes_replicated_mode_under_ascend_dispatch(
-    context: Any, monkeypatch: pytest.MonkeyPatch
+    context: Any, monkeypatch: pytest.MonkeyPatch, sid_domain: bool
 ) -> None:
     """Survive the AscendLogitsProcessor swap installed by engine startup.
 
@@ -184,14 +186,24 @@ def test_stage_projection_routes_replicated_mode_under_ascend_dispatch(
         stage_vocab=SimpleNamespace(vocab_size=128, stage_token_ids=context.ids),
         info=SimpleNamespace(table_metadata=SimpleNamespace(vocab_size=384)),
     )
-    projection = install_npu_stage_projection(runner, backend)
+    if sid_domain:
+        from vllm_gr.ops.npu.sid_stage_vocab import NPUSIDStageVocab
+
+        vocab = NPUSIDStageVocab(384, 128, context.ids)
+        projection = install_npu_sid_stage_projection(runner, vocab)
+    else:
+        projection = install_npu_stage_projection(runner, backend)
     assert projection is not None
     hidden = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 20
     try:
-        actual = processor.forward(head, hidden, head.bias)
-        expected = F.linear(hidden, head.weight, head.bias)[:, context.ids[0].tolist()]
-        assert actual.shape == (2, 128)
-        torch.testing.assert_close(actual[:, : context.ids[0].numel()], expected)
+        full = F.linear(hidden, head.weight, head.bias)
+        for stage, ids in enumerate(context.ids):
+            plan.execution.stage_index = stage
+            actual = processor.forward(head, hidden, head.bias)
+            assert actual.shape == (2, 128)
+            torch.testing.assert_close(actual[:, : ids.numel()], full.index_select(1, ids))
+            torch.testing.assert_close(actual[:, ids.numel() :], torch.zeros(2, 128 - ids.numel()))
+        assert projection.projection_counts == [1, 1, 1]
         # Without an active plan the same Ascend processor falls back to the
         # full-vocabulary projection through the source head.
         runner._gr_npu_stage_runner = SimpleNamespace(pending_plan=None)
@@ -222,9 +234,12 @@ def test_steady_state_reuses_prepared_weights(
     assert projection.projection_counts == [2, 2, 2]
 
 
-def test_skip_gather_is_forwarded_for_compact_and_fallback_projection(context: Any) -> None:
+@pytest.mark.parametrize("sid_domain", [False, True])
+def test_skip_gather_is_forwarded_for_compact_and_fallback_projection(
+    context: Any, sid_domain: bool
+) -> None:
     ctx = context
-    projection = _install(ctx)
+    projection = _install_sid(ctx)[0] if sid_domain else _install(ctx)
     original = projection._original
     calls = []
 
@@ -239,7 +254,7 @@ def test_skip_gather_is_forwarded_for_compact_and_fallback_projection(context: A
 
     projection._original = observed_original
     compact = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias, skip_gather=True)
-    assert compact.shape == (2, 128)
+    assert compact.shape == (2, projection.vocab_size)
     ctx.runner._gr_npu_stage_plan = None
     fallback = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias, skip_gather=True)
     assert fallback.shape == (2, 384)
@@ -782,3 +797,96 @@ def test_npu_hot_update_refreshes_inference_buffers_at_native_boundary(
         _assert_current_stage_logits(ctx)
         assert _projection_addresses(owner) == addresses
         assert owner.snapshot()["refresh_count"] == generation
+
+
+def _install_sid(ctx: Any) -> tuple[NPUStageProjection, Any]:
+    from vllm_gr.ops.npu.sid_stage_vocab import NPUSIDStageVocab
+
+    vocab = NPUSIDStageVocab(384, max(ids.numel() for ids in ctx.ids), ctx.ids)
+    # This path is intentionally independent of the table Backend.
+    ctx.backend.stage_vocab = None
+    owner = install_npu_sid_stage_projection(ctx.runner, vocab)
+    assert owner is not None
+    ctx.runner._gr_npu_stage_projection = owner
+    return owner, vocab
+
+
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_sid_projection_preserves_stage_scores_padding_and_ordinary_fallback(
+    context: Any, use_bias: bool
+) -> None:
+    from vllm_gr.ops.npu.sid_stage_vocab import select_sid_stage_candidates
+
+    ctx = context
+    if not use_bias:
+        ctx.head.bias = None
+    ctx.processor.scale, ctx.processor.soft_cap = 0.7, 13.0
+    full = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias)
+    owner, vocab = _install_sid(ctx)
+    for stage, ids in enumerate(ctx.ids):
+        ctx.runner._gr_npu_stage_plan.execution.stage_index = stage
+        compact = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias)
+        assert compact.shape == (2, vocab.vocab_size)
+        torch.testing.assert_close(compact[:, : ids.numel()], full.index_select(1, ids))
+        torch.testing.assert_close(
+            compact[:, ids.numel() :], torch.zeros_like(compact[:, ids.numel() :])
+        )
+        temperature = torch.tensor([0.0, 0.5])
+        baseline = select_sid_stage_candidates(full, temperature, 6, stage, vocab)
+        selected = select_sid_stage_candidates(
+            compact, temperature, 6, stage, vocab, compact_logits=True
+        )
+        torch.testing.assert_close(selected.token_ids, baseline.token_ids, atol=0, rtol=0)
+        torch.testing.assert_close(selected.logprobs, baseline.logprobs)
+        assert torch.equal(selected.valid_mask, baseline.valid_mask)
+    assert owner.projection_counts == [1, 1, 1]
+    ctx.runner._gr_npu_stage_plan = None
+    torch.testing.assert_close(ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias), full)
+    assert owner.snapshot()["fallback_counts"] == {"no_active_stage": 1}
+    owner.close()
+    torch.testing.assert_close(ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias), full)
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_sid_projection_reuses_transactional_weight_cache_refresh(
+    context: Any, checkpoint: bool
+) -> None:
+    ctx = context
+    owner, vocab = _install_sid(ctx)
+    addresses = _projection_addresses(owner)
+    worker = _streaming_worker(ctx)
+    worker.start_weight_update(is_checkpoint_format=checkpoint)
+    worker.update_weights({"weights": [("weight", ctx.head.weight + 0.25)]})
+    worker.update_weights({"weights": [("bias", ctx.head.bias + 0.5)]})
+    with pytest.raises(RuntimeError, match="cannot run during"):
+        ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias)
+    worker.finish_weight_update()
+    full = F.linear(ctx.hidden, ctx.head.weight, ctx.head.bias)
+    for stage, ids in enumerate(ctx.ids):
+        ctx.runner._gr_npu_stage_plan.execution.stage_index = stage
+        actual = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias)
+        assert actual.shape[-1] == vocab.vocab_size
+        torch.testing.assert_close(actual[:, : ids.numel()], full.index_select(1, ids))
+        assert not actual[:, ids.numel() :].count_nonzero()
+    assert _projection_addresses(owner) == addresses
+    assert owner.snapshot()["refresh_count"] == 1
+    assert owner.snapshot()["weights_valid"]
+
+
+@pytest.mark.parametrize("reason", ["disabled", "lora", "quantized"])
+def test_sid_projection_remains_optional_for_ineligible_or_disabled_models(
+    context: Any, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    from vllm_gr.ops.npu.sid_stage_vocab import NPUSIDStageVocab
+
+    ctx = context
+    vocab = NPUSIDStageVocab(384, 4, ctx.ids)
+    original = ctx.processor._get_logits
+    if reason == "disabled":
+        monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "0")
+    elif reason == "lora":
+        ctx.runner.lora_config = SimpleNamespace()
+    else:
+        ctx.head.quant_method = SimpleNamespace()
+    assert install_npu_sid_stage_projection(ctx.runner, vocab) is None
+    assert ctx.processor._get_logits == original
