@@ -52,10 +52,21 @@ device_overrides:
     boards:
       Ascend910_9362:
         thresholds:
+          accuracy: *decode_graph_accuracy
           performance: &ascend910_9362_performance
             p99_ttft_max: 280
             online_elapsed_seconds_max: 20
             offline_elapsed_seconds_max: 25
+      Ascend_9362:
+        # Compatibility alias; retain the default performance thresholds.
+        thresholds:
+          accuracy: *decode_graph_accuracy
+      Ascend910B1:
+        thresholds:
+          accuracy: *decode_graph_accuracy
+      unknown:
+        thresholds:
+          accuracy: *decode_graph_accuracy
       decode_graph_npu:
         thresholds:
           accuracy: *decode_graph_accuracy

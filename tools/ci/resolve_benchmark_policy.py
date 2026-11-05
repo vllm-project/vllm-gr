@@ -358,10 +358,17 @@ def resolve_policy(policy: dict[str, Any], device: str, board_id: str) -> dict[s
         raise PolicyError(f"device must be gpu or npu, got {device!r}")
     validated = _validate_policy(policy)
     thresholds = deepcopy(validated["thresholds"])
-    board_override = validated["device_overrides"].get(device, {}).get("boards", {}).get(board_id)
+    boards = validated["device_overrides"].get(device, {}).get("boards", {})
+    board_override = boards.get(board_id)
     if board_override:
         for group, override_values in board_override["thresholds"].items():
             thresholds[group].update(override_values)
+    if device == "npu":
+        # Apply the shared NPU accuracy floor after board-specific performance
+        # settings; policies without this profile retain their existing floors.
+        accuracy_override = boards.get("decode_graph_npu", {}).get("thresholds", {}).get("accuracy")
+        if accuracy_override is not None:
+            thresholds["accuracy"].update(accuracy_override)
 
     accuracy = thresholds["accuracy"]
     performance = thresholds["performance"]

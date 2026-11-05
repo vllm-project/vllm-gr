@@ -82,29 +82,29 @@ All three profiles reuse the same accuracy floors. The `Ascend910_9362` profile
 also reuses its existing performance overrides: TTFT 280, online elapsed 20 s,
 and offline elapsed 25 s. Other devices keep the default performance thresholds.
 
-On other branches, GPUs retain `unknown` and NPUs retain their detected board
-ID. Pangu policy and performance modes are unchanged. All three Video-100
-accuracy metrics remain blocking wherever that gate runs. If another
-board-specific performance override is added later, the logical profile must
-preserve that override as well.
+The resolver applies the `decode_graph_npu` accuracy profile to every NPU board,
+regardless of target branch. It first applies the physical board's overrides,
+so performance thresholds and the reported board ID remain unchanged. GPU
+selection remains branch-scoped. Pangu settings and the blocking accuracy mode
+remain unchanged.
 
-This policy affects all GPU and NPU PRs targeting `main` or `decode_graph`, not
-only the parent-score PR. The YAML override itself is not branch-aware; branch
-selection is enforced by the workflow before policy resolution. Legacy workflows
-without these selectors retain the old accuracy floors.
+For compatibility with older resolvers, the YAML explicitly assigns these
+accuracy floors to `Ascend910_9362`, `Ascend_9362`, `Ascend910B1` and
+`unknown`. `Ascend_9362` is a possible alias that has not been verified against
+a 910C runtime. Older resolvers only recognize exact IDs; other NPU IDs need
+the updated resolver or an explicit logical profile to receive these floors.
+The strict bootstrap policy and policies without the NPU profile retain their
+own accuracy floors.
+
+An independent Jenkins pipeline must load the updated policy and resolver.
+Updating this repository does not update that external pipeline automatically.
 
 ## Rollout order
 
-CI continues fetching the policy YAML and resolver from the PR target's
-`base.sha`; the candidate YAML is only linted. This PR cannot self-approve its
-new floors by reading head-owned policy.
-
-The logical selectors and floors were first landed on `decode_graph` and are
-also present on `main`. Any future change to the policy still requires updating
-the target branch before its PRs can use that change.
-
-Changing only the candidate YAML does not change the thresholds for that PR's
-run. Do not switch to head-owned policy to make the prerequisite pass.
+GitHub Actions uses the resolver from the PR target's pinned `base.sha`. A
+changed candidate policy can be used only after the required approval for the
+current PR head. The independent Jenkins pipeline may use a different policy
+source; confirm its effective source and thresholds in its own logs.
 
 After updating the runtime PR, check the **Resolve benchmark policy** job's
 summary for the source ref, the device's policy selector above, and the effective
