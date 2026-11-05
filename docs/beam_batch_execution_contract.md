@@ -204,6 +204,13 @@ advances native accounting by one logical token while Worker execution uses
 physical Beam rows. NPU stage widths and CUDA fixed-width state have their
 own adapter checks.
 
+NPU Decode binds the previous stage's latest winner tensor directly through
+`NPUEagerStagePlan.prepare_decode_inputs`, for both the first and subsequent
+Decode steps. Prefill winners must have shape `(B, output_width)` before they
+become the latest tokens; Decode consumes `(B, input_width)` previous winners.
+Request-level sampling metadata expands through the active `InputBatchProxy`.
+There is no separate first-Decode handoff or attention-layout state.
+
 The runtime currently admits one execution owner with two dispatch slots.
 Persistent buffers are rebound/reset under matching ownership; physical KV
 zeroing is not a wire-protocol requirement. Completion, cancellation, and

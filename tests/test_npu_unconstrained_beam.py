@@ -258,6 +258,8 @@ def test_catalog_free_prefill_uses_full_vocab_without_constraint_state(
 ) -> None:
     stage = _prefill_runner(batch_size, constrained=False)
     assert stage.logits is not None
+    assert stage.pending_plan is not None
+    execution = stage.pending_plan.execution
     logits = stage.logits.clone()
     # A leftover backend must not override explicit unconstrained generation.
     stage.worker.constraint_backend = SimpleNamespace(
@@ -270,7 +272,7 @@ def test_catalog_free_prefill_uses_full_vocab_without_constraint_state(
     assert stage.prefill_candidates is not None
     _assert_matches_reference(stage.prefill_candidates, logits, torch.full((batch_size,), 0.5), 2)
     assert stage.latest_token_ids is stage.prefill_candidates.token_ids
-    assert stage.handoff is not None
+    assert stage.previous is execution
     receipt = output.gr_worker_results["catalog-free-session"]
     assert not receipt.finished and not receipt.resources_released
     assert receipt.owner_generation == 1 and receipt.terminal_result is None

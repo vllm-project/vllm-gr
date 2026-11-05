@@ -21,7 +21,6 @@ from vllm_gr.v1.beam.npu_execution_batch import (
 from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
 from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
 from vllm_gr.v1.worker.npu_beam_stage_adapter import (
-    NPUEagerFirstDecodeHandoff,
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
@@ -146,9 +145,7 @@ def test_npu_prefill_cache_hit_uses_scheduled_logits_and_full_decode_positions(
     winners = torch.arange(len(cached) * 3, dtype=torch.int32).view(len(cached), 3)
     input_ids = torch.empty(len(cached) * 3, dtype=torch.int32)
     positions = torch.empty_like(input_ids)
-    NPUEagerFirstDecodeHandoff.from_prefill(plan, winners).bind_first_decode(
-        decode_plan, input_ids, positions
-    )
+    decode_plan.prepare_decode_inputs(input_ids, positions, winners)
     assert input_ids.tolist() == winners.flatten().tolist()
     assert positions.tolist() == [
         length for length in plan.execution.num_prompt_tokens_by_request for _ in range(3)
@@ -1455,27 +1452,24 @@ def test_npu_capture_logs_requested_and_retained_resources(
     assert "excludes graph and scratch memory" in messages[-1]
 
 
-def test_npu_eager_decode_binds_winners_and_sampling_rows() -> None:
-    prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
-    plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("decode_step", "expected_positions"),
+    [(0, [2, 2, 2, 3, 3, 3, -1, -1]), (1, [3, 3, 3, 4, 4, 4, -1, -1])],
+)
+def test_npu_eager_decode_binds_previous_winners(
+    decode_step: int, expected_positions: list[int]
+) -> None:
+    plan = NPUEagerStagePlan.from_scheduler_output(
+        _eager_stage_output(kind="decode", decode_step=decode_step)
+    )
     input_ids = torch.full((8,), -1, dtype=torch.int32)
     positions = torch.full((8,), -1, dtype=torch.int64)
     winners = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
-    handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
 
-    handoff.bind_first_decode(plan, input_ids, positions)
+    plan.prepare_decode_inputs(input_ids, positions, winners)
 
     assert input_ids.tolist() == [11, 12, 13, 21, 22, 23, -1, -1]
-    assert positions.tolist() == [2, 2, 2, 3, 3, 3, -1, -1]
-    source = SimpleNamespace(
-        temperature=torch.tensor([0.5, 0.9]),
-        top_p=torch.tensor([0.8, 0.7]),
-    )
-    remapped = plan.remap_sampling_metadata(source)
-    assert remapped is not source
-    assert remapped.temperature.tolist() == pytest.approx([0.5] * 3 + [0.9] * 3)
-    assert remapped.top_p.tolist() == pytest.approx([0.8] * 3 + [0.7] * 3)
-    assert source.temperature.tolist() == pytest.approx([0.5, 0.9])
+    assert positions.tolist() == expected_positions
 
 
 class _NPUPositionTensor(torch.Tensor):  # type: ignore[misc]
@@ -1821,23 +1815,6 @@ def test_npu_decode_positions_dynamic_widths_match_original_across_async_steps(
         assert torch.all(actual[rows:] == -9)
 
 
-def test_npu_eager_attention_layout_keeps_request_ownership() -> None:
-    plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
-    layout = plan.build_decode_attention_layout(
-        block_ids_by_request=((10, 11), (20, 21)),
-        pool_slots=(4, 7),
-    )
-
-    assert layout.row_request_indices == (0, 0, 0, 1, 1, 1)
-    assert layout.row_beam_indices == (0, 1, 2, 0, 1, 2)
-    assert layout.query_start_locations == tuple(range(7))
-    assert layout.prefix_sequence_lengths == (2, 2, 2, 3, 3, 3)
-    assert layout.suffix_sequence_lengths == (1,) * 6
-    assert layout.prefix_block_tables[:3] == ((10, 11),) * 3
-    assert layout.prefix_block_tables[3:] == ((20, 21),) * 3
-    assert layout.pool_slots == (4, 7)
-
-
 def test_npu_capability_gate_allows_graph_mode_and_remains_npu_only() -> None:
     worker = SimpleNamespace(
         device="npu",
@@ -1859,12 +1836,21 @@ def test_npu_capability_gate_allows_graph_mode_and_remains_npu_only() -> None:
         validate_npu_eager_capabilities(worker)
 
 
-def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> None:
-    scheduler_output = _eager_stage_output(kind="decode")
+@pytest.mark.parametrize("decode_step", [0, 1])  # type: ignore[misc]
+def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler(
+    decode_step: int,
+) -> None:
+    scheduler_output = _eager_stage_output(kind="decode", decode_step=decode_step)
     plan = NPUEagerStagePlan.from_scheduler_output(scheduler_output)
-    prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
     winners = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
-    input_batch = SimpleNamespace(req_ids=list(plan.execution.request_ids))
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([0.5, 0.9]),
+        top_p=torch.tensor([0.8, 0.7]),
+        top_k=torch.tensor([5, 9], dtype=torch.int32),
+    )
+    input_batch = SimpleNamespace(
+        req_ids=list(plan.execution.request_ids), sampling_metadata=sampling_metadata
+    )
     worker = SimpleNamespace(
         device=torch.device("cpu"),
         input_ids=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32)),
@@ -1876,7 +1862,6 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> 
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker = worker
     stage.pending_plan = plan
-    stage.handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
     stage.latest_token_ids = winners
     runtime_output = stage._runtime_scheduler_output(scheduler_output, plan)
     worker._current_scheduler_output = runtime_output
@@ -1902,10 +1887,23 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> 
         "request-1": 1,
     }
     assert worker.input_ids.gpu[:6].tolist() == [11, 12, 13, 21, 22, 23]
-    assert worker.positions[:6].tolist() == [2, 2, 2, 3, 3, 3]
+    assert worker.positions[:6].tolist() == [value + decode_step for value in (2, 2, 2, 3, 3, 3)]
     assert logits.tolist() == list(range(6))
     assert total == 6
     assert isinstance(worker.input_batch, InputBatchProxy)
+    # Bookkeeping retains B logical ids; indexed/copy access maps B*W rows.
+    assert len(worker.input_batch.req_ids) == 2
+    assert worker.input_batch.req_ids.copy() == ["request-0"] * 3 + ["request-1"] * 3
+    assert worker.input_batch.req_ids[3] == "request-1"
+    assert input_batch.req_ids == ["request-0", "request-1"]
+    assert worker._current_beam_info["req_ids"] == input_batch.req_ids
+    remapped = worker.input_batch.sampling_metadata
+    assert remapped is sampling_metadata
+    assert remapped.temperature.tolist() == pytest.approx([0.5] * 3 + [0.9] * 3)
+    assert remapped.top_p.tolist() == pytest.approx([0.8] * 3 + [0.7] * 3)
+    assert remapped.top_k.tolist() == [5] * 3 + [9] * 3
+    assert remapped.top_k.dtype == torch.int32
+    assert remapped.temperature.is_contiguous() and remapped.top_p.is_contiguous()
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu", "cpu"])  # type: ignore[misc]
@@ -2029,7 +2027,6 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker, stage.previous = worker, prefill.execution
     stage.closed, stage.pending_plan, stage.execution_error = False, None, None
-    stage.handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
     stage.latest_token_ids = winners
     stage.session_request = None
     stage.attention_batch = SimpleNamespace(
@@ -2191,7 +2188,6 @@ def test_npu_stage_runner_receipt_preserves_owner_generation() -> None:
     stage.pending_plan = plan
     stage.logits = torch.zeros((1, 16), dtype=torch.float32)
     stage.prefill_candidates = None
-    stage.handoff = None
     stage.latest_token_ids = None
     stage.attention_batch = None
     stage.closed = False
@@ -2200,6 +2196,127 @@ def test_npu_stage_runner_receipt_preserves_owner_generation() -> None:
 
     result = output.gr_worker_results[plan.execution.session_id]
     assert result.owner_generation == plan.execution.owner_generation == 1
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("candidate_top_k", "candidate_shape", "error_type", "message"),
+    [
+        (3, (2, 3), BeamExecutionContractError, "Prefill winner_token_ids must have shape (2, 2)"),
+        (1, (2, 1), BeamExecutionContractError, "Prefill winner_token_ids must have shape (2, 2)"),
+        (3, (2, 2), RuntimeError, "NPU candidate selection returned an invalid candidate shape"),
+        (2, (1, 2), RuntimeError, "NPU candidate selection returned an invalid candidate shape"),
+    ],
+)
+def test_npu_prefill_sample_preserves_candidate_and_winner_shape_errors(
+    candidate_top_k: int,
+    candidate_shape: tuple[int, int],
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    scheduled = _eager_stage_output(kind="prefill", beam_width=2 if candidate_top_k == 1 else 4)
+    metadata = next(iter(scheduled.gr_stage_metadata.values()))
+    metadata.beam_params.temperature = 0.0
+    # A dynamic schedule rejects K < W before sampling; exercise that case
+    # through fixed-width execution so it reaches the winner-shape check.
+    if candidate_top_k != 1:
+        metadata.beam_params.dynamic_beam_widths = (2, 2, 2)
+    metadata.beam_params.candidate_width = candidate_top_k
+    metadata.is_last_stage = False
+    plan = NPUEagerStagePlan.from_scheduler_output(scheduled)
+    candidates = ConstraintOutput(
+        token_ids=torch.ones(candidate_shape, dtype=torch.int32),
+        logprobs=torch.zeros(candidate_shape),
+        valid_mask=torch.ones(candidate_shape, dtype=torch.bool),
+    )
+
+    def select(logits: torch.Tensor, constraint: ConstraintMetadata) -> ConstraintOutput:
+        assert constraint.current_step == 0 and constraint.top_k == candidate_top_k
+        return candidates
+
+    worker = SimpleNamespace(
+        _current_scheduler_output=scheduled,
+        constraint_backend=SimpleNamespace(info=SimpleNamespace(max_rows=2), select=select),
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.worker, stage.pending_plan, stage.execution_error = worker, plan, None
+    previous_candidates = object()
+    previous_token_ids = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
+    logits = torch.zeros((2, 16))
+    stage.prefill_candidates = previous_candidates
+    stage.latest_token_ids = previous_token_ids
+    stage.logits = logits
+
+    with pytest.raises(error_type) as error:
+        stage.sample()
+
+    assert error.type is error_type
+    assert str(error.value) == message
+
+    if error_type is BeamExecutionContractError:
+        assert stage.prefill_candidates is candidates
+    else:
+        assert stage.prefill_candidates is previous_candidates
+    assert stage.latest_token_ids is previous_token_ids
+    assert stage.pending_plan is plan
+    assert stage.logits is logits
+
+
+def test_npu_decode_sample_accepts_candidate_width_distinct_from_winner_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker import npu_beam_stage_runner
+
+    scheduled = _eager_stage_output(kind="decode", batch_size=1, beam_width=2)
+    metadata = next(iter(scheduled.gr_stage_metadata.values()))
+    metadata.beam_params.temperature = 0.0
+    metadata.beam_params.candidate_width = 3
+    metadata.is_last_stage = False
+    metadata.output_device_state = None
+    plan = NPUEagerStagePlan.from_scheduler_output(scheduled)
+    candidates = ConstraintOutput(
+        token_ids=torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32),
+        logprobs=torch.zeros((2, 3)),
+        valid_mask=torch.ones((2, 3), dtype=torch.bool),
+    )
+    winners = torch.tensor([[11, 21]], dtype=torch.int32)
+
+    def select(logits: torch.Tensor, constraint: ConstraintMetadata) -> ConstraintOutput:
+        assert constraint.current_step == 1 and constraint.top_k == 3
+        return candidates
+
+    def decide(
+        worker: Any,
+        attention_batch: Any,
+        token_ids: torch.Tensor,
+        logprobs: torch.Tensor,
+        *,
+        is_last_step: bool,
+        result_width: int,
+    ) -> dict[str, torch.Tensor]:
+        assert token_ids is candidates.token_ids
+        assert logprobs.shape == (2, 3)
+        assert not is_last_step and result_width == 2
+        return {"out_token_ids": winners}
+
+    monkeypatch.setattr(npu_beam_stage_runner, "run_beam_decision_candidates", decide)
+    worker = SimpleNamespace(
+        _current_scheduler_output=scheduled,
+        constraint_backend=SimpleNamespace(info=SimpleNamespace(max_rows=2), select=select),
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.worker, stage.pending_plan, stage.execution_error = worker, plan, None
+    stage.logits = torch.zeros((2, 16))
+    stage.session_request = SimpleNamespace(
+        output_options=SimpleNamespace(include_parent_beam_indices=False)
+    )
+    stage.attention_batch = SimpleNamespace(
+        context=SimpleNamespace(decision=SimpleNamespace(sequence=torch.zeros((1, 2, 1))))
+    )
+
+    output = stage.sample()
+
+    assert stage.latest_token_ids is winners
+    assert output.gr_worker_results[plan.execution.session_id].stage_index == 1
 
 
 def test_npu_execution_batch_flattens_only_the_xllm_attention_view() -> None:

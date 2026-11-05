@@ -29,6 +29,7 @@ from vllm_gr.v1.beam.batch_contracts import (
 )
 from vllm_gr.v1.beam.beam_decision import run_beam_decision_candidates
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
 from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRRetireMetadata,
@@ -43,7 +44,6 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_WORKER_RESULT_ATTR,
 )
 from vllm_gr.v1.worker.npu_beam_stage_adapter import (
-    NPUEagerFirstDecodeHandoff,
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
@@ -59,7 +59,6 @@ class NPUEagerBeamStageRunner:
         self.pending_plan: NPUEagerStagePlan | None = None
         self.execution_error: Exception | None = None
         self.logical_scheduler_output: Any = None
-        self.handoff: NPUEagerFirstDecodeHandoff | None = None
         self.prefill_candidates: Any = None
         self.latest_token_ids: torch.Tensor | None = None
         self.parent_history: torch.Tensor | None = None
@@ -461,7 +460,11 @@ class NPUEagerBeamStageRunner:
         execution = plan.execution
         if execution.kind == "prefill":
             self.prefill_candidates = candidates
-            self.handoff = NPUEagerFirstDecodeHandoff.from_prefill(plan, candidates.token_ids)
+            expected = (execution.batch_size, execution.output_width)
+            if tuple(candidates.token_ids.shape) != expected:
+                raise BeamExecutionContractError(
+                    f"Prefill winner_token_ids must have shape {expected}"
+                )
             self.latest_token_ids = candidates.token_ids
             if is_last:
                 # Filter and rank all finite candidates before the return limit.
