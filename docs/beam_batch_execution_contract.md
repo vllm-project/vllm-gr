@@ -211,6 +211,16 @@ failure must drain outstanding work before resources are reused. Terminal
 results are delivered only after matching resource-release confirmation.
 See [asynchronous scheduling](async_scheduling.md) for receipts and retirement.
 
+NPU stage preparation is part of the Worker's execution error boundary. A
+preparation failure preserves the original exception, clears pending stage and
+logit state, and requires matching owner retirement before retry. New attention
+batches are published only after session and buffer initialization succeeds;
+failed initialization releases only the registry slots acquired by that attempt.
+An occupied attention context is rejected before shared decision buffers are
+reset. An already-published batch remains owned until normal retirement. These
+rules do not provide automatic EngineCore recovery or certify retirement after
+a failed first Prefill with no previous execution owner.
+
 ## Validation boundaries
 
 | Boundary | Responsibility |

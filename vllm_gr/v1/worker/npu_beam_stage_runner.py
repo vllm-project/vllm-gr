@@ -176,6 +176,10 @@ class NPUEagerBeamStageRunner:
                 self.worker._gr_npu_eager_context = context
         if required_steps > context.decision.sequence.shape[2]:
             raise ValueError("NPU Beam history exceeds the configured Decode capacity")
+        if context.registry.num_active_sessions:
+            # begin_session resets the shared decision buffers, so an NPU
+            # batch must own the complete context before initializing slots.
+            raise RuntimeError("cannot initialize an NPU Beam batch in an active attention context")
         if self._uses_dynamic_state(plan):
             from vllm_gr.v1.beam.npu_dynamic_beam import prune_npu_stage_pools
 
@@ -187,51 +191,70 @@ class NPUEagerBeamStageRunner:
                 )
             prune_npu_stage_pools(context, keep_widths)
         sessions = []
-        for request_id, prompt_len in zip(
-            execution.request_ids,
-            execution.num_prompt_tokens_by_request,
-        ):
-            slot = context.registry.allocate(
-                request_id,
-                beam_width=execution.beam_width,
-                prefix_len=prompt_len,
-            )
-            session = BeamSearchSession(request_id, slot, context)
-            session.begin_session(execution.beam_width, prompt_len)
-            sessions.append(session)
-        self.attention_batch = NPUBeamExecutionBatch(execution, sessions)
-        if self._uses_dynamic_state(plan):
-            from vllm_gr.v1.beam.npu_dynamic_beam import NPUDynamicBeamState
+        allocated_request_ids = []
+        dynamic_state = None
+        parent_history = None
+        try:
+            for request_id, prompt_len in zip(
+                execution.request_ids,
+                execution.num_prompt_tokens_by_request,
+            ):
+                slot = context.registry.allocate(
+                    request_id,
+                    beam_width=execution.beam_width,
+                    prefix_len=prompt_len,
+                )
+                # The slot already belongs to this attempt even if constructing
+                # or beginning the session raises before it enters sessions.
+                allocated_request_ids.append(request_id)
+                session = BeamSearchSession(request_id, slot, context)
+                session.begin_session(execution.beam_width, prompt_len)
+                sessions.append(session)
+            attention_batch = NPUBeamExecutionBatch(execution, sessions)
+            if self._uses_dynamic_state(plan):
+                from vllm_gr.v1.beam.npu_dynamic_beam import NPUDynamicBeamState
 
-            if self.previous is None or self.previous.kind != "prefill":
-                raise RuntimeError("dynamic NPU Beam state requires the preceding Prefill")
-            self.dynamic_state = NPUDynamicBeamState(context, execution.batch_size, required_steps)
-            self.dynamic_state.initialize(self.prefill_candidates, self.previous.output_width)
-            self.worker._beam_context = context
-            self.worker._beam_sessions = {session.session_id: session for session in sessions}
-            return
-        width = execution.beam_width
-        candidates = self.prefill_candidates
-        initial_scores = candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf"))
-        # Candidates carry K columns while the decision state is W-wide, and the
-        # two are independent.  The candidates are score-ordered, so the first
-        # min(W, K) are the survivors; beams beyond that stay inactive with
-        # -inf scores (0 token id, since Prefill parents are zero by definition).
-        candidate_width = candidates.token_ids.shape[1]
-        live = min(width, candidate_width)
-        sequence = context.decision.sequence[: execution.batch_size, :width, 0]
-        scores = context.decision.beam_scores[: execution.batch_size, :width]
-        sequence[:, :live].copy_(candidates.token_ids[:, :live])
-        scores[:, :live].copy_(initial_scores[:, :live])
-        if live < width:
-            sequence[:, live:].zero_()
-            scores[:, live:].fill_(float("-inf"))
-        context.decision.worker_decode_steps = 1
-        self.parent_history = (
-            torch.zeros_like(context.decision.sequence) if self._needs_parent_history() else None
-        )
+                if self.previous is None or self.previous.kind != "prefill":
+                    raise RuntimeError("dynamic NPU Beam state requires the preceding Prefill")
+                dynamic_state = NPUDynamicBeamState(context, execution.batch_size, required_steps)
+                dynamic_state.initialize(self.prefill_candidates, self.previous.output_width)
+            else:
+                width = execution.beam_width
+                candidates = self.prefill_candidates
+                initial_scores = candidates.logprobs.masked_fill(
+                    ~candidates.valid_mask, float("-inf")
+                )
+                # Candidates carry K columns while the decision state is W-wide, and the
+                # two are independent.  The candidates are score-ordered, so the first
+                # min(W, K) are the survivors; beams beyond that stay inactive with
+                # -inf scores (0 token id, since Prefill parents are zero by definition).
+                candidate_width = candidates.token_ids.shape[1]
+                live = min(width, candidate_width)
+                sequence = context.decision.sequence[: execution.batch_size, :width, 0]
+                scores = context.decision.beam_scores[: execution.batch_size, :width]
+                sequence[:, :live].copy_(candidates.token_ids[:, :live])
+                scores[:, :live].copy_(initial_scores[:, :live])
+                if live < width:
+                    sequence[:, live:].zero_()
+                    scores[:, live:].fill_(float("-inf"))
+                context.decision.worker_decode_steps = 1
+                parent_history = (
+                    torch.zeros_like(context.decision.sequence)
+                    if self._needs_parent_history()
+                    else None
+                )
+            beam_sessions = {session.session_id: session for session in sessions}
+        except Exception:
+            # Registry release is host-only and also handles a begin_session
+            # that failed before its facade could be published.
+            for request_id in allocated_request_ids:
+                context.registry.release(request_id)
+            raise
+        self.attention_batch = attention_batch
+        self.dynamic_state = dynamic_state
+        self.parent_history = parent_history
         self.worker._beam_context = context
-        self.worker._beam_sessions = {session.session_id: session for session in sessions}
+        self.worker._beam_sessions = beam_sessions
 
     def _beam_data(self, plan: NPUEagerStagePlan, metadata: Any) -> dict[str, dict[str, Any]]:
         execution = plan.execution
@@ -297,46 +320,45 @@ class NPUEagerBeamStageRunner:
         self.pending_plan = plan
         self.logical_scheduler_output = scheduler_output
         self.worker._gr_npu_stage_runner = self
-        runtime_output = self._runtime_scheduler_output(scheduler_output, plan)
-        self.worker._current_scheduler_output = runtime_output
-        self.worker._gr_npu_stage_plan = plan
-        beam_info = None
         token = None
-        if plan.execution.kind == "decode":
-            self._ensure_attention_batch(plan)
-            assert self.attention_batch is not None
-            for session in self.attention_batch.sessions:
-                session._state.is_last_step = bool(metadata.is_last_stage)
-                if self._uses_dynamic_state(plan):
-                    session._state.decode_step = plan.execution.decode_step
-            beam_data = self._beam_data(plan, metadata)
-            beam_info = {
-                "beam_data": beam_data,
-                "req_ids": [],
-                "beam_session": self.attention_batch,
-            }
-            self.worker._current_beam_data = beam_data
-            self.worker._current_beam_info = beam_info
-            context = self.attention_batch.context
-            step = plan.execution.decode_step
-            assert step is not None
-            context.decode_step_buf.fill_(step)
-            context.decode_step_1based_buf.fill_(step + 1)
-            context.xllm_block_table_buf.copy_(
-                torch.arange(
-                    plan.execution.batch_size,
-                    dtype=torch.int32,
-                    device=self.worker.device,
-                )
-            )
-            from vllm_gr.v1.beam.context import BEAM_DATA_VAR
-
-            token = BEAM_DATA_VAR.set(beam_info)
-        else:
-            self.worker._current_beam_data = {}
-            self.worker._current_beam_info = {"beam_data": {}, "req_ids": []}
-
         try:
+            runtime_output = self._runtime_scheduler_output(scheduler_output, plan)
+            self.worker._current_scheduler_output = runtime_output
+            self.worker._gr_npu_stage_plan = plan
+            if plan.execution.kind == "decode":
+                self._ensure_attention_batch(plan)
+                assert self.attention_batch is not None
+                for session in self.attention_batch.sessions:
+                    session._state.is_last_step = bool(metadata.is_last_stage)
+                    if self._uses_dynamic_state(plan):
+                        session._state.decode_step = plan.execution.decode_step
+                beam_data = self._beam_data(plan, metadata)
+                beam_info = {
+                    "beam_data": beam_data,
+                    "req_ids": [],
+                    "beam_session": self.attention_batch,
+                }
+                self.worker._current_beam_data = beam_data
+                self.worker._current_beam_info = beam_info
+                context = self.attention_batch.context
+                step = plan.execution.decode_step
+                assert step is not None
+                context.decode_step_buf.fill_(step)
+                context.decode_step_1based_buf.fill_(step + 1)
+                context.xllm_block_table_buf.copy_(
+                    torch.arange(
+                        plan.execution.batch_size,
+                        dtype=torch.int32,
+                        device=self.worker.device,
+                    )
+                )
+                from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+
+                token = BEAM_DATA_VAR.set(beam_info)
+            else:
+                self.worker._current_beam_data = {}
+                self.worker._current_beam_info = {"beam_data": {}, "req_ids": []}
+
             result = original(self.worker, runtime_output, *args, **kwargs)
             state = getattr(self.worker, "execute_model_state", None)
             logits = getattr(state, "logits", None)
