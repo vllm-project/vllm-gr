@@ -197,6 +197,7 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
+    from vllm_gr.v1 import npu_kv_layout
 
     monkeypatch.setattr(ascend_compat, "_NPU_WORKER_PATCH_APPLIED", False)
     install_filter = mock.Mock()
@@ -212,6 +213,11 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     install_filter.assert_not_called()
 
     events: list[str] = []
+    monkeypatch.setattr(
+        npu_kv_layout,
+        "apply_npu_contiguous_kv_cache_patch",
+        lambda: events.append("kv_layout"),
+    )
     raise_from_original = False
 
     def original_init_device(self: object) -> str:
@@ -236,7 +242,7 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     assert ascend_compat.patch_npu_worker_init_device() == 0
     install_filter.assert_called_once_with()
     assert worker_class().init_device() == "ready"
-    assert events == ["re_apply", "original"]
+    assert events == ["re_apply", "kv_layout", "original"]
 
     from vllm_gr.v1.worker.model_runner_common import (
         freeze_gc_after_warmup,
@@ -250,7 +256,7 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     raise_from_original = True
     with pytest.raises(RuntimeError, match="init failed"):
         worker_class().init_device()
-    assert events == ["re_apply", "original"]
+    assert events == ["re_apply", "kv_layout", "original"]
 
 
 def _install_fake_ascend_config(

@@ -66,6 +66,7 @@ aligned with it.
 | GR-PATCH-018 | `vllm_gr/v1/ascend_compat.py` | `apply_penalties_warmup_oom_guard` | NPUWorker `init_device` runs and the native penalties warmup is present | installer result; NPU startup at `--max_num_seqs 2048` | NPU worker |
 | GR-PATCH-019 | `vllm_gr/v1/ascend_compat.py` | `apply_engine_core_config_sanitizer`, `patch_npu_worker_init_device` | NPU engine configuration and worker plugin initialization | Ascend config preservation and initialization tests; NPU startup | main, EngineCore, worker |
 | GR-PATCH-020 | `vllm_gr/pangu_compat.py` | `apply_pangu_tied_embeddings_patch` | runtime initialization; tied Pangu models only | Pangu compatibility and patch initialization tests | main, EngineCore, worker |
+| GR-PATCH-021 | `vllm_gr/v1/npu_kv_layout.py` | `apply_npu_contiguous_kv_cache_patch` | known Ascend 0.30.0rc2 policy, before native KV allocation | NPU KV layout, worker lifecycle and row-view tests | NPU worker |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -418,6 +419,34 @@ aligned with it.
   `tests/test_patch_initialization.py` checks installation order.
 - Removal condition: upstream distinguishes the placeholder from independent
   projection weights while loading the official Pangu checkpoint.
+
+### GR-PATCH-021 — Contiguous Beam Prefix KV
+
+- Source / Installer: `vllm_gr/v1/npu_kv_layout.py::apply_npu_contiguous_kv_cache_patch`
+- Orchestration: the NPU worker `init_device` hook, before native runner construction.
+- Targets: `vllm_ascend.attention.utils.requires_contiguous_pa_kv_cache` and its
+  already imported `vllm_ascend.worker.model_runner_v1` binding.
+- Platforms / process roles: NPU worker; risk: High.
+- Behavior: extends the native allocation policy for explicitly eligible
+  CUSTOM V1 xllm Beam layers with ordinary, unpadded FP16/BF16 KV. Native
+  allocation then owns separate dense K/V buffers. The xllm execution module
+  verifies the actual NHD shape, strides, device and format before reading
+  those buffers through the original paged block table. It never reinterprets
+  already interleaved storage; unproven layouts retain the gather path.
+- Guards: exact supported vendor version and helper signature; both aliases
+  must identify the same original or this wrapper. Other platforms, unknown
+  bindings, ordinary attention, quantized/hybrid/shared/sliding/transfer
+  configurations and unqualified vendor options retain the native policy.
+  The six known Ascend compiler defaults are accepted when injected by the
+  supported runtime; unknown keys and nondefault values still fall back.
+  The ordinary native `FullAttentionSpec` has no `cache_dtype_str` field;
+  the cache-config dtype and actual spec dtype remain mandatory guards.
+  Eligibility is evaluated per engine/layer; no engine configuration is cached.
+- Validation: policy controls in `tests/test_npu_kv_layout.py`, installation
+  order in `tests/test_ascend_compat.py`, and direct/fallback routing plus native
+  xllm eager/FULL replay checks in `tests/test_npu_beam_row_views.py`.
+- Removal condition: a native backend contiguous-KV capability covers GR xllm
+  without this version-specific policy bridge.
 
 ## Benchmark-only Runtime Mutations
 

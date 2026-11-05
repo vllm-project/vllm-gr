@@ -116,6 +116,11 @@ def patch_npu_worker_init_device() -> int:
         from vllm_gr.patch import re_apply_patches
 
         re_apply_patches()
+        # Allocation must opt in before the native runner builds its KV pool.
+        # Unknown Ascend interfaces keep their original allocation policy.
+        from vllm_gr.v1.npu_kv_layout import apply_npu_contiguous_kv_cache_patch
+
+        apply_npu_contiguous_kv_cache_patch()
         # The penalties warmup guard must be installed before
         # compile_or_warm_up_model runs in this child process.
         apply_penalties_warmup_oom_guard()

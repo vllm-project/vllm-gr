@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Layout and device guards for NPU identity-row attention views."""
+"""Layout and device guards for NPU attention views and direct shared KV."""
 
 from __future__ import annotations
 
@@ -20,13 +20,13 @@ class _MockNPUTensor(torch.Tensor):  # type: ignore[misc]
     def device(self) -> torch.device:
         # Tensor storage and all arithmetic stay on CPU; only the host guard
         # sees an NPU. This does not exercise the real native operator.
-        return cast(torch.device, SimpleNamespace(type="npu"))
+        return cast(torch.device, SimpleNamespace(type="npu", index=0))
 
 
 class _MockCUDATensor(torch.Tensor):  # type: ignore[misc]
     @property
     def device(self) -> torch.device:
-        return cast(torch.device, SimpleNamespace(type="cuda"))
+        return cast(torch.device, SimpleNamespace(type="cuda", index=0))
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -246,6 +246,200 @@ def test_cpu_and_cuda_keep_gather_without_querying_npu_format(
     row_module.torch_npu.get_npu_format = forbidden_format
     selected = row_module.select_beam_rows(tensor, _metadata(4))
     assert selected.untyped_storage().data_ptr() != tensor.untyped_storage().data_ptr()
+
+
+def _shared_decode_case(offset: int = 0) -> SimpleNamespace:
+    rows, heads, kv_heads, dim = 4, 4, 2, 128
+    key = torch.randn(7 + offset, 4, kv_heads, dim, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    key = key[offset:].as_subclass(_MockNPUTensor)
+    value = value[offset:].as_subclass(_MockNPUTensor)
+    query = torch.randn(rows, heads, dim, dtype=key.dtype).as_subclass(_MockNPUTensor)
+    pool = SimpleNamespace(
+        unshared_key=torch.zeros(1, rows, kv_heads, 3, dim, dtype=key.dtype).as_subclass(
+            _MockNPUTensor
+        ),
+        unshared_value=torch.zeros(1, rows, kv_heads, 3, dim, dtype=key.dtype).as_subclass(
+            _MockNPUTensor
+        ),
+    )
+    metadata = _metadata(rows)
+    metadata.prefix_block_table = torch.tensor([[5, 2, 5]], dtype=torch.int32)
+    metadata.prefix_seqlens_kv_device = torch.tensor([9], dtype=torch.int32)
+    metadata.max_prefix_blocks_count = 3
+    step = torch.tensor([1], dtype=torch.int32)
+    session = SimpleNamespace(
+        slot=0,
+        beam_width=rows,
+        decode_step=0,
+        context=SimpleNamespace(decode_step_1based_buf=step),
+    )
+    return SimpleNamespace(
+        key=key,
+        value=value,
+        query=query,
+        pool=pool,
+        metadata=metadata,
+        session=session,
+        output=torch.empty(rows, heads, dim, dtype=key.dtype),
+    )
+
+
+def _run_shared_decode(module: ModuleType, case: SimpleNamespace) -> None:
+    module._xllm_incremental_decode(
+        case.output,
+        case.query,
+        case.key,
+        case.value,
+        case.metadata,
+        case.session,
+        case.pool,
+        case.key.shape[-1] ** -0.5,
+    )
+
+
+@pytest.mark.parametrize("offset", [0, 2])  # type: ignore[misc]
+@pytest.mark.parametrize("capturing", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("layout", [None, "", "NHD", "LBNHC"])  # type: ignore[misc]
+def test_npu_direct_shared_kv_preserves_original_table_and_storage(
+    row_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    offset: int,
+    capturing: bool,
+    layout: str | None,
+) -> None:
+    """The actual decode dispatcher must bypass all shared-prefix gathers."""
+    if layout is None:
+        monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
+    case = _shared_decode_case(offset)
+    expected = torch.arange(case.output.numel(), dtype=torch.float32).reshape(case.output.shape)
+    expected = expected.to(case.output.dtype)
+    calls: list[tuple[Any, ...]] = []
+
+    def attention(*args: Any) -> torch.Tensor:
+        calls.append(args)
+        assert args[0].data_ptr() == case.query.data_ptr()
+        assert args[1] is case.key and args[2] is case.value
+        assert args[5] is case.metadata.prefix_block_table
+        assert args[6] is case.metadata.prefix_seqlens_kv_device
+        assert args[7] is case.session.context.decode_step_1based_buf
+        assert args[3].data_ptr() == case.pool.unshared_key.data_ptr()
+        assert args[4].data_ptr() == case.pool.unshared_value.data_ptr()
+        assert args[8] == 0.0
+        return expected
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("direct shared KV must not gather or read device values on host")
+
+    monkeypatch.setattr(row_module, "_npu_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(row_module, "_gather_shared_blocks", forbidden)
+    monkeypatch.setattr(row_module.beam_ops, "x_attention", attention)
+    storage = tuple((t.data_ptr(), t.storage_offset(), t.stride()) for t in (case.key, case.value))
+    with monkeypatch.context() as guard:
+        guard.setattr(torch.Tensor, "cpu", forbidden)
+        guard.setattr(torch.Tensor, "item", forbidden)
+        guard.setattr(torch.Tensor, "tolist", forbidden)
+        _run_shared_decode(row_module, case)
+    assert len(calls) == 1
+    assert storage == tuple(
+        (t.data_ptr(), t.storage_offset(), t.stride()) for t in (case.key, case.value)
+    )
+    assert case.key.is_contiguous() and case.value.is_contiguous()
+    assert (case.key.storage_offset() != 0) == (offset != 0)
+    torch.testing.assert_close(case.output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "reason",
+    [
+        "interleaved",
+        "format",
+        "suffix-heads",
+        "query-heads",
+        "query-dim",
+        "value-shape",
+        "value-dtype",
+        "value-device",
+        "unsupported-dtype",
+        "HND",
+        "LBHNC",
+        "unknown-layout",
+        "cpu",
+        "cuda",
+    ],
+)
+def test_unsupported_shared_kv_keeps_original_gather_dispatch(
+    row_module: ModuleType, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    """Guard failures retain the prior routing and block-table remapping."""
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    case = _shared_decode_case()
+    if reason == "interleaved":
+        pool = torch.randn(7, 2, 4, 2, 128, dtype=case.key.dtype).as_subclass(_MockNPUTensor)
+        case.key, case.value = pool[:, 0], pool[:, 1]
+        assert not case.key.is_contiguous()
+    elif reason == "format":
+        row_module.torch_npu.get_npu_format = lambda _tensor: 29
+    elif reason == "suffix-heads":
+        case.pool.unshared_key = case.pool.unshared_key[:, :, :1].contiguous()
+    elif reason == "query-heads":
+        case.query = case.query[:, :3].contiguous()
+    elif reason == "query-dim":
+        case.query = case.query[..., :64].contiguous()
+    elif reason == "value-shape":
+        case.value = case.value[:, :3].contiguous()
+    elif reason == "value-dtype":
+        case.value = case.value.to(torch.float16)
+    elif reason == "value-device":
+        case.value = case.value.as_subclass(torch.Tensor).as_subclass(_MockCUDATensor)
+    elif reason == "unsupported-dtype":
+        case.key, case.value = case.key.float(), case.value.float()
+    elif reason in ("HND", "LBHNC", "unknown-layout"):
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", reason)
+    elif reason in ("cpu", "cuda"):
+        for name in ("key", "value", "query"):
+            tensor = getattr(case, name).as_subclass(torch.Tensor)
+            if reason == "cuda":
+                tensor = tensor.as_subclass(_MockCUDATensor)
+            setattr(case, name, tensor)
+
+        def forbidden_format(_tensor: torch.Tensor) -> int:
+            raise AssertionError("non-NPU tensors must not query the NPU format")
+
+        row_module.torch_npu.get_npu_format = forbidden_format
+    # Real gathering still executes; only the native attention invocation is mocked.
+    original_gather = row_module._gather_shared_blocks
+    gathered: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def gather(*args: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        result = original_gather(*args)
+        gathered.append(result)
+        return cast(tuple[torch.Tensor, torch.Tensor, torch.Tensor], result)
+
+    def attention(*args: Any) -> torch.Tensor:
+        assert len(gathered) == 1
+        assert args[1] is gathered[0][0] and args[2] is gathered[0][1]
+        assert args[5] is gathered[0][2]
+        assert args[5] is not case.metadata.prefix_block_table
+        return torch.zeros_like(case.output)
+
+    monkeypatch.setattr(row_module, "_npu_stream_capturing", lambda: False)
+    monkeypatch.setattr(row_module, "_gather_shared_blocks", gather)
+    monkeypatch.setattr(row_module.beam_ops, "x_attention", attention)
+    _run_shared_decode(row_module, case)
+    assert len(gathered) == 1
+    table = case.metadata.prefix_block_table
+    expected_table = torch.arange(table.numel(), dtype=table.dtype).reshape(table.shape)
+    torch.testing.assert_close(gathered[0][2], expected_table, rtol=0, atol=0)
+    for actual, original in zip(gathered[0][:2], (case.key, case.value)):
+        torch.testing.assert_close(
+            actual.as_subclass(torch.Tensor),
+            original[table.reshape(-1)].as_subclass(torch.Tensor),
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_cuda_forward_keeps_original_kv_gather(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -534,6 +728,173 @@ def test_npu_shared_gather_attention_and_graph_replay_are_exact(
             for expected, actual in zip(gather(0), gather(1)):
                 torch.testing.assert_close(expected, actual, rtol=0, atol=0)
             eager_control, eager_candidate = run(0), run(1)
+            for graph in graphs:
+                graph.replay()
+            torch.npu.synchronize()
+
+            assert addresses == tuple(tensor.data_ptr() for tensor in inputs)
+            torch.testing.assert_close(eager_control, eager_candidate, rtol=0, atol=0)
+            torch.testing.assert_close(outputs[0], eager_control, rtol=0, atol=0)
+            torch.testing.assert_close(outputs[1], eager_control, rtol=0, atol=0)
+            for expected, actual in zip(pools[0], pools[1]):
+                torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+
+
+@pytest.mark.npu_integration  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "batch_size,beam_width,heads,kv_heads",
+    [(1, 128, 16, 8), (4, 128, 16, 8), (1, 32, 8, 8), (4, 32, 8, 8)],
+)
+def test_npu_direct_shared_kv_attention_and_graph_replay_are_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    batch_size: int,
+    beam_width: int,
+    heads: int,
+    kv_heads: int,
+) -> None:
+    """Compare direct paged reads with the prior gather/remap at real replay.
+
+    Nonzero-offset dense caches and duplicate, unsorted page IDs must remain
+    valid as lengths cross page boundaries. This covers operator/graph
+    behavior; allocator selection and full-model parity are separate checks.
+    """
+    _torch_npu, module = _native_modules()
+    from vllm_gr.ops.npu import beam_ops
+
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "NHD")
+    device = torch.device("npu")
+    rows, dim = batch_size * beam_width, 128
+    num_blocks, block_size, table_width = 7, 128, 32
+    torch.manual_seed(2029 + batch_size)
+    # Rank-4/5 factories can choose NCHW/NCDHW on Ascend even when logical
+    # strides are dense. Match the native allocator's unblocked ABI before
+    # taking offset views; a later format conversion could erase the offset.
+    storage_key = _torch_npu.npu_format_cast(
+        torch.randn(10, block_size, kv_heads, dim, dtype=dtype, device=device) * 0.1, 2
+    )
+    storage_value = _torch_npu.npu_format_cast(torch.randn_like(storage_key) * 0.1, 2)
+    shared_key, shared_value = storage_key[2:9], storage_value[2:9]
+    assert shared_key.is_contiguous() and shared_value.is_contiguous()
+    assert shared_key.storage_offset() > 0 and shared_value.storage_offset() > 0
+    assert _torch_npu.get_npu_format(shared_key) == 2
+    assert _torch_npu.get_npu_format(shared_value) == 2
+    table_cpu = (
+        torch.arange(batch_size * table_width, dtype=torch.int32).reshape(batch_size, table_width)
+        * 3
+        + 1
+    ) % num_blocks
+    table_cpu[:, :3] = torch.tensor(
+        [[5, 2, 5], [3, 1, 3], [6, 0, 2], [1, 6, 1]][:batch_size], dtype=torch.int32
+    )
+    table = table_cpu.to(device)
+    lengths_cpu = torch.tensor([127, 128, 129, 257][:batch_size], dtype=torch.int32)
+    lengths = lengths_cpu.to(device)
+    blocks = torch.arange(batch_size, dtype=torch.int32, device=device)
+    step = torch.ones(1, dtype=torch.int32, device=device)
+    query = torch.randn(rows, heads, dim, dtype=dtype, device=device) * 0.1
+    key = torch.randn(rows, kv_heads, dim, dtype=dtype, device=device) * 0.1
+    value = torch.randn_like(key) * 0.1
+    pools = [
+        (
+            _torch_npu.npu_format_cast(
+                torch.zeros(batch_size, beam_width, kv_heads, 3, dim, dtype=dtype, device=device), 2
+            ),
+            _torch_npu.npu_format_cast(
+                torch.zeros(batch_size, beam_width, kv_heads, 3, dim, dtype=dtype, device=device), 2
+            ),
+        )
+        for _ in range(2)
+    ]
+    for pool_key, pool_value in pools:
+        assert _torch_npu.get_npu_format(pool_key) == 2
+        assert _torch_npu.get_npu_format(pool_value) == 2
+    metadata = _metadata(rows)
+    metadata.prefix_indices = metadata.prefix_indices.to(device)
+    metadata.prefix_block_table = table
+    metadata.prefix_seqlens_kv_device = lengths
+    metadata.max_prefix_blocks_count = 3
+    session = SimpleNamespace(
+        slot=0,
+        beam_width=beam_width,
+        attention_width=rows,
+        decode_step=0,
+        context=SimpleNamespace(decode_step_1based_buf=step),
+    )
+    candidate_pool = SimpleNamespace(
+        unshared_key=pools[1][0].view(1, rows, kv_heads, 3, dim),
+        unshared_value=pools[1][1].view(1, rows, kv_heads, 3, dim),
+    )
+    assert _torch_npu.get_npu_format(candidate_pool.unshared_key[0]) == 2
+    assert _torch_npu.get_npu_format(candidate_pool.unshared_value[0]) == 2
+    candidate_output = torch.empty_like(query)
+    eager_output = torch.empty_like(query)
+    original_gather = module._gather_shared_blocks
+
+    def forbidden_gather(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("eligible dense NPU caches must reach x_attention without gathering")
+
+    monkeypatch.setattr(module, "_gather_shared_blocks", forbidden_gather)
+
+    def run(mode: int, destination: torch.Tensor | None = None) -> torch.Tensor:
+        pool_key, pool_value = pools[mode]
+        beam_ops.cache_unshared_kv(pool_key, pool_value, key, value, blocks, step)
+        if mode == 0:
+            gathered_key, gathered_value, remapped = original_gather(
+                shared_key, shared_value, table, 0
+            )
+            return beam_ops.x_attention(
+                query,
+                gathered_key,
+                gathered_value,
+                pool_key.view(rows, kv_heads, 3, dim),
+                pool_value.view(rows, kv_heads, 3, dim),
+                remapped,
+                lengths,
+                step,
+            )
+        output = candidate_output if destination is None else destination
+        module._xllm_incremental_decode(
+            output, query, shared_key, shared_value, metadata, session, candidate_pool, dim**-0.5
+        )
+        return output
+
+    with torch.inference_mode():
+        assert module._can_use_direct_shared_kv(
+            shared_key, shared_value, query, candidate_pool.unshared_key[0]
+        )
+        for mode in (0, 1):
+            for _ in range(2):
+                run(mode)
+        torch.npu.synchronize()
+        graphs, outputs = [], []
+        for mode in (0, 1):
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                output = run(mode)
+            graphs.append(graph)
+            outputs.append(output)
+        inputs = (shared_key, shared_value, table, lengths, query, key, value, step)
+        addresses = tuple(tensor.data_ptr() for tensor in inputs)
+        for iteration in range(3):
+            shared_key.copy_(torch.randn_like(shared_key) * (0.1 + iteration * 0.03))
+            shared_value.copy_(torch.randn_like(shared_value) * 0.1)
+            table.copy_((table_cpu + 2 * iteration + 1) % num_blocks)
+            if batch_size == 1:
+                lengths.fill_((127, 129, 257)[iteration])
+            else:
+                lengths.copy_(lengths_cpu.roll(iteration))
+            query.copy_(torch.randn_like(query) * 0.1)
+            key.copy_(torch.randn_like(key) * 0.1)
+            value.copy_(torch.randn_like(value) * 0.1)
+            step.fill_(1 + iteration % 2)
+            eager_control = run(0)
+            # Use a separate output so eager execution cannot pre-populate
+            # the captured candidate's destination and hide a broken replay.
+            eager_candidate = run(1, eager_output)
+            for output in outputs:
+                output.fill_(float("nan"))
             for graph in graphs:
                 graph.replay()
             torch.npu.synchronize()

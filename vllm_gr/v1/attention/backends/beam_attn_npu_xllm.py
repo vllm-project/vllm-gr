@@ -17,6 +17,8 @@ pool->buffer copies + the merge operator chain".
 from __future__ import annotations
 
 import math
+import os
+from typing import cast
 
 import torch
 import torch_npu
@@ -159,6 +161,57 @@ def _npu_stream_capturing() -> bool:
         return True
 
 
+def _can_use_direct_shared_kv(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query: torch.Tensor,
+    unshared_key: torch.Tensor,
+) -> bool:
+    """Recognize the x_attention NHD ABI without reading device values.
+
+    Separate native allocations can have an aligned storage offset: their
+    data_ptr still starts a valid dense span. Interleaved, blocked-format or
+    head-major views must continue through the existing materialization path.
+    """
+    if os.environ.get("VLLM_KV_CACHE_LAYOUT") not in (None, "", "NHD", "LBNHC"):
+        return False
+    if key_cache.device.type != "npu" or key_cache.ndim != 4:
+        return False
+    if (
+        value_cache.shape != key_cache.shape
+        or value_cache.device != key_cache.device
+        or value_cache.dtype != key_cache.dtype
+        or key_cache.dtype not in (torch.float16, torch.bfloat16)
+        or not key_cache.is_contiguous()
+        or not value_cache.is_contiguous()
+        or any(size <= 0 for size in key_cache.shape)
+    ):
+        return False
+    _, block_size, heads, dim = key_cache.shape
+    if (
+        query.ndim != 3
+        or unshared_key.ndim != 4
+        or query.device != key_cache.device
+        or unshared_key.device != key_cache.device
+        or query.dtype != key_cache.dtype
+        or unshared_key.dtype != key_cache.dtype
+        or query.shape[-1] != dim
+        or query.shape[-2] <= 0
+        or query.shape[-2] % heads
+        or unshared_key.shape[1] != heads
+        or unshared_key.shape[-1] != dim
+    ):
+        return False
+    # Be explicit about the physical axis order, including degenerate sizes.
+    expected_stride = (block_size * heads * dim, heads * dim, dim, 1)
+    if key_cache.stride() != expected_stride or value_cache.stride() != expected_stride:
+        return False
+    return cast(
+        bool,
+        torch_npu.get_npu_format(key_cache) == 2 and torch_npu.get_npu_format(value_cache) == 2,
+    )
+
+
 def _gather_shared_blocks(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -275,7 +328,10 @@ def _xllm_incremental_decode(
     if step_count is None:
         step_count = step + 1  # dev is 0-based; kernel takes 1-based count
 
-    # When a shared-prefix table is available, gather its blocks in both
+    # Native separate NHD K/V allocations can be read through the original
+    # paged table. Preserve their addresses; this branch captures no gather,
+    # remapping or copy and replay consumes the refreshed table/sequence data.
+    # When the source layout is not proven, gather its blocks in both
     # eager and ACL-graph capture to avoid copying the whole interleaved pool.
     #
     # Capture uses the fixed table width so the gather shape stays constant
@@ -285,7 +341,9 @@ def _xllm_incremental_decode(
     # this does not require copying every block in the KV pool.
     # Eager can use ``max_prefix_blocks_count`` to omit padding columns.
     shared_table = attn_metadata.prefix_block_table
-    if shared_table is not None:
+    if _can_use_direct_shared_kv(key_cache, value_cache, beam_query, unshared_key):
+        shared_key, shared_value = key_cache, value_cache
+    elif shared_table is not None:
         max_valid_cols = (
             0 if _npu_stream_capturing() else getattr(attn_metadata, "max_prefix_blocks_count", 0)
         )

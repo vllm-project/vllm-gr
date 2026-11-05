@@ -292,6 +292,20 @@ patches:
     contract: pangu-tied-embeddings
     removal_condition: upstream distinguishes Pangu's zero-filled lm_head placeholder from an independent projection weight
 
+  - id: GR-PATCH-021
+    owner: vllm_gr/v1/npu_kv_layout.py
+    installer: vllm_gr.v1.npu_kv_layout.apply_npu_contiguous_kv_cache_patch
+    activation: NPUWorker init_device before native runner construction; known Ascend 0.30.0rc2 bindings
+    validator_or_test:
+      - tests/test_npu_kv_layout.py
+      - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+      - tests/test_npu_beam_row_views.py
+    process_roles: [npu_worker]
+    target: vllm_ascend.attention.utils.requires_contiguous_pa_kv_cache and its model_runner_v1 import binding
+    risk: high
+    contract: npu-contiguous-prefix-kv-allocation
+    removal_condition: Ascend exposes a backend contiguous-KV capability covering GR xllm without a native policy bridge
+
 # IDs are retained here when the installer and its legacy surface have been removed.
 retired_patches:
   - id: GR-PATCH-006
