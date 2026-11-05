@@ -39,6 +39,7 @@ from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
+    _hidden_logits,
     _StageExecutionHooks,
     should_replay_decode_graph,
 )
@@ -212,7 +213,8 @@ class V2StageExecutionHooks(_StageExecutionHooks):
     """_StageExecutionHooks bound to the V2 GPUModelRunner surface."""
 
     persistent_graph_install = False
-    supports_transposed_head = False
+    # Both runners allocate and use the transposed head only when slicing is requested.
+    supports_transposed_head = True
 
     def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
         from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2InputBuffers
@@ -261,7 +263,7 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             graph_type=V2BeamDecodeGraph,
         )
 
-    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor:
+    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
         from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
         worker = self.worker
@@ -317,7 +319,7 @@ class V2StageExecutionHooks(_StageExecutionHooks):
                 )
                 return owner._forward()
         if should_replay_decode_graph_v2(worker, owner.graph, batch_size=batch_size):
-            return worker.model.compute_logits(owner.graph.replay())
+            return _hidden_logits(owner, owner.graph.replay())
         return owner._forward()
 
     def consume_retirement_state(

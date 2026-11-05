@@ -364,6 +364,10 @@ def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
         inputs=SimpleNamespace(width=4),
         dynamic=None,
         graph=None,
+        # Vocabulary slicing is opt-in; a stage without a request keeps the
+        # monolithic LM head.
+        _head_slice_request=0,
+        _head_buffers=SimpleNamespace(release_full=Mock(), release_slice=Mock()),
         _forward_hidden=Mock(),
         _decode_logits=Mock(return_value="logits"),
         _forward=Mock(),
@@ -380,6 +384,106 @@ def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
         graph.capture.assert_called_once_with(owner._forward_hidden, persistent_install=True)
         graph.replay.assert_called_once()
         owner._decode_logits.assert_called_once_with("hidden")
+
+
+@pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
+def test_eager_decode_keeps_forward_entry_and_slices_before_logits(v2: bool) -> None:
+    worker = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=True),
+        _vllm_gr_config=SimpleNamespace(beam_graph_enabled=True, beam_online_batch_sizes=(1,)),
+    )
+    owner = SimpleNamespace(
+        bindings=(object(),),
+        inputs=SimpleNamespace(width=4),
+        dynamic=None,
+        graph=None,
+        _head_slice_request=0,
+        _head_buffers=SimpleNamespace(release_full=Mock(), release_slice=Mock()),
+        _forward=Mock(return_value="logits"),
+        _forward_hidden=Mock(),
+        _decode_logits=Mock(return_value="logits"),
+    )
+    hooks = (V2StageExecutionHooks if v2 else stages._StageExecutionHooks)(worker)
+    assert V2StageExecutionHooks.supports_transposed_head
+
+    assert hooks.decode_logits(owner) == "logits"
+    owner._forward.assert_called_once_with()
+    owner._forward_hidden.assert_not_called()
+
+    # The shared head helper stages hidden states in owner storage instead of
+    # aliasing the graph's replay buffer, then skips the monolithic logits.
+    owner._hidden_staging = None
+    hidden = torch.zeros((2, 4))
+    owner._head_slice_request = 16
+    owner.head_slice_cols = Mock(return_value=16)
+    assert stages._hidden_logits(owner, hidden) is None
+    assert owner.hidden is not hidden
+    assert torch.equal(owner.hidden, hidden)
+    assert owner._active_slice_cols == 16
+    owner._decode_logits.assert_not_called()
+
+    # A later replay writes the graph output in place; the staged copy must not
+    # change, and a smaller stage reuses the same high-water-mark buffer.
+    staged_buffer = owner._hidden_staging
+    hidden.fill_(7)
+    assert torch.equal(owner.hidden, torch.zeros((2, 4)))
+    smaller = torch.ones((1, 4))
+    assert stages._hidden_logits(owner, smaller) is None
+    assert owner._hidden_staging is staged_buffer
+    assert torch.equal(owner.hidden, smaller)
+
+
+def test_v2_graph_replay_consumes_hidden_through_shared_logits() -> None:
+    graph = SimpleNamespace(ready=True, replay=Mock(return_value="hidden"))
+    worker = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        _vllm_gr_config=SimpleNamespace(beam_graph_enabled=True, beam_online_batch_sizes=(1,)),
+    )
+    owner = SimpleNamespace(
+        bindings=(object(),),
+        inputs=SimpleNamespace(width=4),
+        dynamic=None,
+        graph=None,
+        _head_slice_request=0,
+        _head_buffers=SimpleNamespace(release_full=Mock(), release_slice=Mock()),
+        _forward_hidden=Mock(),
+        _decode_logits=Mock(return_value="logits"),
+        _forward=Mock(return_value="eager"),
+    )
+    hooks = V2StageExecutionHooks(worker)
+    hooks.decode_graph = Mock(return_value=graph)
+
+    assert hooks.decode_logits(owner) == "logits"
+    graph.replay.assert_called_once_with()
+    owner._decode_logits.assert_called_once_with("hidden")
+    owner._forward.assert_not_called()
+
+
+def test_mode_switch_releases_the_inactive_logits_buffer() -> None:
+    layout = (torch.empty((4, 8)), torch.Event())
+    buffers = stages._HeadLogits(layout, torch.device("cpu"))
+    assert buffers.full_buffer(3) is not None
+    assert buffers.slice_buffer(3, 4) is not None
+    owner = SimpleNamespace(
+        _head_slice_request=4,
+        _head_buffers=buffers,
+        _hidden_staging=None,
+        hidden=None,
+        _active_slice_cols=0,
+        head_slice_cols=Mock(return_value=4),
+        _decode_logits=Mock(return_value="logits"),
+    )
+
+    # A slicing stage drops the full-vocabulary buffer; it used ~344 MiB at
+    # 1023 rows and must not survive beside the slice buffer.
+    assert stages._hidden_logits(owner, torch.zeros((3, 4))) is None
+    assert buffers.full is None
+    assert buffers.slice is not None
+
+    # A monolithic stage drops the slice buffer, so only one mode is retained.
+    owner.head_slice_cols.return_value = 0
+    assert stages._hidden_logits(owner, torch.zeros((3, 4))) == "logits"
+    assert buffers.slice is None
 
 
 @pytest.mark.parametrize("sizes", [(1, 2, 4), (1, 3, 7), (1, 6, 8)])  # type: ignore[misc]

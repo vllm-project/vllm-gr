@@ -51,6 +51,7 @@ class MCarryTopKScratch:
     merge_keys: torch.Tensor
     final_keys: torch.Tensor
     repair_flag: torch.Tensor
+    repair_running: torch.Tensor
     tile_flag: torch.Tensor
     vocab_size: int
     top_k: int
@@ -96,6 +97,8 @@ def _local_keys_kernel(
     keep_width,
     tile_flag,
     tile_flag_stride,
+    tile_offset,
+    slice_size,
     BLOCK: tl.constexpr,
     KEEP_BLOCK: tl.constexpr,
     NEED_MARGINAL: tl.constexpr,
@@ -105,11 +108,14 @@ def _local_keys_kernel(
     """Logsumexp statistics plus the retained keys of one vocabulary tile."""
 
     row = tl.program_id(0)
-    tile = tl.program_id(1)
+    tile = tile_offset + tl.program_id(1)
     offsets = tl.arange(0, BLOCK)
     flat = tile * BLOCK + offsets
-    valid = flat < vocab_size
-    values = tl.load(logits + row * logits_stride + flat, mask=valid, other=-float("inf"))
+    # ``logits`` may be one vocabulary slice of the full row, so addressing is
+    # relative to the slice while the packed key keeps the global index.
+    local = flat - tile_offset * BLOCK
+    valid = (flat < vocab_size) & (local < slice_size)
+    values = tl.load(logits + row * logits_stride + local, mask=valid, other=-float("inf"))
     values = values.to(tl.float32)
     temperature_index = tl.where(temperature_count == 1, 0, row)
     temperature = tl.load(temperatures + temperature_index)
@@ -144,9 +150,12 @@ def _local_keys_kernel(
         ranked = ~tl.topk(~surrogate, KEEP_BLOCK)
         lanes = ranked & ((1 << LANE_BITS) - 1)
         selected_flat = tile * BLOCK + lanes
-        selected_valid = (selected_flat < vocab_size) & (lanes < BLOCK)
+        selected_local = selected_flat - tile_offset * BLOCK
+        selected_valid = (
+            (selected_flat < vocab_size) & (selected_local < slice_size) & (selected_local >= 0)
+        )
         selected_values = tl.load(
-            logits + row * logits_stride + selected_flat,
+            logits + row * logits_stride + selected_local,
             mask=selected_valid,
             other=-float("inf"),
         ).to(tl.float32)
@@ -421,6 +430,251 @@ def _repair_row_kernel(
         tl.store(output_counts + row, tl.sum(valid_out.to(tl.int32), axis=0))
 
 
+@triton.jit
+def _repair_fold_kernel(
+    logits,
+    temperatures,
+    repair_flag,
+    final_keys,
+    running,
+    tile_flag,
+    vocab_size,
+    logits_stride,
+    temperature_count,
+    key_stride,
+    running_stride,
+    tile_flag_stride,
+    tile_offset,
+    slice_size,
+    slice_tiles,
+    tile_count,
+    top_k,
+    BLOCK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+    FIRST: tl.constexpr,
+):
+    """Refold the flagged tiles of one vocabulary slice into the running set."""
+
+    row = tl.program_id(0)
+    if tl.load(repair_flag + row) != 0:
+        lanes = tl.arange(0, TOPK_BLOCK)
+        if FIRST:
+            # Start from the merged Top-K with every entry owned by a flagged
+            # tile removed; those tiles are refolded from exact keys below.
+            key = tl.load(final_keys + row * key_stride + lanes, mask=lanes < top_k, other=_MAX_I64)
+            key_tile = ((key & 0x00000000FFFFFFFF) // BLOCK).to(tl.int32)
+            key_tile = tl.where((key_tile >= 0) & (key_tile < tile_count), key_tile, 0)
+            superseded = (
+                tl.load(
+                    tile_flag + row * tile_flag_stride + key_tile,
+                    mask=lanes < top_k,
+                    other=0,
+                )
+                != 0
+            )
+            current = tl.where(superseded, _MAX_I64, key)
+        else:
+            current = tl.load(
+                running + row * running_stride + lanes, mask=lanes < top_k, other=_MAX_I64
+            )
+        temperature_index = tl.where(temperature_count == 1, 0, row)
+        temperature = tl.load(temperatures + temperature_index)
+        temperature = tl.where(temperature == 0.0, 1.0, temperature)
+        for step in range(0, slice_tiles):
+            tile = tile_offset + step
+            if tl.load(tile_flag + row * tile_flag_stride + tile) != 0:
+                offsets = tl.arange(0, BLOCK)
+                global_flat = tile * BLOCK + offsets
+                local = global_flat - tile_offset * BLOCK
+                valid = (global_flat < vocab_size) & (local < slice_size)
+                values = tl.load(
+                    logits + row * logits_stride + local,
+                    mask=valid,
+                    other=-float("inf"),
+                ).to(tl.float32)
+                values = values / temperature
+                values = tl.where(
+                    (values > -float("inf")) & (values < float("inf")),
+                    values,
+                    -float("inf"),
+                )
+                packed = _pack_score_index(values, global_flat, valid)
+                tile_top = ~tl.topk(~packed, TOPK_BLOCK)
+                both = tl.cat(current, tile_top, can_reorder=True)
+                current = ~tl.topk(~both, TOPK_BLOCK)
+        tl.store(running + row * running_stride + lanes, current, mask=lanes < top_k)
+
+
+@triton.jit
+def _stream_slice_kernel(
+    logits,
+    temperatures,
+    local_keys,
+    local_marginal,
+    tile_flag,
+    running,
+    repair_flag,
+    logits_stride,
+    temperature_count,
+    candidate_stride,
+    tile_stride,
+    running_stride,
+    vocab_size,
+    tile_offset,
+    slice_size,
+    top_k,
+    KEEP: tl.constexpr,
+    SLICE_TILES: tl.constexpr,
+    CANDIDATE_BLOCK: tl.constexpr,
+    TILE_BLOCK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+    FIRST: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Merge and repair a slice before its logits buffer is reused."""
+
+    row = tl.program_id(0)
+    lanes = tl.arange(0, TOPK_BLOCK)
+    offsets = tl.arange(0, CANDIDATE_BLOCK)
+    if FIRST:
+        previous = tl.full((CANDIDATE_BLOCK,), _MAX_I64, tl.int64)
+    else:
+        previous = tl.load(
+            running + row * running_stride + offsets, mask=offsets < top_k, other=_MAX_I64
+        )
+    retained = tl.load(
+        local_keys + row * candidate_stride + tile_offset * KEEP + offsets,
+        mask=offsets < SLICE_TILES * KEEP,
+        other=_MAX_I64,
+    )
+    combined = tl.cat(previous, retained, can_reorder=True)
+    if TOPK_BLOCK == 1:
+        current = tl.min(combined, axis=0, keep_dims=True)
+    else:
+        current = ~tl.topk(~combined, TOPK_BLOCK)
+    cutoff = tl.max(tl.where(lanes < top_k, current, -9223372036854775808), axis=0)
+
+    # The retained keys are a subset of the true candidates, so their cutoff
+    # is a lower bound on the final score cutoff. Any tile whose marginal is
+    # worse can be discarded permanently, including in later slices.
+    tiles = tl.arange(0, TILE_BLOCK)
+    marginal = tl.load(
+        local_marginal + row * tile_stride + tile_offset + tiles,
+        mask=tiles < SLICE_TILES,
+        other=_MAX_I64,
+    )
+    ambiguous = tl.load(
+        tile_flag + row * tile_stride + tile_offset + tiles,
+        mask=tiles < SLICE_TILES,
+        other=0,
+    )
+    flagged = (tiles < SLICE_TILES) & ((marginal < cutoff) | (ambiguous != 0))
+    tl.store(
+        tile_flag + row * tile_stride + tile_offset + tiles,
+        flagged.to(tl.int8),
+        mask=tiles < SLICE_TILES,
+    )
+    key_tile = ((current & 0x00000000FFFFFFFF) // BLOCK).to(tl.int32) - tile_offset
+    in_slice = (key_tile >= 0) & (key_tile < SLICE_TILES)
+    superseded = in_slice & tl.gather(
+        flagged, tl.minimum(tl.maximum(key_tile, 0), TILE_BLOCK - 1), 0
+    )
+    current = tl.where(superseded | (lanes >= top_k), _MAX_I64, current)
+
+    temperature_index = tl.where(temperature_count == 1, 0, row)
+    temperature = tl.load(temperatures + temperature_index)
+    temperature = tl.where(temperature == 0.0, 1.0, temperature)
+    # Only this row's flagged tiles are read again, while this slice's GEMM
+    # result is still available. No host decision or projection rerun is needed.
+    tl.debug_barrier()
+    for step in range(0, SLICE_TILES):
+        tile = tile_offset + step
+        if tl.load(tile_flag + row * tile_stride + tile) != 0:
+            positions = tl.arange(0, BLOCK)
+            flat = tile * BLOCK + positions
+            local = step * BLOCK + positions
+            valid = (flat < vocab_size) & (local < slice_size)
+            values = (
+                tl.load(logits + row * logits_stride + local, mask=valid, other=-float("inf")).to(
+                    tl.float32
+                )
+                / temperature
+            )
+            values = tl.where(
+                (values > -float("inf")) & (values < float("inf")), values, -float("inf")
+            )
+            packed = _pack_score_index(values, flat, valid)
+            if TOPK_BLOCK == 1:
+                tile_top = tl.min(packed, axis=0, keep_dims=True)
+            else:
+                tile_top = ~tl.topk(~packed, TOPK_BLOCK)
+            repaired = tl.cat(current, tile_top, can_reorder=True)
+            if TOPK_BLOCK == 1:
+                current = tl.min(repaired, axis=0, keep_dims=True)
+            else:
+                current = ~tl.topk(~repaired, TOPK_BLOCK)
+    tl.store(running + row * running_stride + lanes, current, mask=lanes < top_k)
+    # Every streaming row is complete, even when none of its tiles needed repair.
+    tl.store(repair_flag + row, 1)
+
+
+@triton.jit
+def _repair_emit_kernel(
+    running,
+    repair_flag,
+    partial_max,
+    partial_sum,
+    output_ids,
+    output_logprobs,
+    output_valid,
+    output_counts,
+    running_stride,
+    partial_stride,
+    tile_count,
+    output_stride,
+    top_k,
+    SCAN_BLOCK: tl.constexpr,
+    OUTPUT_BLOCK: tl.constexpr,
+):
+    """Emit the rows rebuilt by the vocabulary-sliced repair pass."""
+
+    row = tl.program_id(0)
+    if tl.load(repair_flag + row) != 0:
+        ranks = tl.arange(0, OUTPUT_BLOCK)
+        selected = ranks < top_k
+        key = tl.load(running + row * running_stride + ranks, mask=selected, other=_MAX_I64)
+        tile_offsets = tl.arange(0, SCAN_BLOCK)
+        tile_valid = tile_offsets < tile_count
+        tile_maxes = tl.load(
+            partial_max + row * partial_stride + tile_offsets,
+            mask=tile_valid,
+            other=-float("inf"),
+        )
+        tile_sums = tl.load(
+            partial_sum + row * partial_stride + tile_offsets,
+            mask=tile_valid,
+            other=0.0,
+        )
+        global_max = tl.max(tile_maxes, axis=0)
+        has_mass = global_max != -float("inf")
+        safe_max = tl.where(has_mass, global_max, 0.0)
+        denominator = safe_max + tl.log(tl.sum(tile_sums * tl.exp(tile_maxes - safe_max), axis=0))
+        tokens = (key & 0x00000000FFFFFFFF).to(tl.int32)
+        scores = _unpack_score(key)
+        valid = (
+            selected & has_mass & (tokens >= 0) & (scores > -float("inf")) & (scores < float("inf"))
+        )
+        output_offset = row * output_stride + ranks
+        tl.store(output_ids + output_offset, tokens, mask=selected)
+        tl.store(
+            output_logprobs + output_offset,
+            tl.where(valid, scores - denominator, -float("inf")),
+            mask=selected,
+        )
+        tl.store(output_valid + output_offset, valid, mask=selected)
+        tl.store(output_counts + row, tl.sum(valid.to(tl.int32), axis=0))
+
+
 def mcap_topk_tiling(vocab_size: int, top_k: int) -> tuple[int, int, int, int]:
     """Return ``(tiles, keep, candidates, chunk_count)``; one shared definition."""
 
@@ -467,6 +721,9 @@ def allocate_mcap_topk_scratch(
         ),
         final_keys=torch.empty((batch_size, top_k), dtype=torch.int64, device=device),
         repair_flag=torch.zeros((batch_size,), dtype=torch.int32, device=device),
+        repair_running=torch.empty(
+            (batch_size, 2 * triton.next_power_of_2(top_k)), dtype=torch.int64, device=device
+        ),
         tile_flag=torch.zeros((batch_size, tiles), dtype=torch.int8, device=device),
         vocab_size=vocab_size,
         top_k=top_k,
@@ -527,15 +784,34 @@ def unconstrained_topk_mcap_out(
     ):
         raise ValueError("out_valid_counts must be a CUDA int32 tensor")
 
+    _launch_local_slice(
+        rows,
+        logits,
+        temperatures,
+        top_k,
+        scratch,
+        tile_offset=0,
+        slice_size=vocab_size,
+    )
+    return finish(
+        rows,
+        top_k,
+        scratch,
+        out_token_ids,
+        out_logprobs,
+        out_valid_mask,
+        out_valid_counts,
+        repair_logits=logits,
+        temperatures=temperatures,
+    )
+
+
+def _local_slice_plan(
+    vocab_size: int, top_k: int, scratch: MCarryTopKScratch
+) -> tuple[int, int, int, int, bool, bool, int]:
     tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k)
     if keep != scratch.keep:
         raise ValueError("bounded Top-K scratch retention width does not match its tiling")
-    keep_stride = candidates
-    # A chunk keeps ``chunk_width`` keys and that width is also its slot stride,
-    # so ``merge_keys`` has exactly ``chunk_count * chunk_width`` columns.
-    chunk_width = merge_chunk_width(top_k)
-    chunk_stride = chunk_count * chunk_width
-    select_block = triton.next_power_of_2(chunk_width)
     need_marginal = keep < top_k
     i32_select = os.environ.get("VLLM_GR_TOPK_SELECT", "i64").strip().lower() == "i32"
     # The i32 surrogate ranks a truncated key, so it must also retain the value
@@ -547,41 +823,133 @@ def unconstrained_topk_mcap_out(
     )
     # An ambiguous i32 cutoff can only be resolved by the exact repair pass, so
     # verification runs even when the marginal check is not needed.
+    # NOTE: the i32 surrogate ranks a truncated key, so ``_finalize_kernel``
+    # only detects a collision at the cutoff (``last_in == first_out``).  A pair
+    # of same-prefix keys that both fall into the dropped set can make the
+    # reported marginal the second-best dropped key.  Default i64 selection is a
+    # strict total order and is unaffected; the monolithic path shares this edge.
     verify = need_marginal or (i32_select and keep_block > 1)
-    lane_bits = (LOCAL_TILE_SIZE - 1).bit_length()
+    return tiles, keep, candidates, chunk_count, need_marginal, verify, keep_block
 
-    _local_keys_kernel[(rows, tiles)](
+
+def _launch_local_slice(
+    rows: int,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+    scratch: MCarryTopKScratch,
+    *,
+    tile_offset: int,
+    slice_size: int,
+) -> None:
+    tiles, keep, candidates, _, need_marginal, _, keep_block = _local_slice_plan(
+        scratch.vocab_size, top_k, scratch
+    )
+    mode = os.environ.get("VLLM_GR_TOPK_SELECT", "i64").strip().lower()
+    slice_tiles = -(-slice_size // LOCAL_TILE_SIZE)
+    _local_keys_kernel[(rows, slice_tiles)](
         logits,
         temperatures,
         scratch.local_keys,
         scratch.local_marginal,
         scratch.partial_max,
         scratch.partial_sum,
-        vocab_size,
+        scratch.vocab_size,
         logits.stride(0),
         temperatures.numel(),
-        keep_stride,
+        candidates,
         tiles,
         keep,
         scratch.tile_flag,
         tiles,
+        tile_offset,
+        slice_size,
         BLOCK=LOCAL_TILE_SIZE,
         KEEP_BLOCK=keep_block,
         NEED_MARGINAL=need_marginal,
-        I32_SELECT=i32_select,
-        LANE_BITS=lane_bits,
+        I32_SELECT=mode == "i32",
+        LANE_BITS=(LOCAL_TILE_SIZE - 1).bit_length(),
         # 4 warps measured fastest: the in-block bitonic network is
         # register-bound, so more warps per CTA only lower occupancy.
         num_warps=4,
     )
+
+
+def local_slice(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+    scratch: MCarryTopKScratch,
+    rows: int,
+    *,
+    tile_offset: int = 0,
+) -> None:
+    """Scan one contiguous vocabulary slice into the persistent scratch."""
+
+    slice_size = int(logits.shape[1])
+    if (
+        logits.ndim != 2
+        or not logits.is_cuda
+        or logits.stride(1) != 1
+        or logits.stride(0) < slice_size
+        or slice_size <= 0
+    ):
+        raise ValueError("logits slice must be a CUDA matrix with contiguous vocabulary rows")
+    if rows <= 0 or rows > scratch.local_keys.shape[0] or logits.shape[0] < rows:
+        raise ValueError("logits slice has insufficient rows for the scratch")
+    if not 0 <= tile_offset * LOCAL_TILE_SIZE < scratch.vocab_size:
+        raise ValueError("tile_offset is outside the configured vocabulary")
+    if top_k != scratch.top_k:
+        raise ValueError("bounded Top-K scratch shape does not match the requested width")
+    _launch_local_slice(
+        rows,
+        logits,
+        temperatures,
+        top_k,
+        scratch,
+        tile_offset=tile_offset,
+        slice_size=slice_size,
+    )
+
+
+def finish(
+    rows: int,
+    top_k: int,
+    scratch: MCarryTopKScratch,
+    out_token_ids: torch.Tensor,
+    out_logprobs: torch.Tensor,
+    out_valid_mask: torch.Tensor,
+    out_valid_counts: torch.Tensor,
+    *,
+    repair_logits: torch.Tensor | None = None,
+    temperatures: torch.Tensor | None = None,
+    allow_unrepaired: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Merge the scanned slices and emit the candidates.
+
+    ``repair_logits`` is needed when ``keep < top_k``.  A sliced caller that has
+    already dropped the logits must run ``repair_plan``/``repair_fold`` itself
+    and pass ``allow_unrepaired=True``; otherwise the emitted Top-K can be
+    inexact.
+    """
+
+    if top_k != scratch.top_k:
+        raise ValueError("bounded Top-K scratch shape does not match the requested width")
+    tiles, _, candidates, chunk_count, _, verify, _ = _local_slice_plan(
+        scratch.vocab_size, top_k, scratch
+    )
+    # A chunk keeps ``chunk_width`` keys and that width is also its slot stride,
+    # so ``merge_keys`` has exactly ``chunk_count * chunk_width`` columns.
+    chunk_width = merge_chunk_width(top_k)
+    chunk_stride = chunk_count * chunk_width
     _merge_chunk_kernel[(rows, chunk_count)](
         scratch.local_keys,
         scratch.merge_keys,
         candidates,
-        keep_stride,
+        candidates,
         chunk_stride,
         BLOCK=MERGE_CHUNK,
-        SELECT_BLOCK=select_block,
+        SELECT_BLOCK=triton.next_power_of_2(chunk_width),
         STORE_BLOCK=chunk_width,
         num_warps=8,
     )
@@ -619,12 +987,19 @@ def unconstrained_topk_mcap_out(
         OUTPUT_BLOCK=triton.next_power_of_2(top_k),
         num_warps=8,
     )
-    if verify:
+    if verify and repair_logits is None and not allow_unrepaired:
+        raise ValueError(
+            "exact Top-K repair is required; pass repair_logits, or "
+            "allow_unrepaired=True after repair_plan/repair_fold/repair_emit"
+        )
+    if verify and repair_logits is not None:
+        if temperatures is None:
+            raise ValueError("temperatures are required when repair is enabled")
         # Rare path: rows whose retained set missed global winners (or whose i32
         # cutoff collided) are rebuilt by folding the row tile by tile.
         topk_block = triton.next_power_of_2(top_k)
         _repair_row_kernel[(rows,)](
-            logits,
+            repair_logits,
             temperatures,
             scratch.repair_flag,
             scratch.final_keys,
@@ -635,8 +1010,8 @@ def unconstrained_topk_mcap_out(
             out_logprobs,
             out_valid_mask,
             out_valid_counts,
-            vocab_size,
-            logits.stride(0),
+            scratch.vocab_size,
+            repair_logits.stride(0),
             temperatures.numel(),
             top_k,
             tiles,
@@ -653,10 +1028,152 @@ def unconstrained_topk_mcap_out(
     return out_token_ids, out_logprobs, out_valid_mask, out_valid_counts
 
 
+def stream_slice(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+    scratch: MCarryTopKScratch,
+    rows: int,
+    *,
+    tile_offset: int,
+) -> None:
+    """Scan, merge and exactly repair one slice without host synchronization.
+
+    Call in vocabulary order, starting at tile zero, then use ``repair_emit``
+    after the final slice. The logits can be overwritten as soon as this call
+    returns; the running Top-K and normalization statistics live in scratch.
+    """
+
+    local_slice(logits, temperatures, top_k, scratch, rows, tile_offset=tile_offset)
+    tiles, keep, candidates, _, _, _, _ = _local_slice_plan(scratch.vocab_size, top_k, scratch)
+    slice_size = int(logits.shape[1])
+    slice_tiles = -(-slice_size // LOCAL_TILE_SIZE)
+    topk_block = triton.next_power_of_2(top_k)
+    # Pad both inputs equally so tl.cat also has a power-of-two length.
+    candidate_block = triton.next_power_of_2(max(topk_block, slice_tiles * keep))
+    _stream_slice_kernel[(rows,)](
+        logits,
+        temperatures,
+        scratch.local_keys,
+        scratch.local_marginal,
+        scratch.tile_flag,
+        scratch.repair_running,
+        scratch.repair_flag,
+        logits.stride(0),
+        temperatures.numel(),
+        candidates,
+        tiles,
+        2 * topk_block,
+        scratch.vocab_size,
+        tile_offset,
+        slice_size,
+        top_k,
+        KEEP=keep,
+        SLICE_TILES=slice_tiles,
+        CANDIDATE_BLOCK=candidate_block,
+        TILE_BLOCK=triton.next_power_of_2(slice_tiles),
+        TOPK_BLOCK=topk_block,
+        FIRST=tile_offset == 0,
+        BLOCK=LOCAL_TILE_SIZE,
+        num_warps=4,
+    )
+
+
+def repair_plan(rows: int, scratch: MCarryTopKScratch, slice_tiles: int) -> list[int]:
+    """Host-side: vocabulary slices that still hold a flagged tile."""
+
+    if slice_tiles <= 0:
+        raise ValueError("slice_tiles must be positive")
+    flagged = scratch.tile_flag[:rows].any(dim=0)
+    if not bool(flagged.any().item()):
+        return []
+    tiles = torch.nonzero(flagged, as_tuple=False).flatten()
+    return torch.unique(tiles // slice_tiles).tolist()
+
+
+def repair_fold(
+    rows: int,
+    top_k: int,
+    scratch: MCarryTopKScratch,
+    logits_slice: torch.Tensor,
+    temperatures: torch.Tensor,
+    *,
+    tile_offset: int,
+    first: bool,
+) -> None:
+    """Refold the flagged tiles of one re-scanned slice into the running set."""
+
+    slice_size = int(logits_slice.shape[1])
+    tiles, _, _, _, _, _, _ = _local_slice_plan(scratch.vocab_size, top_k, scratch)
+    topk_block = triton.next_power_of_2(top_k)
+    _repair_fold_kernel[(rows,)](
+        logits_slice,
+        temperatures,
+        scratch.repair_flag,
+        scratch.final_keys,
+        scratch.repair_running,
+        scratch.tile_flag,
+        scratch.vocab_size,
+        logits_slice.stride(0),
+        temperatures.numel(),
+        top_k,
+        2 * topk_block,
+        tiles,
+        tile_offset,
+        slice_size,
+        -(-slice_size // LOCAL_TILE_SIZE),
+        tiles,
+        top_k,
+        BLOCK=LOCAL_TILE_SIZE,
+        TOPK_BLOCK=topk_block,
+        FIRST=first,
+        num_warps=4,
+    )
+
+
+def repair_emit(
+    rows: int,
+    top_k: int,
+    scratch: MCarryTopKScratch,
+    out_token_ids: torch.Tensor,
+    out_logprobs: torch.Tensor,
+    out_valid_mask: torch.Tensor,
+    out_valid_counts: torch.Tensor,
+) -> None:
+    """Emit every row the sliced repair pass rebuilt."""
+
+    tiles, _, _, _, _, _, _ = _local_slice_plan(scratch.vocab_size, top_k, scratch)
+    topk_block = triton.next_power_of_2(top_k)
+    _repair_emit_kernel[(rows,)](
+        scratch.repair_running,
+        scratch.repair_flag,
+        scratch.partial_max,
+        scratch.partial_sum,
+        out_token_ids,
+        out_logprobs,
+        out_valid_mask,
+        out_valid_counts,
+        2 * topk_block,
+        tiles,
+        tiles,
+        out_token_ids.stride(0),
+        top_k,
+        SCAN_BLOCK=triton.next_power_of_2(tiles),
+        OUTPUT_BLOCK=triton.next_power_of_2(top_k),
+        num_warps=4,
+    )
+
+
 __all__ = [
     "MCarryTopKScratch",
     "allocate_mcap_topk_scratch",
+    "finish",
+    "local_slice",
     "mcap_topk_tiling",
     "merge_chunk_width",
+    "repair_emit",
+    "repair_fold",
+    "repair_plan",
+    "stream_slice",
     "unconstrained_topk_mcap_out",
 ]

@@ -75,8 +75,13 @@ def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
         inputs=SimpleNamespace(width=128),
         dynamic=None,
         metadata=SimpleNamespace(prefix_length_bucket=1024),
+        # Vocabulary slicing is opt-in; a stage without a request keeps the
+        # monolithic LM head.
+        _head_slice_request=0,
+        _head_buffers=SimpleNamespace(release_full=Mock(), release_slice=Mock()),
         _forward_hidden=Mock(),
         _forward=Mock(),
+        _decode_logits=Mock(return_value="logits"),
     )
     assert hooks.decode_logits(owner) == "logits"
     assert hooks.decode_logits(owner) == "logits"

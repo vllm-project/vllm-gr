@@ -75,6 +75,7 @@ def close_v2_runtime(runner: Any) -> None:
         "_gr_dynamic_graphs_discarded",
         "_gr_async_decode_graph_capture_failed",
         "_gr_async_decode_graph_capture_error",
+        "_gr_unconstrained_head_layout",
     ):
         if hasattr(runner, name):
             delattr(runner, name)

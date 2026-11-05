@@ -16,6 +16,7 @@ from threading import Condition, Lock
 from typing import Any, cast
 
 import torch
+from torch.cuda.streams import Event as CUDAEvent
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
@@ -23,10 +24,17 @@ from vllm_gr.config import resolve_candidate_width
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+    LOCAL_TILE_SIZE,
+)
+from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     MCarryTopKScratch as UnconstrainedTopKScratch,
 )
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     allocate_mcap_topk_scratch as allocate_unconstrained_topk_scratch,
+)
+from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+    repair_emit,
+    stream_slice,
 )
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     unconstrained_topk_mcap_out as unconstrained_topk_out,
@@ -339,7 +347,7 @@ class _StageExecutionHooks:
 
         return get_beam_decode_graph(self.worker, batch_size=batch_size, beam_width=beam_width)
 
-    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor:
+    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
         """V1 can capture a missing graph against a new stage's buffers."""
         worker = self.worker
         from vllm_gr.v1.worker.model_runner_common import _get_gr_config
@@ -361,9 +369,10 @@ class _StageExecutionHooks:
                 )
             owner.graph = graph
         if should_replay_decode_graph(worker, owner.graph):
-            return owner._decode_logits(owner.graph.replay())
-        else:
-            return owner._forward()
+            return _hidden_logits(owner, owner.graph.replay())
+        # Eager Decode keeps the stage's ``_forward`` entry point; ``_forward``
+        # publishes ``hidden`` itself when the LM head is sliced.
+        return owner._forward()
 
     def consume_retirement_state(
         self, scheduler_output: Any, bindings: tuple[BeamRequestBinding, ...]
@@ -445,10 +454,182 @@ def _get_unconstrained_head_layout(
         if cached is not None and cached[0] == source_key:
             return cached[1], cached[2]
         transposed = weight.detach().T.contiguous()
-        ready = torch.Event()
+        # CUDA-specific external events preserve this dependency as a wait
+        # node in captured heads; torch.Event does not expose that option.
+        ready = CUDAEvent(external=True)
         ready.record(torch.cuda.current_stream(weight.device))
         worker._gr_unconstrained_head_layout = (source_key, transposed, ready)
         return transposed, ready
+
+
+# ``VLLM_GR_HEAD_SLICE`` values: 0 disables slicing, -1 decides per stage.
+SLICE_AUTO = -1
+# Measured on L20 (V=176,256, K=256): blocks narrower than this only add
+# launches, and wider than ``HEAD_SLICE_MAX_COLS`` only add memory.
+HEAD_SLICE_MIN_COLS = 16384
+HEAD_SLICE_MAX_COLS = 32768
+
+
+def head_slice_plan(
+    rows: int,
+    vocab_size: int,
+    itemsize: int,
+    cols: int,
+    min_rows: int,
+    max_bytes: int,
+) -> tuple[bool, int]:
+    """Return ``(use_slicing, cols)`` for one selection of ``rows`` rows.
+
+    Slicing removes the ``rows x vocab`` logits round trip but pays a fixed
+    per-block cost of roughly 90 us ``vocab / cols`` times, so it only pays for
+    wide selections: 1.22x at rows=1024 and 0.95-0.99x at rows=192..768 for
+    V=176,256 / K=256 / bf16 on L20.  ``cols=SLICE_AUTO`` derives the width from
+    the vocabulary and gates on ``min_rows``; an explicit width forces slicing
+    for a manual A/B.  ``max_bytes`` shrinks the block down to
+    ``HEAD_SLICE_MIN_COLS`` and no further.
+    """
+
+    if cols == 0 or rows <= 0 or vocab_size <= 0:
+        return False, 0
+    forced = cols != SLICE_AUTO
+    if cols == SLICE_AUTO:
+        cols = -(-(vocab_size // 6) // LOCAL_TILE_SIZE) * LOCAL_TILE_SIZE
+    cols = min(
+        max(cols - cols % LOCAL_TILE_SIZE, HEAD_SLICE_MIN_COLS),
+        HEAD_SLICE_MAX_COLS,
+        vocab_size,
+    )
+    if cols >= vocab_size:
+        # A single block would only add launches to the monolithic path.
+        return False, 0
+    while max_bytes > 0 and cols > HEAD_SLICE_MIN_COLS and rows * cols * itemsize > max_bytes:
+        # The caller addresses blocks by tile, so a reduced width must remain a
+        # whole number of tiles; never shrink below the measured minimum.
+        cols = max(cols // 2, HEAD_SLICE_MIN_COLS)
+    cols -= cols % LOCAL_TILE_SIZE
+    return forced or rows >= min_rows, cols
+
+
+class _HeadLogits:
+    """LM-head logits buffers, allocated only for the mode in use.
+
+    A stage switch releases the inactive mode, so an ``auto`` session never
+    keeps the full-vocabulary buffer alive beside the slice buffer.
+    """
+
+    def __init__(
+        self,
+        layout: tuple[torch.Tensor, torch.Event] | None,
+        device: torch.device,
+    ) -> None:
+        self._layout = layout
+        self._device = device
+        self.full: torch.Tensor | None = None
+        self.slice: torch.Tensor | None = None
+
+    def full_buffer(self, rows: int) -> torch.Tensor | None:
+        """``[rows, vocab]`` logits for the monolithic path."""
+
+        if self._layout is None or rows <= 0:
+            return None
+        if self.full is None or self.full.shape[0] < rows:
+            self.full = torch.empty(
+                (rows, self._layout[0].shape[1]),
+                dtype=self._layout[0].dtype,
+                device=self._device,
+            )
+        return self.full[:rows]
+
+    def slice_buffer(self, rows: int, cols: int) -> torch.Tensor | None:
+        """``[rows, cols]`` logits for one vocabulary block of the sliced path."""
+
+        if self._layout is None or rows <= 0 or cols <= 0:
+            return None
+        if self.slice is None or self.slice.shape[0] < rows or self.slice.shape[1] != cols:
+            self.slice = torch.empty((rows, cols), dtype=self._layout[0].dtype, device=self._device)
+        return self.slice[:rows]
+
+    def release_full(self) -> None:
+        """Drop the monolithic logits buffer after its last reader."""
+        self.full = None
+
+    def release_slice(self) -> None:
+        """Drop the slice logits buffer after its last reader."""
+        self.slice = None
+
+
+def _head_slice_request() -> int:
+    """``VLLM_GR_HEAD_SLICE``: 0 off, ``auto`` per stage, otherwise forced cols."""
+
+    raw = os.environ.get("VLLM_GR_HEAD_SLICE", "0").strip().lower()
+    if raw in ("", "0", "off", "false"):
+        return 0
+    if raw == "auto":
+        return SLICE_AUTO
+    try:
+        cols = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"VLLM_GR_HEAD_SLICE must be 0, 'auto' or a column count, got {raw!r}"
+        ) from error
+    return max(0, cols)
+
+
+def _head_slice_min_rows() -> int:
+    return max(int(os.environ.get("VLLM_GR_HEAD_SLICE_MIN_ROWS", "1024") or 0), 0)
+
+
+def _head_slice_max_bytes() -> int:
+    """Per-selection slice budget; 0 means unlimited."""
+
+    megabytes = float(os.environ.get("VLLM_GR_HEAD_SLICE_MAX_MB", "128") or 0)
+    return max(int(megabytes * 2**20), 0)
+
+
+def _stage_hidden(owner: GPUBeamStageRunner, hidden: torch.Tensor) -> torch.Tensor:
+    """Copy Decode hidden states out of the graph's shared replay buffer.
+
+    ``BeamDecodeGraph.replay()`` returns the graph's static output, which the
+    next replay of the same geometry overwrites.  Decode keeps working storage
+    for its logits, so the sliced path stages hidden states in a private buffer
+    instead of aliasing that output across ``execute`` and ``sample``.
+    """
+
+    rows, width = hidden.shape
+    staged = owner._hidden_staging
+    if (
+        staged is None
+        or staged.shape[0] < rows
+        or staged.shape[1] != width
+        or staged.dtype != hidden.dtype
+        or staged.device != hidden.device
+    ):
+        staged = torch.empty((rows, width), dtype=hidden.dtype, device=hidden.device)
+        owner._hidden_staging = staged
+    target = staged[:rows]
+    target.copy_(hidden)
+    return target
+
+
+def _hidden_logits(owner: GPUBeamStageRunner, hidden: torch.Tensor) -> torch.Tensor | None:
+    """Turn Decode hidden states into logits, or publish them for slicing."""
+
+    if owner._head_slice_request:
+        # The row count decides whether slicing pays for this stage.
+        cols = owner.head_slice_cols(hidden.shape[0])
+        if cols:
+            # A mixed ``auto`` session must not keep the full-vocabulary buffer
+            # alive beside the slice buffer.  The previous stage's ``sample``
+            # already consumed it, and no logits buffer is graph-captured.
+            owner._head_buffers.release_full()
+            # Blocks are reduced before the next one is produced, so only the
+            # hidden states travel forward from here.
+            owner.hidden = _stage_hidden(owner, hidden)
+            owner._active_slice_cols = cols
+            return None
+    owner._head_buffers.release_slice()
+    owner.hidden = None
+    return owner._decode_logits(hidden)
 
 
 class GPUBeamStageRunner:
@@ -521,20 +702,24 @@ class GPUBeamStageRunner:
         self.logits: torch.Tensor | None = None
         batch_size = len(bindings)
         rows = batch_size * beam.state.beam_width
-        self._head_layout = (
-            _get_unconstrained_head_layout(worker)
-            if backend is None and self.hooks.supports_transposed_head
-            else None
+        slice_request = (
+            _head_slice_request() if backend is None and self.hooks.supports_transposed_head else 0
         )
-        self._head_logits = (
-            torch.empty(
-                (rows, self._head_layout[0].shape[1]),
-                dtype=self._head_layout[0].dtype,
-                device=beam.state.device,
-            )
-            if self._head_layout is not None
-            else None
-        )
+        # The transposed copy is only consumed by the opt-in sliced-head path.
+        # Gate before creating it: the worker cache retains this allocation.
+        self._head_layout = _get_unconstrained_head_layout(worker) if slice_request else None
+        # Opt-in vocabulary slicing: drive the LM head one column block at a time
+        # and reduce each block before moving on.  ``auto`` slices only the
+        # stages whose row count makes it pay; switching modes releases the
+        # inactive logits buffer, so a mixed session keeps at most one of the
+        # full and slice allocations at a time.
+        self.hidden: torch.Tensor | None = None
+        self._hidden_staging: torch.Tensor | None = None
+        self._head_buffers = _HeadLogits(self._head_layout, beam.state.device)
+        self._head_slice_request = slice_request if self._head_layout is not None else 0
+        self._head_slice_min_rows = _head_slice_min_rows()
+        self._head_slice_max_bytes = _head_slice_max_bytes()
+        self._active_slice_cols = 0
         self.input_ids: torch.Tensor
         self.positions: torch.Tensor
         self.slots: torch.Tensor
@@ -728,30 +913,101 @@ class GPUBeamStageRunner:
         graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
         return graph
 
-    def _forward(self) -> torch.Tensor:
-        return self._decode_logits(self._forward_hidden(False))
+    def _forward(self) -> torch.Tensor | None:
+        """Eager Decode entry point; publishes hidden when the head is sliced."""
+
+        return _hidden_logits(self, self._forward_hidden(False))
+
+    def head_slice_cols(self, rows: int) -> int:
+        """Vocabulary block width for one selection; 0 means "do not slice"."""
+
+        layout = self._head_layout
+        if layout is None:
+            return 0
+        use_slicing, cols = head_slice_plan(
+            rows,
+            int(layout[0].shape[1]),
+            layout[0].element_size(),
+            self._head_slice_request,
+            self._head_slice_min_rows,
+            self._head_slice_max_bytes,
+        )
+        return cols if use_slicing else 0
 
     def _decode_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self._try_transposed_head_logits(hidden)
         return logits if logits is not None else self.worker.model.compute_logits(hidden)
 
+    def _select_from_hidden_slices(
+        self,
+        hidden: torch.Tensor,
+        rows: int,
+        top_k: int,
+        scratch: UnconstrainedTopKScratch,
+        candidates: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        counts: torch.Tensor,
+    ) -> None:
+        """Reduce the LM head one vocabulary block at a time.
+
+        Each block is consumed while it is still in cache, so the full
+        ``[rows, vocab]`` logits matrix never exists. Each block's retained set
+        is merged and repaired on the GPU before the buffer is reused, so no
+        host synchronization or repeated head GEMM is needed for exact Top-K.
+        """
+
+        if hidden.ndim != 2 or hidden.shape[0] != rows or not hidden.is_contiguous():
+            raise RuntimeError(
+                "vocabulary slicing expects contiguous hidden states with "
+                f"{rows} rows, got shape {tuple(hidden.shape)}"
+            )
+        layout = self._head_layout
+        if layout is None:
+            raise RuntimeError("vocabulary slicing requires the transposed head layout")
+        transposed, ready = layout
+        torch.cuda.current_stream(transposed.device).wait_event(ready)
+        vocab_size = int(transposed.shape[1])
+        cols = self._active_slice_cols
+        buffer = self._head_buffers.slice_buffer(rows, cols)
+        if buffer is None:
+            raise RuntimeError("vocabulary slicing requires a slice logits buffer")
+        temperatures = self.temperatures[:rows]
+
+        def block(start: int) -> torch.Tensor:
+            width = min(cols, vocab_size - start)
+            # Pack the tail into the same storage with a contiguous row stride.
+            # The previous slice has been consumed before this buffer is reused.
+            target = buffer.view(-1)[: rows * width].view(rows, width)
+            torch.mm(hidden, transposed[:, start : start + width], out=target)
+            return target
+
+        for start in range(0, vocab_size, cols):
+            stream_slice(
+                block(start),
+                temperatures,
+                top_k,
+                scratch,
+                rows,
+                tile_offset=start // LOCAL_TILE_SIZE,
+            )
+        repair_emit(rows, top_k, scratch, *candidates, counts)
+
     def _try_transposed_head_logits(self, hidden: torch.Tensor) -> torch.Tensor | None:
         layout = self._head_layout
-        output = self._head_logits
         if (
-            layout is None
-            or output is None
+            not self._head_slice_request
+            or layout is None
             or hidden.ndim != 2
             or not hidden.is_contiguous()
-            or hidden.device != output.device
-            or hidden.dtype != output.dtype
             or hidden.shape[1] != layout[0].shape[0]
-            or hidden.shape[0] > output.shape[0]
         ):
+            # The transposed GEMM belongs to the sliced path; the monolithic
+            # head keeps the model's own ``compute_logits``.
+            return None
+        logits = self._head_buffers.full_buffer(hidden.shape[0])
+        if logits is None or hidden.device != logits.device or hidden.dtype != logits.dtype:
             return None
         transposed, ready = layout
         torch.cuda.current_stream(hidden.device).wait_event(ready)
-        logits = output[: hidden.shape[0]]
         torch.mm(hidden, transposed, out=logits)
         return logits
 
@@ -774,6 +1030,7 @@ class GPUBeamStageRunner:
             if m.kind is GRStageKind.PREFILL:
                 self.temperatures.fill_(m.beam_params.temperature)
                 self.prefixes.fill_(-1)
+                self.hidden = None
                 self.logits = self.hooks.prefill_logits(original, scheduler_output, *args, **kwargs)
             else:
                 # Pure CPU work can run before the native Prefill staging fence.
@@ -803,11 +1060,12 @@ class GPUBeamStageRunner:
         for entry in execution.entries:
             m = entry.metadata
             if m.produces_output and not self.cancelled:
-                if self.logits is None:
+                if self.logits is None and self.hidden is None:
                     raise RuntimeError("GR output stage has no native model logits")
                 layout = BeamBatchExecutionView.from_stage_metadata(m)
                 rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
                 candidate_width = layout.candidate_top_k
+                device = self.hidden.device if self.hidden is not None else self.logits.device
                 candidates = (
                     self.dynamic.candidate_buffers(rows, candidate_width)
                     if self.dynamic is not None
@@ -828,12 +1086,12 @@ class GPUBeamStageRunner:
                     if (
                         tuple(tensor.shape) != expected
                         or tensor.dtype != dtype
-                        or tensor.device != self.logits.device
+                        or tensor.device != device
                         or not tensor.is_contiguous()
                     ):
                         raise RuntimeError(
                             f"GR candidate {name} must be contiguous {dtype} "
-                            f"{expected} on {self.logits.device}, got "
+                            f"{expected} on {device}, got "
                             f"{tuple(tensor.shape)} {tensor.dtype} {tensor.device}"
                         )
                 if self.backend is not None:
@@ -853,27 +1111,42 @@ class GPUBeamStageRunner:
                         device_step=self.constraint_steps,
                     )
                 else:
-                    logits = self.logits[:rows]
+                    sliced = self.hidden is not None
+                    logits = None if sliced else self.logits[:rows]
+                    vocab_size = (
+                        int(self._head_layout[0].shape[1]) if sliced else int(logits.shape[-1])
+                    )
                     if (
                         self.unconstrained_topk_scratch is None
                         or self.unconstrained_topk_scratch.top_k != layout.candidate_top_k
+                        or self.unconstrained_topk_scratch.vocab_size != vocab_size
                     ):
                         self.unconstrained_topk_scratch = allocate_unconstrained_topk_scratch(
                             batch_size=len(self.bindings) * self.beam.state.beam_width,
-                            vocab_size=int(logits.shape[-1]),
+                            vocab_size=vocab_size,
                             top_k=layout.candidate_top_k,
-                            device=logits.device,
+                            device=device,
                         )
-                    unconstrained_topk_out(
-                        logits,
-                        self.temperatures[:rows],
-                        layout.candidate_top_k,
-                        self.unconstrained_topk_scratch,
-                        candidates[0],
-                        candidates[1],
-                        candidates[2],
-                        self.counts[:rows],
-                    )
+                    if sliced:
+                        self._select_from_hidden_slices(
+                            self.hidden,
+                            rows,
+                            layout.candidate_top_k,
+                            self.unconstrained_topk_scratch,
+                            candidates,
+                            self.counts[:rows],
+                        )
+                    else:
+                        unconstrained_topk_out(
+                            logits,
+                            self.temperatures[:rows],
+                            layout.candidate_top_k,
+                            self.unconstrained_topk_scratch,
+                            candidates[0],
+                            candidates[1],
+                            candidates[2],
+                            self.counts[:rows],
+                        )
                 candidate_batch = BeamCandidateBatch(layout, *candidates)
                 if self.dynamic is not None:
                     self.dynamic.advance(layout, candidates, m.is_last_stage)
@@ -1168,7 +1441,9 @@ def get_stage_runner(
         for name in group.layer_names:
             impl = getattr(layers.get(name), "impl", None)
             if not isinstance(impl, BeamAttentionImpl):
-                raise ValueError("persistent GR requires Beam Attention on every KV layer")  # noqa: TRY004
+                raise ValueError(  # noqa: TRY004
+                    "persistent GR requires Beam Attention on every KV layer"
+                )
             # Packed beam queries do not preserve sliding-window positions
             # across the prefix/suffix split. No window is stored as (-1, -1).
             if impl.sliding_window != (-1, -1):

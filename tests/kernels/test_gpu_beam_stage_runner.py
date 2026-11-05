@@ -13,6 +13,7 @@ import msgspec
 import numpy as np
 import pytest
 import torch
+from torch.cuda.streams import Event as CUDAEvent
 
 from tests.constraints.test_table import make_table
 from tests.test_gr_async_scheduler import _batch_request
@@ -39,10 +40,14 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
 )
 from vllm_gr.v1.worker.beam_search_runner import BeamBatchSearchRunner, BeamSearchRunner
 from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+    LOCAL_TILE_SIZE,
+    SLICE_AUTO,
     BeamRequestBinding,
     GPUBeamStageRunner,
     _batch_finished,
+    _HeadLogits,
     get_stage_runner,
+    head_slice_plan,
     validate_dispatch,
 )
 from vllm_gr.v1.worker.gr_inputs import GRInputBuffers, bind_device_inputs
@@ -91,7 +96,15 @@ def dispatch(m: GRStageMetadata) -> SimpleNamespace:
     return result
 
 
-def runtime(dtype=torch.float16, n=3, stop_token_ids=(), candidate_width=None):
+def runtime(
+    dtype=torch.float16,
+    n=3,
+    stop_token_ids=(),
+    candidate_width=None,
+    *,
+    unconstrained=False,
+    hooks_cls=None,
+):
     context = BeamAttentionContext(3, 4, 1, 5, 8, 2, torch.device("cuda"), dtype)
     top_k = 4 if candidate_width is None else candidate_width
     state = BeamSearchState(
@@ -133,7 +146,11 @@ def runtime(dtype=torch.float16, n=3, stop_token_ids=(), candidate_width=None):
         _update_states=Mock(),
     )
     owner = GPUBeamStageRunner(
-        worker, beam, (BeamRequestBinding("session-0", 0, "session-0", 0, 0, 0),), backend
+        worker,
+        beam,
+        (BeamRequestBinding("session-0", 0, "session-0", 0, 0, 0),),
+        None if unconstrained else backend,
+        hooks=hooks_cls(worker) if hooks_cls is not None else None,
     )
     owner.metadata = SimpleNamespace(
         suffix_cu_seqlens_q_device=torch.arange(5, device="cuda", dtype=torch.int32),
@@ -878,3 +895,236 @@ def test_prefill_sampling_orders_producer_compute_and_host_copy(monkeypatch, n):
         done = torch.Event()
         done.record(compute)
         owner.release(owner.binding, consumer_done=done)
+
+
+def test_head_slice_plan_gates_on_rows_and_clamps_cols() -> None:
+    """Only wide selections slice, and never with a block narrower than 16384."""
+
+    vocab, itemsize, budget = 176256, 2, 128 * 2**20
+
+    assert head_slice_plan(4096, vocab, itemsize, 0, 1024, budget) == (False, 0)
+    # A forced width is clamped into the measured-useful window and ignores the
+    # row gate (manual A/B).
+    assert head_slice_plan(1, vocab, itemsize, 1024, 1024, budget) == (True, 16384)
+    assert head_slice_plan(1, vocab, itemsize, 100000, 1024, budget) == (True, 32768)
+    # ``auto`` derives the width from the vocabulary and gates on the row count.
+    assert head_slice_plan(256, vocab, itemsize, SLICE_AUTO, 1024, budget) == (False, 29696)
+    assert head_slice_plan(1024, vocab, itemsize, SLICE_AUTO, 1024, budget) == (True, 29696)
+    # The budget shrinks the block but never below the measured minimum, and
+    # the caller addresses blocks by tile, so the width stays tile-aligned.
+    tight = 120 * 2**20
+    assert head_slice_plan(4096, vocab, itemsize, SLICE_AUTO, 1024, tight) == (True, 16384)
+    # A vocabulary that fits one block is never sliced.
+    assert head_slice_plan(64, 8192, itemsize, SLICE_AUTO, 0, budget) == (False, 0)
+
+
+@pytest.mark.parametrize("rows", [1024, 2048, 4096])  # type: ignore[misc]
+def test_head_slice_budget_reduction_keeps_tile_alignment(rows: int) -> None:
+    """Every reduced width must address whole tiles (``start // LOCAL_TILE_SIZE``)."""
+
+    for vocab in (16512, 33000, 176256):
+        for budget_mb in (1, 16, 64, 128):
+            use_slicing, cols = head_slice_plan(rows, vocab, 2, SLICE_AUTO, 1024, budget_mb * 2**20)
+            if use_slicing:
+                assert cols % LOCAL_TILE_SIZE == 0, (rows, vocab, budget_mb, cols)
+
+
+def test_head_logits_buffers_are_allocated_lazily_per_mode() -> None:
+    """Slicing must not retain the full-vocabulary buffer beside the slice."""
+
+    rows, hidden_size, vocab, cols = 8, 16, 4096, 1024
+    device = torch.device("cuda")
+    layout = (torch.empty((hidden_size, vocab), dtype=torch.bfloat16, device=device), None)
+
+    buffers = _HeadLogits(layout, device)
+    assert buffers.full is None and buffers.slice is None
+    full = buffers.full_buffer(rows)
+    assert full is not None and tuple(full.shape) == (rows, vocab)
+    assert buffers.slice is None
+
+    buffers = _HeadLogits(layout, device)
+    sliced = buffers.slice_buffer(rows, cols)
+    assert sliced is not None and tuple(sliced.shape) == (rows, cols)
+    assert buffers.full is None
+
+    # Growth reallocates; a smaller row count reuses the buffer in place.
+    assert buffers.slice_buffer(rows * 2, cols).shape == (rows * 2, cols)
+    assert buffers.slice_buffer(rows, cols).shape == (rows, cols)
+    assert buffers.full_buffer(0) is None
+
+    assert _HeadLogits(None, device).full_buffer(rows) is None
+    assert _HeadLogits(None, device).slice_buffer(rows, cols) is None
+
+
+@pytest.mark.parametrize("runner_version", ["v1", "v2"])
+@pytest.mark.parametrize("slice_setting", [None, "0", "off", "auto", "16384"])
+def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version, slice_setting):
+    from vllm_gr.v1.worker import gpu_beam_stage_runner as stage_runner
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+
+    monkeypatch.setenv("VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT", "transposed")
+    if slice_setting is None:
+        monkeypatch.delenv("VLLM_GR_HEAD_SLICE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GR_HEAD_SLICE", slice_setting)
+    # Isolate the head-allocation boundary from V2's native input storage.
+    monkeypatch.setattr(
+        V2StageExecutionHooks,
+        "initialize_inputs",
+        stage_runner._StageExecutionHooks.initialize_inputs,
+    )
+    layout = (torch.empty((8, 32768), dtype=torch.bfloat16, device="cuda"), None)
+    get_layout = Mock(return_value=layout)
+    monkeypatch.setattr(stage_runner, "_get_unconstrained_head_layout", get_layout)
+    owner = runtime(
+        unconstrained=True,
+        hooks_cls=V2StageExecutionHooks if runner_version == "v2" else None,
+    )
+    if slice_setting in (None, "0", "off"):
+        get_layout.assert_not_called()
+        assert owner._head_layout is None
+        assert owner._head_slice_request == 0
+    else:
+        get_layout.assert_called_once_with(owner.worker)
+        assert owner._head_layout is layout
+        assert owner._head_slice_request == (SLICE_AUTO if slice_setting == "auto" else 16384)
+
+
+def test_sliced_head_non_divisible_vocab_peak_allocation(monkeypatch):
+    from vllm_gr.v1.worker import gpu_beam_stage_runner as stage_runner
+
+    rows, hidden_size, vocab_size = 2048, 16, 176256
+    budget = 128 * 2**20
+    use_slicing, cols = head_slice_plan(rows, vocab_size, 2, SLICE_AUTO, 1024, budget)
+    assert use_slicing and vocab_size % cols
+    hidden = torch.zeros((rows, hidden_size), dtype=torch.bfloat16, device="cuda")
+    weight = torch.zeros((hidden_size, vocab_size), dtype=hidden.dtype, device="cuda")
+    ready = CUDAEvent(external=True)
+    ready.record()
+    owner = SimpleNamespace(
+        _head_layout=(weight, ready),
+        _head_buffers=_HeadLogits((weight, ready), hidden.device),
+        _active_slice_cols=cols,
+        temperatures=torch.ones(rows, device="cuda"),
+    )
+    # Measure the production projection path independently of Top-K scratch.
+    monkeypatch.setattr(stage_runner, "stream_slice", lambda *args, **kwargs: None)
+    monkeypatch.setattr(stage_runner, "repair_emit", lambda *args, **kwargs: None)
+
+    def run():
+        GPUBeamStageRunner._select_from_hidden_slices(owner, hidden, rows, 1, None, (), None)
+
+    run()  # Warm up GEMM, including the tail shape, before measuring allocations.
+    torch.accelerator.synchronize()
+    owner._head_buffers.release_slice()
+    baseline = torch.accelerator.memory_allocated()
+    torch.accelerator.reset_peak_memory_stats()
+    run()
+    torch.accelerator.synchronize()
+    peak = torch.accelerator.max_memory_allocated() - baseline
+    assert rows * cols * hidden.element_size() <= peak <= budget
+    assert owner._head_buffers.full is None
+
+
+def test_transposed_head_gemm_only_when_slicing_is_requested():
+    rows, hidden_size, vocab_size = 2, 8, 4096
+    transposed = torch.randn((hidden_size, vocab_size), dtype=torch.bfloat16, device="cuda")
+    ready = CUDAEvent(external=True)
+    ready.record()
+    owner = SimpleNamespace(
+        _head_layout=(transposed, ready),
+        _head_buffers=_HeadLogits((transposed, ready), transposed.device),
+        _head_slice_request=0,
+    )
+    hidden = torch.randn((rows, hidden_size), dtype=transposed.dtype, device="cuda")
+
+    # Slicing disabled: the monolithic head stays on the model's compute_logits.
+    assert GPUBeamStageRunner._try_transposed_head_logits(owner, hidden) is None
+
+    owner._head_slice_request = 1024
+    logits = GPUBeamStageRunner._try_transposed_head_logits(owner, hidden)
+    assert logits is not None
+    assert tuple(logits.shape) == (rows, vocab_size)
+
+
+@pytest.mark.parametrize("top_k", [3, 32])
+def test_sliced_head_selection_can_capture_projection_and_repair(monkeypatch, top_k):
+    from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+        allocate_mcap_topk_scratch,
+        unconstrained_topk_mcap_out,
+    )
+
+    rows, hidden_size, vocab_size, cols = 3, 16, 8205, 2048
+    generator = torch.Generator(device="cuda").manual_seed(77)
+    hidden = torch.randn(
+        (rows, hidden_size), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    weight = torch.randn(
+        (hidden_size, vocab_size), dtype=hidden.dtype, device="cuda", generator=generator
+    )
+    ready = CUDAEvent(external=True)
+    ready.record()
+    owner = SimpleNamespace(
+        _head_layout=(weight, ready),
+        _head_buffers=_HeadLogits((weight, ready), hidden.device),
+        _active_slice_cols=cols,
+        temperatures=torch.ones(rows, device="cuda"),
+    )
+    scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, hidden.device)
+    reference_scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, hidden.device)
+
+    def buffers():
+        return (
+            torch.empty((rows, top_k), dtype=torch.int32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.float32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.bool, device="cuda"),
+            torch.empty(rows, dtype=torch.int32, device="cuda"),
+        )
+
+    result, expected = buffers(), buffers()
+    mm = torch.mm
+    projections = []
+
+    def counted_mm(*args, **kwargs):
+        projections.append(args[1].shape[1])
+        target = kwargs["out"]
+        assert target.is_contiguous()
+        assert target.data_ptr() == owner._head_buffers.slice.data_ptr()
+        return mm(*args, **kwargs)
+
+    def run():
+        GPUBeamStageRunner._select_from_hidden_slices(
+            owner, hidden, rows, top_k, scratch, result[:3], result[3]
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "mm", counted_mm)
+        run()
+    assert projections == [cols] * (vocab_size // cols) + [vocab_size % cols]
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for iteration in range(2):
+        if iteration:
+            hidden.neg_()
+        graph.replay()
+        # Match the sliced GEMM's shapes and output strides: the monolithic
+        # GEMM can legitimately round BF16 values differently.
+        logits = torch.empty((rows, vocab_size), dtype=hidden.dtype, device="cuda")
+        buffer = torch.empty((rows, cols), dtype=hidden.dtype, device="cuda")
+        for start in range(0, vocab_size, cols):
+            width = min(cols, vocab_size - start)
+            if width == cols:
+                mm(hidden, weight[:, start : start + width], out=buffer)
+                sliced = buffer
+            else:
+                sliced = mm(hidden, weight[:, start : start + width])
+            logits[:, start : start + width].copy_(sliced)
+        unconstrained_topk_mcap_out(logits, owner.temperatures, top_k, reference_scratch, *expected)
+        # Streaming and full scans reduce the FP32 normalizer in different
+        # orders. Selection stays exact; logprobs may differ in their last bits.
+        torch.testing.assert_close(result[1], expected[1], rtol=1e-6, atol=4e-6)
+        for index in (0, 2, 3):
+            got, want = result[index], expected[index]
+            assert torch.equal(got, want)

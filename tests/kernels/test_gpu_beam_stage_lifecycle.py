@@ -127,7 +127,9 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
             SimpleNamespace(layer_names=["layer"], kv_cache_spec=SimpleNamespace(block_size=16))
         ]
     )
-    owner._forward = lambda: decode_logits + owner.input_ids[:, None].to(dtype)
+    if not graph:
+        owner._forward_hidden = lambda capture: decode_logits + owner.input_ids[:, None].to(dtype)
+        worker.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
     if graph:
         worker.device = owner.beam.state.device
         worker._beam_context = owner.beam.session.context

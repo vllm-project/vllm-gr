@@ -19,11 +19,19 @@ from vllm_gr.ops.cuda.unconstrained_topk import (
 )
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     LOCAL_KEEP_MAX,
+    LOCAL_TILE_SIZE,
     allocate_mcap_topk_scratch,
+    finish,
+    local_slice,
     mcap_topk_tiling,
     merge_chunk_width,
+    repair_emit,
+    repair_fold,
+    repair_plan,
+    stream_slice,
     unconstrained_topk_mcap_out,
 )
+from vllm_gr.v1.worker.gpu_beam_stage_runner import head_slice_plan
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 
@@ -283,6 +291,213 @@ def test_mcap_i32_small_k_repairs_collision_at_cutoff(
     assert torch.equal(new_lp, ref_lp)
     assert torch.equal(new_valid, ref_valid)
     assert torch.equal(new_counts, ref_counts)
+
+
+def test_mcap_vocabulary_slices_match_full_scan() -> None:
+    """A vocabulary-sliced scan must reproduce the single-shot scan."""
+
+    vocab_size, top_k, rows, slice_cols = 8192, 128, 2, 2048
+    generator = torch.Generator().manual_seed(77)
+    logits = torch.randn((rows, vocab_size), generator=generator).cuda()
+    temperatures = torch.ones(rows, dtype=torch.float32, device="cuda")
+
+    def buffers() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty((rows, top_k), dtype=torch.int32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.float32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.bool, device="cuda"),
+            torch.empty((rows,), dtype=torch.int32, device="cuda"),
+        )
+
+    full_scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    full_out = buffers()
+    unconstrained_topk_mcap_out(logits, temperatures, top_k, full_scratch, *full_out)
+
+    sliced_scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    for start in range(0, vocab_size, slice_cols):
+        local_slice(
+            logits[:, start : start + slice_cols],
+            temperatures,
+            top_k,
+            sliced_scratch,
+            rows,
+            tile_offset=start // LOCAL_TILE_SIZE,
+        )
+    sliced_out = buffers()
+    finish(
+        rows,
+        top_k,
+        sliced_scratch,
+        *sliced_out,
+        repair_logits=logits,
+        temperatures=temperatures,
+    )
+
+    for got, want in zip(sliced_out, full_out):
+        assert torch.equal(got, want), "sliced scan diverged from the single-shot scan"
+
+
+def test_mcap_sliced_repair_matches_full_scan() -> None:
+    """A flagged tile must be repaired by re-scanning only its own slice."""
+
+    vocab_size, top_k, rows, slice_cols = 8192, 128, 2, 2048
+    generator = torch.Generator().manual_seed(99)
+    logits = torch.full((rows, vocab_size), -100.0, device="cuda")
+    logits[:] = torch.randn((rows, vocab_size), generator=generator).cuda()
+    # The whole Top-K comes from the first tile, so keeping a bounded number of
+    # its candidates cannot be exact and only that tile is flagged.  The tail is
+    # strictly ordered (no ties) so no other tile can look unsafe.
+    logits[:, :200] = torch.linspace(50.0, 0.0, 200, device="cuda")
+    logits[:, 200:] = -100.0 - torch.arange(vocab_size - 200, device="cuda") / 1.0e6
+    temperatures = torch.ones(rows, dtype=torch.float32, device="cuda")
+
+    def buffers() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty((rows, top_k), dtype=torch.int32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.float32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.bool, device="cuda"),
+            torch.empty((rows,), dtype=torch.int32, device="cuda"),
+        )
+
+    reference = buffers()
+    reference_scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    unconstrained_topk_mcap_out(logits, temperatures, top_k, reference_scratch, *reference)
+
+    scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    sliced = buffers()
+    for start in range(0, vocab_size, slice_cols):
+        local_slice(
+            logits[:, start : start + slice_cols],
+            temperatures,
+            top_k,
+            scratch,
+            rows,
+            tile_offset=start // LOCAL_TILE_SIZE,
+        )
+    finish(rows, top_k, scratch, *sliced, allow_unrepaired=True)
+
+    slices = repair_plan(rows, scratch, slice_cols // LOCAL_TILE_SIZE)
+    # The hot tile must be re-scanned; neighbouring tiles can also look unsafe
+    # because the retained set is deliberately incomplete.
+    assert 0 in slices, f"the hot slice must be re-scanned, got {slices}"
+    for index, slice_index in enumerate(slices):
+        start = slice_index * slice_cols
+        cols = min(slice_cols, vocab_size - start)
+        repair_fold(
+            rows,
+            top_k,
+            scratch,
+            logits[:, start : start + cols],
+            temperatures,
+            tile_offset=start // LOCAL_TILE_SIZE,
+            first=index == 0,
+        )
+    repair_emit(rows, top_k, scratch, *sliced)
+
+    for got, want in zip(sliced, reference):
+        assert torch.equal(got, want), "sliced repair diverged from the single-shot scan"
+
+
+def test_budget_reduced_slice_width_matches_full_scan() -> None:
+    """A budget-reduced width must stay tile-aligned, or tokens map to wrong tiles."""
+
+    rows, vocab_size, top_k = 4096, 33000, 8
+    use_slicing, cols = head_slice_plan(rows, vocab_size, 2, 29696, 1024, 128 * 2**20)
+    assert use_slicing
+    assert cols == 16384 and cols % LOCAL_TILE_SIZE == 0
+
+    logits = torch.full((rows, vocab_size), -100.0, dtype=torch.bfloat16, device="cuda")
+    # The unique maximum starts exactly at the second block boundary.
+    logits[:, cols] = 100.0
+    temperatures = torch.ones(rows, dtype=torch.float32, device="cuda")
+
+    def buffers() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty((rows, top_k), dtype=torch.int32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.float32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.bool, device="cuda"),
+            torch.empty((rows,), dtype=torch.int32, device="cuda"),
+        )
+
+    reference = buffers()
+    reference_scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    unconstrained_topk_mcap_out(logits, temperatures, top_k, reference_scratch, *reference)
+
+    sliced = buffers()
+    scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    for start in range(0, vocab_size, cols):
+        width = min(cols, vocab_size - start)
+        local_slice(
+            logits[:, start : start + width],
+            temperatures,
+            top_k,
+            scratch,
+            rows,
+            tile_offset=start // LOCAL_TILE_SIZE,
+        )
+    finish(rows, top_k, scratch, *sliced, repair_logits=logits, temperatures=temperatures)
+
+    assert (reference[0][:, 0] == cols).all(), "the full scan must select the unique maximum"
+    for got, want in zip(sliced, reference):
+        assert torch.equal(got, want), "budget-reduced slices diverged from the full scan"
+
+
+@pytest.mark.parametrize(
+    "top_k,mode",
+    [(1, "i64"), (3, "i64"), (32, "i64"), (128, "i64"), (2, "i32"), (32, "i32")],
+)  # type: ignore[misc]
+def test_mcap_streaming_slices_repair_before_buffer_reuse(
+    monkeypatch: pytest.MonkeyPatch, top_k: int, mode: str
+) -> None:
+    """Repair hot/tied tiles without a host read, even in a captured graph."""
+
+    monkeypatch.setenv("VLLM_GR_TOPK_SELECT", mode)
+    rows, vocab_size, slice_cols = 4, 8205, 2048
+    logits = torch.randn((rows, vocab_size), device="cuda")
+    logits[0].fill_(-10)
+    logits[0, :3] = torch.tensor([1.0, 1.0, 1.0000001192092896], device="cuda")
+    logits[1].zero_()  # Ties force exact repair beyond the retained prefix.
+    logits[2, -200:] = torch.linspace(10, 100, 200, device="cuda")
+    logits[3].fill_(-float("inf"))
+    logits[3, :2] = torch.tensor([float("nan"), float("inf")], device="cuda")
+    temperatures = torch.tensor([0.0, 0.75, 1.5, 1.0], device="cuda")
+
+    def buffers() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty((rows, top_k), dtype=torch.int32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.float32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.bool, device="cuda"),
+            torch.empty(rows, dtype=torch.int32, device="cuda"),
+        )
+
+    scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    reference_scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    result, expected = buffers(), buffers()
+    buffer = torch.empty((rows, slice_cols), device="cuda")
+
+    def run() -> None:
+        for start in range(0, vocab_size, slice_cols):
+            width = min(slice_cols, vocab_size - start)
+            sliced = buffer[:, :width]
+            sliced.copy_(logits[:, start : start + width])
+            stream_slice(
+                sliced, temperatures, top_k, scratch, rows, tile_offset=start // LOCAL_TILE_SIZE
+            )
+        repair_emit(rows, top_k, scratch, *result)
+
+    run()  # Compile before capture.
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for iteration in range(2):
+        if iteration:
+            # Replaying must reset the running set and pick up changed inputs.
+            logits[2, :200].fill_(200)
+        graph.replay()
+        unconstrained_topk_mcap_out(logits, temperatures, top_k, reference_scratch, *expected)
+        for got, want in zip(result, expected):
+            assert torch.equal(got, want)
 
 
 def test_mcap_single_candidate_width() -> None:
