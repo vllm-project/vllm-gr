@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import operator
 from typing import Any
 
 import numpy as np
@@ -15,22 +16,50 @@ class NumpyTokenBuffer:
 
     Prompt contents are copied in bulk once by native Request construction;
     only the short generated tail is appended. Slices/copies return arrays.
+
+    ``_items`` exports the storage as a buffer so full iteration produces
+    Python ints without boxing a NumPy scalar per token (``map(int, ...)``
+    measured ~5x slower). Exporting a buffer forbids ``resize``; the array is
+    sized exactly once in ``__init__`` and only item-assigned afterwards.
     """
+
+    __slots__ = ("_items", "length", "storage")
 
     def __init__(self, owned_prompt: npt.NDArray[np.int64], max_new_tokens: int) -> None:
         self.length = len(owned_prompt)
         owned_prompt.resize((self.length + max_new_tokens,), refcheck=False)
         self.storage = owned_prompt
+        self._items = memoryview(owned_prompt)
 
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, index: Any) -> Any:
-        value = self.storage[: self.length][index]
-        return int(value) if np.isscalar(value) else value
+        """Read one token or a token view.
+
+        Only integer and slice indices are supported. The list-backed request
+        this buffer replaces also accepted NumPy fancy indices, which the engine
+        never uses; those now raise instead of returning an array by accident.
+        """
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.length)
+            if step < 0:
+                # Normalized -1 stops are sentinels, not backing-array indices.
+                return self.storage[: self.length][index]
+            # Forward slices can address the backing array directly.
+            return self.storage[start:stop:step]
+        try:
+            position = operator.index(index)
+        except TypeError as error:
+            raise TypeError("GR token index must be an int or a slice") from error
+        if position < 0:
+            position += self.length
+        if position < 0 or position >= self.length:
+            raise IndexError("GR token index out of range")
+        return int(self.storage[position])
 
     def __iter__(self) -> Any:
-        return map(int, self.storage[: self.length])
+        return iter(self._items[: self.length])
 
     def copy(self) -> npt.NDArray[np.int64]:
         return self.storage[: self.length].copy()

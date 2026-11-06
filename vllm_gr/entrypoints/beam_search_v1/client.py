@@ -133,11 +133,13 @@ class BeamSearchClient:
         self.llm = llm
         self.engine = llm.llm_engine
         self._boundary_tokens: tuple[str, tuple[int | None, int | None]] | None = None
+        self._original_prompt_token_ids: tuple[tuple[int, ...], ...] | None = None
 
     def prepare_request(self, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
         processor = BeamSearchInputProcessor(self.engine)
         request = processor.process_offline_inputs(self.llm, call)
         self._boundary_tokens = (request.batch_id, processor.boundary_token_ids)
+        self._original_prompt_token_ids = processor.original_prompt_token_ids
         return request
 
     def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
@@ -186,8 +188,15 @@ class BeamSearchClient:
         boundaries = (
             prepared[1] if prepared is not None and prepared[0] == request.batch_id else None
         )
+        original_prompts = (
+            self._original_prompt_token_ids
+            if prepared is not None and prepared[0] == request.batch_id
+            else None
+        )
         return BeamSearchOutputProcessor(
-            self.llm.get_tokenizer(), boundary_token_ids=boundaries
+            self.llm.get_tokenizer(),
+            boundary_token_ids=boundaries,
+            original_prompt_token_ids=original_prompts,
         ).process_outputs(call, request, result)
 
     def abort(self, session: BeamSearchSession) -> None:

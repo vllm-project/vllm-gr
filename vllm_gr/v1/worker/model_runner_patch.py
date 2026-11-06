@@ -306,6 +306,21 @@ def _install_active_worker_resource_hook() -> None:
     install_worker_utility_hooks(Worker)
 
 
+def _install_numpy_token_staging() -> None:
+    """Bulk NumPy token staging is shared by the V1 and V2 GPU runners.
+
+    ``StagedWriteTensor.stage_write`` and ``async_tensor_h2d`` are the same
+    objects on both runners, so the patch is runner-agnostic; installing it
+    from the common entry point gives V1 the bulk ``np.copyto`` path too.
+    NPU workers stage tokens through their own adapter.
+    """
+    if _active_platform_module_name() != _GPU_PATCH_MODULE:
+        return
+    from vllm_gr.v1.worker.numpy_staging import install_numpy_staging
+
+    install_numpy_staging()
+
+
 def apply_worker_patches() -> None:
     """Install grouped-Beam hooks on active-platform ModelRunner targets."""
     from vllm_gr.v1.worker.gr_async_output import install_async_output_guard
@@ -316,6 +331,9 @@ def apply_worker_patches() -> None:
     # even when all runner hooks were already present (idempotent) so canonical
     # Constraint Tables can be injected in both uniproc and multiproc engines.
     _install_active_worker_resource_hook()
+    # Runner-agnostic: V1 and V2 both write prompt tokens through the same
+    # StagedWriteTensor, so install the NumPy staging patch before dispatch.
+    _install_numpy_token_staging()
 
     if _active_runner_module_name() == _V2_GPU_PATCH_MODULE:
         # V2 runner exposes ``prepare_inputs``/``sample``/``sample_tokens`` and

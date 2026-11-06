@@ -128,6 +128,29 @@ def test_invalid_trie_rejected_before_native_add_and_engine_remains_usable(core,
     complete(core, "good-trie")
 
 
+@pytest.mark.parametrize("via_socket", [False, True])
+def test_negative_tokens_rejected_before_preprocessing(core, monkeypatch, via_socket):
+    bad = batch("negative-token")
+    bad.items[0].request.prompt_token_ids = np.array([-1, 2, 3], dtype=np.int64)
+    preprocess = Mock(wraps=core.preprocess_add_request)
+    monkeypatch.setattr(core, "preprocess_add_request", preprocess)
+    free = core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    if via_socket:
+        core._handle_submit_gr_session(bad)
+    else:
+        core._handle_client_request(EngineCoreRequestType.SUBMIT_GR_SESSION, bad)
+    assert core.input_queue.empty()
+    preprocess.assert_not_called()
+    assert_one_error(core, "negative-token")
+    assert not core.scheduler.requests
+    assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+    assert core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
+
+    core._handle_submit_gr_session(batch("valid-after-negative"))
+    core._process_input_queue()
+    complete(core, "valid-after-negative")
+
+
 @pytest.mark.parametrize("counts", [[1], [2, 2], [1, 2], [], [0]])
 def test_engine_startup_publishes_live_trie_count(counts):
     from vllm_gr.v1.engine.core import loaded_constraint_trie_count

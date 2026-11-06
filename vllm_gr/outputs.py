@@ -28,6 +28,8 @@ class CompactBeamSearchOutput:
     """Candidates in the same order as the full beam-search output.
 
     As in the full output, there can be fewer valid candidates than beam width.
+    ``prompt_token_ids`` is the accepted input (without the configured begin
+    token) and is shared by every candidate of the request.
     """
 
     sequences: tuple[CompactBeamSearchSequence, ...]

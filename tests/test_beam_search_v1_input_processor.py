@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 import torch
 from vllm.exceptions import VLLMValidationError
-from vllm.inputs import embeds_input, tokens_input
+from vllm.inputs import TextPrompt, TokensPrompt, embeds_input, tokens_input
 from vllm.renderers.params import TokenizeParams
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
@@ -318,6 +318,54 @@ def test_offline_inputs_preserve_caller_formed_batch_order(batch_size: int) -> N
     assert [item.request.prompt_token_ids.tolist() for item in request.items] == prompts
     assert request.batch_id == request.items[0].request.request_id
     assert len({item.request.request_id for item in request.items}) == batch_size
+
+
+@pytest.mark.parametrize("text_input", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("begin", [None, "<begin>"])  # type: ignore[misc]
+def test_offline_compact_output_preserves_accepted_prompt_snapshot(
+    text_input: bool, begin: str | None
+) -> None:
+    engine = _make_engine()
+    engine.get_supported_tasks = lambda: ("generate",)
+    tokenizer = SimpleNamespace(
+        eos_token_id=2,
+        convert_tokens_to_ids=lambda token: {"<begin>": 7, "<end>": 8}[token],
+    )
+    accepted = [1, 2]
+    llm = SimpleNamespace(
+        llm_engine=engine,
+        get_tokenizer=lambda: tokenizer,
+        _preprocess_cmpl=lambda prompts: [{"prompt_token_ids": accepted}],
+        _lora_request_to_seq=lambda lora, size: [lora],
+    )
+    params = BeamSearchParams(beam_width=2, max_tokens=4 + int(begin is not None), ignore_eos=True)
+    params.begin_token = begin
+    params.end_token = "<end>"
+    raw_tokens = [9, 9]
+    source_prompt: TextPrompt | TokensPrompt = (
+        {"prompt": "rendered text"} if text_input else {"prompt_token_ids": raw_tokens}
+    )
+    call = OfflineBeamSearchRequest([source_prompt], params)
+    client = BeamSearchClient(llm)
+    request = client.prepare_request(call)
+    assert request.items[0].request.prompt_token_ids.tolist() == [1, 2] + (
+        [] if begin is None else [7]
+    )
+    accepted[0] = 99
+    raw_tokens[0] = 88
+    # The engine owns a snapshot; later caller mutations do not leak in.
+    assert request.items[0].request.prompt_token_ids.tolist()[0] == 1
+    request.items[0].request.prompt_token_ids[0] = 77
+    result = BeamBatchResult(
+        request.protocol_version,
+        request.batch_id,
+        BeamBatchOutput((BeamRequestOutput(0, request.batch_id, ()),)),
+        None,
+    )
+    first = client.build_output(call, request, result)[0]
+    second = client.build_output(call, request, result)[0]
+    assert first.prompt_token_ids == (1, 2)
+    assert first.prompt_token_ids is second.prompt_token_ids
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]

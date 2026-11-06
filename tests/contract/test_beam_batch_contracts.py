@@ -177,11 +177,62 @@ def test_request_uses_engine_request_identity_and_beam_params_authority() -> Non
 
 
 def test_request_rejects_embedding_only_prompt() -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
     engine_request = _engine_request("request-0", None)
     engine_request.prompt_embeds = torch.ones((2, 8), dtype=torch.float32)
-    request = _request(items=(BeamBatchItem(0, engine_request),))
-    with pytest.raises(BeamContractError, match="nonempty contiguous nonnegative int64"):
-        validate_beam_batch_request(request)
+    request = _request(batch_id="request-0", items=(BeamBatchItem(0, engine_request),))
+    with pytest.raises(ValueError, match="requires a nonempty token prompt"):
+        validate_gr_request(request)
+
+
+def test_to_int64_tokens_normalizes_or_fails_closed() -> None:
+    import numpy as np
+
+    from vllm_gr.v1.beam.batch_contracts import to_int64_tokens
+
+    tokens = to_int64_tokens([1, 2, 3])
+    assert tokens.dtype == np.int64
+    assert tokens.flags.c_contiguous
+    assert tokens.tolist() == [1, 2, 3]
+    # Canonical arrays cross the boundary without a copy.
+    assert to_int64_tokens(tokens) is tokens
+    for bad in (
+        np.array([1, 2], dtype=np.int32),
+        np.array([[1, 2], [3, 4]], dtype=np.int64),
+        np.arange(8, dtype=np.int64)[::2],
+        np.array([], dtype=np.int64),
+        [1.5, 2.5],
+        [[1, 2], [3, 4]],
+    ):
+        with pytest.raises(BeamContractError, match="int64"):
+            to_int64_tokens(bad)
+
+
+def test_batch_contract_rejects_non_canonical_token_arrays() -> None:
+    import numpy as np
+
+    from vllm_gr.v1.beam.batch_contracts import BeamEngineCoreRequest
+
+    def beam_request(tokens: object) -> BeamEngineCoreRequest:
+        values = {
+            name: getattr(_engine_request("request-0", None), name)
+            for name in EngineCoreRequest.__struct_fields__
+        }
+        values["prompt_token_ids"] = tokens
+        return BeamEngineCoreRequest(**values)
+
+    for bad in (
+        np.array([[1, 2], [3, 4]], dtype=np.int64),
+        np.array([1, 2], dtype=np.int32),
+        np.arange(8, dtype=np.int64)[::2],
+    ):
+        request = _request(
+            batch_id="request-0",
+            items=(BeamBatchItem(0, beam_request(bad)),),
+        )
+        with pytest.raises(BeamContractError, match="contiguous int64"):
+            validate_beam_batch_request(request)
 
 
 @pytest.mark.parametrize("bad_value", [0, -1, True, 1025])  # type: ignore[misc]

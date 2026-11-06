@@ -281,12 +281,44 @@ def test_compact_does_not_copy_prompt_or_decode_text_per_beam() -> None:
         1, "request-1", BeamBatchOutput((BeamRequestOutput(0, "request-1", sequences),)), None
     )
     compact = processor.process_outputs(replace(call, output_mode="compact"), request, result)[0]
+    # One materialization per request: 256 Beams must not re-read the prompt.
     assert prompt.reads == 1
     assert compact.prompt_token_ids == tuple(range(1024))
     assert tokenizer.decode_calls == 0
     assert len(compact.sequences) == 256
     assert all(len(seq.token_ids) == 3 for seq in compact.sequences)
     assert compact.sequences[255].cumulative_logprob == -255.0
+
+
+@pytest.mark.parametrize("begin", [None, "begin"])  # type: ignore[misc]
+def test_compact_reuses_accepted_prompt_snapshot_without_array_materialization(
+    begin: str | None,
+) -> None:
+    class NoMaterialization(np.ndarray[Any, np.dtype[np.int64]]):  # type: ignore[misc]
+        def tolist(self) -> list[int]:
+            raise AssertionError("compact output must reuse the accepted prompt snapshot")
+
+    _, call, request, result, tokenizer = _case(begin=begin)
+    prompt = request.items[0].request.prompt_token_ids.view(NoMaterialization)
+    request.items[0].request.prompt_token_ids = prompt
+    snapshot = ((1, 2),)
+    processor = BeamSearchOutputProcessor(tokenizer, original_prompt_token_ids=snapshot)
+    prompt[0] = 999
+    call.prompts[0]["prompt_token_ids"][0] = 888
+    compact = processor.process_outputs(replace(call, output_mode="compact"), request, result)[0]
+    assert compact.prompt_token_ids is snapshot[0]
+    assert compact.prompt_token_ids == (1, 2)
+    assert compact.sequences[0].token_ids == (() if begin is None else (10,)) + (3, 4, 20)
+    assert tokenizer.decode_calls == 0
+
+
+def test_compact_output_keeps_prompt_token_ids_constructor_compatibility() -> None:
+    from vllm_gr.outputs import CompactBeamSearchOutput, CompactBeamSearchSequence
+
+    sequence = CompactBeamSearchSequence((3, 4), -1.25)
+    output = CompactBeamSearchOutput((sequence,), prompt_token_ids=(1, 2))
+    assert output.prompt_token_ids == (1, 2)
+    assert CompactBeamSearchOutput((sequence,)).prompt_token_ids is None
 
 
 def test_compact_empty_candidates_and_request_order() -> None:
@@ -312,6 +344,7 @@ def test_compact_empty_candidates_and_request_order() -> None:
     out = processor.process_outputs(call, request, result)
     assert [x.prompt_token_ids for x in out] == [(7, 8), (1, 2)]
     assert out[0].sequences == ()
+    assert out[1].sequences
     assert tokenizer.decode_calls == 0
 
 

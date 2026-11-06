@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import numpy as np
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
@@ -28,6 +29,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchParams,
     BeamBatchRequest,
     BeamOutputOptions,
+    to_int64_tokens,
 )
 
 
@@ -129,13 +131,22 @@ def _create_request_params(
     return sampling_params, begin_token_id, end_token_id
 
 
-def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> None:
+def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> list[int]:
     # Mixed inputs also carry token IDs. Reject embeddings before changing IDs
     # so their per-position mask and embedding rows cannot become misaligned.
     if request.prompt_embeds is not None or request.prompt_token_ids is None:
         raise BeamSearchRequestError("embedding prompts are not supported by beam_search_v1")
-    if begin_token_id is not None:
-        request.prompt_token_ids = [*request.prompt_token_ids, begin_token_id]
+    original = request.prompt_token_ids
+    if begin_token_id is None:
+        # The batch contract normalizes the sequence exactly once; copying it
+        # here only to convert it later would unbox every token twice.
+        return original
+    tokens = to_int64_tokens(original)
+    owned = np.empty(tokens.size + 1, dtype=np.int64)
+    owned[:-1] = tokens
+    owned[-1] = begin_token_id
+    request.prompt_token_ids = owned
+    return original
 
 
 def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
@@ -328,6 +339,7 @@ class BeamSearchInputProcessor:
     def __init__(self, engine: Any) -> None:
         self.engine = engine
         self.boundary_token_ids: tuple[int | None, int | None] = (None, None)
+        self.original_prompt_token_ids: tuple[tuple[int, ...], ...] | None = None
 
     def process_offline_inputs(self, llm: Any, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
         if not call.prompts:
@@ -341,6 +353,7 @@ class BeamSearchInputProcessor:
         engine_inputs = llm._preprocess_cmpl(call.prompts)
         lora_requests = llm._lora_request_to_seq(call.lora_request, len(engine_inputs))
         engine_requests = []
+        original_prompts = []
         arrival_time = time.time()
         supported_tasks = self.engine.get_supported_tasks()
         for engine_input, lora_request in zip(engine_inputs, lora_requests, strict=True):
@@ -352,7 +365,9 @@ class BeamSearchInputProcessor:
                 arrival_time=arrival_time,
                 lora_request=lora_request,
             )
-            _prepare_prompt(engine_request, begin_token_id)
+            original = _prepare_prompt(engine_request, begin_token_id)
+            if call.output_mode == "compact":
+                original_prompts.append(tuple(original))
             self.engine.input_processor.assign_request_id(engine_request)
             engine_requests.append(engine_request)
         session_id = engine_requests[0].request_id
@@ -364,6 +379,9 @@ class BeamSearchInputProcessor:
             trie_ids=call.trie_ids,
         )
         self.boundary_token_ids = (begin_token_id, end_token_id)
+        self.original_prompt_token_ids = (
+            tuple(original_prompts) if call.output_mode == "compact" else None
+        )
         return request
 
     async def process_online_inputs(

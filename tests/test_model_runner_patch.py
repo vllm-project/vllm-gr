@@ -341,6 +341,33 @@ def test_dispatcher_routes_platform_before_v2_flag(
     assert imported == [expected]
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "device_type,expected",
+    [("cuda", ["staging"]), ("npu", [])],
+)
+def test_numpy_token_staging_installs_for_cuda_runners_only(
+    monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
+    expected: list[str],
+) -> None:
+    """V1 and V2 share StagedWriteTensor, so staging is runner-agnostic."""
+    from vllm_gr.v1.worker import numpy_staging
+
+    calls: list[str] = []
+    monkeypatch.setattr(numpy_staging, "install_numpy_staging", lambda: calls.append("staging"))
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_active_platform_module_name",
+        lambda: (
+            model_runner_patch._GPU_PATCH_MODULE
+            if device_type == "cuda"
+            else model_runner_patch._NPU_PATCH_MODULE
+        ),
+    )
+    model_runner_patch._install_numpy_token_staging()
+    assert calls == expected
+
+
 def test_apply_worker_patches_dispatches_to_v2_installer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -357,6 +384,9 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: True)
     monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
+    monkeypatch.setattr(
+        model_runner_patch, "_install_numpy_token_staging", lambda: called.append("staging")
+    )
     # The platform path must not be touched under V2.
     monkeypatch.setattr(
         model_runner_patch,
@@ -366,7 +396,7 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
     monkeypatch.setattr(v2_patch_module, "_apply_v2_runner_patches", lambda: called.append("v2"))
 
     model_runner_patch.apply_worker_patches()
-    assert called == ["v2"]
+    assert called == ["staging", "v2"]
 
 
 @pytest.mark.parametrize("mode", [None, BeamExecutionMode.V1])  # type: ignore[misc]

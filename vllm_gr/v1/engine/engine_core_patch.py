@@ -4,11 +4,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections import OrderedDict
 from functools import wraps
 
+import msgspec
+import numpy as np
 from vllm.logger import init_logger
+from vllm.utils.hashing import sha256 as _vllm_sha256
 
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
@@ -879,6 +883,48 @@ _KV_HASH_MEMO_LIMIT = 65536
 _CHAIN_FALLBACK_ACTIVE = False
 
 
+def _token_bytes(tokens) -> memoryview:
+    """Expose token storage as contiguous bytes without copying.
+
+    GR requests already carry 1-D contiguous int64 arrays. Native requests
+    (the ADD path) still pass Python lists, which normalize through the same
+    boundary contract instead of raising inside ``hashlib``.
+    """
+    if not (
+        isinstance(tokens, np.ndarray)
+        and tokens.dtype == np.int64
+        and tokens.ndim == 1
+        and tokens.flags.c_contiguous
+    ):
+        from vllm_gr.v1.beam.batch_contracts import to_int64_tokens
+
+        tokens = to_int64_tokens(tokens, name="block tokens")
+    return memoryview(tokens).cast("B")
+
+
+def _hash_block_bytes(block, parent_hash, extra_keys) -> bytes:
+    """Hash token bytes, then a domain tag plus parent/extra-key metadata.
+
+    The one-byte tag keeps the common no-extra-keys path free of per-block
+    MessagePack encoding while staying unambiguous with the extra-keys path.
+    """
+    digest = hashlib.sha256(block)
+    if extra_keys is None:
+        digest.update(b"\x00")
+        digest.update(parent_hash)
+        return digest.digest()
+    digest.update(b"\x01")
+    try:
+        digest.update(msgspec.msgpack.encode(extra_keys))
+    except TypeError:
+        # Preserve support for opaque extra keys through vLLM's native object
+        # hasher instead of maintaining another serializer here.
+        digest.update(b"\x02")
+        digest.update(_vllm_sha256(extra_keys))
+    digest.update(parent_hash)
+    return digest.digest()
+
+
 def apply_kv_hash_memo_patch() -> None:
     """Memoize vLLM's per-block prefix-cache hashing (EngineCore process).
 
@@ -887,9 +933,11 @@ def apply_kv_hash_memo_patch() -> None:
     inputs always produce the same ``BlockHash``.  Repeated blocks
     (re-sent beam suffixes, popular prefixes) re-hash identical blocks on
     every request — ~1.3ms of sha256 work per 1024-token prompt — so a
-    bounded FIFO memo turns those hits into dict lookups.  First-seen blocks
-    pay one extra tuple() key build (microseconds).  The wrapper is
-    idempotent and installs on the module attribute
+    bounded FIFO memo turns those hits into dict lookups.  Keys are immutable
+    byte snapshots of the token view (``bytes(memoryview)``; never
+    ``tobytes()``), so a miss hashes each block exactly once, and non-array
+    token sequences normalize through the same boundary contract.  The wrapper
+    is idempotent and installs on the module attribute
     (``request_block_hasher`` resolves it as a module global at call time,
     so every existing and future hasher picks it up).
 
@@ -918,24 +966,26 @@ def apply_kv_hash_memo_patch() -> None:
     def hash_block_tokens_memo(
         hash_function, parent_block_hash, curr_block_token_ids, extra_keys=None
     ):
-        import numpy as np
-
-        if isinstance(curr_block_token_ids, np.ndarray):
-            curr_block_token_ids = tuple(map(int, curr_block_token_ids))
-        if _CHAIN_FALLBACK_ACTIVE:
-            # Chain-memo miss in flight: hash at stock speed (see
-            # _CHAIN_FALLBACK_ACTIVE).
+        if hash_function is not _vllm_sha256:
+            # The direct-buffer encoding below is SHA-256 specific; keep the
+            # configured algorithm authoritative for other hash functions.
+            # Those requests take the native path and therefore do NOT get memo
+            # acceleration. Identity comparison is intentional: upstream hands
+            # us the module-level ``sha256`` itself, so a wrapper falls back.
+            # Native serializers require Python ints, not NumPy scalars.
+            if isinstance(curr_block_token_ids, np.ndarray):
+                curr_block_token_ids = curr_block_token_ids.tolist()
             return original(hash_function, parent_block_hash, curr_block_token_ids, extra_keys)
-        key = (
-            hash_function,
-            parent_block_hash,
-            tuple(curr_block_token_ids),
-            extra_keys,
-        )
+        parent_hash = parent_block_hash or kv_cache_utils.NONE_HASH
+        # Immutable content snapshot: exact memo key, no second block hash.
+        token_bytes = bytes(_token_bytes(curr_block_token_ids))
+        if _CHAIN_FALLBACK_ACTIVE:
+            return kv_cache_utils.BlockHash(_hash_block_bytes(token_bytes, parent_hash, extra_keys))
+        key = (hash_function, parent_hash, token_bytes, extra_keys)
         hit = memo.get(key)
         if hit is not None:
             return hit
-        hit = original(hash_function, parent_block_hash, curr_block_token_ids, extra_keys)
+        hit = kv_cache_utils.BlockHash(_hash_block_bytes(token_bytes, parent_hash, extra_keys))
         if len(memo) >= _KV_HASH_MEMO_LIMIT:
             # Constant-time FIFO eviction keeps the memo bounded in
             # long-running servers under varied (never-repeating) traffic.
@@ -965,10 +1015,12 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
     (hash_function, block_size, salt, the full-block token prefix), so a
     hit can replay the whole list in one dict lookup.
 
-    A MISS hashes the already-materialized token tuple directly with the
-    native hash function and parent/extra-key ABI. Eligibility below proves
-    that extra keys are absent. No per-block memo bookkeeping is needed;
-    the chain entry is still recorded for a repeat of this exact prompt.
+    A MISS hashes the full-block byte view directly with SHA-256, using the
+    same ``sha256(tokens || tag || parent)`` encoding as incremental hashing.
+    Eligibility proves that extra keys are absent. The immutable token-byte
+    snapshot doubles as the memo key, so no second whole-prompt hash is paid.
+    No per-block memo bookkeeping is needed; the chain entry is still recorded
+    for a repeat of this exact prompt.
 
     Fast-path eligibility is conservative: any incremental call
     (``block_hashes`` non-empty), mm_features, lora_request, a non-``None``
@@ -999,6 +1051,10 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
                 or getattr(request, "prompt_embeds", None) is not None
             ):
                 return original_hasher(request)
+            if caching_hash_fn is not _vllm_sha256:
+                # Same contract as the per-block memo: non-default algorithms
+                # keep native hashing and lose the chain memo.
+                return original_hasher(request)
 
             num_tokens = request.num_tokens
             num_full_blocks = num_tokens // block_size
@@ -1007,14 +1063,11 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
 
             # Only the full-block prefix participates in hashing; trailing
             # partial-block tokens never reach hash_block_tokens.
-            import numpy as np
-
-            prefix = request.all_token_ids[: num_full_blocks * block_size]
-            # Array memo keys stay compact; cold hashing materializes Python
-            # integers one block at a time to preserve native cache identity.
-            array_tokens = isinstance(prefix, np.ndarray)
-            tokens = prefix if array_tokens else tuple(prefix)
-            key = (caching_hash_fn, block_size, tokens.tobytes() if array_tokens else tokens)
+            tokens = request.all_token_ids[: num_full_blocks * block_size]
+            # Immutable content snapshot: an exact memo key that costs one
+            # memcpy instead of a whole-prompt SHA-256.
+            token_bytes = bytes(_token_bytes(tokens))
+            key = (caching_hash_fn, block_size, token_bytes)
             hit = chain_memo.get(key)
             if hit is not None:
                 return list(hit)
@@ -1022,20 +1075,17 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
             _CHAIN_FALLBACK_ACTIVE = True
             try:
                 # Eligibility above proves every block has no extra keys.
-                # Reuse the immutable full-block tuple already built for the
-                # memo key, preserving the exact native hash input and chain.
+                # Use the same direct-buffer encoding as hash_block_tokens_memo.
                 result = []
                 parent_hash = None
-                for start in range(0, len(tokens), block_size):
+                block_view = memoryview(token_bytes)
+                step = block_size * 8
+                for start in range(0, len(block_view), step):
                     parent_hash = kv_cache_utils.BlockHash(
-                        caching_hash_fn(
-                            (
-                                parent_hash or kv_cache_utils.NONE_HASH,
-                                tuple(map(int, tokens[start : start + block_size]))
-                                if array_tokens
-                                else tokens[start : start + block_size],
-                                None,
-                            )
+                        _hash_block_bytes(
+                            block_view[start : start + step],
+                            parent_hash or kv_cache_utils.NONE_HASH,
+                            None,
                         )
                     )
                     result.append(parent_hash)

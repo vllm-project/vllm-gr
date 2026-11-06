@@ -7,6 +7,7 @@ import os
 from importlib import import_module
 from unittest import mock
 
+import numpy as np
 import pytest
 
 from vllm_gr.patch import (
@@ -279,7 +280,7 @@ def test_kv_hash_memo_patch_equivalence_and_hits() -> None:
 
     hash_block_tokens is pure in (hash_function, parent hash, tokens,
     extra_keys), so a bounded memo must return the exact same BlockHash for
-    repeated inputs (dict hit) and fall through to the original for
+    repeated inputs (dict hit) and compute the byte encoding for
     first-seen blocks.  FIFO eviction keeps the memo bounded.
     """
     import hashlib
@@ -305,18 +306,20 @@ def test_kv_hash_memo_patch_equivalence_and_hits() -> None:
         wrapped = kv_cache_utils.hash_block_tokens
         assert getattr(wrapped, "_gr_hash_memo", False)
 
-        def sha_fn(payload: object) -> bytes:
-            return hashlib.sha256(repr(payload).encode()).digest()
+        from vllm.utils.hashing import sha256 as sha_fn
 
-        tokens = list(range(100, 116))
+        tokens = np.arange(100, 116, dtype=np.int64)
         first = wrapped(sha_fn, None, tokens, None)
         # Purity: identical inputs -> byte-identical hash (memo hit).
         second = wrapped(sha_fn, None, tokens, None)
         assert first == second
-        # Direct call to the original agrees bit-for-bit.
-        assert first == original(sha_fn, None, tokens, None)
+        # Compute the direct-view encoding independently of the memo helper.
+        expected = hashlib.sha256(tokens)
+        expected.update(b"\x00")
+        expected.update(kv_cache_utils.NONE_HASH)
+        assert first == expected.digest()
         # Different tokens -> different hash (no false hits).
-        assert wrapped(sha_fn, None, tokens[:-1] + [999], None) != first
+        assert wrapped(sha_fn, None, np.concatenate((tokens[:-1], [999])), None) != first
         # Parent hash participates in the key.
         assert wrapped(sha_fn, first, tokens, None) != first
         # Idempotent re-apply keeps the same wrapper.
@@ -362,14 +365,13 @@ def test_block_hash_chain_memo_replays_full_chain() -> None:
         # per-block loop.
         assert _vllm_engine.core.get_request_block_hasher is kv_cache_utils.get_request_block_hasher
 
-        def sha_fn(payload: object) -> bytes:
-            return hashlib.sha256(repr(payload).encode()).digest()
+        from vllm.utils.hashing import sha256 as sha_fn
 
         block_size = 16
         hasher = kv_cache_utils.get_request_block_hasher(block_size, sha_fn)
 
         fresh = SimpleNamespace(
-            all_token_ids=list(range(64)),
+            all_token_ids=np.arange(0, 64, dtype=np.int64),
             num_tokens=64,
             block_hashes=[],
             mm_features=None,
@@ -382,7 +384,7 @@ def test_block_hash_chain_memo_replays_full_chain() -> None:
 
         # Second identical request: chain-memo hit returns an equal list.
         fresh2 = SimpleNamespace(
-            all_token_ids=list(range(64)),
+            all_token_ids=np.arange(0, 64, dtype=np.int64),
             num_tokens=64,
             block_hashes=[],
             mm_features=None,
@@ -400,7 +402,7 @@ def test_block_hash_chain_memo_replays_full_chain() -> None:
         # memo and compute through the original path: a request whose token
         # stream grew by one full block yields exactly one new hash.
         grown = SimpleNamespace(
-            all_token_ids=list(range(80)),
+            all_token_ids=np.arange(0, 80, dtype=np.int64),
             num_tokens=80,
             block_hashes=list(first),
             mm_features=None,
@@ -414,7 +416,7 @@ def test_block_hash_chain_memo_replays_full_chain() -> None:
         # Salted requests never hit the chain memo (fall back; different
         # salt must produce a different chain via the original hasher).
         salted = SimpleNamespace(
-            all_token_ids=list(range(64)),
+            all_token_ids=np.arange(0, 64, dtype=np.int64),
             num_tokens=64,
             block_hashes=[],
             mm_features=None,
@@ -439,7 +441,7 @@ def test_block_hash_chain_memo_replays_full_chain() -> None:
 
         def embed_req(embeds: torch.Tensor) -> SimpleNamespace:
             return SimpleNamespace(
-                all_token_ids=[0] * emb_size,
+                all_token_ids=np.zeros(emb_size, dtype=np.int64),
                 num_tokens=emb_size,
                 block_hashes=[],
                 mm_features=[],
@@ -468,7 +470,9 @@ def test_block_hash_chain_memo_replays_full_chain() -> None:
         _vllm_engine.core.get_request_block_hasher = orig_core_factory
 
 
-def test_hash_memos_survive_varied_traffic_beyond_capacity() -> None:
+def test_hash_memos_survive_varied_traffic_beyond_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Oversubscribed varied traffic stays correct, bounded, and evicting.
 
     Regression for the FIFO eviction scan: after saturation,
@@ -476,19 +480,16 @@ def test_hash_memos_survive_varied_traffic_beyond_capacity() -> None:
     on every miss (CPython only compacts on resize), so varied traffic pays
     an ever-longer scan per eviction.  ``OrderedDict.popitem(last=False)``
     is O(1).  With the limits shrunk, distinct blocks/requests beyond
-    capacity must (a) still return hashes identical to the unpatched path,
+    capacity must (a) still return hashes consistent with the GR block encoding,
     (b) keep the stores bounded at the limit, and (c) actually evict the
     oldest entries (a re-run of an evicted key recomputes through the
-    original; a resident key does not).
+    hash function; a resident key does not).
     """
     import hashlib
-    from collections.abc import Callable, Sequence
     from types import SimpleNamespace
-    from typing import Any
 
     from vllm.v1 import engine as _vllm_engine
     from vllm.v1.core import kv_cache_utils
-    from vllm.v1.core.kv_cache_utils import BlockHash
 
     from vllm_gr.v1.engine import engine_core_patch
 
@@ -503,59 +504,45 @@ def test_hash_memos_survive_varied_traffic_beyond_capacity() -> None:
     orig_block_limit = engine_core_patch._KV_HASH_MEMO_LIMIT
     orig_chain_limit = engine_core_patch._CHAIN_MEMO_LIMIT
     try:
-        # Spy on the original so the test can observe eviction-driven
-        # recomputation (a memo hit never reaches it).
-        calls = {"n": 0}
-
-        def counting_original(
-            hash_function: Callable[[Any], bytes],
-            parent_block_hash: BlockHash | None,
-            tokens: Sequence[int],
-            extra_keys: tuple[Any, ...] | None,
-        ) -> BlockHash:
-            calls["n"] += 1
-            return orig_hash(hash_function, parent_block_hash, tokens, extra_keys)
-
-        kv_cache_utils.hash_block_tokens = counting_original
+        # Count real block digests; the configured function is only a namespace.
+        block_digest = mock.Mock(wraps=engine_core_patch._hash_block_bytes)
+        monkeypatch.setattr(engine_core_patch, "_hash_block_bytes", block_digest)
         engine_core_patch._KV_HASH_MEMO_LIMIT = 8
         engine_core_patch._CHAIN_MEMO_LIMIT = 4
         engine_core_patch.apply_kv_hash_memo_patch()
         wrapped = kv_cache_utils.hash_block_tokens
-        assert wrapped is not counting_original
-        block_store = wrapped._gr_hash_memo_entries  # type: ignore[attr-defined]
+        assert getattr(wrapped, "_gr_hash_memo", False)
+        block_store = wrapped._gr_hash_memo_entries
+        block_store.clear()
 
-        def sha_fn(payload: object) -> bytes:
-            return hashlib.sha256(repr(payload).encode()).digest()
+        from vllm.utils.hashing import sha256 as sha_fn
 
-        # 20 distinct blocks through a limit-8 memo: every value matches the
-        # unpatched function and the store stays pinned at the limit.
-        distinct = [list(range(200 + i, 216 + i)) for i in range(20)]
-        for tokens in distinct:
-            assert wrapped(sha_fn, None, tokens, None) == orig_hash(sha_fn, None, tokens, None)
+        # 20 distinct blocks through a limit-8 memo stay distinct; the
+        # store stays pinned at the limit.
+        distinct = [np.arange(200 + i, 216 + i, dtype=np.int64) for i in range(20)]
+        results = [wrapped(sha_fn, None, tokens, None) for tokens in distinct]
+        assert len(set(results)) == 20
         assert len(block_store) == 8
-        assert calls["n"] == 20  # all misses
+        assert block_digest.call_count == 20  # all misses
 
         # The oldest entry was evicted: re-running it recomputes...
-        assert wrapped(sha_fn, None, distinct[0], None) == orig_hash(
-            sha_fn, None, distinct[0], None
-        )
-        assert calls["n"] == 21
+        assert wrapped(sha_fn, None, distinct[0], None) == results[0]
+        assert block_digest.call_count == 21
         # ...while the newest is still resident (served from the memo).
-        assert wrapped(sha_fn, None, distinct[-1], None) == orig_hash(
-            sha_fn, None, distinct[-1], None
-        )
-        assert calls["n"] == 21
+        assert wrapped(sha_fn, None, distinct[-1], None) == results[-1]
+        assert block_digest.call_count == 21
 
         # Chain memo (limit 4): varied fresh requests beyond capacity stay
         # correct and bounded.
         memo_factory = kv_cache_utils.get_request_block_hasher
         chain_store = memo_factory._gr_chain_memo_entries
+        chain_store.clear()
         block_size = 16
         hasher = memo_factory(block_size, sha_fn)
         ground = orig_factory(block_size, sha_fn)
         for i in range(10):
             req = SimpleNamespace(
-                all_token_ids=list(range(i * 64, i * 64 + 64)),
+                all_token_ids=np.arange(i * 64, i * 64 + 64, dtype=np.int64),
                 num_tokens=64,
                 block_hashes=[],
                 mm_features=None,
@@ -606,8 +593,7 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
         assert getattr(wrapped, "_gr_hash_memo", False)
         block_store = wrapped._gr_hash_memo_entries
 
-        def sha_fn(payload: object) -> bytes:
-            return hashlib.sha256(repr(payload).encode()).digest()
+        from vllm.utils.hashing import sha256 as sha_fn
 
         block_size = 16
         hasher = kv_cache_utils.get_request_block_hasher(block_size, sha_fn)
@@ -615,7 +601,7 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
 
         def fresh_req(i: int) -> SimpleNamespace:
             return SimpleNamespace(
-                all_token_ids=[i + 1000] + list(range(63)),
+                all_token_ids=np.array([i + 1000, *range(63)], dtype=np.int64),
                 num_tokens=64,
                 block_hashes=[],
                 mm_features=None,
@@ -647,7 +633,7 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
         # Incremental request (block_hashes seeded): routes to the per-block
         # memo and populates it.
         incremental = SimpleNamespace(
-            all_token_ids=varied[0].all_token_ids + list(range(200, 232)),
+            all_token_ids=np.concatenate((varied[0].all_token_ids, np.arange(200, 232))),
             num_tokens=96,
             block_hashes=list(head_digests[0]),
             mm_features=None,
@@ -662,10 +648,10 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
 
         # The bypass flag reset: direct per-block calls still memoize (the
         # first miss inserts, the second is served without further growth).
-        probe = list(range(3000, 3016))
-        assert wrapped(sha_fn, None, probe, None) == orig_hash(sha_fn, None, probe, None)
+        probe = np.arange(3000, 3016, dtype=np.int64)
+        first_probe = wrapped(sha_fn, None, probe, None)
         grown = len(block_store)
-        assert wrapped(sha_fn, None, probe, None) == orig_hash(sha_fn, None, probe, None)
+        assert wrapped(sha_fn, None, probe, None) == first_probe
         assert len(block_store) == grown
         assert engine_core_patch._CHAIN_FALLBACK_ACTIVE is False
     finally:

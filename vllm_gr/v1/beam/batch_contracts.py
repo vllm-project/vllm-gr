@@ -10,6 +10,7 @@ serialized. This module holds data and validation, not runtime ownership.
 
 from __future__ import annotations
 
+import array
 import math
 import sys
 from dataclasses import dataclass
@@ -51,6 +52,39 @@ class BeamEngineCoreRequest(EngineCoreRequest):
             self.external_req_id = self.request_id
 
 
+def to_int64_tokens(
+    values: object,
+    *,
+    name: str = "prompt_token_ids",
+) -> np.ndarray:
+    """Normalize edge token values into the canonical GR token array.
+
+    ndarray inputs must already satisfy the contract because the engine hashes
+    raw token bytes: dtype, shape and contiguity are part of the cache-key
+    identity. Python sequences unbox once through ``array.array`` (about twice
+    as fast as ``np.asarray``) and fail closed on non-integers or int64
+    overflow instead of silently truncating.
+    """
+    if isinstance(values, np.ndarray):
+        if (
+            values.dtype == np.int64
+            and values.ndim == 1
+            and values.flags.c_contiguous
+            and values.size > 0
+        ):
+            return values
+        raise BeamContractError(f"{name} must be a non-empty 1-D contiguous int64 array")
+    if not isinstance(values, (list, tuple, array.array)):
+        raise BeamContractError(f"{name} must be an integer sequence or an int64 array")
+    try:
+        tokens = np.frombuffer(array.array("q", values), dtype=np.int64)
+    except (TypeError, OverflowError) as error:
+        raise BeamContractError(f"{name} must contain int64 token ids: {error}") from error
+    if tokens.size == 0:
+        raise BeamContractError(f"{name} must not be empty")
+    return tokens
+
+
 class BeamBatchItem(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -72,7 +106,7 @@ class BeamBatchItem(
                 name: getattr(self.request, name) for name in EngineCoreRequest.__struct_fields__
             }
             if values["prompt_token_ids"] is not None:
-                values["prompt_token_ids"] = np.asarray(values["prompt_token_ids"], dtype=np.int64)
+                values["prompt_token_ids"] = to_int64_tokens(values["prompt_token_ids"])
             converted = BeamEngineCoreRequest(**values)
             msgspec.structs.force_setattr(self, "request", converted)
 
@@ -471,16 +505,21 @@ def validate_beam_batch_request(request: BeamBatchRequest) -> None:
         if request_id in request_ids:
             _fail("item request_id values must be unique within a batch")
         request_ids.add(request_id)
+        # Direct GR submissions can bypass frontend token validation. Enforce
+        # the byte hasher's storage contract and reject negative embedding IDs
+        # before enqueue/preprocessing. Embedding-only requests are rejected
+        # later with a dedicated message.
         tokens = item.request.prompt_token_ids
-        if (
+        if tokens is not None and (
             not isinstance(tokens, np.ndarray)
             or tokens.dtype != np.int64
             or tokens.ndim != 1
             or not tokens.flags.c_contiguous
             or tokens.size == 0
-            or tokens.min() < 0
         ):
-            _fail("GR prompt_token_ids must be a nonempty contiguous nonnegative int64 array")
+            _fail("GR prompt_token_ids must be a nonempty contiguous int64 array")
+        if tokens is not None and tokens.min() < 0:
+            _fail("GR prompt_token_ids must contain only non-negative token IDs")
         if item.request.sampling_params is None:
             _fail("Beam batch items require sampling_params")
         if item.request.pooling_params is not None:
@@ -645,6 +684,7 @@ __all__ = [
     "BeamOutputOptions",
     "BeamOutputSequence",
     "BeamRequestOutput",
+    "to_int64_tokens",
     "validate_beam_batch_limits",
     "validate_beam_batch_request",
     "validate_beam_batch_request_limits",

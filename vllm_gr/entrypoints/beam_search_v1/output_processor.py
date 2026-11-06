@@ -52,27 +52,33 @@ def _prompt_text(prompt: Any) -> str | None:
 
 def _prompt_boundaries(
     tokenizer: Any,
-    request: BeamBatchRequest,
     params: Any,
     boundary_token_ids: tuple[int | None, int | None] | None = None,
-) -> tuple[list[Sequence[int]], list[Sequence[int]], int | None, int | None]:
+) -> tuple[int | None, int | None]:
     if boundary_token_ids is None:
         begin_token_id = _token_id(tokenizer, getattr(params, "begin_token", None), "begin_token")
         end_token_id = _token_id(tokenizer, getattr(params, "end_token", None), "end_token")
     else:
         begin_token_id, end_token_id = boundary_token_ids
-    prepared_prompts: list[Sequence[int]] = []
-    original_prompts: list[Sequence[int]] = []
-    for item in request.items:
-        prompt_token_ids = item.request.prompt_token_ids
-        prepared = prompt_token_ids
-        if begin_token_id is not None:
-            original = prepared[:-1]
-        else:
-            original = prepared
-        prepared_prompts.append(prepared)
-        original_prompts.append(original.tolist())
-    return prepared_prompts, original_prompts, begin_token_id, end_token_id
+    return begin_token_id, end_token_id
+
+
+def _as_prompt_list(tokens: Any) -> list[int]:
+    return tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+
+
+def _prepared_prompt_lists(request: BeamBatchRequest) -> list[list[int]]:
+    """Materialize accepted prompts once per request, never per Beam."""
+    return [_as_prompt_list(item.request.prompt_token_ids) for item in request.items]
+
+
+def _original_prompt_lists(
+    prepared_prompts: list[list[int]],
+    begin_token_id: int | None,
+) -> list[list[int]]:
+    if begin_token_id is None:
+        return prepared_prompts
+    return [prepared[:-1] for prepared in prepared_prompts]
 
 
 def _output_suffix(sequence: BeamOutputSequence, end_token_id: int | None) -> list[int]:
@@ -108,8 +114,9 @@ class _V1BeamTailMaterializer:
 
     __slots__ = ("_tokenizer", "_prepared", "_shared_prompt", "_prompt_text")
 
-    def __init__(self, tokenizer: Any, prepared_prompt: Sequence[int]) -> None:
+    def __init__(self, tokenizer: Any, prepared_prompt: list[int]) -> None:
         self._tokenizer = tokenizer
+        # Materialized once per request; Beams only copy the reference list.
         self._prepared = prepared_prompt
         self._shared_prompt: bool | None = None
         self._prompt_text: str | None = None
@@ -118,15 +125,13 @@ class _V1BeamTailMaterializer:
         from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 
         suffix = beam.__dict__.pop("_v1_suffix")
-        full = (
-            self._prepared.tolist() if hasattr(self._prepared, "tolist") else list(self._prepared)
-        )
+        full = self._prepared.copy()
         full.extend(suffix)
         if self._shared_prompt is None:
             self._shared_prompt = _can_share_prompt_decode(self._tokenizer, self._prepared)
         if self._shared_prompt:
             if self._prompt_text is None:
-                self._prompt_text = fast_decode(self._tokenizer, self._prepared.tolist())
+                self._prompt_text = fast_decode(self._tokenizer, self._prepared)
             text = self._prompt_text + fast_decode(self._tokenizer, suffix)
         else:
             text = fast_decode(self._tokenizer, full)
@@ -141,7 +146,11 @@ class BeamSearchOutputProcessor:
     """Convert one trusted terminal result without retaining session state."""
 
     def __init__(
-        self, tokenizer: Any, *, boundary_token_ids: tuple[int | None, int | None] | None = None
+        self,
+        tokenizer: Any,
+        *,
+        boundary_token_ids: tuple[int | None, int | None] | None = None,
+        original_prompt_token_ids: tuple[tuple[int, ...], ...] | None = None,
     ) -> None:
         if tokenizer is None:
             raise ValueError("beam_search_v1 output conversion requires a tokenizer")
@@ -149,6 +158,19 @@ class BeamSearchOutputProcessor:
         # Prepared IDs describe the accepted request, even if caller params
         # change while it runs. Direct output-converter callers still resolve.
         self._boundary_token_ids = boundary_token_ids
+        self._original_prompt_token_ids = original_prompt_token_ids
+
+    def _accepted_prompt(
+        self,
+        request: BeamBatchRequest,
+        item_index: int,
+        begin_token_id: int | None,
+    ) -> tuple[int, ...]:
+        """Accepted prompt IDs, reusing the caller-side snapshot when present."""
+        if self._original_prompt_token_ids is not None:
+            return self._original_prompt_token_ids[item_index]
+        prepared = _as_prompt_list(request.items[item_index].request.prompt_token_ids)
+        return tuple(prepared[:-1] if begin_token_id is not None else prepared)
 
     def process_outputs(
         self,
@@ -158,8 +180,8 @@ class BeamSearchOutputProcessor:
     ) -> list[Any]:
         output = _result_output(result)
         try:
-            prepared, original, begin_token_id, end_token_id = _prompt_boundaries(
-                self.tokenizer, request, call.params, self._boundary_token_ids
+            begin_token_id, end_token_id = _prompt_boundaries(
+                self.tokenizer, call.params, self._boundary_token_ids
             )
 
             if call.output_mode == "compact":
@@ -185,7 +207,9 @@ class BeamSearchOutputProcessor:
                             )
                             for sequence in item.sequences
                         ),
-                        prompt_token_ids=tuple(original[item.item_index]),
+                        prompt_token_ids=self._accepted_prompt(
+                            request, item.item_index, begin_token_id
+                        ),
                     )
                     for item in output.items
                 ]
@@ -194,16 +218,20 @@ class BeamSearchOutputProcessor:
 
             from vllm_gr.entrypoints.beam_output import _LazyMaterializedBeamSequence
 
+            prepared_prompts = _prepared_prompt_lists(request)
+            original_prompts = _original_prompt_lists(prepared_prompts, begin_token_id)
             end_suffix = () if end_token_id is None else (end_token_id,)
             converted = []
             for item in output.items:
                 source_prompt = call.prompts[item.item_index]
                 prompt = tokens_input(
-                    original[item.item_index],
+                    original_prompts[item.item_index],
                     prompt=_prompt_text(source_prompt),
                     cache_salt=request.items[item.item_index].request.cache_salt,
                 )
-                materializer = _V1BeamTailMaterializer(self.tokenizer, prepared[item.item_index])
+                materializer = _V1BeamTailMaterializer(
+                    self.tokenizer, prepared_prompts[item.item_index]
+                )
                 lora_request = request.items[item.item_index].request.lora_request
                 sequences = []
                 for sequence in item.sequences:
@@ -243,8 +271,11 @@ class BeamSearchOutputProcessor:
     ) -> list[Any]:
         output = _result_output(result)
         try:
-            _, original, begin_token_id, end_token_id = _prompt_boundaries(
-                self.tokenizer, request, call.params, self._boundary_token_ids
+            begin_token_id, end_token_id = _prompt_boundaries(
+                self.tokenizer, call.params, self._boundary_token_ids
+            )
+            original_prompts = _original_prompt_lists(
+                _prepared_prompt_lists(request), begin_token_id
             )
 
             from vllm.outputs import CompletionOutput, RequestOutput
@@ -274,7 +305,7 @@ class BeamSearchOutputProcessor:
                         zip(item.sequences, completion_token_ids, texts, strict=True)
                     )
                 ]
-                prompt_token_ids = original[item_index]
+                prompt_token_ids = original_prompts[item_index]
                 prompt_text = _prompt_text(call.prompts[item_index])
                 if prompt_text is None:
                     prompt_text = fast_decode(self.tokenizer, prompt_token_ids)
