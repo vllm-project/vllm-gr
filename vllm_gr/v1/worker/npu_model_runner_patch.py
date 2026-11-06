@@ -1101,6 +1101,10 @@ def make_patched_model_forward_npu(_orig_model_forward):
         inputs_embeds=None,
         **model_kwargs,
     ):
+        p_runner = getattr(self, "_prefill_graph_runner", None)
+        if p_runner is not None:
+            # Check before every route, including native and BSND forwards.
+            p_runner.raise_if_failed()
         scheduler_output = getattr(self, "_current_scheduler_output", None)
         # BSND/TND graph wrappers cannot consume non-token model payloads.
         if intermediate_tensors is not None or inputs_embeds is not None or model_kwargs:

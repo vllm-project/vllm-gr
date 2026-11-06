@@ -556,9 +556,9 @@ def update_graph_params(
     serving stream are unchanged. Tensor contents are deliberately excluded:
     the runner refreshes its fixed input buffers before every replay.
 
-    Returns True on success. The caller MUST NOT replay the graph on False:
-    a partially-updated graph would execute with stale per-layer params and
-    the output would be silently wrong.
+    Returns True on success, False for a preflight rejection before task
+    updates begin. Runtime update failures propagate: the caller must not
+    replay or fall back to native execution after a potentially partial update.
 
     Deliberately ignores non-prefill-graph callers (e.g. vllm-ascend's
     full-graph update hook, which passes different arguments).
@@ -634,11 +634,12 @@ def update_graph_params(
             value = task.value
             lse = task.lse
             if output is None or query is None or key is None or value is None or lse is None:
-                logger.warning(
-                    "NPU prefill graph update: layer tensors are missing; "
-                    "aborting the update (the replay would execute with stale params)."
+                # An earlier layer may already have been updated. Unlike the
+                # preflight check above, this cannot safely request fallback.
+                raise RuntimeError(
+                    "NPU prefill graph update: layer tensors became unavailable "
+                    "after preflight; worker restart required."
                 )
-                return False
             kw = _fia_v2_graph_kwargs(
                 query,
                 key,

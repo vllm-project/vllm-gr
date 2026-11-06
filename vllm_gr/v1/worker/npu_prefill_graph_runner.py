@@ -108,6 +108,9 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             buckets=buckets,
         )
         self._update_stream: Any = None
+        # A failed device task update may leave the graph/stream unusable.
+        # Retain its resources and error until the worker is restarted.
+        self._task_update_error: Exception | None = None
         self.entries: dict[int, Any] = {}
         # Opt-in configuration is read once per runner; empty means TND only.
         self._BSND_CAPTURE_SPECS = parse_bsnd_capture_specs(
@@ -437,8 +440,17 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         msg = f"Prefill NPU Graph capture completed. Captured (bucket -> graph): {captured_summary}"
         logger.info(msg)
 
+    def raise_if_failed(self) -> None:
+        """Reject further execution after a task update has failed."""
+        if self._task_update_error is not None:
+            raise RuntimeError(
+                "NPU prefill graph task update previously failed; "
+                "restart the worker before further model execution."
+            ) from self._task_update_error
+
     def has_captured_graph(self, bucket: int, num_reqs: int = 1) -> bool:
         """Returns True if a graph was captured for this bucket (covers all num_reqs)."""
+        self.raise_if_failed()
         buf = self.buffers.get(bucket)
         return (
             buf is not None
@@ -456,6 +468,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         num_scheduled_tokens: list[int] | dict[Any, int],
     ) -> torch.Tensor | None:
         """Populates static buffers, rewrites task-group params, and replays the graph."""
+        self.raise_if_failed()
         token_counts = (
             list(num_scheduled_tokens.values())
             if isinstance(num_scheduled_tokens, dict)
@@ -556,17 +569,19 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                 self._get_update_stream(), entry, qlen_list, kvlen_list, bt_staged
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "NPU prefill graph replay: task-group update failed (%r); "
-                "falling back to eager prefill.",
-                e,
+            self._task_update_error = e
+            logger.exception(
+                "NPU prefill graph task update failed for bucket %d; worker restart required.",
+                bucket,
             )
-            return None
+            # Do not end the failed update or release graph resources here:
+            # the device update state is unknown. Preserve the original error.
+            raise
         if not update_ok:
-            # Never replay after a failed update: a partially-updated graph
-            # would execute with stale per-layer params. Fall back to eager.
+            # False is a preflight rejection before any task update begins.
             logger.warning(
-                "NPU prefill graph replay: task-group update failed; falling back to eager prefill."
+                "NPU prefill graph replay: task-group update unavailable; "
+                "falling back to eager prefill."
             )
             return None
         # Ordering chain (no host-side synchronize):
@@ -594,6 +609,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
 
     def has_bsnd_captured_graph(self, T: int, B: int) -> bool:
         """BSND: True if the BSND graph for (T,B) is captured."""
+        self.raise_if_failed()
         buf = self.buffers.get(T)
         return (
             buf is not None
@@ -772,6 +788,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         into a separate persistent buffer so the caller's logits index extraction
         (cumsum-1) is unchanged.
         """
+        self.raise_if_failed()
         buf = self.buffers.get(T)
         if (
             buf is None

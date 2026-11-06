@@ -417,6 +417,7 @@ class ForwardRouting(unittest.TestCase):
             return "native-hidden"
 
         graph = SimpleNamespace(
+            _task_update_error=None,
             has_bsnd_captured_graph=lambda *args: True,
             execute_model_prefill_bsnd=bsnd,
             log_replay_bsnd=lambda *args: None,
@@ -425,6 +426,7 @@ class ForwardRouting(unittest.TestCase):
             execute_model_prefill=tnd,
             log_replay=lambda *args: None,
         )
+        graph.raise_if_failed = MethodType(extract(RUNNER, "raise_if_failed", {}), graph)
         env: dict[str, Any] = {
             "wraps": wraps,
             "_WORKER_MODEL_FORWARD_PATCH_MARKER": "_test_patched",
@@ -438,9 +440,10 @@ class ForwardRouting(unittest.TestCase):
         factory = extract(PATCH, "make_patched_model_forward_npu", env)
         forward = factory(native)
         runner = SimpleNamespace(
+            _prefill_graph_runner=graph,
             _current_scheduler_output=SimpleNamespace(
                 num_scheduled_tokens={str(i): 100 for i in range(4)}, total_num_scheduled_tokens=400
-            )
+            ),
         )
         context = SimpleNamespace(
             get_forward_context=lambda: SimpleNamespace(
