@@ -167,6 +167,21 @@ class BeamAttentionImpl(AttentionImpl):
         kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
     ) -> None:
+        if NPU_DEVICE and not CUDA_DEVICE:
+            unsupported = []
+            if sliding_window is not None:
+                unsupported.append("sliding_window")
+            if alibi_slopes is not None:
+                unsupported.append("alibi_slopes")
+            if logits_soft_cap not in (None, 0.0):
+                unsupported.append("logits_soft_cap")
+            if unsupported:
+                raise NotImplementedError(
+                    "NPU CUSTOM Beam Attention does not support "
+                    + ", ".join(unsupported)
+                    + "; neither the cascade nor xllm execution path implements these settings."
+                )
+
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)

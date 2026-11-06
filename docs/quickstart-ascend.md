@@ -209,11 +209,14 @@ vllm serve <model> --additional-config '{"vllm_gr_attention_backend": "CUSTOM", 
 Notes:
 
 - The option is NPU-only; selecting `xllm` on a CUDA host raises at startup.
-- Mixed std/beam batches and mixed sliding-window / sink / ALiBI configs are
-  not supported by the fused path; the scheduler falls back to the cascade
-  operators for those cases, and unsorted or shrunk beam selections always
-  reorder through the cascade kernel (the fused `select_unshared_kv` only
-  encodes full-width parents grouped by source beam).
+- NPU `CUSTOM` Beam Attention rejects sliding windows, ALiBi slopes, and
+  nonzero Attention logits softcap at initialization. Neither `xllm` nor
+  `cascade` implements these features. Sink attention and FP8 KV caches are
+  also unsupported by this backend. These restrictions do not describe GPU
+  or native vLLM-Ascend attention backends.
+- Mixed std/beam batches use the cascade implementation. Unsorted or shrunk
+  beam selections reorder through the cascade kernel because the fused
+  `select_unshared_kv` only encodes full-width parents grouped by source beam.
 
 ## Optional BSND Prefill graphs
 
