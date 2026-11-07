@@ -56,16 +56,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+
+      # The vllm wheel drags in the full CUDA 13 stack (~6 GB).  Reclaim the
+      # ~25 GB of preinstalled toolchains this lane never uses and skip the
+      # pip cache, or the install runs out of disk on the hosted runner
+      # ("No space left on device", ~14 GB free on /).
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
 
       - name: Install CPU test environment
         run: |
           python -m pip install --upgrade pip
           # vllm is imported by the tests themselves; the CUDA build imports
           # fine on a CPU-only host.  TODO: pin exactly what the GPU CI uses.
-          pip install vllm==0.30.0
-          pip install pytest pytest-asyncio pytest-timeout pytest-xdist regex
-          pip install -e . --no-deps
+          pip install --no-cache-dir vllm==0.30.0
+          pip install --no-cache-dir pytest pytest-asyncio pytest-timeout pytest-xdist regex
+          pip install --no-cache-dir -e . --no-deps
 
       - name: Run CPU test lane
         run: |
