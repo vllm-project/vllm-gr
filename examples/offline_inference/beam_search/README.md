@@ -515,8 +515,9 @@ check the captured shape and `fallbacks` when comparing graph performance.
 ### Per-stage Beam widths through the Python API
 
 CUDA and NPU V1 support a retained Beam width for each generated token, plus a
-separate final result limit. CUDA can additionally set a per-parent candidate
-count for each stage. Omitting it preserves the existing `K=W` behavior.
+separate final result limit. CUDA and constrained NPU V1 can additionally set
+a per-parent candidate count for each stage. Omitting it preserves the existing
+candidate-width policy.
 
 For an existing NPU V1 engine `llm` and a B=1, 2, or 4 batch `prompts`, use:
 
@@ -538,7 +539,8 @@ params = BeamSearchParams(
 outputs = llm.beam_search_v1(prompts, params)
 ```
 
-For CUDA, K and W can be configured independently after the first stage:
+For CUDA and constrained NPU V1, K and W can be configured independently after
+the first stage:
 
 ```python
 params = BeamSearchParams(
@@ -558,6 +560,16 @@ implementation.
 An explicit `per_parent_beam_widths` overrides the startup
 `constraint_table.candidate_width`, subject to backend `max_top_k` capacity.
 Without it, existing behavior and startup configuration restrictions remain.
+Each configured per-parent K is an upper bound: the shared execution policy uses
+`min(K, W_out)` candidates per parent because no parent can supply more than
+`W_out` winners to the retained set.
+NPU V1 also accepts this schedule and uses dynamic selection even when retained
+widths are fixed. Candidate selection remains outside the model graph; graph
+input rows still depend on batch size and the preceding retained width.
+This NPU path requires an enabled canonical NPU Constraint Table; it does not
+add unconstrained NPU generation. An explicit schedule can order tied candidates
+differently and retain different candidates at a tied cutoff from native
+selection, even when its widths happen to match.
 HTTP clients can pass the schedule in `vllm_xargs` through Completion or Chat;
 native non-GR Beam rejects an explicit schedule.
 

@@ -188,13 +188,6 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
         validate_npu_device_config(config, gr_config, request)
     if (
         request is not None
-        and request.beam_params.per_parent_beam_widths is not None
-        and device is not None
-        and str(device).split(":")[0] != "cuda"
-    ):
-        raise ValueError("per_parent_beam_widths requires CUDA beam_search_v1")
-    if (
-        request is not None
         and device is not None
         and str(device).split(":")[0] not in ("cuda", "npu")
         and (

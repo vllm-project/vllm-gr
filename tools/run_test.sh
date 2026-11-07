@@ -82,7 +82,7 @@ if [ "$(unset CUDA_VISIBLE_DEVICES; _cuda_device_indices 3)" != "$(printf '0\n1\
     echo "unset CUDA_VISIBLE_DEVICES fallback is wrong" >&2
     exit 1
 fi
-if CUDA_VISIBLE_DEVICES= _cuda_device_indices 3 >/dev/null 2>&1; then
+if CUDA_VISIBLE_DEVICES='' _cuda_device_indices 3 >/dev/null 2>&1; then
     echo "empty CUDA_VISIBLE_DEVICES should expose no devices" >&2
     exit 1
 fi

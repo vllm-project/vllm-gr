@@ -58,6 +58,7 @@ def _config(
     sid: bool = False,
     configured_width: int | None = None,
     catalog: bool = False,
+    capacity: int = 4,
 ) -> Any:
     config = SimpleNamespace(
         additional_config={},
@@ -66,7 +67,7 @@ def _config(
         use_v2_model_runner=False,
     )
     table = ConstraintTableConfig(
-        max_top_k=4,
+        max_top_k=capacity,
         candidate_width=configured_width,
         backend=ConstraintTableBackendEnum(device),
         enabled=catalog,
@@ -93,6 +94,7 @@ def _request(
     candidate_width: int | None = 4,
     widths: tuple[int, ...] | None = (2, 4, 4),
     temperature: float = 0.0,
+    per_parent: tuple[int, ...] | None = None,
 ) -> BeamBatchRequest:
     native = EngineCoreRequest(
         request_id="npu-admission",
@@ -111,7 +113,14 @@ def _request(
         batch_id=native.request_id,
         items=(BeamBatchItem(0, native),),
         beam_params=BeamBatchParams(
-            4, 3, temperature, (), True, candidate_width=candidate_width, dynamic_beam_widths=widths
+            4,
+            3,
+            temperature,
+            (),
+            True,
+            candidate_width=candidate_width,
+            dynamic_beam_widths=widths,
+            per_parent_beam_widths=per_parent,
         ),
         output_options=BeamOutputOptions(4 if widths is None else widths[-1], True, True, False),
     )
@@ -219,6 +228,92 @@ def test_inproc_npu_width_refusal_raises_admission_error(path: str) -> None:
     assert str(caught.value) == REASON
     core._handle_request_preproc_error.assert_not_called()
     _assert_no_allocation(core)
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("path", ["submit", "socket", "inproc"])
+@pytest.mark.parametrize("sid", [False, True])
+def test_catalog_free_per_parent_refusal_preserves_reason_and_owner(path: str, sid: bool) -> None:
+    core = _core(_config(sid=sid))
+    request = _request(None, None, per_parent=(4, 2, 1))
+    reason = "NPU per_parent_beam_widths requires an enabled canonical NPU constraint table"
+    if path == "inproc":
+        del core.output_queue
+        with pytest.raises(
+            GRAdmissionError, match="per_parent_beam_widths.*canonical NPU"
+        ) as caught:
+            _admit_gr_session(core, request)
+        assert str(caught.value) == reason
+    else:
+        _dispatch(core, request, path)
+        output = _output(core)
+        assert admission_rejection(output) == reason
+        assert (
+            output.kv_transfer_params[GR_BATCH_RESULT_PARAM].failure.code == ADMISSION_REJECTED_CODE
+        )
+    core._handle_request_preproc_error.assert_not_called()
+    _assert_no_allocation(core)
+    if path != "inproc":
+        _dispatch(core, _request(4, None), path)
+        core.preprocess_add_request.assert_called_once()
+        core.add_request.assert_called_once()
+        assert core.output_queue.empty()
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("path", ["submit", "socket", "inproc"])
+@pytest.mark.parametrize("capacity,overflow", [(4, 8), (8, 9)])
+@pytest.mark.parametrize("overflow_stages", ["middle", "last", "multiple"])
+def test_constrained_per_parent_capacity_refusal_precedes_allocation_and_recovers(
+    path: str, capacity: int, overflow: int, overflow_stages: str
+) -> None:
+    core = _core(_config(catalog=True, capacity=capacity))
+    # The first step must produce the initial retained width. Keep that
+    # independent shared invariant valid while exceeding the table later.
+    schedules = {
+        "middle": (4, overflow, 1),
+        "last": (4, 1, overflow),
+        "multiple": (4, overflow, overflow),
+    }
+    request = _request(None, None, per_parent=schedules[overflow_stages])
+    reason = f"NPU per_parent_beam_widths exceeds constraint_table.max_top_k={capacity}"
+    if path == "inproc":
+        del core.output_queue
+        with pytest.raises(GRAdmissionError, match="per_parent_beam_widths.*max_top_k") as caught:
+            _admit_gr_session(core, request)
+        assert str(caught.value) == reason
+    else:
+        _dispatch(core, request, path)
+        output = _output(core)
+        assert admission_rejection(output) == reason
+        failure = output.kv_transfer_params[GR_BATCH_RESULT_PARAM].failure
+        assert failure.code == ADMISSION_REJECTED_CODE and failure.message == reason
+    core._handle_request_preproc_error.assert_not_called()
+    _assert_no_allocation(core)
+    assert core.input_queue.empty() and core.batch_queue == []
+
+    # Reuse the same Core and external request ID after refusal. Equality
+    # with the configured capacity is supported, including K != W at cap 8.
+    supported = _request(None, None, per_parent=(4, capacity, 1))
+    if path == "inproc":
+        _admit_gr_session(core, supported)
+    else:
+        _dispatch(core, supported, path)
+        assert core.output_queue.empty()
+    core.preprocess_add_request.assert_called_once()
+    core.add_request.assert_called_once()
+    core._handle_request_preproc_error.assert_not_called()
+    assert core.input_queue.empty()
+
+
+@pytest.mark.l1
+def test_npu_per_parent_capacity_refusal_does_not_change_cuda_admission() -> None:
+    core = _core(_config(device="cuda", catalog=True, capacity=4))
+    _dispatch(core, _request(None, None, per_parent=(4, 8, 1)), "socket")
+    core.preprocess_add_request.assert_called_once()
+    core.add_request.assert_called_once()
+    core._handle_request_preproc_error.assert_not_called()
+    assert core.input_queue.empty() and core.output_queue.empty()
 
 
 @pytest.mark.parametrize("path", ["submit", "socket"])

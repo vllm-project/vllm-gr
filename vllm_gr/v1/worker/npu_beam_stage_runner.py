@@ -86,7 +86,8 @@ class NPUEagerBeamStageRunner:
             all(width == capacity for width in widths) and (len(widths) == 1 or capacity % 32 == 0)
         )
         return (
-            not native_schedule
+            getattr(plan.execution, "per_parent_beam_widths", None) is not None
+            or not native_schedule
             or getattr(output_options, "num_return_sequences", capacity) != capacity
         )
 
@@ -922,6 +923,17 @@ def get_npu_stage_runner(worker: Any, scheduler_output: Any) -> NPUEagerBeamStag
     existing = getattr(worker, "_gr_npu_stage_runner", None)
     if existing is not None and not existing.closed:
         return existing
+    metadata = next(iter(getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR).values()))
+    candidate_widths = getattr(metadata.beam_params, "per_parent_beam_widths", None)
+    if candidate_widths is not None:
+        backend = getattr(worker, "constraint_backend", None)
+        info = getattr(backend, "info", None)
+        if backend is None or info is None:
+            raise ValueError("NPU per-parent widths require a loaded constraint backend")
+        if max(candidate_widths) > getattr(info, "max_top_k", 0):
+            raise ValueError(
+                "NPU constraint backend capacity is smaller than requested per-parent widths"
+            )
     runner = NPUEagerBeamStageRunner(worker)
     worker._gr_npu_stage_runner = runner
     return runner

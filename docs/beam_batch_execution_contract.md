@@ -289,12 +289,25 @@ exceeds the 256 candidate ceiling, which is rejected at parse time. With a
 dynamic schedule, a configured `K` must be at least every stage width and is the
 top-k of every stage. An unset `K` is not written onto the request: each stage
 keeps taking its own output width as top-k, exactly as before `K` existed, and
-the sampler, workspace and `BeamSearchState` are sized from `W`. NPU still
-requires `K == W` and raises for any other combination.
+the sampler, workspace and `BeamSearchState` are sized from `W`. The NPU native
+fixed-width selection path still requires `K == W`.
 
-CUDA V1 requests can additionally configure each stage's per-parent `K` with
+CUDA and NPU V1 requests can additionally configure each stage's per-parent `K` with
 `per_parent_beam_widths` through the dynamic execution path; such a request
 schedule overrides the configured `K` (see the candidate boundary below).
+On NPU, an explicit schedule uses dynamic selection for the entire session,
+including fixed retained widths. This avoids the square native Beam selection
+ABI without changing the default path or requiring a new operator build.
+The NPU schedule currently requires an enabled canonical NPU Constraint Table;
+catalog-free NPU requests with an explicit schedule are rejected at admission.
+Frontend and EngineCore admission compare every requested per-parent width with
+`constraint_table.max_top_k` before native preprocessing or Worker allocation.
+Oversized schedules return a request rejection and leave the engine available
+for later supported requests. The Worker also checks the loaded backend's
+capacity as a defensive invariant.
+The shared execution policy caps an explicit stage's effective candidate width
+at `min(K, W_out)`; requesting more cannot increase its contribution beyond the
+stage's retained width.
 
 Unconstrained V1 generation has its own configuration and budget checks; it
 does not require a catalog artifact. NPU dynamic widths must satisfy their
@@ -321,7 +334,7 @@ Bootstrap uses `P=1`. Decode uses `P=num_active_beams`, with
 `K` is modelled as an independent dimension of `W` throughout this contract,
 with `1 <= K <= MAX_CANDIDATE_WIDTH`. Without `per_parent_beam_widths`,
 candidate generation uses the configured `K`, or `K=W_out` when it is unset.
-CUDA requests may configure a per-stage candidate schedule: bootstrap requires
+CUDA and NPU requests may configure a per-stage candidate schedule: bootstrap requires
 `K_1=W_1`, and later stages require `W_i <= W_(i-1)*K_i`. Every `K_i` is
 limited to 256, so a request schedule needs `W_1 <= 256`.
 An explicit request schedule uses dynamic selection, which flattens the

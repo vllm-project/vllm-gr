@@ -74,3 +74,20 @@ def validate_npu_device_config(
                     )
                 ):
                     raise GRDeviceRequestError(candidate_width_error)
+            if request.beam_params.per_parent_beam_widths is not None:
+                raise GRDeviceRequestError(
+                    "NPU per_parent_beam_widths requires an enabled canonical NPU constraint table"
+                )
+    elif request is not None:
+        table = gr_config.constraint_table
+        widths = request.beam_params.per_parent_beam_widths
+        # A later stage can exceed capacity even when the bootstrap fits.
+        # Refuse the entire request before native preprocessing or Worker allocation.
+        if (
+            table is not None
+            and widths is not None
+            and any(width > table.max_top_k for width in widths)
+        ):
+            raise GRDeviceRequestError(
+                f"NPU per_parent_beam_widths exceeds constraint_table.max_top_k={table.max_top_k}"
+            )
