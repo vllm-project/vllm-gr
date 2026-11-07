@@ -79,6 +79,8 @@ def evaluate(
 ) -> Any:
     # Evaluate only the small expression subset used by these tracked workflow
     # guards. Keep the expressions in YAML as the source of truth.
+    if not isinstance(expression, str):  # plain scalars (e.g. cancel-in-progress: true)
+        return expression
     expression = expression.strip().removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("github.event.pull_request.labels.*.name", "labels")
     expression = expression.replace("needs.resolve-ab-freshness.outputs.fresh", "ab_fresh")
@@ -123,7 +125,7 @@ class TestReadyLabelCI(unittest.TestCase):
         self.workflows = {
             path.name: yaml.safe_load(path.read_text())
             for path in (ROOT / ".github/workflows").glob("*.yml")
-            if path.name in {"pre-commit.yml", "build_wheel.yml"}
+            if path.name in {"pre-commit.yml", "build_wheel.yml", "cpu-tests.yml"}
         }
 
     def scheduled(
@@ -259,9 +261,7 @@ class TestReadyLabelCI(unittest.TestCase):
         self.assertEqual(render(group, older), render(group, full))
         gpu_jobs = (
             "pre-commit",
-            "decode-benchmark",
-            "pangu-offline",
-            "pangu-online",
+            "gpu-e2e",
             "beam-performance-ab-only",
         )
         for job_name in gpu_jobs:
@@ -550,9 +550,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                         self.assertIn("resolve-ab-freshness", running)
                         self.assertIn("benchmark-policy", running)
                         self.assertIn("pre-commit", running)
-                        self.assertIn("decode-benchmark", running)
-                        self.assertIn("pangu-offline", running)
-                        self.assertIn("pangu-online", running)
+                        self.assertIn("gpu-e2e", running)
                         self.assertEqual("beam-performance-ab-only" in running, not fresh)
                         results = {
                             need: "success" if need in running else "skipped"
@@ -579,7 +577,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                     )
 
     def test_recall_and_decode_benchmark_cover_both_target_branches_and_devices(self) -> None:
-        steps = self.workflows["pre-commit.yml"]["jobs"]["decode-benchmark"]["steps"]
+        steps = self.workflows["pre-commit.yml"]["jobs"]["gpu-e2e"]["steps"]
         by_name = {step.get("name"): step for step in steps}
         recall_steps = (
             "Cache OneRec Recall constraint tables",
@@ -609,7 +607,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                             self.assertEqual(bool(evaluate(condition, github)), expect_recall, name)
                         benchmark = by_name["Execute decode benchmark gates"]["if"].replace(
                             "env.BENCHMARK_DEVICE", repr(device)
-                        )
+                        ).replace("steps.stage-recall.outcome", "'success'")
                         self.assertEqual(bool(evaluate(benchmark, github)), not expect_recall)
 
     def test_unready_and_draft_events_fail_required_gate(self) -> None:
@@ -632,24 +630,20 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                 result = self.run_gate(results)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
-    def test_cancellation_stops_pangu_but_keeps_cleanup_and_gate(self) -> None:
+    def test_cancellation_stops_gpu_e2e_but_keeps_cleanup_and_gate(self) -> None:
         workflow = self.workflows["pre-commit.yml"]
         jobs = workflow["jobs"]
-        # A cancellation can arrive while a Pangu job is already running, after
-        # its prerequisites have succeeded. GitHub re-evaluates the job guard.
+        # A cancellation can arrive while the consolidated chain is already
+        # running, after its prerequisites have succeeded. GitHub re-evaluates
+        # the job guard.
         results = dict.fromkeys(jobs["benchmark-blocking"]["needs"], "success")
-        for name in ("pangu-offline", "pangu-online"):
-            with self.subTest(job=name):
-                self.assertTrue(evaluate(jobs[name]["if"], context(), results))
-                self.assertFalse(evaluate(jobs[name]["if"], context(), results, cancelled=True))
-        # Upstream validation failures must still allow independent accuracy
-        # checks to run, and must not hide a failed final gate.
-        for failed in ("decode-benchmark", "pangu-offline"):
-            with self.subTest(failed=failed):
-                running = self.scheduled(workflow, context(), failed)
-                self.assertIn("pangu-offline", running)
-                self.assertIn("pangu-online", running)
-                self.assertIn("benchmark-blocking", running)
+        self.assertTrue(evaluate(jobs["gpu-e2e"]["if"], context(), results))
+        self.assertFalse(evaluate(jobs["gpu-e2e"]["if"], context(), results, cancelled=True))
+        # A failed chain must not hide the A/B check or the final gate.
+        running = self.scheduled(workflow, context(), failed="gpu-e2e")
+        self.assertIn("gpu-e2e", running)
+        self.assertIn("beam-performance-ab-only", running)
+        self.assertIn("benchmark-blocking", running)
         self.assertEqual(
             self.scheduled(workflow, context(), cancelled=True), ["benchmark-blocking"]
         )
@@ -662,17 +656,98 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             text=True,
         )
         self.assertEqual(rejected.returncode, 1)
-        for name in ("decode-benchmark", "pangu-offline", "pangu-online"):
-            cleanup = next(
-                step for step in jobs[name]["steps"] if step.get("name") == "Check clear device"
+        # Each stage ends with the pre-merge read-only device check, placed
+        # *before* the kill script that would sweep a leaked EngineCore away.
+        steps = jobs["gpu-e2e"]["steps"]
+        names = [step.get("name") for step in steps]
+        pairs = (
+            ("Execute decode benchmark gates", "Check clear device after the decode stage"),
+            ("Run Pangu offline accuracy gate", "Check clear device after the offline stage"),
+            (
+                "Run Pangu online accuracy and API contract gate",
+                "Check clear device after the online stage",
+            ),
+        )
+        for stage_name, check_name in pairs:
+            with self.subTest(stage=stage_name):
+                self.assertLess(names.index(stage_name), names.index(check_name))
+                # Nothing may run between the check and the kill that follows
+                # it, or the leak could be cleaned up before being recorded.
+                after = names[names.index(check_name) + 1 :]
+                self.assertEqual(after[0], "Kill stale process on device")
+                cleanup = steps[names.index(check_name)]
+                self.assertTrue(cleanup.get("continue-on-error"))
+                # Evaluate the guard after successful device mapping, even
+                # during cancellation. Failed mapping must still prevent
+                # unsafe cleanup.
+                for outcome in ("success", "failure", "skipped"):
+                    condition = cleanup["if"].replace(
+                        "steps.cuda-mapping.outcome", repr(outcome)
+                    )
+                    self.assertEqual(
+                        bool(evaluate(condition, context(), cancelled=True)),
+                        outcome == "success",
+                    )
+
+    def test_gpu_e2e_stage_failure_does_not_hide_later_stages_or_the_gate(self) -> None:
+        jobs = self.workflows["pre-commit.yml"]["jobs"]
+        steps = jobs["gpu-e2e"]["steps"]
+        by_id = {step.get("id"): step for step in steps}
+        # Stage gates are individually continue-on-error so one failure cannot
+        # hide the remaining stages (the pre-merge jobs' !cancelled() rule).
+        for stage in ("stage-recall", "stage-decode", "stage-offline", "stage-online"):
+            self.assertTrue(by_id[stage].get("continue-on-error"), stage)
+        # A recall failure still aborts the decode benchmark step (the old
+        # within-job abort), while the accuracy stages are not gated on it.
+        for outcome, expected in (("success", True), ("failure", False), ("skipped", True)):
+            condition = (
+                by_id["stage-decode"]["if"]
+                .replace("env.BENCHMARK_DEVICE", "'npu'")
+                .replace("steps.stage-recall.outcome", repr(outcome))
             )
-            # Evaluate the guard after successful device mapping, even during
-            # cancellation. Failed mapping must still prevent unsafe cleanup.
-            for outcome in ("success", "failure", "skipped"):
-                condition = cleanup["if"].replace("steps.cuda-mapping.outcome", repr(outcome))
-                self.assertEqual(
-                    bool(evaluate(condition, context(), cancelled=True)), outcome == "success"
-                )
+            self.assertEqual(bool(evaluate(condition, context())), expected, outcome)
+        for stage in ("stage-offline", "stage-online"):
+            self.assertNotIn("steps.", by_id[stage].get("if", ""))
+        # The final aggregation fails the job when any stage OR any per-stage
+        # device check failed, and passes only when everything succeeded.
+        aggregate = next(
+            step for step in steps if step.get("name") == "Require every stage to pass"
+        )
+        watched = (
+            "stage-recall",
+            "stage-decode",
+            "stage-offline",
+            "stage-online",
+            "check-decode",
+            "check-offline",
+            "check-online",
+        )
+        for failed_step in watched:
+            outcomes = {step: "success" for step in watched}
+            outcomes[failed_step] = "failure"
+            condition = aggregate["if"]
+            for step in watched:
+                condition = condition.replace(f"steps.{step}.outcome", repr(outcomes[step]))
+            self.assertTrue(bool(evaluate(condition, context())), failed_step)
+        condition = aggregate["if"]
+        for step in watched:
+            condition = condition.replace(f"steps.{step}.outcome", "'success'")
+        self.assertFalse(bool(evaluate(condition, context())))
+
+    def test_cpu_lane_follows_the_ready_label_transition(self) -> None:
+        workflow = self.workflows["cpu-tests.yml"]
+        self.assertIn("labeled", workflow[True]["pull_request"]["types"])
+        job = workflow["jobs"]["cpu-tests"]
+        # PRs usually open unlabelled and receive `ready` afterwards: the
+        # opening run skips, and the labeled event must be the one that
+        # starts the lane.
+        self.assertFalse(evaluate(job["if"], context("opened", ready=False)))
+        self.assertTrue(evaluate(job["if"], context("labeled", ready=True, label="ready")))
+        # Unrelated labels, drafts and unlabelled updates stay out.
+        self.assertFalse(evaluate(job["if"], context("labeled", ready=False, label="abtest")))
+        self.assertFalse(evaluate(job["if"], context("labeled", draft=True, label="ready")))
+        self.assertFalse(evaluate(job["if"], context("synchronize", ready=False)))
+        self.assertTrue(evaluate(job["if"], context("synchronize", ready=True)))
 
 
 if __name__ == "__main__":

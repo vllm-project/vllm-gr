@@ -832,6 +832,16 @@ jobs:
           TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
         run: ./tests/system/run_benchmark_and_verify.sh
 
+      # The read-only device check must run *before* the kill script cleans
+      # up: a stage that leaked an EngineCore has to fail the job instead of
+      # being quietly swept away before the aggregation (each pre-merge job
+      # ended with exactly this check).
+      - name: Check clear device after the decode stage
+        id: check-decode
+        continue-on-error: true
+        if: always() && steps.cuda-mapping.outcome == 'success'
+        run: bash ./scripts/check_vllm_on_device.sh
+
       - name: Kill stale process on device
         if: always()
         run: bash ./scripts/kill_vllm_on_device.sh
@@ -859,6 +869,12 @@ jobs:
         continue-on-error: true
         run: ./tests/system/run_pangu1b_acc_and_verify.sh
 
+      - name: Check clear device after the offline stage
+        id: check-offline
+        continue-on-error: true
+        if: always() && steps.cuda-mapping.outcome == 'success'
+        run: bash ./scripts/check_vllm_on_device.sh
+
       - name: Kill stale process on device
         if: always()
         run: bash ./scripts/kill_vllm_on_device.sh
@@ -870,9 +886,15 @@ jobs:
         continue-on-error: true
         run: ./tests/system/run_pangu1b_online_and_verify.sh
 
-      - name: Check clear device
+      - name: Check clear device after the online stage
+        id: check-online
+        continue-on-error: true
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
+
+      - name: Kill stale process on device
+        if: always()
+        run: bash ./scripts/kill_vllm_on_device.sh
 
       - name: Require every stage to pass
         if: >-
@@ -880,7 +902,10 @@ jobs:
           (steps.stage-recall.outcome == 'failure' ||
            steps.stage-decode.outcome == 'failure' ||
            steps.stage-offline.outcome == 'failure' ||
-           steps.stage-online.outcome == 'failure')
+           steps.stage-online.outcome == 'failure' ||
+           steps.check-decode.outcome == 'failure' ||
+           steps.check-offline.outcome == 'failure' ||
+           steps.check-online.outcome == 'failure')
         run: |
           failed=0
           check() {
@@ -893,6 +918,9 @@ jobs:
           check "Decode benchmark" "${{ steps.stage-decode.outcome }}"
           check "Pangu offline accuracy" "${{ steps.stage-offline.outcome }}"
           check "Pangu online accuracy and API contract" "${{ steps.stage-online.outcome }}"
+          check "Device check after the decode stage" "${{ steps.check-decode.outcome }}"
+          check "Device check after the offline stage" "${{ steps.check-offline.outcome }}"
+          check "Device check after the online stage" "${{ steps.check-online.outcome }}"
           exit "$failed"
 
   beam-performance-ab-only:

@@ -265,7 +265,9 @@ class TestRuntimeResolution(unittest.TestCase):
 class TestRuntimeWorkflow(unittest.TestCase):
     def test_every_runtime_job_resolves_before_cache_and_verifies_before_execution(self) -> None:
         workflow = yaml.safe_load((ROOT / ".github/workflows/pre-commit.yml").read_text())
-        for name in ("pre-commit", "decode-benchmark", "pangu-offline", "pangu-online"):
+        # gpu-e2e subsumes the former decode-benchmark/pangu-offline/pangu-online
+        # runtime plumbing (one resolve/cache/verify pass for the whole chain).
+        for name in ("pre-commit", "gpu-e2e"):
             with self.subTest(job=name):
                 steps = workflow["jobs"][name]["steps"]
                 resolve = next(i for i, step in enumerate(steps) if step.get("id") == "runtime")
@@ -285,6 +287,10 @@ class TestRuntimeWorkflow(unittest.TestCase):
                     steps[cache]["with"]["key"], "${{ steps.runtime.outputs.cache-key }}"
                 )
                 self.assertIn("BENCHMARK_DEVICE", steps[resolve]["env"]["RUNTIME_DEVICE"])
+        # The A/B job resolves its own runtime with a literal CUDA device.
+        ab_steps = workflow["jobs"]["beam-performance-ab-only"]["steps"]
+        ab_resolve = next(step for step in ab_steps if step.get("id") == "runtime")
+        self.assertIn("--device cuda", ab_resolve["run"])
         base = next(
             step
             for step in workflow["jobs"]["pre-commit"]["steps"]

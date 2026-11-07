@@ -14,11 +14,24 @@ name: CPU Tests
 on:
   pull_request:
     branches: [main, decode_graph]
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` matters: PRs usually open without labels and receive `ready`
+    # afterwards; without it the lane would never start after adding the
+    # label, and removing/re-adding `ready` could not rerun it.  Unrelated
+    # label edits are kept out of the pending slot by the concurrency group,
+    # matching the main workflow's discipline.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, converted_to_draft]
   workflow_dispatch:
 
 concurrency:
-  group: cpu-tests-${{ github.event.pull_request.number || github.ref }}
+  # Mirror the main workflow: unrelated label noise must not cancel or
+  # replace a pending real run.
+  group: >-
+    cpu-tests-${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') && 'pull_request' || github.event_name }}-${{
+    github.event.pull_request.number || github.ref
+    }}-${{
+    (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+    github.event.label.name != 'ready' &&
+    format('ignored-{0}', github.run_id) || 'ci' }}
   cancel-in-progress: true
 
 jobs:
@@ -26,7 +39,9 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
-       contains(github.event.pull_request.labels.*.name, 'ready'))
+       contains(github.event.pull_request.labels.*.name, 'ready') &&
+       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+        github.event.label.name == 'ready'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
