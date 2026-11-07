@@ -155,8 +155,29 @@ domain when checking correctness. Catalog membership is not guaranteed.
 
 ## Supported execution boundaries
 
-- The initial NPU implementation supports one, two, or three generated tokens,
-  with `ignore_eos=True`. It is not an arbitrary-length text Beam decoder.
+- The experimental full-vocabulary NPU path admits one through six generated
+  tokens. Five- and six-token model validation currently covers
+  Qwen3-0.6B-OneRecVocab BF16, B=1/W=128, eight KV heads, head dimension 128,
+  ModelRunner V1, Eager and FULL Decode Graph. This does not establish arbitrary
+  generation horizons or support for all model geometries: native history
+  layouts and scratch-buffer capacity still bound further generalization.
+  Use this path with
+  `ignore_eos=True` and `beam.sid_stage_vocab=False`. Configure
+  `beam.max_decode_steps=6` to reserve capacity for requests through six tokens.
+  Each request selects its own `max_tokens` within that capacity; the configured
+  maximum does not force shorter requests to generate six tokens. Six-token
+  generation executes one output-producing Prefill followed by five Decode
+  forwards. This remains a bounded Beam decoder, rather than arbitrary-length
+  text Beam generation.
+- Configured capacities above three also require known positive KV-head
+  geometry that fits the native `SelectUnsharedKV` 95 KiB buffer per K/V copy.
+  Admission checks the full configured capacity before allocation, even for a
+  shorter request. For example, 64 KV heads with head dimension 128 fit five
+  tokens but exceed this buffer at six; eight KV heads at that dimension fit
+  six. Reduce `beam.max_decode_steps` when this guard rejects a configuration.
+- SID stage projection and Constraint Table generation retain their existing
+  three-stage boundary. Dynamic width schedules also retain their one-, two-,
+  or three-token contract; longer generation uses a fixed Beam width.
 - Existing NPU restrictions remain: a plain text decoder, FP16/BF16, ModelRunner
   V1, asynchronous scheduling, and TP/PP/DP/DCP/PCP all equal to one.
 - Logical batch sizes follow the existing NPU Beam contract (1 through 8). The

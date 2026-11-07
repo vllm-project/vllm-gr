@@ -42,7 +42,8 @@ DTYPES = [torch.float16, torch.bfloat16]
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_cache_unshared_kv_npu_inplace_write(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("max_decode_steps", [3, 4, 6])
+def test_cache_unshared_kv_npu_inplace_write(dtype: torch.dtype, max_decode_steps: int) -> None:
     """Every decode step writes its per-beam K/V slice; nothing else changes."""
     torch.manual_seed(1234)
 
@@ -50,7 +51,6 @@ def test_cache_unshared_kv_npu_inplace_write(dtype: torch.dtype) -> None:
     beam_size = 128
     kv_heads = 8
     head_dim = 128
-    max_decode_steps = 3
     num_blocks = 4
     pool_shape = (num_blocks, beam_size, kv_heads, max_decode_steps, head_dim)
 
@@ -89,8 +89,9 @@ def test_cache_unshared_kv_npu_inplace_write(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("max_decode_steps", [3, 4, 6])
 def test_cache_unshared_kv_npu_preserves_previous_steps(
-    dtype: torch.dtype,
+    dtype: torch.dtype, max_decode_steps: int
 ) -> None:
     """A later write must not clobber slices written at earlier steps."""
     torch.manual_seed(4321)
@@ -99,7 +100,6 @@ def test_cache_unshared_kv_npu_preserves_previous_steps(
     beam_size = 128
     kv_heads = 8
     head_dim = 128
-    max_decode_steps = 3
     pool_shape = (2, beam_size, kv_heads, max_decode_steps, head_dim)
     block_table = torch.tensor([0], dtype=torch.int32)
 
