@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
+import os
+from pathlib import Path
+
 import pytest
 
 
@@ -21,6 +24,24 @@ def pytest_configure(config: pytest.Config) -> None:
         ' (select lanes with -m requires_gpu / -m "not requires_gpu";'
         " see tests/gpu_lanes.py)",
     )
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    """Keep GPU-lane files out of CPU lane collection entirely.
+
+    ``-m`` filtering happens *after* import, so a GPU-lane module that
+    imports CUDA-only dependencies would abort collection on a CPU-only
+    host even though its tests are deselected.  ``run_tests.sh cpu`` sets
+    ``VLLM_GR_TEST_LANE=cpu`` and this hook skips those files before they
+    are imported; every other invocation collects as before.
+    """
+    if os.environ.get("VLLM_GR_TEST_LANE") != "cpu":
+        return None
+    if collection_path.suffix != ".py":
+        return None
+    from tests.gpu_lanes import requires_gpu
+
+    return requires_gpu(collection_path)
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

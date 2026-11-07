@@ -10,7 +10,13 @@ set -e
 # from the classification in tests/gpu_lanes.py.
 lane="${1:-all}"
 case "$lane" in
-    cpu) selection=(-m "not requires_gpu") ;;
+    cpu)
+        selection=(-m "not requires_gpu")
+        # Also skips importing GPU-lane modules (conftest pytest_ignore_collect):
+        # -m alone filters after import, which would abort collection on hosts
+        # without the CUDA stack.
+        export VLLM_GR_TEST_LANE=cpu
+        ;;
     gpu) selection=(-m "requires_gpu") ;;
     all) selection=() ;;
     *)

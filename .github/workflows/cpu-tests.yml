@@ -31,6 +31,10 @@ jobs:
     timeout-minutes: 30
     env:
       VLLM_GR_TARGET_DEVICE: cpu
+      # Keeps GPU-lane modules from being imported at collection time
+      # (see pytest_ignore_collect in tests/conftest.py); -m alone filters
+      # only after import, which would abort collection without the CUDA stack.
+      VLLM_GR_TEST_LANE: cpu
     steps:
       - uses: actions/checkout@v4
 

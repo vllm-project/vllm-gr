@@ -61,6 +61,9 @@ GPU_TEST_FILES = frozenset(
         "test_gpu_model_runner_patch.py",
         "test_gpu_prefill_graph_runner_v2.py",
         "test_constraint_resource_inject.py",
+        # Drives tests/system/run_beam_v1_performance.sh, which needs CI-only
+        # benchmark artifacts (TRIPLES_PATH) present on the validation host.
+        "test_beam_v1_performance_gate.py",
     }
 )
 
