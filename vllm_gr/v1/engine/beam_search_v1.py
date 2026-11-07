@@ -218,6 +218,32 @@ def _reject_candidate_width_below_dynamic_schedule(
             )
 
 
+def _validate_npu_decode_token_budget(request: BeamBatchRequest, config: Any) -> None:
+    """Fit physical Decode rows in the native ModelRunner's token buffers."""
+    device = getattr(getattr(config, "device_config", None), "device", None)
+    if str(device).split(":")[0] != "npu" or request.beam_params.max_tokens == 1:
+        return
+    budget = getattr(getattr(config, "scheduler_config", None), "max_num_batched_tokens", None)
+    if budget is None:
+        return
+    params = request.beam_params
+    # Prefill produces the first winners. Each remaining invocation consumes
+    # the preceding stage's winners; the final output is never a model input.
+    input_width = (
+        params.beam_width
+        if params.dynamic_beam_widths is None
+        else max(params.dynamic_beam_widths[:-1])
+    )
+    physical_tokens = len(request.items) * input_width
+    if physical_tokens > budget:
+        raise ValueError(
+            f"NPU Beam Decode requires {physical_tokens} physical tokens "
+            f"(batch_size={len(request.items)} * peak_input_width={input_width}), "
+            f"exceeding max_num_batched_tokens={budget}; increase the token budget "
+            "or reduce the batch size or Decode input widths"
+        )
+
+
 def validate_gr_request(
     request: BeamBatchRequest, *, config: Any = None, trie_count: int | None = None
 ) -> None:
@@ -267,6 +293,7 @@ def validate_gr_request(
                 f"Decode steps {max_tokens} exceed runtime limit {gr_config.beam_max_decode_steps}"
             )
         _reject_candidate_width_below_dynamic_schedule(gr_config, request.beam_params)
+        _validate_npu_decode_token_budget(request, config)
 
 
 @dataclass(frozen=True, slots=True)

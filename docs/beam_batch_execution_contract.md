@@ -233,6 +233,15 @@ and supported device features. Logical B=1..8 is supported by admission; the
 online batch/capture policy selects which exact sizes are enabled. Do not
 confuse this policy with native `max_num_seqs` capacity.
 
+On NPU, frontend and EngineCore admission also require the peak physical Decode
+input rows to fit `scheduler_config.max_num_batched_tokens`. For fixed widths,
+this is `batch_size * beam_width`. For dynamic widths, it is
+`batch_size * max(dynamic_beam_widths[:-1])`: the final winners are returned,
+not fed into another model invocation. A one-step request has no Decode and is
+exempt from this additional check. Equality is accepted; exceeding the budget
+rejects the batch before scheduling. Increase the token budget or reduce the
+batch size or Decode input widths to admit it. Prefill token checks still apply.
+
 Constraint Table generation supports up to three effective output steps and a
 per-row candidate width (`K`) of at most 256. The Beam width (`W`, rows per
 request) is a separate dimension with its own operator ceiling of 1024. The ceiling is
