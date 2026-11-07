@@ -1,0 +1,54 @@
+# Draft CPU test lane (local only — not pushed yet).
+#
+# Runs every test classified as CPU-safe (tests/gpu_lanes.py) on a free
+# GitHub-hosted runner so the single self-hosted GPU card only executes
+# `-m requires_gpu` work.  Before promoting this to a required check:
+#   1. validate the install steps actually satisfy the CPU-lane imports
+#      (vllm version pin, regex, tokenizer deps);
+#   2. compare pass/skip counts against a full run on the card to catch
+#      misclassified files (a file that only passes with CUDA belongs in
+#      GPU_TEST_FILES);
+#   3. keep it non-required until it is green for a few consecutive PRs.
+name: CPU Tests
+
+on:
+  pull_request:
+    branches: [main, decode_graph]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+concurrency:
+  group: cpu-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-tests:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+       contains(github.event.pull_request.labels.*.name, 'ready'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VLLM_GR_TARGET_DEVICE: cpu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CPU test environment
+        run: |
+          python -m pip install --upgrade pip
+          # vllm is imported by the tests themselves; the CUDA build imports
+          # fine on a CPU-only host.  TODO: pin exactly what the GPU CI uses.
+          pip install vllm==0.30.0
+          pip install pytest pytest-asyncio pytest-timeout pytest-xdist regex
+          pip install -e . --no-deps
+
+      - name: Run CPU test lane
+        run: |
+          python -m pytest tests -m "not requires_gpu" \
+            --run-slow -n auto --durations=10 -q --timeout=250

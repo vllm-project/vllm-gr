@@ -15,9 +15,24 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "npu_integration: require a complete, usable Ascend NPU runtime",
     )
+    config.addinivalue_line(
+        "markers",
+        "requires_gpu: test needs a CUDA device and only runs in the GPU lane"
+        ' (select lanes with -m requires_gpu / -m "not requires_gpu";'
+        " see tests/gpu_lanes.py)",
+    )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # Lane marking must run before the --run-slow early return so the GPU
+    # lane (which passes --run-slow) still gets its markers.
+    from tests.gpu_lanes import requires_gpu
+
+    gpu_marker = pytest.mark.requires_gpu
+    for item in items:
+        if requires_gpu(item.path):
+            item.add_marker(gpu_marker)
+
     if config.getoption("--run-slow"):
         return
     skip_slow = pytest.mark.skip(reason="need --run-slow option to run")
