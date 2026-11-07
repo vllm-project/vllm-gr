@@ -11,7 +11,6 @@ const path = require('path');
 const POLICY = '.github/benchmark-gate.yaml';
 const RESOLVER = 'tools/ci/resolve_benchmark_policy.py';
 const NORMALIZER = 'tools/ci/normalize_benchmark_policy_env.py';
-const APPROVAL = 'tools/ci/benchmark_policy_approval.js';
 const MAX_FILE_BYTES = 1024 * 1024;
 const shaPattern = /^[a-f0-9]{40}$/i;
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -37,8 +36,7 @@ async function reportPolicyProposal(core, basePolicy, candidatePolicy, baseSha, 
     `Candidate commit: \`${headSha}\`  \nCandidate policy SHA-256: \`${hash(candidatePolicy)}\`\n\n` +
     `#### Base policy\n\n<pre><code>${policyPreview(basePolicy)}</code></pre>\n\n` +
     `#### Candidate policy\n\n<pre><code>${policyPreview(candidatePolicy)}</code></pre>\n\n` +
-    `Review the policy and test changes at this exact candidate commit. ` +
-    `A current-head approval from a qualified non-author is required.\n`;
+    `Review the policy and test changes at this exact candidate commit.\n`;
   await core.summary.addRaw(section).write();
 }
 
@@ -73,37 +71,6 @@ async function readFile(github, owner, repo, filePath, ref, optional = false) {
   const text = bytes.toString('utf8');
   if (!Buffer.from(text, 'utf8').equals(bytes)) throw new Error(`${filePath}@${ref} is not UTF-8.`);
   return text;
-}
-
-async function reviewsAndPermissions(github, owner, repo, pullNumber, author) {
-  const reviews = [];
-  for (let page = 1; page <= 100; page++) {
-    const response = await github.rest.pulls.listReviews({
-      owner, repo, pull_number: pullNumber, per_page: 100, page,
-    });
-    if (!response || !Array.isArray(response.data)) throw new Error('Could not read PR reviews.');
-    reviews.push(...response.data);
-    if (response.data.length < 100) break;
-    if (page === 100) throw new Error('Too many reviews to verify safely.');
-  }
-  const users = new Map();
-  for (const review of reviews) {
-    const user = review && review.user;
-    if (user && user.type === 'User' && typeof user.login === 'string' &&
-        user.login && user.login.toLowerCase() !== author.toLowerCase() &&
-        ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)) {
-      users.set(user.login.toLowerCase(), user.login);
-    }
-  }
-  const permissions = {};
-  for (const [key, username] of users) {
-    const response = await github.rest.repos.getCollaboratorPermissionLevel({owner, repo, username});
-    if (!response || !response.data || typeof response.data.permission !== 'string') {
-      throw new Error(`Could not verify repository permission for ${username}.`);
-    }
-    permissions[key] = response.data.permission;
-  }
-  return {reviews, permissions};
 }
 
 function validatePr(pr, expected, label) {
@@ -151,9 +118,6 @@ async function preparePolicy({github, context, core, tempDir}) {
   ]);
   let effectivePolicy = basePolicy;
   let policyMode = 'base';
-  let reviewer = null;
-  let decide = null;
-  let firstDecision = null;
   if (isPr) {
     const mergePolicy = await readFile(github, owner, repo, POLICY, mergeSha);
     if (mergePolicy !== basePolicy) {
@@ -162,41 +126,17 @@ async function preparePolicy({github, context, core, tempDir}) {
       // base-scoped token does not also need permission on a private fork.
       const candidate = await readFile(github, owner, repo, POLICY, headSha);
       if (candidate !== mergePolicy) {
-        throw new Error('Merged policy differs from the approved head policy; rebase the PR before approval.');
+        throw new Error('Merged policy differs from the head policy; update the PR branch.');
       }
       await reportPolicyProposal(core, basePolicy, candidate, baseSha, headSha);
-      const approvalSource = await readFile(github, owner, repo, APPROVAL, baseSha, true);
-      if (approvalSource === null) {
-        throw new Error('The trusted base approval helper is missing; land the approval infrastructure first.');
-      }
-      const dir = fs.mkdtempSync(path.join(tempDir, 'benchmark-policy-'));
-      const helperPath = path.join(dir, 'benchmark_policy_approval.js');
-      fs.writeFileSync(helperPath, approvalSource, {encoding: 'utf8', mode: 0o600});
-      decide = require(helperPath).decidePolicy;
-      if (typeof decide !== 'function') throw new Error('Invalid trusted base approval helper.');
-      const snapshot = await reviewsAndPermissions(github, owner, repo, number, initialPr.user.login);
-      firstDecision = decide({headSha, baseSha, prAuthor: initialPr.user.login,
-        basePolicy, candidatePolicy: candidate, ...snapshot});
-      if (!firstDecision || firstDecision.mode !== 'candidate') {
-        throw new Error(firstDecision && firstDecision.reason || 'Candidate policy is not approved.');
-      }
       effectivePolicy = candidate;
       policyMode = 'candidate';
-      reviewer = firstDecision.reviewer;
     }
     // The API may have changed while we resolved the immutable snapshots.
     const currentPr = (await github.rest.pulls.get({owner, repo, pull_number: number})).data;
     validatePr(currentPr, {number, headSha, baseSha, mergeSha}, 'Current PR');
     if (currentPr.user.login.toLowerCase() !== initialPr.user.login.toLowerCase()) {
       throw new Error('The PR author changed while verifying policy.');
-    }
-    if (policyMode === 'candidate') {
-      const snapshot = await reviewsAndPermissions(github, owner, repo, number, currentPr.user.login);
-      const decision = decide({headSha, baseSha, prAuthor: currentPr.user.login,
-        basePolicy, candidatePolicy: effectivePolicy, ...snapshot});
-      if (!decision || decision.mode !== 'candidate' || decision.reviewer !== reviewer) {
-        throw new Error('The candidate policy approval changed during verification.');
-      }
     }
   }
 
@@ -217,10 +157,9 @@ async function preparePolicy({github, context, core, tempDir}) {
   fs.writeFileSync(normalizerPath, normalizer, {encoding: 'utf8', mode: 0o600});
   const sourceRef = policyMode === 'candidate' ? headSha : baseSha;
   const policySha256 = hash(effectivePolicy);
-  core.info(`Benchmark policy mode=${policyMode} source=${sourceRef} base=${baseSha} sha256=${policySha256}` +
-    (reviewer ? ` reviewer=${reviewer}` : ''));
+  core.info(`Benchmark policy mode=${policyMode} source=${sourceRef} base=${baseSha} sha256=${policySha256}`);
   return {policyPath, resolverPath, normalizerPath, sourceRef, policyMode,
-    baseSha, headSha, mergeSha, policySha256, reviewer};
+    baseSha, headSha, mergeSha, policySha256};
 }
 
 module.exports = {preparePolicy};

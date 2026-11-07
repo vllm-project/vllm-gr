@@ -59,17 +59,35 @@ cancels its previous PR runs and skips new validation. Remove and re-add
 `ready` to request a fresh run. Unrelated labels do not start full validation;
 manual dispatches have their own job conditions.
 
-Keep `Benchmark blocking gate` required in branch protection. It rejects
+For PRs that only change Markdown files under `docs/` or the root files
+`README.md`, `CONTRIBUTING.md`, `AGENTS.md`, and `CLAUDE.md`, the workflow runs
+documentation checks instead of full validation. It runs the Markdown,
+character, spelling, whitespace, and line-ending hooks on changed files and
+checks tracked filenames. Deleted documents count toward classification but
+are not passed to the hooks. The `ready` and non-draft requirements still apply.
+
+A mixed PR, an unverified file list, or a file list too large for the
+documentation route falls back to full validation or the explicit A/B path.
+The target branch must contain the documentation classifier; otherwise the
+full gate runs. Deploy the workflow changes to each target branch separately.
+Independent Jenkins jobs retain their own configuration. The `/retest` router
+runs from the default branch and has its own label handling.
+
+Keep `Benchmark blocking gate` required in branch protection. It requires the
+appropriate documentation checks or full validation jobs to succeed and rejects
 failed, cancelled, or skipped blocking jobs; a skipped run is not successful
 validation. Cancelling CI also stops Pangu jobs, whose cleanup steps still run
 after device mapping has succeeded.
 
-For non-draft PRs into `decode_graph`, adding `abtest` requests a separate
-Beam V1 performance A/B run. Remove and re-add it to rerun. Its success alone
-does not satisfy full validation. A full `ready` run reuses an eligible A/B
-result for the current revision or runs A/B when needed.
+For non-draft PRs into `main` or `decode_graph`, adding `abtest` requests a
+separate Beam V1 performance A/B run for changes that are not confirmed as
+documentation-only. Remove and re-add it to rerun. Its success alone does not
+satisfy full validation. A full `ready` run reuses an eligible A/B result for
+the current revision or runs A/B when needed. Confirmed documentation-only PRs
+do not run A/B tests, including when `abtest` is added.
 
-Benchmark policy depends on the PR base and device. Video-100/Pangu policy is
-resolved from the PR base; Recall baseline provenance has separate rules.
+Benchmark policy depends on the PR base and device. Video-100/Pangu policy
+resolution uses the PR base and can use a changed candidate policy from the PR;
+Recall baseline provenance has separate rules.
 Use the [benchmark guide](docs/tools/README.md#benchmark-acceptance) and inspect
 the target revision's workflows when interpreting a result.
