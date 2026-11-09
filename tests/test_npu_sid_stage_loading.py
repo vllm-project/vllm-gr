@@ -44,6 +44,7 @@ def _runner() -> SimpleNamespace:
         "constraint_table": {"enabled": False, "backend": "npu", "max_top_k": 4},
     }
     return SimpleNamespace(
+        model=torch.nn.Module(),
         vllm_config=SimpleNamespace(additional_config={"vllm_gr": config}),
         model_config=SimpleNamespace(get_vocab_size=lambda: 40),
         device=torch.device("npu:0") if hasattr(torch, "npu") else "npu:0",

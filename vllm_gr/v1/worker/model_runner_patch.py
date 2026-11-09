@@ -103,6 +103,9 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
         result = original(self, *args, **kwargs)
 
+        from vllm_gr.ops.lm_head_cache import install_lm_head_cache_reload_hooks
+
+        install_lm_head_cache_reload_hooks(self.model)
         backend = None
         try:
             gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
@@ -198,6 +201,9 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
                 if projection is not None:
                     self._gr_npu_stage_projection = projection
                     self.model_memory_usage += projection.device_memory_bytes
+            from vllm_gr.v1.worker.hot_update import versioned_constraint_table
+
+            self.constraint_backend = versioned_constraint_table(self, backend)
             return result
         except BaseException:
             projection = getattr(self, "_gr_npu_stage_projection", None)
@@ -284,8 +290,10 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
 def install_worker_utility_hooks(worker_cls: type) -> None:
     """Install named utility RPCs shared by CUDA and NPU Worker classes."""
     from vllm_gr.constraints.worker_inject import install_worker_resource_hook
+    from vllm_gr.v1.worker.hot_update import install_worker_hot_update_hooks
 
     install_worker_resource_hook(worker_cls)
+    install_worker_hot_update_hooks(worker_cls)
     if not getattr(worker_cls, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
         # Utility RPC dispatch resolves named Worker methods. Keep these
         # importable functions instead of relying on callable serialization.

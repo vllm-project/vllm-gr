@@ -17,6 +17,7 @@ from tests.kernels.test_gpu_beam_stage_runner import (
     install_decode_model,
     metadata,
 )
+from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
 
@@ -67,13 +68,14 @@ def test_dynamic_stage_execution_and_reuse(
     from tests.constraints.test_table import make_table
     from vllm_gr.constraints.loader import _upload_cuda_backend
 
-    worker.constraint_backend, _ = _upload_cuda_backend(
+    backend, _ = _upload_cuda_backend(
         make_table(),
         device=worker.device,
         max_top_k=2 if per_parent_beam_widths is not None else 4,
         max_rows=batch * 4,
     )
-    worker.constraint_backend._mark_ready()
+    backend._mark_ready()
+    worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     if not constrained:
         worker.constraint_backend = None
         worker._vllm_gr_config.constrained_generation = False

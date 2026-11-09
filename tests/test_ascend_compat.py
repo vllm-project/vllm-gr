@@ -251,12 +251,16 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
 
     assert worker_class.__dict__["get_gr_beam_graph_runtime_stats"] is get_beam_graph_runtime_stats
     assert worker_class.__dict__["gr_freeze_gc_after_warmup"] is freeze_gc_after_warmup
+    from vllm_gr.v1.worker.hot_update import reload_trie
+
+    assert worker_class.__dict__["reload_trie"] is reload_trie
 
     events.clear()
     raise_from_original = True
     with pytest.raises(RuntimeError, match="init failed"):
         worker_class().init_device()
     assert events == ["re_apply", "kv_layout", "original"]
+    assert worker_class.__dict__["reload_trie"] is reload_trie
 
 
 def _install_fake_ascend_config(

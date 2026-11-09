@@ -23,6 +23,7 @@ from tests.constraints.test_table import make_table
 from tests.test_gr_async_scheduler import _batch_request
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
 from vllm_gr.constraints.loader import _upload_cuda_backend
+from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
     cache_unshared_kv_graph,
@@ -242,7 +243,7 @@ def admission_worker(
             # fixture's W=4 workspace.
             constraint_table=None,
         ),
-        constraint_backend=backend,
+        constraint_backend=VersionedConstraintTable(backend, loader=lambda _: backend),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
                 SimpleNamespace(

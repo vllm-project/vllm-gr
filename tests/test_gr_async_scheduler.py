@@ -718,7 +718,13 @@ def test_gr_submission_disables_native_stop_ownership() -> None:
 def test_forced_prefix_reset_is_rejected_while_gr_session_is_active() -> None:
     class ResetScheduler:
         def __init__(self) -> None:
-            self._gr_v1_sessions = {"session-0": object()}
+            self._gr_v1_sessions = {
+                "session-0": SimpleNamespace(
+                    status=GRSessionStatus.RUNNING,
+                    resource_status=GRResourceStatus.RUNNING,
+                    in_flight_stages=1,
+                )
+            }
             self.calls: list[bool] = []
 
         def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
@@ -732,6 +738,31 @@ def test_forced_prefix_reset_is_rejected_while_gr_session_is_active() -> None:
     assert scheduler.calls == []
     assert scheduler.reset_prefix_cache(reset_running_requests=False)
     assert scheduler.calls == [False]
+
+
+@pytest.mark.l1
+def test_prefix_reset_after_drain_preserves_waiting_gr_sessions() -> None:
+    class ResetScheduler:
+        def __init__(self) -> None:
+            self._gr_v1_sessions = {
+                "queued": SimpleNamespace(
+                    status=GRSessionStatus.WAITING,
+                    resource_status=GRResourceStatus.WAITING,
+                    in_flight_stages=0,
+                )
+            }
+            self.calls: list[bool] = []
+
+        def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
+            self.calls.append(reset_running_requests)
+            return True
+
+    _patch_scheduler_reset_prefix_cache(ResetScheduler)
+    scheduler = ResetScheduler()
+    queued = scheduler._gr_v1_sessions["queued"]
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert scheduler.calls == [True]
+    assert scheduler._gr_v1_sessions["queued"] is queued
 
 
 def test_native_abort_all_result_cleans_unscheduled_gr_session() -> None:

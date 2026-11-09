@@ -442,23 +442,19 @@ def _get_unconstrained_head_layout(
         or weight.shape[0] != processor.org_vocab_size
     ):
         return None
-    source_key = (
-        id(weight),
-        weight.data_ptr(),
-        weight._version,
-        tuple(weight.shape),
-        weight.dtype,
-    )
+    # Weight-only reload preserves shape/dtype. Refresh the head-owned cache in
+    # the post-load hooks installed at model load instead of a tensor-version key:
+    # existing stage runners retain this storage and must see the new weights.
     with _UNCONSTRAINED_HEAD_LAYOUT_LOCK:
-        cached = getattr(worker, "_gr_unconstrained_head_layout", None)
-        if cached is not None and cached[0] == source_key:
-            return cached[1], cached[2]
+        cached = getattr(head, "_gr_unconstrained_head_layout", None)
+        if cached is not None:
+            return cached
         transposed = weight.detach().T.contiguous()
         # CUDA-specific external events preserve this dependency as a wait
         # node in captured heads; torch.Event does not expose that option.
         ready = CUDAEvent(external=True)
         ready.record(torch.cuda.current_stream(weight.device))
-        worker._gr_unconstrained_head_layout = (source_key, transposed, ready)
+        head._gr_unconstrained_head_layout = (transposed, ready)
         return transposed, ready
 
 
@@ -1396,7 +1392,10 @@ def get_stage_runner(
     # A GRConfig without the switch (or a partial config object) keeps the
     # constrained default: only an explicit ``False`` selects full vocabulary.
     unconstrained = getattr(cfg, "constrained_generation", None) is False
-    if not unconstrained and not isinstance(backend, CUDAConstraintBackend):
+    if not unconstrained and not isinstance(
+        backend.get(),
+        CUDAConstraintBackend,
+    ):
         raise ValueError("persistent GR requires a loaded canonical CUDA Constraint Table")
     if (
         existing is not None

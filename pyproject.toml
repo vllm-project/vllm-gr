@@ -84,6 +84,7 @@ vllm_gr = "vllm_gr.plugin:register"
 
 [project.scripts]
 vllm-gr = "vllm_gr.entrypoints.cli.main:main"
+vllm-gr-sidecar = "vllm_gr.sidecar.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

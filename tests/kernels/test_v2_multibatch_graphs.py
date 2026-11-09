@@ -21,6 +21,7 @@ from tests.kernels.test_gpu_beam_stage_runner import (
 )
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.loader import _upload_cuda_backend
+from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     get_stage_runner,
@@ -151,7 +152,7 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
             make_table(), device=runner.device, max_top_k=4, max_rows=32
         )
         fresh._mark_ready()
-        runner.constraint_backend = fresh
+        runner.constraint_backend = VersionedConstraintTable(fresh, loader=lambda _: fresh)
         loaded.append(runner)
 
     monkeypatch.setattr(
@@ -160,7 +161,7 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     )
     make_load_model_with_constraint_backend(native_load, close_runtime=close_v2_runtime)(worker)
     assert loaded == [worker]
-    assert isinstance(worker.constraint_backend, CUDAConstraintBackend)
+    assert isinstance(worker.constraint_backend.get(), CUDAConstraintBackend)
     assert not hasattr(worker, "_gr_runtime_decode_capture_failures")
 
     # The replacement recaptures the same geometry and really replays it.

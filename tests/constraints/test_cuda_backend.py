@@ -261,7 +261,8 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
             {
                 "apply": lambda self, layer, hidden, bias=None: torch.nn.functional.linear(
                     hidden, layer.weight, bias
-                )
+                ),
+                "process_weights_after_loading": lambda self, layer: None,
             },
         )()
         sliced_logits = runner.model[0]._get_logits(hidden, head, None)

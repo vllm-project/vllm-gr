@@ -11,8 +11,10 @@ from vllm_gr.constraints.backend import (
     ConstraintOutput,
 )
 from vllm_gr.constraints.loader import load_constraint_backend
+from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 
 __all__ = [
+    "VersionedConstraintTable",
     "ConstraintBackend",
     "ConstraintBackendInfo",
     "ConstraintMetadata",

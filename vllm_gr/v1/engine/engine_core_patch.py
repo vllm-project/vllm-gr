@@ -158,6 +158,10 @@ def apply_engine_core_request_patches() -> None:
     """Install V1 session admission and native request dispatch."""
     from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 
+    from vllm_gr.v1.engine.hot_update import install_core_hot_update_hooks
+
+    install_core_hot_update_hooks(EngineCore)
+
     from vllm_gr.v1.engine.core import (
         _handle_submit_gr_session,
         is_gr_session_retired,
@@ -392,7 +396,18 @@ def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
     @wraps(original_reset)
     def patched_reset_prefix_cache(self, *args, **kwargs):
         reset_running_requests = kwargs.get("reset_running_requests", args[0] if args else False)
-        if reset_running_requests and getattr(self, "_gr_v1_sessions", {}):
+        from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, GRSessionStatus
+
+        # Native forced reset cannot safely preempt active GR resources. Weight
+        # updates may leave unstarted sessions queued after pause/drain, so allow
+        # cache clearing for those while still rejecting executing/retiring work.
+        sessions = getattr(self, "_gr_v1_sessions", {}).values()
+        if reset_running_requests and any(
+            session.status is not GRSessionStatus.WAITING
+            or session.resource_status is not GRResourceStatus.WAITING
+            or session.in_flight_stages
+            for session in sessions
+        ):
             logger.warning(
                 "Rejecting reset_prefix_cache(reset_running_requests=True) "
                 "while GR sessions are active"

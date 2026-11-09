@@ -12,6 +12,39 @@ from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
 from vllm_gr.v1.worker import gpu_model_runner_patch, model_runner_patch
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_active_cuda_worker_hot_update_utility_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    class Worker:
+        model_runner: Any
+
+        def reload_weights(self, weights_path: str) -> str:
+            return weights_path
+
+    module = ModuleType("vllm.v1.worker.gpu_worker")
+    setattr(module, "Worker", Worker)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_active_platform_module_name",
+        lambda: model_runner_patch._GPU_PATCH_MODULE,
+    )
+    native_reload = Worker.reload_weights
+    model_runner_patch._install_active_worker_resource_hook()
+    reload_trie = getattr(Worker, "reload_trie")
+    model_runner_patch._install_active_worker_resource_hook()
+    assert getattr(Worker, "reload_trie") is reload_trie
+    assert Worker.reload_weights is native_reload
+
+    worker = Worker()
+    backend = Mock()
+    worker.model_runner = SimpleNamespace(constraint_backend=backend)
+    assert getattr(worker, "reload_trie")("/tries/v2", "v2") == {"version": "v2", "ready": True}
+    backend.reload.assert_called_once_with("/tries/v2", "v2")
+    assert worker.reload_weights("/weights/v2") == "/weights/v2"
+
+
 def test_dispatcher_selects_one_platform_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

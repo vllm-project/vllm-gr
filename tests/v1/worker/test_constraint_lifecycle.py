@@ -62,6 +62,7 @@ def _runner(
     max_top_k: int = 4,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        model=torch.nn.Module(),
         constraint_backend=None,
         vllm_config=_vllm_config(
             enabled=enabled,
@@ -122,7 +123,7 @@ def test_weights_then_readiness_then_publication_and_memory(
     )
     assert wrapped(runner) == "loaded"
     assert events == ["weights", "readiness"]
-    assert runner.constraint_backend is backend
+    assert runner.constraint_backend.get() is backend
     assert runner.model_memory_usage == 137
 
 
@@ -189,7 +190,7 @@ def test_complete_reload_and_shutdown_close_once(
 
     assert len(created) == 2
     assert created[0].close_calls == 1
-    assert runner.constraint_backend is created[1]
+    assert runner.constraint_backend.get() is created[1]
 
     native_shutdown_calls: list[int] = []
 
@@ -370,7 +371,7 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
     set_vocab_slice_config(99, 5)
     try:
         assert make_load_model_with_constraint_backend(weights)(runner) == "loaded"
-        assert runner.constraint_backend is backend
+        assert runner.constraint_backend.get() is backend
         assert backend.vocab_slice is None
         assert runner.model[0]._gr_vocab_slice is None
         actual = runner.model[0]._get_logits(hidden, head, None)
@@ -428,9 +429,10 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
             "UnquantizedEmbeddingMethod",
             (),
             {
+                "process_weights_after_loading": lambda self, layer: None,
                 "apply": lambda self, layer, hidden, bias=None: torch.nn.functional.linear(
                     hidden, layer.weight, bias
-                )
+                ),
             },
         )()
         hidden = torch.randn(2, 8)

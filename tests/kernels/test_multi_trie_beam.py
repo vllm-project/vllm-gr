@@ -19,6 +19,7 @@ from tests.kernels.test_gpu_beam_stage_runner import (
 )
 from tests.test_gr_async_scheduler import _multi_batch_request
 from vllm_gr.constraints.loader import _upload_cuda_backend
+from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
 
@@ -66,10 +67,9 @@ def test_mixed_roots_beam_selection_and_reuse(graph, widths, independent_k):
     # Destroying a previous CUDAGraph during capture invalidates the active stream.
     gc.collect()
     worker = admission_worker(max_rows=8)
-    worker.constraint_backend, _ = _upload_cuda_backend(
-        make_tries(), device=worker.device, max_top_k=4, max_rows=8
-    )
-    worker.constraint_backend._mark_ready()
+    backend, _ = _upload_cuda_backend(make_tries(), device=worker.device, max_top_k=4, max_rows=8)
+    backend._mark_ready()
+    worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     worker.model_config.enforce_eager = not graph
     worker._vllm_gr_config.beam_graph_enabled = graph
     base = torch.tensor([0.1, 0.7, -0.3, 0.2, 0.5, -0.9], device=worker.device, dtype=torch.float16)
@@ -131,10 +131,9 @@ def test_unknown_root_is_rejected_before_registry_allocation():
 
 def test_multi_trie_expansion_capacity_is_checked_before_allocation():
     worker = admission_worker(max_rows=8)
-    worker.constraint_backend, _ = _upload_cuda_backend(
-        make_tries(), device=worker.device, max_top_k=4, max_rows=8
-    )
-    worker.constraint_backend._mark_ready()
+    backend, _ = _upload_cuda_backend(make_tries(), device=worker.device, max_top_k=4, max_rows=8)
+    backend._mark_ready()
+    worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     with pytest.raises(ValueError, match="constraint backend capacity"):
         get_stage_runner(worker, root_dispatch(0, (0, 1), factors=(4, 8, 1)))
     assert not getattr(worker, "_beam_sessions", {})
@@ -146,10 +145,9 @@ def test_multi_trie_startup_capture_and_request_reuse():
 
     gc.collect()
     worker = admission_worker(max_rows=8)
-    worker.constraint_backend, _ = _upload_cuda_backend(
-        make_tries(), device=worker.device, max_top_k=4, max_rows=8
-    )
-    worker.constraint_backend._mark_ready()
+    backend, _ = _upload_cuda_backend(make_tries(), device=worker.device, max_top_k=4, max_rows=8)
+    backend._mark_ready()
+    worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     worker.model_config.enforce_eager = False
     worker._vllm_gr_config.beam_graph_enabled = True
     base = torch.arange(6, device=worker.device, dtype=torch.float16)
