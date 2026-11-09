@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 
+import gc
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -61,6 +62,9 @@ def root_dispatch(stage, roots, widths=None, factors=None):
 @pytest.mark.parametrize("widths", [None, (2, 3, 4)])
 @pytest.mark.parametrize("independent_k", [False, True])
 def test_mixed_roots_beam_selection_and_reuse(graph, widths, independent_k):
+    # Retire cyclic graph owners before a new capture can allocate and trigger GC.
+    # Destroying a previous CUDAGraph during capture invalidates the active stream.
+    gc.collect()
     worker = admission_worker(max_rows=8)
     worker.constraint_backend, _ = _upload_cuda_backend(
         make_tries(), device=worker.device, max_top_k=4, max_rows=8
@@ -140,6 +144,7 @@ def test_multi_trie_expansion_capacity_is_checked_before_allocation():
 def test_multi_trie_startup_capture_and_request_reuse():
     from vllm_gr.v1.worker.gr_startup import _capture_batch
 
+    gc.collect()
     worker = admission_worker(max_rows=8)
     worker.constraint_backend, _ = _upload_cuda_backend(
         make_tries(), device=worker.device, max_top_k=4, max_rows=8

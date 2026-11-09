@@ -26,10 +26,11 @@ through Engine Core and Worker staging. The code baseline is `decode_graph`.
   GetTokenizer remains UNIMPLEMENTED, as in the pinned upstream version.
 - `GenerateRequest.trie_id` selects a Trie for each input; omitted selects Trie 0.
   `GenerateBatch` members can select different Tries while sharing beam/output
-  options. Multi-Trie execution requires CUDA and a multi-Trie constraint table;
-  Engine Core validates IDs against the loaded table before admission. A single
-  Trie or unconstrained deployment accepts only ID 0. Nonzero IDs on NPU are
-  rejected, matching Python/HTTP.
+  options. CUDA and NPU support Multi-Trie execution with a multi-Trie constraint
+  table. Engine Core validates IDs against the loaded table before admission.
+  A single-Trie or unconstrained deployment accepts only ID 0, matching
+  Python/HTTP. See [Multi-Trie constraint tables](multi_root_constraint_table.md)
+  for backend scoring semantics and execution limits.
 - Patch bindings and the servicer during upstream gRPC startup. Upstream owns
   engine/listener initialization, standard health, reflection, keepalive,
   statistics and shutdown. GR supplies extended-schema reflection and drains

@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from vllm_gr.constraints.npu_tables import npu_trie_arrays
 from vllm_gr.constraints.table import CONSTRAINT_TABLE_TENSOR_NAMES, ConstraintTable
 
 
@@ -28,6 +29,10 @@ class NPUStageVocab:
     stage_token_ids: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     prefix_token_maps: tuple[torch.Tensor, torch.Tensor]
     tables: tuple[torch.Tensor, ...]
+    trie_tables: tuple[tuple[torch.Tensor, ...], ...] = ()
+
+    def tables_for_trie(self, trie_id: int) -> tuple[torch.Tensor, ...]:
+        return self.trie_tables[trie_id] if self.trie_tables else self.tables
 
     def owned_tensors(self) -> dict[str, torch.Tensor]:
         tensors = {
@@ -43,6 +48,13 @@ class NPUStageVocab:
                 for step, tensor in enumerate(self.prefix_token_maps)
             }
         )
+        for trie_id, tables in enumerate(self.trie_tables[1:], 1):
+            tensors.update(
+                {
+                    f"stage_trie_{trie_id}_{name}": tensor
+                    for name, tensor in zip(CONSTRAINT_TABLE_TENSOR_NAMES, tables)
+                }
+            )
         return tensors
 
     def local_prefixes(self, prefixes: torch.Tensor, current_step: int) -> torch.Tensor:
@@ -93,36 +105,52 @@ def build_npu_stage_vocab(
     if vocab_size >= table.metadata.vocab_size:
         return None
 
+    # Every root shares these sorted union maps and the same projection shape.
+    # Its six tables retain only that root's legal edges. In particular, shared
+    # SA/SB token IDs must never combine their SC lists across roots.
     first, second, third = stage_ids
-    degrees = table.prefix1_offsets[first + 1] - table.prefix1_offsets[first]
-    offsets = np.full(vocab_size + 1, table.prefix1_values.size, dtype=np.int32)
-    offsets[0] = 0
-    offsets[1 : first.size + 1] = np.cumsum(degrees, dtype=np.int64).astype(np.int32)
-    second_values = np.searchsorted(second, table.prefix1_values).astype(np.int32)
-    compact_arrays = (
-        np.arange(first.size, dtype=np.int32),
-        offsets,
-        second_values,
-        np.repeat(np.arange(first.size, dtype=np.int64), degrees) * vocab_size
-        + second_values.astype(np.int64),
-        table.prefix2_value_offsets,
-        np.searchsorted(third, table.prefix2_values).astype(np.int32),
-    )
-    prefix_maps = []
-    for ids in (first, second):
-        mapping = np.full(table.metadata.vocab_size, vocab_size - 1, dtype=np.int32)
-        mapping[ids] = np.arange(ids.size, dtype=np.int32)
-        prefix_maps.append(upload(mapping, device))
-    return NPUStageVocab(
-        vocab_size=vocab_size,
-        stage_token_ids=(
-            upload(first.astype(np.int64), device),
-            upload(second.astype(np.int64), device),
-            upload(third.astype(np.int64), device),
-        ),
-        prefix_token_maps=(prefix_maps[0], prefix_maps[1]),
-        tables=tuple(upload(array, device) for array in compact_arrays),
-    )
+    trie_tables: list[tuple[torch.Tensor, ...]] = []
+    prefix_maps: list[torch.Tensor] = []
+    try:
+        for trie_id in range(table.metadata.trie_count):
+            root_first, offsets1, values1, _keys, offsets2, values2 = npu_trie_arrays(
+                table, trie_id
+            )
+            local_first = np.searchsorted(first, root_first).astype(np.int32)
+            degrees = offsets1[root_first + 1] - offsets1[root_first]
+            offsets = np.zeros(vocab_size + 1, dtype=np.int32)
+            offsets[local_first + 1] = degrees
+            offsets = np.cumsum(offsets, dtype=np.int64).astype(np.int32)
+            second_values = np.searchsorted(second, values1).astype(np.int32)
+            compact_arrays = (
+                local_first,
+                offsets,
+                second_values,
+                np.repeat(local_first.astype(np.int64), degrees) * vocab_size
+                + second_values.astype(np.int64),
+                offsets2,
+                np.searchsorted(third, values2).astype(np.int32),
+            )
+            trie_tables.append(tuple(upload(array, device) for array in compact_arrays))
+        for ids in (first, second):
+            mapping = np.full(table.metadata.vocab_size, vocab_size - 1, dtype=np.int32)
+            mapping[ids] = np.arange(ids.size, dtype=np.int32)
+            prefix_maps.append(upload(mapping, device))
+        return NPUStageVocab(
+            vocab_size=vocab_size,
+            stage_token_ids=(
+                upload(first.astype(np.int64), device),
+                upload(second.astype(np.int64), device),
+                upload(third.astype(np.int64), device),
+            ),
+            prefix_token_maps=(prefix_maps[0], prefix_maps[1]),
+            tables=trie_tables[0],
+            trie_tables=tuple(trie_tables),
+        )
+    except BaseException:
+        trie_tables.clear()
+        prefix_maps.clear()
+        raise
 
 
 __all__ = ["NPUStageVocab", "build_npu_stage_vocab"]

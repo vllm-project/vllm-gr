@@ -374,12 +374,19 @@ def test_offline_compact_output_preserves_accepted_prompt_snapshot(
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
-@pytest.mark.parametrize("independent_k", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "device,independent_k", [("cuda", False), ("cuda", True), ("npu", False)]
+)
 @pytest.mark.parametrize(  # type: ignore[misc]
     "trie_ids", [None, [0, 1], [1, 1], (1, 0), [True, 0], [-1, 0], [None, 1], [0]]
 )
-def test_per_prompt_trie_selection(trie_ids: Any, online: bool, independent_k: bool) -> None:
-    engine = _make_engine()
+def test_per_prompt_trie_selection(
+    trie_ids: Any, online: bool, independent_k: bool, device: str
+) -> None:
+    canonical = _canonical_gr_config(backend=device)
+    canonical["constraint_table"]["format"] = "constraint_table_v2"
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device=device)
     params = BeamSearchParams(
         beam_width=2,
         max_tokens=3,

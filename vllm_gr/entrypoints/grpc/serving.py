@@ -69,13 +69,10 @@ class BeamVllmEngineServicer(VllmEngineServicer):
             raise ValueError("requests must not be empty")
         config = getattr(self.engine, "vllm_config", None)
         gr_config = GRConfig.from_vllm_config(config) if config is not None else None
-        device = getattr(getattr(config, "device_config", None), "device", "cuda")
         params_key = None
         members, identities = [], []
         batch_id = uuid.uuid4().hex
         for index, message in enumerate(messages):
-            if str(device).split(":")[0] == "npu" and message.trie_id:
-                raise ValueError("multi-trie requests currently require CUDA")
             if not message.HasField("beam_search"):
                 raise ValueError("GenerateBatch requires explicit beam_search on every member")
             if message.WhichOneof("input") != "tokenized":

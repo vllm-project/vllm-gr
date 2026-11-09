@@ -123,28 +123,39 @@ def test_full_request_to_numpy_batch(binary: bool) -> None:
 
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
-def test_constrained_length_is_checked_before_grpc_token_decoding(binary: bool) -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "backend,table_format,trie_id",
+    [("cuda", "constraint_table_v1", 0), ("npu", "constraint_table_v2", 1)],
+)
+def test_constrained_length_is_checked_before_grpc_token_decoding(
+    binary: bool, backend: str, table_format: str, trie_id: int
+) -> None:
     from tests.test_beam_search_v1_input_processor import _canonical_gr_config
 
-    config = _canonical_gr_config()
+    config = _canonical_gr_config(backend=backend)
+    config["constraint_table"]["format"] = table_format
     config["beam"]["max_decode_steps"] = 7
-    backend = engine()
-    backend.vllm_config = SimpleNamespace(additional_config={"vllm_gr": config})
-    servicer = BeamVllmEngineServicer(backend, 0.0)
+    runtime = engine()
+    runtime.vllm_config = SimpleNamespace(
+        additional_config={"vllm_gr": config}, device_config=SimpleNamespace(device=backend)
+    )
+    servicer = BeamVllmEngineServicer(runtime, 0.0)
     decode = Mock(wraps=servicer.decode_tokens)
     servicer.decode_tokens = decode
     request = message(binary=binary)
+    request.trie_id = trie_id
     for length in (1, 2, 4, 7):
         request.sampling_params.max_tokens = length
         with pytest.raises(
             ValueError,
-            match=f"effective generation length {length} must equal constraint_table_v1 depth",
+            match=f"effective generation length {length} must equal {table_format} depth",
         ):
             servicer.build_batch([request])
         decode.assert_not_called()
     request.sampling_params.max_tokens = 3
     batch, _ = servicer.build_batch([request])
     assert batch.beam_params.max_tokens == 3
+    assert batch.items[0].trie_id == trie_id
     decode.assert_called_once()
 
 
@@ -167,12 +178,8 @@ def test_npu_trie_selector_matches_http_validation(trie_id: int) -> None:
     request = message()
     request.trie_id = trie_id
     servicer = BeamVllmEngineServicer(backend, 0.0)
-    if trie_id:
-        with pytest.raises(ValueError, match="multi-trie requests currently require CUDA"):
-            servicer.build_batch([request])
-    else:
-        batch, _ = servicer.build_batch([request])
-        assert batch.items[0].trie_id == 0
+    batch, _ = servicer.build_batch([request])
+    assert batch.items[0].trie_id == trie_id
 
 
 @pytest.mark.parametrize("result_width", [None, 1, 2])  # type: ignore[misc]
@@ -398,9 +405,11 @@ async def connection() -> AsyncIterator[tuple[Any, SimpleNamespace, list[Any], A
 
 @pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("method", ["Generate", "GenerateBatch"])  # type: ignore[misc]
-def test_trie_selection_over_grpc(binary: bool, method: str) -> None:
+@pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
+def test_trie_selection_over_grpc(binary: bool, method: str, device: str) -> None:
     async def run() -> None:
         async with connection() as (stub, backend, submitted, servicer):
+            backend.vllm_config = SimpleNamespace(device_config=SimpleNamespace(device=device))
             if method == "Generate":
                 request = message(binary=binary)
                 request.trie_id = 1
@@ -425,8 +434,9 @@ def test_trie_selection_over_grpc(binary: bool, method: str) -> None:
 
 @pytest.mark.parametrize("trie_count", [1, 2])  # type: ignore[misc]
 @pytest.mark.parametrize("method", ["Generate", "GenerateBatch"])  # type: ignore[misc]
+@pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
 def test_invalid_trie_uses_core_admission_and_service_recovers(
-    trie_count: int, method: str
+    trie_count: int, method: str, device: str
 ) -> None:
     from queue import Queue
 
@@ -437,6 +447,7 @@ def test_invalid_trie_uses_core_admission_and_service_recovers(
 
     async def run() -> None:
         async with connection() as (stub, backend, submitted, servicer):
+            backend.vllm_config = SimpleNamespace(device_config=SimpleNamespace(device=device))
             original_submit = backend.submit_gr_session
             core = SimpleNamespace(_gr_trie_count=trie_count, input_queue=Queue())
 

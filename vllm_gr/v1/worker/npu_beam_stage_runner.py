@@ -63,6 +63,8 @@ class NPUEagerBeamStageRunner:
         self.latest_token_ids: torch.Tensor | None = None
         self.parent_history: torch.Tensor | None = None
         self.session_request: BeamBatchRequest | None = None
+        self._session_trie_ids: tuple[int, ...] | None = None
+        self._trie_ids_by_width: dict[int, tuple[int, ...]] = {}
         self.decode_candidates: Any = None
         self.logits: torch.Tensor | None = None
         self.attention_batch: NPUBeamExecutionBatch | None = None
@@ -310,10 +312,13 @@ class NPUEagerBeamStageRunner:
         metadata = self._metadata(scheduler_output)
         session_init = getattr(metadata, "session_init", None)
         if session_init is not None:
-            if any(item.trie_id != 0 for item in session_init.items):
-                raise ValueError("NPU currently supports trie_id=0 only")
             if plan.execution.kind != "prefill" or self.session_request is not None:
                 raise ValueError("NPU session_init must appear once on Prefill")
+        if plan.execution.kind == "prefill":
+            trie_ids = self._validate_session_trie_ids(plan, session_init)
+            self._session_trie_ids = trie_ids
+            self._trie_ids_by_width = {}
+        if session_init is not None:
             self.session_request = session_init
 
         self.pending_plan = plan
@@ -469,7 +474,10 @@ class NPUEagerBeamStageRunner:
             if backend is None or not callable(getattr(backend, "select", None)):
                 raise RuntimeError("NPU GR requires a loaded canonical constraint backend")
             candidates = self._select_constraint_candidates(
-                backend, self.logits.contiguous(), metadata
+                backend,
+                self.logits.contiguous(),
+                metadata,
+                trie_ids=self._constraint_trie_ids(plan),
             )
         expected = (
             plan.execution.num_execution_rows,
@@ -628,6 +636,8 @@ class NPUEagerBeamStageRunner:
         backend: Any,
         logits: torch.Tensor,
         metadata: ConstraintMetadata,
+        *,
+        trie_ids: tuple[int, ...] | None = None,
     ) -> ConstraintOutput:
         """Select candidates within one Backend call's row capacity.
 
@@ -638,8 +648,22 @@ class NPUEagerBeamStageRunner:
         max_rows = int(backend.info.max_rows)
         if max_rows < 1:
             raise RuntimeError(f"NPU constraint backend has invalid max_rows={max_rows}")
+        if trie_ids is not None and len(trie_ids) != logits.shape[0]:
+            raise RuntimeError("NPU Trie selectors must match physical candidate rows")
+
+        select_for_rows: (
+            Callable[[torch.Tensor, ConstraintMetadata, tuple[int, ...]], ConstraintOutput] | None
+        ) = None
+        if trie_ids is not None:
+            host_selector = getattr(backend, "select_for_rows", None)
+            if not callable(host_selector):
+                raise RuntimeError("NPU multi-trie selection requires host-row routing")
+            select_for_rows = host_selector
         if logits.shape[0] <= max_rows:
-            return backend.select(logits, metadata)
+            if trie_ids is None:
+                return backend.select(logits, metadata)
+            assert select_for_rows is not None
+            return select_for_rows(logits, metadata, trie_ids)
 
         outputs: list[ConstraintOutput] = []
         for start in range(0, logits.shape[0], max_rows):
@@ -652,8 +676,14 @@ class NPUEagerBeamStageRunner:
                 temperatures=temperatures,
                 current_step=metadata.current_step,
                 top_k=metadata.top_k,
+                trie_ids=None if metadata.trie_ids is None else metadata.trie_ids[start:stop],
             )
-            outputs.append(backend.select(logits[start:stop].contiguous(), chunk_metadata))
+            chunk_logits = logits[start:stop].contiguous()
+            if trie_ids is None:
+                outputs.append(backend.select(chunk_logits, chunk_metadata))
+            else:
+                assert select_for_rows is not None
+                outputs.append(select_for_rows(chunk_logits, chunk_metadata, trie_ids[start:stop]))
 
         return ConstraintOutput(
             token_ids=torch.cat([output.token_ids for output in outputs], dim=0),
@@ -828,8 +858,41 @@ class NPUEagerBeamStageRunner:
                 sessions.pop(request_id, None)
         self.closed = True
         self.parent_history = None
+        self._session_trie_ids = None
+        self._trie_ids_by_width = {}
         self.logical_scheduler_output = None
         self.execution_error = None
+
+    def _validate_session_trie_ids(
+        self, plan: NPUEagerStagePlan, request: BeamBatchRequest | None
+    ) -> tuple[int, ...] | None:
+        """Validate immutable request selectors before retaining session state."""
+        backend = getattr(self.worker, "constraint_backend", None)
+        trie_count = backend.info.table_metadata.trie_count if backend is not None else 1
+        if type(trie_count) is not int or trie_count < 1:
+            raise RuntimeError("NPU constraint backend has an invalid live Trie count")
+        if request is None:
+            if trie_count > 1:
+                raise ValueError("NPU multi-trie execution requires the initial batch request")
+            return None
+        execution = plan.execution
+        execution.validate_request_order(tuple(item.request.request_id for item in request.items))
+        roots = tuple(item.trie_id for item in request.items)
+        if any(type(root) is not int or not 0 <= root < trie_count for root in roots):
+            raise ValueError("trie_id is outside the loaded constraint table")
+        # A single Trie needs neither per-row selectors nor hot-path dispatch.
+        return roots if trie_count > 1 else None
+
+    def _constraint_trie_ids(self, plan: NPUEagerStagePlan) -> tuple[int, ...] | None:
+        roots = getattr(self, "_session_trie_ids", None)
+        if roots is None:
+            return None
+        width = plan.execution.input_width
+        expanded = self._trie_ids_by_width.get(width)
+        if expanded is None:
+            expanded = plan.execution.expand_per_request(roots, name="trie_ids")
+            self._trie_ids_by_width[width] = expanded
+        return expanded
 
     def _constraint_prefixes(self, plan: NPUEagerStagePlan) -> torch.Tensor:
         rows = plan.execution.num_execution_rows

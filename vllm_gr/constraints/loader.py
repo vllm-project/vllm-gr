@@ -31,6 +31,7 @@ from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
 from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab, build_npu_stage_vocab
+from vllm_gr.constraints.npu_tables import npu_trie_arrays
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
@@ -150,12 +151,14 @@ def _reject_unsupported_last_vocab_prefix(table: ConstraintTable) -> None:
     only semantics-preserving Python behavior is to reject such an Artifact.
     """
 
-    last = table.metadata.vocab_size - 1
-    if int(table.prefix1_offsets[last]) != int(table.prefix1_offsets[last + 1]):
-        raise RuntimeError(
-            "NPU rec_constrained_topk does not support an active prefix at "
-            "token ID vocab_size - 1; use the CPU Backend or a fixed NPU kernel"
-        )
+    vocab = table.metadata.vocab_size
+    for trie_id in range(table.metadata.trie_count):
+        last = (trie_id + 1) * vocab - 1
+        if int(table.prefix1_offsets[last]) != int(table.prefix1_offsets[last + 1]):
+            raise RuntimeError(
+                "NPU rec_constrained_topk does not support an active prefix at "
+                "token ID vocab_size - 1; use the CPU Backend or a fixed NPU kernel"
+            )
 
 
 def _upload_table_tensor(array: NDArray[Any], device: torch.device) -> torch.Tensor:
@@ -204,15 +207,28 @@ def _upload_npu_backend(
     max_rows: int,
     enable_npu_stage_vocab: bool = False,
 ) -> tuple[NPUConstraintBackend, tuple[_ReadyCase, ...]]:
-    cases = _readiness_cases(table, max_top_k)
+    cases = tuple(
+        case
+        for trie_id in range(table.metadata.trie_count)
+        for case in _readiness_cases(table, max_top_k, trie_id)
+    )
     device_tables: dict[str, torch.Tensor] = {}
+    trie_tables: list[tuple[torch.Tensor, ...]] = []
+    stage_vocab = None
     backend: NPUConstraintBackend | None = None
+
+    def upload(array: NDArray[Any], target: torch.device) -> torch.Tensor:
+        tensor = _upload_table_tensor(array, target)
+        device_tables[f"owned_{len(device_tables)}"] = tensor
+        return tensor
+
     try:
-        for name in CONSTRAINT_TABLE_TENSOR_NAMES:
-            device_tables[name] = _upload_table_tensor(getattr(table, name), device)
-        stage_vocab = None
+        for trie_id in range(table.metadata.trie_count):
+            trie_tables.append(
+                tuple(upload(array, device) for array in npu_trie_arrays(table, trie_id))
+            )
         if enable_npu_stage_vocab and os.environ.get("VLLM_GR_NPU_STAGE_LM_HEAD", "1") == "1":
-            stage_vocab = build_npu_stage_vocab(table, device, _upload_table_tensor)
+            stage_vocab = build_npu_stage_vocab(table, device, upload)
             if stage_vocab is not None:
                 device_tables.update(stage_vocab.owned_tensors())
         _synchronize_current_npu_stream(device)
@@ -225,20 +241,23 @@ def _upload_npu_backend(
             device_memory_bytes=_unique_storage_bytes(device_tables),
         )
         backend = NPUConstraintBackend(
-            first_token_ids=device_tables["first_token_ids"],
-            prefix1_offsets=device_tables["prefix1_offsets"],
-            prefix1_values=device_tables["prefix1_values"],
-            prefix1_pair_keys=device_tables["prefix1_pair_keys"],
-            prefix2_value_offsets=device_tables["prefix2_value_offsets"],
-            prefix2_values=device_tables["prefix2_values"],
+            first_token_ids=trie_tables[0][0],
+            prefix1_offsets=trie_tables[0][1],
+            prefix1_values=trie_tables[0][2],
+            prefix1_pair_keys=trie_tables[0][3],
+            prefix2_value_offsets=trie_tables[0][4],
+            prefix2_values=trie_tables[0][5],
             info=info,
             op=op,
             stage_vocab=stage_vocab,
+            trie_tables=tuple(trie_tables),
         )
         return backend, cases
     except BaseException:
         if backend is not None:
             backend.close()
+        stage_vocab = None
+        trie_tables.clear()
         device_tables.clear()
         raise
 
@@ -599,8 +618,6 @@ def load_constraint_backend(
         expected_vocab_size=vocab_size,
         expected_format=config.format,
     )
-    if config.backend is ConstraintTableBackendEnum.NPU and table.metadata.trie_count > 1:
-        raise ValueError("multi-trie Constraint Tables currently support CPU/CUDA only")
     if config.backend is ConstraintTableBackendEnum.CPU:
         info = _backend_info(
             table,
@@ -644,8 +661,8 @@ def load_constraint_backend(
         max_rows=max_rows,
         enable_npu_stage_vocab=enable_npu_stage_vocab,
     )
-    # ``cases`` contains at most 2 * max_top_k Python integers per step and no
-    # NumPy views. Drop the full Host table before launching readiness.
+    # Each root's readiness case retains only bounded Python token tuples,
+    # never NumPy views. Drop the full Host table before launching readiness.
     del table
     try:
         _run_npu_readiness(

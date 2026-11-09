@@ -53,7 +53,7 @@ aligned with it.
 | GR-PATCH-005 | `vllm_gr/engine/arg_utils_gr.py` | `patch_add_cli_args` | required frontend plan finds GR EngineArgs methods absent | `_validate_engine_args_patch`; attention backend configuration tests | main, API server |
 | GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds V1 client/lifecycle methods incomplete | `_validate_batch_and_fork_patch`; V1 request, admission, rejection, and online lifecycle tests | API server |
 | GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
-| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; V1 request and admission tests | EngineCore |
+| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | Shared EngineCore plan, including NPU child entry, finds request dispatch or Trie-capacity initialization incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; V1 request and admission tests | EngineCore |
 | GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `gr_async_scheduler.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
 | GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py`, `gpu_model_runner_v2_patch.py` | `model_runner_patch.apply_worker_patches` | selected CUDA V1/V2 runner hooks are incomplete | `_validate_model_runner_patch`; V1/V2 GPU, dispatcher, and stage-parity tests | GPU worker |
 | GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
@@ -190,6 +190,10 @@ aligned with it.
     - GR Beam request handlers
 - Risk: Critical
 - Behavior: integrates grouped Beam request processing into EngineCore.
+  The shared child plan installs the live Trie-capacity initialization wrapper
+  before construction. The sanitized NPU process entry invokes this plan too;
+  installing it later from Worker initialization would miss the current
+  EngineCore constructor and leave request admission without a Trie count.
 - Compatibility-sensitive upstream behavior includes:
     - ZMQ socket construction;
     - READY and coordinator handshakes;
@@ -374,8 +378,11 @@ aligned with it.
 - Mutation: entrypoint wrapper plus function wrapper
 - Platform / process role: NPU; main, EngineCore, worker
 - Risk: High
-- Behavior: installs a filter before delegating to vllm-ascend's own
-  entrypoint. During each synchronous `init_ascend_config` call, the canonical
+- Behavior: installs a filter and initializes the shared EngineCore-only patch
+  plan before delegating to vllm-ascend's own entrypoint. This keeps the native
+  Ascend startup chain while installing GR request admission, including live
+  Trie-capacity discovery, before EngineCore construction. During each
+  synchronous `init_ascend_config` call, the canonical
   `vllm_gr` key and legacy `vllm_gr_*` keys are excluded from its validation
   mapping. The original `additional_config` mapping is restored in `finally`,
   including on failure. The native config cache retains the original

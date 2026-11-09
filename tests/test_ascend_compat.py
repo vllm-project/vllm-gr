@@ -398,7 +398,11 @@ def test_ascend_config_filter_leaves_ordinary_config_untouched(
 def test_ascend_entry_installs_filter_before_delegating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import vllm_gr.patch as runtime_patch
+
     config = SimpleNamespace(additional_config={"vllm_gr_beam_max_width": 4})
+    initialize_child = mock.Mock()
+    monkeypatch.setattr(runtime_patch, "initialize_engine_core_beam_patches", initialize_child)
 
     def initialize(received: Any) -> None:
         assert received is config
@@ -407,6 +411,7 @@ def test_ascend_entry_installs_filter_before_delegating(
     _, entry = _install_fake_ascend_config(monkeypatch, initialize)
 
     def native_entry(*args: Any, **kwargs: Any) -> str:
+        initialize_child.assert_called_once_with()
         assert args == ("socket-address",)
         assert kwargs == {"vllm_config": config, "dp_rank": 2, "local_dp_rank": 1}
         entry.init_ascend_config(config)
@@ -420,6 +425,136 @@ def test_ascend_entry_installs_filter_before_delegating(
         )
         == "ready"
     )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("trie_count", [1, 3])  # type: ignore[misc]
+@pytest.mark.parametrize("beam", [False, True])  # type: ignore[misc]
+def test_ascend_child_activates_live_trie_capacity_before_first_core_initialization(
+    monkeypatch: pytest.MonkeyPatch, trie_count: int, beam: bool
+) -> None:
+    """Exercise the real child plan/installer, including an incomplete prior patch."""
+    from queue import Queue
+
+    import msgspec
+    import vllm.v1.engine.core as native_core
+
+    import vllm_gr.patch as runtime_patch
+    from tests.test_gr_async_scheduler import _multi_batch_request
+    from vllm_gr.v1.beam import token_buffer
+    from vllm_gr.v1.engine import engine_core_patch
+    from vllm_gr.v1.engine.core import loaded_constraint_trie_count
+    from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
+
+    config = SimpleNamespace(
+        device_config=SimpleNamespace(device="npu"),
+        additional_config={"vllm_gr_beam_execution_mode": "v1"} if beam else {},
+    )
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            constraint_backend=SimpleNamespace(
+                info=SimpleNamespace(table_metadata=SimpleNamespace(trie_count=trie_count))
+            )
+        )
+    )
+
+    class Core:
+        def __init__(self, vllm_config: Any) -> None:
+            self.vllm_config = vllm_config
+            self.scheduler = SimpleNamespace()
+            self.model_executor = SimpleNamespace(
+                collective_rpc=mock.Mock(side_effect=lambda function: [function(worker)])
+            )
+            self.input_queue: Queue[Any] = Queue()
+
+    class CoreProc(Core):
+        def _handle_client_request(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("Native dispatch is outside this startup test")
+
+        def process_input_sockets(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("No socket thread is started by this test")
+
+        def _process_engine_step(self) -> None:
+            raise AssertionError("No Worker/model is started by this test")
+
+    class DPCoreProc(CoreProc):
+        pass
+
+    monkeypatch.setattr(native_core, "EngineCore", Core)
+    monkeypatch.setattr(native_core, "EngineCoreProc", CoreProc)
+    monkeypatch.setattr(native_core, "DPEngineCoreProc", DPCoreProc)
+    monkeypatch.setattr(token_buffer, "install_numpy_request_factory", mock.Mock())
+    monkeypatch.setattr(token_buffer, "install_numpy_scheduler_data", mock.Mock())
+    monkeypatch.setattr(engine_core_patch, "UPSTREAM_PROCESS_INPUT_SOCKETS", None)
+    monkeypatch.setattr(runtime_patch, "_LAST_BEAM_PATCH_REPORT", None)
+    # Keep the real requests applicator and verifier. Other child capabilities
+    # do not own startup capacity and would require a device/model fixture.
+    requests_plan = runtime_patch._engine_core_beam_patches()[:1]
+    monkeypatch.setattr(runtime_patch, "_engine_core_beam_patches", lambda: requests_plan)
+    raw_initialize = Core.__init__
+    engine_core_patch.apply_engine_core_request_patches()
+    Core.__init__ = raw_initialize  # type: ignore[method-assign]
+    assert runtime_patch._validate_engine_core_request_patch() is not None
+
+    def initialize_ascend(received: Any) -> None:
+        assert received is config and received.additional_config == {}
+
+    _, entry = _install_fake_ascend_config(monkeypatch, initialize_ascend, install=False)
+
+    def native_entry(*args: Any, **kwargs: Any) -> CoreProc:
+        entry.init_ascend_config(config)
+        assert runtime_patch._validate_engine_core_request_patch() is None
+        return CoreProc(kwargs["vllm_config"])
+
+    setattr(entry, "_run_engine_core_patch_func", native_entry)
+    initialize = None
+    for _ in range(2):
+        core = ascend_compat._sanitize_engine_core_entry(vllm_config=config)
+        if initialize is None:
+            initialize = Core.__init__
+        assert Core.__init__ is initialize, "Repeated child activation stacked init wrappers"
+        if not beam:
+            assert not hasattr(core, "_gr_trie_count")
+            core.model_executor.collective_rpc.assert_not_called()
+            continue
+        assert core._gr_trie_count == core.scheduler._gr_trie_count == trie_count
+        core.model_executor.collective_rpc.assert_called_once_with(loaded_constraint_trie_count)
+        request = _multi_batch_request()
+        bad = msgspec.structs.replace(
+            request,
+            items=(request.items[0], msgspec.structs.replace(request.items[1], trie_id=trie_count)),
+        )
+        with pytest.raises(GRAdmissionError, match="trie_id"):
+            core._handle_submit_gr_session(bad)
+        assert core.input_queue.empty()
+        good = msgspec.structs.replace(
+            request,
+            items=(
+                msgspec.structs.replace(request.items[0], trie_id=trie_count - 1),
+                request.items[1],
+            ),
+        )
+        core._handle_submit_gr_session(good)
+        assert core.input_queue.get_nowait()[1] is good and core.input_queue.empty()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_ascend_child_does_not_start_native_core_when_required_patching_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_gr.patch as runtime_patch
+
+    _, entry = _install_fake_ascend_config(monkeypatch, mock.Mock(), install=False)
+    native_entry = mock.Mock()
+    setattr(entry, "_run_engine_core_patch_func", native_entry)
+    monkeypatch.setattr(
+        runtime_patch,
+        "initialize_engine_core_beam_patches",
+        mock.Mock(side_effect=RuntimeError("required child patch failed")),
+    )
+    with pytest.raises(RuntimeError, match="required child patch failed"):
+        ascend_compat._sanitize_engine_core_entry(vllm_config=SimpleNamespace(additional_config={}))
+    native_entry.assert_not_called()
 
 
 pytestmark = pytest.mark.cpu_test

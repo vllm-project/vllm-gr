@@ -126,11 +126,13 @@ patches:
   - id: GR-PATCH-009
     owner: vllm_gr/v1/engine/core.py and engine_core_patch.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
-    activation: the EngineCore patch plan detects request dispatch is incomplete
+    activation: the shared EngineCore plan, including the sanitized NPU child entrypoint, detects incomplete request dispatch or Trie-capacity initialization
     validator_or_test:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
       - tests/test_gr_async_scheduler.py
+      - tests/test_npu_multi_trie_routing.py
+      - tests/test_ascend_compat.py
     process_roles: [engine_core]
     target: vllm.v1.engine.core.EngineCoreProc
     risk: critical
@@ -253,7 +255,7 @@ patches:
   - id: GR-PATCH-019
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer and patch_npu_worker_init_device
-    activation: NPU engine configuration and worker plugin initialization; entrypoint re-asserted on every create_engine_config call
+    activation: NPU engine configuration and worker plugin initialization; entrypoint re-asserted on every create_engine_config call and initializes the shared EngineCore plan before native construction
     validator_or_test:
       - vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer return value
       - tests/test_ascend_compat.py::test_ascend_config_filter_preserves_engine_identity_and_gr_config

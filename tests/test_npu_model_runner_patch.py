@@ -2198,6 +2198,7 @@ def test_npu_stage_runner_receipt_preserves_owner_generation() -> None:
     assert result.owner_generation == plan.execution.owner_generation == 1
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("candidate_top_k", "candidate_shape", "error_type", "message"),
     [
@@ -2261,6 +2262,7 @@ def test_npu_prefill_sample_preserves_candidate_and_winner_shape_errors(
     assert stage.logits is logits
 
 
+@pytest.mark.l1  # type: ignore[misc]
 def test_npu_decode_sample_accepts_candidate_width_distinct_from_winner_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
