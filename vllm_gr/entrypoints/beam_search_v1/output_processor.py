@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, NoReturn
 
 from vllm.inputs import tokens_input
+from vllm.platforms import current_platform
 
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchEngineError
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
@@ -137,6 +138,43 @@ class _V1BeamTailMaterializer:
         beam.__class__ = BeamSearchSequence
 
 
+class _NPUBeamTailMaterializer(_V1BeamTailMaterializer):
+    """Snapshot the common NPU prompt once, keeping public beam lists owned."""
+
+    __slots__ = ("_prepared_list",)
+
+    def __init__(self, tokenizer: Any, prepared_prompt: Sequence[int]) -> None:
+        super().__init__(tokenizer, prepared_prompt)
+        self._prepared_list: list[int] | None = None
+
+    def __call__(self, beam: Any) -> None:
+        from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
+
+        suffix = beam.__dict__.pop("_v1_suffix")
+        if self._prepared_list is None:
+            # Defer the snapshot until tokens, text or logprobs are read.
+            self._prepared_list = (
+                self._prepared.tolist()
+                if hasattr(self._prepared, "tolist")
+                else list(self._prepared)
+            )
+        full = self._prepared_list.copy()
+        full.extend(suffix)
+        if self._shared_prompt is None:
+            self._shared_prompt = _can_share_prompt_decode(self._tokenizer, self._prepared)
+        if self._shared_prompt:
+            if self._prompt_text is None:
+                self._prompt_text = fast_decode(self._tokenizer, self._prepared_list)
+            text = self._prompt_text + fast_decode(self._tokenizer, suffix)
+        else:
+            text = fast_decode(self._tokenizer, full)
+        beam.__dict__["tokens"] = full
+        beam.__dict__["logprobs"] = []
+        beam.__dict__["text"] = text
+        beam.__dict__["_lazy_materializer"] = None
+        beam.__class__ = BeamSearchSequence
+
+
 class BeamSearchOutputProcessor:
     """Convert one trusted terminal result without retaining session state."""
 
@@ -195,6 +233,11 @@ class BeamSearchOutputProcessor:
             from vllm_gr.entrypoints.beam_output import _LazyMaterializedBeamSequence
 
             end_suffix = () if end_token_id is None else (end_token_id,)
+            materializer_class = (
+                _NPUBeamTailMaterializer
+                if current_platform.device_type == "npu"
+                else _V1BeamTailMaterializer
+            )
             converted = []
             for item in output.items:
                 source_prompt = call.prompts[item.item_index]
@@ -203,7 +246,7 @@ class BeamSearchOutputProcessor:
                     prompt=_prompt_text(source_prompt),
                     cache_salt=request.items[item.item_index].request.cache_salt,
                 )
-                materializer = _V1BeamTailMaterializer(self.tokenizer, prepared[item.item_index])
+                materializer = materializer_class(self.tokenizer, prepared[item.item_index])
                 lora_request = request.items[item.item_index].request.lora_request
                 sequences = []
                 for sequence in item.sequences:
