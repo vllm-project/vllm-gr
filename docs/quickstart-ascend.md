@@ -80,6 +80,10 @@ bash build_and_run.sh
 
 Return to the vllm-gr directory before continuing.
 
+For the optional caller-owned XAttention output binding, see
+[NPU XAttention output buffers](npu_xattention_out.md). Its separate build
+reuses the installed kernel; normal installation retains the allocating path.
+
 4. **Install vllm-gr**
 
 ```bash

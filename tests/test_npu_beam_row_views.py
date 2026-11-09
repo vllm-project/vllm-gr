@@ -318,7 +318,8 @@ def test_npu_direct_shared_kv_preserves_original_table_and_storage(
     expected = expected.to(case.output.dtype)
     calls: list[tuple[Any, ...]] = []
 
-    def attention(*args: Any) -> torch.Tensor:
+    def attention(*args: Any, out: torch.Tensor | None = None) -> torch.Tensor:
+        assert out is None
         calls.append(args)
         assert args[0].data_ptr() == case.query.data_ptr()
         assert args[1] is case.key and args[2] is case.value
@@ -418,7 +419,8 @@ def test_unsupported_shared_kv_keeps_original_gather_dispatch(
         gathered.append(result)
         return cast(tuple[torch.Tensor, torch.Tensor, torch.Tensor], result)
 
-    def attention(*args: Any) -> torch.Tensor:
+    def attention(*args: Any, out: torch.Tensor | None = None) -> torch.Tensor:
+        assert out is None
         assert len(gathered) == 1
         assert args[1] is gathered[0][0] and args[2] is gathered[0][1]
         assert args[5] is gathered[0][2]

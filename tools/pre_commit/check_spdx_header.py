@@ -25,7 +25,6 @@ COPYRIGHT_PREFIXES = ("# SPDX-FileCopyrightText:", "// SPDX-FileCopyrightText:")
 HASH_COMMENT_SUFFIXES = {".py", ".pyi", ".sh"}
 SLASH_COMMENT_SUFFIXES = {".proto", ".js", ".cjs", ".mjs"}
 
-
 def comment_prefix(file_path):
     """Comment token this file type uses, or None when the hook must not rewrite it.
 
