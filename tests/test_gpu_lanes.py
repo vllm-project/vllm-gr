@@ -9,8 +9,6 @@ selects the wrong lane.  This file itself lives in the CPU lane.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from tests.gpu_lanes import CPU_OVERRIDES, GPU_DIRECTORIES, GPU_TEST_FILES, TESTS_ROOT
 
 
@@ -26,16 +24,12 @@ def test_listed_files_exist() -> None:
 
 
 def test_overrides_stay_inside_gpu_directories() -> None:
-    strays = sorted(
-        name for name in CPU_OVERRIDES if name.split("/", 1)[0] not in GPU_DIRECTORIES
-    )
+    strays = sorted(name for name in CPU_OVERRIDES if name.split("/", 1)[0] not in GPU_DIRECTORIES)
     assert not strays, f"CPU_OVERRIDES must only relax GPU directories: {strays}"
 
 
 def test_gpu_files_stay_outside_gpu_directories() -> None:
-    strays = sorted(
-        name for name in GPU_TEST_FILES if name.split("/", 1)[0] in GPU_DIRECTORIES
-    )
+    strays = sorted(name for name in GPU_TEST_FILES if name.split("/", 1)[0] in GPU_DIRECTORIES)
     assert not strays, f"GPU_TEST_FILES is redundant for GPU directories: {strays}"
 
 

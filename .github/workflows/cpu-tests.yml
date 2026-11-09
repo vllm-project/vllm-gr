@@ -73,7 +73,10 @@ jobs:
           # vllm is imported by the tests themselves; the CUDA build imports
           # fine on a CPU-only host.  TODO: pin exactly what the GPU CI uses.
           pip install --no-cache-dir vllm==0.30.0
-          pip install --no-cache-dir pytest pytest-asyncio pytest-timeout pytest-xdist regex
+          # pandas is imported directly (test_task_specific_catalog_program)
+          # and via benchmarks/open_one_rec/open_one_rec_loader.py, which the
+          # async-scheduler fixture chain pulls in.
+          pip install --no-cache-dir pytest pytest-asyncio pytest-timeout pytest-xdist regex pandas
           pip install --no-cache-dir -e . --no-deps
 
       - name: Run CPU test lane

@@ -605,9 +605,11 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                                 )
                             )
                             self.assertEqual(bool(evaluate(condition, github)), expect_recall, name)
-                        benchmark = by_name["Execute decode benchmark gates"]["if"].replace(
-                            "env.BENCHMARK_DEVICE", repr(device)
-                        ).replace("steps.stage-recall.outcome", "'success'")
+                        benchmark = (
+                            by_name["Execute decode benchmark gates"]["if"]
+                            .replace("env.BENCHMARK_DEVICE", repr(device))
+                            .replace("steps.stage-recall.outcome", "'success'")
+                        )
                         self.assertEqual(bool(evaluate(benchmark, github)), not expect_recall)
 
     def test_unready_and_draft_events_fail_required_gate(self) -> None:
@@ -681,9 +683,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                 # during cancellation. Failed mapping must still prevent
                 # unsafe cleanup.
                 for outcome in ("success", "failure", "skipped"):
-                    condition = cleanup["if"].replace(
-                        "steps.cuda-mapping.outcome", repr(outcome)
-                    )
+                    condition = cleanup["if"].replace("steps.cuda-mapping.outcome", repr(outcome))
                     self.assertEqual(
                         bool(evaluate(condition, context(), cancelled=True)),
                         outcome == "success",
