@@ -386,39 +386,7 @@ class BeamAttentionImpl(AttentionImpl):
                 layer._beam_pool_index = layer_idx
             pool = beam_session.pools[layer_idx]
 
-            # Extract the beam tokens' KV from the key/value tensors (they
-            # contain all scheduled tokens).  The gather runs inside the
-            # captured graph: fancy indexing allocates from the graph pool
-            # (address-stable across replays) and re-gathers from the
-            # fixed-address prefix_indices buffer each replay.
-            if attn_metadata.prefix_indices is not None:
-                # Beam tokens at prefix_indices positions (always set on the
-                # incremental decode path, mixed or pure batch alike).
-                select_rows = (
-                    getattr(platform_execution, "select_beam_rows", None)
-                    if key.device.type == "npu"
-                    else None
-                )
-                if select_rows is not None:
-                    beam_key = select_rows(key, attn_metadata)
-                    beam_value = select_rows(value, attn_metadata)
-                else:
-                    beam_key = key[attn_metadata.prefix_indices]  # [W, H, D]
-                    beam_value = value[attn_metadata.prefix_indices]  # [W, H, D]
-            else:
-                # Fallback kept for callers that do not set prefix_indices;
-                # the incremental path always sets it (see beam_attn_metadata).
-                beam_key = key
-                beam_value = value
-
-            # cache_unshared_kv: write current step's KV into pool.
-            # Use Graph-compatible Triton kernel when decode_step_buf is
-            # available on CUDA (reads decode_step from device buffer instead
-            # of host Python int, enabling CUDA Graph capture/replay).
-            # Non-CUDA (NPU xllm/cascade, CPU unit tests) dispatches through
-            # the platform module so the xllm execution mode can swap in the
-            # fused NPU operator; cascade modules forward to the original
-            # beam_kernels implementation.
+            prefix_indices = attn_metadata.prefix_indices
             decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
             if decode_step_buf is not None and decode_step_buf.is_cuda:
                 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
@@ -428,19 +396,27 @@ class BeamAttentionImpl(AttentionImpl):
                 cache_unshared_kv_graph(
                     pool.unshared_key,
                     pool.unshared_value,
-                    beam_key,
-                    beam_value,
+                    key,
+                    value,
                     beam_session.slot,
                     decode_step_buf,
                     active_mask=getattr(attn_metadata, "beam_active_mask", None),
+                    row_indices=prefix_indices,
                 )
             else:
-                # Non-CUDA (NPU xllm/cascade, CPU unit tests) dispatches through
-                # the platform module so the xllm execution mode can swap in the
-                # fused NPU operator; cascade modules forward to the original
-                # beam_kernels implementation.  The beam_session gives the xllm
-                # module access to the context's fixed-address device buffers
-                # (ACL graph capture/replay); cascade/gpu modules ignore it.
+                beam_key, beam_value = key, value
+                if prefix_indices is not None:
+                    select_rows = (
+                        getattr(platform_execution, "select_beam_rows", None)
+                        if key.device.type == "npu"
+                        else None
+                    )
+                    if select_rows is not None:
+                        beam_key = select_rows(key, attn_metadata)
+                        beam_value = select_rows(value, attn_metadata)
+                    else:
+                        beam_key = key[prefix_indices]
+                        beam_value = value[prefix_indices]
                 platform_execution.cache_unshared_kv(
                     pool.unshared_key,
                     pool.unshared_value,
