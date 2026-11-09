@@ -15,7 +15,7 @@ been removed, so this module installs only the slim hook set:
 - ``sample_tokens``: stage bypass (``stage_runner.pending`` → the stage
   runner's own constraint sampling); ordinary frames fall through to the
   native sampler.
-- ``prepare_inputs``: guarded single-request GR Prefill specialization;
+- ``prepare_inputs``: guarded single- and multi-request GR Prefill specialization;
   unsupported inputs fall through to the native V2 InputBatch builder.
 - ``add_requests``: guarded GR Prefill registration without unused native
   sampler initialization/refresh; other dispatches retain native behavior.
@@ -117,11 +117,11 @@ def make_patched_add_requests_v2(_orig_add_requests):
     if getattr(_orig_add_requests, _WORKER_V2_ADD_REQUESTS_PATCH_MARKER, False):
         return _orig_add_requests
 
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import try_add_gr_prefill_request
+    from vllm_gr.v1.worker.gpu_prefill_requests_v2 import try_add_gr_prefill_requests
 
     @wraps(_orig_add_requests)
     def patched_add_requests(self, scheduler_output):
-        if try_add_gr_prefill_request(self, scheduler_output):
+        if try_add_gr_prefill_requests(self, scheduler_output):
             return None
         return _orig_add_requests(self, scheduler_output)
 

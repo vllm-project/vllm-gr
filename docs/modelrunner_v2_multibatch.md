@@ -7,9 +7,35 @@ physical rows. B is not the beam width or the asynchronous dispatch depth.
 
 ## Reuse of native vLLM
 
-The implementation keeps native request registration, input preparation,
-Prefix Cache, KV block tables and Prefill execution. Native preparation may
-reorder requests. The V2 adapter selects the last-token logit rows in the
+The implementation keeps native request state, Prefix Cache, KV block tables
+and Prefill execution. For an admitted all-new GR Prefill batch, registration
+skips unused native sampler initialization and refresh, while preserving
+request removal, model state, block IDs and per-slot prompt-logprob resets.
+Every member must pass admission before any slot changes. Ordinary, mixed,
+new-plus-cached and unsupported batches retain native registration.
+`gpu_prefill_requests_v2` owns this registration and its staged-write ABI;
+the V2 stage hooks own execution and lifecycle transitions.
+
+Fresh batches on an empty native request set can flush token, total-length,
+computed-token and single-group block-table writes through one packed transfer
+and one Triton kernel. This includes multi-request batches with unequal prompt
+lengths and reused native slots. The specialization requires complete prompts,
+zero computed tokens and no previously queued writes; other registrations keep
+native flushing. Queue contents are cleared only after successful submission,
+and the subsequent native block-table flush still publishes block counts.
+
+For supported pure Prefill batches, one Triton kernel prepares input tokens,
+positions, sequence lengths, query offsets, logits indices and sampling row
+indices. Multi-request batches and single requests with request padding transfer
+one small packed descriptor containing native slot indices and query offsets.
+The existing single-request path without request padding needs no descriptor
+transfer. GPU computed-token state determines tokens and positions, while CPU
+upper bounds remain available to native attention code.
+Request padding has monotonic query offsets and zero sequence lengths. Sampling
+indices have per-dispatch storage for asynchronous consumers. Block-table gather,
+slot mapping and attention metadata construction remain native operations.
+
+Native preparation may reorder requests. The V2 adapter selects the last-token logit rows in the
 original logical member order before Beam sampling; it does not reorder
 native request or KV state.
 
@@ -128,6 +154,7 @@ state and actual CUDA replay check request order and storage reuse.
 | Native token budget and `(B,T)` admission, V1 grid isolation | `tests/test_gpu_prefill_graph_runner_v2.py` |
 | Logical member order, retirement and Backend capacity policy | `tests/test_v2_multibatch.py` |
 | Native row/slot reuse and unchanged request state | `tests/kernels/test_gpu_beam_stage_v2_state.py` |
+| Batched registration and fused input parity, cached offsets, token-block boundaries, padding and atomic fallback | `tests/kernels/test_gr_prefill_v2.py` |
 | B-switch replay, fixed storage, configured B=3/7 and 6/8, per-shape fallback | `tests/kernels/test_v2_multibatch_graphs.py` |
 | Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
 | Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |
@@ -135,6 +162,9 @@ state and actual CUDA replay check request order and storage reuse.
 | Unconstrained B=1/4, V1/V2 Eager, default Graph and explicit FULL Prefill | `tests/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1` |
 | Real-model multi-batch execution and V1 baseline comparison | `tests/st/model_runner_policy_isolation.py` (manual CLI) |
 | Real video business accuracy and cross-B comparison | `tests/st/onerec_multibatch_accuracy.py` (manual CLI) |
+
+Partial-prompt cases exercise low-level input-helper parity with native vLLM;
+they do not extend the public GR scope to Chunked Prefill.
 
 The two manual CLIs are explicit experiments, not pytest-collected tests.
 Profiling, synthetic latency sweeps and intermediate-tensor diagnostics are

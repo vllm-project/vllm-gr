@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Single-request Prefill metadata, written to native ModelRunner buffers."""
+"""GR Prefill inputs and metadata, written to native ModelRunner buffers."""
 
 import triton
 import triton.language as tl
@@ -37,6 +37,34 @@ def apply_gr_prefill_state_writes_v2(
     if tl.program_id(0) == 0:
         tl.store(total_lens + row, tl.load(packed))
         tl.store(num_computed_tokens + row, tl.load(packed + 1))
+
+
+@triton.jit
+def apply_gr_prefill_batch_state_writes_v2(
+    packed,
+    total_lens,
+    all_token_ids,
+    num_computed_tokens,
+    block_table,
+    TOKEN_STRIDE: tl.constexpr,
+    BLOCK_TABLE_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Flush one native registration write per row from a packed batch."""
+    header = packed + tl.program_id(0) * 7
+    row = tl.load(header).to(tl.int64)
+    token_start = tl.load(header + 3)
+    token_count = tl.load(header + 4)
+    block_start = tl.load(header + 5)
+    block_count = tl.load(header + 6)
+    index = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    tokens = tl.load(packed + token_start + index, index < token_count, other=0)
+    tl.store(all_token_ids + row * TOKEN_STRIDE + index, tokens, index < token_count)
+    blocks = tl.load(packed + block_start + index, index < block_count, other=0)
+    tl.store(block_table + row * BLOCK_TABLE_STRIDE + index, blocks, index < block_count)
+    if tl.program_id(1) == 0:
+        tl.store(total_lens + row, tl.load(header + 1))
+        tl.store(num_computed_tokens + row, tl.load(header + 2))
 
 
 @triton.jit(do_not_specialize=["computed", "scheduled", "num_tokens"])
@@ -112,3 +140,65 @@ def prepare_gr_prefill_inputs_v2(
         next_pos = computed + scheduled
         if next_pos < tl.load(prefill_lens + req_index):
             tl.store(next_prefill_tokens + req_index, tl.load(request_tokens + next_pos))
+
+
+@triton.jit(do_not_specialize=["num_tokens", "padded_tokens"])
+def prepare_gr_prefill_batch_inputs_v2(
+    input_ids,
+    positions,
+    query_start_loc,
+    seq_lens,
+    is_padding,
+    all_token_ids,
+    num_computed_tokens,
+    prefill_lens,
+    next_prefill_tokens,
+    descriptors,
+    idx_mapping,
+    batch_indices,
+    logits_indices,
+    num_tokens,
+    padded_tokens,
+    NUM_REQS: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    MAX_REQS: tl.constexpr,
+    WRITE_PADDING: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Prepare native ordered Prefill rows from one packed descriptor copy."""
+    row = tl.program_id(0)
+    index = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    req_index = tl.load(descriptors + row)
+    start = tl.load(descriptors + NUM_REQS + row)
+    end = tl.load(descriptors + NUM_REQS + row + 1)
+    scheduled = end - start
+    computed = tl.load(num_computed_tokens + req_index)
+    request_tokens = all_token_ids + req_index.to(tl.int64) * TOKEN_STRIDE
+    tokens = tl.load(request_tokens + computed + index, index < scheduled, other=0)
+    tl.store(input_ids + start + index, tokens, index < scheduled)
+    tl.store(positions + start + index, computed + index.to(tl.int64), index < scheduled)
+    if WRITE_PADDING:
+        tl.store(is_padding + start + index, False, index < scheduled)
+
+    if tl.program_id(1) == 0:
+        tl.store(query_start_loc + row, start)
+        tl.store(seq_lens + row, computed + scheduled)
+        tl.store(idx_mapping + row, req_index)
+        tl.store(batch_indices + row, row)
+        tl.store(batch_indices + NUM_REQS + 1 + row, 0)
+        tl.store(logits_indices + row, end - 1)
+        next_pos = computed + scheduled
+        next_token = tl.load(
+            request_tokens + next_pos, next_pos < tl.load(prefill_lens + req_index), other=0
+        )
+        tl.store(next_prefill_tokens + req_index, next_token)
+
+    if row == 0:
+        # One row owns all padding: monotonic query offsets and zero sequence
+        # lengths for dummy requests, without racing real rows above.
+        tl.store(query_start_loc + index, num_tokens, (index >= NUM_REQS) & (index <= MAX_REQS))
+        tl.store(seq_lens + index, 0, (index >= NUM_REQS) & (index < MAX_REQS))
+        if WRITE_PADDING:
+            tl.store(is_padding + num_tokens + index, True, num_tokens + index < padded_tokens)
+        if tl.program_id(1) == 0:
+            tl.store(batch_indices + NUM_REQS, NUM_REQS)

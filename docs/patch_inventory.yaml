@@ -152,13 +152,14 @@ patches:
 
   - id: GR-PATCH-011
     owner: vllm_gr/v1/worker/gpu_model_runner_patch.py and gpu_model_runner_v2_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/gpu_prefill_requests_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
-    activation: the selected CUDA ModelRunner V1 or V2 is discovered and its hooks are incomplete
+    activation: the selected CUDA ModelRunner V1 or V2 is discovered and its hooks are incomplete; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_gpu_model_runner_patch.py
       - tests/test_gpu_model_runner_v2_patch.py
+      - tests/kernels/test_gr_prefill_v2.py
       - tests/test_model_runner_patch.py
       - tests/st/test_modelrunner_v2_stage_parity_st.py
     process_roles: [gpu_worker]

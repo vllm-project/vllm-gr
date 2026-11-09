@@ -3,50 +3,20 @@
 """Exercise GR stage boundaries against real ModelRunner V2 request state."""
 
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import Mock
 
 import pytest
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-from vllm.v1.worker.gpu.input_batch import InputBuffers
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-from vllm.v1.worker.gpu.states import RequestState
 
 from tests.kernels.test_gpu_beam_stage_runner import dispatch, metadata, runtime
+from tests.kernels.v2_input_test_utils import make_native_v2_worker
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
-
-
-def _native_worker(prompt, computed=0, capacity=2):
-    worker: Any = GPUModelRunner.__new__(GPUModelRunner)
-    worker.device = torch.device("cuda", torch.accelerator.current_device_index())
-    worker.max_num_reqs = capacity
-    worker.use_dcp = False
-    worker.input_buffers = InputBuffers(capacity, 64, worker.device)
-    worker.req_states = RequestState(capacity, 16, 64, 0, 512, worker.device)
-    worker.req_states.add_request("session-0", len(prompt), prompt, computed, max_tokens=3)
-    worker.req_states.apply_staged_writes()
-    worker.block_tables = SimpleNamespace(apply_staged_writes=Mock())
-    worker.encoder_cache = None
-    worker.prompt_logprobs_worker = None
-    worker.lora_state = SimpleNamespace(remove_request=Mock())
-    worker.sampler = None
-    worker.pooling_runner = None
-    worker.pp_handler = None
-    worker.adaptive_verification = None
-    worker.fast_prefill = None
-    worker.pcp_manager = None
-    worker.decode_query_len = 1
-    worker.model_config = SimpleNamespace(rswa_window=None)
-    worker.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1, remove_request=Mock())
-    worker.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
-    return worker
 
 
 @pytest.mark.parametrize("cached", [0, 2, 7])
@@ -55,7 +25,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(
     monkeypatch, cached, specialized
 ):
     prompt = list(range(10, 18))
-    worker = _native_worker(prompt, cached)
+    worker = make_native_v2_worker(prompt, cached)
     monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
     if specialized:
         from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -136,7 +106,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(
 
 def test_terminal_output_retires_native_v2_request():
     owner = runtime(n=1)
-    worker = _native_worker(list(range(7)))
+    worker = make_native_v2_worker(list(range(7)))
     worker._beam_sessions = owner.worker._beam_sessions
     owner.worker = worker
     owner.hooks = V2StageExecutionHooks(worker)
@@ -159,7 +129,7 @@ def test_terminal_output_retires_native_v2_request():
 def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
     from dataclasses import replace
 
-    worker = _native_worker([1], capacity=7)
+    worker = make_native_v2_worker([1], capacity=7)
     states = worker.req_states
     prompts = {"a": [101] * 9, "b": [202] * 2, "c": [303] * 7, "d": [404] * 5}
     for request_id in ("unused-x", "a", "unused-y", "b", "c"):

@@ -221,7 +221,7 @@ aligned with it.
     - `vllm_gr/v1/worker/gpu_model_runner_patch.py`
     - `vllm_gr/v1/worker/gpu_model_runner_v2_patch.py`
     - `vllm_gr/v1/worker/gpu_model_runner_v2_graph.py`
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/gpu_prefill_requests_v2.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - ModelRunner V1 targets:
     - `GPUModelRunner.execute_model`
@@ -244,8 +244,18 @@ aligned with it.
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
 - ModelRunner V2 dependencies:
     - native `prepare_inputs`/`add_requests` request-state contracts;
+    - admitted all-new GR Prefill batches skip unused native sampler registration;
+    - fresh, complete Prefill batches on an empty request set fuse native state
+      writes only when they own all queued writes and one compatible KV group;
+    - pure GR Prefill input fusion preserves native row order, GPU token state,
+      CPU mirrors and per-dispatch sampling indices; unsupported batches fall back;
     - instance-local CUDA graph manager and capture registry;
     - graph-memory profiling lifecycle and temporary KV-cache ownership.
+- V2 Prefill fast-path validation: `tests/kernels/test_gr_prefill_v2.py` compares
+  registration and fused inputs with native CUDA state, including reused slots,
+  cached/chunked inputs, padding, pending-write fallback and failed submission
+  without queue loss. `gpu_prefill_requests_v2.py` owns registration and the
+  packed native-state write contract, separate from stage execution hooks.
 - Removal condition: upstream provides stable hooks for grouped input preparation and output collapsing.
 
 ### GR-PATCH-012 — NPU ModelRunner Override
