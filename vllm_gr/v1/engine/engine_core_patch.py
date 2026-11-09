@@ -888,7 +888,7 @@ def apply_kv_hash_memo_patch() -> None:
     (re-sent beam suffixes, popular prefixes) re-hash identical blocks on
     every request — ~1.3ms of sha256 work per 1024-token prompt — so a
     bounded FIFO memo turns those hits into dict lookups.  First-seen blocks
-    pay one extra tuple() key build (microseconds).  The wrapper is
+    construct a token-bytes key. The wrapper is
     idempotent and installs on the module attribute
     (``request_block_hasher`` resolves it as a module global at call time,
     so every existing and future hasher picks it up).
@@ -905,7 +905,6 @@ def apply_kv_hash_memo_patch() -> None:
         return
 
     _CHAIN_FALLBACK_ACTIVE = False
-    original = kv_cache_utils.hash_block_tokens
     # OrderedDict (not plain dict): after the memo saturates, every miss
     # evicts the oldest entry.  ``dict.pop(next(iter(...)))`` is NOT
     # constant-time — the fresh iterator rescans the leading run of deleted
@@ -918,24 +917,19 @@ def apply_kv_hash_memo_patch() -> None:
     def hash_block_tokens_memo(
         hash_function, parent_block_hash, curr_block_token_ids, extra_keys=None
     ):
-        import numpy as np
-
-        if isinstance(curr_block_token_ids, np.ndarray):
-            curr_block_token_ids = tuple(map(int, curr_block_token_ids))
-        if _CHAIN_FALLBACK_ACTIVE:
-            # Chain-memo miss in flight: hash at stock speed (see
-            # _CHAIN_FALLBACK_ACTIVE).
-            return original(hash_function, parent_block_hash, curr_block_token_ids, extra_keys)
-        key = (
-            hash_function,
-            parent_block_hash,
-            tuple(curr_block_token_ids),
+        curr_block_token_ids = curr_block_token_ids.tobytes()
+        hash_input = (
+            parent_block_hash or kv_cache_utils.NONE_HASH,
+            curr_block_token_ids,
             extra_keys,
         )
+        if _CHAIN_FALLBACK_ACTIVE:
+            return kv_cache_utils.BlockHash(hash_function(hash_input))
+        key = (hash_function, *hash_input)
         hit = memo.get(key)
         if hit is not None:
             return hit
-        hit = original(hash_function, parent_block_hash, curr_block_token_ids, extra_keys)
+        hit = kv_cache_utils.BlockHash(hash_function(hash_input))
         if len(memo) >= _KV_HASH_MEMO_LIMIT:
             # Constant-time FIFO eviction keeps the memo bounded in
             # long-running servers under varied (never-repeating) traffic.
@@ -965,8 +959,8 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
     (hash_function, block_size, salt, the full-block token prefix), so a
     hit can replay the whole list in one dict lookup.
 
-    A MISS hashes the already-materialized token tuple directly with the
-    native hash function and parent/extra-key ABI. Eligibility below proves
+    A MISS hashes ndarray block bytes directly with the configured hash
+    function, using the same encoding as incremental hashing. Eligibility proves
     that extra keys are absent. No per-block memo bookkeeping is needed;
     the chain entry is still recorded for a repeat of this exact prompt.
 
@@ -1007,14 +1001,8 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
 
             # Only the full-block prefix participates in hashing; trailing
             # partial-block tokens never reach hash_block_tokens.
-            import numpy as np
-
-            prefix = request.all_token_ids[: num_full_blocks * block_size]
-            # Array memo keys stay compact; cold hashing materializes Python
-            # integers one block at a time to preserve native cache identity.
-            array_tokens = isinstance(prefix, np.ndarray)
-            tokens = prefix if array_tokens else tuple(prefix)
-            key = (caching_hash_fn, block_size, tokens.tobytes() if array_tokens else tokens)
+            tokens = request.all_token_ids[: num_full_blocks * block_size]
+            key = (caching_hash_fn, block_size, tokens.tobytes())
             hit = chain_memo.get(key)
             if hit is not None:
                 return list(hit)
@@ -1022,8 +1010,7 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
             _CHAIN_FALLBACK_ACTIVE = True
             try:
                 # Eligibility above proves every block has no extra keys.
-                # Reuse the immutable full-block tuple already built for the
-                # memo key, preserving the exact native hash input and chain.
+                # Use the same block-byte encoding as hash_block_tokens_memo.
                 result = []
                 parent_hash = None
                 for start in range(0, len(tokens), block_size):
@@ -1031,9 +1018,7 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
                         caching_hash_fn(
                             (
                                 parent_hash or kv_cache_utils.NONE_HASH,
-                                tuple(map(int, tokens[start : start + block_size]))
-                                if array_tokens
-                                else tokens[start : start + block_size],
+                                tokens[start : start + block_size].tobytes(),
                                 None,
                             )
                         )

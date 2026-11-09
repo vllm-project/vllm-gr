@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 from vllm.utils.hashing import sha256 as _hash
 from vllm.v1.core import kv_cache_utils
@@ -14,7 +15,7 @@ from vllm_gr.v1.engine import engine_core_patch
 
 def _request(length: int) -> Any:
     return SimpleNamespace(
-        all_token_ids=list(range(100000, 100000 + length)),
+        all_token_ids=np.arange(100000, 100000 + length, dtype=np.int64),
         num_tokens=length,
         block_hashes=[],
         mm_features=None,
@@ -43,14 +44,18 @@ def _factory(monkeypatch: Any, block_size: int, hash_fn: Any = _hash) -> Any:
 
 @pytest.mark.parametrize("block_size", [4, 16, 32])  # type: ignore[misc]
 @pytest.mark.parametrize("length", [0, 3, 4, 15, 16, 17, 1023, 1024, 1025])  # type: ignore[misc]
-def test_plain_chain_matches_native_blocks(monkeypatch: Any, block_size: int, length: int) -> None:
+def test_gr_chain_matches_block_byte_encoding(monkeypatch: Any, block_size: int, length: int) -> None:
     hasher, fallback, _ = _factory(monkeypatch, block_size)
     request = _request(length)
     expected: list[bytes] = []
     parent = None
     for start in range(0, length - block_size + 1, block_size):
-        parent = kv_cache_utils.hash_block_tokens(
-            _hash, parent, request.all_token_ids[start : start + block_size], None
+        parent = _hash(
+            (
+                parent or kv_cache_utils.NONE_HASH,
+                request.all_token_ids[start : start + block_size].tobytes(),
+                None,
+            )
         )
         expected.append(parent)
     actual = hasher(request)

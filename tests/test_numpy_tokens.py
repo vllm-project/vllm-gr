@@ -145,10 +145,10 @@ def test_scheduler_data_preserves_native_mrope_metadata(uses_mrope):
     assert request.mm_features[0].data is data
 
 
-def test_hashes_match_list_path_for_cold_warm_incremental_and_salt():
+@pytest.mark.parametrize("salt", [None, "different-model-features"])
+def test_numpy_hashes_match_full_recompute_for_cold_warm_and_incremental(salt):
     from vllm.utils.hashing import sha256
     from vllm.v1.core import kv_cache_utils as kv
-    from vllm.v1.request import Request
 
     from vllm_gr.v1.engine.engine_core_patch import apply_kv_hash_memo_patch
 
@@ -156,21 +156,40 @@ def test_hashes_match_list_path_for_cold_warm_incremental_and_salt():
         kv.init_none_hash(sha256)
     apply_kv_hash_memo_patch()
     hasher = kv.get_request_block_hasher(4, sha256)
-    tokens = list(range(10))
-    for salt in (None, "different-model-features"):
-        for _ in range(2):
-            plain = native(tokens)
-            plain.cache_salt = salt
-            array = BeamBatchItem(0, plain).request
-            expected = Request.from_engine_core_request(plain, hasher)
-            actual = initialize_numpy_request(array, hasher)
-            assert actual.block_hashes == expected.block_hashes
-            actual.append_output_token_ids([10, 11])
-            expected.append_output_token_ids([10, 11])
-            assert actual.block_hashes == expected.block_hashes
-            np.testing.assert_array_equal(
-                actual.all_token_ids.copy(), expected.all_token_ids.copy()
-            )
+
+    def make_request(tokens):
+        request = native(tokens)
+        request.cache_salt = salt
+        return initialize_numpy_request(BeamBatchItem(0, request).request, hasher)
+
+    cold = make_request(list(range(10)))
+    warm = make_request(list(range(10)))
+    assert cold.block_hashes == warm.block_hashes
+    cold.append_output_token_ids([10, 11])
+    complete = make_request(list(range(12)))
+    assert cold.block_hashes == complete.block_hashes
+    assert len(cold.block_hashes) == 3
+
+    changed = make_request([99, *range(1, 12)])
+    assert all(a != b for a, b in zip(changed.block_hashes, complete.block_hashes))
+
+
+def test_numpy_block_hash_uses_bytes_without_python_iteration():
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core import kv_cache_utils as kv
+
+    from vllm_gr.v1.engine.engine_core_patch import apply_kv_hash_memo_patch
+
+    class NoIteration(np.ndarray):
+        def __iter__(self):
+            raise AssertionError("must not materialize Python token integers")
+
+    apply_kv_hash_memo_patch()
+    tokens = np.arange(4, dtype=np.int64).view(NoIteration)
+    result = kv.hash_block_tokens(sha256, None, tokens)
+    assert result == kv.hash_block_tokens(sha256, None, tokens.copy())
+    assert result != kv.hash_block_tokens(sha256, None, tokens, ("salt",))
+    assert result != kv.hash_block_tokens(sha256, result, tokens)
 
 
 def test_worker_detaches_arrays_without_python_token_lists():
