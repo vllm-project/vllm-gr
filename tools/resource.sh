@@ -128,6 +128,57 @@ function get_gpus() {
     done
 }
 
+# process_state <pid>
+# Prints the single-letter process state (R/S/D/Z...), or returns 1 when the
+# PID does not exist. Reads /proc when available, otherwise falls back to ps.
+function process_state() {
+    local pid=$1
+    if [ -r "/proc/$pid/stat" ]; then
+        local stat_line
+        stat_line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+        stat_line=${stat_line##*) }
+        echo "${stat_line%% *}"
+        return 0
+    fi
+    local ps_state
+    ps_state=$(ps -o stat= -p "$pid" 2>/dev/null) || return 1
+    ps_state=${ps_state// /}
+    [ -n "$ps_state" ] || return 1
+    echo "${ps_state:0:1}"
+}
+
+# is_process_alive <pid>
+# Returns 0 only when the process exists and is not a zombie. A killed process
+# stays in the process table as a zombie until its parent reaps it, and an
+# orphaned lock process is reaped by PID 1 / a subreaper at an arbitrary time.
+# `ps -p` alone cannot tell a zombie from a live process.
+function is_process_alive() {
+    local pid=$1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    local state
+    state=$(process_state "$pid") || return 1
+    [ -n "$state" ] || return 1
+    [ "$state" != "Z" ] || return 1
+    return 0
+}
+
+# wait_process_exit <pid> [timeout_secs]
+# Waits until the process is gone or a zombie. Returns 1 on timeout.
+function wait_process_exit() {
+    local pid=$1
+    local timeout_secs=${2:-5}
+    local ticks=$(( timeout_secs * 10 ))
+    local waited=0
+    while is_process_alive "$pid"; do
+        if [ "$waited" -ge "$ticks" ]; then
+            return 1
+        fi
+        sleep 0.1
+        waited=$(( waited + 1 ))
+    done
+    return 0
+}
+
 # lock_gpu <gpu_id>
 # Allocates a small amount of memory on the given GPU to "lock" it.
 # This prevents other scripts using get_gpu from selecting it.
@@ -154,7 +205,7 @@ function lock_gpu() {
     # Poll until we see 'READY' or the process dies (max ~10s).
     local ready=0
     for (( i=0; i<40; i++ )); do
-        if ! ps -p "$lock_pid" >/dev/null 2>&1; then
+        if ! is_process_alive "$lock_pid"; then
             break
         fi
         if grep -q "READY" "$ready_file" 2>/dev/null; then
@@ -184,7 +235,9 @@ function unlock_gpu() {
     fi
 
     local pid=$1
-    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+    [ -n "$pid" ] || return 0
+    kill -9 "$pid" 2>/dev/null || true
+    wait_process_exit "$pid" 5
 }
 
 function lock_gpus() {
