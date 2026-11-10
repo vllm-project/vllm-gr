@@ -13,7 +13,10 @@ from vllm_gr.config.models import (
     DEFAULT_ONLINE_BATCH_SIZES,
     GR_CONFIG_SCHEMA_VERSION,
     ConstraintBackend,
+    ConstraintConfig,
+    ConstraintMode,
     ConstraintTableConfig,
+    ConstraintTableSpec,
     GRConfig,
 )
 from vllm_gr.config.validation import (
@@ -33,6 +36,8 @@ from vllm_gr.config.validation import (
     validate_catalog_path,
     validate_constrained_generation,
     validate_constraint_backend,
+    validate_constraint_backend_kind,
+    validate_constraint_mode,
     validate_constraint_table_backend,
     validate_constraint_table_enabled,
     validate_constraint_table_format,
@@ -95,6 +100,15 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
 _TOP_LEVEL_KEYS: Final = frozenset(
     {"schema_version", "beam", "constraint_table", "attention_backend", "constrained_generation"}
 )
+_TOP_LEVEL_KEYS_V2: Final = frozenset({"schema_version", "beam", "constraint", "attention_backend"})
+_REMOVED_V2_KEYS: Final = frozenset(
+    {"constraint_table", "constrained_generation", "catalog_path", "constraint_backend"}
+)
+_CONSTRAINT_KEYS: Final = frozenset({"mode", "table"})
+_CONSTRAINT_TABLE_KEYS_V2: Final = frozenset(
+    {"path", "backend", "max_top_k", "digests", "artifact_digest", "tokenizer_digest"}
+)
+_CONSTRAINT_DIGEST_KEYS: Final = frozenset({"artifact", "tokenizer"})
 _BEAM_KEYS: Final = frozenset(
     {
         "graph_enabled",
@@ -109,6 +123,7 @@ _BEAM_KEYS: Final = frozenset(
         "engine_driven",
         "execution_mode",
         "sid_stage_vocab",
+        "candidate_width",
     }
 )
 _CONSTRAINT_TABLE_KEYS: Final = frozenset(
@@ -173,17 +188,100 @@ def _normalize_artifact_path(
     return str((normalized_base / artifact_path).resolve(strict=False))
 
 
+def _gr_config_from_v2_mapping(
+    mapping: Mapping[str, object],
+    *,
+    base_dir: str | Path | None,
+) -> GRConfig:
+    """Build a schema-v2 config: ``constraint.mode`` + ``constraint.table``."""
+    removed = sorted(set(mapping) & _REMOVED_V2_KEYS)
+    if removed:
+        raise ValueError(
+            "schema-v2 configuration replaced "
+            + ", ".join(repr(key) for key in removed)
+            + " with constraint.mode/constraint.table"
+        )
+    _reject_unknown_mapping_keys(mapping, _TOP_LEVEL_KEYS_V2, "configuration")
+
+    beam_raw = _as_string_mapping(mapping.get("beam", {}), "beam")
+    _reject_unknown_mapping_keys(beam_raw, _BEAM_KEYS, "beam")
+    constraint_raw = _as_string_mapping(mapping.get("constraint", {}), "constraint")
+    _reject_unknown_mapping_keys(constraint_raw, _CONSTRAINT_KEYS, "constraint")
+
+    mode = validate_constraint_mode(constraint_raw.get("mode", "none"))
+    table = None
+    if mode is ConstraintMode.TABLE:
+        table_raw = _as_string_mapping(constraint_raw.get("table", {}), "constraint.table")
+        _reject_unknown_mapping_keys(table_raw, _CONSTRAINT_TABLE_KEYS_V2, "constraint.table")
+        digests_raw = _as_string_mapping(table_raw.get("digests", {}), "constraint.table.digests")
+        _reject_unknown_mapping_keys(
+            digests_raw, _CONSTRAINT_DIGEST_KEYS, "constraint.table.digests"
+        )
+        table = ConstraintTableSpec(
+            path=validate_constraint_table_path(
+                _normalize_artifact_path(table_raw.get("path"), base_dir=base_dir)
+            ),
+            backend=validate_constraint_backend_kind(table_raw.get("backend", "auto")),
+            max_top_k=(
+                validate_constraint_table_max_top_k(table_raw["max_top_k"])
+                if "max_top_k" in table_raw
+                else None
+            ),
+            artifact_digest=validate_artifact_digest(
+                digests_raw.get("artifact", table_raw.get("artifact_digest"))
+            ),
+            tokenizer_digest=validate_tokenizer_digest(
+                digests_raw.get("tokenizer", table_raw.get("tokenizer_digest"))
+            ),
+        )
+    elif "table" in constraint_raw:
+        raise ValueError("vllm-gr constraint.mode='none' forbids constraint.table")
+
+    graph_enabled = beam_raw.get("graph_enabled", True)
+    if not isinstance(graph_enabled, bool):
+        raise ValueError("vllm-gr beam.graph_enabled must be a boolean")
+
+    return GRConfig(
+        schema_version=2,
+        constraint=ConstraintConfig(mode=mode, table=table),
+        beam_candidate_width=validate_candidate_width(beam_raw.get("candidate_width")),
+        attention_backend=validate_attention_backend(mapping.get("attention_backend")),
+        beam_graph_enabled=graph_enabled,
+        prefill_flash_attn_version=validate_prefill_flash_attn_version(
+            beam_raw.get("prefill_flash_attn_version", "auto")
+        ),
+        enable_short_suffix_attention=validate_enable_short_suffix_attention(
+            beam_raw.get("enable_short_suffix_attention", True)
+        ),
+        beam_graph_batch_size=validate_beam_graph_batch_size(beam_raw.get("graph_batch_size", 1)),
+        beam_graph_widths=validate_beam_graph_widths(beam_raw.get("graph_widths")),
+        beam_online_batch_sizes=validate_beam_online_batch_sizes(
+            beam_raw.get("online_batch_sizes", DEFAULT_ONLINE_BATCH_SIZES)
+        ),
+        beam_max_width=validate_beam_max_width(beam_raw.get("max_width")),
+        beam_max_decode_steps=validate_beam_max_decode_steps(
+            beam_raw.get("max_decode_steps", _BEAM_MAX_DECODE_STEPS_DEFAULT)
+        ),
+        beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
+        beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
+        beam_execution_mode=validate_beam_execution_mode(beam_raw.get("execution_mode")),
+        beam_sid_stage_vocab=validate_beam_sid_stage_vocab(beam_raw.get("sid_stage_vocab", False)),
+    )
+
+
 def gr_config_from_mapping(
     raw: object,
     *,
     base_dir: str | Path | None = None,
 ) -> GRConfig:
-    """Build a validated config from a canonical schema-v1 mapping."""
+    """Build a validated config from a canonical schema-v1 or schema-v2 mapping."""
 
     mapping = _as_string_mapping(raw, "configuration")
-    _reject_unknown_mapping_keys(mapping, _TOP_LEVEL_KEYS, "configuration")
     if "schema_version" not in mapping:
         raise ValueError("vllm-gr configuration requires schema_version")
+    if mapping["schema_version"] == 2:
+        return _gr_config_from_v2_mapping(mapping, base_dir=base_dir)
+    _reject_unknown_mapping_keys(mapping, _TOP_LEVEL_KEYS, "configuration")
 
     beam_raw = _as_string_mapping(mapping.get("beam", {}), "beam")
     _reject_unknown_mapping_keys(beam_raw, _BEAM_KEYS, "beam")
@@ -241,6 +339,8 @@ def gr_config_from_mapping(
 
 
 def _reject_lossy_canonical_conversion(config: GRConfig) -> None:
+    if config.constraint is not None:
+        return
     legacy_values = []
     if config.catalog_path is not None:
         legacy_values.append("catalog_path")
@@ -265,9 +365,6 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     if not isinstance(config, GRConfig):
         raise TypeError("config must be a GRConfig")
     _reject_lossy_canonical_conversion(config)
-    table = config.constraint_table
-    if table is None:
-        raise ValueError("cannot encode GRConfig without canonical constraint_table state")
     beam: dict[str, object] = {
         "graph_enabled": config.beam_graph_enabled,
         "max_width": config.beam_max_width,
@@ -294,6 +391,38 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     if config.beam_sid_stage_vocab:
         beam["sid_stage_vocab"] = True
 
+    if config.constraint is not None:
+        if config.beam_candidate_width is not None:
+            beam["candidate_width"] = config.beam_candidate_width
+        constraint: dict[str, object]
+        if config.constraint.mode is ConstraintMode.TABLE:
+            table_spec = config.constraint.table
+            assert table_spec is not None
+            table_mapping: dict[str, object] = {
+                "path": table_spec.path,
+                "backend": table_spec.backend.value,
+                "digests": {
+                    "artifact": table_spec.artifact_digest,
+                    "tokenizer": table_spec.tokenizer_digest,
+                },
+            }
+            if table_spec.max_top_k is not None:
+                table_mapping["max_top_k"] = table_spec.max_top_k
+            constraint = {"mode": "table", "table": table_mapping}
+        else:
+            constraint = {"mode": "none"}
+        return {
+            "schema_version": 2,
+            "beam": beam,
+            "constraint": constraint,
+            "attention_backend": (
+                config.attention_backend.value if config.attention_backend is not None else None
+            ),
+        }
+
+    table = config.constraint_table
+    if table is None:
+        raise ValueError("cannot encode GRConfig without canonical constraint_table state")
     constraint_table: dict[str, object] = {
         "enabled": table.enabled,
         "backend": table.backend.value,
@@ -324,7 +453,7 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
 
 
 def load_gr_config(path: str | Path) -> GRConfig:
-    """Load canonical schema-v1 YAML on the Driver and normalize its paths."""
+    """Load canonical schema-v1/v2 YAML on the Driver and normalize its paths."""
 
     try:
         import yaml
@@ -442,9 +571,9 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         raise ValueError(
             "legacy vLLM-GR config cannot be combined with canonical additional_config['vllm_gr']"
         )
-    if gr_config.constraint_table is not None:
+    if gr_config.constraint_table is not None or gr_config.constraint is not None:
         raise ValueError(
-            "write_gr_config cannot serialize canonical constraint_table state; "
+            "write_gr_config cannot serialize canonical constraint state; "
             "use write_canonical_gr_config"
         )
 

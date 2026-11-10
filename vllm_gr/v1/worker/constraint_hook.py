@@ -1079,11 +1079,11 @@ def try_sample_with_constraint_backend(
                 "runner.constraint_backend is None; unconstrained sampling "
                 "is forbidden"
             )
-        from vllm_gr.config import ConstraintBackend
+        from vllm_gr.config import ConstraintMode
         from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
         gr_config = _get_gr_config(runner)
-        if gr_config.constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE:
+        if gr_config.constraint_config.mode is not ConstraintMode.TABLE:
             return None
         execution_adapter = get_or_create_execution_adapter(runner)
 

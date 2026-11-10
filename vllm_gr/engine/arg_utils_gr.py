@@ -15,6 +15,9 @@ from vllm_gr.config import (
     DEFAULT_ONLINE_BATCH_SIZES,
     BeamExecutionMode,
     ConstraintBackend,
+    ConstraintBackendKind,
+    ConstraintConfig,
+    ConstraintMode,
     GRAttentionBackend,
     GRConfig,
     GRConfigInput,
@@ -392,6 +395,31 @@ def _is_cuda_platform() -> bool:
     return getattr(current_platform, "device_type", None) == "cuda"
 
 
+def _resolve_constraint_backend(config: GRConfig) -> GRConfig:
+    """Resolve ``constraint.table.backend='auto'`` to the active device."""
+    constraint = config.constraint
+    if constraint is None or constraint.mode is not ConstraintMode.TABLE:
+        return config
+    table = constraint.table
+    if table is None or table.backend is not ConstraintBackendKind.AUTO:
+        return config
+    try:
+        from vllm.platforms import current_platform
+
+        device_type = str(getattr(current_platform, "device_type", "cuda")).lower()
+    except Exception:
+        device_type = "cuda"
+    if device_type not in {kind.value for kind in ConstraintBackendKind}:
+        raise ValueError(
+            f"cannot resolve constraint.table.backend='auto' for device {device_type!r}"
+        )
+    resolved_table = replace(table, backend=ConstraintBackendKind(device_type))
+    return replace(
+        config,
+        constraint=ConstraintConfig(mode=ConstraintMode.TABLE, table=resolved_table),
+    )
+
+
 def _constraint_explicitly_configured(
     engine_args: object,
     existing_gr_config: GRConfig,
@@ -623,6 +651,8 @@ def create_engine_config(self, usage_context=None, headless=False):
             effective_gr_config,
             beam_worker_decision=worker_decision,
         )
+
+    effective_gr_config = _resolve_constraint_backend(effective_gr_config)
 
     if (
         effective_gr_config.constrained_generation is False

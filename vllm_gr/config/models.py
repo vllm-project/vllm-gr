@@ -51,6 +51,41 @@ class ConstraintTableBackendEnum(str, Enum):
     NPU = "npu"
 
 
+class ConstraintMode(str, Enum):
+    """Schema-v2 switch between no constraint and a canonical table."""
+
+    NONE = "none"
+    TABLE = "table"
+
+
+class ConstraintBackendKind(str, Enum):
+    """Schema-v2 constraint-table placement, including automatic selection."""
+
+    AUTO = "auto"
+    CPU = "cpu"
+    CUDA = "cuda"
+    NPU = "npu"
+
+
+@dataclass(frozen=True, slots=True)
+class ConstraintTableSpec:
+    """Schema-v2 constraint-table source; runtime loads one artifact."""
+
+    path: str | None = None
+    backend: ConstraintBackendKind = ConstraintBackendKind.AUTO
+    max_top_k: int | None = None
+    artifact_digest: str | None = None
+    tokenizer_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConstraintConfig:
+    """Schema-v2 constraint mode and its optional table specification."""
+
+    mode: ConstraintMode = ConstraintMode.NONE
+    table: ConstraintTableSpec | None = None
+
+
 # Default values for beam KV pool sizing — also used by parser.py (to decide
 # whether a value is the default and can be omitted from additional_config) and
 # by validation.py (as fallbacks).  Keep all three sites in sync.
@@ -210,6 +245,11 @@ class GRConfig:
     beam_sid_stage_vocab: bool = False
     """Opt into catalog-free NPU SA/SB/SC domains and stage-local probabilities."""
 
+    # Schema-v2 constraint state. ``None`` keeps the legacy fields authoritative
+    # so v1 configs and direct constructions keep working during the transition.
+    constraint: ConstraintConfig | None = None
+    beam_candidate_width: int | None = None
+
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
@@ -223,9 +263,11 @@ class GRConfig:
             validate_beam_online_batch_sizes,
             validate_beam_sid_stage_vocab,
             validate_beam_worker_decision,
+            validate_candidate_width,
             validate_catalog_path,
             validate_constrained_generation,
             validate_constraint_backend,
+            validate_constraint_config,
             validate_enable_short_suffix_attention,
             validate_npu_decode_execution,
             validate_prefill_flash_attn_version,
@@ -300,6 +342,54 @@ class GRConfig:
             self.constraint_table, ConstraintTableConfig
         ):
             raise ValueError("vllm-gr constraint_table must be a ConstraintTableConfig or None")
+        constraint = validate_constraint_config(self.constraint)
+        object.__setattr__(self, "constraint", constraint)
+        object.__setattr__(
+            self, "beam_candidate_width", validate_candidate_width(self.beam_candidate_width)
+        )
+        if constraint is not None:
+            if constraint.mode is ConstraintMode.NONE:
+                object.__setattr__(self, "constraint_table", None)
+                object.__setattr__(self, "constrained_generation", False)
+                object.__setattr__(self, "constraint_backend", ConstraintBackend.TRIE)
+                object.__setattr__(self, "catalog_path", None)
+                object.__setattr__(self, "vocab_offset", None)
+                object.__setattr__(self, "vocab_slice_size", None)
+            else:
+                table_spec = constraint.table
+                assert table_spec is not None  # validated above
+                existing_table = self.constraint_table
+                backend = table_spec.backend
+                if backend is ConstraintBackendKind.AUTO:
+                    backend = (
+                        ConstraintBackendKind(existing_table.backend.value)
+                        if existing_table is not None
+                        else ConstraintBackendKind.CUDA
+                    )
+                max_top_k = table_spec.max_top_k
+                if max_top_k is None and existing_table is not None:
+                    max_top_k = existing_table.max_top_k
+                if max_top_k is None:
+                    raise ValueError(
+                        "constraint.mode='table' requires constraint.table.max_top_k "
+                        "until artifact metadata carries it"
+                    )
+                object.__setattr__(
+                    self,
+                    "constraint_table",
+                    ConstraintTableConfig(
+                        max_top_k=max_top_k,
+                        enabled=True,
+                        backend=ConstraintTableBackendEnum(backend.value),
+                        path=table_spec.path,
+                        artifact_digest=table_spec.artifact_digest,
+                        tokenizer_digest=table_spec.tokenizer_digest,
+                        candidate_width=self.beam_candidate_width,
+                    ),
+                )
+                object.__setattr__(self, "constraint_backend", ConstraintBackend.CONSTRAINT_TABLE)
+                object.__setattr__(self, "constrained_generation", None)
+                object.__setattr__(self, "catalog_path", table_spec.path)
         object.__setattr__(
             self,
             "beam_worker_decision",
@@ -382,7 +472,35 @@ class GRConfig:
             or self.beam_worker_decision is not None
             or self.beam_execution_mode is not None
             or self.beam_sid_stage_vocab
+            or (self.constraint is not None and self.constraint.mode is ConstraintMode.TABLE)
         )
+
+    @property
+    def constraint_config(self) -> ConstraintConfig:
+        """Return the schema-v2 view, deriving it from legacy fields if needed."""
+        if self.constraint is not None:
+            return self.constraint
+        if self.constrained_generation is False:
+            return ConstraintConfig(mode=ConstraintMode.NONE)
+        if self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE or (
+            self.constraint_table is not None and self.constraint_table.enabled
+        ):
+            table = self.constraint_table
+            return ConstraintConfig(
+                mode=ConstraintMode.TABLE,
+                table=ConstraintTableSpec(
+                    path=table.path if table is not None else self.catalog_path,
+                    backend=(
+                        ConstraintBackendKind(table.backend.value)
+                        if table is not None
+                        else ConstraintBackendKind.AUTO
+                    ),
+                    max_top_k=table.max_top_k if table is not None else None,
+                    artifact_digest=table.artifact_digest if table is not None else None,
+                    tokenizer_digest=table.tokenizer_digest if table is not None else None,
+                ),
+            )
+        return ConstraintConfig(mode=ConstraintMode.NONE)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: object | None) -> GRConfig:
@@ -436,6 +554,9 @@ def resolve_candidate_width(config: GRConfig) -> int:
 
     # ``getattr`` keeps this usable from partial config objects (the worker
     # admits a structural stand-in in several tests and in the V2 path).
+    beam_candidate_width = getattr(config, "beam_candidate_width", None)
+    if beam_candidate_width is not None:
+        return int(beam_candidate_width)
     table = getattr(config, "constraint_table", None)
     if table is not None and getattr(table, "candidate_width", None) is not None:
         return int(table.candidate_width)

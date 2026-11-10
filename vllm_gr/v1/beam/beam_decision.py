@@ -673,13 +673,13 @@ def cuda_prefill_postprocess_enabled(
         or batch_size != 1
     ):
         return False
-    from vllm_gr.config import ConstraintBackend
+    from vllm_gr.config import ConstraintMode
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
     gr_cfg = _get_gr_config(runner)
     if not bool(gr_cfg.beam_worker_decision):
         return False
-    if gr_cfg.constraint_backend != ConstraintBackend.CONSTRAINT_TABLE:
+    if gr_cfg.constraint_config.mode is not ConstraintMode.TABLE:
         return False
     workspace = get_beam_postprocess_workspace(runner, int(beam_width))
     if workspace is None or workspace.max_batch < int(batch_size):
@@ -743,7 +743,7 @@ def worker_decision_enabled(runner: Any) -> bool:
     dispatches through the canonical CUDA operators. Trie filtering remains
     frontend-side and therefore keeps the frontend NumPy decision path.
     """
-    from vllm_gr.config import ConstraintBackend
+    from vllm_gr.config import ConstraintMode
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
     gr_cfg = _get_gr_config(runner)
@@ -771,7 +771,7 @@ def worker_decision_enabled(runner: Any) -> bool:
     # worker-side when no frontend-side catalog pruning applies.
     if (
         gr_cfg.catalog_path is not None
-        and gr_cfg.constraint_backend != ConstraintBackend.CONSTRAINT_TABLE
+        and gr_cfg.constraint_config.mode is not ConstraintMode.TABLE
     ):
         return False
     return True
@@ -956,7 +956,7 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
     The decode session initializes independently from its first per-parent
     candidate matrix; prefill scores must not seed its persistent buffers.
     """
-    from vllm_gr.config import ConstraintBackend
+    from vllm_gr.config import ConstraintMode
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
     if bool(getattr(sampler_output, "_gr_deferred_prefill_status", False)):
@@ -973,7 +973,7 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
     gr_cfg = _get_gr_config(runner)
     if not bool(gr_cfg.beam_worker_decision):
         return None
-    if gr_cfg.constraint_backend != ConstraintBackend.CONSTRAINT_TABLE:
+    if gr_cfg.constraint_config.mode is not ConstraintMode.TABLE:
         return None
 
     beam_info = getattr(runner, "_current_beam_info", None)

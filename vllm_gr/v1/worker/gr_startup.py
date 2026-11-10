@@ -118,9 +118,11 @@ def capture_async_forward(
 def _capture_enabled(worker: Any) -> bool:
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
+    from vllm_gr.config import ConstraintMode
+
     cfg = _get_gr_config(worker)
     validate_gr_execution_runtime(worker.vllm_config)
-    unconstrained = getattr(cfg, "constrained_generation", None) is False
+    unconstrained = cfg.constraint_config.mode is ConstraintMode.NONE
     if (
         not cfg.beam_worker_decision
         or cfg.beam_max_width is None

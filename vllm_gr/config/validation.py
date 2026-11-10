@@ -12,14 +12,17 @@ import regex as re
 from vllm_gr.config.models import (
     _BEAM_MAX_DECODE_STEPS_DEFAULT,
     CONSTRAINT_TABLE_FORMAT,
-    GR_CONFIG_SCHEMA_VERSION,
     MAX_BEAM_WIDTH,
     MAX_CANDIDATE_WIDTH,
     MULTI_TRIE_CONSTRAINT_TABLE_FORMAT,
     SUPPORTED_BEAM_BATCH_SIZES,
     BeamExecutionMode,
     ConstraintBackend,
+    ConstraintBackendKind,
+    ConstraintConfig,
+    ConstraintMode,
     ConstraintTableBackendEnum,
+    ConstraintTableSpec,
     GRAttentionBackend,
     NPUDecodeExecution,
 )
@@ -60,12 +63,78 @@ def validate_beam_online_batch_sizes(value: object) -> tuple[int, ...]:
 
 
 def validate_schema_version(value: object) -> int:
-    if type(value) is not int or value != GR_CONFIG_SCHEMA_VERSION:
+    if type(value) is not int or value not in (1, 2):
+        raise ValueError(f"unsupported vllm-gr schema_version {value!r}; expected integer 1 or 2")
+    return value
+
+
+def validate_constraint_mode(value: object) -> ConstraintMode:
+    if isinstance(value, ConstraintMode):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("vllm-gr constraint.mode must be a string")
+    try:
+        return ConstraintMode(value.lower())
+    except ValueError as exc:
+        raise ValueError("vllm-gr constraint.mode must be 'none' or 'table'") from exc
+
+
+def validate_constraint_backend_kind(value: object) -> ConstraintBackendKind:
+    if isinstance(value, ConstraintBackendKind):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("vllm-gr constraint.table.backend must be a string")
+    try:
+        return ConstraintBackendKind(value.lower())
+    except ValueError as exc:
+        supported = ", ".join(kind.value for kind in ConstraintBackendKind)
         raise ValueError(
-            f"unsupported vllm-gr schema_version {value!r}; "
-            f"expected integer {GR_CONFIG_SCHEMA_VERSION}"
-        )
-    return GR_CONFIG_SCHEMA_VERSION
+            f"unsupported vllm-gr constraint.table.backend {value!r}; supported: {supported}"
+        ) from exc
+
+
+def validate_constraint_config(value: object) -> ConstraintConfig | None:
+    """Validate the schema-v2 constraint block.
+
+    Digests remain required in this transition step because the legacy
+    ConstraintTableConfig still validates them; artifact-metadata defaults are a
+    follow-up.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, ConstraintConfig):
+        raise ValueError("vllm-gr constraint must be a ConstraintConfig or null")
+    mode = validate_constraint_mode(value.mode)
+    if mode is ConstraintMode.NONE:
+        if value.table is not None:
+            raise ValueError("vllm-gr constraint.mode='none' forbids constraint.table")
+        return ConstraintConfig(mode=mode)
+    if value.table is None:
+        raise ValueError("vllm-gr constraint.mode='table' requires constraint.table")
+    table = value.table
+    if not isinstance(table, ConstraintTableSpec):
+        raise ValueError("vllm-gr constraint.table must be a ConstraintTableSpec")
+    path = validate_constraint_table_path(table.path)
+    if path is None:
+        raise ValueError("vllm-gr constraint.mode='table' requires constraint.table.path")
+    artifact_digest = validate_artifact_digest(table.artifact_digest)
+    tokenizer_digest = validate_tokenizer_digest(table.tokenizer_digest)
+    if artifact_digest is None or tokenizer_digest is None:
+        raise ValueError("vllm-gr constraint.mode='table' requires artifact and tokenizer digests")
+    return ConstraintConfig(
+        mode=mode,
+        table=ConstraintTableSpec(
+            path=path,
+            backend=validate_constraint_backend_kind(table.backend),
+            max_top_k=(
+                None
+                if table.max_top_k is None
+                else validate_constraint_table_max_top_k(table.max_top_k)
+            ),
+            artifact_digest=artifact_digest,
+            tokenizer_digest=tokenizer_digest,
+        ),
+    )
 
 
 def validate_constraint_table_enabled(value: object) -> bool:

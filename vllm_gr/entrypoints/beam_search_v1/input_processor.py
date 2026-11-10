@@ -164,9 +164,11 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
         raise BeamSearchRequestError(str(error)) from error
     # Shared validation above owns request/config semantics. Only frontend
     # limits and the configured Constraint Table remain to check here.
+    from vllm_gr.config import ConstraintMode
+
     gr_config = GRConfig.from_vllm_config(vllm_config)
     table = gr_config.constraint_table
-    unconstrained = gr_config.constrained_generation is False
+    unconstrained = gr_config.constraint_config.mode is ConstraintMode.NONE
     device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
     device_type = str(device).split(":")[0]
     if unconstrained and device_type not in ("cuda", "npu"):

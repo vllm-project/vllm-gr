@@ -11,7 +11,7 @@ from typing import Any, cast
 
 from vllm.logger import init_logger
 
-from vllm_gr.config import ConstraintTableBackendEnum
+from vllm_gr.config import ConstraintMode, ConstraintTableBackendEnum
 from vllm_gr.v1.worker.model_runner_common import (
     _CONSTRAINT_LOAD_PATCH_MARKER,
     _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
@@ -106,7 +106,7 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
         backend = None
         try:
             gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
-            if gr_config.constrained_generation is False:
+            if gr_config.constraint_config.mode is ConstraintMode.NONE:
                 return result
             table_config = gr_config.constraint_table
             if table_config is None or not table_config.enabled:
