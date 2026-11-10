@@ -11,19 +11,45 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "slow: mark test as slow to run")
-    config.addinivalue_line(
-        "markers",
-        "npu_integration: require a complete, usable Ascend NPU runtime",
-    )
+    config.addinivalue_line("markers", "npu: require a usable Ascend NPU runtime")
+    config.addinivalue_line("markers", "gpu: require a usable NVIDIA GPU runtime")
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+def _npu_available() -> bool:
+    try:
+        import torch
+
+        npu = getattr(torch, "npu", None)
+        return npu is not None and bool(npu.is_available())
+    except ImportError:
+        return False
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    if config.getoption("--run-slow"):
-        return
-    skip_slow = pytest.mark.skip(reason="need --run-slow option to run")
-    for item in items:
-        if "slow" in item.keywords:
-            item.add_marker(skip_slow)
+    if not config.getoption("--run-slow"):
+        skip_slow = pytest.mark.skip(reason="need --run-slow option to run")
+        for item in items:
+            if "slow" in item.keywords:
+                item.add_marker(skip_slow)
+    if not _cuda_available():
+        skip_gpu = pytest.mark.skip(reason="CUDA unavailable")
+        for item in items:
+            if "gpu" in item.keywords:
+                item.add_marker(skip_gpu)
+    if not _npu_available():
+        skip_npu = pytest.mark.skip(reason="NPU runtime unavailable")
+        for item in items:
+            if "npu" in item.keywords:
+                item.add_marker(skip_npu)
 
 
 @pytest.fixture  # type: ignore

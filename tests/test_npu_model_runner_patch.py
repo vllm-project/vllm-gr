@@ -1734,7 +1734,7 @@ def test_npu_decode_positions_retain_input_validation(invalid: str, message: str
     assert torch.all(positions.as_subclass(torch.Tensor) == -9)
 
 
-@pytest.mark.npu_integration  # type: ignore[misc]
+@pytest.mark.npu  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     "prompt_lengths",
@@ -1774,7 +1774,7 @@ def test_npu_decode_positions_match_original_construction_across_async_steps(
         assert actual[rows:].cpu().tolist() == [-9, -9]
 
 
-@pytest.mark.npu_integration  # type: ignore[misc]
+@pytest.mark.npu  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     "dynamic_beam_widths", [(128, 64, 32), (32, 128, 256)]
@@ -2278,7 +2278,7 @@ def test_npu_terminal_result_keeps_batch_identity_and_output_options() -> None:
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "device", ["cpu", pytest.param("npu", marks=pytest.mark.npu_integration)]
+    "device", ["cpu", pytest.param("npu", marks=pytest.mark.npu)]
 )
 @pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
 @pytest.mark.parametrize("result_width", [1, 2])  # type: ignore[misc]

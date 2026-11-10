@@ -201,16 +201,11 @@ def _assert_accelerator_reset_contract(device: torch.device) -> None:
     assert pool.unshared_value.data_ptr() == value_ptr
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")  # type: ignore[misc]
+@pytest.mark.gpu  # type: ignore[misc]
 def test_cuda_pool_reset_preserves_addresses() -> None:
     _assert_accelerator_reset_contract(torch.device("cuda"))
 
 
-def _npu_is_available() -> bool:
-    npu = getattr(torch, "npu", None)
-    return npu is not None and bool(npu.is_available())
-
-
-@pytest.mark.skipif(not _npu_is_available(), reason="NPU is not available")  # type: ignore[misc]
+@pytest.mark.npu  # type: ignore[misc]
 def test_npu_pool_reset_preserves_addresses() -> None:
     _assert_accelerator_reset_contract(torch.device("npu"))

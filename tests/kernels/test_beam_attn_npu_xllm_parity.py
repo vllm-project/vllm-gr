@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytestmark = pytest.mark.npu_integration
+pytestmark = pytest.mark.npu
 
 try:
     import torch_npu  # noqa: F401

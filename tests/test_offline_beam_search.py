@@ -17,6 +17,8 @@ import torch
 from vllm_gr.entrypoints.gr import GRLLM
 from vllm_gr.sampling_params import BeamSearchParams
 
+pytestmark = pytest.mark.gpu
+
 if not torch.cuda.is_available():
     pytest.skip("beam_search_v1 requires CUDA", allow_module_level=True)
 

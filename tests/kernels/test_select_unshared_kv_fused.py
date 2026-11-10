@@ -18,8 +18,6 @@ from vllm_gr.v1.attention.backends.beam_kernels import (
     select_unshared_kv_fused,
 )
 
-CUDA_OK = torch.cuda.is_available()
-
 
 def _make_pool(
     max_batch: int,
@@ -94,7 +92,7 @@ BEAM_INDEX_CASES = {
 }
 
 
-@pytest.mark.skipif(not CUDA_OK, reason="requires CUDA + Triton")  # type: ignore
+@pytest.mark.gpu  # type: ignore
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore
 @pytest.mark.parametrize("case", BEAM_INDEX_CASES.keys())  # type: ignore
 def test_fused_matches_reference(dtype: torch.dtype, case: str) -> None:
@@ -116,7 +114,7 @@ def test_fused_matches_reference(dtype: torch.dtype, case: str) -> None:
         )
 
 
-@pytest.mark.skipif(not CUDA_OK, reason="requires CUDA + Triton")  # type: ignore
+@pytest.mark.gpu  # type: ignore
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore
 def test_fused_shrink_beam_count(dtype: torch.dtype) -> None:
     """n < W: only the first n pool rows are reordered; trailing rows keep
@@ -135,7 +133,7 @@ def test_fused_shrink_beam_count(dtype: torch.dtype) -> None:
     torch.testing.assert_close(fv.cpu(), rv.cpu())
 
 
-@pytest.mark.skipif(not CUDA_OK, reason="requires CUDA + Triton")  # type: ignore
+@pytest.mark.gpu  # type: ignore
 def test_fused_multi_layer_and_slot() -> None:
     """The real call pattern: per-layer pools with distinct data, per-layer
     aux buffers ([L, W, H, S, D]), and a nonzero batch slot — a cross-layer
@@ -178,7 +176,7 @@ def test_fused_multi_layer_and_slot() -> None:
         torch.testing.assert_close(v.cpu(), ref_v[i].cpu(), msg=f"layer {i} value")
 
 
-@pytest.mark.skipif(not CUDA_OK, reason="requires CUDA + Triton")  # type: ignore
+@pytest.mark.gpu  # type: ignore
 def test_fused_returns_false_off_cuda() -> None:
     pool_k, pool_v = _make_pool(1, 4, 2, 3, 16, torch.bfloat16, 1, device="cpu")
     aux = torch.zeros(1, 4, 2, 3, 16, dtype=torch.bfloat16)

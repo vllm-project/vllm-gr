@@ -471,7 +471,7 @@ def test_only_npu_incremental_geometry_uses_async_upload(
     assert transfers == [is_npu]
 
 
-@pytest.mark.npu_integration  # type: ignore[misc]
+@pytest.mark.npu  # type: ignore[misc]
 def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
     """Queued uploads retain immutable payloads after their local source dies."""
     pytest.importorskip("torch_npu")

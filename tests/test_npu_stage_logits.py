@@ -758,7 +758,7 @@ def test_weight_update_hooks_preserve_native_behavior_without_active_projection(
     assert worker.finish_weight_update() == "finished"
 
 
-@pytest.mark.npu_integration
+@pytest.mark.npu
 @pytest.mark.parametrize("update_api", ["runner", "worker"])
 def test_npu_hot_update_refreshes_inference_buffers_at_native_boundary(
     context: Any, update_api: str

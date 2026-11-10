@@ -15,10 +15,13 @@ import os
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("VLLM_GR_RUN_MODEL_SMOKE") != "1" or not torch.cuda.is_available(),
-    reason="opt-in CUDA model smoke",
-)
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        os.getenv("VLLM_GR_RUN_MODEL_SMOKE") != "1",
+        reason="opt-in CUDA model smoke",
+    ),
+]
 
 SUCCESSORS = {
     (): [1, 3],

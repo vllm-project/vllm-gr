@@ -20,7 +20,7 @@ from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_prepare_inputs_gpu
 from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+pytestmark = pytest.mark.gpu
 # pytest parametrization decorators are untyped under strict mypy.
 # mypy: disable-error-code="misc"
 

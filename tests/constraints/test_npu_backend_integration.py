@@ -20,7 +20,7 @@ from vllm_gr.ops.npu.rec_constrained_topk import (
     is_available as rec_constrained_topk_npu_available,
 )
 
-pytestmark = pytest.mark.npu_integration
+pytestmark = pytest.mark.npu
 
 try:
     import torch_npu  # noqa: F401

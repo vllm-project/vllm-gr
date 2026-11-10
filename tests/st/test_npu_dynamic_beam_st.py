@@ -384,7 +384,7 @@ def _run_regression(work_dir: Path) -> None:
                 ordinary_reference = ordinary_after
 
 
-@pytest.mark.npu_integration
+@pytest.mark.npu
 @pytest.mark.slow
 @pytest.mark.timeout(960)
 def test_npu_dynamic_beam_full_model_eager_graph(tmp_path: Path) -> None:

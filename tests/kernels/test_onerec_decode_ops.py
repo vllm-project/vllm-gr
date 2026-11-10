@@ -342,9 +342,7 @@ def test_registered_final_select_is_visible_to_torch_compile() -> None:
         torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(  # type: ignore[misc]
-    not torch.cuda.is_available(), reason="CUDA is required"
-)
+@pytest.mark.gpu
 @pytest.mark.parametrize("case", ["final", "group"])  # type: ignore[misc]
 def test_topk_torch_cuda_graph(case: str) -> None:
     if case == "final":

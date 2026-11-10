@@ -46,7 +46,7 @@ from vllm_gr.v1.beam.cpu_reference import (
 from vllm_gr.v1.worker.beam_final_output import _PayloadLayout
 from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+pytestmark = pytest.mark.gpu
 # Test fixtures and Triton DSL functions intentionally use untyped values.
 # mypy: disable-error-code="misc,no-untyped-def,no-untyped-call"
 

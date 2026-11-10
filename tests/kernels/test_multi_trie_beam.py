@@ -21,7 +21,7 @@ from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+pytestmark = pytest.mark.gpu
 
 
 def root_dispatch(stage, roots, widths=None, factors=None):

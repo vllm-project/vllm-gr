@@ -11,7 +11,7 @@ import torch
 
 Case = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.gpu
 
 
 @pytest.fixture(scope="session", params=[2, 3, 4])

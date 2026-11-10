@@ -84,10 +84,12 @@ if [ "${npu_state:-false}" == "true" ]; then
     PYTORCH_NPU_ALLOW_FORK=true \
     VLLM_WORKER_MULTIPROC_METHOD="spawn" \
     TORCH_MULTIPROCESSING_METHOD="spawn" \
+    VLLM_GR_TEST_MARKER="npu" \
     ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
     bash tools/pre_commit/run_tests.sh
 else
     NODEENV_SSL_NO_VERIFY=1 \
+    VLLM_GR_TEST_MARKER="gpu" \
     CUDA_VISIBLE_DEVICES=$idle_gpu \
     pre-commit run --all-files
 fi

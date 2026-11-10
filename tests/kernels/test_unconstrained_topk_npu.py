@@ -12,7 +12,7 @@ import torch
 
 from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
 
-pytestmark = pytest.mark.npu_integration
+pytestmark = pytest.mark.npu
 
 
 @pytest.fixture

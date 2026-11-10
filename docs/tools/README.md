@@ -17,9 +17,35 @@ targeted check does not satisfy every CI gate.
 | Targeted regression | `python -m pytest -q <test-file-or-node>` | Dependencies and fixtures of the selected tests; inspect device checks |
 | Kernel/integration | Selected `tests/kernels/` or `tests/integration/` files | Matching CUDA or Ascend runtime and a usable device |
 | Model/system | Selected `tests/st/` files or documented probes | Device, model snapshot, configuration/artifact, and any test data |
-| Local full test runner | `./tools/run_test.sh` | Available accelerator, installed runtime, model dependencies; platform behavior below |
+| Local test runner | `./tools/run_test.sh` | Available accelerator, installed runtime, model dependencies; runs only the current device's tests (`gpu`/`npu`) |
 | Wheel smoke | `tools/run_wheel_smoke_test.sh` | Build tooling; validates installed wheel metadata/imports outside the checkout |
 | Benchmark acceptance | `tests/system/` scripts and CI workflow | Fixed inputs, resolved branch/device policy, and saved results |
+
+### Test hardware markers
+
+The suite is split by hardware into three categories selected with pytest
+markers:
+
+| Marker | Meaning | Select with |
+| --- | --- | --- |
+| (none) | CPU / device-agnostic logic tests | `-m "not gpu and not npu"` |
+| `gpu` | Requires an NVIDIA GPU | `-m "gpu"` |
+| `npu` | Requires an Ascend NPU | `-m "npu"` |
+
+The markers are registered in `tests/conftest.py`, which also auto-skips `gpu`
+tests without CUDA and `npu` tests without NPU, so a plain `pytest tests` run is
+still safe on any machine. `tools/pre_commit/run_tests.sh` honors
+`VLLM_GR_TEST_MARKER` and passes it as `-m`, so CI and `tools/run_test.sh` can
+run one category per machine:
+
+```bash
+VLLM_GR_TEST_MARKER="not gpu and not npu" bash tools/pre_commit/run_tests.sh   # CPU
+VLLM_GR_TEST_MARKER="gpu" bash tools/pre_commit/run_tests.sh                   # GPU
+VLLM_GR_TEST_MARKER="npu" bash tools/pre_commit/run_tests.sh                   # NPU
+```
+
+New tests are CPU-runnable and unmarked by default; add a marker only to pin a
+test to accelerator hardware.
 
 ### Documentation and selected hooks
 
@@ -103,26 +129,34 @@ for V1/V2 batch-switch and graph lifecycle changes. Launch runner/configuration
 comparisons in fresh processes. Record actual replay/fallback counters and
 clean shutdown, not only returned candidates.
 
-### Local full test runner
+### Local test runner
 
 ```bash
 ./tools/run_test.sh
 ```
 
-The current script performs these steps:
+The script selects an available accelerator, then runs only that device's test
+category through `VLLM_GR_TEST_MARKER` (see
+[Test hardware markers](#test-hardware-markers)). It performs these steps:
 
 1. Runs `tests/development/test_resource.sh`, which probes allocation/locking.
 2. Sources `tools/resource.sh` and selects an available accelerator. Detection
    uses the presence of `npu-smi`; otherwise it follows the CUDA path. Selection
    can wait for an idle device and is not an exclusive reservation for the suite.
-3. On CUDA, runs `pre-commit run --all-files` with the selected device, including
-   the `run-tests` hook.
+3. On CUDA, runs `pre-commit run --all-files` with `VLLM_GR_TEST_MARKER=gpu`, so
+   the `run-tests` hook runs only `gpu`-marked tests. The static hooks still run.
 4. On NPU, probes/builds xllm-ops through `tools/install_xllm_ops.sh`, loads the
-   custom operator environment, sets spawn-related variables, and directly runs
-   `tools/pre_commit/run_tests.sh`. This branch does not run the other pre-commit
-   hooks; run them separately when needed.
+   custom operator environment, sets spawn-related variables, and runs
+   `tools/pre_commit/run_tests.sh` with `VLLM_GR_TEST_MARKER=npu`. This branch
+   does not run the other pre-commit hooks; run them separately when needed.
 
-Both paths reach the full slow suite described in
+Neither path runs the CPU (unmarked) tests. Run them separately with:
+
+```bash
+VLLM_GR_TEST_MARKER="not gpu and not npu" bash tools/pre_commit/run_tests.sh
+```
+
+Both device paths reach the slow suite described in
 [pre-commit scope](../PRE_COMMIT.md#choose-the-scope). The NPU installer may
 clone/build dependencies when they are unavailable, so
 prepare the vendor image and operator library before using this as a test gate.
@@ -147,7 +181,11 @@ variable and prepared environment.
 VLLM_GR_TARGET_DEVICE=cpu ./tools/run_wheel_smoke_test.sh --python python3
 ```
 
-Use `cuda` or `npu` for the other metadata targets. The script builds a wheel,
+Use `cuda` or `npu` for the other metadata targets. `VLLM_GR_TARGET_DEVICE=cpu`
+selects `requirements/cpu.txt`, which does not install vLLM, so this target is
+for wheel metadata and import-origin checks only; it does not run the unit test
+suite (those always import vLLM — see
+[Test hardware markers](#test-hardware-markers)). The script builds a wheel,
 installs it with `--no-deps` into a temporary directory, checks import origin
 and dependency metadata outside the source checkout, and runs packaging tests.
 It does not validate accelerator inference. Its build helper installs build

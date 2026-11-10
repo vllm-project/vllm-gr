@@ -27,6 +27,8 @@ from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingM
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 
+pytestmark = pytest.mark.gpu
+
 if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 

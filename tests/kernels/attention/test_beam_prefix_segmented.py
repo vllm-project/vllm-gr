@@ -9,7 +9,7 @@ import torch
 from vllm_gr.v1.attention.backends.beam_attn_gpu import prefix_attention
 from vllm_gr.v1.attention.backends.beam_prefix_policy import PrefixPlan
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.gpu
 
 
 @pytest.mark.parametrize("version,splits,segments", [(2, 1, 4), (3, 1, 4), (3, 1, 1), (3, 4, 1)])

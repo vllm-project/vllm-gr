@@ -22,7 +22,7 @@ from vllm_gr.v1.beam.beam_decision import (
 )
 from vllm_gr.v1.worker import constraint_hook
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+pytestmark = pytest.mark.gpu
 
 
 def test_workspace_execution_adapter_preserves_sequence_group_geometry() -> None:

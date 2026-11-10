@@ -29,7 +29,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
 )
 from vllm_gr.v1.worker.gr_inputs import ERROR_DISPATCH_STATE, GRInputBuffers
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+pytestmark = pytest.mark.gpu
 
 
 @pytest.mark.parametrize("width", [1, 4, 128, 256])

@@ -18,7 +18,7 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import should_replay_decode_graph
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
 from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.gpu
 
 
 @torch.inference_mode()  # type: ignore[misc]

@@ -19,7 +19,7 @@ from tests.kernels.test_gpu_beam_stage_runner import dispatch, metadata, runtime
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+pytestmark = pytest.mark.gpu
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 
 

@@ -18,7 +18,7 @@ from vllm_gr.ops.onerec_decode import _beam_search_group_torch
 # mypy: disable-error-code="misc"
 
 
-pytestmark = pytest.mark.npu_integration
+pytestmark = pytest.mark.npu
 
 
 try:

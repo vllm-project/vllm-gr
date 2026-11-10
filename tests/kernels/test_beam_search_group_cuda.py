@@ -30,7 +30,7 @@ from vllm_gr.v1.attention.backends.beam_kernels import (
 # mypy: disable-error-code="misc"
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+pytestmark = pytest.mark.gpu
 
 
 def _inputs(

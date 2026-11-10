@@ -23,7 +23,7 @@ def _devices() -> list[pytest.ParameterSet]:
         pytest.param(
             torch.device("cuda"),
             id="cuda",
-            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available"),
+            marks=pytest.mark.gpu,
         ),
     ]
 

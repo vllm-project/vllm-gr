@@ -10,7 +10,7 @@ from unittest import mock
 import pytest
 import torch
 
-pytestmark = pytest.mark.npu_integration
+pytestmark = pytest.mark.npu
 
 
 def _require_npu_runtime() -> None:

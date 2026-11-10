@@ -17,7 +17,7 @@ import torch
 # mypy: disable-error-code="misc"
 
 
-pytestmark = pytest.mark.npu_integration
+pytestmark = pytest.mark.npu
 
 
 try:

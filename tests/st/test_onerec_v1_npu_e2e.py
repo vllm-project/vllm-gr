@@ -653,14 +653,14 @@ def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
                 process.wait()
 
 
-@pytest.mark.npu_integration
+@pytest.mark.npu
 @pytest.mark.slow
 @pytest.mark.timeout(660)
 def test_onerec_v1_npu_public_api_end_to_end(tmp_path: Path) -> None:
     _run_subprocess(tmp_path)
 
 
-@pytest.mark.npu_integration
+@pytest.mark.npu
 @pytest.mark.slow
 @pytest.mark.timeout(660)
 def test_onerec_v1_npu_graph_shape_switch(tmp_path: Path) -> None:

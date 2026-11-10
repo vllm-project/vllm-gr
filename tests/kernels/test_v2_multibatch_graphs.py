@@ -32,7 +32,7 @@ from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forwa
 from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
 from vllm_gr.v1.worker.model_runner_patch import make_load_model_with_constraint_backend
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.gpu
 
 
 @torch.inference_mode()

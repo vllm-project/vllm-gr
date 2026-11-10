@@ -25,7 +25,7 @@ from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     unconstrained_topk_mcap_out,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+pytestmark = pytest.mark.gpu
 
 
 def _run_both(

@@ -10,7 +10,7 @@ from vllm_gr.ops.cuda.unconstrained_topk import (
     unconstrained_topk_out,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+pytestmark = pytest.mark.gpu
 
 
 @pytest.mark.parametrize("vocab_size,top_k", [(17, 1), (17, 32), (1031, 3), (5123, 128)])  # type: ignore[misc]

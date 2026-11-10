@@ -16,7 +16,7 @@ from vllm_gr.ops.npu.sid_stage_vocab import (
     select_sid_stage_candidates,
 )
 
-pytestmark = pytest.mark.npu_integration
+pytestmark = pytest.mark.npu
 
 
 @pytest.fixture

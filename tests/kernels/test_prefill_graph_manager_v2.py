@@ -34,7 +34,7 @@ from vllm_gr.v1.worker.model_runner_patch import make_load_model_with_constraint
 from vllm_gr.v1.worker.prefill_graph_common import PrefillGraphEnv
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")  # type: ignore[misc]
+@pytest.mark.gpu  # type: ignore[misc]
 @pytest.mark.parametrize("fail_full", [False, True])  # type: ignore[misc]
 def test_native_capture_replay_fixed_output_and_piecewise_recovery(
     monkeypatch: pytest.MonkeyPatch, fail_full: bool | str
@@ -232,7 +232,7 @@ def test_native_capture_replay_fixed_output_and_piecewise_recovery(
         torch.testing.assert_close(result, torch.full((128, 4), 11.0, device=device))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")  # type: ignore[misc]
+@pytest.mark.gpu  # type: ignore[misc]
 @torch.inference_mode()  # type: ignore[misc]
 def test_capacity_boundary_capture_replays_real_prefill_attention() -> None:
     from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -314,7 +314,7 @@ def test_capacity_boundary_capture_replays_real_prefill_attention() -> None:
             torch.testing.assert_close(output, torch.full_like(output, constant))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")  # type: ignore[misc]
+@pytest.mark.gpu  # type: ignore[misc]
 def test_real_cuda_invalidation_is_fatal_in_isolated_process() -> None:
     import os
     import subprocess

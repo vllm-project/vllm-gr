@@ -22,7 +22,7 @@ from vllm_gr.v1.beam.beam_decision import (
     unpack_beam_result_buffer,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+pytestmark = pytest.mark.gpu
 
 # pytest parametrization decorators are untyped under strict mypy.
 # mypy: disable-error-code="misc"

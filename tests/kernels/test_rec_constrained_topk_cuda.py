@@ -20,7 +20,7 @@ from vllm_gr.ops.rec_constrained_topk import rec_constrained_topk_torch
 # mypy: disable-error-code="misc"
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+pytestmark = pytest.mark.gpu
 
 
 def _inputs(dtype: torch.dtype) -> tuple[torch.Tensor, ...]:

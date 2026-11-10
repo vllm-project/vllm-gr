@@ -244,6 +244,7 @@ def _run_arm(work_dir: Path, arm: str) -> None:
 
 
 @pytest.mark.slow
+@pytest.mark.gpu
 @pytest.mark.timeout(3900)
 def test_modelrunner_v2_stage_parity(tmp_path: Path) -> None:
     import torch

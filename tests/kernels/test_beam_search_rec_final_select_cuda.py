@@ -23,7 +23,7 @@ from vllm_gr.ops.onerec_decode import (
 # mypy: disable-error-code="misc"
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+pytestmark = pytest.mark.gpu
 
 
 def _inputs(

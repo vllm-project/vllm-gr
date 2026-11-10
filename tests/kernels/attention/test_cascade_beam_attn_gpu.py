@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytestmark = pytest.mark.gpu
+
 # Skip before importing CUDA-only dependencies or newer vLLM GPU APIs.
 if os.environ.get("VLLM_GR_TARGET_DEVICE", "").lower() == "npu" or not torch.cuda.is_available():
     pytest.skip("CUDA is required for this test.", allow_module_level=True)

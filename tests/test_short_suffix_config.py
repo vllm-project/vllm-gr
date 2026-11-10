@@ -304,7 +304,7 @@ def test_context_rejects_nonpositive_capacity_before_allocating(capacity: int) -
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.gpu
 @pytest.mark.parametrize("capacity", [4, 8, 16, 32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_context_accepts_positive_capacity(capacity: int, dtype: torch.dtype) -> None:
