@@ -73,7 +73,6 @@ def test_get_install_requires_by_device(
     # Reset the module-level cache so the monkeypatched function is used.
     monkeypatch.setattr(gr_setup, "_cached_device", None)
     monkeypatch.setattr(gr_setup, "detect_target_device", lambda: device)
-    monkeypatch.setattr(gr_setup, "warn_deprecated_extra_install", lambda: None)
 
     requirements = set(gr_setup.get_install_requires())
     package_names = {
@@ -125,21 +124,6 @@ def test_release_version_override(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert gr_setup.get_vllm_gr_version() == "0.30.0.dev1"
     write_version.assert_called_once_with(write_to="vllm_gr/_version.py")
-
-
-def test_warn_deprecated_extra_install_emits_warning() -> None:
-    import warnings
-
-    gr_setup = _load_setup_module()
-    original_argv = sys.argv
-    try:
-        sys.argv = ["pip", "install", "-e", ".[gpu]"]
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            gr_setup.warn_deprecated_extra_install()
-        assert any(isinstance(w.message, DeprecationWarning) for w in caught)
-    finally:
-        sys.argv = original_argv
 
 
 pytestmark = pytest.mark.cpu_test

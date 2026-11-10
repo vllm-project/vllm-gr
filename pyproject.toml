@@ -58,13 +58,6 @@ dev = [
     # version is written into the output, so another release yields a diff.
     "grpcio-tools==1.84.0",
 ]
-# DEPRECATED: use `pip install -e .` — platform deps come from setup.py
-# Kept for one transition release so legacy `.[gpu]` installs still receive
-# the GPU-only GR dependencies even if setup.py metadata routing is bypassed.
-gpu = [
-]
-# DEPRECATED: use `pip install -e .` — platform deps come from setup.py
-npu = []
 
 [project.urls]
 Homepage = "https://github.com/JiusiServe/vllm-gr"

@@ -10,8 +10,6 @@ dependencies (CUDA/NPU/CPU) without requiring extras like `[gpu]`.
 
 import logging
 import os
-import sys
-import warnings
 from pathlib import Path
 
 from setuptools import setup
@@ -26,22 +24,6 @@ VLLM_GR_BASE_VERSION = "0.30.0"
 # per setup.py invocation, avoiding duplicate log output and potential
 # inconsistency if env vars change between calls.
 _cached_device: str | None = None
-
-
-def warn_deprecated_extra_install() -> None:
-    """Warn when installing via deprecated [gpu] or [npu] extras."""
-    argv = " ".join(sys.argv).lower()
-    for extra in ("[gpu]", "[npu]", ".[gpu", ".[npu"):
-        if extra in argv:
-            warnings.warn(
-                f"Installing vllm-gr via the deprecated extra {extra!r} is "
-                "supported for one transition release only. "
-                "Use `pip install -e .` instead — platform dependencies are "
-                "auto-selected by setup.py.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            return
 
 
 def detect_target_device() -> str:
@@ -164,8 +146,6 @@ def load_requirements(file_path: Path) -> list[str]:
 
 def get_install_requires() -> list[str]:
     """Get dependencies based on detected platform."""
-    warn_deprecated_extra_install()
-
     device = detect_target_device()
     requirements_dir = Path(__file__).parent / "requirements"
     requirements_file = requirements_dir / f"{device}.txt"

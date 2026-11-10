@@ -6,8 +6,8 @@ Beam Search V1 owns Prefill and Decode in EngineCore and the Worker. The old
 frontend phase loop no longer calls a GR Prometheus collector. Consequently
 this version does not automatically expose the old
 `vllm_gr_beam_search_*` Prefill/Decode/sort counters or histograms.
-The unused `vllm_gr.v1.metrics.beam_search_metrics` collector and
-`vllm_gr.v1.metrics.stats.RequestStateStats` extension have been retired.
+The `vllm_gr.v1.metrics` package has been removed; its collector and
+`RequestStateStats` extension are no longer available.
 
 The native vLLM `/metrics` endpoint is unchanged. Its native request metrics
 are not replacements for measured GR Beam stage durations. For reproducible

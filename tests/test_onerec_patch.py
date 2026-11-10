@@ -15,7 +15,7 @@ package import from side effects:
    ``one_rec_acc_test.py``) rely on.
 
 The tests purge ``sys.modules`` between cases so each case observes a clean
-import state, mirroring the approach in ``test_yuanrong_monkey_patch.py``.
+import state, mirroring the approach in other patch-contract tests.
 
 When ``vllm`` is not installed, the
 ``TestPatchTriggerContractWithRealVllm`` cases auto-skip and the
