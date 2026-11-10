@@ -31,7 +31,9 @@ def context(batch, device):
     )
 
 
-@pytest.mark.parametrize("device", [pytest.param("cpu"), pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize(
+    "device", [pytest.param("cpu"), pytest.param("cuda", marks=pytest.mark.gpu)]
+)
 @pytest.mark.parametrize("batch", [1, 2, 4])
 @pytest.mark.parametrize("source,target", [(4, 2), (2, 4), (3, 3)])
 def test_request_local_kv_fanout(device, batch, source, target):
@@ -166,7 +168,9 @@ def test_widening_keeps_multiple_winners_from_one_parent():
     torch.testing.assert_close(result["out_log_probs"], torch.tensor([[-0.2, -0.3], [-0.3, -0.4]]))
 
 
-@pytest.mark.parametrize("device", [pytest.param("cpu"), pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize(
+    "device", [pytest.param("cpu"), pytest.param("cuda", marks=pytest.mark.gpu)]
+)
 def test_decode_branch_candidates_are_independent_from_retained_widths(device):
     ctx = context(1, device)
     state = DynamicBeamState(ctx, 1, 2)
