@@ -103,6 +103,7 @@ def _fused_topk_kernel(
     device_step,
     DEVICE_STEP: tl.constexpr,
     BLOCK: tl.constexpr,
+    OUTPUT_BLOCK: tl.constexpr,
     WINDOW_BLOCK: tl.constexpr,
 ):
     if DEVICE_STEP:
@@ -254,7 +255,13 @@ def _fused_topk_kernel(
     # promote the table offset before selecting the i64 sentinel.
     tie_key = tl.where(candidate_mask, offsets.to(tl.int64), 0x00000000FFFFFFFF)
     packed = (key64 << 32) | tie_key
-    sorted_pairs = tl.sort(packed, descending=False)
+    # Complement reverses signed-i64 order, retaining the exact score/tie key.
+    # Select only the output bucket instead of sorting the entire candidate row.
+    if OUTPUT_BLOCK == 1:
+        sorted_pairs = tl.min(packed, axis=0).expand_dims(0)
+    else:
+        sorted_pairs = ~tl.topk(~packed, OUTPUT_BLOCK)
+    offsets = tl.arange(0, OUTPUT_BLOCK)
     selected_offsets = (sorted_pairs & 0x00000000FFFFFFFF).to(tl.int64)
     sorted_keys = ((sorted_pairs >> 32) & 0x00000000FFFFFFFF).to(tl.int32)
     sorted_sign = sorted_keys >> 31
@@ -590,6 +597,7 @@ def _launch_rec_constrained_topk_cuda_out(
         device_step=device_step,
         DEVICE_STEP=device_step is not None,
         BLOCK=block,
+        OUTPUT_BLOCK=triton.next_power_of_2(top_k),
         WINDOW_BLOCK=2048,
         num_warps=8 if block >= 2048 else 4,
     )
