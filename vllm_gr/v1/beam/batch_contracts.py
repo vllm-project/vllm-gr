@@ -188,6 +188,23 @@ class BeamOutputSequence(
     stop_token_id: int | None
 
 
+class BeamSequenceColumns(
+    msgspec.Struct, frozen=True, gc=False, forbid_unknown_fields=True, tag="complete_beams_v1"
+):
+    """Owned little-endian columns for equal-length, non-stopped Beam paths.
+
+    This is an internal transport alternative, independent of a device's final
+    buffer layout. Only returned rows and requested columns are transmitted.
+    Public clients materialize ordinary sequences unless explicitly requested.
+    """
+
+    count: Annotated[int, msgspec.Meta(ge=1)]
+    steps: Annotated[int, msgspec.Meta(ge=1)]
+    token_ids: bytes
+    cumulative_logprobs: bytes | None
+    parent_beam_indices: bytes | None
+
+
 class BeamRequestOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -197,7 +214,7 @@ class BeamRequestOutput(
 ):  # type: ignore[call-arg]
     item_index: int
     request_id: str
-    sequences: tuple[BeamOutputSequence, ...]
+    sequences: tuple[BeamOutputSequence, ...] | BeamSequenceColumns
 
 
 class BeamBatchOutput(
@@ -661,6 +678,14 @@ def validate_beam_batch_result(
             if request_id in request_ids:
                 _fail("output request_id values must be unique")
             request_ids.add(request_id)
+            if isinstance(item.sequences, BeamSequenceColumns):
+                from vllm_gr.v1.beam.output_columns import validate_complete_sequences
+
+                try:
+                    validate_complete_sequences(item.sequences)
+                except (TypeError, ValueError) as exc:
+                    _fail(str(exc))
+                continue
             for sequence_index, sequence in enumerate(item.sequences):
                 _validate_output_sequence(
                     sequence,
@@ -679,6 +704,7 @@ __all__ = [
     "BeamBatchParams",
     "BeamBatchRequest",
     "BeamBatchResult",
+    "BeamSequenceColumns",
     "BeamContractError",
     "BeamEngineCoreRequest",
     "BeamOutputOptions",

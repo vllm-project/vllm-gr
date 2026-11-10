@@ -24,6 +24,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchRequest,
     BeamEngineCoreRequest,
     BeamOutputOptions,
+    BeamSequenceColumns,
 )
 from vllm_gr.v1.engine.beam_search_v1 import (
     validate_gr_generation_budget,
@@ -192,13 +193,51 @@ class BeamVllmEngineServicer(VllmEngineServicer):
         validate_gr_request(request, config=config)
         return request, identities
 
-    def build_response(self, request, identities, result, response_batch_id="", *, compact=True):
+    def build_response(
+        self, request, identities, result, response_batch_id="", *, compact=True, binary=False
+    ):
         response = pb.BatchGenerateResponse(batch_id=response_batch_id or request.batch_id)
         for identity, source, item in zip(
             identities, request.items, result.output.items, strict=True
         ):
             target = response.items.add(request_id=identity)
             sequences = item.sequences
+            if isinstance(sequences, BeamSequenceColumns):
+                if compact and binary:
+                    beams = target.binary_beams
+                    beams.count = sequences.count
+                    beams.steps = sequences.steps
+                    beams.prompt_tokens = len(source.request.prompt_token_ids)
+                    beams.output_ids_i32_le = sequences.token_ids
+                    if sequences.cumulative_logprobs is not None:
+                        beams.cumulative_logprobs_f32_le = sequences.cumulative_logprobs
+                    if sequences.parent_beam_indices is not None:
+                        beams.parent_beam_indices_i32_le = sequences.parent_beam_indices
+                    continue
+                from vllm_gr.v1.beam.output_columns import sequence_columns
+
+                if not compact:
+                    raise TypeError("non-compact replies require materialized Beam sequences")
+                tokens, scores, parents = sequence_columns(sequences)
+                count, steps = sequences.count, sequences.steps
+                beams = target.beams
+                beams.prompt_tokens = len(source.request.prompt_token_ids)
+                beams.output_ids.extend(tokens.reshape(-1).tolist())
+                beams.output_offsets.extend(range(0, count * steps + 1, steps))
+                beams.cumulative_logprobs.extend(
+                    itertools.repeat(0.0, count) if scores is None else scores.tolist()
+                )
+                beams.has_cumulative_logprob.extend(itertools.repeat(scores is not None, count))
+                beams.finish_reasons.extend(itertools.repeat("length", count))
+                if parents is not None:
+                    beams.parent_beam_indices.extend(parents.reshape(-1).tolist())
+                beams.parent_offsets.extend(
+                    itertools.repeat(0, count + 1)
+                    if parents is None
+                    else range(0, count * steps + 1, steps)
+                )
+                beams.stop_token_ids.extend(itertools.repeat(-1, count))
+                continue
             if compact:
                 beams = target.beams
                 beams.prompt_tokens = len(source.request.prompt_token_ids)
@@ -240,7 +279,9 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                         complete.matched_token_id = sequence.stop_token_id
         return response
 
-    async def _execute(self, messages, context, response_batch_id="", *, compact=True):
+    async def _execute(
+        self, messages, context, response_batch_id="", *, compact=True, binary=False
+    ):
         try:
             request, identities = self.build_batch(messages)
             if any(identity in self._beam_tasks for identity in identities):
@@ -255,7 +296,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
         try:
             try:
                 session = await self.client.submit_once(request)
-                result = await self.client.wait_final(session)
+                result = await self.client.wait_final(session, materialize=not compact)
             except VLLMValidationError as exc:
                 await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
                 raise
@@ -270,7 +311,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                 )
                 await context.abort(status, result.failure.message)
             return self.build_response(
-                request, identities, result, response_batch_id, compact=compact
+                request, identities, result, response_batch_id, compact=compact, binary=binary
             )
         except asyncio.CancelledError:
             await context.abort(grpc.StatusCode.CANCELLED, "GR beam session cancelled")
@@ -294,7 +335,9 @@ class BeamVllmEngineServicer(VllmEngineServicer):
             yield response
 
     async def GenerateBatch(self, request, context):
-        return await self._execute(request.requests, context, request.batch_id)
+        return await self._execute(
+            request.requests, context, request.batch_id, binary=request.binary_beam_output
+        )
 
     async def Embed(self, request, context):
         await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Embedding is not supported by GR")

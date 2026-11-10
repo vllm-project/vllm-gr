@@ -131,3 +131,37 @@ isolated gRPC wall-time spikes affect means, so median/P95 are also reported.
 Final measurement code, source hashes, requests, logs and raw samples are
 archived outside the MR at
 `/workspace/ws/data/vllm-gr-mr-evidence-20261029/final-vs-decode-graph/`.
+
+## Binary Beam results
+
+The default `GenerateBatch` response retains the existing flat Beam fields.
+For large complete results, the internal result can travel as owned columns
+without constructing one Python object per candidate. This representation
+does not depend on input token encoding or a particular model architecture.
+
+Clients can additionally set `BatchGenerateRequest.binary_beam_output = true`.
+Eligible items then return `binary_beams` with `count`, `steps`, `prompt_tokens`,
+and little-endian int32 `output_ids_i32_le` in `[count, steps]` row order.
+Requested scores use optional FP32 `cumulative_logprobs_f32_le`; requested parent
+indices use optional int32 `parent_beam_indices_i32_le` with the same row shape.
+
+Clients opting in must handle both `binary_beams` and ordinary `beams`: small,
+stopped, or variable-length items retain the existing response. The binary
+option changes the output representation only; default gRPC, HTTP and offline
+outputs keep their existing behavior.
+
+For an existing `BatchGenerateRequest` and generated gRPC stub:
+
+```python
+request.binary_beam_output = True
+response = stub.GenerateBatch(request)
+for item in response.items:
+    if item.HasField("binary_beams"):
+        columns = item.binary_beams
+        tokens = np.frombuffer(columns.output_ids_i32_le, dtype="<i4").reshape(
+            columns.count, columns.steps
+        )
+    else:
+        # Existing flat Beam fields, including the small/STOP fallback.
+        tokens = item.beams.output_ids
+```

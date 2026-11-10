@@ -136,7 +136,7 @@ class BeamOutputSequence:
 class BeamRequestOutput:
     item_index: int
     request_id: str
-    sequences: tuple[BeamOutputSequence, ...]
+    sequences: tuple[BeamOutputSequence, ...] | BeamSequenceColumns
 
 
 class BeamBatchOutput:
@@ -158,6 +158,20 @@ class BeamBatchResult:
 
 Exactly one of `output` and `failure` is present. A failure never carries a
 partial output.
+
+For complete, equal-length, non-stopped results, `BeamRequestOutput.sequences`
+can instead carry `BeamSequenceColumns`: a count, step count, and owned
+little-endian int32 token/parent buffers with optional FP32 scores. The CUDA
+output packer uses this representation for at least 64 returned candidates.
+Small, stopped, and variable-length results keep the sequence representation.
+Both forms receive structural and request-dependent validation. Host output
+storage can be reused immediately without changing an already-published result.
+
+HTTP and offline clients materialize the existing public sequence objects by
+default. gRPC consumes columns directly while preserving its default response
+fields; an explicit binary response is described in the
+[gRPC guide](grpc_numpy_upgrade.md#binary-beam-results). As with other internal
+schema changes, frontend, Core, and Workers must restart on the same revision.
 
 Internal Decode state contains `B * W` Beam rows. Final output contains up to
 `B * R` compact sequences, where:
