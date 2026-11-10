@@ -111,6 +111,12 @@ def _create_request_params(
         raise BeamSearchRequestError(
             "max_tokens must leave at least one Decode step after begin/end tokens"
         )
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_generation_budget
+
+    try:
+        validate_gr_generation_budget(GRConfig.from_vllm_config(vllm_config), decode_steps)
+    except ValueError as error:
+        raise BeamSearchRequestError(str(error)) from error
 
     stop_token_id = end_token_id
     if stop_token_id is None:

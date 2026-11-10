@@ -57,6 +57,28 @@ def test_dynamic_beam_cli_rejects_invalid_options(
     assert message in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("backend", ["cuda", "npu"])  # type: ignore[misc]
+@pytest.mark.parametrize("steps", [1, 2])  # type: ignore[misc]
+@pytest.mark.parametrize("mode", [[], ["--cot"]])  # type: ignore[misc]
+def test_constrained_example_rejects_incomplete_sid_at_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    backend: str,
+    steps: int,
+    mode: list[str],
+) -> None:
+    options = ["--constraint-backend", backend, "--generated-steps", str(steps)]
+    monkeypatch.setattr(sys, "argv", _cli_args(tmp_path) + options + mode)
+    with pytest.raises(SystemExit) as exc:
+        example.parse_args()
+    assert exc.value.code == 2
+    assert "requires --generated-steps 3" in capsys.readouterr().err
+
+    monkeypatch.setattr(sys, "argv", _cli_args(tmp_path) + options + ["--enable-thinking"])
+    assert example.parse_args().generated_steps == steps
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     "widths,graph_widths", [([8, 4, 2], [4, 8]), ([2, 4, 8], [2, 4])]
 )
@@ -183,11 +205,11 @@ def test_npu_graph_example_requires_replay_only_for_decode(
             "graph",
             "--batch-size",
             "2",
-            "--generated-steps",
-            str(steps),
         ],
     )
     args = example.parse_args()
+    # Test replay accounting with synthetic outputs independently of SID CLI admission.
+    args.generated_steps = steps
     sequence = SimpleNamespace(
         tokens=[1, 2, 3, 4, 5], cum_logprob=-1.0, finish_reason="length", stop_reason=None
     )

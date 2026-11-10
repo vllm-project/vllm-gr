@@ -15,7 +15,8 @@ from typing import Any, Protocol, cast
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_gr.config import MAX_BEAM_WIDTH
+from vllm_gr.config import MAX_BEAM_WIDTH, GRConfig
+from vllm_gr.config.models import CONSTRAINT_TABLE_MAX_DECODE_STEPS
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
@@ -266,6 +267,20 @@ def _validate_npu_decode_token_budget(request: BeamBatchRequest, config: Any) ->
         )
 
 
+def validate_gr_generation_budget(gr_config: GRConfig, max_tokens: int) -> None:
+    """Fix constrained SID length to table depth; otherwise bound it by capacity."""
+    table = gr_config.constraint_table
+    if table is not None and table.enabled and max_tokens != CONSTRAINT_TABLE_MAX_DECODE_STEPS:
+        raise ValueError(
+            f"effective generation length {max_tokens} must equal {table.format} depth "
+            f"({CONSTRAINT_TABLE_MAX_DECODE_STEPS})"
+        )
+    if max_tokens > gr_config.beam_max_decode_steps:
+        raise ValueError(
+            f"Decode steps {max_tokens} exceed runtime limit {gr_config.beam_max_decode_steps}"
+        )
+
+
 def validate_gr_request(
     request: BeamBatchRequest, *, config: Any = None, trie_count: int | None = None
 ) -> None:
@@ -297,23 +312,8 @@ def validate_gr_request(
             raise ValueError("native and Beam generation budgets must match and n must be 1")
     _validate_gr_generation_params(request.beam_params)
     if config is not None:
-        from vllm_gr.config import GRConfig
-        from vllm_gr.config.models import CONSTRAINT_TABLE_MAX_DECODE_STEPS
-
         gr_config = GRConfig.from_vllm_config(config)
-        max_tokens = request.beam_params.max_tokens
-        if (
-            gr_config.constrained_generation is not False
-            and max_tokens > CONSTRAINT_TABLE_MAX_DECODE_STEPS
-        ):
-            raise ValueError(
-                "generation budget exceeds constraint_table_v1 depth "
-                f"({CONSTRAINT_TABLE_MAX_DECODE_STEPS})"
-            )
-        if max_tokens > gr_config.beam_max_decode_steps:
-            raise ValueError(
-                f"Decode steps {max_tokens} exceed runtime limit {gr_config.beam_max_decode_steps}"
-            )
+        validate_gr_generation_budget(gr_config, request.beam_params.max_tokens)
         _reject_candidate_width_below_dynamic_schedule(gr_config, request.beam_params)
         _validate_npu_decode_token_budget(request, config)
 
@@ -744,6 +744,7 @@ __all__ = [
     "validate_gr_device_config",
     "validate_gr_execution_config",
     "validate_gr_execution_runtime",
+    "validate_gr_generation_budget",
     "validate_gr_request",
     "validate_npu_unconstrained_runner",
 ]

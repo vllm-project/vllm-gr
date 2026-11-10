@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Collect the manual probes' startup contract in the normal regression suite."""
+"""Validate model probes' startup and request contracts without an accelerator."""
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from tests.st.model_runner_policy_isolation import startup_expectations
+from tests.st.test_modelrunner_v2_stage_parity_st import _SESSIONS
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -48,6 +50,29 @@ def test_probe_separates_capture_policy_from_backend_capacity(
         max_num_seqs=max_seqs,
         enforce_eager=eager,
     ) == (1024 if runner == "v2" else 128, expected)
+
+
+@pytest.mark.parametrize("length,steps", _SESSIONS)  # type: ignore[misc]
+def test_v2_parity_sessions_pass_constrained_request_validation(length: int, steps: int) -> None:
+    from tests.st.test_onerec_v1_scheduler_st import _params
+    from tests.test_beam_search_v1_input_processor import _make_engine
+    from vllm_gr.entrypoints.beam_search_v1.input_processor import (
+        _create_request_params,
+    )
+
+    # Exercise the real ST parameters and request normalization before paying
+    # for model startup. A boundary-wrapped SID must still contain three tokens.
+    engine = _make_engine()
+    tokenizer = SimpleNamespace(
+        eos_token_id=2,
+        convert_tokens_to_ids=lambda token: {"<|sid_begin|>": 7, "<|sid_end|>": 8}[token],
+    )
+    native, begin, end = _create_request_params(
+        _params(steps), tokenizer, vllm_config=engine.vllm_config
+    )
+    assert native.max_tokens == 3 and (begin, end) == (7, 8), (
+        f"invalid parity session {length=}, {steps=}"
+    )
 
 
 pytestmark = pytest.mark.cpu_test

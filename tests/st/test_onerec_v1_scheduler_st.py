@@ -456,11 +456,11 @@ def _params(steps: int) -> Any:
     )
 
 
-# The first three requests exercise cache miss/hit and N=1/2/3. The
+# The first three requests exercise cache miss/hit with complete three-token SIDs. The
 # remaining cold prompts straddle KV-block and graph-bucket boundaries.
 _CASES = (
-    (900, 1, True),
-    (900, 2, False),
+    (900, 3, True),
+    (900, 3, False),
     (900, 3, False),
     (1023, 3, True),
     (1024, 3, True),
@@ -527,6 +527,10 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
             else []
         )
         llm.collective_rpc("onerec_v1_st_observe")
+        for steps in (1, 2):
+            with pytest.raises(ValueError, match="must equal constraint_table_v1 depth"):
+                llm.beam_search_v1([{"prompt_token_ids": source}], _params(steps))
+        assert not llm.collective_rpc("onerec_v1_st_events")[0]
         state_address = None
         for length, steps, cold in _CASES:
             if cold:
@@ -597,6 +601,14 @@ async def _run_online(work_dir: Path) -> None:
             ),
         )
         await engine.collective_rpc("onerec_v1_st_observe")
+        for steps in (1, 2):
+            with pytest.raises(ValueError, match="must equal constraint_table_v1 depth"):
+                async for _ in serving.beam_search_v1(
+                    tokens_input(source), "invalid-length", _params(steps)
+                ):
+                    pytest.fail("invalid constrained length reached generation")
+        assert not (await engine.collective_rpc("onerec_v1_st_events"))[0]
+        assert not engine.output_processor.has_unfinished_requests()
         rows = []
         cancellations = []
 
