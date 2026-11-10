@@ -41,23 +41,24 @@ on:
         type: boolean
 
 concurrency:
-  # Keep A/B-only requests out of the full validation's single pending slot.
+  # Keep all gating work for one PR in this repository-wide workflow queue.
+  # Non-gating events get their own group so they cannot occupy the queue.
+  # This outer group must differ from each device job's inner group.
   group: >-
-    ${{ github.workflow }}-${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') && 'pull_request' || github.event_name }}-${{
-      github.event.pull_request.number || github.ref
-    }}-${{
-      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-      github.event.label.name != 'ready' &&
-      (github.event.label.name != 'abtest' ||
-       github.event.action == 'unlabeled') &&
-      format('ignored-{0}', github.run_id) ||
-      (github.event.action == 'labeled' &&
-       github.event.label.name == 'abtest' && 'abtest' || 'ci')
-    }}
-  cancel-in-progress: >-
-    ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
-        !(github.event.action == 'labeled' &&
-          github.event.label.name == 'abtest') }}
+    ${{ (github.event_name == 'workflow_dispatch' ||
+        ((github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+         github.event.pull_request.draft == false &&
+         (github.event.pull_request.base.ref == 'main' ||
+          github.event.pull_request.base.ref == 'decode_graph') &&
+         ((contains(github.event.pull_request.labels.*.name, 'ready') &&
+           ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+            github.event.label.name == 'ready')) ||
+          (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+           github.event.label.name == 'abtest')))) &&
+        format('vllm-gr-pr-workflow-{0}', github.repository) ||
+        format('vllm-gr-nongating-{0}', github.run_id) }}
+  queue: max
+  cancel-in-progress: false
 
 permissions:
   actions: read
@@ -69,9 +70,200 @@ env:
   CUDA_DEVICE_ORDER: PCI_BUS_ID
 
 jobs:
+  pr-admission:
+    name: Validate queued PR revision
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: &pr_queue_freshness |
+            const event = context.eventName;
+            if (event !== 'pull_request' && event !== 'pull_request_review') return;
+            const pr = context.payload.pull_request;
+            const validLabels = labels => Array.isArray(labels) && labels.every(
+              item => item && typeof item === 'object' && typeof item.name === 'string'
+            );
+            if (!pr || !pr.base || !pr.head || !Number.isSafeInteger(pr.number) || pr.number < 1 ||
+                typeof pr.base.ref !== 'string' || typeof pr.draft !== 'boolean' || !validLabels(pr.labels)) {
+              throw new Error('Malformed pull request event context');
+            }
+            if (!['main', 'decode_graph'].includes(pr.base.ref) || pr.draft) return;
+            const action = context.payload.action;
+            const label = context.payload.label && context.payload.label.name;
+            if (event === 'pull_request' && ['labeled', 'unlabeled'].includes(action)) {
+              if (typeof label !== 'string') throw new Error('Malformed pull request label event');
+              if (label !== 'ready' && !(action === 'labeled' && label === 'abtest')) return;
+            }
+            const validSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
+            if (!validSha(pr.head.sha) || !validSha(pr.base.sha) || !validSha(context.sha)) {
+              throw new Error('Queued pull request event has invalid commit identifiers');
+            }
+            const {owner, repo} = context.repo;
+            const {data: live} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
+            if (!live || live.number !== pr.number || live.state !== 'open' ||
+                typeof live.draft !== 'boolean' || live.draft || !live.head || !live.base ||
+                !validLabels(live.labels) || live.head.sha !== pr.head.sha ||
+                live.base.sha !== pr.base.sha || live.base.ref !== pr.base.ref ||
+                live.merge_commit_sha !== context.sha) {
+              throw new Error('Queued pull request changed or is invalid; this run is stale');
+            }
+            const has = (labels, name) => labels.some(item => item.name === name);
+            // Full ready validation always requires a current A/B result; toggling
+            // the optional A/B request label does not change its gate requirements.
+            // Standalone A/B requests still require their label to remain current.
+            const fullReady = has(pr.labels, 'ready') &&
+              !(event === 'pull_request' && action === 'labeled' && label === 'abtest');
+            const checkedLabels = fullReady ? ['ready'] : ['ready', 'abtest'];
+            for (const name of checkedLabels) {
+              if (has(pr.labels, name) !== has(live.labels, name)) {
+                throw new Error('Queued pull request labels changed; this run is stale');
+              }
+            }
+            core.info('Queued pull request matches the current revision and gate labels');
+
+  wheel-scope:
+    # Preserve the wheel path filters for PR gates and rerun them for reviews.
+    # On an API error or uncertain diff, run rather than silently skip.
+    name: Determine wheel build scope
+    needs: pr-admission
+    if: >-
+      needs.pr-admission.result == 'success' &&
+      (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+      github.event.pull_request.draft == false &&
+      (github.event.pull_request.base.ref == 'main' ||
+       github.event.pull_request.base.ref == 'decode_graph') &&
+      contains(github.event.pull_request.labels.*.name, 'ready') &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+       github.event.label.name == 'ready')
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
+      - name: Check wheel path filters
+        id: scope
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Match build_wheel.yml's paths-ignore; test both sides of a rename
+            // conservatively so a change to source code cannot be missed.
+            const ignored = p => typeof p === 'string' &&
+              (p.startsWith('docs/') || p.startsWith('examples/') ||
+               p.startsWith('.github/') || p.startsWith('.buildkite/') ||
+               /^[^/]*\.yml$/.test(p) || /\.md$/.test(p) ||
+               p === '.gitignore' || p === '.gitattributes' || p === 'LICENSE');
+            let required = true;
+            try {
+              const pr = context.payload.pull_request;
+              if (!pr || !Number.isSafeInteger(pr.number) || pr.number <= 0 ||
+                  !pr.head || !pr.base || !/^[0-9a-f]{40}$/i.test(pr.head.sha || '') ||
+                  !/^[0-9a-f]{40}$/i.test(pr.base.sha || '') ||
+                  !/^[0-9a-f]{40}$/i.test(context.sha || '')) {
+                throw new Error('Missing pinned PR revisions');
+              }
+              const args = {owner: context.repo.owner, repo: context.repo.repo,
+                            pull_number: pr.number};
+              const getCurrent = async () => {
+                const {data: live} = await github.rest.pulls.get(args);
+                if (!live || live.state !== 'open' || live.number !== pr.number ||
+                    !live.head || !live.base || live.head.sha !== pr.head.sha ||
+                    live.base.sha !== pr.base.sha || live.merge_commit_sha !== context.sha ||
+                    !Number.isSafeInteger(live.changed_files) || live.changed_files <= 0 ||
+                    live.changed_files >= 3000) {
+                  throw new Error('PR changed or its file count is invalid');
+                }
+                return live.changed_files;
+              };
+              const expected = await getCurrent();
+              let count = 0;
+              let hasRelevantPath = false;
+              const seen = new Set();
+              const allowed = new Set(['added', 'modified', 'removed', 'renamed']);
+              for (let page = 1; page <= 30; page++) {
+                const {data} = await github.rest.pulls.listFiles({...args, per_page: 100, page});
+                if (!Array.isArray(data) || data.length > 100) throw new Error('Invalid files page');
+                for (const file of data) {
+                  if (!file || !allowed.has(file.status) || typeof file.filename !== 'string' ||
+                      !file.filename || seen.has(file.filename)) throw new Error('Invalid file');
+                  if (file.status === 'renamed') {
+                    if (typeof file.previous_filename !== 'string' || !file.previous_filename ||
+                        file.previous_filename === file.filename) throw new Error('Invalid rename');
+                    if (!ignored(file.previous_filename)) hasRelevantPath = true;
+                  } else if (file.previous_filename != null) {
+                    throw new Error('Unexpected previous filename');
+                  }
+                  seen.add(file.filename);
+                  count++;
+                  if (!ignored(file.filename)) hasRelevantPath = true;
+                  if (count > expected || count >= 3000) throw new Error('Too many files');
+                }
+                if (data.length < 100) break;
+                if (page === 30) throw new Error('File list may be truncated');
+              }
+              if (count !== expected || await getCurrent() !== expected) {
+                throw new Error('PR file list incomplete or changed');
+              }
+              required = hasRelevantPath;
+            } catch (error) {
+              core.warning('Wheel file classification unavailable; running wheel build: ' + error.message);
+            }
+            core.setOutput('required', required ? 'true' : 'false');
+
+  build:
+    # Keep the original matrix job/check names from build_wheel.yml.
+    needs: wheel-scope
+    if: needs.wheel-scope.outputs.required == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        target-device: ["cpu", "cuda"]
+
+    steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: |
+          pip install uv pytest packaging regex
+
+      - name: Build and smoke-test wheel
+        env:
+          UV_SYSTEM_PYTHON: 1
+          VLLM_GR_TARGET_DEVICE: ${{ matrix.target-device }}
+        run: |
+          if [[ "$VLLM_GR_TARGET_DEVICE" == "cpu" ]]; then
+            export VLLM_GR_EXPECTED_VERSION=0.30.0+cpu
+          else
+            export VLLM_GR_EXPECTED_VERSION=0.30.0
+          fi
+          bash tools/run_wheel_smoke_test.sh --python python
+
+      - name: Upload Wheel Artifact
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-gr-${{ matrix.target-device }}-wheel-py${{ matrix.python-version }}
+          path: dist/*.whl
+          retention-days: 3
+
   docs-scope:
     name: Classify documentation changes
+    needs: pr-admission
     if: >-
+      needs.pr-admission.result == 'success' &&
       (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
       github.event.pull_request.draft == false &&
       (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'decode_graph') &&
@@ -141,6 +333,10 @@ jobs:
       !(github.event.action == 'labeled' && github.event.label.name == 'abtest')
     runs-on: ubuntu-latest
     steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -273,9 +469,9 @@ jobs:
 
   benchmark-policy:
     name: Resolve benchmark policy
-    needs: docs-scope
+    needs: [docs-scope, pr-admission]
     if: >-
-      !cancelled() && needs.docs-scope.outputs.docs-only != 'true' &&
+      needs.pr-admission.result == 'success' && !cancelled() && needs.docs-scope.outputs.docs-only != 'true' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_review') ||
       (github.event.pull_request.draft == false &&
        (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'decode_graph') &&
@@ -293,6 +489,10 @@ jobs:
       policy-mode: ${{ steps.benchmark-policy.outputs.mode }}
       policy-digest: ${{ steps.benchmark-policy.outputs.digest }}
     steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -506,10 +706,14 @@ jobs:
     if: needs.benchmark-policy.result == 'success'
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -617,7 +821,7 @@ jobs:
       needs.pre-commit.result == 'success'
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     env:
@@ -636,6 +840,10 @@ jobs:
       P99_TTFT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TTFT_THRESHOLD }}
       P99_TPOT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_THRESHOLD }}
     steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -817,9 +1025,9 @@ jobs:
 
   beam-performance-ab-only:
     name: Beam V1 performance A/B only
-    needs: [resolve-ab-freshness, pangu-online, docs-scope]
+    needs: [resolve-ab-freshness, pangu-online, docs-scope, pr-admission]
     if: >-
-      !cancelled() &&
+      needs.pr-admission.result == 'success' && !cancelled() &&
       needs.docs-scope.outputs.docs-only != 'true' &&
       (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
       github.event.pull_request.draft == false &&
@@ -833,10 +1041,14 @@ jobs:
         needs.resolve-ab-freshness.outputs.fresh != 'true'))
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
       - uses: actions/checkout@v4
         with:
           # A/B checks that the event base is an ancestor of the merge's first
@@ -987,7 +1199,7 @@ jobs:
       needs.pre-commit.result == 'success' }}
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     env:
@@ -996,6 +1208,10 @@ jobs:
       PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE }}
       PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
     steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -1090,7 +1306,7 @@ jobs:
       needs.pre-commit.result == 'success' }}
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     env:
@@ -1099,6 +1315,10 @@ jobs:
       PANGU1B_ONLINE_ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_ONLINE_ACCURACY_FAILURE_MODE }}
       PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
     steps:
+      - name: Check queued PR freshness
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -1209,6 +1429,7 @@ jobs:
           'Beam V1 performance A/B gate' ||
           'Benchmark blocking gate' }}
     needs:
+      - pr-admission
       - docs-scope
       - docs-check
       - resolve-ab-freshness
@@ -1218,6 +1439,8 @@ jobs:
       - beam-performance-ab-only
       - pangu-offline
       - pangu-online
+      - wheel-scope
+      - build
     if: >-
       always() &&
       !(needs.docs-scope.outputs.docs-only == 'true' &&
@@ -1232,6 +1455,12 @@ jobs:
         github.event.action == 'labeled'))
     runs-on: ubuntu-latest
     steps:
+      - name: Require queued PR admission
+        if: needs.pr-admission.result != 'success'
+        run: |
+          echo "::error::Queued PR admission failed or was skipped."
+          exit 1
+
       - name: Revalidate candidate benchmark policy
         if: needs.benchmark-policy.result == 'success' && needs.benchmark-policy.outputs.policy-mode == 'candidate'
         uses: actions/github-script@v7
@@ -1450,6 +1679,18 @@ jobs:
                 contains(github.event.pull_request.labels.*.name, 'ready') &&
                 !(github.event.action == 'labeled' &&
                   github.event.label.name == 'abtest') }}
+          WHEEL_ELIGIBLE: >-
+            ${{ (github.event_name == 'pull_request' ||
+                 github.event_name == 'pull_request_review') &&
+                github.event.pull_request.draft == false &&
+                (github.event.pull_request.base.ref == 'main' ||
+                 github.event.pull_request.base.ref == 'decode_graph') &&
+                contains(github.event.pull_request.labels.*.name, 'ready') &&
+                ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+                 github.event.label.name == 'ready') }}
+          WHEEL_SCOPE_RESULT: ${{ needs.wheel-scope.result }}
+          WHEEL_REQUIRED: ${{ needs.wheel-scope.outputs.required }}
+          WHEEL_RESULT: ${{ needs.build.result }}
           DOCS_ONLY: ${{ needs.docs-scope.outputs.docs-only }}
           DOCS_RESULT: ${{ needs.docs-check.result }}
           POLICY_RESULT: ${{ needs.benchmark-policy.result }}
@@ -1469,6 +1710,17 @@ jobs:
               exit 1
             fi
             exit 0
+          fi
+          if [[ "$WHEEL_ELIGIBLE" == true ]]; then
+            if [[ "$WHEEL_SCOPE_RESULT" != success ||
+                  ( "$WHEEL_REQUIRED" != true && "$WHEEL_REQUIRED" != false ) ]]; then
+              echo "::error::Wheel scope could not be established."
+              exit 1
+            fi
+            if [[ "$WHEEL_REQUIRED" == true && "$WHEEL_RESULT" != success ]]; then
+              echo "::error::Required wheel build did not pass."
+              exit 1
+            fi
           fi
           if [[ "$DOCS_ONLY" == true ]]; then
             echo "DOCS_RESULT=$DOCS_RESULT"
@@ -1503,6 +1755,11 @@ jobs:
             fi
           done
           exit "$failed"
+
+      - name: Recheck queued PR freshness at completion
+        uses: actions/github-script@v7
+        with:
+          script: *pr_queue_freshness
 
       - name: Reject cancelled workflow
         if: cancelled()

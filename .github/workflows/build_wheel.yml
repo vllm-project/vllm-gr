@@ -1,32 +1,9 @@
 name: Build Wheel
 
 on:
-  pull_request:
-    branches:
-      - main
-      - decode_graph
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
-      - converted_to_draft
-      - labeled
-      - unlabeled
-    paths-ignore:
-      - 'docs/**'
-      - 'examples/**'
-      - '.github/**'
-      - '.buildkite/**'
-      - '*.yml'
-      - '**.md'
-      - '.gitignore'
-      - '.gitattributes'
-      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:
-  # Unrelated label edits must not cancel queued or running CI for this PR.
   group: >-
     ${{ github.workflow }}-${{ github.event_name }}-${{
       github.event.pull_request.number || github.ref

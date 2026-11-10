@@ -41,6 +41,7 @@ def context(
     return namespace(
         {
             "workflow": "test",
+            "repository": "JiusiServe/vllm-gr",
             "event_name": event,
             "run_id": 123,
             "ref": "refs/pull/481/merge",
@@ -77,6 +78,7 @@ def evaluate(
     ab_fresh: bool = False,
     ab_passed: bool = False,
     docs_only: bool = False,
+    wheel_required: bool = True,
 ) -> Any:
     # Evaluate only the small expression subset used by these tracked workflow
     # guards. Keep the expressions in YAML as the source of truth.
@@ -85,6 +87,7 @@ def evaluate(
     expression = expression.replace("needs.resolve-ab-freshness.outputs.fresh", "ab_fresh")
     expression = expression.replace("needs.resolve-ab-freshness.outputs.passed", "ab_passed")
     expression = expression.replace("needs.docs-scope.outputs.docs-only", "docs_only")
+    expression = expression.replace("needs.wheel-scope.outputs.required", "wheel_required")
     expression = re.sub(r"needs\.([\w-]+)\.result", r"results['\1']", expression)
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
@@ -100,6 +103,7 @@ def evaluate(
             "ab_fresh": "True" if ab_fresh else "False",
             "ab_passed": "True" if ab_passed else "False",
             "docs_only": "True" if docs_only else "False",
+            "wheel_required": "True" if wheel_required else "False",
             "always": lambda: True,
             "cancelled": lambda: cancelled,
             "contains": lambda items, value: value in items,
@@ -158,6 +162,7 @@ class TestReadyLabelCI(unittest.TestCase):
                     cancelled=cancelled,
                     ab_fresh=ab_fresh,
                     docs_only=docs_only and results.get("docs-scope") == "success",
+                    wheel_required=not docs_only,
                 )
                 results[name] = (
                     ("failure" if name == failed else "success") if enabled else "skipped"
@@ -189,6 +194,8 @@ class TestReadyLabelCI(unittest.TestCase):
             ("labeled", False, False, "bug", False),
         ]
         for filename, workflow in self.workflows.items():
+            if filename == "build_wheel.yml":
+                continue  # Standalone wheel is now manual-only.
             triggers = workflow.get("on", workflow.get(True))["pull_request"]["types"]
             for action, ready, draft, label, expected in events:
                 with self.subTest(
@@ -197,7 +204,9 @@ class TestReadyLabelCI(unittest.TestCase):
                     self.assertIn(action, triggers)
                     github = context(action, ready=ready, draft=draft, label=label)
                     running = self.scheduled(workflow, github)
-                    validation = [job for job in running if job != "benchmark-blocking"]
+                    validation = [
+                        job for job in running if job not in {"benchmark-blocking", "pr-admission"}
+                    ]
                     self.assertEqual(bool(validation), expected)
                     if expected:
                         self.assertEqual(set(running), set(workflow["jobs"]) - {"docs-check"})
@@ -218,30 +227,30 @@ class TestReadyLabelCI(unittest.TestCase):
             self.assertIn("workflow_dispatch", triggers)
             self.assertNotIn("push", triggers)
             github = context(event="workflow_dispatch", ready=False, draft=True)
-            self.assertEqual(
-                set(self.scheduled(workflow, github)),
-                set(workflow["jobs"])
-                - {"beam-performance-ab-only", "resolve-ab-freshness", "docs-scope", "docs-check"},
-            )
+            expected = set(workflow["jobs"])
+            if "pr-admission" in workflow["jobs"]:
+                expected -= {
+                    "beam-performance-ab-only",
+                    "resolve-ab-freshness",
+                    "docs-scope",
+                    "docs-check",
+                    "wheel-scope",
+                    "build",
+                }
+            self.assertEqual(set(self.scheduled(workflow, github)), expected)
 
     def test_label_edits_do_not_cancel_unrelated_runs(self) -> None:
-        for workflow in self.workflows.values():
-            group = workflow["concurrency"]["group"]
-            normal = render(group, context())
-            for action, ready, draft, label in (
-                ("labeled", True, False, "ready"),
-                ("unlabeled", False, False, "ready"),
-                ("converted_to_draft", True, True, ""),
-            ):
-                github = context(action, ready=ready, draft=draft, label=label)
-                self.assertEqual(render(group, github), normal)
-                self.assertTrue(evaluate(workflow["concurrency"]["cancel-in-progress"], github))
-            for action in ("labeled", "unlabeled"):
-                github = context(action, label="bug")
-                self.assertNotEqual(render(group, github), normal)
-                second = copy.deepcopy(github)
-                second.run_id += 1
-                self.assertNotEqual(render(group, second), render(group, github))
+        workflow = self.workflows["pre-commit.yml"]
+        group = workflow["concurrency"]["group"]
+        normal = render(group, context())
+        self.assertEqual(workflow["concurrency"]["queue"], "max")
+        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+        for action in ("labeled", "unlabeled"):
+            github = context(action, label="bug")
+            self.assertNotEqual(render(group, github), normal)
+            second = copy.deepcopy(github)
+            second.run_id += 1
+            self.assertNotEqual(render(group, second), render(group, github))
 
     def test_abtest_toggle_does_not_cancel_ready_validation(self) -> None:
         workflow = self.workflows["pre-commit.yml"]
@@ -251,8 +260,8 @@ class TestReadyLabelCI(unittest.TestCase):
         added = context("labeled", ready=True, abtest=True, label="abtest")
         removed = context("unlabeled", ready=True, abtest=False, label="abtest")
 
-        self.assertNotEqual(render(group, added), render(group, full))
-        self.assertFalse(evaluate(cancel, added))
+        self.assertEqual(render(group, added), render(group, full))
+        self.assertFalse(cancel)
         # An active old run and pending full run share the full group; the
         # A/B label event must not replace that pending full run.
         older = copy.deepcopy(full)
@@ -272,10 +281,10 @@ class TestReadyLabelCI(unittest.TestCase):
             self.assertFalse(gpu_lock["cancel-in-progress"])
         self.assertEqual(
             self.scheduled(workflow, added),
-            ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
+            ["pr-admission", "docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
         )
         self.assertNotEqual(render(group, removed), render(group, full))
-        self.assertEqual(self.scheduled(workflow, removed), [])
+        self.assertEqual(self.scheduled(workflow, removed), ["pr-admission"])
         self.assertEqual(
             render(workflow["jobs"]["benchmark-blocking"]["name"], removed),
             "Ignored label event",
@@ -299,6 +308,7 @@ class TestReadyLabelCI(unittest.TestCase):
             "resolve-ab-freshness",
             "docs-scope",
             "docs-check",
+            "pr-admission",
         }:
             for status in ("failure", "cancelled", "skipped"):
                 scenarios.append(({**success, variable: status}, 1))
@@ -319,7 +329,8 @@ class TestReadyLabelCI(unittest.TestCase):
             github = context("labeled", ready=ready, abtest=True, label="abtest")
             running = self.scheduled(workflow, github)
             self.assertEqual(
-                running, ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"]
+                running,
+                ["pr-admission", "docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
             )
             self.assertEqual(render(gate["name"], github), "Beam V1 performance A/B gate")
             results = {need: "success" if need in running else "skipped" for need in gate["needs"]}
@@ -327,7 +338,7 @@ class TestReadyLabelCI(unittest.TestCase):
 
         draft = context("labeled", ready=True, abtest=True, draft=True, label="abtest")
         running = self.scheduled(workflow, draft)
-        self.assertEqual(running, ["benchmark-blocking"])
+        self.assertEqual(running, ["pr-admission", "benchmark-blocking"])
         self.assertEqual(render(gate["name"], draft), "Beam V1 performance A/B gate")
         results = dict.fromkeys(gate["needs"], "skipped")
         self.assertEqual(self.run_gate(results, draft).returncode, 1)
@@ -341,7 +352,16 @@ class TestReadyLabelCI(unittest.TestCase):
             ):
                 with self.subTest(base=base, action=event.event.action):
                     running = self.scheduled(workflow, event, docs_only=True)
-                    self.assertEqual(running, ["docs-scope", "docs-check", "benchmark-blocking"])
+                    self.assertEqual(
+                        running,
+                        [
+                            "pr-admission",
+                            "wheel-scope",
+                            "docs-scope",
+                            "docs-check",
+                            "benchmark-blocking",
+                        ],
+                    )
 
             for ready in (False, True):
                 with self.subTest(base=base, ready=ready):
@@ -349,16 +369,27 @@ class TestReadyLabelCI(unittest.TestCase):
                         "labeled", ready=ready, abtest=True, label="abtest", base_ref=base
                     )
                     self.assertEqual(
-                        self.scheduled(workflow, event, docs_only=True), ["docs-scope"]
+                        self.scheduled(workflow, event, docs_only=True),
+                        ["pr-admission", "docs-scope"],
                     )
                     # Failed or uncertain classification preserves the explicit A/B path.
                     self.assertEqual(
                         self.scheduled(workflow, event, docs_only=False),
-                        ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
+                        [
+                            "pr-admission",
+                            "docs-scope",
+                            "beam-performance-ab-only",
+                            "benchmark-blocking",
+                        ],
                     )
                     self.assertEqual(
                         self.scheduled(workflow, event, failed="docs-scope", docs_only=True),
-                        ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
+                        [
+                            "pr-admission",
+                            "docs-scope",
+                            "beam-performance-ab-only",
+                            "benchmark-blocking",
+                        ],
                     )
 
     def test_docs_gate_requires_docs_checks_and_ignores_ab_results(self) -> None:
@@ -366,7 +397,14 @@ class TestReadyLabelCI(unittest.TestCase):
         gate = workflow["jobs"]["benchmark-blocking"]
         event = context("synchronize", ready=True, abtest=True)
         results = dict.fromkeys(gate["needs"], "skipped")
-        results.update({"docs-scope": "success", "docs-check": "success"})
+        results.update(
+            {
+                "docs-scope": "success",
+                "docs-check": "success",
+                "wheel-scope": "success",
+                "pr-admission": "success",
+            }
+        )
         for fresh, passed in ((False, False), (True, False), (True, True)):
             result = self.run_gate(results, event, docs_only=True, ab_fresh=fresh, ab_passed=passed)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -388,7 +426,9 @@ class TestReadyLabelCI(unittest.TestCase):
                 "Benchmark blocking gate",
             ),
         ):
-            self.assertEqual(self.scheduled(workflow, github), ["benchmark-blocking"])
+            self.assertEqual(
+                self.scheduled(workflow, github), ["pr-admission", "benchmark-blocking"]
+            )
             self.assertEqual(render(gate["name"], github), expected_name)
             self.assertEqual(self.run_gate(results, github).returncode, 1)
 
@@ -421,7 +461,11 @@ class TestReadyLabelCI(unittest.TestCase):
     def test_ab_freshness_lookup_accepts_only_current_revision(self) -> None:
         if shutil.which("node") is None:
             self.skipTest("Node.js is required to exercise the github-script lookup")
-        step = self.workflows["pre-commit.yml"]["jobs"]["resolve-ab-freshness"]["steps"][0]
+        step = next(
+            item
+            for item in self.workflows["pre-commit.yml"]["jobs"]["resolve-ab-freshness"]["steps"]
+            if item.get("name") == "Find a successful A/B run for this PR revision"
+        )
         harness = """
 const fixture = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const outputs = {};
@@ -500,6 +544,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                     ab_fresh=ab_fresh,
                     ab_passed=ab_passed,
                     docs_only=docs_only,
+                    wheel_required=not docs_only,
                 )
             ).lower()
             for key, value in step["env"].items()
@@ -522,20 +567,27 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                 ready = context("labeled", ready=True, label="ready", base_ref=base)
                 ab_only = context("labeled", ready=True, abtest=True, label="abtest", base_ref=base)
                 removed = context("unlabeled", ready=True, label="abtest", base_ref=base)
-                self.assertNotEqual(render(group, full), render(group, ab_only))
-                self.assertFalse(evaluate(cancel, ab_only))
+                self.assertEqual(render(group, full), render(group, ab_only))
+                self.assertFalse(cancel)
                 self.assertEqual(
                     self.scheduled(workflow, ab_only),
-                    ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
+                    [
+                        "pr-admission",
+                        "docs-scope",
+                        "beam-performance-ab-only",
+                        "benchmark-blocking",
+                    ],
                 )
                 self.assertEqual(render(gate["name"], ab_only), "Beam V1 performance A/B gate")
-                self.assertEqual(self.scheduled(workflow, removed), [])
+                self.assertEqual(self.scheduled(workflow, removed), ["pr-admission"])
                 for status, expected in (("success", 0), ("failure", 1), ("skipped", 1)):
                     results = dict.fromkeys(gate["needs"], "skipped")
                     results["beam-performance-ab-only"] = status
                     self.assertEqual(self.run_gate(results, ab_only).returncode, expected)
                 unready_update = context("synchronize", ready=False, abtest=True, base_ref=base)
-                self.assertEqual(self.scheduled(workflow, unready_update), ["benchmark-blocking"])
+                self.assertEqual(
+                    self.scheduled(workflow, unready_update), ["pr-admission", "benchmark-blocking"]
+                )
                 self.assertEqual(
                     render(gate["name"], unready_update), "Beam V1 performance A/B gate"
                 )
@@ -574,7 +626,9 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                     context("unlabeled", ready=False, label="ready", base_ref=base),
                     context("converted_to_draft", draft=True, base_ref=base),
                 ):
-                    self.assertEqual(self.scheduled(workflow, event), ["benchmark-blocking"])
+                    self.assertEqual(
+                        self.scheduled(workflow, event), ["pr-admission", "benchmark-blocking"]
+                    )
                     self.assertEqual(
                         self.run_gate(dict.fromkeys(gate["needs"], "skipped"), event).returncode, 1
                     )
@@ -625,7 +679,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         ):
             with self.subTest(event=github.event):
                 running = self.scheduled(workflow, github)
-                self.assertEqual(running, ["benchmark-blocking"])
+                self.assertEqual(running, ["pr-admission", "benchmark-blocking"])
                 self.assertEqual(render(gate["name"], github), "Benchmark blocking gate")
                 results = {
                     need: "success" if need in running else "skipped" for need in gate["needs"]
