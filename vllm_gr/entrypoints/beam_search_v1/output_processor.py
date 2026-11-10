@@ -10,6 +10,7 @@ from typing import Any, NoReturn
 
 from vllm.inputs import tokens_input
 
+from vllm_gr.entrypoints.beam_admission import beam_output_top_k
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchEngineError
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OfflineBeamSearchRequest,
@@ -85,6 +86,20 @@ def _output_suffix(sequence: BeamOutputSequence, end_token_id: int | None) -> li
     return suffix
 
 
+def _limited_sequences(
+    sequences: Sequence[BeamOutputSequence], limit: int | None
+) -> Sequence[BeamOutputSequence]:
+    """Keep the best ``limit`` sequences (the engine returns them best first).
+
+    Truncating before detokenization and public-output construction is what
+    makes a smaller result set cheaper: a caller that only reads the top-k of a
+    wide beam no longer pays for decoding and serializing the rest.
+    """
+    if limit is None or len(sequences) <= limit:
+        return sequences
+    return sequences[:limit]
+
+
 def _can_share_prompt_decode(tokenizer: Any, prepared_prompt: Sequence[int]) -> bool:
     try:
         from tokenizers.decoders import ByteLevel
@@ -106,7 +121,7 @@ def _can_share_prompt_decode(tokenizer: Any, prepared_prompt: Sequence[int]) -> 
 class _V1BeamTailMaterializer:
     """Populate one V1 Beam on first public access using PR380's lazy class."""
 
-    __slots__ = ("_tokenizer", "_prepared", "_shared_prompt", "_prompt_text")
+    __slots__ = ("_prepared", "_prompt_text", "_shared_prompt", "_tokenizer")
 
     def __init__(self, tokenizer: Any, prepared_prompt: Sequence[int]) -> None:
         self._tokenizer = tokenizer
@@ -232,7 +247,7 @@ class BeamSearchOutputProcessor:
             return converted
         except BeamSearchEngineError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - conversion boundary
             _raise_engine_error("output_conversion_failed", str(exc))
 
     def process_online_outputs(
@@ -249,13 +264,15 @@ class BeamSearchOutputProcessor:
 
             from vllm.outputs import CompletionOutput, RequestOutput
 
+            output_top_k = beam_output_top_k()
             results = []
             for item in output.items:
                 item_index = item.item_index
+                sequences = _limited_sequences(item.sequences, output_top_k)
                 completion_token_ids = [
                     ([] if begin_token_id is None else [begin_token_id])
                     + _output_suffix(sequence, end_token_id)
-                    for sequence in item.sequences
+                    for sequence in sequences
                 ]
                 texts = fast_batch_decode(self.tokenizer, completion_token_ids)
                 lora_request = request.items[item_index].request.lora_request
@@ -271,7 +288,7 @@ class BeamSearchOutputProcessor:
                         lora_request=lora_request,
                     )
                     for choice_index, (sequence, token_ids, text) in enumerate(
-                        zip(item.sequences, completion_token_ids, texts, strict=True)
+                        zip(sequences, completion_token_ids, texts, strict=True)
                     )
                 ]
                 prompt_token_ids = original[item_index]
@@ -292,5 +309,5 @@ class BeamSearchOutputProcessor:
             return results
         except BeamSearchEngineError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - conversion boundary
             _raise_engine_error("output_conversion_failed", str(exc))

@@ -80,7 +80,9 @@ def beam_search_dispatch(
         if gr_config.beam_execution_mode is not BeamExecutionMode.V1:
             raise ValueError("trie_ids require GR beam_search_v1")
         trie_kwargs["trie_ids"] = trie_ids
-    return impl(
+    from vllm_gr.entrypoints.beam_admission import admitted_stream
+
+    inner = impl(
         self,
         prompt=prompt,
         request_id=request_id,
@@ -90,6 +92,10 @@ def beam_search_dispatch(
         session_id=session_id,
         **trie_kwargs,
     )
+    # Admission bounds the sessions this process offers the engine and answers
+    # overload with 429 instead of an unbounded queue; the slot is released, and
+    # an abandoned session closed, when the caller stops consuming ``inner``.
+    return admitted_stream(inner)
 
 
 def patch_beam_search():
