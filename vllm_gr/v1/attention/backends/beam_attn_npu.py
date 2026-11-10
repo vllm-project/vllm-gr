@@ -186,49 +186,33 @@ def cascade_attention(
             suffix_v_buf = beam_session.suffix_v_buf
             suffix_k_buf[:total_kv] = pool_k.permute(0, 2, 1, 3).reshape(-1, H, D)
             suffix_v_buf[:total_kv] = pool_v.permute(0, 2, 1, 3).reshape(-1, H, D)
-
-            suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                beam_query,
-                suffix_k_buf[:total_kv],
-                suffix_v_buf[:total_kv],
-                num_query_heads=attn_metadata.num_heads,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
-                actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
-                softmax_scale=scale,
-                atten_mask=attn_metadata.npu_causal_atten_mask,
-                block_table=None,
-                block_size=0,
-                sparse_mode=3,
-                inner_precise=0,
-                input_layout="TND",
-                return_softmax_lse=True,
-            )
+            suffix_k = suffix_k_buf[:total_kv]
+            suffix_v = suffix_v_buf[:total_kv]
         else:
             # Standard (recompute) path: extract_suffix_kv from paged cache
-            contig_k, contig_v = extract_suffix_kv_pytorch(
+            suffix_k, suffix_v = extract_suffix_kv_pytorch(
                 key_cache,
                 value_cache,
                 attn_metadata.suffix_slot_mapping_out,
             )
 
-            suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                beam_query,
-                contig_k,
-                contig_v,
-                num_query_heads=attn_metadata.num_heads,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
-                actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
-                softmax_scale=scale,
-                atten_mask=attn_metadata.npu_causal_atten_mask,
-                block_table=None,
-                block_size=0,
-                sparse_mode=3,
-                inner_precise=0,
-                input_layout="TND",
-                return_softmax_lse=True,
-            )
+        suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
+            beam_query,
+            suffix_k,
+            suffix_v,
+            num_query_heads=attn_metadata.num_heads,
+            num_key_value_heads=attn_metadata.num_kv_heads,
+            actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
+            actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
+            softmax_scale=scale,
+            atten_mask=attn_metadata.npu_causal_atten_mask,
+            block_table=None,
+            block_size=0,
+            sparse_mode=3,
+            inner_precise=0,
+            input_layout="TND",
+            return_softmax_lse=True,
+        )
 
         out, _ = merge_tnd_attention_outputs(
             prefix_out,
