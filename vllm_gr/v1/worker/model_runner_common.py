@@ -1054,7 +1054,9 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
             device=selected_ids.device,
         )
     elif workspace is not None:
-        from vllm_gr.v1.beam.beam_decision import get_beam_postprocess_workspace
+        from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
+            get_beam_postprocess_workspace,
+        )
 
         fixed = get_beam_postprocess_workspace(runner, int(token_ids.shape[1]))
         if fixed is not None and token_ids.shape[0] <= fixed.max_batch:

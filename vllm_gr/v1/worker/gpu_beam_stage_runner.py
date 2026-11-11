@@ -45,10 +45,10 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchResult,
 )
-from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRExecutionCapacity,
     GRRetireMetadata,

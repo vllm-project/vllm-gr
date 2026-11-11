@@ -949,7 +949,7 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
     from unittest.mock import Mock
 
     from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode, GRConfig
-    from vllm_gr.v1.beam.beam_decision import (
+    from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
     )

@@ -35,7 +35,6 @@ from vllm_gr.ops.cuda.beam_state import (
     _validate_step_kernel,
 )
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspace
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.beam.cpu_reference import (
@@ -43,6 +42,7 @@ from vllm_gr.v1.beam.cpu_reference import (
     select_initial_beams,
     select_next_beams,
 )
+from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.worker.beam_final_output import _PayloadLayout
 from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
 
