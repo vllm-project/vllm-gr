@@ -113,6 +113,7 @@ class CUDAConstraintBackend:
         out_prefill_status: torch.Tensor | None = None,
         out_prefill_payload: torch.Tensor | None = None,
         device_step: torch.Tensor | None = None,
+        specialize_steps: bool = False,
         validate: bool = True,
         build_output: bool = True,
     ) -> ConstraintOutput | None:
@@ -194,6 +195,7 @@ class CUDAConstraintBackend:
             }
             if not validate:
                 launch_kwargs["device_step"] = device_step
+                launch_kwargs["specialize_steps"] = specialize_steps
                 launch_kwargs["out_prefill_status"] = out_prefill_status
                 launch_kwargs["out_prefill_payload"] = out_prefill_payload
             launch_out(
@@ -231,6 +233,41 @@ class CUDAConstraintBackend:
         if self._state is not _BackendState.INITIALIZING:
             raise RuntimeError("only an initializing CUDA constraint backend can become ready")
         self._state = _BackendState.READY
+
+    def warmup_stage_topk(self, dtype: torch.dtype) -> None:
+        """Warm V2's device-step kernel for every supported candidate-capacity bucket."""
+        device = self._tables()[0].device
+        vocab_size = (
+            self.vocab_slice[1]
+            if self.vocab_slice is not None
+            else self.info.table_metadata.vocab_size
+        )
+        logits = torch.zeros((1, vocab_size), dtype=dtype, device=device)
+        prefixes = torch.zeros((1, 3), dtype=torch.int32, device=device)
+        temperatures = torch.ones(1, dtype=torch.float32, device=device)
+        step = torch.zeros(1, dtype=torch.int32, device=device)
+        trie_ids = torch.zeros(1, dtype=torch.int32, device=device)
+        max_top_k = self.info.max_top_k
+        token_ids = torch.empty((1, max_top_k), dtype=torch.int32, device=device)
+        logprobs = torch.empty((1, max_top_k), dtype=torch.float32, device=device)
+        valid_mask = torch.empty((1, max_top_k), dtype=torch.bool, device=device)
+        valid_counts = torch.empty(1, dtype=torch.int32, device=device)
+        # K itself, row counts and strides do not specialize the kernel. One K
+        # per power-of-two output capacity covers all admitted request widths;
+        # each launch compiles all three device-selected SID branches together.
+        for power in range((max_top_k - 1).bit_length() + 1):
+            top_k = min(1 << power, max_top_k)
+            self.select_out_unchecked(
+                logits,
+                ConstraintMetadata(prefixes, temperatures, 0, top_k, trie_ids),
+                out_token_ids=token_ids,
+                out_logprobs=logprobs,
+                out_valid_mask=valid_mask,
+                out_valid_counts=valid_counts,
+                device_step=step,
+                specialize_steps=True,
+            )
+        torch.accelerator.synchronize(device)
 
     def select(self, logits: torch.Tensor, metadata: ConstraintMetadata) -> ConstraintOutput:
         if self._state is not _BackendState.READY:
@@ -281,6 +318,7 @@ class CUDAConstraintBackend:
         out_prefill_status: torch.Tensor | None = None,
         out_prefill_payload: torch.Tensor | None = None,
         device_step: torch.Tensor | None = None,
+        specialize_steps: bool = False,
     ) -> None:
         """Write to a prevalidated persistent Worker workspace.
 
@@ -305,6 +343,7 @@ class CUDAConstraintBackend:
             out_prefill_status=out_prefill_status,
             out_prefill_payload=out_prefill_payload,
             device_step=device_step,
+            specialize_steps=specialize_steps,
             validate=False,
             build_output=False,
         )

@@ -23,6 +23,7 @@ def test_every_operation_is_abstract() -> None:
     assert {
         "persistent_graph_install",
         "supports_transposed_head",
+        "specialize_constraint_steps",
         "required_constraint_rows",
         "forward_hidden",
         "prefill_logits",
@@ -44,6 +45,7 @@ def test_incomplete_implementation_cannot_be_instantiated() -> None:
     class Incomplete(CudaStageHooks):  # type: ignore[misc]
         persistent_graph_install = False
         supports_transposed_head = False
+        specialize_constraint_steps = False
 
         @staticmethod
         def required_constraint_rows(batch_size: int, beam_width: int) -> int:
@@ -71,6 +73,7 @@ def test_validate_rejects_a_different_hooks_class() -> None:
     class First(CudaStageHooks):  # type: ignore[misc]
         persistent_graph_install = False
         supports_transposed_head = False
+        specialize_constraint_steps = False
 
         @staticmethod
         def required_constraint_rows(batch_size: int, beam_width: int) -> int:

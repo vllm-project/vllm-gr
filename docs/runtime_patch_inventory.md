@@ -302,6 +302,16 @@ and Decode capture policy remain active when this cache is disabled.
       CPU mirrors and per-dispatch sampling indices; unsupported batches fall back;
     - instance-local CUDA graph manager and capture registry;
     - graph-memory profiling lifecycle and temporary KV-cache ownership.
+- V2 constrained selection uses device-selected SID branches with complete
+  stage-specific candidate capacities. The `CudaStageHooks` contract requires
+  an explicit specialization policy from both V1 and V2 implementations.
+  V2 alone prepares these kernels before
+  initial or replacement table publication, covering all supported K capacity
+  buckets and model/output-head dtypes. `tests/kernels/test_stage_topk_v2.py`
+  checks exact selection parity, unequal multi-Trie stage capacities, changing
+  device steps under CUDA replay and absence of request-time JIT cache misses
+  after warmup. Constraint lifecycle tests cover preparation before publication
+  and cleanup on preparation failure.
 - V2 Prefill fast-path validation: `tests/kernels/test_gr_prefill_v2.py` compares
   registration and fused inputs with native CUDA state, including reused slots,
   cached/chunked inputs, padding, pending-write fallback and failed submission

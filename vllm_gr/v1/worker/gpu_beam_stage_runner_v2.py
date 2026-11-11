@@ -52,6 +52,7 @@ class CudaStageHooksV2(CudaStageHooks):
     persistent_graph_install: ClassVar[bool] = False
     # Both runners allocate and use the transposed head only when slicing is requested.
     supports_transposed_head: ClassVar[bool] = True
+    specialize_constraint_steps: ClassVar[bool] = True
 
     def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
         from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2InputBuffers

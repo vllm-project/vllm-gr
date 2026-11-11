@@ -46,6 +46,11 @@ class CudaStageHooks(ABC):
     def supports_transposed_head(self) -> bool:
         """Whether sliced sampling can use the transposed LM head."""
 
+    @property
+    @abstractmethod
+    def specialize_constraint_steps(self) -> bool:
+        """Whether device-driven Top-K uses complete SID-stage capacities."""
+
     def __init__(self, worker: Any) -> None:
         self.worker = worker
 

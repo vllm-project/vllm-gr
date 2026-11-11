@@ -82,8 +82,11 @@ def test_apply_v2_runner_patches_stamps_markers(
             return 0
 
     native_methods = {name: getattr(Runner, name) for name in ("sample", "finish_requests")}
+    constraint_load = Mock(wraps=v2.make_load_model_with_constraint_backend)
+    monkeypatch.setattr(v2, "make_load_model_with_constraint_backend", constraint_load)
     monkeypatch.setattr(v2, "discover_worker_runners", lambda: (("GPUModelRunnerV2", Runner),))
     v2._apply_v2_runner_patches()
+    assert constraint_load.call_args.kwargs["prepare_backend"] is v2._warmup_constraint_backend
 
     # Input preparation/registration have guarded GR specializations; native
     # sampling and request retirement remain unchanged.

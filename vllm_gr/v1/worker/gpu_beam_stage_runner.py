@@ -982,6 +982,7 @@ class GPUBeamStageRunner:
                         out_valid_mask=candidates[2],
                         out_valid_counts=self.counts[:rows],
                         device_step=self.constraint_steps,
+                        specialize_steps=self.hooks.specialize_constraint_steps,
                     )
                 else:
                     sliced = self.hidden is not None

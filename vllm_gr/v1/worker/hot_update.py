@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -41,11 +42,29 @@ def _load_trie(runner: Any, path: str) -> Any:
     return backend
 
 
-def versioned_constraint_table(runner: Any, backend: Any) -> VersionedConstraintTable:
-    """Wrap the loaded backend once, keeping the runner's original attribute."""
+def versioned_constraint_table(
+    runner: Any,
+    backend: Any,
+    *,
+    prepare_backend: Callable[[Any, Any], None] | None = None,
+) -> VersionedConstraintTable:
+    """Finish runner-specific preparation before initial or replacement publication."""
+    if prepare_backend is not None:
+        prepare_backend(runner, backend)
+
+    def load(path: str) -> Any:
+        candidate = _load_trie(runner, path)
+        try:
+            if prepare_backend is not None:
+                prepare_backend(runner, candidate)
+        except BaseException:
+            candidate.close()
+            raise
+        return candidate
+
     return VersionedConstraintTable(
         backend,
-        loader=lambda path: _load_trie(runner, path),
+        loader=load,
         retention_seconds=float(os.environ.get("VLLM_GR_TRIE_RETENTION_SECONDS", "60")),
         before_release=lambda: _sync(runner),
     )

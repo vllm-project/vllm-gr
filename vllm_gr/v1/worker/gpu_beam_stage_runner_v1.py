@@ -24,6 +24,7 @@ class CudaStageHooksV1(CudaStageHooks):
 
     persistent_graph_install: ClassVar[bool] = True
     supports_transposed_head: ClassVar[bool] = True
+    specialize_constraint_steps: ClassVar[bool] = False
 
     def forward_hidden(
         self,

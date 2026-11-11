@@ -85,7 +85,11 @@ def _runner_vocab_size(runner: object) -> int:
 
 
 def make_load_model_with_constraint_backend(
-    original: Any, *, max_batch: int = 1, close_runtime: Any = None
+    original: Any,
+    *,
+    max_batch: int = 1,
+    close_runtime: Any = None,
+    prepare_backend: Callable[[Any, Any], None] | None = None,
 ) -> Any:
     """Load weights first, then atomically publish a ready canonical Backend."""
 
@@ -168,10 +172,6 @@ def make_load_model_with_constraint_backend(
             model_memory_usage = int(getattr(self, "model_memory_usage", 0))
             self.model_memory_usage = model_memory_usage + backend.info.device_memory_bytes
 
-            # Publication is the atomic boundary. The loader returns an NPU
-            # Backend only after readiness and returns an immediately usable CPU
-            # Backend, so requests never observe a partially initialized object.
-            self.constraint_backend = backend
             if getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.CUDA:
                 # Import GPU layers only after selecting the CUDA backend.
                 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -207,7 +207,10 @@ def make_load_model_with_constraint_backend(
                     self.model_memory_usage += projection.device_memory_bytes
             from vllm_gr.v1.worker.hot_update import versioned_constraint_table
 
-            self.constraint_backend = versioned_constraint_table(self, backend)
+            # Publish only after readiness and runner-specific kernel warmup.
+            self.constraint_backend = versioned_constraint_table(
+                self, backend, prepare_backend=prepare_backend
+            )
             return result
         except BaseException:
             projection = getattr(self, "_gr_npu_stage_projection", None)

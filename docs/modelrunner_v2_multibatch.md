@@ -59,6 +59,21 @@ installs a fresh GR plan and allocates output storage for the new model.
 Decode replay also checks the captured model, context and input storage before
 launching.
 
+V2 constrained selection branches on the current device SID stage. Each branch
+calls the shared CUDA Top-K kernel with that stage's complete maximum candidate
+degree. Full-window score normalization and exact score/tie ordering remain
+shared. This avoids processing first-stage padding in later stages without
+predicting progress on the Host. V1 retains table-wide capacity for
+device-driven selection. The `CudaStageHooks` contract requires an explicit
+`specialize_constraint_steps` policy: `False` for V1 and `True` for V2.
+
+V2 warms the stage-specialized kernel before publishing the initial constraint
+backend or a replacement Trie. Warmup covers every supported power-of-two K
+capacity for the model and configured output-head dtypes, including the table's
+current stage degrees and Trie count. A capacity change therefore compiles
+during table loading rather than the first request. Failed warmup releases the
+candidate backend before it can become active.
+
 ### V1 compatibility boundary
 
 ModelRunner V1 retains the behavior of the rebased parent `7ee1d95`: the GR
@@ -100,12 +115,13 @@ adapter and does not import either CUDA implementation.
 V1 retains stage-owned storage and lazy graph capture. V2 selects fixed Worker
 storage, configured startup graph capture, batched Backend admission and
 full-member retirement; its existing dynamic-shape recapture and recoverable
-failure handling remain in the V2 implementation. The V2 installer alone supplies the extended
-Backend capacity and runtime cleanup callback. Shared graph construction has
-an optional graph class; V2 uses a subclass for storage/model validation.
+failure handling remain in the V2 implementation. The V2 installer alone supplies
+the extended Backend capacity, kernel preparation and runtime cleanup callbacks.
+Shared graph construction has an optional graph class; V2 uses a subclass for
+storage/model validation.
 There is no new environment switch or duplicated Beam state machine.
 
-The contracts document the existing eleven operations and two policy flags,
+The contracts document eleven operations and three policy flags,
 including Prefill row ordering/counter updates, the V1 Host-input fence, input
 storage lifetime and capture recovery. They do not move remaining native field
 cleanup out of the core or unify graph policies. The dedicated mypy group checks
@@ -196,6 +212,7 @@ state and actual CUDA replay check request order and storage reuse.
 | Logical member order, retirement and Backend capacity policy | `tests/test_v2_multibatch.py` |
 | Native row/slot reuse and unchanged request state | `tests/kernels/test_gpu_beam_stage_v2_state.py` |
 | Batched registration and fused input parity, cached offsets, token-block boundaries, padding and atomic fallback | `tests/kernels/test_gr_prefill_v2.py` |
+| SID-stage capacity, exact outputs and changing device step under replay | `tests/kernels/test_stage_topk_v2.py` |
 | B-switch replay, fixed storage, configured B=3/7 and 6/8, per-shape fallback | `tests/kernels/test_v2_multibatch_graphs.py` |
 | Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
 | Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |

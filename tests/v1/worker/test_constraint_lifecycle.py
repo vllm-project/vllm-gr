@@ -116,15 +116,42 @@ def test_weights_then_readiness_then_publication_and_memory(
         load_backend,
     )
 
+    def prepare_backend(owner: Any, candidate: Any) -> None:
+        assert owner is runner
+        assert candidate is backend
+        assert runner.constraint_backend is None
+        events.append("prepare")
+
     wrapped = (
         make_load_model_with_constraint_backend(original)
         if max_batch == 1
-        else make_load_model_with_constraint_backend(original, max_batch=max_batch)
+        else make_load_model_with_constraint_backend(
+            original, max_batch=max_batch, prepare_backend=prepare_backend
+        )
     )
     assert wrapped(runner) == "loaded"
-    assert events == ["weights", "readiness"]
+    assert events == ["weights", "readiness"] + (["prepare"] if max_batch > 1 else [])
     assert runner.constraint_backend.get() is backend
     assert runner.model_memory_usage == 137
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_preparation_failure_closes_unpublished_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _runner()
+    backend = _Backend()
+    monkeypatch.setattr("vllm_gr.constraints.loader.load_constraint_backend", lambda **kw: backend)
+
+    def fail_preparation(owner: Any, candidate: Any) -> None:
+        assert owner.constraint_backend is None
+        assert candidate is backend
+        raise RuntimeError("kernel warmup failed")
+
+    with pytest.raises(RuntimeError, match="kernel warmup failed"):
+        make_load_model_with_constraint_backend(
+            lambda self: None, prepare_backend=fail_preparation
+        )(runner)
+    assert runner.constraint_backend is None
+    assert backend.close_calls == 1
 
 
 def test_loader_failure_never_publishes_backend(
