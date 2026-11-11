@@ -247,3 +247,156 @@ def test_full_rejects_corrupt_phase_even_with_another_pass(tmp_path: Path) -> No
         }
     )
     assert runner.audit_report(report, None, rc)["status"] == "FAILED"
+
+
+def test_p0_manifest_requires_reviewed_exact_nodes() -> None:
+    manifest = json.loads((ROOT / "tools/ci/npu_test_suites.json").read_text(encoding="utf-8"))
+    manifest["tiers"]["p0"]["frozen"] = False
+    with pytest.raises(ValueError, match="not frozen"):
+        runner.p0_groups(manifest)
+    node = "tests/test_npu_ci_runner.py::test_allocated_device_and_vendor_paths_survive"
+    tier = manifest["tiers"]["p0"]
+    tier.update(frozen=True, expected_count=2, required_passes=2, allowed_skips=0)
+    tier["groups"] = {"first": {"expected_count": 2, "nodes": [node, node]}}
+    with pytest.raises(ValueError, match="duplicated"):
+        runner.p0_groups(manifest)
+
+
+def _group_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    groups: dict[str, dict[str, Any]] = {
+        name: {"expected_count": 1, "nodes": [f"tests/test_probe.py::test_{name}"]}
+        for name in ("first", "second")
+    }
+    environments = []
+
+    def execute(argv: list[str], env: dict[str, str], log: Path, timeout: int | None) -> int:
+        assert argv[0] == sys.executable
+        assert timeout == 30
+        assert "--basetemp=" + str(log.parent / "basetemp") in argv
+        environments.append(env)
+        name = log.parent.name
+        node = groups[name]["nodes"][0]
+        selected = [node]
+        if outcome == "extra" and name == "first":
+            selected.append("tests/test_probe.py::unfrozen")
+        reports = [
+            {"nodeid": item, "phase": phase, "outcome": "passed"}
+            for item in selected
+            for phase in ("setup", "call", "teardown")
+        ]
+        if name == "first" and outcome in ("failed", "skipped"):
+            reports[1]["outcome"] = outcome
+        rc = 1 if name == "first" and outcome == "failed" else 0
+        runner.write_json(
+            Path(env["VLLM_GR_NPU_TEST_REPORT"]),
+            {
+                "selected": [{"nodeid": item} for item in selected],
+                "reports": reports,
+                "collection_skips": (
+                    [{"detail": "dependency missing"}]
+                    if outcome == "collection_skip" and name == "first"
+                    else []
+                ),
+                "exitstatus": rc,
+            },
+        )
+        (log.parent / "junit.xml").write_text("<testsuites/>", encoding="utf-8")
+        if name == "first" and outcome == "cleanup":
+            raise RuntimeError("owned process cleanup was required")
+        return rc
+
+    monkeypatch.setattr(runner, "run_command", execute)
+    result = runner.run_p0_groups(groups, {"ASCEND_RT_VISIBLE_DEVICES": "3"}, tmp_path, 30)
+    return result, environments
+
+
+@pytest.mark.parametrize("outcome", ["failed", "skipped", "extra", "collection_skip"])  # type: ignore[misc]
+def test_p0_failed_group_preserves_evidence_and_later_nodes_are_not_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    result, environments = _group_probe(tmp_path, monkeypatch, outcome)
+    assert result["status"] == "FAILED"
+    assert len(environments) == 1
+    assert result["groups"]["first"]["status"] == "FAILED"
+    assert result["groups"]["second"]["status"] == "NOT_RUN"
+    assert result["nodes"]["tests/test_probe.py::test_second"] == "NOT_RUN"
+    assert (tmp_path / "groups/first/result.json").is_file()
+    assert not (tmp_path / "groups/second").exists()
+
+
+def test_p0_groups_use_distinct_process_reports_and_aggregate_actual_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, environments = _group_probe(tmp_path, monkeypatch, "passed")
+    assert result["status"] == "PASSED"
+    assert result["counts"] == {"PASSED": 2}
+    assert result["phase_counts"] == {"setup:passed": 2, "call:passed": 2, "teardown:passed": 2}
+    assert len({env["VLLM_GR_NPU_TEST_REPORT"] for env in environments}) == 2
+    assert all(env["ASCEND_RT_VISIBLE_DEVICES"] == "3" for env in environments)
+    failed, _ = _group_probe(tmp_path / "cleanup", monkeypatch, "cleanup")
+    assert failed["status"] == "FAILED"
+    assert failed["counts"] == {"PASSED": 1, "NOT_RUN": 1}
+    assert failed["phase_counts"] == {"setup:passed": 1, "call:passed": 1, "teardown:passed": 1}
+    assert "cleanup" in failed["groups"]["first"]["command_error"]
+
+
+def test_p0_post_execution_source_error_cannot_leave_passed_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "p0"
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--device",
+            "3",
+            "--tier",
+            "p0",
+            "--output-dir",
+            str(output),
+        ],
+    )
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "3")
+    monkeypatch.setenv("VLLM_GR_TEST_MODEL", str(model))
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
+    inspections = iter([{"content_sha256": "initial"}, OSError("source unavailable")])
+
+    def identity() -> dict[str, Any]:
+        value = next(inspections)
+        if isinstance(value, OSError):
+            raise value
+        assert isinstance(value, dict)
+        return value
+
+    monkeypatch.setattr(runner, "source_identity", identity)
+    monkeypatch.setattr(
+        runner, "p0_groups", lambda manifest: {"probe": {"expected_count": 1, "nodes": ["test"]}}
+    )
+    monkeypatch.setattr(runner, "run_command", lambda *args: 0)
+    monkeypatch.setattr(
+        runner,
+        "run_p0_groups",
+        lambda *args: {
+            "status": "PASSED",
+            "problems": [],
+            "commands": [],
+            "pytest_returncode": 0,
+        },
+    )
+    assert runner.main() == 1
+    receipt = json.loads((output / "result.json").read_text(encoding="utf-8"))
+    assert receipt["status"] == "FAILED"
+    assert receipt["error"] == "source unavailable"

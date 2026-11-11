@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Run the existing full suite or an explicit, incomplete NPU P0 candidate."""
+"""Run the full NPU suite, an incomplete candidate, or grouped P0 acceptance."""
 
 from __future__ import annotations
 
@@ -78,6 +78,36 @@ def candidate_nodes(manifest: dict[str, Any]) -> list[str]:
         if "::" not in node or not (ROOT / path).is_file():
             raise ValueError(f"Candidate test does not exist: {node}")
     return nodes
+
+
+def p0_groups(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Require an explicitly frozen, exact selection before starting P0."""
+    if manifest.get("schema_version") != 1:
+        raise ValueError("Unsupported NPU suite manifest schema")
+    tier = manifest["tiers"]["p0"]
+    if tier.get("frozen") is not True:
+        raise ValueError("P0 selection is not frozen; collect and review its exact nodes first")
+    groups = tier["groups"]
+    nodes = []
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError("P0 requires named test groups")
+    for name, group in groups.items():
+        if not name or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in name):
+            raise ValueError("P0 group names must be safe directory names")
+        if not group["nodes"] or len(group["nodes"]) != group["expected_count"]:
+            raise ValueError(f"P0 group count disagrees with its node list: {name}")
+        for node in group["nodes"]:
+            path = Path(node.split("::", 1)[0])
+            if path.is_absolute() or ".." in path.parts or path.parts[0] != "tests":
+                raise ValueError(f"P0 node must be below tests/: {node}")
+            if "::" not in node or not (ROOT / path).is_file():
+                raise ValueError(f"P0 test does not exist: {node}")
+        nodes.extend(group["nodes"])
+    if len(nodes) != len(set(nodes)) or len(nodes) != tier["expected_count"]:
+        raise ValueError("P0 node list is duplicated or has an incorrect count")
+    if tier["allowed_skips"] != 0 or tier["required_passes"] != len(nodes):
+        raise ValueError("Every P0 node must execute and pass")
+    return groups
 
 
 def source_identity() -> dict[str, Any]:
@@ -271,15 +301,115 @@ def audit_report(report: dict[str, Any], expected: list[str] | None, rc: int) ->
     }
 
 
+def run_p0_groups(
+    groups: dict[str, dict[str, Any]],
+    env: dict[str, str],
+    output: Path,
+    timeout: int,
+) -> dict[str, Any]:
+    """Isolate host fixtures from native/model tests without changing Python."""
+    results: dict[str, Any] = {
+        name: {
+            "status": "NOT_RUN",
+            "expected_count": group["expected_count"],
+            "nodes": dict.fromkeys(group["nodes"], "NOT_RUN"),
+        }
+        for name, group in groups.items()
+    }
+    commands = []
+    stopped = False
+    for name, group in groups.items():
+        if stopped:
+            continue
+        directory = output / "groups" / name
+        directory.mkdir(parents=True, exist_ok=False)
+        report_path = directory / "pytest-events.json"
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-x",
+            "--run-slow",
+            "--durations=10",
+            "-s",
+            "-p",
+            "npu_pytest_report",
+            "-p",
+            "pytest_timeout",
+            "-p",
+            "pytest_asyncio.plugin",
+            "--junitxml=" + str(directory / "junit.xml"),
+            "--basetemp=" + str(directory / "basetemp"),
+            *group["nodes"],
+        ]
+        commands.append(command)
+        item = results[name]
+        item.update(status="RUNNING", command=command, evidence_dir=str(directory))
+        write_json(directory / "result.json", item)
+        rc = 1
+        try:
+            rc = run_command(
+                command,
+                dict(env, VLLM_GR_NPU_TEST_REPORT=str(report_path)),
+                directory / "pytest.log",
+                timeout,
+            )
+            item["pytest_returncode"] = rc
+        except (OSError, ValueError, RuntimeError) as error:
+            item["command_error"] = str(error)
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            item.update(audit_report(report, group["nodes"], rc))
+            item["phase_counts"] = dict(
+                Counter(
+                    f"{event['phase']}:{event['outcome']}" for event in report.get("reports", [])
+                )
+            )
+            if report.get("collection_skips") or not (directory / "junit.xml").is_file():
+                item["status"] = "FAILED"
+                item["problems"].append("collection skipped a module or JUnit evidence is missing")
+            if "command_error" in item:
+                item["status"] = "FAILED"
+                item["problems"].append("group command or process cleanup failed")
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+            item.update(status="FAILED", error=str(error))
+        stopped = item["status"] != "PASSED"
+        write_json(directory / "result.json", item)
+    nodes = {
+        node: item["nodes"].get(node, "MISSING")
+        for name, group in groups.items()
+        for node in group["nodes"]
+        for item in (results[name],)
+    }
+    phase_counts: Counter[str] = Counter()
+    for item in results.values():
+        phase_counts.update(item.get("phase_counts", {}))
+    problems = [
+        f"{name}: {item['status']}" for name, item in results.items() if item["status"] != "PASSED"
+    ]
+    if any(outcome != "PASSED" for outcome in nodes.values()):
+        problems.append("not every frozen P0 node passed")
+    return {
+        "status": "FAILED" if problems else "PASSED",
+        "problems": problems,
+        "counts": dict(Counter(nodes.values())),
+        "nodes": nodes,
+        "groups": results,
+        "phase_counts": dict(phase_counts),
+        "commands": commands,
+        "pytest_returncode": 1 if problems else 0,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", required=True)
-    parser.add_argument("--tier", choices=("full", "p0-candidate"), default="full")
+    parser.add_argument("--tier", choices=("full", "p0-candidate", "p0"), default="full")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--timeout",
         type=int,
-        help="Pytest deadline in seconds (candidate: 1800; full: surrounding job deadline)",
+        help="Pytest deadline in seconds (candidate/P0 group: 1800; full: job deadline)",
     )
     args = parser.parse_args()
     if args.timeout is not None and args.timeout <= 0:
@@ -299,7 +429,17 @@ def main() -> int:
         env = device_environment(args.device, dict(os.environ))
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         expected = candidate_nodes(manifest) if args.tier == "p0-candidate" else None
-        write_json(output / "suite.json", manifest if expected is not None else {"tier": "full"})
+        groups = p0_groups(manifest) if args.tier == "p0" else None
+        if groups is not None:
+            result["groups"] = {
+                name: {
+                    "status": "NOT_RUN",
+                    "expected_count": group["expected_count"],
+                    "nodes": dict.fromkeys(group["nodes"], "NOT_RUN"),
+                }
+                for name, group in groups.items()
+            }
+        write_json(output / "suite.json", manifest if args.tier != "full" else {"tier": "full"})
         before = source_identity()
         write_json(output / "source.json", before)
         result["device"] = args.device
@@ -307,11 +447,11 @@ def main() -> int:
             "caller; this runner does not acquire or release a device lease"
         )
         result["model"] = env.get("VLLM_GR_TEST_MODEL")
-        if expected is not None:
+        if args.tier != "full":
             model = Path(env.get("VLLM_GR_TEST_MODEL", ""))
             if not env.get("VLLM_GR_TEST_MODEL") or not (model / "config.json").is_file():
                 raise ValueError(
-                    "p0-candidate requires VLLM_GR_TEST_MODEL pointing to a local model"
+                    f"{args.tier} requires VLLM_GR_TEST_MODEL pointing to a local model"
                 )
             env.update(
                 HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
@@ -336,6 +476,18 @@ def main() -> int:
                 command, env, output / f"preflight-{index}.log", min(args.timeout or 120, 120)
             ):
                 raise RuntimeError(f"NPU preflight {index} failed; tests were not run")
+        if groups is not None:
+            grouped = run_p0_groups(groups, env, output, args.timeout or 1800)
+            result["commands"].extend(grouped.pop("commands"))
+            result.update(grouped)
+            result["source_unchanged"] = (
+                before["content_sha256"] == source_identity()["content_sha256"]
+            )
+            if not result["source_unchanged"]:
+                result["status"] = "FAILED"
+                result["problems"].append("source changed during P0 execution")
+            rc = 0 if result["status"] == "PASSED" else 1
+            return rc
         report_path = output / "pytest-events.json"
         env["VLLM_GR_NPU_TEST_REPORT"] = str(report_path)
         command = [

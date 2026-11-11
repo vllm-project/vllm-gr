@@ -189,4 +189,236 @@ def test_forward_probe_observes_real_arguments_and_restores(
     json.dumps(events, allow_nan=False)
 
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("fails", [False, True])
+def test_forward_probe_explicit_b1_b4_cold_metadata_is_snapshotted(
+    batch_size: int, fails: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    total = batch_size * 128
+    request_ids = tuple(f"r{row}" for row in range(batch_size))
+    input_ids = torch.arange(total)
+    positions = torch.arange(128).repeat(batch_size)
+    query_start = torch.arange(batch_size + 1) * 128
+    context = SimpleNamespace(
+        cudagraph_runtime_mode="NONE",
+        skip_compiled=False,
+        attn_metadata={"layer.0": SimpleNamespace(query_start_loc=query_start)},
+    )
+    calls = []
+
+    class Runner:
+        _prefill_graph_runner: Any
+        requests: dict[str, Any]
+        _current_scheduler_output: Any
+
+        def _model_forward(self, num_tokens_padded: int, input_ids: Any, positions: Any) -> int:
+            calls.append(num_tokens_padded)
+            self._prefill_graph_runner._replays_by_bucket[total] += 1
+            input_ids.fill_(99)
+            query_start.fill_(99)
+            for request_id in request_ids:
+                self.requests[request_id].num_computed_tokens = 99
+                self.requests[request_id].prompt_token_ids.clear()
+                self._current_scheduler_output.num_scheduled_tokens[request_id] = 1
+            if fails:
+                raise ValueError("original matrix forward error")
+            return 17
+
+    runner: Any = Runner()
+    runner._prefill_graph_runner = SimpleNamespace(_replays_by_bucket={total: 2})
+    runner.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode="NONE", cudagraph_mode="NONE", cudagraph_capture_sizes=[]
+        )
+    )
+    runner.model_config = SimpleNamespace(enforce_eager=True)
+    runner.model = object()
+    runner.input_batch = SimpleNamespace(req_ids=list(request_ids))
+    runner.requests = {
+        request_id: SimpleNamespace(num_computed_tokens=0, prompt_token_ids=list(range(128)))
+        for request_id in request_ids
+    }
+    runner._current_scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={request_id: 128 for request_id in request_ids},
+        total_num_scheduled_tokens=total,
+    )
+    runner._gr_npu_stage_plan = SimpleNamespace(
+        execution=SimpleNamespace(
+            batch_size=batch_size, stage_index=0, kind="prefill", request_ids=request_ids
+        ),
+        model_token_count=total,
+    )
+    probe = NPUForwardTrace(
+        runner, lambda: context, expected_batch_size=batch_size, record_cold=True
+    )
+    try:
+        with monkeypatch.context() as guard:
+
+            def forbidden(*args: Any, **kwargs: Any) -> None:
+                raise AssertionError("host transfer inside model forward")
+
+            guard.setattr(torch.Tensor, "cpu", forbidden)
+            guard.setattr(torch.Tensor, "tolist", forbidden)
+            if fails:
+                with pytest.raises(ValueError, match="original matrix forward error"):
+                    runner._model_forward(total, input_ids, positions)
+            else:
+                assert runner._model_forward(total, input_ids, positions) == 17
+    finally:
+        events = probe.finish()
+    assert "_model_forward" not in vars(runner)
+    assert calls == [total]
+    assert events[0]["input_ids"] == list(range(total))
+    assert events[0]["attention"]["query_start_loc"] == [row * 128 for row in range(batch_size + 1)]
+    assert events[0]["cold_rows"] == [
+        dict(num_computed_tokens=0, prompt_tokens=128, scheduled_tokens=128) for _ in request_ids
+    ]
+    assert events[0]["scheduled_total"] == total
+    assert events[0]["gr_prefill_replay_delta"] == {str(total): 1}
+
+
+@pytest.mark.parametrize("batch_size,padded", [(1, 128), (4, 512), (2, 0), (2, 513)])
+def test_forward_probe_default_b2_guard_is_preserved(batch_size: int, padded: int) -> None:
+    calls = []
+
+    def original(num_tokens_padded: int) -> None:
+        calls.append(num_tokens_padded)
+
+    runner = SimpleNamespace(
+        _model_forward=original,
+        _gr_npu_stage_plan=SimpleNamespace(execution=SimpleNamespace(batch_size=batch_size)),
+        vllm_config=SimpleNamespace(compilation_config=None),
+    )
+    probe = NPUForwardTrace(runner, lambda: SimpleNamespace())
+    try:
+        with pytest.raises(RuntimeError, match="unexpected or unbounded shape"):
+            runner._model_forward(padded)
+    finally:
+        assert probe.finish() == []
+    assert runner._model_forward is original and calls == []
+
+
+@pytest.fixture
+def p0_matrix_helpers() -> dict[str, Any]:
+    source = Path(__file__).parent / "st/test_onerec_v1_npu_p0_matrix.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    names = {"_matrix_environment", "_assert_matrix_trace", "_npu_test_unavailable"}
+    nodes: list[ast.stmt] = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    namespace: dict[str, Any] = {
+        "Any": Any,
+        "Mapping": Mapping,
+        "pytest": pytest,
+        "_INPUT_LEN": 128,
+        "_BEAM_WIDTH": 128,
+    }
+    exec("import os", namespace)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("graph", [False, True])
+def test_p0_matrix_trace_requires_actual_inputs_and_replays(
+    batch_size: int, graph: bool, p0_matrix_helpers: dict[str, Any]
+) -> None:
+    prompts = [[row] * 127 for row in range(batch_size)]
+    total = batch_size * 128
+    prefill = dict(
+        stage=0,
+        kind="prefill",
+        actual_tokens=total,
+        padded_tokens=total,
+        input_ids_shape=[total],
+        positions_shape=[total],
+        input_ids=[token for prompt in prompts for token in [*prompt, 999]],
+        positions=list(range(128)) * batch_size,
+        input_request_ids=[f"r{row}" for row in range(batch_size)],
+        attention=dict(
+            query_start_loc=[row * 128 for row in range(batch_size + 1)],
+            seq_lens=[128] * batch_size,
+        ),
+        cold_rows=[
+            dict(num_computed_tokens=0, prompt_tokens=128, scheduled_tokens=128) for _ in prompts
+        ],
+        scheduled_total=total,
+        gr_prefill_replay_delta={str(total): 1} if graph else {},
+        enforce_eager=not graph,
+        compilation_mode="VLLM_COMPILE" if graph else "NONE",
+        runtime_mode="NONE",
+        skip_compiled=False,
+    )
+    decode = dict(
+        kind="decode",
+        actual_tokens=total,
+        padded_tokens=total,
+        gr_prefill_replay_delta={},
+        enforce_eager=not graph,
+        compilation_mode="VLLM_COMPILE" if graph else "NONE",
+        runtime_mode="FULL" if graph else "NONE",
+    )
+    events = [prefill, dict(stage=1, **decode), dict(stage=2, **decode)]
+    check = p0_matrix_helpers["_assert_matrix_trace"]
+    check(events, prompts, 999, graph=graph)
+    for mutation in (
+        {"input_ids": [0] * total},
+        {"positions": [0] * total},
+        {"padded_tokens": total + 128},
+        {"cold_rows": [dict(num_computed_tokens=1, prompt_tokens=128, scheduled_tokens=127)]},
+        {"gr_prefill_replay_delta": {"wrong-bucket": 1}},
+    ):
+        with pytest.raises(AssertionError):
+            check([dict(prefill, **mutation), *events[1:]], prompts, 999, graph=graph)
+    if graph:
+        with pytest.raises(AssertionError):
+            check(
+                [dict(prefill, gr_prefill_replay_delta={}), *events[1:]], prompts, 999, graph=True
+            )
+        with pytest.raises(AssertionError):
+            check(
+                [prefill, dict(events[1], runtime_mode="NONE"), events[2]], prompts, 999, graph=True
+            )
+
+
+def test_p0_matrix_environment_is_exact_and_does_not_change_device_assignment(
+    p0_matrix_helpers: dict[str, Any],
+) -> None:
+    inherited = {
+        "ASCEND_RT_VISIBLE_DEVICES": "8",
+        "VLLM_ASCEND_ENABLE_NZ": "1",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "TORCH_MULTIPROCESSING_METHOD": "fork",
+        "VLLM_ENABLE_PREFILL_CUDAGRAPH": "0",
+        "VLLM_GR_PREFILL_GRAPH_BUCKETS": "8192",
+        "VLLM_GR_PREFILL_GRAPH_KV_BOUND": "65536",
+        "VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS": "512,4",
+        "VLLM_GR_TEST_PADDED_PREFILL": "1",
+    }
+    result = p0_matrix_helpers["_matrix_environment"](inherited)
+    assert result["ASCEND_RT_VISIBLE_DEVICES"] == "8"
+    assert result["VLLM_GR_TARGET_DEVICE"] == "npu"
+    assert result["TORCH_MULTIPROCESSING_METHOD"] == "spawn"
+    assert result["VLLM_ASCEND_ENABLE_NZ"] == "0"
+    assert result["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
+    assert result["VLLM_ENABLE_PREFILL_CUDAGRAPH"] == "1"
+    assert result["VLLM_GR_PREFILL_GRAPH_BUCKETS"] == "128,512"
+    assert result["VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS"] == ""
+    assert "VLLM_GR_PREFILL_GRAPH_KV_BOUND" not in result
+    assert "VLLM_GR_TEST_PADDED_PREFILL" not in result
+    assert inherited["VLLM_ENABLE_PREFILL_CUDAGRAPH"] == "0"
+
+
+def test_p0_matrix_required_npu_cannot_skip(
+    p0_matrix_helpers: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unavailable = p0_matrix_helpers["_npu_test_unavailable"]
+    monkeypatch.setenv("VLLM_GR_TARGET_DEVICE", "npu")
+    with pytest.raises(pytest.fail.Exception, match="required NPU P0 runtime"):
+        unavailable("operators missing")
+    monkeypatch.setenv("VLLM_GR_TARGET_DEVICE", "cuda")
+    with pytest.raises(pytest.skip.Exception, match="operators missing"):
+        unavailable("operators missing")

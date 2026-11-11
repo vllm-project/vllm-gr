@@ -272,6 +272,16 @@ class TestRunTestNPUDevice(unittest.TestCase):
         self.assertIn("runner-env:0:true:spawn:spawn", self.events())
         self.assertNotIn("device-selection", self.events())
 
+    def test_formal_p0_is_passed_without_reallocating_the_device(self) -> None:
+        result = self.run_script("--npu-device", "8", "--npu-tier", "p0", inherited="8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "runner<tools/ci/run_npu_tests.py><--device><8><--tier><p0>"
+            "<--output-dir><results/npu-tests>",
+            self.events(),
+        )
+        self.assertNotIn("device-selection", self.events())
+
     def test_explicit_tier_without_device_keeps_legacy_selection(self) -> None:
         result = self.run_script("--npu-tier", "full")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -303,7 +313,7 @@ class TestRunTestNPUDevice(unittest.TestCase):
         for arguments in (
             ("--npu-device",),
             ("--npu-tier",),
-            ("--npu-tier", "p0"),
+            ("--npu-tier", "not-a-tier"),
             ("--npu-results-dir",),
             ("--npu-results-dir", ""),
             ("--unexpected",),

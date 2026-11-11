@@ -13,7 +13,7 @@ NPU_OPT_IN=false
 CLI_DEVICE_ID=""
 
 usage() {
-    echo "Usage: $0 [--wheel] [--device-id N] [--npu-device N] [--npu-tier full|p0-candidate] [--npu-results-dir DIR]"
+    echo "Usage: $0 [--wheel] [--device-id N] [--npu-device N] [--npu-tier full|p0-candidate|p0] [--npu-results-dir DIR]"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -50,8 +50,8 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --npu-tier)
-            if [[ $# -lt 2 || ( "$2" != full && "$2" != p0-candidate ) ]]; then
-                echo "--npu-tier requires full or p0-candidate" >&2
+            if [[ $# -lt 2 || ( "$2" != full && "$2" != p0-candidate && "$2" != p0 ) ]]; then
+                echo "--npu-tier requires full, p0-candidate or p0" >&2
                 exit 1
             fi
             NPU_TIER=$2
