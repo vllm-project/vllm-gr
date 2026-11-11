@@ -1302,32 +1302,13 @@ def apply_constrained_sample_override(
     ``make_patched_execute_model``) and ``_current_scheduler_output`` (its
     ``_gr_request_row_configs``), both published before sampling runs.
     """
-    beam_data = getattr(runner, "_current_beam_data", None)
-    if not beam_data:
-        return
-    scheduler_output = getattr(runner, "_current_scheduler_output", None)
-    request_row_configs = (
-        getattr(scheduler_output, "_gr_request_row_configs", None)
-        if scheduler_output is not None
-        else None
-    )
-    if not request_row_configs:
-        return
-
-    rows = collect_constrained_rows(request_row_configs, beam_data)
+    rows = collect_constrained_override_rows(runner)
     if not rows:
         return
 
-    _validate_homogeneous_step(request_row_configs, beam_data)
-
-    widths = {mdata["beam_width"] for _, _, _, mdata in rows}
-    if len(widths) != 1:
-        raise RuntimeError(
-            f"constrained step mixes beam_widths {sorted(widths)}; "
-            "mixed-width Constraint Table batches are not supported yet (P8)"
-        )
-    width = next(iter(widths))
-    candidate_width = _constraint_candidate_width(runner, rows[0][3], rows[0][0], width)
+    req_id, _, _, beam_metadata = rows[0]
+    beam_width = beam_metadata["beam_width"]
+    candidate_width = _constraint_candidate_width(runner, beam_metadata, req_id, beam_width)
 
     adapter = get_or_create_execution_adapter(runner)
     top_tokens, top_logprobs, valid_mask, global_rows = run_constrained_partition(
@@ -1339,25 +1320,12 @@ def apply_constrained_sample_override(
 
 
 def collect_constrained_override_rows(runner: Any) -> list[tuple[Any, int, int, dict[str, Any]]]:
-    """Return the constrained rows for the runner's current step, if any.
-
-    Thin pre-check for the sampler short-circuit path: same collection walk
-    as ``apply_constrained_sample_override`` (rows + homogeneous validation)
-    without running the operator, so ``patched_sample`` can decide whether
-    the original sampler is needed before paying for it.
-    """
-    beam_data = getattr(runner, "_current_beam_data", None)
-    if not beam_data:
-        return []
-    scheduler_output = getattr(runner, "_current_scheduler_output", None)
-    request_row_configs = (
-        getattr(scheduler_output, "_gr_request_row_configs", None)
-        if scheduler_output is not None
-        else None
-    )
-    if not request_row_configs:
+    """Collect and validate constrained rows for both sampler paths."""
+    context = _sampling_context(runner)
+    if context is None:
         return []
 
+    beam_data, request_row_configs = context
     rows = collect_constrained_rows(request_row_configs, beam_data)
     if not rows:
         return []
