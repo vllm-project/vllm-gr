@@ -271,6 +271,26 @@ def _gather_shared_blocks(
     return gathered_key, gathered_value, remapped_table
 
 
+def _direct_attention_output(
+    output: torch.Tensor, query: torch.Tensor, attn_metadata: BeamAttentionMetadata
+) -> torch.Tensor | None:
+    """Only pure Beam rows have a caller-owned contiguous leading view."""
+    if attn_metadata.std_indices is not None:
+        return None
+    from vllm_gr.ops.npu._xattention_out import x_attention_out_available
+
+    # Most deployments initially use the original allocating binding. Its
+    # cached absence must not add per-layer output views or format/alias checks.
+    if not x_attention_out_available():
+        return None
+    if not output.is_contiguous() or query.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    view = output[: attn_metadata.num_prefix_indices]
+    if view.shape != query.shape or view.dtype != query.dtype or view.device != query.device:
+        return None
+    return view
+
+
 def _xllm_incremental_decode(
     output: torch.Tensor,
     query: torch.Tensor,
@@ -359,6 +379,7 @@ def _xllm_incremental_decode(
         shared_key = key_cache.contiguous()
         shared_value = value_cache.contiguous()
 
+    direct_output = _direct_attention_output(output, beam_query, attn_metadata)
     out = beam_ops.x_attention(
         beam_query,
         shared_key,
@@ -369,7 +390,10 @@ def _xllm_incremental_decode(
         seqlens_kv,
         step_count,
         0.0,  # auto 1/sqrt(head_dim), validated above
+        out=direct_output,
     )
+    if direct_output is not None:
+        return
     # Scatter into the layer output: slice copy for a pure beam batch (rows
     # [0, num_prefix_indices) are exactly the beam rows; index_put_ here was
     # a host-blocking op), fancy-index scatter otherwise.

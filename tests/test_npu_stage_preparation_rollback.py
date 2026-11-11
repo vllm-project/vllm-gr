@@ -22,7 +22,7 @@ from vllm_gr.v1.worker.npu_beam_stage_runner import (
     execute_npu_gr_retirement,
 )
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
 
 def _scheduled(*, prefill: bool = False, dynamic: bool = False) -> Any:
