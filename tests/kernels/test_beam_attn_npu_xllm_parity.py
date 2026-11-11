@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -63,6 +64,60 @@ HEAD_DIM = 128
 BLOCK_SIZE = 128
 MAX_DECODE_STEPS = 8
 NUM_LAYERS = 1
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("case", "expected"),
+    [
+        ("eligible", None),
+        ("not_beam_decode", "not_beam_decode"),
+        ("missing_beam_session", "missing_beam_session"),
+        ("inactive_beam_session", "inactive_beam_session"),
+        ("mixed_std_beam_batch", "mixed_std_beam_batch"),
+        ("missing_prefix_indices", "missing_prefix_indices"),
+        ("sliding_window", "sliding_window"),
+        ("logits_soft_cap", "logits_soft_cap"),
+        ("attention_sinks", "attention_sinks"),
+        ("alibi", "alibi"),
+        ("missing_beam_pool", "missing_beam_pool"),
+    ],
+)
+def test_xllm_cascade_fallback_reason(case: str, expected: str | None) -> None:
+    metadata = SimpleNamespace(
+        is_beam_decode=True,
+        beam_session=SimpleNamespace(is_active=True),
+        std_indices=None,
+        prefix_indices=object(),
+    )
+    kwargs: dict[str, Any] = {
+        "sliding_window_size": None,
+        "logits_soft_cap": 0.0,
+        "s_aux": None,
+        "alibi_slopes": None,
+        "beam_pool": object(),
+    }
+    if case == "not_beam_decode":
+        metadata.is_beam_decode = False
+    elif case == "missing_beam_session":
+        metadata.beam_session = None
+    elif case == "inactive_beam_session":
+        metadata.beam_session.is_active = False
+    elif case == "mixed_std_beam_batch":
+        metadata.std_indices = object()
+    elif case == "missing_prefix_indices":
+        metadata.prefix_indices = None
+    elif case == "sliding_window":
+        kwargs["sliding_window_size"] = (-1, 0)
+    elif case == "logits_soft_cap":
+        kwargs["logits_soft_cap"] = 1.0
+    elif case == "attention_sinks":
+        kwargs["s_aux"] = object()
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = object()
+    elif case == "missing_beam_pool":
+        kwargs["beam_pool"] = None
+
+    assert beam_attn_npu_xllm._cascade_fallback_reason(metadata, **kwargs) == expected
 
 
 def _build_incremental_metadata(
