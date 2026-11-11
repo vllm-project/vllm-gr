@@ -1408,8 +1408,6 @@
     "tests/test_benchmark_branch_policy.py::TestBenchmarkBranchPolicy::test_all_npu_profiles_preserve_custom_performance_and_pangu": "l1",
     "tests/test_benchmark_branch_policy.py::TestBenchmarkBranchPolicy::test_resolver_cli_unified_npu_and_strict_fallback": "l1",
     "tests/test_benchmark_branch_policy.py::TestBenchmarkBranchPolicy::test_workflow_branch_and_device_scope": "l1",
-    "tests/test_benchmark_policy_bootstrap.py::BenchmarkPolicyBootstrapTest::test_workflow_bootstrap": "l1",
-    "tests/test_benchmark_policy_runtime.py::BenchmarkPolicyRuntimeTest::test_runtime": "l1",
     "tests/test_build_constraint_triples.py::test_ab_to_c_key_does_not_collide_on_comma_in_tokens": "l1",
     "tests/test_build_constraint_triples.py::test_accepts_tuple_sequences": "l1",
     "tests/test_build_constraint_triples.py::test_compile_string_is_valid_json": "l1",

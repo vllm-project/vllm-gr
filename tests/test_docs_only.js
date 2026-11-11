@@ -79,3 +79,14 @@ test('requires the A/B label and the same snapshot at both reads', async () => {
     {docsOnly: false, files: []});
   }
 });
+
+test('a recomputed test merge commit still classifies the same pull request', async () => {
+  const files = [{status: 'modified', filename: 'docs/readme.md'}];
+  const live = {state: 'open', number: 577, draft: false, labels: [{name: 'ready'}],
+    head: {sha: head}, base: {sha: base}, merge_commit_sha: merge, changed_files: 1};
+  // GitHub rebuilds this throwaway commit when the base branch advances. A run
+  // that waited in the queue must still classify an unchanged pull request.
+  const later = {...live, merge_commit_sha: 'd'.repeat(40)};
+  assert.deepEqual(await classifyFiles(files, {snapshots: [live, later]}),
+    {docsOnly: true, files: ['docs/readme.md']});
+});

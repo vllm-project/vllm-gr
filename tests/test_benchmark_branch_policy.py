@@ -47,7 +47,7 @@ class TestBenchmarkBranchPolicy(unittest.TestCase):
         step = next(
             item
             for item in workflow["jobs"]["benchmark-policy"]["steps"]
-            if item.get("name") == "Resolve base-owned benchmark policy"
+            if item.get("name") == "Resolve benchmark policy"
         )
         self.assertEqual(
             step["env"]["POLICY_TARGET_BRANCH"],

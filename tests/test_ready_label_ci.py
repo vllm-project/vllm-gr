@@ -368,6 +368,64 @@ class TestReadyLabelCI(unittest.TestCase):
             0,
         )
 
+    @pytest.mark.l1  # type: ignore[misc]
+    def test_blocking_gate_names_the_root_cause_not_every_blocked_check(self) -> None:
+        # One failing prerequisite skips the rest. The gate must point at the
+        # job that actually failed, and describe the others as blocked by it,
+        # otherwise a single root cause reads as six independent failures and
+        # sends reviewers after the wrong thing.
+        job = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]
+        success = dict.fromkeys(job["needs"], "success")
+        success["beam-performance-ab-only"] = "skipped"
+        broken = {
+            **success,
+            "benchmark-policy": "failure",
+            "pre-commit": "skipped",
+            "decode-benchmark": "skipped",
+            "pangu-offline": "skipped",
+            "pangu-online": "skipped",
+        }
+        # A/B can also fail when no cached result exists. Report the failed
+        # prerequisite before the A/B freshness check in either case.
+        for fresh, ab_status in ((True, "skipped"), (False, "failure")):
+            broken["beam-performance-ab-only"] = ab_status
+            result = self.run_gate(broken, ab_fresh=fresh, ab_passed=fresh)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            errors = [line for line in result.stdout.splitlines() if "::error::" in line]
+            self.assertTrue(errors, result.stdout)
+            # The first annotation must be the root cause, not a blocked check. The
+            # gate reports the result variables it evaluates, not the job identifiers.
+            self.assertIn("POLICY_RESULT", errors[0])
+            for blocked in (
+                "PRE_COMMIT_RESULT",
+                "DECODE_RESULT",
+                "PANGU_OFFLINE_RESULT",
+                "PANGU_ONLINE_RESULT",
+            ):
+                self.assertNotIn(
+                    f"{blocked} did not pass",
+                    " ".join(errors),
+                    "blocked checks must not be reported as failures",
+                )
+            # Exactly one annotation per group: the failure and the blocked set.
+            self.assertLessEqual(len(errors), 2, "\n".join(errors))
+
+    @pytest.mark.l1  # type: ignore[misc]
+    def test_blocking_gate_reports_pure_skips_as_unrun_not_failed(self) -> None:
+        # Nothing failed, but required checks did not run. That must still fail
+        # the gate, and must say so plainly rather than blaming a nonexistent
+        # failure.
+        job = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]
+        success = dict.fromkeys(job["needs"], "success")
+        success["beam-performance-ab-only"] = "skipped"
+        skipped = {**success, "benchmark-policy": "skipped", "pre-commit": "skipped"}
+        result = self.run_gate(skipped, ab_fresh=True, ab_passed=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        errors = [line for line in result.stdout.splitlines() if "::error::" in line]
+        self.assertTrue(errors, result.stdout)
+        self.assertIn("did not run", errors[0])
+        self.assertNotIn("failed and blocked", " ".join(errors))
+
     def test_ab_only_has_separate_check_and_does_not_run_on_drafts(self) -> None:
         workflow = self.workflows["pre-commit.yml"]
         gate = workflow["jobs"]["benchmark-blocking"]

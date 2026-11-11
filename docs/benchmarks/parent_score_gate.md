@@ -99,17 +99,21 @@ own accuracy floors.
 An independent Jenkins pipeline must load the updated policy and resolver.
 Updating this repository does not update that external pipeline automatically.
 
-## Rollout order
+## Policy revision
 
-GitHub Actions uses the resolver from the PR target's pinned `base.sha`. A
-changed candidate policy can be used only after the required approval for the
-current PR head. The independent Jenkins pipeline may use a different policy
-source; confirm its effective source and thresholds in its own logs.
+GitHub Actions reads the policy and resolver from the same fixed `github.sha`
+checkout as the tests. For a PR this is the test merge, so both the base's
+threshold updates and the PR's policy edits are included. Policy, resolver, and
+test changes can land together through ordinary PR review. See the
+[CI policy guide](../ci/benchmark-policy-approvals.md).
+The independent Jenkins pipeline may use a different policy source; confirm
+its effective source and thresholds in its own logs.
 
 After updating the runtime PR, check the **Resolve benchmark policy** job's
 summary for the source ref, the device's policy selector above, and the effective
 floors. If the selector is missing or the old floors remain, check that the run
-includes the workflow selector and that its base contains the policy update.
+includes the workflow selector and that its tested commit contains the policy
+update.
 
 ## Validation without accelerator inference
 
