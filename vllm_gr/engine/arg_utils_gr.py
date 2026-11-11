@@ -23,7 +23,6 @@ from vllm_gr.config import (
     GRConfigInput,
     write_canonical_gr_config,
 )
-from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
 from vllm_gr.config.parser import (
     BEAM_ENGINE_DRIVEN_KEY,
     GR_CONFIG_KEY,
@@ -578,49 +577,12 @@ def create_engine_config(self, usage_context=None, headless=False):
             beam_width_configured=beam_width_configured,
             worker_decision=effective_beam_worker_decision,
         )
-        offset, slice_size = None, None
-        # CUDA Constraint Tables support sliced logits while keeping global
-        # table token ids (CUDAConstrainedTopKExecution._vocab_window).  The
-        # slice helper accepts both Trie lists and triples documents, so keep
-        # the old lm_head fast path on CUDA. NPU retains its full-vocabulary
-        # ABI and validate_constraint_table_platform rejects slicing there.
-        constraint_slice_supported = (
-            effective_constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
-            or _is_cuda_platform()
-        )
-        if (
-            effective_constrained_generation is not False
-            and effective_catalog_path is not None
-            and effective_catalog_path != AUTO_CONSTRAINT_TABLE_PATH
-            and constraint_slice_supported
-        ):
-            model_name = getattr(self, "model", None)
-            if model_name is not None:
-                from vllm_gr.utils.catalog import (
-                    compute_catalog_slice_config,
-                )
-
-                trust_remote_code = bool(getattr(self, "trust_remote_code", False))
-                offset, slice_size = compute_catalog_slice_config(
-                    effective_catalog_path,
-                    model_name,
-                    trust_remote_code=trust_remote_code,
-                )
-                if offset is not None and slice_size is not None:
-                    from vllm_gr.ops.sliced_logits import set_vocab_slice_config
-
-                    set_vocab_slice_config(offset, slice_size)
-
         effective_gr_config = replace(
             existing_gr_config,
             catalog_path=effective_catalog_path,
             constraint_backend=effective_constraint_backend,
             attention_backend=(
                 backend_override if backend_is_explicit else existing_gr_config.attention_backend
-            ),
-            vocab_offset=offset if offset is not None else existing_gr_config.vocab_offset,
-            vocab_slice_size=(
-                slice_size if slice_size is not None else existing_gr_config.vocab_slice_size
             ),
             beam_graph_enabled=(
                 existing_gr_config.beam_graph_enabled and not getattr(self, "no_beam_graph", False)
