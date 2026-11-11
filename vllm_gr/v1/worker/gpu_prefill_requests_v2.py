@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from vllm_gr import stage_profile
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 
 if TYPE_CHECKING:
@@ -78,6 +79,7 @@ def _apply_fused_prefill_state_writes(worker: Any) -> None:
         apply_gr_prefill_state_writes_v2,
     )
 
+    start_ns = stage_profile.now()
     states = worker.req_states
     block_table = worker.block_tables.block_tables[0]
     tokens = states.all_token_ids._staged_write_contents
@@ -97,6 +99,7 @@ def _apply_fused_prefill_state_writes(worker: Any) -> None:
         BLOCK_TABLE_STRIDE=block_table.gpu.stride(0),
         BLOCK=256,
     )
+    payload_start = stage_profile.now()
     if count == 1:
         req_index = states.total_len._staged_write_indices[0]
         payload: npt.NDArray[np.int32] = np.empty(2 + len(tokens) + len(block_ids), dtype=np.int32)
@@ -104,6 +107,13 @@ def _apply_fused_prefill_state_writes(worker: Any) -> None:
         payload[1] = states.num_computed_tokens._staged_write_contents[0]
         payload[2 : 2 + len(tokens)] = token_array
         payload[2 + len(tokens) :] = block_ids
+        stage_profile.durations(
+            "worker_fused_payload",
+            start_ns=payload_start,
+            rows=1,
+            tokens=len(tokens),
+            blocks=len(block_ids),
+        )
         packed = array_h2d(payload, torch.int32, worker.device)
         apply_gr_prefill_state_writes_v2[((max(len(tokens), len(block_ids)) + 255) // 256,)](
             packed, *targets, req_index, len(tokens), len(block_ids), **strides
@@ -130,6 +140,13 @@ def _apply_fused_prefill_state_writes(worker: Any) -> None:
         header[:, 6] = header_size + len(tokens) + block_ends - header[:, 5]
         payload[header_size : header_size + len(tokens)] = token_array
         payload[header_size + len(tokens) :] = block_ids
+        stage_profile.durations(
+            "worker_fused_payload",
+            start_ns=payload_start,
+            rows=count,
+            tokens=len(tokens),
+            blocks=len(block_ids),
+        )
         extent = max(int(header[:, 4].max()), int(header[:, 6].max()))
         packed = array_h2d(payload, torch.int32, worker.device)
         apply_gr_prefill_batch_state_writes_v2[(count, (extent + 255) // 256)](
@@ -145,6 +162,13 @@ def _apply_fused_prefill_state_writes(worker: Any) -> None:
         block_table,
     ):
         tensor.clear_staged_writes()
+    stage_profile.durations(
+        "worker_fused_flush",
+        start_ns=start_ns,
+        rows=count,
+        tokens=len(tokens),
+        blocks=len(block_ids),
+    )
 
 
 def try_add_gr_prefill_requests(worker: Any, scheduler_output: "SchedulerOutput") -> bool:
@@ -197,6 +221,19 @@ def try_add_gr_prefill_requests(worker: Any, scheduler_output: "SchedulerOutput"
             return False
 
     fuse_writes = _can_fuse_prefill_state_writes(worker, scheduler_output, new_reqs)
+    computed_rows = sum(1 for request in new_reqs if request.num_computed_tokens)
+    stage_profile.count("prefill_fused" if fuse_writes else "prefill_unfused")
+    if not fuse_writes:
+        stage_profile.count(
+            "prefill_unfused_computed" if computed_rows else "prefill_unfused_other"
+        )
+        if stage_profile.enabled():
+            stage_profile.record(
+                "prefill_decline",
+                rows=len(new_reqs),
+                computed_rows=computed_rows,
+            )
+    register_start = stage_profile.now()
     # Keep native CPU registration and slot lifecycle. The optional fused
     # flush writes the same native state; other GR Prefills retain individual
     # staged writes. Native sampler initialization remains unnecessary here.
@@ -226,4 +263,11 @@ def try_add_gr_prefill_requests(worker: Any, scheduler_output: "SchedulerOutput"
     else:
         worker.req_states.apply_staged_writes()
     worker.model_state.apply_staged_writes()
+    stage_profile.durations(
+        "worker_prefill_register",
+        start_ns=register_start,
+        fused=fuse_writes,
+        rows=len(new_reqs),
+        computed_rows=computed_rows,
+    )
     return True

@@ -14,6 +14,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 from vllm.v1.engine import EngineCoreRequest
 
+from vllm_gr import stage_profile
 from vllm_gr.config import GRConfig, resolve_candidate_width
 from vllm_gr.config.models import ConstraintTableBackendEnum
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
@@ -350,13 +351,18 @@ class BeamSearchInputProcessor:
         sampling_params, begin_token_id, end_token_id = _create_request_params(
             call.params, tokenizer, vllm_config=self.engine.vllm_config
         )
+        preprocess_start = stage_profile.now()
         engine_inputs = llm._preprocess_cmpl(call.prompts)
+        stage_profile.durations(
+            "frontend_preprocess", start_ns=preprocess_start, items=len(engine_inputs)
+        )
         lora_requests = llm._lora_request_to_seq(call.lora_request, len(engine_inputs))
         engine_requests = []
         original_prompts = []
         arrival_time = time.time()
         supported_tasks = self.engine.get_supported_tasks()
         for engine_input, lora_request in zip(engine_inputs, lora_requests, strict=True):
+            item_start = stage_profile.now()
             engine_request = self.engine.input_processor.process_inputs(
                 _generate_request_id(),
                 engine_input,
@@ -365,12 +371,22 @@ class BeamSearchInputProcessor:
                 arrival_time=arrival_time,
                 lora_request=lora_request,
             )
+            input_done = stage_profile.now()
             original = _prepare_prompt(engine_request, begin_token_id)
+            prompt_done = stage_profile.now()
+            if stage_profile.enabled():
+                stage_profile.record(
+                    "frontend_item",
+                    req=engine_request.request_id,
+                    process_inputs_us=(input_done - item_start) / 1000.0,
+                    prepare_prompt_us=(prompt_done - input_done) / 1000.0,
+                )
             if call.output_mode == "compact":
                 original_prompts.append(tuple(original))
             self.engine.input_processor.assign_request_id(engine_request)
             engine_requests.append(engine_request)
         session_id = engine_requests[0].request_id
+        build_start = stage_profile.now()
         request = _create_batch_request(
             session_id=session_id,
             engine_requests=tuple(engine_requests),
@@ -378,6 +394,7 @@ class BeamSearchInputProcessor:
             vllm_config=self.engine.vllm_config,
             trie_ids=call.trie_ids,
         )
+        stage_profile.durations("frontend_build", start_ns=build_start, items=len(engine_requests))
         self.boundary_token_ids = (begin_token_id, end_token_id)
         self.original_prompt_token_ids = (
             tuple(original_prompts) if call.output_mode == "compact" else None

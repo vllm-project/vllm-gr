@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from vllm_gr import stage_profile
+
 
 class NumpyTokenBuffer:
     """Native Request's mutable token interface backed by a bounded array.
@@ -88,11 +90,22 @@ def initialize_numpy_request(request: Any, block_hasher: Any) -> Any:
     from vllm.v1.utils import ConstantList
 
     original = getattr(Request, "_gr_numpy_original", Request.from_engine_core_request.__func__)
+    start = stage_profile.now()
     native = original(Request, request, None)
+    native_done = stage_profile.now()
     native._all_token_ids = NumpyTokenBuffer(native._all_token_ids, native.max_tokens)
+    resize_done = stage_profile.now()
     native.all_token_ids = ConstantList(native._all_token_ids)
     native._block_hasher = block_hasher
     native.update_block_hashes()
+    if stage_profile.enabled():
+        stage_profile.record(
+            "core_request",
+            req=request.request_id,
+            native_init_us=(native_done - start) / 1000.0,
+            buffer_us=(resize_done - native_done) / 1000.0,
+            hash_us=(stage_profile.now() - resize_done) / 1000.0,
+        )
     return native
 
 
@@ -132,9 +145,20 @@ def install_numpy_scheduler_data() -> None:
         prefill_token_ids: Any = None,
         uses_mrope: bool = False,
     ) -> Any:
+        start = stage_profile.now()
         if isinstance(prefill_token_ids, NumpyTokenBuffer):
             prefill_token_ids = prefill_token_ids.copy()
-        return original(cls, request, block_ids, prefill_token_ids, uses_mrope=uses_mrope)
+        copied = stage_profile.now()
+        data = original(cls, request, block_ids, prefill_token_ids, uses_mrope=uses_mrope)
+        if stage_profile.enabled():
+            stage_profile.record(
+                "scheduler_new_request",
+                req=request.request_id,
+                copy_us=(copied - start) / 1000.0,
+                build_us=(stage_profile.now() - copied) / 1000.0,
+                tokens=len(prefill_token_ids) if prefill_token_ids is not None else 0,
+            )
+        return data
 
     setattr(from_request, "_gr_numpy_tokens", True)
     NewRequestData.from_request = classmethod(  # type: ignore[method-assign,assignment]

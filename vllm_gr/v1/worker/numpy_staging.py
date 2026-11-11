@@ -10,6 +10,8 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from vllm_gr import stage_profile
+
 
 class NumpyStagedContents:
     """Concatenate array chunks in bulk rather than list.extend per token."""
@@ -33,6 +35,7 @@ class NumpyStagedContents:
         self.extend(np.asarray([value], dtype=self.dtype))
 
     def array(self) -> npt.NDArray[Any]:
+        stage_profile.count("staged_array_calls")
         if not self.chunks:
             return np.empty(0, dtype=self.dtype)
         if len(self.chunks) == 1:
@@ -88,6 +91,9 @@ def install_numpy_staging() -> None:
     original_h2d = buffer_utils.async_tensor_h2d
 
     def stage_write(self: Any, index: int, start: int, values: Any) -> None:
+        stage_profile.count(
+            "stage_write_array" if isinstance(values, np.ndarray) else "stage_write_other"
+        )
         if not isinstance(values, np.ndarray):
             return original_stage(self, index, start, values)
         if index < 0 or start < 0 or values.ndim != 1:
@@ -105,13 +111,23 @@ def install_numpy_staging() -> None:
         self._staged_write_cu_lens.append(len(self._staged_write_contents))
 
     def async_tensor_h2d(data: Any, *args: Any, **kwargs: Any) -> Any:
-        if isinstance(data, NumpyStagedContents):
+        start_ns = stage_profile.now()
+        staged = isinstance(data, NumpyStagedContents)
+        if staged:
             data = data.array()
             # vLLM 0.30 accepts arrays directly. Keep received read-only storage
             # out of torch.from_numpy, which exposes writable Tensor access.
             if not data.flags.writeable:
                 data = data.copy()
-        return original_h2d(data, *args, **kwargs)
+        result = original_h2d(data, *args, **kwargs)
+        if stage_profile.enabled():
+            stage_profile.durations(
+                "worker_h2d",
+                start_ns=start_ns,
+                staged=staged,
+                nbytes=int(getattr(data, "nbytes", 0)),
+            )
+        return result
 
     setattr(stage_write, "_gr_numpy_tokens", True)
     cls.stage_write = stage_write  # type: ignore[method-assign]
