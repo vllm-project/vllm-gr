@@ -59,6 +59,11 @@ sinks, ALiBi and FP8, are rejected by the BSND guard. Device capture/replay
 errors are propagated rather than treated as ordinary graph misses. The TND
 update-before-replay stream ordering is retained.
 
+The TND graph path stages paged block tables in persistent contiguous rows.
+It retains the allocated column width and clears unused columns before FIA
+task updates. Narrowing the column dimension could otherwise introduce an
+extra layout-copy task that is absent from the captured task group.
+
 Padding and input/output copies add device work and memory use. Reduced FIA
 submission overhead does not guarantee lower latency for every length distribution.
 
