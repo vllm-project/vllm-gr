@@ -3,6 +3,8 @@
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import pytest
 
+pytest_plugins = ("tests.level_plugin",)
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--loops", action="store", default=1, type=int, help="number to test loops")

@@ -30,8 +30,9 @@ def test_npu_provider_passes_device() -> None:
 
 def test_npu_provider_creates_independent_instances() -> None:
     """Each call must create an independent stateful adapter (not a singleton)."""
-    first = npu.NPU_BACKEND.create_constrained_topk_execution()
-    second = npu.NPU_BACKEND.create_constrained_topk_execution()
+    # Table loading allocates tensors. Keep this CPU contract independent of NPU hardware.
+    first = npu.NPU_BACKEND.create_constrained_topk_execution(device="cpu")
+    second = npu.NPU_BACKEND.create_constrained_topk_execution(device="cpu")
 
     assert first is not second
     # Loading tables on one must not affect the other.

@@ -52,6 +52,7 @@ def test_probe_separates_capture_policy_from_backend_capacity(
     ) == (1024 if runner == "v2" else 128, expected)
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("length,steps", _SESSIONS)  # type: ignore[misc]
 def test_v2_parity_sessions_pass_constrained_request_validation(length: int, steps: int) -> None:
     from tests.st.test_onerec_v1_scheduler_st import _params

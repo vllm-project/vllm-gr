@@ -11,7 +11,7 @@ import torch
 
 from vllm_gr.v1.attention.backends import beam_attn
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
 
 @pytest.fixture

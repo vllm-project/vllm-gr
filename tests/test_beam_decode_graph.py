@@ -160,8 +160,70 @@ def capture_graph(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Mock, Mock]:
     monkeypatch.setattr(shared.torch.cuda, "current_stream", lambda _: stream)
     monkeypatch.setattr(shared.torch.cuda, "Stream", lambda **kw: Mock())
     monkeypatch.setattr(shared.torch.cuda, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(shared.torch.cuda, "graph_pool_handle", lambda: (0, 123))
     monkeypatch.setattr(shared, "set_cudagraph_capturing_enabled", capturing)
     return graph, stream, capturing
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_capture_rotates_private_pool_only_after_last_graph_is_discarded(
+    monkeypatch: pytest.MonkeyPatch, capture_graph: tuple[Any, Mock, Mock]
+) -> None:
+    graph, _stream, _capturing = capture_graph
+    new_pool = Mock(side_effect=[(0, 101), (0, 102)])
+    monkeypatch.setattr(shared.torch.cuda, "graph_pool_handle", new_pool)
+
+    def capture(_flag: bool) -> None:
+        if _flag:
+            graph.wrapper.concrete_cudagraph_entries[graph.descriptor] = SimpleNamespace(
+                cudagraph=Mock(), output="hidden"
+            )
+
+    graph.select(1, 4)
+    graph.capture(capture, persistent_install=False)
+    assert graph.wrapper.graph_pool == (0, 101)
+    graph.select(2, 4)
+    graph.capture(capture, persistent_install=False)
+    assert graph.wrapper.graph_pool == (0, 101)
+    graph.select(1, 4)
+    graph.discard_selected()
+    graph.select(2, 4)
+    survivor = graph.wrapper.concrete_cudagraph_entries[graph.descriptor].cudagraph
+    assert graph.replay() == "hidden"
+    survivor.replay.assert_called_once_with()
+    graph.discard_selected()
+    graph.select(1, 4)
+    graph.capture(capture, persistent_install=False)
+    assert graph.wrapper.graph_pool == (0, 102)
+    assert new_pool.call_count == 2
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_failed_first_capture_uses_a_fresh_pool_on_retry(
+    monkeypatch: pytest.MonkeyPatch, capture_graph: tuple[Any, Mock, Mock]
+) -> None:
+    graph, _stream, _capturing = capture_graph
+    new_pool = Mock(side_effect=[(0, 201), (0, 202)])
+    monkeypatch.setattr(shared.torch.cuda, "graph_pool_handle", new_pool)
+    graph.select(1, 4)
+
+    def fail(capturing: bool) -> None:
+        if capturing:
+            raise RuntimeError("unexpected capture failure")
+
+    with pytest.raises(RuntimeError, match="unexpected capture failure"):
+        graph.capture(fail, persistent_install=False)
+    graph.select(1, 4)
+
+    def succeed(capturing: bool) -> None:
+        if capturing:
+            graph.wrapper.concrete_cudagraph_entries[graph.descriptor] = SimpleNamespace(
+                cudagraph=Mock(), output="hidden"
+            )
+
+    graph.capture(succeed, persistent_install=False)
+    assert graph.wrapper.graph_pool == (0, 202)
+    assert new_pool.call_count == 2
 
 
 @pytest.mark.parametrize("persistent_install", [False, True])  # type: ignore[misc]

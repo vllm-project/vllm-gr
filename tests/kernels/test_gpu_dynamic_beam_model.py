@@ -118,6 +118,10 @@ def build_tiny_engine(tmp_path, *, capacity=4, dense_catalog=False, graph=True):
         max_num_seqs=max(16, 4 * capacity),
         max_logprobs=capacity,
         gpu_memory_utilization=0.1,
+        # This tiny model needs little KV memory. A fixed budget avoids vLLM's
+        # free-memory profiling across successive in-process engine lifetimes;
+        # these tests exercise beam and graph behavior, not memory sizing.
+        kv_cache_memory_bytes=256 * 1024**2,
         compilation_config={"mode": 0, "cudagraph_mode": "NONE"},
     )
     return llm, model_path

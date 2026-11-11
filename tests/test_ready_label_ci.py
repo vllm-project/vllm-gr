@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ def context(
     return namespace(
         {
             "workflow": "test",
+            "repository": "JiusiServe/vllm-gr",
             "event_name": event,
             "run_id": 123,
             "ref": "refs/pull/481/merge",
@@ -268,6 +270,13 @@ class TestReadyLabelCI(unittest.TestCase):
         for job_name in gpu_jobs:
             gpu_lock = workflow["jobs"][job_name]["concurrency"]
             self.assertEqual(render(gpu_lock["group"], full), render(gpu_lock["group"], added))
+            self.assertEqual(
+                render(gpu_lock["group"], full),
+                render(gpu_lock["group"], context(number=482, base_ref="main")),
+            )
+            self.assertEqual(
+                gpu_lock["group"], workflow["jobs"]["pre-commit"]["concurrency"]["group"]
+            )
             self.assertEqual(gpu_lock["queue"], "max")
             self.assertFalse(gpu_lock["cancel-in-progress"])
         self.assertEqual(
@@ -643,8 +652,8 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             with self.subTest(job=name):
                 self.assertTrue(evaluate(jobs[name]["if"], context(), results))
                 self.assertFalse(evaluate(jobs[name]["if"], context(), results, cancelled=True))
-        # Upstream validation failures must still allow independent accuracy
-        # checks to run, and must not hide a failed final gate.
+        # Benchmark failures must still allow the other accuracy checks to
+        # run, and must not hide a failed final gate.
         for failed in ("decode-benchmark", "pangu-offline"):
             with self.subTest(failed=failed):
                 running = self.scheduled(workflow, context(), failed)
@@ -674,6 +683,270 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                 self.assertEqual(
                     bool(evaluate(condition, context(), cancelled=True)), outcome == "success"
                 )
+
+    @pytest.mark.l1  # type: ignore[misc]
+    def test_benchmark_jobs_wait_for_successful_precommit_and_policy(self) -> None:
+        workflow = self.workflows["pre-commit.yml"]
+        jobs = workflow["jobs"]
+        benchmark_jobs = ("decode-benchmark", "pangu-offline", "pangu-online")
+        for name in benchmark_jobs:
+            job = jobs[name]
+            self.assertEqual(set(job["needs"]), {"benchmark-policy", "pre-commit"})
+            for policy in ("success", "failure", "cancelled", "skipped"):
+                for precommit in ("success", "failure", "cancelled", "skipped"):
+                    for cancelled in (False, True):
+                        with self.subTest(
+                            job=name, policy=policy, precommit=precommit, cancelled=cancelled
+                        ):
+                            results = {"benchmark-policy": policy, "pre-commit": precommit}
+                            expected = policy == precommit == "success" and not cancelled
+                            self.assertEqual(
+                                bool(evaluate(job["if"], context(), results, cancelled=cancelled)),
+                                expected,
+                            )
+
+        for failed in ("benchmark-policy", "pre-commit"):
+            with self.subTest(failed=failed):
+                running = self.scheduled(workflow, context(), failed=failed)
+                self.assertTrue(set(benchmark_jobs).isdisjoint(running))
+                self.assertIn("benchmark-blocking", running)
+
+    def test_level_workflow_schedule_and_resource_safety(self) -> None:
+        workflow = yaml.safe_load((ROOT / ".github/workflows/test-levels.yml").read_text())
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertEqual(triggers["push"]["branches"], ["main"])
+        self.assertNotIn("pull_request", triggers)  # PR levels run in the existing gate.
+        self.assertEqual(
+            [item["cron"] for item in triggers["schedule"]],
+            ["0 18 * * *", "0 19 * * 0"],
+        )
+        self.assertEqual(
+            triggers["workflow_dispatch"]["inputs"]["level"]["options"],
+            ["l1", "l2", "l3", "l4", "l5"],
+        )
+        self.assertEqual(workflow["concurrency"]["queue"], "max")
+        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+
+        pr_workflow = self.workflows["pre-commit.yml"]
+        gpu_lock = pr_workflow["jobs"]["pre-commit"]["concurrency"]["group"]
+        self.assertEqual(gpu_lock, "vllm-gr-accelerator-${{ github.repository }}")
+        self.assertEqual(workflow["concurrency"]["group"], gpu_lock)
+        # A workflow must not wait on a job that requests the same lock it owns.
+        self.assertNotIn("concurrency", workflow["jobs"]["level"])
+        self.assertNotEqual(
+            render(pr_workflow["concurrency"]["group"], context()), render(gpu_lock, context())
+        )
+
+        job = workflow["jobs"]["level"]
+        self.assertEqual(job["runs-on"], "self-hosted")
+        expression = job["env"]["TEST_LEVEL"].strip().removeprefix("${{").removesuffix("}}")
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        for event, schedule, chosen, expected in (
+            ("push", "", "", "l3"),
+            ("schedule", "0 18 * * *", "", "l4"),
+            ("schedule", "0 19 * * 0", "", "l5"),
+            ("workflow_dispatch", "", "l2", "l2"),
+        ):
+            with self.subTest(event=event, schedule=schedule, chosen=chosen):
+                selected = eval(  # noqa: S307 - only repository-owned workflow expressions
+                    expression.strip(),
+                    {"__builtins__": {}},
+                    {
+                        "github": namespace({"event_name": event, "event": {"schedule": schedule}}),
+                        "inputs": namespace({"level": chosen}),
+                    },
+                )
+                self.assertEqual(selected, expected)
+
+        steps = {step.get("name"): step for step in job["steps"] if step.get("name")}
+        self.assertIn("vars.VLLM_GR_ISOLATED_RUNNER", job["env"]["VLLM_GR_ISOLATED_RUNNER"])
+        resource = steps["Run L2 resource probe if isolated"]
+        self.assertIn("env.TEST_LEVEL == 'l2'", resource["if"])
+        self.assertEqual(resource["run"], "bash tools/ci/run_resource_level.sh")
+        self.assertIn("torch.cuda.is_available", steps["Verify accelerator prerequisites"]["run"])
+        self.assertNotIn("kill_vllm_on_device", str(job))
+        self.assertNotIn("check_cuda_device_mapping", str(job))
+        self.assertIn("HF_TOKEN", steps["Download OpenOneRec dataset"]["env"])
+        self.assertIn("run_beam_v1_recall.sh", steps["Run full OneRec recall gate"]["run"])
+        self.assertIn(
+            "run_beam_v1_performance.sh", steps["Run OneRec performance scenarios"]["run"]
+        )
+        self.assertIn("VLLM_GR_TARGET_DEVICE == 'cuda'", steps["Run full OneRec recall gate"]["if"])
+
+    @pytest.mark.l1  # type: ignore[misc]
+    def test_level_workflow_skips_npu_before_setup(self) -> None:
+        workflow = yaml.safe_load((ROOT / ".github/workflows/test-levels.yml").read_text())
+        steps = workflow["jobs"]["level"]["steps"]
+        detect = steps[0]
+        self.assertEqual(detect["id"], "accelerator")
+        self.assertEqual(detect["name"], "Detect runner accelerator")
+        bash = shutil.which("bash") or "bash"
+        for devices, lane, expected, exit_code in (
+            ((), "gpu", None, 1),
+            ((), "npu", None, 1),
+            (("npu-smi",), "gpu", "false", 0),
+            (("npu-smi",), "npu", "true", 0),
+            (("nvidia-smi",), "gpu", "true", 0),
+            (("nvidia-smi",), "npu", "false", 0),
+            (("npu-smi", "nvidia-smi"), "gpu", "false", 0),
+            (("npu-smi", "nvidia-smi"), "npu", "true", 0),
+        ):
+            with (
+                self.subTest(devices=devices, lane=lane),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                directory = Path(temporary)
+                for name in devices:
+                    executable = directory / name
+                    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    executable.chmod(0o755)
+                output = directory / "output"
+                summary = directory / "summary"
+                result = subprocess.run(
+                    [bash, "-eu", "-o", "pipefail", "-c", detect["run"]],
+                    env={
+                        **os.environ,
+                        "PATH": str(directory),
+                        "GITHUB_OUTPUT": str(output),
+                        "GITHUB_STEP_SUMMARY": str(summary),
+                        "TEST_LEVEL": "l3",
+                        "LANE_DEVICE": lane,
+                    },
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                if expected is None:
+                    self.assertIn("No supported GPU or NPU", result.stderr)
+                else:
+                    self.assertIn(f"run={expected}", output.read_text())
+                    if expected == "false":
+                        self.assertIn("not run", summary.read_text())
+                        self.assertIn("::warning::", result.stdout)
+
+        def enabled(step: dict[str, Any], runner: str, level: str, hit: str) -> bool:
+            condition = step["if"]
+            condition = condition.replace("steps.accelerator.outputs.run", repr(runner))
+            condition = condition.replace("steps.cache-venv.outputs.cache-hit", repr(hit))
+            condition = condition.replace("steps.cache-pangu.outputs.cache-hit", repr(hit))
+            condition = condition.replace("steps.cache-dataset.outputs.cache-hit", repr(hit))
+            condition = condition.replace("env.TEST_LEVEL", repr(level))
+            condition = condition.replace("env.VLLM_GR_TARGET_DEVICE", "'cuda'")
+            return bool(evaluate(condition, context()))
+
+        for step in steps[1:]:
+            self.assertIn("steps.accelerator.outputs.run", step["if"])
+            for level in ("l1", "l2", "l3", "l4", "l5"):
+                for hit in ("true", "false"):
+                    with self.subTest(
+                        step=step.get("name", step.get("uses")), level=level, hit=hit
+                    ):
+                        self.assertFalse(enabled(step, "false", level, hit))
+
+        by_name = {step.get("name"): step for step in steps if step.get("name")}
+        for level in ("l1", "l2", "l3", "l4", "l5"):
+            self.assertTrue(enabled(by_name["Run selected level"], "true", level, "true"))
+        self.assertTrue(enabled(by_name["Run L2 resource probe if isolated"], "true", "l2", "true"))
+        self.assertFalse(
+            enabled(by_name["Run L2 resource probe if isolated"], "true", "l3", "true")
+        )
+        self.assertTrue(enabled(by_name["Create virtual environment"], "true", "l3", "false"))
+        self.assertFalse(enabled(by_name["Create virtual environment"], "true", "l3", "true"))
+        for name in (
+            "Run full OneRec recall gate",
+            "Run OneRec performance scenarios",
+            "Upload L4 system results",
+        ):
+            self.assertTrue(enabled(by_name[name], "true", "l4", "false"))
+            self.assertFalse(enabled(by_name[name], "true", "l3", "false"))
+
+    def test_level_ci_preserves_existing_benchmark_gates(self) -> None:
+        workflow = self.workflows["pre-commit.yml"]
+        jobs = workflow["jobs"]
+        self.assertEqual(jobs["pre-commit"]["env"]["VLLM_GR_TEST_LEVEL"], "pr")
+        self.assertIn(
+            "vars.VLLM_GR_ISOLATED_RUNNER",
+            jobs["pre-commit"]["env"]["VLLM_GR_ISOLATED_RUNNER"],
+        )
+        probe = next(
+            step
+            for step in jobs["pre-commit"]["steps"]
+            if step.get("name") == "Run L2 resource probe if isolated"
+        )
+        self.assertEqual(probe["run"], "bash tools/ci/run_resource_level.sh")
+        self.assertTrue(
+            {"pre-commit", "decode-benchmark", "pangu-offline", "pangu-online"}
+            <= set(jobs["benchmark-blocking"]["needs"])
+        )
+        self.assertIn("beam-performance-ab-only", jobs)
+        local_runner = (ROOT / "tools/pre_commit/run_tests.sh").read_text()
+        self.assertIn("VLLM_GR_TEST_LEVEL", local_runner)
+        self.assertIn("python3 -m pytest -x --run-slow --durations=10 -s tests", local_runner)
+        level_runner = (ROOT / "tools/ci/run_test_level.sh").read_text()
+        self.assertIn("--strict-test-levels", level_runner)
+        self.assertIn("--run-slow", level_runner)
+        self.assertIn("$status -eq 5", level_runner)
+        self.assertIn('"$level" == l5', level_runner)
+        resource_runner = (ROOT / "tools/ci/run_resource_level.sh").read_text()
+        self.assertIn('"${VLLM_GR_ISOLATED_RUNNER:-false}" != true', resource_runner)
+        self.assertIn("bash tests/development/test_resource.sh", resource_runner)
+        self.assertIn("grep -q 'SKIP'", resource_runner)
+        self.assertIn("status=${PIPESTATUS[0]}", resource_runner)
+
+    @pytest.mark.l1  # type: ignore[misc]
+    def test_parallel_benchmark_jobs_provision_on_cache_miss(self) -> None:
+        jobs = self.workflows["pre-commit.yml"]["jobs"]
+        for name in ("decode-benchmark", "pangu-offline", "pangu-online"):
+            steps = jobs[name]["steps"]
+            names = [step.get("name") for step in steps]
+            create = steps[names.index("Create virtual environment")]
+            install = steps[names.index("Install CUDA base environment")]
+            self.assertLess(names.index("Restore virtual environment"), names.index(create["name"]))
+            self.assertLess(names.index(create["name"]), names.index("Set up virtual environment"))
+            self.assertLess(names.index("Set up virtual environment"), names.index(install["name"]))
+            self.assertLess(
+                names.index(install["name"]), names.index("Refresh editable installation")
+            )
+            for hit in ("true", "false"):
+                for device in ("cuda", "npu"):
+                    with self.subTest(job=name, cache_hit=hit, device=device):
+                        commands = []
+                        for step in (create, install):
+                            guard = (
+                                step["if"]
+                                .replace("steps.cache-venv.outputs.cache-hit", repr(hit))
+                                .replace("env.VLLM_GR_TARGET_DEVICE", repr(device))
+                            )
+                            if evaluate(guard, context()):
+                                result = subprocess.run(
+                                    [
+                                        shutil.which("bash") or "bash",
+                                        "-eu",
+                                        "-o",
+                                        "pipefail",
+                                        "-c",
+                                        "uv() { printf '%s\\n' \"$*\"; }\n" + step["run"],
+                                    ],
+                                    env={
+                                        **os.environ,
+                                        "VLLM_GR_TARGET_DEVICE": device,
+                                        "CI_VLLM_REQUIREMENT": "vllm==test",
+                                    },
+                                    capture_output=True,
+                                    text=True,
+                                )
+                                self.assertEqual(result.returncode, 0, result.stderr)
+                                commands.extend(result.stdout.splitlines())
+                        expected = []
+                        if hit == "false":
+                            expected.append(
+                                "venv --seed --system-site-packages .venv"
+                                if device == "npu"
+                                else "venv --seed .venv"
+                            )
+                            if device == "cuda":
+                                expected.append("pip install vllm==test")
+                        self.assertEqual(commands, expected)
 
 
 if __name__ == "__main__":

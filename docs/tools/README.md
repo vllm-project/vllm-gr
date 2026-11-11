@@ -52,6 +52,125 @@ their own conditions. Neither omitting `--run-slow` nor running `--collect-only`
 turns the entire suite into a dependency-free host check. Do not bypass shared
 fixtures to make a runtime test appear supported.
 
+### Test levels and CI selection
+
+Strict CI collection requires exactly one `l1` through `l5` level for each
+collected pytest item. Ordinary local collection permits unclassified items,
+but still rejects conflicting markers and invalid rules. Choose a level using
+both the risk of an undetected regression and execution cost. Levels describe
+CI scope; they do not imply that a test ran successfully on every device.
+
+| Level | Scope | Typical coverage |
+| --- | --- | --- |
+| L1 | Every PR | Fast host-side unit, contract, validation, and failure-path checks |
+| L2 | Every PR | Small, representative device and integration correctness checks |
+| L3 | After merge to `main` | Broader functional matrices and model or system integration |
+| L4 | Nightly | Expensive model, accuracy, performance, and larger workload matrices |
+| L5 | Weekly | Long-running stability, soak, and stress tests |
+
+Keep representative assertions for critical behavior in L1 or L2, including
+beam-result consistency against an independent reference, request isolation,
+completion and cancellation, and graph/eager parity where applicable. For an
+expensive matrix, keep a meaningful small specification in the PR scope and
+assign expanded specifications to L3/L4. Cost alone does not justify moving
+all coverage for a critical behavior out of PR checks. A benchmark gate or a
+mock test is not automatically equivalent to an end-to-end assertion.
+
+#### Maintaining the classification
+
+For a test whose collected specifications all belong to the same level, put
+one explicit marker close to it: on the function, class, or module. For
+example:
+
+```python
+@pytest.mark.l1
+def test_rejects_invalid_request():
+    ...
+```
+
+If different parameter values or runtime options need different levels, use
+`tests/level_inventory.json` with the parameter-free pytest node ID. For
+example, a small batch can be L2 while the rest of the matrix is L3:
+
+```json
+"tests/example.py::test_case": {
+  "default": "l3",
+  "rules": [{"level": "l2", "when": {"ref": "params.batch", "eq": 1}}]
+}
+```
+
+The example is an entry inside the manifest's `tests` object. Rules must be
+non-overlapping and refer to actual collected parameters or supported options.
+Do not combine a manifest rule with an incompatible explicit marker, or apply
+different level markers through function, class, module, or parameter scope:
+conflicting levels fail collection. The `cpu_test`, `gpu_test`, and
+`npu_test` platform markers are a separate requirement; see [Test tiers](#test-tiers).
+
+When migrating a test from the manifest to explicit markers, remove its old
+manifest entry. The entry covers every parameter instance of that function:
+migrate the entire function and ensure each collected instance has exactly one
+appropriate marker. If only some specifications have been migrated, keep a
+complete manifest rule for the function instead of leaving other cases
+unclassified or adding incompatible markers.
+
+When adding a test, choose its level and declare it explicitly or add its
+parameter rule. When renaming or moving a test with a manifest entry, move the
+entry to the new node ID and remove the old one. When changing parameters,
+update the rule and verify both the small PR cases and the expanded cases.
+Run strict collection and the relevant selected tests, for example:
+
+```bash
+python -m pytest --collect-only --strict-test-levels tests
+bash tools/ci/run_test_level.sh pr
+```
+
+Strict collection rejects unclassified items and conflicting or invalid
+rules; it cannot decide whether a level is appropriate. Review the actual
+assertions and selected specifications as well as collection results.
+
+#### Running by level
+
+Select a level with:
+
+```bash
+bash tools/ci/run_test_level.sh pr  # L1 and L2
+bash tools/ci/run_test_level.sh l3
+bash tools/ci/run_test_level.sh l4
+bash tools/ci/run_test_level.sh l5
+```
+
+The wrapper enables slow tests and strict classification. When
+`VLLM_GR_TARGET_DEVICE` is `cuda` or `npu`, it selects CPU tests and tests
+for that accelerator; `cpu` selects CPU tests only. Without a target it
+does not apply a platform filter. An unknown or unclassified test is an error.
+An empty L5 selection reports that no stability tests ran; an empty selection
+at another level is an error. Additional pytest
+arguments may be supplied after the level. The full local `run-tests` hook
+continues to run all tests unless `VLLM_GR_TEST_LEVEL` is explicitly set.
+
+The pre-commit CI job sets `VLLM_GR_TEST_LEVEL=pr` to run L1/L2. The separate
+level workflow selects L3 on pushes to `main`, L4 nightly, and L5 weekly; it
+also supports manual level selection. These level runs require a GPU runner.
+The shared self-hosted pool has no GPU/NPU labels, so it can assign an NPU
+runner: in that case the workflow reports that the level did not run and skips
+the test steps. A scheduled run therefore does not guarantee GPU execution or
+coverage of both platforms. The existing benchmark gates remain separate.
+Use runners with isolated accelerator access. The level workflow does not
+terminate processes belonging to other jobs. L3/L4 model tests require the
+model and runtime dependencies in their fixtures. The L4 GPU job also prepares
+the gated OpenOneRec dataset and runs the full OneRec recall and performance
+scripts; a cache miss requires the `HF_TOKEN` secret. The Pangu pytest cases
+cover the corresponding model scenarios; the existing PR A/B
+gate remains the entry point for its PR-only comparison. The PR L1/L2 job and
+manual L2 workflow include the device resource probe only when the repository
+variable `VLLM_GR_ISOLATED_RUNNER` is exactly `true`. Set it only when the
+physical devices of every runner eligible for these jobs are isolated from
+other work: the probe discovers and locks devices, and its two-device scenario
+runs only when two are available.
+Otherwise the job reports that the probe did not run. The wrapper also reports
+any skipped device scenarios. `tools/run_test.sh` remains available to run the
+probe locally on a suitably isolated host.
+
 After locating coverage, run the selected files or pytest node IDs in the
 installed development runtime. For example, for initialization changes:
 

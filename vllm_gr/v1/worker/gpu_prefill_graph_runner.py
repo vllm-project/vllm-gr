@@ -249,6 +249,17 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     self._apply_max_seq_len_bound(attn_metadata, bound)
                     buf.max_seq_len_bounds[num_reqs] = bound
 
+                    # Native FA3 AOT scheduler metadata was built for the
+                    # dummy capture lengths and is not refreshed on replay.
+                    # Let FA3 schedule from the replay's live lengths instead.
+                    parallel_config = getattr(
+                        getattr(runner, "vllm_config", None), "parallel_config", None
+                    )
+                    self._disable_stale_native_fa_scheduler(
+                        attn_metadata,
+                        getattr(parallel_config, "decode_context_parallel_size", None),
+                    )
+
                     # Rebind the block table, seq_lens, and query_start_loc
                     # to static per-bucket buffers: a captured graph bakes the
                     # pointer address, so the tensor at that address must stay
@@ -371,6 +382,23 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         if kv_bound is not None and kv_bound > bound:
             bound = kv_bound
         return bound
+
+    @staticmethod
+    def _disable_stale_native_fa_scheduler(attn_metadata: Any, dcp_size: int | None) -> None:
+        """Do not capture a native FA schedule computed from dummy lengths.
+
+        Cascade and DCP use different native attention paths; preserve their
+        schedules.  Unknown parallel configurations also remain unchanged.
+        GR-specific attention metadata is deliberately left alone.
+        """
+        if dcp_size != 1:
+            return
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+
+        metas = attn_metadata.values() if isinstance(attn_metadata, dict) else (attn_metadata,)
+        for meta in metas:
+            if isinstance(meta, FlashAttentionMetadata) and not meta.use_cascade:
+                meta.scheduler_metadata = None
 
     @staticmethod
     def _apply_max_seq_len_bound(attn_metadata: Any, bound: int) -> None:

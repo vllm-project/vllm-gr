@@ -710,6 +710,7 @@ def test_npu_per_parent_beam_widths_is_rejected_before_submission(online: bool) 
     engine.submit_gr_session.assert_not_called()
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("capacity", [1, 6, 7, 9])  # type: ignore[misc]
 def test_cuda_unconstrained_requests_vary_budget_with_one_runtime(
@@ -746,6 +747,7 @@ def test_cuda_unconstrained_requests_vary_budget_with_one_runtime(
     assert prepare(capacity).beam_params.max_tokens == capacity
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("backend", ["cuda", "npu"])  # type: ignore[misc]
 @pytest.mark.parametrize("constrained", [None, True])  # type: ignore[misc]
@@ -799,6 +801,7 @@ def test_constrained_length_is_checked_before_native_input_processing(
     process_inputs.assert_called_once()
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("missing", [False, True])  # type: ignore[misc]
 def test_missing_constraint_table_is_not_reported_as_a_length_mismatch(
@@ -830,6 +833,7 @@ def test_missing_constraint_table_is_not_reported_as_a_length_mismatch(
             )
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("length", [1, 2, 4, 7])  # type: ignore[misc]
 def test_core_rechecks_constrained_length_without_frontend_validation(length: int) -> None:
     from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request

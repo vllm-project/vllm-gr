@@ -121,6 +121,7 @@ def test_full_request_to_numpy_batch(binary: bool) -> None:
     assert batch.items[0].request.external_req_id == "id-0"
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
 def test_constrained_length_is_checked_before_grpc_token_decoding(binary: bool) -> None:
     from tests.test_beam_search_v1_input_processor import _canonical_gr_config

@@ -505,8 +505,14 @@ jobs:
     needs: benchmark-policy
     if: needs.benchmark-policy.result == 'success'
     runs-on: self-hosted
+    env:
+      VLLM_GR_TEST_LEVEL: pr
+      VLLM_GR_ISOLATED_RUNNER: ${{ vars.VLLM_GR_ISOLATED_RUNNER || 'false' }}
+      # Activate the opt-in tiny-model smoke tests (graph/eager parity and the
+      # dynamic-beam CPU-oracle comparison) that L2 now collects per PR.
+      VLLM_GR_RUN_MODEL_SMOKE: '1'
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     steps:
@@ -605,19 +611,24 @@ jobs:
           --color=always
           --all-files
 
+      - name: Run L2 resource probe if isolated
+        run: bash tools/ci/run_resource_level.sh
+
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
 
   decode-benchmark:
     name: Decode benchmark
+    # The shared GPU concurrency group serializes device-intensive jobs.
     needs: [benchmark-policy, pre-commit]
     if: >-
+      ${{ !cancelled() &&
       needs.benchmark-policy.result == 'success' &&
-      needs.pre-commit.result == 'success'
+      needs.pre-commit.result == 'success' }}
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     env:
@@ -663,11 +674,14 @@ jobs:
           base: /data/actions/cache
           key: ${{ steps.runtime.outputs.cache-key }}
 
-      - name: Require cached virtual environment
+      - name: Create virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
-          echo "The pre-commit environment cache is unexpectedly unavailable." >&2
-          exit 1
+          if [[ "$VLLM_GR_TARGET_DEVICE" == "npu" ]]; then
+            uv venv --seed --system-site-packages .venv
+          else
+            uv venv --seed .venv
+          fi
 
       - name: Set up virtual environment
         run: |
@@ -676,6 +690,12 @@ jobs:
             echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
             echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           } >> "$GITHUB_ENV"
+
+      - name: Install CUDA base environment
+        if: >-
+          steps.cache-venv.outputs.cache-hit != 'true' &&
+          env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        run: uv pip install "$CI_VLLM_REQUIREMENT"
 
       - name: Refresh editable installation
         run: |
@@ -783,6 +803,7 @@ jobs:
           V1_RECALL_DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           V1_RECALL_OUTPUT_DIR: ${{ github.workspace }}/v1_recall_results
           V1_RECALL_BASELINE_FILE: ${{ github.workspace }}/benchmarks/beam_search/v1_recall_b4_baseline.json
+          V1_RECALL_DIAGNOSTICS: '1'
         run: bash ./tests/system/run_beam_v1_recall.sh
 
       - name: Upload Beam V1 Recall measurements
@@ -817,7 +838,7 @@ jobs:
 
   beam-performance-ab-only:
     name: Beam V1 performance A/B only
-    needs: [resolve-ab-freshness, pangu-online, docs-scope]
+    needs: [resolve-ab-freshness, docs-scope]
     if: >-
       !cancelled() &&
       needs.docs-scope.outputs.docs-only != 'true' &&
@@ -833,7 +854,7 @@ jobs:
         needs.resolve-ab-freshness.outputs.fresh != 'true'))
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     steps:
@@ -980,14 +1001,16 @@ jobs:
 
   pangu-offline:
     name: Pangu offline accuracy
-    needs: [benchmark-policy, pre-commit, decode-benchmark]
+    # Accuracy remains independently required; the GPU concurrency group
+    # prevents this job from overlapping other accelerator jobs.
+    needs: [benchmark-policy, pre-commit]
     if: >-
       ${{ !cancelled() &&
       needs.benchmark-policy.result == 'success' &&
       needs.pre-commit.result == 'success' }}
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     env:
@@ -1023,9 +1046,14 @@ jobs:
           base: /data/actions/cache
           key: ${{ steps.runtime.outputs.cache-key }}
 
-      - name: Require cached virtual environment
+      - name: Create virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: exit 1
+        run: |
+          if [[ "$VLLM_GR_TARGET_DEVICE" == "npu" ]]; then
+            uv venv --seed --system-site-packages .venv
+          else
+            uv venv --seed .venv
+          fi
 
       - name: Set up virtual environment
         run: |
@@ -1034,6 +1062,12 @@ jobs:
             echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
             echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           } >> "$GITHUB_ENV"
+
+      - name: Install CUDA base environment
+        if: >-
+          steps.cache-venv.outputs.cache-hit != 'true' &&
+          env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        run: uv pip install "$CI_VLLM_REQUIREMENT"
 
       - name: Refresh editable installation
         run: |
@@ -1083,14 +1117,15 @@ jobs:
 
   pangu-online:
     name: Pangu online accuracy and API contract
-    needs: [benchmark-policy, pre-commit, decode-benchmark, pangu-offline]
+    # Accuracy remains independently required and shares the GPU lock.
+    needs: [benchmark-policy, pre-commit]
     if: >-
       ${{ !cancelled() &&
       needs.benchmark-policy.result == 'success' &&
       needs.pre-commit.result == 'success' }}
     runs-on: self-hosted
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
       cancel-in-progress: false
     env:
@@ -1126,9 +1161,14 @@ jobs:
           base: /data/actions/cache
           key: ${{ steps.runtime.outputs.cache-key }}
 
-      - name: Require cached virtual environment
+      - name: Create virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: exit 1
+        run: |
+          if [[ "$VLLM_GR_TARGET_DEVICE" == "npu" ]]; then
+            uv venv --seed --system-site-packages .venv
+          else
+            uv venv --seed .venv
+          fi
 
       - name: Set up virtual environment
         run: |
@@ -1137,6 +1177,12 @@ jobs:
             echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
             echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           } >> "$GITHUB_ENV"
+
+      - name: Install CUDA base environment
+        if: >-
+          steps.cache-venv.outputs.cache-hit != 'true' &&
+          env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        run: uv pip install "$CI_VLLM_REQUIREMENT"
 
       - name: Refresh editable installation
         run: |

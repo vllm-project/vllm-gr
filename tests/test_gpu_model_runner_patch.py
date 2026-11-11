@@ -693,6 +693,7 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     monkeypatch.setattr(torch.cuda, "Stream", lambda **kw: stream)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: (0, 123))
     context = object()
     native_model = object()
     runner = SimpleNamespace(
@@ -717,6 +718,7 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     graph.descriptor = BatchDescriptor(num_tokens=4, uniform=True)
     entries: dict[Any, Any] = {}
     graph.wrapper = SimpleNamespace(concrete_cudagraph_entries=entries, clear_graphs=entries.clear)
+    graph._registries = {graph.signature: entries}
     # R1 install/uninstall state (normally set in __init__, bypassed by
     # object.__new__): V1's capture() installs the wrapper persistently, so
     # the ownership pair must be present and consistent.
@@ -736,6 +738,7 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     monkeypatch.setattr(gpu_patch, "_dummy_beam_forward", forward)
     assert gpu_patch.capture_beam_decode_graph(runner)
     assert modes == [False, False, True]
+    assert graph.wrapper.graph_pool == (0, 123)
     assert runner._beam_graph_keys == {4}
     # V1 persistent install (R1): after capture the wrapper owns worker.model
     # (the native FULL replay path routes through it for the engine lifetime).

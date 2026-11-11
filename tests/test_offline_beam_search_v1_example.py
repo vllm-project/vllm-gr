@@ -57,6 +57,7 @@ def test_dynamic_beam_cli_rejects_invalid_options(
     assert message in capsys.readouterr().err
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("backend", ["cuda", "npu"])  # type: ignore[misc]
 @pytest.mark.parametrize("steps", [1, 2])  # type: ignore[misc]
 @pytest.mark.parametrize("mode", [[], ["--cot"]])  # type: ignore[misc]

@@ -240,12 +240,24 @@ def _cpu_uva_pool(monkeypatch):
     return buffer_utils.UvaBufferPool(1, dtype=torch.int32, max_concurrency=2)
 
 
-@pytest.mark.gpu_test
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.fixture
+def cpu_staging_pin_memory(monkeypatch):
+    """Allow native CPU staging with CUDA wheels but no visible CUDA device."""
+    if torch.cuda.is_available():
+        return
+    from vllm.utils import torch_utils
+    from vllm.v1.worker import gpu_input_batch
+
+    # These tests intentionally use CPU storage; the CUDA platform's imported
+    # PIN_MEMORY constant otherwise requests a CUDA-only allocator on CPU.
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
+
+
 @pytest.mark.parametrize("array_backed", [False, True])
 @pytest.mark.parametrize("uva_contents", [False, True])
 def test_native_v2_staging_batches_arrays_and_keeps_kernel_write_order(
-    monkeypatch, array_backed, uva_contents
+    monkeypatch, cpu_staging_pin_memory, array_backed, uva_contents
 ):
     from vllm.v1.worker.gpu import buffer_utils
 
@@ -339,10 +351,8 @@ def test_staged_contents_array_protocol_dtype_and_copy(chunks, dtype, copy):
         assert np.shares_memory(result, source) == (copy is not True)
 
 
-@pytest.mark.gpu_test
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("readonly", [False, True])
-def test_native_v2_array_transfer_preserves_output_buffer(readonly):
+def test_native_v2_array_transfer_preserves_output_buffer(cpu_staging_pin_memory, readonly):
     from vllm.v1.worker.gpu import buffer_utils
 
     install_numpy_staging()
@@ -358,9 +368,7 @@ def test_native_v2_array_transfer_preserves_output_buffer(readonly):
     assert source.flags.writeable != readonly
 
 
-@pytest.mark.gpu_test
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_native_v1_input_batch_copies_arrays_in_bulk():
+def test_native_v1_input_batch_copies_arrays_in_bulk(cpu_staging_pin_memory):
     from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
     batch = InputBatch(
