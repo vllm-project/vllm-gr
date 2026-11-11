@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "description": "Explicit opt-in NPU test candidates. The default full suite is not replaced by this manifest.",
+  "tiers": {
+    "p0-candidate": {
+      "status": "candidate-incomplete",
+      "description": "Existing operator representatives and model smoke tests; not a complete P0 acceptance matrix or a performance gate.",
+      "source_review_commit": "37a0ef8e603a225ad360ad110b9c3114225b1be5",
+      "expected_count": 17,
+      "required_passes": 17,
+      "allowed_skips": 0,
+      "requires_model": true,
+      "model_environment_variable": "VLLM_GR_TEST_MODEL",
+      "groups": {
+        "kernels": {
+          "expected_count": 15,
+          "description": "Real NPU operator/reference checks and Ascend registration; synthetic inputs, no model weights.",
+          "nodes": [
+            "tests/kernels/test_rec_constrained_topk_npu.py::test_rec_constrained_topk_npu_matches_torch_reference[False-dtype1-0]",
+            "tests/kernels/test_rec_constrained_topk_npu.py::test_rec_constrained_topk_npu_matches_torch_reference[False-dtype1-1]",
+            "tests/kernels/test_rec_constrained_topk_npu.py::test_rec_constrained_topk_npu_matches_torch_reference[False-dtype1-2]",
+            "tests/kernels/test_cache_unshared_kv_npu.py::test_cache_unshared_kv_npu_inplace_write[3-dtype1]",
+            "tests/kernels/test_select_unshared_kv_npu.py::test_select_unshared_kv_npu_matches_torch_reference[3-2-2]",
+            "tests/kernels/test_select_unshared_kv_npu.py::test_select_unshared_kv_npu_untouched_blocks_stay_intact",
+            "tests/kernels/test_beam_search_group_npu.py::test_beam_search_group_npu_matches_torch_reference[2-16-16-2]",
+            "tests/kernels/test_beam_search_rec_final_select_npu.py::test_final_select_npu_matches_torch_reference[2-16-64-64-2]",
+            "tests/kernels/test_x_attention_npu.py::test_x_attention_npu_matches_reference[1-128-kvlen_list0-1-3]",
+            "tests/kernels/test_x_attention_npu.py::test_x_attention_npu_matches_reference[2-128-kvlen_list2-2-3]",
+            "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_cascade_execution_batch_matches_individual_requests[16-2-1]",
+            "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_cascade_execution_batch_matches_individual_requests[16-2-4]",
+            "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_xllm_mixed_std_beam_batch_falls_back_to_cascade",
+            "tests/integration/test_ascend_attention_backend.py::test_native_backend_loads_after_normal_ascend_op_registration",
+            "tests/constraints/test_npu_backend_integration.py::test_real_npu_loader_passes_step_zero_one_two_at_top_k_256[dtype0]"
+          ]
+        },
+        "model": {
+          "expected_count": 2,
+          "description": "Existing OneRec V1 public-API and graph shape-switch smoke tests; B1/B2, W8, not B1/B4 W128 acceptance.",
+          "nodes": [
+            "tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_public_api_end_to_end",
+            "tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch"
+          ]
+        }
+      },
+      "coverage_gaps": [
+        "The model tests do not provide the target B1/B4, per-request L128, W128, Prefill FULL plus Decode FULL matrix.",
+        "The existing graph model test requires B2 FULL replay and deliberately verifies B1 shape-miss fallback; that fallback must not be removed to claim B1 FULL coverage.",
+        "Direct XAttention reference cases cover B1/B2; the selected B4 attention case exercises Cascade, not the fused B4 XAttention path.",
+        "The BF16 constrained-TopK wrapper widens input logits to FP32; raw fused BF16 loader readiness remains a separately skipped known-precision case.",
+        "Long-context, repeated-request memory stability, online-service and calibrated performance acceptance are not supplied by these nodes.",
+        "Host-only cases validated in a separate runtime are not included as universal candidates."
+      ]
+    }
+  }
+}

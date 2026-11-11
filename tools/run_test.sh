@@ -5,11 +5,15 @@
 set -euo pipefail
 
 RUN_WHEEL=false
+NPU_DEVICE=""
+NPU_TIER=full
+NPU_RESULTS_DIR=results/npu-tests
+NPU_OPT_IN=false
 
 CLI_DEVICE_ID=""
 
 usage() {
-    echo "Usage: $0 [--wheel] [--device-id N]"
+    echo "Usage: $0 [--wheel] [--device-id N] [--npu-device N] [--npu-tier full|p0-candidate] [--npu-results-dir DIR]"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -36,6 +40,33 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             ;;
+        --npu-device)
+            if [[ $# -lt 2 || ! "$2" =~ ^(0|[1-9][0-9]*)$ ]]; then
+                echo "--npu-device requires one canonical nonnegative integer" >&2
+                exit 1
+            fi
+            NPU_DEVICE=$2
+            NPU_OPT_IN=true
+            shift 2
+            ;;
+        --npu-tier)
+            if [[ $# -lt 2 || ( "$2" != full && "$2" != p0-candidate ) ]]; then
+                echo "--npu-tier requires full or p0-candidate" >&2
+                exit 1
+            fi
+            NPU_TIER=$2
+            NPU_OPT_IN=true
+            shift 2
+            ;;
+        --npu-results-dir)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "--npu-results-dir requires a nonempty directory" >&2
+                exit 1
+            fi
+            NPU_RESULTS_DIR=$2
+            NPU_OPT_IN=true
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -48,12 +79,37 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Validate explicit NPU assignments before resource.sh can query devices.
+# Visibility is not a reservation; the caller retains ownership of its lease.
+if [[ -n "$NPU_DEVICE" ]]; then
+    if [[ -n "$CLI_DEVICE_ID" && "$CLI_DEVICE_ID" != "$NPU_DEVICE" ]]; then
+        echo "--npu-device conflicts with --device-id" >&2
+        exit 1
+    fi
+    CLI_DEVICE_ID=$NPU_DEVICE
+fi
+if [[ "$NPU_OPT_IN" == true && -n "$CLI_DEVICE_ID" ]]; then
+    if [[ ! "$CLI_DEVICE_ID" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "The opt-in NPU runner requires one canonical nonnegative integer device" >&2
+        exit 1
+    fi
+    if [[ ${ASCEND_RT_VISIBLE_DEVICES+x} == x &&
+          "$ASCEND_RT_VISIBLE_DEVICES" != "$CLI_DEVICE_ID" ]]; then
+        echo "Explicit NPU device conflicts with inherited ASCEND_RT_VISIBLE_DEVICES" >&2
+        exit 1
+    fi
+fi
+
 if [ -n "${CONDA_PREFIX:-}" ]; then
     export LD_LIBRARY_PATH=${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}
     export PATH=${CONDA_PREFIX}/bin:${PATH:-}
 fi
 
 source "./tools/resource.sh"
+if [[ "$NPU_OPT_IN" == true && "${npu_state:-false}" != true ]]; then
+    echo "--npu-device, --npu-tier and --npu-results-dir require an NPU host" >&2
+    exit 1
+fi
 if [ "${npu_state:-}" == "true" ]; then
     export VLLM_GR_TARGET_DEVICE=npu
     # Jenkins must validate the same vendor Python that will run pytest.
@@ -107,6 +163,9 @@ if [ -n "$DEVICE_ID" ]; then
     fi
     idle_gpu="$DEVICE_ID"
     echo "using externally provided device $idle_gpu (skip resource auto-detection)"
+    if [[ "$NPU_OPT_IN" == true ]]; then
+        echo "using caller-allocated NPU $idle_gpu; reservation remains caller-owned"
+    fi
 else
     # test development suite only after checking the NPU vendor runtime
     ./tests/development/test_resource.sh
@@ -145,11 +204,20 @@ if [ "${npu_state:-false}" == "true" ]; then
     source "${CUSTOM_XLLM_MATH_ROOT}/bin/set_env.bash"
     cd "${run_test_workdir}"
 
-    PYTORCH_NPU_ALLOW_FORK=true \
-    VLLM_WORKER_MULTIPROC_METHOD="spawn" \
-    TORCH_MULTIPROCESSING_METHOD="spawn" \
-    ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
-    bash tools/pre_commit/run_tests.sh
+    if [[ "$NPU_OPT_IN" == true ]]; then
+        PYTORCH_NPU_ALLOW_FORK=true \
+        VLLM_WORKER_MULTIPROC_METHOD="spawn" \
+        TORCH_MULTIPROCESSING_METHOD="spawn" \
+        ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
+        python3 tools/ci/run_npu_tests.py --device "$idle_gpu" \
+            --tier "$NPU_TIER" --output-dir "$NPU_RESULTS_DIR"
+    else
+        PYTORCH_NPU_ALLOW_FORK=true \
+        VLLM_WORKER_MULTIPROC_METHOD="spawn" \
+        TORCH_MULTIPROCESSING_METHOD="spawn" \
+        ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
+        bash tools/pre_commit/run_tests.sh
+    fi
 else
     NODEENV_SSL_NO_VERIFY=1 \
     CUDA_VISIBLE_DEVICES=$idle_gpu \

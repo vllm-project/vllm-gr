@@ -442,3 +442,9 @@ not include uncommitted work in the exported difference.
 
 Use it only for an intended history export after reviewing the script and target
 branch. Ordinary documentation or test work does not require this utility.
+
+For the NPU entry point's inherited-device contract, complete-suite default and
+opt-in incomplete `p0-candidate` manifest, see the
+[NPU test runner guide](npu-test-runner.md). Candidate results do not replace
+the separate system/benchmark gates or establish the missing B1/B4 FULL-graph
+acceptance matrix.
