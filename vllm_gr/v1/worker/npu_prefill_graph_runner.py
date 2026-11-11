@@ -559,8 +559,15 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             )
             return None
         num_cols = min(live_bt.shape[1], bt_buf.shape[1])
-        bt_staged = bt_buf[: live_bt.shape[0], :num_cols]
-        bt_staged.copy_(live_bt[: live_bt.shape[0], :num_cols], non_blocking=True)
+        # Keep every staged column: narrowing a multi-row tensor leaves a
+        # non-contiguous view. FIA then adds a layout-copy task during the
+        # update, which cannot match the contiguous capture's task group.
+        # The full-width row view is contiguous and keeps its graph-owned
+        # address; unused columns are outside the valid KV lengths.
+        bt_staged = bt_buf[: live_bt.shape[0]]
+        bt_staged[:, :num_cols].copy_(live_bt[:, :num_cols], non_blocking=True)
+        if num_cols < bt_staged.shape[1]:
+            bt_staged[:, num_cols:].zero_()
 
         from vllm_gr.v1.attention.backends.beam_attn_npu import update_graph_params
 

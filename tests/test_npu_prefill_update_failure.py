@@ -124,6 +124,63 @@ def test_success_and_cache_hit_still_replay(case: _ForwardCase) -> None:
     case.native.assert_not_called()
 
 
+@pytest.mark.l1
+@pytest.mark.parametrize("num_reqs", [2, 4])
+def test_replay_stages_contiguous_full_width_table_without_reallocation(
+    case: _ForwardCase, num_reqs: int
+) -> None:
+    tokens_per_request = 4 // num_reqs
+    request_ids = [f"r{index}" for index in range(num_reqs)]
+    case.owner.input_batch.req_id_to_index = {
+        req_id: index for index, req_id in enumerate(request_ids)
+    }
+    case.owner.input_batch.num_computed_tokens_cpu = [0] * num_reqs
+    case.owner.input_batch.num_prompt_tokens = [tokens_per_request] * num_reqs
+    case.owner._current_scheduler_output.num_scheduled_tokens = dict.fromkeys(
+        request_ids, tokens_per_request
+    )
+    case.metadata.num_reqs = num_reqs
+    case.metadata.query_start_loc_cpu = [
+        index * tokens_per_request for index in range(num_reqs + 1)
+    ]
+    case.metadata.seq_lens_cpu = [tokens_per_request] * num_reqs
+    buf = case.runner.buffers[4]
+    # A narrower multi-row view of this buffer has stride (5, 1), unlike
+    # the contiguous dummy table used during graph capture. Keep its full
+    # width at the FIA boundary without allocating a per-replay temporary.
+    staging = torch.full((8, 5), -1, dtype=torch.int32, device="cpu")
+    buf.block_table_buf = staging
+    address = staging.data_ptr()
+    bound_tables: list[torch.Tensor] = []
+
+    for iteration, live_cols in enumerate((4, 2, 4)):
+        live = torch.arange(num_reqs * live_cols, dtype=torch.int32, device="cpu")
+        live = live.reshape(num_reqs, live_cols) + iteration * 100
+        case.metadata.block_table = live
+        case.cache.api.clear()
+        assert case.run() is case.output
+        if iteration == 0:
+            assert len(case.cache.api.calls) == len(case.cache.entry.layers)
+            bound_tables = [call["block_table"] for call in case.cache.api.calls]
+        else:
+            # Only table contents changed. The FIA update may hit its binding
+            # cache, but the same bound storage must still contain fresh IDs.
+            assert case.cache.api.calls == []
+        assert buf.block_table_buf is staging
+        assert staging.data_ptr() == address
+        for table in bound_tables:
+            assert table.shape == (num_reqs, 5)
+            assert table.is_contiguous()
+            assert table.stride() == (5, 1)
+            assert table.data_ptr() == address
+            assert torch.equal(table[:, :live_cols], live)
+            assert torch.count_nonzero(table[:, live_cols:]).item() == 0
+        # Staging must not overwrite rows owned by other possible batches.
+        assert torch.all(staging[num_reqs:] == -1)
+        assert case.graph.replay.call_count == iteration + 1
+    case.native.assert_not_called()
+
+
 @pytest.mark.parametrize("phase", ["begin", "fia", "end"])
 @pytest.mark.parametrize("layer_index", [0, 1])
 def test_update_failure_preserves_original_error_and_graph_ownership(
