@@ -7,13 +7,31 @@ import sys
 import time
 
 
+def _cuda_visible_ordinal(gpu_id: int) -> int:
+    """Map a physical GPU id to its CUDA-visible logical ordinal.
+
+    With CUDA_VISIBLE_DEVICES set, CUDA renumbers the visible devices from 0,
+    so cuDeviceGet needs the ordinal within that list rather than the physical
+    id reported by nvidia-smi.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not visible:
+        return gpu_id
+    ids = [token.strip() for token in visible.split(",")]
+    try:
+        return ids.index(str(gpu_id))
+    except ValueError:
+        return gpu_id
+
+
 def _lock_gpu_cuda(gpu_id: int, mem_to_alloc_mb: int) -> bool:
     try:
+        ordinal = _cuda_visible_ordinal(gpu_id)
         cuda = ctypes.CDLL("libcuda.so.1")
         if cuda.cuInit(0) != 0:
             return False
         dev = ctypes.c_int()
-        if cuda.cuDeviceGet(ctypes.byref(dev), gpu_id) != 0:
+        if cuda.cuDeviceGet(ctypes.byref(dev), ordinal) != 0:
             return False
         ctx = ctypes.c_void_p()
         if cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev.value) != 0:

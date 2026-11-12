@@ -44,6 +44,47 @@ function is_available() {
     return 1
 }
 
+# _cuda_device_indices <gpu_count>
+# Prints the physical GPU indices to consider, one per line. Honors
+# CUDA_VISIBLE_DEVICES (a comma-separated list of physical indices, matching
+# nvidia-smi under CUDA_DEVICE_ORDER=PCI_BUS_ID) so selection stays inside the
+# devices the CUDA runtime can see. Falls back to all indices when unset, and
+# exposes none when the variable is set but empty, matching the CUDA runtime.
+function _cuda_device_indices() {
+    local gpu_count=$1
+    if ! [[ -v CUDA_VISIBLE_DEVICES ]]; then
+        # Unset: consider every physical GPU.
+        local i
+        for (( i=0; i<gpu_count; i++ )); do
+            echo "$i"
+        done
+        return 0
+    fi
+    if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+        # Set but empty: CUDA exposes no devices.
+        echo "CUDA_VISIBLE_DEVICES is set but empty: no devices visible" >&2
+        return 1
+    fi
+    local idx
+    local found=0
+    IFS=',' read -ra indices <<< "$CUDA_VISIBLE_DEVICES"
+    for idx in "${indices[@]}"; do
+        if [[ ! "$idx" =~ ^[0-9]+$ ]]; then
+            echo "Invalid CUDA_VISIBLE_DEVICES token '$idx': expected a non-negative integer" >&2
+            return 1
+        fi
+        if [ "$idx" -lt "$gpu_count" ]; then
+            echo "$idx"
+            found=$((found + 1))
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "No CUDA_VISIBLE_DEVICES id is within [0, $gpu_count)" >&2
+        return 1
+    fi
+    return 0
+}
+
 function get_gpu() {
     if [ "$npu_state" = true ]; then
         get_npu "$@"
@@ -57,12 +98,15 @@ function get_gpu() {
     gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tail -n 1) || return 1
     if [ -z "$gpu_count" ]; then echo "No GPUs available"; return 1; fi
 
+    local indices
+    indices=$(_cuda_device_indices "$gpu_count")
+    if [ -z "$indices" ]; then echo "No GPUs visible to CUDA"; return 1; fi
+
     local start_time=$(date +%s)
 
     while true; do
-        # Loop through each GPU index
-        for (( i=0; i<gpu_count; i++ ))
-        do
+        # Loop through each visible GPU index
+        for i in $indices; do
             if is_available "$i" "$mem_gpu"; then
                 echo "$i"
                 return 0
@@ -94,15 +138,22 @@ function get_gpus() {
     gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tail -n 1) || return 1
     if [ -z "$gpu_count" ]; then return 1; fi
 
+    local indices
+    indices=$(_cuda_device_indices "$gpu_count")
+    if [ -z "$indices" ]; then return 1; fi
+
     local start_time=$(date +%s)
 
     while true; do
         local idle_gpus=""
         local found=0
 
-        # Loop through each GPU index
-        for (( i=0; i<gpu_count; i++ ))
-        do
+        # Loop through each visible GPU index
+        for i in $indices; do
+            # Skip ids already selected (CUDA_VISIBLE_DEVICES may repeat them).
+            if [[ ",$idle_gpus," == *",$i,"* ]]; then
+                continue
+            fi
             if is_available "$i" "$mem_gpu"; then
                 if [ -z "$idle_gpus" ]; then
                     idle_gpus="$i"

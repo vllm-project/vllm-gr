@@ -2737,6 +2737,8 @@
     "tests/test_npu_standard_graph.py::test_workspace_pool_rejects_invalid_getter_buffers_before_capture": "l1",
     "tests/test_npu_standard_graph.py::test_workspace_pool_separates_workspace_dtypes_at_equal_byte_capacity": "l1",
     "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_cuda_gate_does_not_require_an_ascend_runtime": "l1",
+    "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_empty_device_id_is_rejected": "l1",
+    "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_explicit_device_still_runs_the_parser_check": "l1",
     "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_matching_npu_runtime_reaches_tests_with_explicit_target": "l1",
     "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_wrong_npu_runtime_stops_before_resources_and_pytest": "l1",
     "tests/test_npu_unconstrained_beam.py::test_candidate_selection_accepts_row_padding_without_host_tensor_reads": "l1",

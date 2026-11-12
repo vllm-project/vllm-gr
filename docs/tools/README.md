@@ -277,18 +277,26 @@ for V1/V2 batch-switch and graph lifecycle changes. Launch runner/configuration
 comparisons in fresh processes. Record actual replay/fallback counters and
 clean shutdown, not only returned candidates.
 
-### Local full test runner
+### Local test runner
 
 ```bash
-./tools/run_test.sh
+./tools/run_test.sh [--wheel] [--device-id N]
 ```
 
-The current script performs these steps:
+The script performs these steps:
 
-1. Runs `tests/development/test_resource.sh`, which probes allocation/locking.
-2. Sources `tools/resource.sh` and selects an available accelerator. Detection
-   uses the presence of `npu-smi`; otherwise it follows the CUDA path. Selection
-   can wait for an idle device and is not an exclusive reservation for the suite.
+1. Verifies that device-index parsing honors `CUDA_VISIBLE_DEVICES` /
+   `ASCEND_RT_VISIBLE_DEVICES` (pure logic, no device).
+2. Sources `tools/resource.sh` and selects a device:
+    - `--device-id N` (comma-separated list accepted) uses those device ids
+      directly and skips the resource auto-detection step, for a preallocated
+      device.
+    - Otherwise runs `tests/development/test_resource.sh` (allocation/locking
+      probes) and calls `get_gpu` / `get_npu`. Auto-selection can wait for an idle
+      device and is not an exclusive reservation for the suite.
+    - Selection respects the runtime visibility variables: when
+      `CUDA_VISIBLE_DEVICES` (or `ASCEND_RT_VISIBLE_DEVICES`) is set, only the
+      listed indices are considered (see [Resource helper](#resource-helper)).
 3. On CUDA, runs `pre-commit run --all-files` with the selected device, including
    the `run-tests` hook.
 4. On NPU, probes/builds xllm-ops through `tools/install_xllm_ops.sh`, loads the
@@ -296,7 +304,7 @@ The current script performs these steps:
    `tools/pre_commit/run_tests.sh`. This branch does not run the other pre-commit
    hooks; run them separately when needed.
 
-Both paths reach the full slow suite described in
+Both device paths reach the slow suite described in
 [pre-commit scope](../PRE_COMMIT.md#choose-the-scope). The NPU installer may
 clone/build dependencies when they are unavailable, so
 prepare the vendor image and operator library before using this as a test gate.
@@ -311,9 +319,8 @@ HF_HUB_OFFLINE=1 \
 ```
 
 Pass `--wheel` to append the wheel smoke test after successful test execution.
-The runner chooses its own device; for a specific preallocated device, use the
-targeted commands or direct test script with the corresponding visibility
-variable and prepared environment.
+Use `--device-id` for a preallocated device; the runner otherwise picks an idle
+device within the runtime-visible set.
 
 ### Packaging
 
@@ -352,7 +359,11 @@ command, and output location. Report skips and unavailable coverage explicitly.
 ## Resource helper
 
 Source `tools/resource.sh` from the root. It delegates to `resource-npu.sh` when
-`npu-smi` is present. Device selection does not reserve the returned device.
+`npu-smi` is present. Device selection does not reserve the returned device, and
+it honors the runtime visibility variables: when `CUDA_VISIBLE_DEVICES` (or
+`ASCEND_RT_VISIBLE_DEVICES` for NPU) is set, `get_gpu`/`get_gpus` (respectively
+`get_npu`/`get_npus`) only consider the listed indices and never return a device
+outside that set.
 
 | Function | Arguments and result |
 | --- | --- |

@@ -7,7 +7,11 @@ chip_num() {
     # Run the npu-smi command and extract the chip count
     local output=$(npu-smi info -t board -i 0)
     local chip_count=$(echo "$output" | grep "Chip Count" | awk -F': *' '{print $2}' | tr -cd '0-9')
-    # Return the chip count
+    # A board whose npu-smi output lacks "Chip Count" is treated as single-chip
+    # so enumeration and the card/chip split use the same non-zero count.
+    if [ -z "$chip_count" ] || [ "$chip_count" -le 0 ]; then
+        chip_count=1
+    fi
     echo "$chip_count"
 }
 
@@ -26,6 +30,11 @@ function is_available_npu() {
 
     # Calculate card_id and chip_id
     local nchip=${CHIP_NUM}
+    # A board whose npu-smi output lacks "Chip Count" is treated as a single
+    # chip, so the card/chip arithmetic never divides by zero.
+    if [ -z "$nchip" ] || [ "$nchip" -le 0 ]; then
+        nchip=1
+    fi
 
     local card_id=$(( npu_id / nchip ))
     local chip_id=$(( npu_id % nchip ))
@@ -48,6 +57,46 @@ function is_available_npu() {
     fi
 }
 
+# _npu_device_indices <total>
+# Prints the logical NPU device ids to consider, one per line. Honors
+# ASCEND_RT_VISIBLE_DEVICES (a comma-separated list of logical device ids, the
+# same ids get_npu returns) so selection stays inside the devices the CANN
+# runtime can see. Falls back to all ids when unset/empty.
+function _npu_device_indices() {
+    local total=$1
+    if ! [[ -v ASCEND_RT_VISIBLE_DEVICES ]]; then
+        # Unset: consider every physical NPU.
+        local i
+        for (( i=0; i<total; i++ )); do
+            echo "$i"
+        done
+        return 0
+    fi
+    if [ -z "$ASCEND_RT_VISIBLE_DEVICES" ]; then
+        # Set but empty: the runtime exposes no devices.
+        echo "ASCEND_RT_VISIBLE_DEVICES is set but empty: no devices visible" >&2
+        return 1
+    fi
+    local idx
+    local found=0
+    IFS=',' read -ra indices <<< "$ASCEND_RT_VISIBLE_DEVICES"
+    for idx in "${indices[@]}"; do
+        if [[ ! "$idx" =~ ^[0-9]+$ ]]; then
+            echo "Invalid ASCEND_RT_VISIBLE_DEVICES token '$idx': expected a non-negative integer" >&2
+            return 1
+        fi
+        if [ "$idx" -lt "$total" ]; then
+            echo "$idx"
+            found=$((found + 1))
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "No ASCEND_RT_VISIBLE_DEVICES id is within [0, $total)" >&2
+        return 1
+    fi
+    return 0
+}
+
 function get_npu() {
     local mem_npu=${1:-3000}
     local timeout_secs=${2:-0} # 0 means wait indefinitely
@@ -57,12 +106,15 @@ function get_npu() {
     nchip=${CHIP_NUM}
     total=$(( ncount * nchip ))
 
+    local indices
+    indices=$(_npu_device_indices "$total")
+    if [ -z "$indices" ]; then echo "No NPUs visible to CANN"; return 1; fi
+
     local start_time=$(date +%s)
 
     while true; do
-        # Loop through each NPU index
-        for (( i=0; i<total; i++ ))
-        do
+        # Loop through each visible NPU index
+        for i in $indices; do
             if is_available_npu "$i" "$mem_npu"; then
                 echo "$i"
                 return 0
@@ -88,15 +140,23 @@ function get_npus() {
     local ncount=${NPU_COUNT}
     local nchip=${CHIP_NUM}
     local total=$(( ncount * nchip ))
+
+    local indices
+    indices=$(_npu_device_indices "$total")
+    if [ -z "$indices" ]; then return 1; fi
+
     local start_time=$(date +%s)
 
     while true; do
         local idle_npus=""
         local found=0
 
-        # Loop through each NPU index
-        for (( i=0; i<total; i++ ))
-        do
+        # Loop through each visible NPU index
+        for i in $indices; do
+            # Skip ids already selected (ASCEND_RT_VISIBLE_DEVICES may repeat them).
+            if [[ ",$idle_npus," == *",$i,"* ]]; then
+                continue
+            fi
             if is_available_npu "$i" "$mem_npu"; then
                 if [ -z "$idle_npus" ]; then
                     idle_npus="$i"

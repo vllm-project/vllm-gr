@@ -24,6 +24,32 @@ source "./tools/resource.sh"
 
 echo "Running tests for resource.sh..."
 
+# 0. CUDA lock maps a physical id to its CUDA-visible ordinal (pure logic).
+# The device-index parsing checks live in tools/run_test.sh so they also run on
+# the --device-id path and on hosts without nvidia-smi/npu-smi.
+echo -n "Testing CUDA visible-ordinal translation... "
+if ! python3 - <<'PY'
+import importlib.util
+import os
+
+spec = importlib.util.spec_from_file_location("lock_gpu", "tools/lock_gpu.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+assert module._cuda_visible_ordinal(1) == 0
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,0"
+assert module._cuda_visible_ordinal(2) == 0
+assert module._cuda_visible_ordinal(0) == 1
+os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+assert module._cuda_visible_ordinal(1) == 1
+PY
+then
+    echo "FAILED"
+    exit 1
+fi
+echo "PASSED"
+
 # 1. Test get_gpu
 echo -n "Testing get_gpu... "
 set +e
@@ -115,5 +141,31 @@ if pgrep -P "$$" -f "import ctypes" > /dev/null; then
     echo "WARNING (Some Python lock processes might still be lingering)"
 fi
 echo "PASSED (GPUs unlocked)"
+
+# 5. Selection + lock under a nonzero single-device mask (CUDA, needs >=2 GPUs).
+if ! command -v npu-smi > /dev/null && [ "$GPU_COUNT" -ge 2 ]; then
+    echo -n "Testing selection+lock under CUDA_VISIBLE_DEVICES=1... "
+    set +e
+    MASKED_ID=$(CUDA_VISIBLE_DEVICES=1 get_gpu "$mem_th" 15)
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ] || [ -z "$MASKED_ID" ]; then
+        echo "SKIP (no device visible under the mask)"
+    elif [ "$MASKED_ID" != "1" ]; then
+        echo "FAILED (expected device 1, got '$MASKED_ID')"
+        exit 1
+    else
+        set +e
+        MASKED_PID=$(CUDA_VISIBLE_DEVICES=1 lock_gpu "$MASKED_ID")
+        rc=$?
+        set -e
+        if [ $rc -ne 0 ] || [ -z "$MASKED_PID" ]; then
+            echo "FAILED (lock_gpu did not return a PID under the mask)"
+            exit 1
+        fi
+        unlock_gpu "$MASKED_PID"
+        echo "PASSED"
+    fi
+fi
 
 echo "All integration tests passed successfully!"
