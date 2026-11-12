@@ -7,7 +7,7 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +18,53 @@ import regex as re
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+_WORKFLOW_COMMAND_TIMEOUT = 10.0
+
+
+def run_workflow_command(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    # These workflow snippets use mocked tools. Do not load CI shell startup
+    # files, exported functions, or Node preload options from the parent.
+    child_env = {
+        name: os.environ[name]
+        for name in ("PATH", "SYSTEMROOT", "WINDIR", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL")
+        if name in os.environ
+    }
+    child_env.update(env or {})
+    return subprocess.run(
+        command,
+        env=child_env,
+        input=input,
+        stdin=None if input is not None else subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=_WORKFLOW_COMMAND_TIMEOUT,
+    )
+
+
+def run_accelerator_detection(
+    directory: Path, devices: tuple[str, ...], lane: str
+) -> subprocess.CompletedProcess[str]:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/test-levels.yml").read_text())
+    detect = workflow["jobs"]["level"]["steps"][0]
+    for name in devices:
+        executable = directory / name
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+    return run_workflow_command(
+        [shutil.which("bash") or "bash", "-eu", "-o", "pipefail", "-c", detect["run"]],
+        env={
+            "PATH": str(directory),
+            "GITHUB_OUTPUT": str(directory / "output"),
+            "GITHUB_STEP_SUMMARY": str(directory / "summary"),
+            "TEST_LEVEL": "l3",
+            "LANE_DEVICE": lane,
+        },
+    )
 
 
 def namespace(value: Any) -> Any:
@@ -474,11 +521,9 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                         "run_attempt": 1,
                     },
                 }
-                result = subprocess.run(
+                result = run_workflow_command(
                     ["node", "-e", harness],
                     input=json.dumps(fixture),
-                    capture_output=True,
-                    text=True,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
@@ -513,11 +558,9 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             ).lower()
             for key, value in step["env"].items()
         }
-        return subprocess.run(
+        return run_workflow_command(
             ["bash", "-eu", "-o", "pipefail", "-c", step["run"]],
-            env={**os.environ, **env},
-            capture_output=True,
-            text=True,
+            env=env,
         )
 
     def test_main_and_decode_graph_have_equivalent_ab_routing(self) -> None:
@@ -666,10 +709,8 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         reject_cancelled = jobs["benchmark-blocking"]["steps"][-1]
         self.assertFalse(evaluate(reject_cancelled["if"], context()))
         self.assertTrue(evaluate(reject_cancelled["if"], context(), cancelled=True))
-        rejected = subprocess.run(
+        rejected = run_workflow_command(
             ["bash", "-eu", "-o", "pipefail", "-c", reject_cancelled["run"]],
-            capture_output=True,
-            text=True,
         )
         self.assertEqual(rejected.returncode, 1)
         for name in ("decode-benchmark", "pangu-offline", "pangu-online"):
@@ -780,49 +821,6 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         detect = steps[0]
         self.assertEqual(detect["id"], "accelerator")
         self.assertEqual(detect["name"], "Detect runner accelerator")
-        bash = shutil.which("bash") or "bash"
-        for devices, lane, expected, exit_code in (
-            ((), "gpu", None, 1),
-            ((), "npu", None, 1),
-            (("npu-smi",), "gpu", "false", 0),
-            (("npu-smi",), "npu", "true", 0),
-            (("nvidia-smi",), "gpu", "true", 0),
-            (("nvidia-smi",), "npu", "false", 0),
-            (("npu-smi", "nvidia-smi"), "gpu", "false", 0),
-            (("npu-smi", "nvidia-smi"), "npu", "true", 0),
-        ):
-            with (
-                self.subTest(devices=devices, lane=lane),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                directory = Path(temporary)
-                for name in devices:
-                    executable = directory / name
-                    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                    executable.chmod(0o755)
-                output = directory / "output"
-                summary = directory / "summary"
-                result = subprocess.run(
-                    [bash, "-eu", "-o", "pipefail", "-c", detect["run"]],
-                    env={
-                        **os.environ,
-                        "PATH": str(directory),
-                        "GITHUB_OUTPUT": str(output),
-                        "GITHUB_STEP_SUMMARY": str(summary),
-                        "TEST_LEVEL": "l3",
-                        "LANE_DEVICE": lane,
-                    },
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertEqual(result.returncode, exit_code, result.stderr)
-                if expected is None:
-                    self.assertIn("No supported GPU or NPU", result.stderr)
-                else:
-                    self.assertIn(f"run={expected}", output.read_text())
-                    if expected == "false":
-                        self.assertIn("not run", summary.read_text())
-                        self.assertIn("::warning::", result.stdout)
 
         def enabled(step: dict[str, Any], runner: str, level: str, hit: str) -> bool:
             condition = step["if"]
@@ -918,7 +916,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                                 .replace("env.VLLM_GR_TARGET_DEVICE", repr(device))
                             )
                             if evaluate(guard, context()):
-                                result = subprocess.run(
+                                result = run_workflow_command(
                                     [
                                         shutil.which("bash") or "bash",
                                         "-eu",
@@ -928,12 +926,9 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                                         "uv() { printf '%s\\n' \"$*\"; }\n" + step["run"],
                                     ],
                                     env={
-                                        **os.environ,
                                         "VLLM_GR_TARGET_DEVICE": device,
                                         "CI_VLLM_REQUIREMENT": "vllm==test",
                                     },
-                                    capture_output=True,
-                                    text=True,
                                 )
                                 self.assertEqual(result.returncode, 0, result.stderr)
                                 commands.extend(result.stdout.splitlines())
@@ -947,6 +942,80 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                             if device == "cuda":
                                 expected.append("pip install vllm==test")
                         self.assertEqual(commands, expected)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "devices,lane,expected,exit_code",
+    [
+        ((), "gpu", None, 1),
+        ((), "npu", None, 1),
+        (("npu-smi",), "gpu", "false", 0),
+        (("npu-smi",), "npu", "true", 0),
+        (("nvidia-smi",), "gpu", "true", 0),
+        (("nvidia-smi",), "npu", "false", 0),
+        (("npu-smi", "nvidia-smi"), "gpu", "false", 0),
+        (("npu-smi", "nvidia-smi"), "npu", "true", 0),
+    ],
+)
+def test_level_workflow_detects_accelerator(
+    tmp_path: Path, devices: tuple[str, ...], lane: str, expected: str | None, exit_code: int
+) -> None:
+    # Separate pytest items give each command its own timeout and let -x stop
+    # immediately, instead of recording a timeout inside unittest.subTest.
+    result = run_accelerator_detection(tmp_path, devices, lane)
+    assert result.returncode == exit_code, result.stderr
+    if expected is None:
+        assert "No supported GPU or NPU" in result.stderr
+    else:
+        assert f"run={expected}" in (tmp_path / "output").read_text()
+        if expected == "false":
+            assert "not run" in (tmp_path / "summary").read_text()
+            assert "::warning::" in result.stdout
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_accelerator_detection_ignores_shell_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    startup = tmp_path / "startup.sh"
+    startup.write_text("echo unexpected-shell-startup >&2\nexit 99\n", encoding="utf-8")
+    monkeypatch.setenv("BASH_ENV", str(startup))
+    monkeypatch.setenv("BASH_FUNC_command%%", "() { return 0; }")
+    result = run_accelerator_detection(tmp_path, (), "gpu")
+    assert result.returncode == 1
+    assert "No supported GPU or NPU" in result.stderr
+    assert "unexpected-shell-startup" not in result.stderr
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.timeout(5, func_only=True)  # type: ignore[misc]
+def test_accelerator_detection_times_out_and_reaps_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Replace only the Bash executable. Exercise the real detection path with
+    # a process that never reaches the workflow snippet.
+    sleep = shutil.which("sleep")
+    assert sleep is not None
+    bash = tmp_path / "bash"
+    bash.write_text(f"#!/bin/sh\nexec '{sleep}' 30\n", encoding="utf-8")
+    bash.chmod(0o755)
+    which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name: str(bash) if name == "bash" else which(name))
+    monkeypatch.setattr(sys.modules[__name__], "_WORKFLOW_COMMAND_TIMEOUT", 0.2)
+    processes: list[subprocess.Popen[str]] = []
+    popen = subprocess.Popen
+
+    def track_process(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", track_process)
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_accelerator_detection(tmp_path, (), "gpu")
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
 
 
 if __name__ == "__main__":
