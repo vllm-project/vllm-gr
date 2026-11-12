@@ -121,6 +121,33 @@ def test_full_request_to_numpy_batch(binary: bool) -> None:
     assert batch.items[0].request.external_req_id == "id-0"
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
+def test_constrained_length_is_checked_before_grpc_token_decoding(binary: bool) -> None:
+    from tests.test_beam_search_v1_input_processor import _canonical_gr_config
+
+    config = _canonical_gr_config()
+    config["beam"]["max_decode_steps"] = 7
+    backend = engine()
+    backend.vllm_config = SimpleNamespace(additional_config={"vllm_gr": config})
+    servicer = BeamVllmEngineServicer(backend, 0.0)
+    decode = Mock(wraps=servicer.decode_tokens)
+    servicer.decode_tokens = decode
+    request = message(binary=binary)
+    for length in (1, 2, 4, 7):
+        request.sampling_params.max_tokens = length
+        with pytest.raises(
+            ValueError,
+            match=f"effective generation length {length} must equal constraint_table_v1 depth",
+        ):
+            servicer.build_batch([request])
+        decode.assert_not_called()
+    request.sampling_params.max_tokens = 3
+    batch, _ = servicer.build_batch([request])
+    assert batch.beam_params.max_tokens == 3
+    decode.assert_called_once()
+
+
 @pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("trie_id", [None, 0, 1, 2**32 - 1])  # type: ignore[misc]
 def test_per_input_trie_selector_wire_and_batch_mapping(binary: bool, trie_id: int | None) -> None:

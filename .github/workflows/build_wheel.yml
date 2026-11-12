@@ -48,7 +48,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
-        target-device: ["cpu", "cuda"]
+        target-device: ["cpu", "cuda", "npu"]
 
     steps:
       - uses: actions/checkout@v4
@@ -67,11 +67,8 @@ jobs:
           UV_SYSTEM_PYTHON: 1
           VLLM_GR_TARGET_DEVICE: ${{ matrix.target-device }}
         run: |
-          if [[ "$VLLM_GR_TARGET_DEVICE" == "cpu" ]]; then
-            export VLLM_GR_EXPECTED_VERSION=0.30.0+cpu
-          else
-            export VLLM_GR_EXPECTED_VERSION=0.30.0
-          fi
+          # Packaging tests cover tags/fallbacks; the smoke test checks that
+          # installed module and distribution versions agree for this target.
           bash tools/run_wheel_smoke_test.sh --python python
 
       - name: Upload Wheel Artifact

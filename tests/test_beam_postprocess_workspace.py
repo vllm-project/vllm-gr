@@ -6,7 +6,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_gr.v1.beam.beam_decision import (
+from tests.beam_postprocess_workspace_utils import (
+    active_beams,
+    candidate_rows,
+    result_count,
+)
+from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
     BeamPostprocessWorkspace,
     BeamPostprocessWorkspaceKey,
     BeamPostprocessWorkspacePool,
@@ -39,21 +44,6 @@ def test_workspace_reserves_batch_dimension_and_fixed_protocol_buffers() -> None
     assert workspace.selected_parent_ids.shape == (2, 4)
     assert workspace.selected_scores.shape == (2, 4)
     assert workspace.next_sequence.shape == (2, 4, 3)
-    assert workspace.final_token_ids.shape == (2, 4)
-    assert workspace.final_parent_ids.shape == (2, 4)
-    assert workspace.final_scores.shape == (2, 4)
-    assert workspace.packed_result.shape == (24,)
-    assert workspace.host_result.shape == (24,)
-    assert workspace.host_result_numpy.shape == (24,)
-    workspace.host_result[0] = 17
-    assert int(workspace.host_result_numpy[0]) == 17
-    assert workspace.copy_event is None
-    assert workspace.prefill_staging.shape == (26,)
-    assert workspace.host_prefill_staging.shape == (26,)
-    assert workspace.host_prefill_staging_numpy.shape == (26,)
-    workspace.host_prefill_staging[1] = 23
-    assert int(workspace.host_prefill_staging_numpy[1]) == 23
-    assert workspace.prefill_copy_event is None
 
 
 def test_workspace_batch_slots_do_not_overwrite_each_other() -> None:
@@ -82,13 +72,14 @@ def test_workspace_views_are_contiguous_and_addresses_stay_stable() -> None:
     addresses = tuple(tensor.data_ptr() for tensor in workspace.device_tensors())
 
     for batch_size in (1, 2, 1, 2):
-        decode = workspace.candidate_rows(workspace.topk_token_ids, batch_size)
-        compact = workspace.candidate_rows(
+        decode = candidate_rows(workspace, workspace.topk_token_ids, batch_size)
+        compact = candidate_rows(
+            workspace,
             workspace.topk_token_ids,
             batch_size,
             compact=True,
         )
-        selected = workspace.active_beams(workspace.selected_token_ids, batch_size)
+        selected = active_beams(workspace, workspace.selected_token_ids, batch_size)
         assert decode.shape == (batch_size * 4, 4)
         assert compact.shape == (batch_size, 4)
         assert selected.shape == (batch_size, 4)
@@ -139,12 +130,12 @@ def test_workspace_rejects_invalid_geometry(kwargs: dict[str, int], match: str) 
 
 def test_workspace_result_count_bounds() -> None:
     workspace = _workspace()
-    assert workspace.result_count(1) == 4
-    assert workspace.result_count(2, 3) == 6
+    assert result_count(workspace, 1) == 4
+    assert result_count(workspace, 2, 3) == 6
     with pytest.raises(ValueError, match="batch_size"):
-        workspace.result_count(3)
+        result_count(workspace, 3)
     with pytest.raises(ValueError, match="result_width"):
-        workspace.result_count(1, 5)
+        result_count(workspace, 1, 5)
 
 
 pytestmark = pytest.mark.cpu_test

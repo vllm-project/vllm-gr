@@ -395,15 +395,11 @@ def cascade_attention(
 ) -> None:
     """Dispatch incremental beam decode to x_attention; forward the rest.
 
-    Shapes the fused kernel cannot express are delegated to the cascade
-    module instead of raising: mixed std/beam batches, sliding-window /
-    soft-cap / sink / ALiBI configs, or a missing prefix_indices/pool all
-    fall back to ``beam_attn_npu.cascade_attention``, which computes the
-    same quantity per-operator (std rows via paged attention, beam rows via
-    the pool-slice incremental path — numerically equivalent to the fused
-    kernel, locked by the parity tests).  Without this delegation the
-    documented fallback (docs/quickstart-ascend.md) would be a user-visible
-    request failure whenever a std request shares a batch with beam decode.
+    Mixed std/beam batches and missing prefix_indices/pool are delegated
+    to ``beam_attn_npu.cascade_attention``, which handles those layouts.
+    Sliding-window, softcap, ALiBi and sink configurations are unsupported
+    by both NPU execution paths and rejected by ``BeamAttentionImpl`` at
+    initialization; delegation does not add support for those semantics.
     """
     beam_session = getattr(attn_metadata, "beam_session", None)
     is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
@@ -436,9 +432,8 @@ def cascade_attention(
             # cascade handles (its beam branch falls back to full gather).
             _fallback_to_cascade()
             return
-        # (-1, -1) is the "no sliding window" sentinel the impl passes for
-        # models without one; only a real window is unsupported here (the
-        # cascade path ignores the argument entirely on the beam branch).
+        # (-1, -1) is the "no sliding window" sentinel. BeamAttentionImpl
+        # rejects unsupported attention features before selecting this module.
         if sliding_window_size is not None and any(
             w is not None and w >= 0 for w in sliding_window_size
         ):

@@ -19,10 +19,10 @@ from vllm_gr.ops.cuda.beam_selection import (
     _group_beam_outputs_kernel,
     _hierarchical_topk_out,
 )
-from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspace
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
 
 try:
     from torch._C._dynamo.guards import TensorGuards as _TensorGuards

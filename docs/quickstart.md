@@ -3,7 +3,7 @@
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.11, 3.12, or 3.13
 - Pip 23+
 - CUDA 13.0 (for GPU inference)
 - 32GB+ RAM (recommended)
@@ -22,13 +22,9 @@ cd vllm-gr
 This step is not mandatory. You can use a previously installed environment.
 
 ```bash
-uv venv --python 3.12
+uv venv --python 3.12 --seed
 source .venv/bin/activate
-python -m ensurepip --upgrade
-ln -s -r .venv/bin/pip3 .venv/bin/pip
-#make sure pip is installed correctly
-pip --version
-#pip 25.0.1 from /your-path/vllm-gr/.venv/lib/python3.12/site-packages/pip (python 3.12)
+python -m pip --version
 ```
 
 3. **Install vllm-gr**
@@ -40,13 +36,13 @@ version into the same environment.
 For standard installation:
 
 ```bash
-pip install -e .
+VLLM_GR_TARGET_DEVICE=cuda python -m pip install -e .
 ```
 
 For developer mode (includes pytest, ruff, etc.):
 
 ```bash
-pip install -e ".[dev]"
+VLLM_GR_TARGET_DEVICE=cuda python -m pip install -e ".[dev]"
 ```
 
 Confirm that the resolved environment contains the supported runtime:
@@ -61,7 +57,17 @@ vLLM runtime from `requirements/cuda.txt`. There is no CUDA extra. The Ascend
 path is validated on the vLLM-Ascend 0.30.0rc2 vendor image; see the
 [Ascend installation guide](quickstart-ascend.md) before attempting an NPU environment.
 
-> **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
+You can also use uv with the same target and dependency contract:
+
+```bash
+VLLM_GR_TARGET_DEVICE=cuda uv pip install -e ".[dev]"
+```
+
+Set the target explicitly because an isolated build environment may not contain
+Torch for backend detection. When `VLLM_GR_TARGET_DEVICE` is unset, `setup.py`
+auto-detects the Torch backend and defaults to CUDA if Torch cannot be imported.
+See the [dependency and version policy](dependency_version_policy.md)
+for release tags, overrides, and package versions.
 
 4. **Verify installation**
 

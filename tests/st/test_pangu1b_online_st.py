@@ -287,6 +287,8 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
             body = _chat_completion(
                 self.base_url,
                 content=build_prompt(str(row["question"])),
+                # Allow the model to finish its reasoning and final answer.
+                max_tokens=512,
             )
             generated = body["choices"][0]["message"].get("content") or ""
             predicted = extract_final_answer(generated)

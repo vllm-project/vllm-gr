@@ -1,8 +1,10 @@
 [build-system]
 requires = [
+    "packaging>=24.2",
     "setuptools>=77.0.3,<81.0.0",
     "wheel",
-    "setuptools-scm>=8.0",
+    # 8.0.0 generates invalid Python in _version.py; 8.0.4 is the tested floor.
+    "setuptools-scm>=8.0.4",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -44,13 +46,17 @@ grpc = [
 ]
 dev = [
     "packaging>=24.2",
+    # Packaging tests import setup.py and build distributions without build isolation.
+    "pip",
+    "setuptools>=77.0.3,<81.0.0",
+    "setuptools-scm>=8.0.4",
+    "wheel",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout",
     "pytest-cov>=4.0.0",
     "types-protobuf",
     "tblib",
-    "black",
     "ruff",
     "mypy",
     "psutil",
@@ -88,7 +94,7 @@ include = ["vllm_gr*"]
 "vllm_gr.entrypoints.grpc" = ["proto/*.proto"]
 
 [tool.setuptools_scm]
-fallback_version = "0.30.0"
+# setup.py owns version selection and device suffixes.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -109,10 +115,6 @@ markers = [
     "model_test: mark test as requiring model weights",
     "network: mark test as requiring network access",
 ]
-
-[tool.black]
-line-length = 100
-target-version = ['py311', 'py312', 'py313']
 
 [tool.ruff]
 extend-exclude = ["vllm_gr/entrypoints/grpc/generated"]

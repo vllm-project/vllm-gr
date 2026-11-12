@@ -58,7 +58,8 @@ The constrained example requires:
   defaults to `[1, 2, 4]` and must fit engine capacity.
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
 - Request `beam_width == beam.max_width`.
-- Effective generation budget `N` in `{1, 2, 3}`.
+- Effective generation budget `N=3`, matching the three-layer `constraint_table_v1`.
+  Other lengths are rejected at request ingress.
 - Token/text prompts rather than embedding prompts.
 - No speculative decoding, LoRA, quantization, hybrid model, encoder-decoder
   model, or multimodal model.
@@ -128,7 +129,15 @@ constraint_table:
 | `worker_decision` | Performs Beam selection on the Worker | `true` |
 | `engine_driven` | Retired input; V1 always owns scheduling | Omit; old `true` warns and is discarded, `false` is rejected |
 | `max_width` | Engine Beam capacity | Same as request `beam_width` |
-| `max_decode_steps` | Maximum effective generation budget | `1`, `2`, or `3` |
+| `max_decode_steps` | Startup capacity for effective generation length | Positive integer; at least `3` for this constrained example |
+
+On CUDA, with `constrained_generation: false` and
+`constraint_table.enabled: false`, one engine can accept per-request effective
+lengths from `1` through its configured `beam.max_decode_steps` (for example,
+`7`). Existing NPU startup limits still apply (`max_decode_steps <= 3`).
+Increasing capacity does not change the depth of an enabled
+`constraint_table_v1`: constrained requests still require exactly three
+effective tokens.
 
 #### Constraint Table parameters
 
@@ -204,9 +213,10 @@ CUDA_VISIBLE_DEVICES=0 python offline_beam_search_v1.py \
 Run `python offline_beam_search_v1.py --help` to see optional memory, length
 penalty, output-count, and measurement arguments.
 
-On NPU, `--generated-steps 1` completes in Prefill, so a zero Decode
-`full_dispatches` counter is expected. Only runs with Decode (`N > 1`) require
-the requested Beam graph shape to be captured and replayed. The `fallbacks`
+This constrained example accepts only `--generated-steps 3` and rejects `1` or
+`2` during argument validation, before model loading or artifact construction.
+On NPU, this runs Prefill followed by two Decode stages and requires the
+requested Beam graph shape to be captured and replayed in graph mode. The `fallbacks`
 counter means Beam FULL graph was not used: native FULL is rejected, while
 native PIECEWISE/NONE is retained. It does not count exclusively eager forwards.
 
@@ -554,9 +564,11 @@ native non-GR Beam rejects an explicit schedule.
 `beam_width` remains the engine capacity in `[1, 256]` and must equal
 `beam.max_width`.
 The schedule has exactly one integer in `[1, beam_width]` per effective generated
-step N, which remains limited to 1, 2, or 3. Begin/end boundary positions are
-excluded from the schedule. With both boundary tokens above, `max_tokens=5`
-means N=3: retain 128 SA candidates, then 64 SB candidates, then 32 SC candidates.
+step N, which must equal 3 when the constraint table is enabled. Without
+constraints, N can range from 1 through `beam.max_decode_steps`, subject to the
+backend's existing capacity limits. Begin/end boundary positions are excluded
+from the schedule. With both boundary tokens above, `max_tokens=5` means N=3:
+retain 128 SA candidates, then 64 SB candidates, then 32 SC candidates.
 The API appends BEGIN before Prefill; do not append it again to the input prompt.
 END is handled by the existing boundary/output rules, not an extra scheduled
 model step.

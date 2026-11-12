@@ -43,8 +43,11 @@ core = _core_fixture
 scheduler = _scheduler_fixture
 
 
-def _config(*, device="npu", budget=512, width=128):
-    canonical = _canonical_gr_config(backend=device)
+def _config(*, device="npu", budget=512, width=128, constrained=True):
+    canonical = _canonical_gr_config(enabled=constrained, backend=device)
+    if not constrained:
+        canonical["constrained_generation"] = False
+        canonical["constraint_table"] = {"enabled": False, "backend": device}
     canonical["beam"]["max_width"] = width
     canonical["constraint_table"]["max_top_k"] = width
     engine = _make_engine(additional_config={"vllm_gr": canonical})
@@ -100,7 +103,8 @@ CASES = [
 
 @pytest.mark.parametrize("size,steps,widths,budget,accepted", CASES)
 def test_shared_npu_request_and_scheduler_admission(size, steps, widths, budget, accepted):
-    config = _config(budget=budget).vllm_config
+    # Short requests exercise physical-token admission without a three-layer table.
+    config = _config(budget=budget, constrained=steps == 3).vllm_config
     request = _request(size=size, steps=steps, widths=widths)
     scheduler = SimpleNamespace(
         scheduler_config=config.scheduler_config,
@@ -130,7 +134,7 @@ def test_shared_npu_request_and_scheduler_admission(size, steps, widths, budget,
 def test_npu_budget_reaches_native_offline_and_online_frontends(
     online, size, steps, widths, budget, accepted
 ):
-    engine = _config(budget=budget)
+    engine = _config(budget=budget, constrained=steps == 3)
     processor = BeamSearchInputProcessor(engine)
     params = BeamSearchParams(
         beam_width=128,

@@ -96,6 +96,10 @@ run_group() {
       --n 128 \
       --temperature 0.6 \
       --result-dir "$run_dir" 2>&1 | tee "$group_dir/run.log"
+  if [[ "${V1_RECALL_DIAGNOSTICS:-0}" == 1 ]]; then
+    python -m benchmarks.beam_search.v1_recall_diagnostics \
+      --run-log "$group_dir/run.log" --output "$group_dir/attention_diagnostics.json"
+  fi
   echo "$((SECONDS - group_start))" > "$group_dir/wall_seconds.txt"
 }
 

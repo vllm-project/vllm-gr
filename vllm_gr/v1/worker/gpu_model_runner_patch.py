@@ -63,7 +63,7 @@ def initialize_beam_postprocess_workspaces(
         return None
 
     from vllm_gr.config import BeamExecutionMode, resolve_candidate_width
-    from vllm_gr.v1.beam.beam_decision import (
+    from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
         BeamPostprocessWorkspacePool,

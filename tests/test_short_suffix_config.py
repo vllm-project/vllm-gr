@@ -729,7 +729,10 @@ def test_layer_constructor_validates_before_execution(
         "logits_soft_cap": 10.0,
     }
     active = cuda and width is not None and enabled is not False
-    if active:
+    if not cuda:
+        with pytest.raises(NotImplementedError, match="logits_soft_cap"):
+            beam_attn.BeamAttentionImpl(**kwargs)
+    elif active:
         with pytest.raises(ValueError, match="softcap"):
             beam_attn.BeamAttentionImpl(**kwargs)
     else:

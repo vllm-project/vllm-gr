@@ -74,7 +74,13 @@ def parse_args() -> argparse.Namespace:
         help="NPU Decode execution mode; CUDA keeps its existing graph behavior",
     )
     parser.add_argument("--input-len", type=int, default=1024)
-    parser.add_argument("--generated-steps", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument(
+        "--generated-steps",
+        type=int,
+        choices=(1, 2, 3),
+        default=3,
+        help="Effective SID length; constrained Beam requires 3 (unused with --enable-thinking)",
+    )
     parser.add_argument("--beam-width", type=int, default=128)
     parser.add_argument(
         "--dynamic-beam-widths",
@@ -128,6 +134,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--cot-max-tokens must be positive")
     if not args.enable_thinking and args.catalog is None:
         parser.error("--catalog is required unless --enable-thinking is set")
+    if not args.enable_thinking and args.generated_steps != 3:
+        parser.error(
+            "constrained Beam requires --generated-steps 3 to match constraint_table_v1 depth"
+        )
     if args.enable_thinking or args.cot:
         if args.enable_thinking and (
             args.dynamic_beam_widths is not None or args.result_width is not None

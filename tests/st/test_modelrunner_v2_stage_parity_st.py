@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 import pytest
 
-_SESSIONS = ((1024, 3), (900, 1), (900, 2), (1024, 3))
+_SESSIONS = ((1024, 3), (900, 3), (900, 3), (1024, 3))
 _EXTENSIONS = {
     "graph": "tests.st.test_modelrunner_v2_stage_parity_st.OneRecV2ParityWorkerExtension",
     "eager": "tests.st.test_modelrunner_v2_stage_parity_st.OneRecV2ParityWorkerExtension",
@@ -156,6 +156,7 @@ def _run_arm(work_dir: Path, arm: str) -> None:
         _inputs,
         _params,
     )
+    from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
     from vllm_gr.entrypoints.gr import GRLLM
 
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
@@ -231,6 +232,19 @@ def _run_arm(work_dir: Path, arm: str) -> None:
                 and s.tokens[-1] == tokenizer.convert_tokens_to_ids("<|sid_end|>")
                 for s in public.sequences
             )
+            if index == 0:
+                for invalid_steps in (1, 2):
+                    with pytest.raises(
+                        BeamSearchRequestError, match="must equal constraint_table_v1 depth"
+                    ):
+                        llm.beam_search_v1(
+                            [{"prompt_token_ids": ids}], _params(invalid_steps), output_mode="full"
+                        )
+                    assert not llm.llm_engine.has_unfinished_requests()
+                unchanged = llm.collective_rpc("onerec_v2_parity_snapshot", timeout=30)[0]
+                assert unchanged["counts"] == counts, "rejected SID dispatched model work"
+                assert unchanged["session_id"] == snapshot["session_id"] and unchanged["retired"]
+                assert unchanged["native_requests"] == 0 and not unchanged["active_sessions"]
             results.append({"length": length, "steps": steps, "sequences": sequences})
             evidence.append(snapshot)
             print(f"V2 {arm}: prompt={length}, steps={steps}, paths={delta}, retired", flush=True)

@@ -4,10 +4,14 @@
 
 from __future__ import annotations
 
+import gc
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import msgspec
 import numpy as np
@@ -25,10 +29,10 @@ from vllm_gr.v1.attention.backends.beam_graph_kernels import (
     copy_suffix_kv_graph,
 )
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspace
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
     GRStageKind,
@@ -990,7 +994,8 @@ def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version
         assert owner._head_slice_request == (SLICE_AUTO if slice_setting == "auto" else 16384)
 
 
-def test_sliced_head_non_divisible_vocab_peak_allocation(monkeypatch):
+def _assert_sliced_head_non_divisible_vocab_peak_allocation():
+    """Measure only allocations made by this projection in a fresh process."""
     from vllm_gr.v1.worker import gpu_beam_stage_runner as stage_runner
 
     rows, hidden_size, vocab_size = 2048, 16, 176256
@@ -1007,23 +1012,55 @@ def test_sliced_head_non_divisible_vocab_peak_allocation(monkeypatch):
         _active_slice_cols=cols,
         temperatures=torch.ones(rows, device="cuda"),
     )
-    # Measure the production projection path independently of Top-K scratch.
-    monkeypatch.setattr(stage_runner, "stream_slice", lambda *args, **kwargs: None)
-    monkeypatch.setattr(stage_runner, "repair_emit", lambda *args, **kwargs: None)
 
+    # Measure the production projection path independently of Top-K scratch.
     def run():
         GPUBeamStageRunner._select_from_hidden_slices(owner, hidden, rows, 1, None, (), None)
 
-    run()  # Warm up GEMM, including the tail shape, before measuring allocations.
-    torch.accelerator.synchronize()
-    owner._head_buffers.release_slice()
-    baseline = torch.accelerator.memory_allocated()
-    torch.accelerator.reset_peak_memory_stats()
-    run()
-    torch.accelerator.synchronize()
-    peak = torch.accelerator.max_memory_allocated() - baseline
-    assert rows * cols * hidden.element_size() <= peak <= budget
-    assert owner._head_buffers.full is None
+    with (
+        patch.object(stage_runner, "stream_slice", lambda *args, **kwargs: None),
+        patch.object(stage_runner, "repair_emit", lambda *args, **kwargs: None),
+    ):
+        run()  # Warm up GEMM, including the tail shape, before measuring allocations.
+        torch.accelerator.synchronize()
+        owner._head_buffers.release_slice()
+        # Reclaim transient cycles before sampling the process-level baseline;
+        # none may disappear between that baseline and the peak measurement.
+        gc.collect()
+        torch.accelerator.synchronize()
+        gc_enabled = gc.isenabled()
+        if gc_enabled:
+            gc.disable()
+        try:
+            baseline = torch.accelerator.memory_allocated()
+            torch.accelerator.reset_peak_memory_stats()
+            run()
+            torch.accelerator.synchronize()
+            peak = torch.accelerator.max_memory_allocated() - baseline
+        finally:
+            if gc_enabled:
+                gc.enable()
+        assert rows * cols * hidden.element_size() <= peak <= budget
+        assert owner._head_buffers.full is None
+
+
+def test_sliced_head_non_divisible_vocab_peak_allocation():
+    # CUDA allocation counters are process-wide. Run this measurement in a
+    # fresh process so unrelated tests cannot free allocations after baseline.
+    command = (
+        "from tests.kernels.test_gpu_beam_stage_runner import "
+        "_assert_sliced_head_non_divisible_vocab_peak_allocation; "
+        "_assert_sliced_head_non_divisible_vocab_peak_allocation()"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_transposed_head_gemm_only_when_slicing_is_requested():

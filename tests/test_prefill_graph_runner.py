@@ -886,6 +886,37 @@ def test_get_max_context_len() -> None:
     assert get_max_context_len(MockModelRunner()) == 0
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("dcp_size", [1, 2, None])  # type: ignore[misc]
+@pytest.mark.parametrize("as_dict", [False, True])  # type: ignore[misc]
+def test_gpu_capture_preserves_only_valid_native_fa_schedules(
+    dcp_size: int | None, as_dict: bool
+) -> None:
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+
+    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+
+    schedule = object()
+    ordinary = object.__new__(FlashAttentionMetadata)
+    ordinary.use_cascade = False
+    ordinary.scheduler_metadata = schedule
+    cascade = object.__new__(FlashAttentionMetadata)
+    cascade.use_cascade = True
+    cascade.scheduler_metadata = schedule
+    gr_metadata = SimpleNamespace(use_cascade=False, scheduler_metadata=schedule)
+
+    if as_dict:
+        metas: Any = {"ordinary": ordinary, "cascade": cascade, "gr": gr_metadata}
+        GPUPrefillGraphRunner._disable_stale_native_fa_scheduler(metas, dcp_size)
+    else:
+        for meta in (ordinary, cascade, gr_metadata):
+            GPUPrefillGraphRunner._disable_stale_native_fa_scheduler(meta, dcp_size)
+
+    assert ordinary.scheduler_metadata is (None if dcp_size == 1 else schedule)
+    assert cascade.scheduler_metadata is schedule
+    assert gr_metadata.scheduler_metadata is schedule
+
+
 def test_gpu_max_seq_len_bound() -> None:
     from types import SimpleNamespace
 

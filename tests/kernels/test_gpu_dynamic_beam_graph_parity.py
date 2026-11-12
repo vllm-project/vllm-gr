@@ -31,7 +31,7 @@ def test_irregular_graph_parity(tmp_path):
             (4, [7, 3, 11], 5),
             (2, [8, 4, 11], 5),
             (4, [4, 2, 11], 5),
-            (1, [16], 1),
+            (1, [16, 16, 16], 1),
             (4, [16, 16, 16], 16),
             (4, [7, 3, 11], 5),
             (4, [16, 16, 16], 16),
@@ -42,7 +42,7 @@ def test_irregular_graph_parity(tmp_path):
                 beam_width=16,
                 dynamic_beam_widths=widths,
                 result_width=result_width,
-                max_tokens=len(widths),
+                max_tokens=3,
                 ignore_eos=True,
                 temperature=0.0,
             )
@@ -54,7 +54,7 @@ def test_irregular_graph_parity(tmp_path):
                 results.append(
                     [[(tuple(s.tokens), s.cum_logprob) for s in out.sequences] for out in outputs]
                 )
-                if not eager and len(widths) > 1:
+                if not eager:
                     graph = worker._beam_decode_graph
                     assert graph.ready
                     assert graph.signature.beam_width == widths[-2]

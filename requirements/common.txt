@@ -6,12 +6,17 @@
 # require numpy>=2, while the Ascend stack pins numpy==1.26.4 through
 # triton-ascend. The two majors are therefore irreconcilable in one shared
 # list, so each platform declares its own pair.
+# General libraries use lower bounds; exact runtime/ABI constraints belong
+# in the platform files. The retained PyArrow pin is explained below.
 
 msgspec
 regex
 pandas>=3.0.0
 requests>=2.32.0
 scikit-learn>=1.8.0
+# Preserve the existing data-loading baseline. No exclusive API requirement
+# for 23.0.0 is documented; widening this pin needs a separate compatibility
+# check of the Parquet/data-loading paths on the supported NumPy stacks.
 pyarrow==23.0.0
 tqdm>=4.66.0
 safetensors>=0.6.2

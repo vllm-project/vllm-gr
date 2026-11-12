@@ -12,15 +12,20 @@ import logging
 import os
 import sys
 import warnings
+from email.parser import Parser
 from pathlib import Path
 
+from packaging.version import Version
 from setuptools import setup
 from setuptools_scm import get_version
+from setuptools_scm.version import ScmVersion
 
 logger = logging.getLogger("vllm_gr.setup")
 
 _VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
 VLLM_GR_BASE_VERSION = "0.30.0"
+ROOT_DIR = Path(__file__).resolve().parent
+_SCM_OVERRIDE = "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_GR"
 
 # Module-level cache so that detect_target_device() is evaluated exactly once
 # per setup.py invocation, avoiding duplicate log output and potential
@@ -52,7 +57,7 @@ def detect_target_device() -> str:
     1. VLLM_GR_TARGET_DEVICE environment variable (highest priority)
     2. READTHEDOCS=1 -> cpu
     3. Torch backend detection (cuda, npu)
-    4. No torch -> default cuda (consistent with vllm-omni)
+    4. No torch -> default cuda
     5. Torch present but no GPU/NPU backend -> cpu
 
     The result is cached after the first call.
@@ -104,6 +109,12 @@ def detect_target_device() -> str:
         return _cached_device
 
 
+def _release_version(version: ScmVersion) -> str:
+    # Only clean release tags choose a new public version. Untagged/dirty
+    # checkouts keep the declared compatibility baseline instead of 0.1.devN.
+    return str(version.tag) if version.exact else VLLM_GR_BASE_VERSION
+
+
 def get_vllm_gr_version() -> str:
     """
     Get the vllm-gr version with optional device-specific suffix.
@@ -117,13 +128,29 @@ def get_vllm_gr_version() -> str:
         VLLM_GR_VERSION_OVERRIDE: Override version completely
         VLLM_GR_TARGET_DEVICE: Override device detection
     """
-    if env_version := os.getenv("VLLM_GR_VERSION_OVERRIDE"):
-        logger.info("Overriding version with %s from VLLM_GR_VERSION_OVERRIDE", env_version)
-        version = env_version
+    override = (
+        os.getenv("VLLM_GR_VERSION_OVERRIDE")
+        or os.getenv(_SCM_OVERRIDE)
+        or os.getenv("SETUPTOOLS_SCM_PRETEND_VERSION")
+    )
+    if override:
+        version = override
+    elif (ROOT_DIR / "PKG-INFO").is_file():
+        # An sdist has already declared its distribution identity. Preserve it
+        # through metadata preparation and wheel building, even on another target.
+        metadata = Parser().parsestr((ROOT_DIR / "PKG-INFO").read_text(encoding="utf-8"))
+        version = metadata["Version"]
+        if not version:
+            raise ValueError("sdist PKG-INFO is missing its Version")
     else:
-        # vllm-gr releases follow the matching vLLM public version. Do not let
-        # an untagged source checkout produce an unrelated 0.1.devN version.
-        version = VLLM_GR_BASE_VERSION
+        version = get_version(
+            root=str(ROOT_DIR),
+            fallback_root=str(ROOT_DIR),
+            dist_name="vllm-gr",
+            version_scheme=_release_version,
+            local_scheme="no-local-version",
+            fallback_version=VLLM_GR_BASE_VERSION,
+        )
         device = detect_target_device()
 
         if device == "cuda":
@@ -134,8 +161,23 @@ def get_vllm_gr_version() -> str:
         else:
             raise RuntimeError(f"Unknown target device: {device}")
 
-    os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = version
-    get_version(write_to="vllm_gr/_version.py")
+    # Write the final normalized version, including any device suffix.
+    # Scope the override to this distribution and restore it after the write:
+    # PEP 517 frontends can invoke the backend repeatedly in the same process.
+    version = str(Version(version))
+    previous = os.environ.get(_SCM_OVERRIDE)
+    try:
+        os.environ[_SCM_OVERRIDE] = version
+        version = get_version(
+            root=str(ROOT_DIR),
+            dist_name="vllm-gr",
+            write_to="vllm_gr/_version.py",
+        )
+    finally:
+        if previous is None:
+            os.environ.pop(_SCM_OVERRIDE, None)
+        else:
+            os.environ[_SCM_OVERRIDE] = previous
     logger.info("Generated version: %s", version)
     return version
 

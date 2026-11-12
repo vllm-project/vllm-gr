@@ -368,6 +368,7 @@ def _assert_batch_equal(reference: list[Any], candidate: list[Any], label: str) 
 
 
 def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
+    from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
     from vllm_gr.entrypoints.gr import GRLLM
 
     exact_prefill = graph and not _padded_prefill_requested(os.environ)
@@ -444,16 +445,16 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
             tokenizer,
             [staged_prompt, staged_prompt.copy()],
             legal,
-            steps=2,
+            steps=3,
             cache_salts=[
-                "npu-e2e-duplicate-n2-request-row-0",
-                "npu-e2e-duplicate-n2-request-row-1",
+                "npu-e2e-duplicate-n3-request-row-0",
+                "npu-e2e-duplicate-n3-request-row-1",
             ],
         )
         _print_comparison(
             duplicate_outputs[0],
             duplicate_outputs[1],
-            label="same-batch duplicate N=2 request rows",
+            label="same-batch duplicate N=3 request rows",
             prompt_length=len(staged_prompt),
         )
 
@@ -493,7 +494,7 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
             prompt_length=len(staged_prompt),
         )
         print(
-            "NPU V1 E2E: B=1/N=3, duplicate B=2/N=2 and "
+            "NPU V1 E2E: B=1/N=3, duplicate B=2/N=3 and "
             "different-prompt B=2/N=3 functional checks passed",
             flush=True,
         )
@@ -611,18 +612,27 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
                 flush=True,
             )
             stats = current
-        _run_case(
-            llm,
-            tokenizer,
-            comparison_prompts,
-            legal,
-            steps=1,
-            cache_salts=["graph-prefill-only-row-0", "graph-prefill-only-row-1"],
-        )
+        # Short SIDs cannot traverse the enabled three-layer constraint table.
+        for steps in (1, 2):
+            with pytest.raises(
+                BeamSearchRequestError, match="must equal constraint_table_v1 depth"
+            ):
+                _run_case(
+                    llm,
+                    tokenizer,
+                    comparison_prompts,
+                    legal,
+                    steps=steps,
+                    cache_salts=["graph-invalid-length-row-0", "graph-invalid-length-row-1"],
+                )
+            assert not llm.llm_engine.has_unfinished_requests()
         current = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
         assert current["full_dispatches"] == stats["full_dispatches"]
         assert current["fallbacks"] == stats["fallbacks"]
-        print("NPU graph correctness: B=2 -> B=1 -> B=2 and N=1 passed", flush=True)
+        print(
+            "NPU graph correctness: B=2 -> B=1 -> B=2 passed; N=1/2 rejected before dispatch",
+            flush=True,
+        )
 
 
 def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:

@@ -62,14 +62,17 @@ echo "Importing installed wheel outside the source checkout"
     cd "$SMOKE_ROOT"
     export PYTHONPATH="$INSTALL_DIR"
     export INSTALL_DIR
+    export SOURCE_DIR="$ROOT_DIR"
     export VLLM_GR_EXPECTED_VERSION="${VLLM_GR_EXPECTED_VERSION:-}"
     export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-}"
     "$PYTHON" - <<'PY'
 import os
+from email.parser import Parser
 from importlib import metadata
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 import vllm_gr
 
@@ -93,6 +96,23 @@ requirements = {
     if Requirement(value).marker is None
 }
 target = os.environ["VLLM_GR_TARGET_DEVICE"]
+overridden = any(os.environ.get(name) for name in (
+    "VLLM_GR_VERSION_OVERRIDE",
+    "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_GR",
+    "SETUPTOOLS_SCM_PRETEND_VERSION",
+))
+sdist_metadata = Path(os.environ["SOURCE_DIR"]) / "PKG-INFO"
+if not overridden and sdist_metadata.is_file():
+    source_version = Parser().parsestr(sdist_metadata.read_text(encoding="utf-8"))["Version"]
+    if version != source_version:
+        raise SystemExit(f"sdist/wheel version mismatch: {source_version} != {version}")
+elif not overridden:
+    local = Version(version).local
+    suffix = local.split(".")[-1] if local else None
+    if target in {"cpu", "npu"} and suffix != target:
+        raise SystemExit(f"{target} wheel has wrong version suffix: {version}")
+    if target == "cuda" and suffix in {"cpu", "npu"}:
+        raise SystemExit(f"CUDA wheel has wrong version suffix: {version}")
 if "regex" not in requirements:
     raise SystemExit("wheel is missing its direct regex dependency")
 if target == "cuda" and requirements.get("vllm") != "==0.30.0":

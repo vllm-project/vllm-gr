@@ -1,0 +1,246 @@
+name: Test levels
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 02:00 Asia/Shanghai, daily; 03:00 Monday, weekly (UTC cron).
+    - cron: '0 18 * * *'
+    - cron: '0 19 * * 0'
+  workflow_dispatch:
+    inputs:
+      level:
+        description: Test level to run
+        type: choice
+        required: true
+        default: l3
+        options: [l1, l2, l3, l4, l5]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Share the accelerator lock with the PR benchmark workflow. Lanes stay in
+  # this single queue because the pool has no device labels yet; once labels
+  # exist the group can gain a per-device suffix so lanes run in parallel.
+  group: vllm-gr-accelerator-${{ github.repository }}
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  level:
+    # The shared pool has no GPU/NPU labels, so each lane reports and exits
+    # when the selected runner does not match its target device. Giving the
+    # runners device labels would allow precise routing instead.
+    name: level (${{ matrix.device }})
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [gpu, npu]
+    runs-on: self-hosted
+    timeout-minutes: 360
+    env:
+      LANE_DEVICE: ${{ matrix.device }}
+      TEST_LEVEL: ${{ github.event_name == 'push' && 'l3' || github.event_name == 'schedule' && (github.event.schedule == '0 19 * * 0' && 'l5' || 'l4') || inputs.level || 'l3' }}
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      VLLM_GR_RUN_MODEL_SMOKE: '1'
+      VLLM_GR_ISOLATED_RUNNER: ${{ vars.VLLM_GR_ISOLATED_RUNNER || 'false' }}
+      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
+    steps:
+      - name: Detect runner accelerator
+        id: accelerator
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$LANE_DEVICE"
+          if command -v npu-smi >/dev/null 2>&1; then
+            detected=npu
+          elif command -v nvidia-smi >/dev/null 2>&1; then
+            detected=gpu
+          else
+            echo 'No supported GPU or NPU was detected on this self-hosted runner.' >&2
+            exit 1
+          fi
+          if [[ "$detected" != "$target" ]]; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo "$TEST_LEVEL was not run on the $target lane: the selected runner has $detected tooling, so this lane found no matching device." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Test level $target lane skipped because the selected runner is $detected."
+          else
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+            echo "Running $TEST_LEVEL on a detected $detected runner."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.accelerator.outputs.run == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.accelerator.outputs.run == 'true'
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v1
+        if: steps.accelerator.outputs.run == 'true'
+
+      - name: Resolve runtime for runner device
+        id: runtime
+        if: steps.accelerator.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/ci/resolve_runtime.py resolve --device "$LANE_DEVICE" \
+            --output "$RUNNER_TEMP/gr-level-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/spec.json" \
+            --github-output "$GITHUB_OUTPUT" --github-env "$GITHUB_ENV"
+
+      - name: Cache virtual environment
+        if: steps.accelerator.outputs.run == 'true'
+        uses: corca-ai/local-cache@v2
+        id: cache-venv
+        with:
+          path: .venv
+          base: /data/actions/cache
+          key: ${{ steps.runtime.outputs.cache-key }}
+
+      - name: Create virtual environment
+        if: steps.accelerator.outputs.run == 'true' && steps.cache-venv.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if [[ "$LANE_DEVICE" == npu ]]; then
+            # Reuse the vendor runtime (torch, torch_npu, custom ops) prepared
+            # in the runner image instead of installing a private copy.
+            uv venv --seed --system-site-packages .venv
+          else
+            uv venv --seed .venv
+          fi
+
+      - name: Activate virtual environment
+        if: steps.accelerator.outputs.run == 'true'
+        shell: bash
+        run: |
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+
+      - name: Install CUDA base environment
+        if: steps.accelerator.outputs.run == 'true' && steps.cache-venv.outputs.cache-hit != 'true' && env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        run: uv pip install "$CI_VLLM_REQUIREMENT"
+
+      - name: Refresh editable installation
+        if: steps.accelerator.outputs.run == 'true'
+        run: uv pip install -e '.[dev,grpc]'
+
+      - name: Verify installed runtime identity
+        if: steps.accelerator.outputs.run == 'true'
+        run: >-
+          python tools/ci/resolve_runtime.py verify
+          --spec "$RUNNER_TEMP/gr-level-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/spec.json"
+          --venv "$VIRTUAL_ENV"
+          --output "$RUNNER_TEMP/gr-level-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/installed.json"
+          --cache-root "$RUNNER_TEMP/gr-level-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          --github-env "$GITHUB_ENV"
+
+      - name: Verify accelerator prerequisites
+        if: steps.accelerator.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$LANE_DEVICE" == npu ]]; then
+            python -c 'import torch, torch_npu, custom_ops_lib; assert torch.npu.is_available()'
+          else
+            python -c 'import torch; assert torch.cuda.is_available()'
+          fi
+
+      - name: Cache Pangu model
+        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4'
+        uses: corca-ai/local-cache@v2
+        id: cache-pangu
+        with:
+          path: openPangu-Embedded-1B-V1.1
+          base: /data/actions/cache
+          key: pangu1b-model-${{ runner.os }}
+
+      - name: Download Pangu model
+        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4' && steps.cache-pangu.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          uv pip install modelscope
+          modelscope download --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
+            --local_dir "$PANGU1B_MODEL_PATH"
+
+      - name: Run selected level
+        if: steps.accelerator.outputs.run == 'true'
+        run: bash tools/ci/run_test_level.sh "$TEST_LEVEL"
+
+      - name: Run L2 resource probe if isolated
+        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l2'
+        run: bash tools/ci/run_resource_level.sh
+
+      - name: Cache OpenOneRec dataset
+        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4' && env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        uses: corca-ai/local-cache@v2
+        id: cache-dataset
+        with:
+          path: OpenOneRec
+          base: /data/actions/cache
+          key: dataset-openonerec-${{ runner.os }}
+
+      - name: Download OpenOneRec dataset
+        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4' && env.VLLM_GR_TARGET_DEVICE == 'cuda' && steps.cache-dataset.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$HF_TOKEN" ]]; then
+            echo 'HF_TOKEN is required to download the gated OpenOneRec dataset.' >&2
+            exit 1
+          fi
+          uv tool install hf
+          mkdir -p OpenOneRec
+          hf download OpenOneRec/OpenOneRec-RecIF --token "$HF_TOKEN" \
+            --local-dir ./OpenOneRec --repo-type=dataset
+
+      - name: Build OneRec inputs
+        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4' && env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p generated_data/recall_constraints
+          python benchmarks/open_one_rec/tools/create_task_catalog.py \
+            -t video -d ./OpenOneRec/benchmark_data -o generated_data/video_catalog.json
+          python tools/build_constraint_triples.py \
+            --catalog generated_data/video_catalog.json \
+            --output generated_data/video_constraint_triples.json \
+            --begin '<|sid_begin|>' --end '<|sid_end|>'
+          for mapping in sid2pid sid2iid; do
+            python benchmarks/open_one_rec/tools/convert_catalog.py \
+              --dataset-path OpenOneRec/benchmark_data --mapping-file "$mapping.json" \
+              --output-path "generated_data/recall_constraints/$mapping-catalog.json"
+            python tools/build_constraint_triples.py \
+              --catalog "generated_data/recall_constraints/$mapping-catalog.json" \
+              --output "generated_data/recall_constraints/${mapping}_triples.json" \
+              --begin '<|sid_begin|>' --end '<|sid_end|>'
+          done
+
+      - name: Run full OneRec recall gate
+        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4' && env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        env:
+          V1_RECALL_DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
+          V1_RECALL_OUTPUT_DIR: ${{ github.workspace }}/v1_recall_results
+          V1_RECALL_BASELINE_FILE: ${{ github.workspace }}/benchmarks/beam_search/v1_recall_b4_baseline.json
+          V1_RECALL_DIAGNOSTICS: '1'
+        run: bash tests/system/run_beam_v1_recall.sh
+
+      - name: Run OneRec performance scenarios
+        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4' && env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        env:
+          TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
+          V1_PERF_OUTPUT_DIR: ${{ github.workspace }}/v1_performance_results
+        run: bash tests/system/run_beam_v1_performance.sh
+
+      - name: Upload L4 system results
+        if: always() && steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4' && env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        uses: actions/upload-artifact@v4
+        with:
+          name: level-l4-system-${{ matrix.device }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            v1_recall_results
+            v1_performance_results
+          if-no-files-found: warn
+          retention-days: 14

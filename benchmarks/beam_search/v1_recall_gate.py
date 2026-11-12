@@ -18,6 +18,11 @@ from contextlib import nullcontext
 from importlib.metadata import version
 from pathlib import Path
 
+from benchmarks.beam_search.v1_recall_diagnostics import (
+    model_file_manifest,
+    prefix_environment,
+    token_digest,
+)
 from benchmarks.beam_search.v1_sid_validation import validate_sid_tokens
 
 os.environ.setdefault("USE_TF", "0")
@@ -88,7 +93,7 @@ def batch_ranges(count, batch_size, supported_sizes=(1, 2, 4)):
         start += size
 
 
-def infer_batch(llm, tokenizer, token_rows, params):
+def infer_batch(llm, tokenizer, token_rows, params, diagnostics=None):
     """Submit one native batch and decode only generated SID tokens."""
     outputs = llm.beam_search_v1(
         [{"prompt_token_ids": row} for row in token_rows], params, output_mode="full"
@@ -101,6 +106,7 @@ def infer_batch(llm, tokenizer, token_rows, params):
         if len(beams) != params.beam_width:
             raise RuntimeError(f"expected {params.beam_width} beams, got {len(beams)}")
         suffixes = []
+        beam_details = [] if diagnostics is not None else None
         for beam in beams:
             full_tokens = list(beam.tokens)
             if full_tokens[: len(tokens)] != tokens:
@@ -108,6 +114,17 @@ def infer_batch(llm, tokenizer, token_rows, params):
             suffix = full_tokens[len(tokens) :]
             validate_sid_tokens(tokenizer, suffix, "Recall beam")
             suffixes.append(suffix)
+            if beam_details is not None:
+                score = getattr(beam, "cum_logprob", None)
+                score = float(score) if score is not None else None
+                beam_details.append(
+                    {
+                        "token_ids": [int(token) for token in suffix],
+                        "score": score if score is None or math.isfinite(score) else None,
+                    }
+                )
+        if diagnostics is not None:
+            diagnostics.append(beam_details)
         predictions.append(
             tokenizer.batch_decode(
                 suffixes, skip_special_tokens=False, clean_up_tokenization_spaces=False
@@ -211,6 +228,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    diagnostics_enabled = os.getenv("V1_RECALL_DIAGNOSTICS") == "1"
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     import pandas as pd
     import pyarrow.parquet as pq
@@ -226,6 +244,7 @@ def main():
     tasks = args.task_types or [args.task_type]
     grouped = args.task_types is not None
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    model_manifest = model_file_manifest(args.model) if diagnostics_enabled else None
     loader = DataLoaderWrapper(tokenizer=tokenizer, data_dir=str(args.dataset_path))
     prepared = []
     for task in tasks:
@@ -410,10 +429,14 @@ def main():
                 task_start = time.perf_counter()
                 graph_before = graph_stats(llm)
                 samples = {}
+                diagnostic_samples = [] if diagnostics_enabled else None
                 elapsed = 0.0
                 for start, end in tqdm(item["batches"], desc=f"{task} B={args.batch_size}"):
                     begin = time.perf_counter()
-                    predictions = infer_batch(llm, tokenizer, item["token_rows"][start:end], params)
+                    details = [] if diagnostics_enabled else None
+                    predictions = infer_batch(
+                        llm, tokenizer, item["token_rows"][start:end], params, diagnostics=details
+                    )
                     elapsed += time.perf_counter() - begin
                     for sid, generations in zip(
                         item["sample_ids"][start:end], predictions, strict=True
@@ -425,6 +448,21 @@ def main():
                             "ground_truth": original["ground_truth"],
                             "metadata": original.get("metadata", {}),
                         }
+                    if diagnostic_samples is not None:
+                        for sid, tokens, beams in zip(
+                            item["sample_ids"][start:end],
+                            item["token_rows"][start:end],
+                            details,
+                            strict=True,
+                        ):
+                            diagnostic_samples.append(
+                                {
+                                    "sample_id": str(sid),
+                                    "prompt_token_count": len(tokens),
+                                    "prompt_token_sha256": token_digest(tokens),
+                                    "beams": beams,
+                                }
+                            )
                 graph_runtime = graph_delta(
                     graph_before,
                     graph_stats(llm),
@@ -495,6 +533,28 @@ def main():
                     f"{args.model.name}_{task}_bw{args.n}_bs{args.batch_size}_{len(samples)}.json"
                 )
                 output.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n")
+                if diagnostic_samples is not None:
+                    diagnostic = {
+                        "schema_version": 1,
+                        "task": task,
+                        "token_hash_format": "sha256 of compact JSON integer array",
+                        "model_files": model_manifest,
+                        "model_revision": args.model_revision,
+                        "commit": metrics["commit"],
+                        "source_sha256": metrics["source_sha256"],
+                        "artifact_digest": artifact_digest,
+                        "tokenizer_digest": tokenizer_digest,
+                        "runtime_provenance": metrics["runtime_provenance"],
+                        "engine_config": engine_config,
+                        "gr_config": config,
+                        "prefix_environment": prefix_environment(),
+                        "graph_runtime": graph_runtime,
+                        "samples": diagnostic_samples,
+                    }
+                    (item["result_dir"] / "diagnostic_samples.json").write_text(
+                        json.dumps(diagnostic, ensure_ascii=False, allow_nan=False) + "\n",
+                        encoding="utf-8",
+                    )
                 (item["result_dir"] / "wall_seconds.txt").write_text(
                     str(round(time.perf_counter() - task_start)) + "\n"
                 )

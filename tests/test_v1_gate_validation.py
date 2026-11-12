@@ -8,6 +8,12 @@ from typing import Any
 import pytest
 
 from benchmarks.beam_search.v1_performance_gate import validate_online_response
+from benchmarks.beam_search.v1_recall_diagnostics import (
+    effective_attention,
+    model_file_manifest,
+    prefix_environment,
+    token_digest,
+)
 from benchmarks.beam_search.v1_recall_gate import graph_delta, infer_batch
 from benchmarks.open_one_rec.tools.convert_catalog import process_json
 
@@ -50,6 +56,59 @@ def test_recall_rejects_malformed_or_truncated_beam_after_rank_32() -> None:
         output.sequences[-1].tokens = [99, *suffix]
         with pytest.raises(RuntimeError, match="SID"):
             infer_batch(llm, Tokenizer(), [[99]], params)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_recall_diagnostics_record_scores_without_changing_predictions() -> None:
+    output = SimpleNamespace(
+        sequences=[
+            SimpleNamespace(tokens=[99, *range(1, 6)], cum_logprob=-0.25),
+            SimpleNamespace(tokens=[99, *range(1, 6)], cum_logprob=-0.75),
+        ]
+    )
+    llm = SimpleNamespace(beam_search_v1=lambda *_args, **_kwargs: [output])
+    params = SimpleNamespace(beam_width=2)
+    original = infer_batch(llm, Tokenizer(), [[99]], params)
+    details: list[Any] = []
+    assert infer_batch(llm, Tokenizer(), [[99]], params, diagnostics=details) == original
+    assert details == [
+        [
+            {"token_ids": [1, 2, 3, 4, 5], "score": -0.25},
+            {"token_ids": [1, 2, 3, 4, 5], "score": -0.75},
+        ]
+    ]
+    assert token_digest([99]) != token_digest([98])
+    assert token_digest([99]) == token_digest((99,))
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_recall_diagnostics_hash_snapshot_and_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    before = model_file_manifest(tmp_path)
+    (tmp_path / "model.safetensors").write_bytes(b"weights changed")
+    after = model_file_manifest(tmp_path)
+    assert before["config.json"] == after["config.json"]
+    assert before["model.safetensors"]["sha256"] != after["model.safetensors"]["sha256"]
+    calibration = tmp_path / "prefix.yaml"
+    monkeypatch.setenv("VLLM_GR_PREFIX_CALIBRATION_PATH", str(calibration))
+    assert prefix_environment()["prefix_calibration_file_sha256_at_observation"] is None
+    calibration.write_text("calibration", encoding="utf-8")
+    assert prefix_environment()["prefix_calibration_file_sha256_at_observation"] is not None
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_recall_diagnostics_extract_effective_attention_version() -> None:
+    log = """startup
+Beam attention: requested prefill=auto, effective prefill FA3, decode FA2
+Beam attention: requested prefill=auto, effective prefill FA3, decode FA2
+"""
+    assert effective_attention(log) == [
+        {"requested_prefill": "auto", "prefill_fa": 3, "decode_fa": 2}
+    ]
+    assert effective_attention("no attention log") == []
 
 
 @pytest.mark.parametrize("catalog", [{}, {"bad": 1}, {"549755813888": 1}])  # type: ignore[misc]

@@ -14,6 +14,7 @@ from vllm import SamplingParams
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_gr.config import GRConfig
 from vllm_gr.entrypoints.beam_search_v1.client import AsyncBeamSearchClient
 from vllm_gr.v1.beam.batch_contracts import (
     ADMISSION_REJECTED_CODE,
@@ -24,7 +25,10 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamEngineCoreRequest,
     BeamOutputOptions,
 )
-from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+from vllm_gr.v1.engine.beam_search_v1 import (
+    validate_gr_generation_budget,
+    validate_gr_request,
+)
 
 from .generated import vllm_engine_pb2 as pb
 
@@ -64,6 +68,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
         if not messages:
             raise ValueError("requests must not be empty")
         config = getattr(self.engine, "vllm_config", None)
+        gr_config = GRConfig.from_vllm_config(config) if config is not None else None
         device = getattr(getattr(config, "device_config", None), "device", "cuda")
         params_key = None
         members, identities = [], []
@@ -90,6 +95,8 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                 raise ValueError("GR beam requires temperature=0 and ignore_eos=true")
             if not source.HasField("max_tokens") or source.max_tokens < 1:
                 raise ValueError("sampling_params.max_tokens must be explicit and positive")
+            if gr_config is not None:
+                validate_gr_generation_budget(gr_config, source.max_tokens)
             options = message.beam_search
             width = options.beam_width or source.n or 1
             if source.n and source.n != width:

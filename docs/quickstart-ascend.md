@@ -2,12 +2,27 @@
 
 ## Prerequisites
 
-- An Ascend NPU host (verified on 910B) with the matching driver
+- An Ascend NPU host (verified on 910B/950) with the matching driver
 - A container runtime (Docker or Podman)
-- The vendor image `quay.io/ascend/vllm-ascend:v0.30.0rc2`
 - 32GB+ RAM (recommended)
+- A vendor image matching the host hardware and operating system; see the
+  image variants below
 
-The vendor image already contains the complete validated runtime: Python
+The vendor publishes hardware- and OS-specific image variants:
+
+| Image tag | Hardware | Operating system |
+| --- | --- | --- |
+| `quay.io/ascend/vllm-ascend:v0.30.0rc2` | A2 | Ubuntu |
+| `quay.io/ascend/vllm-ascend:v0.30.0rc2-openeuler` | A2 | openEuler |
+| `quay.io/ascend/vllm-ascend:v0.30.0rc2-a5` | A5 | Ubuntu |
+| `quay.io/ascend/vllm-ascend:v0.30.0rc2-a5-openeuler` | A5 | openEuler |
+
+Use the unsuffixed tag for Ubuntu on A2, the `-openeuler` tag for openEuler
+on A2, the `-a5` tag for Ubuntu on A5, and the `-a5-openeuler` tag for
+openEuler on A5. All four variants provide vLLM-Ascend 0.30.0rc2, which is
+the runtime pinned by `vllm_gr._env_check`.
+
+The selected vendor image already contains the complete validated runtime: Python
 3.12, CANN 9.2.0, PyTorch / torch-npu 2.10.0, Triton-Ascend 3.6.0, vLLM
 0.30.0, vLLM-Ascend 0.30.0rc2, and the matching numpy / cv2 pair. No part
 of that stack is installed by hand.
@@ -23,13 +38,11 @@ cd vllm-gr
 
 2. **Enter the validated base environment**
 
-Run all remaining steps inside a container based on the vendor image
-`quay.io/ascend/vllm-ascend:v0.30.0rc2`. That image is the validated base
+Run all remaining steps inside a container based on the vendor image selected
+from the [Prerequisites](#prerequisites). That image is the validated base
 environment of this vllm-gr release: it supplies the complete vendor stack
 (vLLM 0.30.0, vLLM-Ascend 0.30.0rc2, Triton-Ascend 3.6.0, torch /
-torch-npu 2.10.0, CANN 9.2.0) together with the matching numpy and cv2
-pair, and the NPU runtime validation of this release was performed inside
-it.
+torch-npu 2.10.0, CANN 9.2.0) together with the matching numpy and cv2 pair.
 
 This vllm-gr release supports the vLLM 0.30.0 API only.
 
@@ -66,7 +79,7 @@ source "${ASCEND_TOOLKIT_HOME}/set_env.sh"
 # same type name, so build only the required operators instead of the full
 # set; the --no-build-* flags skip the unrelated third-party operator
 # libraries.
-bash build.sh -c ascend910b \
+bash build.sh \
   -n "beam_search_group;cache_unshared_kv;select_unshared_kv;x_attention;onerec_final_beam_select;rec_constrained_top_k" \
   --no-build-transformer --no-build-flash
 
@@ -209,11 +222,14 @@ vllm serve <model> --additional-config '{"vllm_gr_attention_backend": "CUSTOM", 
 Notes:
 
 - The option is NPU-only; selecting `xllm` on a CUDA host raises at startup.
-- Mixed std/beam batches and mixed sliding-window / sink / ALiBI configs are
-  not supported by the fused path; the scheduler falls back to the cascade
-  operators for those cases, and unsorted or shrunk beam selections always
-  reorder through the cascade kernel (the fused `select_unshared_kv` only
-  encodes full-width parents grouped by source beam).
+- NPU `CUSTOM` Beam Attention rejects sliding windows, ALiBi slopes, and
+  nonzero Attention logits softcap at initialization. Neither `xllm` nor
+  `cascade` implements these features. Sink attention and FP8 KV caches are
+  also unsupported by this backend. These restrictions do not describe GPU
+  or native vLLM-Ascend attention backends.
+- Mixed std/beam batches use the cascade implementation. Unsorted or shrunk
+  beam selections reorder through the cascade kernel because the fused
+  `select_unshared_kv` only encodes full-width parents grouped by source beam.
 
 ## Optional BSND Prefill graphs
 

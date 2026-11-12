@@ -308,11 +308,20 @@ def test_run_rejects_decode_max_step_le_current_step(tokenizer: MagicMock) -> No
         )
 
 
-def test_npu_default_device_falls_back_without_crash(tokenizer: MagicMock) -> None:
+@pytest.mark.parametrize("device_class", ["cpu", "accelerator"])  # type: ignore[misc]
+def test_npu_default_device_falls_back_without_crash(
+    tokenizer: MagicMock, device_class: str
+) -> None:
     """On a non-Ascend torch build, torch.device('npu') raises; load must not crash."""
     resource = _build_resource(tokenizer)
     execution = NPUConstrainedTopKExecution()  # no device passed
+    # Classify the current default only when this case runs.  Collection must
+    # not initialize an accelerator merely to select a CI level.
     try:
+        selected = execution._default_device().type
+        actual_class = "cpu" if selected == "cpu" else "accelerator"
+        if actual_class != device_class:
+            pytest.skip(f"default device is {actual_class}, not {device_class}")
         execution.load_tables(resource)
     except RuntimeError as exc:
         if "npu" in str(exc).lower():

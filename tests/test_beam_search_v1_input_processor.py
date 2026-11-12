@@ -6,8 +6,9 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
+import msgspec
 import pytest
 import torch
 from vllm.exceptions import VLLMValidationError
@@ -239,7 +240,11 @@ def test_public_result_keeps_the_accepted_boundary_ids(
         batch_decode=lambda rows, **kwargs: ["|".join(map(str, ids)) for ids in rows],
     )
     params = BeamSearchParams(
-        beam_width=2, max_tokens=3, ignore_eos=True, begin_token=begin, end_token=end
+        beam_width=2,
+        max_tokens=3 + int(begin is not None) + int(end is not None),
+        ignore_eos=True,
+        begin_token=begin,
+        end_token=end,
     )
     if online:
         serving = SimpleNamespace(
@@ -261,7 +266,7 @@ def test_public_result_keeps_the_accepted_boundary_ids(
         request = client.prepare_request(call)
     assert lookups == [token for token in (begin, end) if token is not None]
     assert not request.output_options.include_parent_beam_indices
-    suffix = (9,) * (3 - int(begin is not None) - int(end is not None))
+    suffix = (9,) * 3
     result = BeamBatchResult(
         request.protocol_version,
         request.batch_id,
@@ -642,7 +647,7 @@ def test_npu_request_accepts_matching_width_and_canonical_backend() -> None:
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
-@pytest.mark.parametrize("widths", [None, [2], [2, 1, 2]])  # type: ignore[misc]
+@pytest.mark.parametrize("widths", [None, [2, 2, 2], [2, 1, 2]])  # type: ignore[misc]
 def test_stage_widths_and_return_limit_reach_worker_contract(
     device: str, widths: list[int] | None
 ) -> None:
@@ -705,35 +710,151 @@ def test_npu_per_parent_beam_widths_is_rejected_before_submission(online: bool) 
     engine.submit_gr_session.assert_not_called()
 
 
-def test_cuda_unconstrained_request_accepts_budget_beyond_table_depth() -> None:
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("capacity", [1, 6, 7, 9])  # type: ignore[misc]
+def test_cuda_unconstrained_requests_vary_budget_with_one_runtime(
+    online: bool, capacity: int
+) -> None:
     canonical = _canonical_gr_config(enabled=False)
     canonical["constrained_generation"] = False
-    canonical["beam"]["max_decode_steps"] = 4
+    canonical["beam"]["max_decode_steps"] = capacity
     engine = _make_engine(additional_config={"vllm_gr": canonical})
     engine.vllm_config.device_config = SimpleNamespace(device="cuda")
 
-    request = _prepare_request(
-        engine, [1, 2], BeamSearchParams(beam_width=2, max_tokens=4, ignore_eos=True), online=True
-    )
-
-    assert request.beam_params.max_tokens == 4
-
-
-def test_cuda_constrained_request_rejects_budget_beyond_table_depth() -> None:
-    canonical = _canonical_gr_config()
-    canonical["beam"]["max_decode_steps"] = 4
-    engine = _make_engine(additional_config={"vllm_gr": canonical})
-    engine.vllm_config.device_config = SimpleNamespace(device="cuda")
-
-    with pytest.raises(BeamSearchRequestError, match="constraint_table_v1 depth"):
-        _prepare_request(
+    def prepare(budget: int) -> BeamBatchRequest:
+        return _prepare_request(
             engine,
             [1, 2],
-            BeamSearchParams(beam_width=2, max_tokens=4, ignore_eos=True),
-            online=True,
+            BeamSearchParams(beam_width=2, max_tokens=budget, ignore_eos=True),
+            online=online,
         )
 
-    engine.submit_gr_session.assert_not_called()
+    for budget in (*range(1, capacity + 1), 1, capacity):
+        request = prepare(budget)
+        assert request.beam_params.max_tokens == budget
+        native = request.items[0].request.sampling_params
+        assert native is not None and native.max_tokens == budget and native.ignore_eos
+        assert canonical["beam"]["max_decode_steps"] == capacity
+
+    with pytest.raises(
+        BeamSearchRequestError,
+        match=f"Decode steps {capacity + 1} exceed runtime limit {capacity}",
+    ):
+        prepare(capacity + 1)
+    # A rejected over-capacity request must not poison the existing engine config.
+    assert prepare(1).beam_params.max_tokens == 1
+    assert prepare(capacity).beam_params.max_tokens == capacity
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("backend", ["cuda", "npu"])  # type: ignore[misc]
+@pytest.mark.parametrize("constrained", [None, True])  # type: ignore[misc]
+@pytest.mark.parametrize("table_format", ["constraint_table_v1", "constraint_table_v2"])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "begin,end", [(None, None), ("<begin>", None), (None, "<end>"), ("<begin>", "<end>")]
+)
+def test_constrained_length_is_checked_before_native_input_processing(
+    online: bool,
+    backend: str,
+    constrained: bool | None,
+    table_format: str,
+    begin: str | None,
+    end: str | None,
+) -> None:
+    config = _canonical_gr_config(backend=backend)
+    config["constrained_generation"] = constrained
+    config["constraint_table"]["format"] = table_format
+    config["beam"]["max_decode_steps"] = 7
+    engine = _make_engine(additional_config={"vllm_gr": config})
+    engine.vllm_config.device_config = SimpleNamespace(device=backend)
+    process_inputs = Mock(wraps=engine.input_processor.process_inputs)
+    engine.input_processor.process_inputs = process_inputs
+
+    def prepare(length: int) -> BeamBatchRequest:
+        return _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(
+                beam_width=2,
+                max_tokens=length + int(begin is not None) + int(end is not None),
+                ignore_eos=True,
+                begin_token=begin,
+                end_token=end,
+            ),
+            online=online,
+        )
+
+    for length in (1, 2, 4, 7):
+        with pytest.raises(
+            BeamSearchRequestError,
+            match=f"effective generation length {length} must equal {table_format} depth",
+        ):
+            prepare(length)
+        process_inputs.assert_not_called()
+        engine.submit_gr_session.assert_not_called()
+    # Rejections must not alter the startup config or poison subsequent requests.
+    request = prepare(3)
+    assert request.beam_params.max_tokens == 3
+    assert config["beam"]["max_decode_steps"] == 7
+    process_inputs.assert_called_once()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("missing", [False, True])  # type: ignore[misc]
+def test_missing_constraint_table_is_not_reported_as_a_length_mismatch(
+    online: bool, missing: bool
+) -> None:
+    canonical = _canonical_gr_config(enabled=False)
+    canonical["beam"]["max_decode_steps"] = 7
+    additional = (
+        {
+            "vllm_gr_beam_execution_mode": "v1",
+            "vllm_gr_beam_max_width": 2,
+            "vllm_gr_beam_max_decode_steps": 7,
+        }
+        if missing
+        else {"vllm_gr": canonical}
+    )
+    engine = _make_engine(additional_config=additional)
+    # Unconstrained mode must be explicitly selected; missing artifacts are
+    # deployment errors, not evidence of a fixed three-token generation budget.
+    for length in (1, 2, 3, 7):
+        with pytest.raises(
+            BeamSearchRequestError, match="requires an enabled canonical CUDA constraint table"
+        ):
+            _prepare_request(
+                engine,
+                [1, 2],
+                BeamSearchParams(beam_width=2, max_tokens=length, ignore_eos=True),
+                online=online,
+            )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("length", [1, 2, 4, 7])  # type: ignore[misc]
+def test_core_rechecks_constrained_length_without_frontend_validation(length: int) -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
+    config = _canonical_gr_config()
+    config["beam"]["max_decode_steps"] = 7
+    engine = _make_engine(additional_config={"vllm_gr": config})
+    request = _prepare_request(
+        engine, [1, 2], BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True), online=True
+    )
+    native_params = request.items[0].request.sampling_params
+    assert native_params is not None
+    native_params.max_tokens = length
+    request = msgspec.structs.replace(
+        request, beam_params=msgspec.structs.replace(request.beam_params, max_tokens=length)
+    )
+    with pytest.raises(
+        ValueError,
+        match=f"effective generation length {length} must equal constraint_table_v1 depth",
+    ):
+        validate_gr_request(request, config=engine.vllm_config)
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
@@ -834,19 +955,24 @@ def test_beam_metadata_uses_native_effective_stop_tokens(
 ) -> None:
     engine = _make_engine()
     engine.input_processor.generation_config_fields = {"eos_token_id": model_eos}
+    max_tokens = 3 + int(end_token is not None)
     if not ignore_eos:
         with pytest.raises(BeamSearchRequestError, match="ignore_eos=True"):
             _prepare_request(
                 engine,
                 [10, 11],
-                BeamSearchParams(beam_width=2, max_tokens=3, end_token=end_token, ignore_eos=False),
+                BeamSearchParams(
+                    beam_width=2, max_tokens=max_tokens, end_token=end_token, ignore_eos=False
+                ),
                 online=online,
             )
         return
     request = _prepare_request(
         engine,
         [10, 11],
-        BeamSearchParams(beam_width=2, max_tokens=3, end_token=end_token, ignore_eos=ignore_eos),
+        BeamSearchParams(
+            beam_width=2, max_tokens=max_tokens, end_token=end_token, ignore_eos=ignore_eos
+        ),
         online=online,
     )
     native_params = request.items[0].request.sampling_params
@@ -885,7 +1011,12 @@ def test_embedding_inputs_are_rejected_before_prompt_mutation(
         _prepare_request(
             engine,
             prompt,
-            BeamSearchParams(beam_width=2, max_tokens=3, begin_token=begin_token, ignore_eos=True),
+            BeamSearchParams(
+                beam_width=2,
+                max_tokens=3 + int(begin_token is not None),
+                begin_token=begin_token,
+                ignore_eos=True,
+            ),
             online=online,
         )
     assert len(processed_requests) == 1

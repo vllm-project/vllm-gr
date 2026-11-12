@@ -118,7 +118,7 @@ switch for arbitrary requests. Keep these values for the first reproduction:
 | --- | ---: | --- |
 | Scheduling | `async_scheduling=True` | EngineCore submits the next stage early. |
 | Beam width | 128 | Startup allocates the KV pool and captures a fixed-shape graph; request width must match exactly. |
-| Generation steps `N` | 3 | N includes the first token from Prefill; only 1, 2, and 3 are supported. |
+| Generation steps `N` | 3 | N includes the first token from Prefill and must equal the three-layer `constraint_table_v1` depth. Other lengths are rejected at request ingress. |
 | EOS | `ignore_eos=True` | Legal EOS candidates are retained; finish after N outputs. |
 | Prefill | `enable_chunked_prefill=False` | The complete remaining prompt must fit the native token budget. |
 | Dispatch capacity `Q` | 2 | Two stages may be in flight for the same logical owner; this does not make B=2. |
@@ -230,7 +230,8 @@ deploy.
 ## 5. Validate and troubleshoot
 
 With real model weights, run the system test for actual offline and online V1
-calls, N=1/2/3, Prefix Cache, graph replay, cancellation/reuse and release at return.
+calls with N=3, rejection of constrained N=1/2 requests, Prefix Cache, graph replay,
+cancellation/reuse and release at return.
 Select an available GPU using the environment's existing device allocation rules:
 
 ```bash
@@ -264,7 +265,7 @@ when comparing runs.
 | Symptom | Resolution |
 | --- | --- |
 | `async_scheduling=True` is required | Use the V1 example and keep this `GRLLM` initialization option. |
-| Width or generation-step error | Keep request width equal to `max_width` and use 1 through 3 effective generation steps. |
+| Width or generation-step error | Keep request width equal to `max_width`. With a constraint table, use exactly 3 effective steps and startup `max_decode_steps >= 3`; begin/end positions do not count toward these steps. Without constraints, use 1 through the configured `max_decode_steps`, subject to existing backend limits (NPU capacity remains at most 3). |
 | Constraint Table digest or tokenizer mismatch | Rebuild the artifact from the current model directory and triples document. |
 | CUDA graph or out-of-memory error | Start with width 128 and the default `--gpu-memory-utilization 0.5`; check for competing GPU processes. |
 | Online V1 validation is needed | The system test calls `OpenAIServing.beam_search_v1()` with a real asynchronous multiprocess engine. Legacy HTTP gates remain separate. |

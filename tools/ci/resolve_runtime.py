@@ -3,9 +3,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Resolve candidate runtime declarations before creating the CI environment.
 
-Only the standard library is used: resolving versions must not import setup.py,
+Resolution uses only the standard library and Git; it must not import setup.py,
 GR, torch, or vLLM from a previously cached environment. NPU runners must supply
 the vendor runtime in the selected base Python; this tool does not install it.
+Installed GR version comparison uses packaging after environment preparation.
 """
 
 from __future__ import annotations
@@ -15,10 +16,12 @@ import ast
 import hashlib
 import importlib
 import json
+import os
 import platform
 import subprocess
 import sys
 import tomllib
+from email.parser import Parser
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -72,22 +75,86 @@ def declarations(repo: Path, device: str) -> dict[str, str]:
     }
     base = literal(repo / "setup.py", "VLLM_GR_BASE_VERSION")
     config = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+    # Older A/B baseline revisions still declare a TOML fallback. Validate it
+    # when present; current builds keep the single fallback in setup.py.
+    scm_fallback = config.get("tool", {}).get("setuptools_scm", {}).get("fallback_version", base)
     cuda_lines = [
         line.split("#", 1)[0].strip()
         for line in (repo / "requirements/cuda.txt").read_text(encoding="utf-8").splitlines()
     ]
     pins = [line for line in cuda_lines if line.lower().startswith("vllm")]
-    if (
-        base != guards["vllm"]
-        or config["tool"]["setuptools_scm"]["fallback_version"] != base
-        or pins != [f"vllm=={base}"]
-    ):
+    if base != guards["vllm"] or scm_fallback != base or pins != [f"vllm=={base}"]:
         raise ValueError("vLLM guard, CUDA pin, GR base and SCM fallback versions must agree")
     _check_version_fallback(repo, base)
-    expected = {"vllm": base, "vllm-gr": base}
+    expected = {"vllm": base, "vllm-gr": package_version(repo, base)}
     if device == "npu":
         expected.update({key: guards[key] for key in ("vllm-ascend", "triton-ascend")})
     return expected
+
+
+def package_version(repo: Path, base: str) -> str:
+    """Read the build's version source without executing the target checkout."""
+    tree = ast.parse((repo / "setup.py").read_text(encoding="utf-8"))
+    uses_scm = any(
+        isinstance(node, ast.keyword)
+        and node.arg == "version_scheme"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "_release_version"
+        for node in ast.walk(tree)
+    )
+    overrides = ["VLLM_GR_VERSION_OVERRIDE"]
+    if uses_scm:
+        overrides += [
+            "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_GR",
+            "SETUPTOOLS_SCM_PRETEND_VERSION",
+        ]
+    for name in overrides:
+        if value := os.environ.get(name):
+            return value.strip().lstrip("vV").partition("+")[0]
+    # Historical A/B baselines selected the declared base even at a Git tag.
+    if not uses_scm:
+        return base
+    metadata = repo / "PKG-INFO"
+    if metadata.is_file():
+        version = Parser().parsestr(metadata.read_text(encoding="utf-8"))["Version"]
+        if not version:
+            raise ValueError("sdist PKG-INFO is missing its Version")
+        return version.partition("+")[0]
+    # Accept a checkout or linked worktree, but do not inherit a parent's Git
+    # metadata when resolving an exported source directory.
+    if not (repo / ".git").exists():
+        return base
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "describe",
+            "--dirty",
+            "--tags",
+            "--long",
+            "--abbrev=40",
+            "--match",
+            "*[0-9]*",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode or result.stdout.strip().endswith("-dirty"):
+        return base
+    tag, distance, _ = result.stdout.strip().rsplit("-", 2)
+    if distance != "0":
+        return base
+    # SCM accepts an optional project-name prefix and ignores tag-local data.
+    prefix, separator, version = tag.partition("+")[0].rpartition("-")
+    if not (
+        separator
+        and all(char.isalnum() or char in "_-" for char in prefix)
+        and version.lstrip("vV")[:1].isdigit()
+    ):
+        version = tag.partition("+")[0]
+    return version.lstrip("vV")
 
 
 def _check_version_fallback(repo: Path, base: str) -> None:
@@ -165,10 +232,23 @@ def inventory() -> dict[str, str]:
 
 
 def check_versions(expected: dict[str, str], installed: dict[str, str]) -> list[str]:
+    def matches(name: str, expected_version: str) -> bool:
+        actual = installed.get(name, "")
+        if name.replace("_", "-") == "vllm-gr":
+            # Only verification needs PEP 440 normalization. Resolution runs
+            # before build dependencies are installed and records the raw source.
+            from packaging.version import InvalidVersion, Version
+
+            try:
+                return Version(actual).public == Version(expected_version).public
+            except InvalidVersion:
+                return False
+        return actual.partition("+")[0] == expected_version
+
     return [
         f"{name}: expected {version}, found {installed.get(name, 'not installed')}"
         for name, version in expected.items()
-        if installed.get(name, "").partition("+")[0] != version
+        if not matches(name, version)
     ]
 
 
@@ -272,6 +352,14 @@ def verify(repo: Path, spec: dict[str, Any], venv: Path) -> dict[str, Any]:
                             {name: module_version},
                         )
                     )
+                if name == "vllm_gr":
+                    from packaging.version import Version
+
+                    if Version(module_version) != Version(installed["vllm-gr"]):
+                        errors.append(
+                            "vllm_gr module/distribution version mismatch: "
+                            f"{module_version} != {installed['vllm-gr']}"
+                        )
                 error = check_origin(name, origin, repo, prefixes)
                 if error:
                     errors.append(error)

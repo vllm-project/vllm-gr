@@ -72,6 +72,92 @@ class TestRuntimeResolution(unittest.TestCase):
         self.assertEqual(result["expected"], {"vllm": "0.29.0", "vllm-gr": "0.29.0"})
         self.assertEqual(result, runtime.resolve(self.repo, "cuda"))
 
+    def test_resolve_accepts_scm_config_without_duplicate_fallback(self) -> None:
+        """Removing TOML fallback_version must not break CI runtime resolution."""
+        # setup.py remains the baseline source; 0.29.0 is isolated fixture data.
+        (self.repo / "pyproject.toml").write_text("[tool.setuptools_scm]\n")
+        self.assertEqual(
+            runtime.resolve(self.repo, "cuda")["expected"],
+            {"vllm": "0.29.0", "vllm-gr": "0.29.0"},
+        )
+
+    def test_tagged_worktree_package_version_is_separate_from_runtime(self) -> None:
+        shutil.copyfile(ROOT / "setup.py", self.repo / "setup.py")
+        # Keep this fixture's independent runtime baseline.
+        setup = self.repo / "setup.py"
+        setup.write_text(
+            setup.read_text().replace(
+                'VLLM_GR_BASE_VERSION = "0.30.0"', 'VLLM_GR_BASE_VERSION = "0.29.0"'
+            )
+        )
+        (self.repo / "pyproject.toml").write_text("[tool.setuptools_scm]\n")
+        for args in [
+            ["init", "-q"],
+            ["config", "user.name", "Runtime Test"],
+            ["config", "user.email", "runtime@example.invalid"],
+            ["add", "."],
+            ["commit", "-qm", "Source"],
+            ["tag", "v0.30.1"],
+        ]:
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True)
+        worktree = self.repo.parent / (self.repo.name + "-worktree")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "worktree", "add", "--detach", str(worktree), "v0.30.1"],
+            check=True,
+            capture_output=True,
+        )
+        self.addCleanup(shutil.rmtree, worktree)
+        spec = runtime.resolve(worktree, "cuda")
+        self.assertEqual(spec["expected"], {"vllm": "0.29.0", "vllm-gr": "0.30.1"})
+        output = self.repo / "tagged-spec.json"
+        subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                str(ROOT / "tools/ci/resolve_runtime.py"),
+                "resolve",
+                "--repo",
+                str(worktree),
+                "--device",
+                "cuda",
+                "--output",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        self.assertEqual(json.loads(output.read_text())["expected"], spec["expected"])
+        prefix = Path(sys.prefix).resolve()
+        modules = {
+            name: SimpleNamespace(__file__=str(prefix / name / "__init__.py"))
+            for name in ("vllm", "torch", "triton")
+        }
+        modules["torch"].version = SimpleNamespace(cuda="13.0")
+        modules["vllm"].__version__ = "0.29.0+cu130"
+        modules["vllm_gr"] = SimpleNamespace(
+            __file__=str(worktree / "vllm_gr/__init__.py"), __version__="0.30.1"
+        )
+        modules["vllm.platforms"] = SimpleNamespace(
+            current_platform=SimpleNamespace(device_type="cuda")
+        )
+        with (
+            patch.object(runtime, "inventory", return_value=spec["expected"]),
+            patch.object(importlib.metadata, "distribution") as distribution,
+            patch.object(importlib, "import_module", side_effect=modules.__getitem__),
+        ):
+            distribution.return_value.locate_file.return_value = prefix
+            report = runtime.verify(worktree, spec, prefix)
+            self.assertTrue(report["ok"], report["errors"])
+        self.assertEqual(
+            runtime.check_versions(spec["expected"], {"vllm": "0.29.0+cu130", "vllm-gr": "0.30.1"}),
+            [],
+        )
+        self.assertTrue(
+            runtime.check_versions(spec["expected"], {"vllm": "0.30.1", "vllm-gr": "0.30.1"})
+        )
+        (worktree / "requirements/common.txt").write_text("# Dirty tree\n")
+        self.assertEqual(runtime.resolve(worktree, "cuda")["expected"]["vllm-gr"], "0.29.0")
+
     def test_future_candidate_drives_runtime_without_ci_pin_changes(self) -> None:
         for name in (
             "setup.py",

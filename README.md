@@ -8,6 +8,22 @@ vLLM-based Generative Recommender Inference Engine
 
 This repository focuses on vLLM-based generative recommendation inference, including the OneRec beam-search / catalog-constrained generation pipeline, the Pangu LLM passthrough path, example scripts, test suites, and GPU / NPU runtime adaptation code.
 
+## Runtime version contract
+
+**vLLM-GR 0.30.0 supports vLLM 0.30.0 only.** GR patches depend on vLLM
+internals, and runtime initialization rejects a different public vLLM version.
+Local build suffixes do not change that compatibility requirement.
+
+| Target | Required runtime | Installation source |
+| --- | --- | --- |
+| CUDA | vLLM 0.30.0 | Pinned by `requirements/cuda.txt` |
+| Ascend NPU | vLLM 0.30.0, vLLM-Ascend 0.30.0rc2, Triton-Ascend 3.6.0 | Prepared vendor image; see the [Ascend guide](docs/quickstart-ascend.md) |
+
+The `+npu` and `+cpu` package suffixes identify build targets. A CPU package
+does not provide a production Beam inference runtime. See the
+[dependency and version policy](docs/dependency_version_policy.md) for release
+tags, build overrides, and dependency constraints.
+
 ## Current Scope
 
 The current implementation targets inference scenarios and does not aim for full training-phase feature coverage.
@@ -23,18 +39,11 @@ The current implementation targets inference scenarios and does not aim for full
 
 ## Installation
 
-The current CUDA release candidate targets **vLLM 0.30.0**. A CUDA install of
-`vllm-gr` resolves that exact vLLM version through `requirements/cuda.txt`;
-platform dependencies are selected by `setup.py`, so no `[gpu]` extra is
-needed.
-
-The Ascend path targets vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2 and completed
-NPU runtime validation on that vendor stack. The environment guard pins the
-validated vLLM-Ascend/Triton-Ascend pair; the vendor runtime comes from the
-base image. See the [Ascend installation guide](docs/quickstart-ascend.md) for
-the installation procedure, runtime requirements, and execution contract.
-
-For the validated CUDA installation path, see [quickstart](docs/quickstart.md).
+Use the [CUDA quickstart](docs/quickstart.md) or the
+[Ascend installation guide](docs/quickstart-ascend.md) to prepare the matching
+runtime. Set `VLLM_GR_TARGET_DEVICE` explicitly when installing from source or
+building wheels; `setup.py` selects the platform dependencies. No `[gpu]` extra
+is needed.
 
 ## Unified self-validation
 

@@ -142,6 +142,16 @@ class BeamDecodeGraph:
         if self.ready:
             self._check_context()
             return
+        # Keep Beam captures separate from vLLM's shared pool. A pool whose
+        # last graph was destroyed can remain in the allocator while captured
+        # outputs are still alive; attempting to reuse it then fails. Reuse
+        # our pool only while another Beam graph still owns it.
+        if not any(
+            getattr(entry, "cudagraph", None) is not None
+            for entries in self._registries.values()
+            for entry in entries.values()
+        ):
+            self.wrapper.graph_pool = torch.cuda.graph_pool_handle()
         # V1 replays beam FULL graphs through the native execute_model FULL
         # branch calling ``worker.model`` — the wrapper must STAY installed
         # for the engine's lifetime (uninstalled only by shutdown).  V2

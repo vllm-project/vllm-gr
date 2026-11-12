@@ -301,10 +301,11 @@ def run(args: argparse.Namespace) -> None:
             measured(batch, "cold")
             measured(batch, "warm")
         assert llm.reset_prefix_cache()
-        measured(4, "cold", steps=1)
+        measured(4, "cold")
         assert llm.reset_prefix_cache()
+        # Warm a partial batch with complete SIDs from the three-layer table.
         for ids in prompts[:3]:
-            generate([ids], 1)
+            generate([ids], 3)
             snapshot()
         measured(4, "partial")
         if args.reference:
