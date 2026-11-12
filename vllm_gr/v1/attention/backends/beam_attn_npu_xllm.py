@@ -441,6 +441,7 @@ def cascade_attention(
     by both NPU execution paths and rejected by ``BeamAttentionImpl`` at
     initialization; delegation does not add support for those semantics.
     """
+
     def _fallback_to_cascade() -> None:
         beam_attn_npu.cascade_attention(
             output,
