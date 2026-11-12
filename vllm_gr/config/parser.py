@@ -57,6 +57,7 @@ VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
 PREFILL_FA_VERSION_KEY: Final = "vllm_gr_prefill_flash_attn_version"
 SHORT_SUFFIX_ATTENTION_KEY: Final = "vllm_gr_enable_short_suffix_attention"
 BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
+BEAM_ADAPTER_CACHE_ENABLED_KEY: Final = "vllm_gr_beam_adapter_cache_enabled"
 BEAM_GRAPH_BATCH_SIZE_KEY: Final = "vllm_gr_beam_graph_batch_size"
 BEAM_GRAPH_WIDTHS_KEY: Final = "vllm_gr_beam_graph_widths"
 BEAM_ONLINE_BATCH_SIZES_KEY: Final = "vllm_gr_beam_online_batch_sizes"
@@ -77,6 +78,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         VOCAB_OFFSET_KEY,
         VOCAB_SLICE_SIZE_KEY,
         BEAM_GRAPH_ENABLED_KEY,
+        BEAM_ADAPTER_CACHE_ENABLED_KEY,
         SHORT_SUFFIX_ATTENTION_KEY,
         PREFILL_FA_VERSION_KEY,
         BEAM_GRAPH_BATCH_SIZE_KEY,
@@ -98,6 +100,7 @@ _TOP_LEVEL_KEYS: Final = frozenset(
 _BEAM_KEYS: Final = frozenset(
     {
         "graph_enabled",
+        "adapter_cache_enabled",
         "enable_short_suffix_attention",
         "prefill_flash_attn_version",
         "graph_batch_size",
@@ -211,6 +214,7 @@ def gr_config_from_mapping(
     return GRConfig(
         attention_backend=validate_attention_backend(mapping.get("attention_backend")),
         beam_graph_enabled=graph_enabled,
+        beam_adapter_cache_enabled=beam_raw.get("adapter_cache_enabled", False),
         prefill_flash_attn_version=validate_prefill_flash_attn_version(
             beam_raw.get("prefill_flash_attn_version", "auto")
         ),
@@ -275,6 +279,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     }
     if config.prefill_flash_attn_version != "auto":
         beam["prefill_flash_attn_version"] = config.prefill_flash_attn_version
+    if config.beam_adapter_cache_enabled:
+        beam["adapter_cache_enabled"] = True
     if not config.enable_short_suffix_attention:
         beam["enable_short_suffix_attention"] = False
     if config.beam_graph_batch_size != 1:
@@ -401,6 +407,7 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_graph_enabled=validate_beam_graph_enabled(
             additional_config.get(BEAM_GRAPH_ENABLED_KEY, True)
         ),
+        beam_adapter_cache_enabled=additional_config.get(BEAM_ADAPTER_CACHE_ENABLED_KEY, False),
         beam_graph_batch_size=validate_beam_graph_batch_size(
             additional_config.get(BEAM_GRAPH_BATCH_SIZE_KEY, 1)
         ),
@@ -501,6 +508,10 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(BEAM_GRAPH_ENABLED_KEY, None)
     else:
         additional_config[BEAM_GRAPH_ENABLED_KEY] = False
+    if gr_config.beam_adapter_cache_enabled:
+        additional_config[BEAM_ADAPTER_CACHE_ENABLED_KEY] = True
+    else:
+        additional_config.pop(BEAM_ADAPTER_CACHE_ENABLED_KEY, None)
 
     if gr_config.beam_graph_batch_size == 1:
         additional_config.pop(BEAM_GRAPH_BATCH_SIZE_KEY, None)

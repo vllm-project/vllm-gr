@@ -1524,6 +1524,39 @@ def get_stage_runner(
     )
 
     dynamic_requested = uses_dynamic_beam(m.beam_params)
+    # Captures refer to an adapter's input/attention buffers. Keep one drained
+    # adapter per B instead of replacing those addresses on every B transition.
+    # A new schedule or resource binding invalidates the whole bounded cache.
+    cache_enabled = (
+        getattr(cfg, "beam_adapter_cache_enabled", False)
+        and not getattr(worker.model_config, "enforce_eager", False)
+        and getattr(cfg, "beam_graph_enabled", False)
+    )
+    cache = getattr(worker, "_gr_gpu_stage_runner_cache", {})
+    cache_key = (
+        hooks_type,
+        id(context),
+        id(workspace),
+        id(context.decision),
+        id(backend),
+        resource_key,
+        m.beam_params.beam_width,
+        view.dynamic_beam_widths,
+        dynamic_requested,
+    )
+    cache_matches = cache_enabled and (
+        getattr(worker, "_gr_gpu_stage_runner_cache_key", None) == cache_key
+    )
+    cache_cleared = False
+    if cache and not cache_matches:
+        discard_dynamic_graphs(worker, context)
+        cache.clear()
+        cache_cleared = True
+    if cache_matches and view.batch_size in cache:
+        existing = cache[view.batch_size]
+        resources_match = all(
+            runner._resource_key == resource_key for runner in existing.beam.runners
+        )
     existing_dynamic = getattr(existing, "dynamic", None)
     reuse_adapter = (
         existing is not None
@@ -1540,6 +1573,11 @@ def get_stage_runner(
             runner._scratch_owner is workspace.state_scratch for runner in existing.beam.runners
         )
     )
+    if cache_matches and cache.get(view.batch_size) is existing and not reuse_adapter:
+        # A cached owner still has to pass every original compatibility check.
+        discard_dynamic_graphs(worker, context)
+        cache.clear()
+        cache_cleared = True
     reuse_beam = (
         reuse_adapter
         and existing.beam.state.max_new_tokens == m.beam_params.max_tokens
@@ -1564,7 +1602,12 @@ def get_stage_runner(
             # width, which would undersize a schedule that widens later.
             candidate_width=candidate_width,
         )
-    if not reuse_adapter and (existing_dynamic is not None or dynamic_requested):
+    if (
+        not reuse_adapter
+        and not cache_matches
+        and not cache_cleared
+        and (existing_dynamic is not None or dynamic_requested)
+    ):
         discard_dynamic_graphs(worker, context)
     sessions = []
     bindings = []
@@ -1633,5 +1676,11 @@ def get_stage_runner(
         binding.native_request_id: session for binding, session in zip(binding_tuple, session_tuple)
     }
     worker._gr_gpu_stage_runner = adapter
+    if cache_enabled:
+        cache[view.batch_size] = adapter
+        worker._gr_gpu_stage_runner_cache = cache
+        worker._gr_gpu_stage_runner_cache_key = cache_key
+    elif hasattr(worker, "_gr_gpu_stage_runner_cache_key"):
+        del worker._gr_gpu_stage_runner_cache_key
     adapter._validated_dispatch = (scheduler_output, stages)
     return cast(GPUBeamStageRunner, adapter)

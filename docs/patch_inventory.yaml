@@ -158,6 +158,7 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_gpu_model_runner_patch.py
+      - tests/kernels/test_beam_batch_switch_reuse.py
       - tests/test_gpu_model_runner_v2_patch.py
       - tests/kernels/test_gr_prefill_v2.py
       - tests/test_model_runner_patch.py

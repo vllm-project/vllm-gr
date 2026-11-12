@@ -68,6 +68,22 @@ buffers when a new batch needs a graph. Its Backend row bound, retirement and
 shutdown semantics remain unchanged. Upstream V1/NPU fixes in that parent,
 including B=2 Prefill capture, are retained.
 
+Set `beam.adapter_cache_enabled: true` in the canonical service configuration
+to opt into cross-batch adapter caching. It defaults to false, preserving the
+previous latest-adapter reuse and lazy capture policy. Disabling this cache
+does not disable Decode CUDA Graphs or same-batch adapter reuse. The legacy
+configuration key is `vllm_gr_beam_adapter_cache_enabled`.
+
+When this option and Decode graphs are enabled, the shared runner retains one drained
+adapter per logical batch size while the context, workspace and search geometry
+remain compatible. Returning to an already-warmed B reuses that adapter's fixed
+input/attention addresses and its Decode graphs instead of clearing and
+recapturing them. Each session still rebinds its own inputs and selectors.
+Incompatible resources or geometry invalidate the bounded cache; V2 runtime
+cleanup removes it before model replacement or shutdown.
+The switch is read from service configuration, not from individual requests;
+it does not add startup pre-capture or change schedule-miss behavior.
+
 The default stage hooks implement that V1 policy. `V2StageExecutionHooks`
 selects fixed storage, startup-only graph replay, batched Backend admission
 and full-member retirement. The V2 installer alone supplies the extended

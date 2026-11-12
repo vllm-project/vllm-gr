@@ -556,3 +556,27 @@ def test_engine_creation_serializes_cuda_decision_defaults(
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("enabled", [False, True])  # type: ignore[misc]
+def test_adapter_cache_switch_round_trip(enabled: bool, tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    beam = raw["beam"]
+    assert isinstance(beam, dict)
+    if enabled:
+        beam["adapter_cache_enabled"] = True
+    config = gr_config_from_mapping(raw)
+    assert config.beam_adapter_cache_enabled is enabled
+    assert gr_config_to_mapping(config) == raw
+    host = SimpleNamespace(additional_config={})
+    legacy = GRConfig(beam_adapter_cache_enabled=enabled)
+    legacy.write_to_vllm_config(host)
+    assert GRConfig.from_vllm_config(host).beam_adapter_cache_enabled is enabled
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])  # type: ignore[misc]
+def test_adapter_cache_switch_requires_boolean(value: object) -> None:
+    with pytest.raises(ValueError, match="adapter_cache_enabled must be a boolean"):
+        GRConfig(beam_adapter_cache_enabled=value)

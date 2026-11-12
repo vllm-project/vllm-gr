@@ -217,6 +217,10 @@ aligned with it.
 
 ### GR-PATCH-011 — GPU ModelRunner V1/V2 Overrides
 
+Cross-batch stage-adapter caching is opt-in through
+`beam.adapter_cache_enabled` (default false). The existing same-batch reuse
+and Decode capture policy remain active when this cache is disabled.
+
 - Sources:
     - `vllm_gr/v1/worker/gpu_model_runner_patch.py`
     - `vllm_gr/v1/worker/gpu_model_runner_v2_patch.py`

@@ -210,7 +210,12 @@ class GRConfig:
     beam_sid_stage_vocab: bool = False
     """Opt into catalog-free NPU SA/SB/SC domains and stage-local probabilities."""
 
+    beam_adapter_cache_enabled: bool = False
+    """Opt into CUDA stage-adapter and Decode graph reuse across batch sizes."""
+
     def __post_init__(self) -> None:
+        if type(self.beam_adapter_cache_enabled) is not bool:
+            raise ValueError("beam.adapter_cache_enabled must be a boolean")
         from vllm_gr.config.validation import (
             validate_attention_backend,
             validate_beam_engine_driven,
