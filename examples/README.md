@@ -2,8 +2,8 @@
 
 ## Run OneRec offline
 
-Install the [CUDA runtime](../docs/quickstart.md) or
-[Ascend runtime](../docs/quickstart-ascend.md). Run these commands from the
+Install the [CUDA runtime](../docs/getting_started/installation/cuda.md) or
+[Ascend runtime](../docs/getting_started/installation/ascend.md). Run these commands from the
 repository root in Bash. The first run needs only a local OneRec-1.7B model
 snapshot with its tokenizer.
 
@@ -49,7 +49,8 @@ to restrict the output to known items.
 - [Serve OneRec over HTTP and verify a response](online_serving/beam_search/README.md)
 - [Serve OneRec over gRPC](online_serving/grpc/README.md)
 - [Measure offline Beam Search latency](offline_inference/beam_search/README.md#measure-latency-without-profiling)
-- [Measure offline or online throughput](../docs/benchmarks/throughput.md)
+- [Measure offline or online throughput](../docs/usage/benchmarks/throughput.md)
+- [Run offline Pangu inference](../docs/contributing/tools/pangu1b.md)
 
 ## Run Sidecar hot updates
 
@@ -57,7 +58,7 @@ Copy the [configuration template](sidecar/config.py). Set each task's HDFS
 address and a cache directory that its target instances can read. Set each
 gRPC instance's management address to use its `gr.admin_port`. Run
 `vllm-gr-sidecar --config /path/to/config.py`. See the
-[deployment guide](../docs/weight_update_sidecar_design.md#user-startup-and-publication-guide)
+[deployment guide](../docs/features/hot-update.md#user-startup-and-publication-guide)
 for checkpoint rolling updates and online Trie switching.
 
 ## Choose a ModelRunner
@@ -77,5 +78,5 @@ variable is unset.
 
 Both runners use the same Beam Search API and `gr` configuration.
 CUDA Prefill and Decode capture policies differ by runner. See the
-[V2 integration guide](../docs/modelrunner_v2_multibatch.md) and
-[Prefill capture guide](../docs/prefill_graph_capture.md).
+[V2 integration guide](../docs/features/cuda-graphs.md#modelrunner-v2-multi-batch-execution) and
+[Prefill capture guide](../docs/features/cuda-graphs.md#prefill-capture-configuration).

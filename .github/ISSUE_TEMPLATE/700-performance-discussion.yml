@@ -19,7 +19,7 @@ body:
   attributes:
     label: Report of performance regression
     description: >
-      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark scripts. See https://github.com/JiusiServe/vllm-gr/blob/main/docs/benchmarks/README.md
+      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark scripts. See https://github.com/JiusiServe/vllm-gr/blob/main/docs/usage/benchmarks/README.md
   validations:
     required: false
 - type: textarea

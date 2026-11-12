@@ -1,13 +1,13 @@
 # OneRec Beam Search over gRPC
 
-Install the [CUDA runtime](../../../docs/quickstart.md) and the optional gRPC
+Install the [CUDA runtime](../../../docs/getting_started/installation/cuda.md) and the optional gRPC
 dependencies from the repository root.
 
 ```bash
 VLLM_GR_TARGET_DEVICE=cuda python -m pip install -e ".[grpc]"
 ```
 
-Apply the [vLLM CLI dispatch patch](../../../docs/cli.md#command-form-and-installation).
+Apply the [vLLM CLI dispatch patch](../../../docs/cli/README.md#enable-gr-dispatch).
 
 Follow the [shared Constraint Table setup](../catalog/README.md#set-the-model-and-dataset-paths)
 to set the model and data paths, compile a CUDA table, and write the server YAML.

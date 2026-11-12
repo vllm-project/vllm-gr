@@ -4,9 +4,7 @@ name: Pre-commit and Benchmark
 run-name: >-
   ${{ github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      !((github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
-        github.event.action == 'labeled' &&
+      !(github.event.action == 'labeled' &&
         github.event.label.name == 'abtest') &&
       contains(github.event.pull_request.labels.*.name, 'ready') &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
@@ -21,7 +19,7 @@ run-name: >-
 
 on:
   pull_request:
-    branches: [main, decode_graph]
+    branches: [main]
     types:
       - opened
       - synchronize
@@ -63,6 +61,7 @@ permissions:
   pull-requests: read
 
 env:
+  POLICY_TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name }}
   # Use PCI order; the standalone UUID check verifies actual device identity.
   CUDA_DEVICE_ORDER: PCI_BUS_ID
 
@@ -72,7 +71,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'decode_graph') &&
+      github.event.pull_request.base.ref == 'main' &&
       ((contains(github.event.pull_request.labels.*.name, 'ready') &&
         ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
          github.event.label.name == 'ready')) ||
@@ -198,8 +197,7 @@ jobs:
       !cancelled() && needs.docs-scope.outputs.docs-only != 'true' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+      github.event.pull_request.base.ref == 'main' &&
       contains(github.event.pull_request.labels.*.name, 'ready') &&
       !(github.event.action == 'labeled' && github.event.label.name == 'abtest') &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
@@ -277,10 +275,8 @@ jobs:
       !cancelled() && needs.docs-scope.outputs.docs-only != 'true' &&
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
-       (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'decode_graph') &&
-       !((github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
-         github.event.action == 'labeled' &&
+       github.event.pull_request.base.ref == 'main' &&
+       !(github.event.action == 'labeled' &&
          github.event.label.name == 'abtest') &&
        contains(github.event.pull_request.labels.*.name, 'ready') &&
        ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
@@ -306,7 +302,6 @@ jobs:
         id: benchmark-policy
         env:
           POLICY_REF: ${{ github.sha }}
-          POLICY_TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name }}
         run: |
           device="gpu"
           board_id="unknown"
@@ -318,9 +313,9 @@ jobs:
             )"
           fi
 
-          if [[ "$POLICY_TARGET_BRANCH" == "decode_graph" ||
-                "$POLICY_TARGET_BRANCH" == "main" ]]; then
-            # Use the migrated accuracy floors and retain the known NPU performance profile.
+          if [[ "$POLICY_TARGET_BRANCH" == "main" ||
+                ( "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && "$POLICY_TARGET_BRANCH" == "decode_graph" ) ]]; then
+            # Preserve the manual decode_graph profile alongside main PR validation.
             if [[ "$device" == "npu" && "$board_id" == "Ascend910_9362" ]]; then
               board_id="decode_graph_Ascend910_9362"
             else
@@ -601,9 +596,8 @@ jobs:
 
       - name: Cache OneRec Recall constraint tables
         if: >-
-          ((github.ref_name == 'decode_graph' || github.ref_name == 'main') ||
-           (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main')) &&
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
           env.BENCHMARK_DEVICE == 'gpu'
         uses: corca-ai/local-cache@v2
         id: cache-recall-constraints
@@ -614,9 +608,8 @@ jobs:
 
       - name: Build OneRec Recall constraint tables
         if: >-
-          ((github.ref_name == 'decode_graph' || github.ref_name == 'main') ||
-           (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main')) &&
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
           env.BENCHMARK_DEVICE == 'gpu' &&
           steps.cache-recall-constraints.outputs.cache-hit != 'true'
         run: |
@@ -637,9 +630,8 @@ jobs:
 
       - name: Gate Beam V1 B=4 OneRec Recall on fixed samples
         if: >-
-          ((github.ref_name == 'decode_graph' || github.ref_name == 'main') ||
-           (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main')) &&
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
           env.BENCHMARK_DEVICE == 'gpu'
         env:
           V1_RECALL_DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
@@ -651,9 +643,8 @@ jobs:
       - name: Upload Beam V1 Recall measurements
         if: >-
           always() &&
-          ((github.ref_name == 'decode_graph' || github.ref_name == 'main') ||
-           (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main')) &&
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
           env.BENCHMARK_DEVICE == 'gpu'
         uses: actions/upload-artifact@v4
         with:
@@ -665,9 +656,8 @@ jobs:
       - name: Execute decode benchmark gates
         if: >-
           env.BENCHMARK_DEVICE != 'gpu' ||
-          ((github.ref_name != 'decode_graph' && github.ref_name != 'main') &&
-           (github.event.pull_request.base.ref != 'decode_graph' &&
-            github.event.pull_request.base.ref != 'main'))
+          !(env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph'))
         env:
           DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
@@ -686,8 +676,7 @@ jobs:
       needs.docs-scope.outputs.docs-only != 'true' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+      github.event.pull_request.base.ref == 'main' &&
       ((github.event.action == 'labeled' &&
         github.event.label.name == 'abtest') ||
        (contains(github.event.pull_request.labels.*.name, 'ready') &&
@@ -1087,8 +1076,7 @@ jobs:
            github.event.action == 'unlabeled') &&
           'Ignored label event' ||
           github.event_name == 'pull_request' &&
-          (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+          github.event.pull_request.base.ref == 'main' &&
           contains(github.event.pull_request.labels.*.name, 'abtest') &&
           !(github.event.action == 'unlabeled' &&
             github.event.label.name == 'ready') &&
@@ -1166,8 +1154,7 @@ jobs:
         env:
           ABTEST_ONLY: >-
             ${{ github.event_name == 'pull_request' &&
-                (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+                github.event.pull_request.base.ref == 'main' &&
                 contains(github.event.pull_request.labels.*.name, 'abtest') &&
                 !(github.event.action == 'unlabeled' &&
                   github.event.label.name == 'ready') &&
@@ -1179,8 +1166,7 @@ jobs:
           ABTEST_PASSED: ${{ needs.resolve-ab-freshness.outputs.passed }}
           ABTEST_REQUIRED: >-
             ${{ github.event_name == 'pull_request' &&
-                (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+                github.event.pull_request.base.ref == 'main' &&
                 contains(github.event.pull_request.labels.*.name, 'ready') &&
                 !(github.event.action == 'labeled' &&
                   github.event.label.name == 'abtest') }}

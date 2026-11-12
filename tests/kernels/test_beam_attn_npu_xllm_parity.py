@@ -668,7 +668,7 @@ def test_xllm_mixed_std_beam_batch_falls_back_to_cascade() -> None:
     The fused x_attention kernel only encodes beam rows, so a mixed batch is
     delegated to beam_attn_npu.cascade_attention (std rows via paged
     attention, beam rows via the pool-slice incremental path).  This is the
-    documented fallback (docs/quickstart-ascend.md): a std request sharing a
+    documented fallback (docs/getting_started/installation/ascend.md): a std request sharing a
     batch with beam decode must succeed, not raise.
     """
     beam_width, prefix_len, decode_step = 2, 256, 1

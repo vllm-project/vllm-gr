@@ -5,10 +5,10 @@ returned SIDs against the source catalog.
 
 ## Prepare the environment and inputs
 
-Install the [CUDA runtime](../../../docs/quickstart.md) or
-[Ascend runtime](../../../docs/quickstart-ascend.md). Run the commands below
+Install the [CUDA runtime](../../../docs/getting_started/installation/cuda.md) or
+[Ascend runtime](../../../docs/getting_started/installation/ascend.md). Run the commands below
 from the repository root in Bash with Python and curl 7.76 or later.
-Apply the [vLLM CLI dispatch patch](../../../docs/cli.md#command-form-and-installation).
+Apply the [vLLM CLI dispatch patch](../../../docs/cli/README.md#enable-gr-dispatch).
 Check the installed runtime with `vllm check-env --gr` on CUDA or
 `vllm check-env --gr --npu` on Ascend.
 

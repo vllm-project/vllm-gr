@@ -1,0 +1,3 @@
+# Documentation-only environment; independent of inference dependencies.
+mkdocs==1.6.1
+mkdocs-material==9.8.1

@@ -3,7 +3,7 @@
 ## Dataset prerequisite
 
 Before using these tools, download the OpenOneRec dataset as described in
-[docs/benchmarks/README.md#get-dataset](../../../docs/benchmarks/README.md#get-dataset).
+[docs/usage/benchmarks/README.md#get-dataset](../../../docs/usage/benchmarks/README.md#get-dataset).
 
 ## create_task_catalog.py
 

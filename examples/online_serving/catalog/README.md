@@ -17,7 +17,7 @@ or generate one from the OneRec mapping.
 For serving, use the local snapshot for `ONEREC_MODEL` and set `ONEREC_BACKEND`
 to `npu` on Ascend. Set `ONEREC_DATA` if you are generating a catalog from the
 dataset. See the
-[download instructions](../../../docs/onerec_v1_async_quickstart.md#1-check-the-environment)
+[download instructions](../../../docs/getting_started/quickstart.md#1-check-the-environment)
 if you need the model or mapping.
 
 ```bash

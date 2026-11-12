@@ -22,8 +22,8 @@ logger = logging.getLogger("vllm_gr.patch")
 # Semantic ownership, independent of which process orchestrates an installer.
 # Built-in providers declare their hardware-owned IDs in ``patch_ids``.
 # These independent architectural assertions are checked against the authoritative
-# docs/patch_inventory.yaml; they do not drive installation. See the ownership
-# rationale in docs/runtime_patch_inventory.md.
+# docs/design/patch_inventory.yaml; they do not drive installation. See the ownership
+# rationale in docs/design/runtime_patch_inventory.md.
 CORE_PATCH_IDS = (
     "GR-PATCH-000",
     "GR-PATCH-001",

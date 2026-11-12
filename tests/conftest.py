@@ -16,7 +16,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 # matching the upstream convention that hardware markers are descriptive and
 # selected with `-m` by the runner.
 _SLOW_MARKERS = ("slow", "slow_test")
-# Every test declares where it runs; see docs/tools/README.md#test-tiers.
+# Every test declares where it runs; see docs/contributing/tools/README.md#test-tiers.
 _TIER_MARKERS = ("cpu_test", "gpu_test", "npu_test")
 
 
@@ -34,7 +34,7 @@ def _require_tier_markers(items: list[pytest.Item]) -> None:
     if missing:
         raise pytest.UsageError(
             "Test modules without a tier marker (cpu_test, gpu_test or npu_test); "
-            "see docs/tools/README.md#test-tiers:\n  " + "\n  ".join(missing)
+            "see docs/contributing/tools/README.md#test-tiers:\n  " + "\n  ".join(missing)
         )
 
 

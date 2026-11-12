@@ -10,18 +10,18 @@ Sibling vLLM, vLLM-Ascend, and vLLM-GR checkouts are references unless the task
 explicitly targets them; they are not necessarily the imported runtime.
 
 - For setup and PR workflow, read [CONTRIBUTING.md](CONTRIBUTING.md).
-- Before changing runtime behavior, use [development navigation](docs/development.md)
+- Before changing runtime behavior, use [development navigation](docs/contributing/development.md)
   to find the owning code and read the relevant linked contract.
-- Before selecting tests, read [validation levels](docs/tools/README.md#validation-levels)
+- Before selecting tests, read [validation levels](docs/contributing/tools/README.md#validation-levels)
   and the affected tests' fixtures and device requirements.
 - For documentation-only changes, use the
-  [documentation checks](docs/PRE_COMMIT.md#documentation-checks).
+  [documentation checks](docs/contributing/PRE_COMMIT.md#documentation-checks).
 - When changing agent guidance or tool integration, read
-  [AI instruction maintenance](docs/agent_instructions.md).
+  [AI instruction maintenance](docs/contributing/agent_instructions.md).
 
 ## Environment
 
-Follow the [CUDA](docs/quickstart.md) or [Ascend](docs/quickstart-ascend.md)
+Follow the [CUDA](docs/getting_started/installation/cuda.md) or [Ascend](docs/getting_started/installation/ascend.md)
 installation guide in an environment for the target device. Set
 `VLLM_GR_TARGET_DEVICE` explicitly for platform-specific installs or wheels.
 The deprecated `[gpu]`/`[npu]` extras do not provision those runtimes.
@@ -45,7 +45,7 @@ python -c 'import vllm_gr; print(vllm_gr.__file__)'
 - Generate `vllm_gr/entrypoints/grpc/generated/` from its proto sources using
   `tools/generate_grpc_proto.py`. Do not hand-edit it or `vllm_gr/_version.py`.
 - When changing runtime patch targets, ownership, activation, or removal, update
-  both `docs/runtime_patch_inventory.md` and `docs/patch_inventory.yaml`, with
+  both `docs/design/runtime_patch_inventory.md` and `docs/design/patch_inventory.yaml`, with
   the corresponding contract coverage.
 - Keep transient task notes and machine-specific model/data paths out of shared
   instructions. Treat historical measurements as evidence for their recorded

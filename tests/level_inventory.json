@@ -87,7 +87,7 @@
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_label_edits_do_not_cancel_unrelated_runs": "l1",
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_level_ci_preserves_existing_benchmark_gates": "l1",
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_level_workflow_schedule_and_resource_safety": "l1",
-    "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_main_and_decode_graph_have_equivalent_ab_routing": "l1",
+    "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_main_ab_routing": "l1",
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_manual_dispatch_remains_enabled_without_push": "l1",
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_pr_lifecycle": "l1",
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_ready_reuses_fresh_ab_and_reruns_stale_ab": "l1",

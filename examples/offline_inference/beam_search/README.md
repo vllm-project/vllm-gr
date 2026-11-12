@@ -7,8 +7,8 @@ catalog. The commands below run from the repository root in Bash.
 
 ## Run the V1 example
 
-Install the [CUDA](../../../docs/quickstart.md) or
-[Ascend](../../../docs/quickstart-ascend.md) runtime and set `ONEREC_MODEL`
+Install the [CUDA](../../../docs/getting_started/installation/cuda.md) or
+[Ascend](../../../docs/getting_started/installation/ascend.md) runtime and set `ONEREC_MODEL`
 to a local OneRec-1.7B snapshot with its tokenizer. See the
 [model preparation steps](../../README.md#run-onerec-offline) to set the path
 or download the snapshot. On CUDA, use the default backend.
@@ -181,7 +181,9 @@ belong to `offline_beam_search.py`. Library defaults can differ.
 
 With `gr.constraint_mode: none` and `gr.constraint_table: null`, one engine can
 accept per-request effective lengths from `1` through its configured
-`gr.max_decode_steps`, up to the supported platform limit.
+`gr.max_decode_steps`, up to the supported platform limit. Full-vocabulary NPU generation supports
+one to six steps when KV geometry and scratch capacity fit; dynamic widths
+and SID-stage vocabulary remain limited to three steps.
 Increasing capacity does not change the depth of an enabled
 `constraint_table_v1`: constrained requests still require exactly three
 effective tokens.
@@ -452,15 +454,15 @@ determinism is not asserted. Captured context/KV/state-buffer addresses must sta
 unchanged, replay must resume for the final B=2, and N=1 must finish without Decode
 dispatches. This is a correctness test, not a profile or performance measurement.
 
-#### Padded NPU Prefill precision
+#### Open precision limitation: NPU-PREFILL-PADDING-001
 
-Padding can change BF16 candidate order and scores. In the historical
-OneRec Qwen3 1.7B test on 2026-10-15, the same 290-token batch matched eager
-with an exact bucket but differed when padded to 384. Compiled execution
-at the padded shape also differed without replay. The accelerator model and
-runtime versions for this result were not recorded in this guide.
+Padded BF16 Prefill can change scores and candidate ordering relative to eager
+execution. An exact-bucket graph regression does not establish padded Prefill
+parity or cross-batch determinism. Shape-dependent execution can reproduce the
+difference without graph replay; the responsible operator remains unresolved.
 
-Run the opt-in strict comparison in a prepared Ascend environment:
+Leave `VLLM_GR_TEST_PADDED_PREFILL` unset for the default exact-bucket case.
+Run the strict padded comparison explicitly:
 
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \

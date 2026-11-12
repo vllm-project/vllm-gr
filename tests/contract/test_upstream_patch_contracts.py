@@ -17,7 +17,7 @@ def _parameter_names(callable_obj: object) -> list[str]:
 
 
 def test_patch_inventories_are_aligned_and_complete() -> None:
-    inventory = yaml.safe_load(Path("docs/patch_inventory.yaml").read_text(encoding="utf-8"))
+    inventory = yaml.safe_load(Path("docs/design/patch_inventory.yaml").read_text(encoding="utf-8"))
     patches = inventory["patches"]
     patch_ids = [patch["id"] for patch in patches]
     required_fields = {
@@ -35,7 +35,7 @@ def test_patch_inventories_are_aligned_and_complete() -> None:
     assert all(re.fullmatch(r"GR-PATCH-\d{3}", patch_id) for patch_id in patch_ids)
     assert all(required_fields <= patch.keys() for patch in patches)
 
-    runtime_inventory = Path("docs/runtime_patch_inventory.md").read_text(encoding="utf-8")
+    runtime_inventory = Path("docs/design/runtime_patch_inventory.md").read_text(encoding="utf-8")
     runtime_ids = re.findall(r"^### (GR-PATCH-\d{3})", runtime_inventory, re.MULTILINE)
     assert runtime_ids == patch_ids
     for patch in patches:
@@ -69,7 +69,7 @@ def test_common_and_selected_provider_patch_ownership_is_unique(
     from vllm_gr.platforms import loader
     from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
 
-    inventory = yaml.safe_load(Path("docs/patch_inventory.yaml").read_text(encoding="utf-8"))
+    inventory = yaml.safe_load(Path("docs/design/patch_inventory.yaml").read_text(encoding="utf-8"))
     patches = inventory["patches"]
     assert all(
         (p["scope"] == "core" and p["backend_id"] is None)

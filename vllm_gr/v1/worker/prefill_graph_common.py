@@ -41,7 +41,7 @@ PREFILL_GRAPH_CAPTURE_NUM_REQS = DEFAULT_BEAM_BATCH_SIZES
 # baked for the same request and would drop replays the previous grid
 # admitted (128-token and 17-token cache hits). Opting in keeps the default
 # grid byte-identical to the pre-extension behaviour.
-# See docs/prefill_graph_hit_replay.md section 8 for the measurements.
+# See docs/features/cuda-graphs.md for the capture and replay contract.
 SMALL_PREFILL_BUCKETS = (1, 16)
 DEFAULT_PREFILL_BUCKETS = list(DEFAULT_PREFILL_TOKEN_BUCKETS)
 # Public compatibility alias. Both platforms use the configured bucket range.

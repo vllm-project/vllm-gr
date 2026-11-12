@@ -1,0 +1,121 @@
+site_name: vLLM-GR
+site_description: Generative recommendation inference with vLLM
+repo_name: JiusiServe/vllm-gr
+repo_url: https://github.com/JiusiServe/vllm-gr
+edit_uri: edit/main/docs/
+docs_dir: docs
+site_dir: site
+strict: true
+exclude_docs: |
+  overrides/
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  language: en
+  font: false
+  icon:
+    logo: material/layers-triple
+  palette:
+    - scheme: default
+      primary: white
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to dark mode
+    - scheme: slate
+      primary: black
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - content.action.edit
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+    - toc.follow
+
+plugins:
+  - search
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
+nav:
+  - Home: README.md
+  - User Guide:
+      - Getting started:
+          - getting_started/README.md
+          - First inference: getting_started/first-inference.md
+          - OneRec catalog quickstart: getting_started/quickstart.md
+          - CUDA installation: getting_started/installation/cuda.md
+          - Ascend installation: getting_started/installation/ascend.md
+          - Troubleshooting: getting_started/troubleshooting.md
+      - Serving: serving/README.md
+      - Examples: examples/README.md
+      - Configuration:
+          - configuration/README.md
+          - Dependency versions: configuration/dependency_version_policy.md
+      - Models: models/README.md
+      - Features:
+          - features/README.md
+          - Beam Search: features/beam-search.md
+          - Constraint tables: features/constraint-tables.md
+          - Unconstrained Beam: features/unconstrained-beam-search.md
+          - CUDA graphs: features/cuda-graphs.md
+          - Attention: features/attention.md
+          - Hot updates: features/hot-update.md
+      - Usage and benchmarks:
+          - usage/README.md
+          - Benchmark setup: usage/benchmarks/README.md
+          - Accuracy: usage/benchmarks/accuracy.md
+          - Throughput: usage/benchmarks/throughput.md
+          - Recall gate: usage/benchmarks/beam_v1_recall_gate.md
+          - Video-100 gate: usage/benchmarks/parent_score_gate.md
+  - Developer Guide:
+      - contributing/README.md
+      - Development navigation: contributing/development.md
+      - Validation and tools: contributing/tools/README.md
+      - Pre-commit: contributing/PRE_COMMIT.md
+      - Documentation: contributing/documentation.md
+      - Pangu evaluation: contributing/tools/pangu1b.md
+      - CI benchmark policy: contributing/ci/benchmark-policy-approvals.md
+      - AI tool integration: contributing/agent_instructions.md
+      - Design:
+          - design/index.md
+          - Architecture: design/main-arch.md
+          - Runtime patch inventory: design/runtime_patch_inventory.md
+  - API Reference: api/README.md
+  - CLI Reference: cli/README.md
+  - Community:
+      - community/README.md
+      - Attribution and licenses: community/legal/README.md

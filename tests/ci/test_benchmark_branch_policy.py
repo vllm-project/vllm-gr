@@ -51,7 +51,7 @@ class TestBenchmarkBranchPolicy(unittest.TestCase):
             if item.get("name") == "Resolve benchmark policy"
         )
         self.assertEqual(
-            step["env"]["POLICY_TARGET_BRANCH"],
+            workflow["env"]["POLICY_TARGET_BRANCH"],
             "${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name }}",
         )
         # Execute the workflow's actual selection logic with stubbed NPU probing.
@@ -69,8 +69,9 @@ printf '%s\\n' "$device" "$board_id"
 """
         )
         keys = ("PASS_AT_1_THRESHOLD", "PASS_AT_32_THRESHOLD", "RECALL_AT_32_THRESHOLD")
-        for branch, (device, hardware_board) in product(
-            ("decode_graph", "main", "feature", ""),
+        for branch, event, (device, hardware_board) in product(
+            ("main", "decode_graph", "feature", ""),
+            ("pull_request", "workflow_dispatch"),
             (
                 ("gpu", "unknown"),
                 ("npu", "Ascend910_9362"),
@@ -79,12 +80,15 @@ printf '%s\\n' "$device" "$board_id"
                 ("npu", "unknown"),
             ),
         ):
-            with self.subTest(branch=branch, device=device, hardware_board=hardware_board):
+            with self.subTest(
+                branch=branch, event=event, device=device, hardware_board=hardware_board
+            ):
                 result = subprocess.run(
                     ["bash", "-eu", "-o", "pipefail", "-c", script],
                     env={
                         **os.environ,
                         "POLICY_TARGET_BRANCH": branch,
+                        "GITHUB_EVENT_NAME": event,
                         "TEST_DEVICE": device,
                         "TEST_BOARD": hardware_board,
                     },
@@ -94,7 +98,9 @@ printf '%s\\n' "$device" "$board_id"
                 )
                 actual_device, board = result.stdout.splitlines()
                 self.assertEqual(actual_device, device)
-                enabled = branch in {"decode_graph", "main"}
+                enabled = branch == "main" or (
+                    event == "workflow_dispatch" and branch == "decode_graph"
+                )
                 expected_board = hardware_board
                 if enabled:
                     expected_board = f"decode_graph_{device}"
@@ -127,7 +133,7 @@ printf '%s\\n' "$device" "$board_id"
             "OtherNPU",
             "unknown",
         ):
-            for branch in ("main", "decode_graph", "feature", ""):
+            for branch in ("main", "feature", ""):
                 with self.subTest(board=board, branch=branch):
                     with patch.dict(os.environ, {"CHANGE_TARGET": branch}):
                         values = resolve_policy(policy, "npu", board)
@@ -160,7 +166,7 @@ printf '%s\\n' "$device" "$board_id"
                 "performance": {"p99_ttft_max": 123, "offline_elapsed_seconds_max": 42},
             }
         }
-        for branch in ("main", "decode_graph", "feature", ""):
+        for branch in ("main", "feature", ""):
             with self.subTest(branch=branch), patch.dict(os.environ, {"CHANGE_TARGET": branch}):
                 values = resolve_policy(policy, "npu", "CustomNPU")
                 self.assertEqual(
@@ -218,14 +224,6 @@ printf '%s\\n' "$device" "$board_id"
                     scoped,
                 ),
                 (
-                    "jenkins-decode",
-                    policy_file,
-                    {"CHANGE_TARGET": "decode_graph"},
-                    "npu",
-                    "Ascend910_9362",
-                    scoped,
-                ),
-                (
                     "jenkins-feature",
                     policy_file,
                     {"CHANGE_TARGET": "feature", "BRANCH_NAME": "main"},
@@ -260,7 +258,7 @@ printf '%s\\n' "$device" "$board_id"
                     policy_file,
                     {
                         "GITHUB_EVENT_NAME": "pull_request_review",
-                        "GITHUB_BASE_REF": "decode_graph",
+                        "GITHUB_BASE_REF": "main",
                         "GITHUB_REF_NAME": "123/merge",
                         "GITHUB_REF_TYPE": "branch",
                     },
@@ -311,7 +309,7 @@ printf '%s\\n' "$device" "$board_id"
                     {
                         "GITHUB_EVENT_NAME": "workflow_dispatch",
                         "GITHUB_REF_TYPE": "branch",
-                        "GITHUB_REF_NAME": "decode_graph",
+                        "GITHUB_REF_NAME": "main",
                     },
                     "npu",
                     "Ascend910_9362",
@@ -406,7 +404,7 @@ printf '%s\\n' "$device" "$board_id"
                     "unknown",
                     "unlisted-npu",
                 ),
-                ("main", "decode_graph", "feature", ""),
+                ("main", "feature", ""),
             ):
                 cases += (
                     (

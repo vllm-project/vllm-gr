@@ -2,16 +2,16 @@
 
 ## Development setup
 
-Use the [CUDA guide](docs/quickstart.md) or
-[Ascend guide](docs/quickstart-ascend.md) to prepare the platform runtime and
+Use the [CUDA guide](docs/getting_started/installation/cuda.md) or
+[Ascend guide](docs/getting_started/installation/ascend.md) to prepare the platform runtime and
 install the editable package with development dependencies. Follow the Python
 range in `pyproject.toml` and set `VLLM_GR_TARGET_DEVICE` for the intended
 platform. The Ascend path relies on the vendor runtime; a CPU package install
 does not provide accelerator inference.
 
-Install the [pre-commit hooks](docs/PRE_COMMIT.md). Before runtime validation,
-confirm that the active interpreter imports this checkout, apply the
-[CLI dispatch patch](docs/cli.md), then run:
+Install the [pre-commit hooks](docs/contributing/PRE_COMMIT.md). Before runtime
+validation, confirm that the active interpreter imports this checkout, apply the
+[CLI dispatch patch](docs/cli/README.md#enable-gr-dispatch), then run:
 
 ```bash
 vllm check-env --gr
@@ -23,14 +23,14 @@ the documented environment variables.
 
 ## Change and validation workflow
 
-1. Use [development navigation](docs/development.md) to locate the owning code,
+1. Use [development navigation](docs/contributing/development.md) to locate the owning code,
    callers, and contract. Keep the change focused and preserve unrelated work.
 2. Update behavior, regression coverage, and the owning documentation together.
    Public changes also need the relevant examples and configuration updated.
-3. Select checks using [validation levels](docs/tools/README.md#validation-levels).
+3. Select checks using [validation levels](docs/contributing/tools/README.md#validation-levels).
    Follow its regression guidance and use hardware coverage for device behavior.
    For documentation-only work, use the
-   [documentation checks](docs/PRE_COMMIT.md#documentation-checks).
+   [documentation checks](docs/contributing/PRE_COMMIT.md#documentation-checks).
 4. Review the final diff and fill out the
    [PR template](.github/PULL_REQUEST_TEMPLATE.md) with the problem, resulting
    behavior, exact validation commands, results, and remaining gaps.
@@ -42,7 +42,7 @@ describes the evidence needed for hardware and benchmark claims.
 
 Project rules live in [AGENTS.md](AGENTS.md), with a shared-file import in
 [CLAUDE.md](CLAUDE.md). See
-[AI tool integration and instruction maintenance](docs/agent_instructions.md)
+[AI tool integration and instruction maintenance](docs/contributing/agent_instructions.md)
 for loading checks, other tools, and where to add new guidance. Contributors
 remain responsible for reviewing generated changes and their validation.
 
@@ -103,6 +103,6 @@ do not run A/B tests, including when `abtest` is added.
 Video-100/Pangu benchmarks use the policy and resolver from the same workflow
 commit as the tests, with the existing branch and device settings. Policy and
 test changes can be reviewed together in one PR. See the
-[CI policy guide](docs/ci/benchmark-policy-approvals.md) and
-[benchmark guide](docs/tools/README.md#benchmark-acceptance).
+[CI policy guide](docs/contributing/ci/benchmark-policy-approvals.md) and
+[benchmark guide](docs/contributing/tools/README.md#benchmark-acceptance).
 Recall baseline provenance has separate rules.
