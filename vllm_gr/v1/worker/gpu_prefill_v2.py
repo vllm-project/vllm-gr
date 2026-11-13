@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 def _can_fuse_prefill_state_writes(
     worker: Any, scheduler_output: "SchedulerOutput", requests: list["NewRequestData"]
 ) -> bool:
-    """Check the complete fresh-batch write contract before registration."""
+    """Check complete Prefill registration, including a cached prompt prefix."""
     from vllm.v1.worker.gpu.block_table import BlockTables
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
     from vllm.v1.worker.gpu.states import RequestState
@@ -52,13 +52,15 @@ def _can_fuse_prefill_state_writes(
     ):
         return False
     for request in requests:
-        if request.num_computed_tokens != 0 or len(request.block_ids) != 1:
+        if len(request.block_ids) != 1:
             return False
         num_tokens = len(request.prefill_token_ids)
         num_blocks = len(request.block_ids[0])
         if (
             num_tokens != len(request.prompt_token_ids)
-            or num_tokens != scheduler_output.num_scheduled_tokens[request.req_id]
+            or not 0 <= request.num_computed_tokens < num_tokens
+            or request.num_computed_tokens + scheduler_output.num_scheduled_tokens[request.req_id]
+            != num_tokens
             or not 0 < num_tokens <= states.all_token_ids.gpu.shape[1]
             or not 0 < num_blocks <= blocks.block_tables[0].gpu.shape[1]
         ):
@@ -76,6 +78,73 @@ def _can_fuse_prefill_state_writes(
     )
 
 
+class _PrefillUploadSlot:
+    """Worker-owned payload storage, reusable only after its GPU consumer."""
+
+    def __init__(self, capacity: int, device: Any) -> None:
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        self.cpu = torch.empty(
+            capacity, dtype=torch.int32, device="cpu", pin_memory=is_pin_memory_available()
+        )
+        self.array: npt.NDArray[np.int32] = self.cpu.numpy()
+        self.gpu = torch.empty(capacity, dtype=torch.int32, device=device)
+        self.done = torch.Event(device=device)
+        self.submitted = False
+        self._unrecorded = False
+
+    def wait(self) -> None:
+        if self._unrecorded:
+            raise RuntimeError("Prefill upload completion event was not recorded; slot is unusable")
+        if self.submitted and not self.done.query():
+            self.done.synchronize()
+
+    def copy(self, size: int) -> torch.Tensor:
+        packed = self.gpu[:size]
+        packed.copy_(self.cpu[:size], non_blocking=True)
+        return packed
+
+    def record(self) -> None:
+        # The previous event cannot retire a new submission if recording fails.
+        self._unrecorded = True
+        self.done.record(torch.accelerator.current_stream(self.gpu.device))
+        self.submitted = True
+        self._unrecorded = False
+
+
+class _PrefillUploadBuffers:
+    """Two bounded slots, without borrowed token storage or request metadata."""
+
+    def __init__(self, device: Any) -> None:
+        self.device = device
+        self.slots: list[_PrefillUploadSlot | None] = [None, None]
+        self.next_slot = 0
+
+    def acquire(self, size: int) -> _PrefillUploadSlot:
+        index = self.next_slot
+        self.next_slot = 1 - index
+        slot = self.slots[index]
+        if slot is not None:
+            slot.wait()
+        if slot is None or slot.cpu.numel() < size:
+            slot = _PrefillUploadSlot(size, self.device)
+            self.slots[index] = slot
+        return slot
+
+
+def _copy_prefill_tokens(target: npt.NDArray[np.int32], tokens: Any) -> None:
+    from vllm_gr.v1.worker.numpy_staging import NumpyStagedContents
+
+    if isinstance(tokens, NumpyStagedContents):
+        offset = 0
+        for chunk in tokens.chunks:
+            end = offset + len(chunk)
+            target[offset:end] = chunk
+            offset = end
+    else:
+        target[:] = tokens
+
+
 def _apply_fused_prefill_state_writes(worker: Any) -> None:
     """Flush native registration writes with one H2D and one ordered kernel."""
     from vllm_gr.ops.cuda.gr_prefill_inputs import (
@@ -87,10 +156,15 @@ def _apply_fused_prefill_state_writes(worker: Any) -> None:
     block_table = worker.block_tables.block_tables[0]
     tokens = states.all_token_ids._staged_write_contents
     block_ids = block_table._staged_write_contents
-    from vllm_gr.v1.worker.numpy_staging import NumpyStagedContents, array_h2d
-
-    token_array = tokens.array() if isinstance(tokens, NumpyStagedContents) else np.asarray(tokens)
     count = len(states.total_len._staged_write_indices)
+    uploads = getattr(worker, "_gr_prefill_upload_buffers", None)
+    if uploads is None:
+        uploads = _PrefillUploadBuffers(worker.device)
+        worker._gr_prefill_upload_buffers = uploads
+    header_size = 2 if count == 1 else 7 * count
+    size = header_size + len(tokens) + len(block_ids)
+    slot = uploads.acquire(size)
+    payload = slot.array[:size]
     targets = (
         states.total_len.gpu,
         states.all_token_ids.gpu,
@@ -102,44 +176,48 @@ def _apply_fused_prefill_state_writes(worker: Any) -> None:
         BLOCK_TABLE_STRIDE=block_table.gpu.stride(0),
         BLOCK=256,
     )
-    if count == 1:
-        req_index = states.total_len._staged_write_indices[0]
-        payload: npt.NDArray[np.int32] = np.empty(2 + len(tokens) + len(block_ids), dtype=np.int32)
-        payload[0] = states.total_len._staged_write_contents[0]
-        payload[1] = states.num_computed_tokens._staged_write_contents[0]
-        payload[2 : 2 + len(tokens)] = token_array
-        payload[2 + len(tokens) :] = block_ids
-        packed = array_h2d(payload, torch.int32, worker.device)
-        apply_gr_prefill_state_writes_v2[((max(len(tokens), len(block_ids)) + 255) // 256,)](
-            packed, *targets, req_index, len(tokens), len(block_ids), **strides
-        )
+    try:
+        if count == 1:
+            req_index = states.total_len._staged_write_indices[0]
+            payload[0] = states.total_len._staged_write_contents[0]
+            payload[1] = states.num_computed_tokens._staged_write_contents[0]
+            _copy_prefill_tokens(payload[2 : 2 + len(tokens)], tokens)
+            payload[2 + len(tokens) :] = block_ids
+            packed = slot.copy(size)
+            apply_gr_prefill_state_writes_v2[((max(len(tokens), len(block_ids)) + 255) // 256,)](
+                packed, *targets, req_index, len(tokens), len(block_ids), **strides
+            )
+        else:
+            # Header: slot, total/computed lengths, token offset/count, block
+            # offset/count. Preserve the existing fused kernel ABI.
+            header = payload[:header_size].reshape(count, 7)
+            header[:, 0] = states.total_len._staged_write_indices
+            header[:, 1] = states.total_len._staged_write_contents
+            header[:, 2] = states.num_computed_tokens._staged_write_contents
+            token_ends = np.asarray(states.all_token_ids._staged_write_cu_lens, dtype=np.int32)
+            block_ends = np.asarray(block_table._staged_write_cu_lens, dtype=np.int32)
+            header[0, 3] = header_size
+            header[1:, 3] = header_size + token_ends[:-1]
+            header[:, 4] = header_size + token_ends - header[:, 3]
+            header[0, 5] = header_size + len(tokens)
+            header[1:, 5] = header_size + len(tokens) + block_ends[:-1]
+            header[:, 6] = header_size + len(tokens) + block_ends - header[:, 5]
+            _copy_prefill_tokens(payload[header_size : header_size + len(tokens)], tokens)
+            payload[header_size + len(tokens) :] = block_ids
+            extent = max(int(header[:, 4].max()), int(header[:, 6].max()))
+            packed = slot.copy(size)
+            apply_gr_prefill_batch_state_writes_v2[(count, (extent + 255) // 256)](
+                packed, *targets, **strides
+            )
+    except BaseException as error:
+        try:
+            slot.record()
+        except BaseException as completion_error:
+            error.add_note(f"Recording Prefill upload completion also failed: {completion_error!r}")
+        raise
     else:
-        # Registration appends one start-zero write per tensor and native slot.
-        # Pack offsets with the contents so the GPU needs no per-tensor UVA
-        # descriptors. Each row owns a distinct slot, including after reuse.
-        # Header columns: slot, total length, computed tokens, token offset,
-        # token count, block offset and block count. The kernel uses this ABI.
-        header_size = 7 * count
-        payload = np.empty(header_size + len(tokens) + len(block_ids), dtype=np.int32)
-        header = payload[:header_size].reshape(count, 7)
-        header[:, 0] = states.total_len._staged_write_indices
-        header[:, 1] = states.total_len._staged_write_contents
-        header[:, 2] = states.num_computed_tokens._staged_write_contents
-        token_ends = np.asarray(states.all_token_ids._staged_write_cu_lens, dtype=np.int32)
-        block_ends = np.asarray(block_table._staged_write_cu_lens, dtype=np.int32)
-        header[0, 3] = header_size
-        header[1:, 3] = header_size + token_ends[:-1]
-        header[:, 4] = header_size + token_ends - header[:, 3]
-        header[0, 5] = header_size + len(tokens)
-        header[1:, 5] = header_size + len(tokens) + block_ends[:-1]
-        header[:, 6] = header_size + len(tokens) + block_ends - header[:, 5]
-        payload[header_size : header_size + len(tokens)] = token_array
-        payload[header_size + len(tokens) :] = block_ids
-        extent = max(int(header[:, 4].max()), int(header[:, 6].max()))
-        packed = array_h2d(payload, torch.int32, worker.device)
-        apply_gr_prefill_batch_state_writes_v2[(count, (extent + 255) // 256)](
-            packed, *targets, **strides
-        )
+        # One event covers the copy and any kernel enqueued on the same stream.
+        slot.record()
     # Clear only after successful submission. The native block-table flush
     # still follows update_requests and refreshes num_blocks, but must not
     # submit the same block IDs twice. CUDA errors propagate normally.

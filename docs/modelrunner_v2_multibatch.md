@@ -19,13 +19,17 @@ stage hooks own execution and lifecycle transitions. Both CUDA integrations
 use `gpu_postprocess_workspace` for workspace initialization and load-time
 device-memory accounting; V2 does not import V1 patch implementation code.
 
-Fresh batches on an empty native request set can flush token, total-length,
+New batches on an empty native request set can flush token, total-length,
 computed-token and single-group block-table writes through one packed transfer
 and one Triton kernel. This includes multi-request batches with unequal prompt
-lengths and reused native slots. The specialization requires complete prompts,
-zero computed tokens and no previously queued writes; other registrations keep
-native flushing. Queue contents are cleared only after successful submission,
-and the subsequent native block-table flush still publishes block counts.
+lengths and reused native slots. The scheduled suffix must complete Prefill,
+including when a prompt prefix was cached. Compatible native state, one KV
+group and no previously queued writes are still required; other registrations
+keep native flushing. Worker-owned upload slots wait for their final GPU consumer
+before reuse or growth. Failure to record that completion event makes the slot
+unusable and preserves any original submission error. Queue contents are cleared
+only after successful submission, and the subsequent native block-table flush
+still publishes block counts.
 
 For supported pure Prefill batches, one Triton kernel prepares input tokens,
 positions, sequence lengths, query offsets, logits indices and sampling row

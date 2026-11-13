@@ -164,13 +164,14 @@ def _fresh_registration_worker():
 
 @pytest.mark.parametrize("batch", [1, 2, 4, 8])
 @pytest.mark.parametrize("numpy_tokens", [False, True])
-def test_fused_registration_matches_native_after_batch_reuse(batch, numpy_tokens):
+@pytest.mark.parametrize("cached", [0, 2])
+def test_fused_registration_matches_native_after_batch_reuse(batch, numpy_tokens, cached):
     from vllm_gr.v1.worker.numpy_staging import install_numpy_staging
 
     install_numpy_staging()
     native, fast = _fresh_registration_worker(), _fresh_registration_worker()
     fast.req_states.apply_staged_writes = Mock(wraps=fast.req_states.apply_staged_writes)
-    for iteration in range(2):
+    for iteration in range(3):
         scheduled = _scheduled(batch)
         for i, request in enumerate(scheduled.scheduled_new_reqs):
             length = (1, 257, 513, 1024)[(i + iteration) % 4]
@@ -179,7 +180,8 @@ def test_fused_registration_matches_native_after_batch_reuse(batch, numpy_tokens
             request.prompt_token_ids = tokens if numpy_tokens else tokens.tolist()
             request.prefill_token_ids = request.prompt_token_ids
             request.block_ids = (list(range(1 + i * 128, 1 + i * 128 + (length + 15) // 16)),)
-            scheduled.num_scheduled_tokens[request.req_id] = length
+            request.num_computed_tokens = min(cached, length - 1)
+            scheduled.num_scheduled_tokens[request.req_id] = length - request.num_computed_tokens
         scheduled.total_num_scheduled_tokens = sum(scheduled.num_scheduled_tokens.values())
         counts = tuple(len(r.prompt_token_ids) for r in scheduled.scheduled_new_reqs)
         scheduled.gr_stage_metadata["session-0"] = replace(
@@ -194,6 +196,7 @@ def test_fused_registration_matches_native_after_batch_reuse(batch, numpy_tokens
         GPUModelRunner.add_requests(native, scheduled)
         assert try_add_gr_prefill_requests(fast, scheduled)
         fast.req_states.apply_staged_writes.assert_not_called()
+        assert fast._gr_prefill_upload_buffers.slots[0] is not None
         assert not fast.block_tables.block_tables[0]._staged_write_indices
         for worker in (native, fast):
             worker.block_tables.apply_staged_writes()
@@ -243,24 +246,90 @@ def test_registration_preserves_pending_writes_via_native_flush(pending):
     assert tensor.gpu[0].reshape(-1)[0].item() == 37
 
 
-def test_fused_registration_submission_failure_keeps_queued_writes(monkeypatch):
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("after_launch", [False, True])
+def test_fused_registration_submission_failure_keeps_queued_writes(
+    monkeypatch, batch, after_launch
+):
     from vllm_gr.ops.cuda import gr_prefill_inputs
+    from vllm_gr.v1.worker import gpu_prefill_v2
 
     worker = _fresh_registration_worker()
-    scheduled = _scheduled(4)
+    scheduled = _scheduled(batch)
     worker._current_scheduler_output = scheduled
+    name = (
+        "apply_gr_prefill_state_writes_v2"
+        if batch == 1
+        else "apply_gr_prefill_batch_state_writes_v2"
+    )
+    original_kernel = getattr(gr_prefill_inputs, name)
+    recorded = []
+    original_record = gpu_prefill_v2._PrefillUploadSlot.record
+
+    def record(slot):
+        original_record(slot)
+        recorded.append(slot)
+
+    def select(grid):
+        def submit(*args, **kwargs):
+            if after_launch:
+                original_kernel[grid](*args, **kwargs)
+            raise RuntimeError("submission")
+
+        return submit
+
+    monkeypatch.setattr(gpu_prefill_v2._PrefillUploadSlot, "record", record)
     failing_kernel = Mock()
-    failing_kernel.__getitem__ = Mock(return_value=Mock(side_effect=RuntimeError("submission")))
-    monkeypatch.setattr(gr_prefill_inputs, "apply_gr_prefill_batch_state_writes_v2", failing_kernel)
+    failing_kernel.__getitem__ = Mock(side_effect=select)
+    monkeypatch.setattr(gr_prefill_inputs, name, failing_kernel)
     with pytest.raises(RuntimeError, match="submission"):
         try_add_gr_prefill_requests(worker, scheduled)
+    (slot,) = recorded
+    assert slot.submitted
+    slot.done.synchronize()
     for tensor in (
         worker.req_states.total_len,
         worker.req_states.all_token_ids,
         worker.req_states.num_computed_tokens,
         worker.block_tables.block_tables[0],
     ):
-        assert len(tensor._staged_write_indices) == 4
+        assert len(tensor._staged_write_indices) == batch
+
+
+@pytest.mark.l2
+@pytest.mark.gpu_test
+def test_prefill_upload_slots_wait_before_reuse_and_growth():
+    from vllm_gr.v1.worker.gpu_prefill_v2 import _PrefillUploadBuffers
+
+    buffers = _PrefillUploadBuffers(torch.device("cuda"))
+    first = buffers.acquire(8)
+    second = buffers.acquire(8)
+    assert first is not second
+    first.submitted = second.submitted = True
+    first.done = Mock(query=Mock(return_value=False))
+    second.done = Mock(query=Mock(return_value=False))
+    assert buffers.acquire(4) is first
+    first.done.synchronize.assert_called_once()
+    grown = buffers.acquire(16)
+    second.done.synchronize.assert_called_once()
+    assert grown is not second
+    assert grown.cpu.numel() == 16
+    assert len(buffers.slots) == 2
+
+
+@pytest.mark.l2
+@pytest.mark.gpu_test
+@pytest.mark.parametrize("computed,scheduled_tokens", [(-1, 10), (9, 0), (2, 6), (2, 8)])
+def test_fused_registration_requires_complete_remaining_prefill(computed, scheduled_tokens):
+    from vllm_gr.v1.worker.gpu_prefill_v2 import _can_fuse_prefill_state_writes
+
+    worker = _fresh_registration_worker()
+    scheduled = _scheduled(1, cached=2)
+    assert _can_fuse_prefill_state_writes(worker, scheduled, scheduled.scheduled_new_reqs)
+    scheduled.scheduled_new_reqs[0].num_computed_tokens = computed
+    scheduled.num_scheduled_tokens["member-0"] = scheduled_tokens
+    assert not _can_fuse_prefill_state_writes(worker, scheduled, scheduled.scheduled_new_reqs)
+    assert worker.req_states.num_reqs == 0
 
 
 def _input_case(lengths, computed, query_lens, padded_tokens, cpu_ahead):

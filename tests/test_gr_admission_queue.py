@@ -450,4 +450,97 @@ def test_shutdown_add_keeps_native_abort_semantics(core):
     assert not getattr(core.scheduler, "_gr_v1_sessions", {})
 
 
+@pytest.mark.l1
+@pytest.mark.parametrize("queued", [False, True])
+def test_admission_reuses_validation_only_inside_core_thread(core, scheduler, monkeypatch, queued):
+    from vllm_gr.v1.engine import beam_search_v1, gr_async_scheduler
+
+    validate = Mock(wraps=beam_search_v1.validate_gr_request)
+    monkeypatch.setattr(beam_search_v1, "validate_gr_request", validate)
+    monkeypatch.setattr(gr_async_scheduler, "validate_gr_request", validate)
+    target = core if queued else bare_core(scheduler, EngineCore)
+    request = batch("validation-scope")
+    _handle_submit_gr_session(target, request)
+    if queued:
+        assert validate.call_count == 1
+        target._process_input_queue()
+    assert validate.call_count == (3 if queued else 2)
+    native = scheduler.requests[request.batch_id]
+    assert not hasattr(native, "_gr_admission_validation")
+    assert not hasattr(request, "_gr_admission_validation")
+    complete(target, request.batch_id)
+
+
+@pytest.mark.l1
+def test_queued_admission_revalidates_mutated_tokens(core):
+    request = batch("changed-after-enqueue")
+    _handle_submit_gr_session(core, request)
+    request.items[0].request.prompt_token_ids[0] = -1
+    core._process_input_queue()
+    assert_one_error(core, request.batch_id)
+    assert not core.scheduler.requests
+    assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("mismatch", ["request", "config", "trie_count"])
+def test_core_revalidates_mismatched_admission_proof(scheduler, monkeypatch, mismatch):
+    from vllm_gr.v1.engine import beam_search_v1
+    from vllm_gr.v1.engine.beam_search_v1 import _GRRequestValidation
+    from vllm_gr.v1.engine.core import _admit_gr_session
+
+    scheduler._gr_trie_count = 1
+    request = batch("mismatched-proof")
+    proof = _GRRequestValidation(
+        batch("other") if mismatch == "request" else request,
+        SimpleNamespace() if mismatch == "config" else scheduler.vllm_config,
+        2 if mismatch == "trie_count" else 1,
+    )
+    request.items[0].request.prompt_token_ids[0] = -1
+    validate = Mock(wraps=beam_search_v1.validate_gr_request)
+    monkeypatch.setattr(beam_search_v1, "validate_gr_request", validate)
+    with pytest.raises(GRAdmissionError, match="non-negative"):
+        _admit_gr_session(bare_core(scheduler, EngineCore), request, _validation=proof)
+    validate.assert_called_once()
+    assert not scheduler.requests
+    assert not getattr(scheduler, "_gr_v1_sessions", {})
+
+
+@pytest.mark.l1
+def test_inprocess_admission_does_not_forward_proof_past_preprocessing(scheduler, monkeypatch):
+    target = bare_core(scheduler, EngineCore)
+    seen = []
+    failure = RuntimeError("injected ADD failure")
+
+    def reject(native, *args):
+        seen.append(native)
+        assert not hasattr(native, "_gr_admission_validation")
+        raise failure
+
+    monkeypatch.setattr(target, "add_request", reject)
+    with pytest.raises(RuntimeError) as raised:
+        _handle_submit_gr_session(target, batch("failed-add"))
+    assert raised.value is failure
+    assert len(seen) == 1
+    assert not hasattr(seen[0], "_gr_admission_validation")
+    assert not scheduler.requests
+
+
+@pytest.mark.l1
+def test_inprocess_admission_rejects_tokens_mutated_during_preprocessing(core, monkeypatch):
+    target = bare_core(core.scheduler, EngineCore)
+    original = target.preprocess_add_request
+
+    def mutate(owned_request):
+        result = original(owned_request)
+        owned_request.prompt_token_ids[0] = -1
+        return result
+
+    monkeypatch.setattr(target, "preprocess_add_request", mutate)
+    with pytest.raises(GRAdmissionError, match="non-negative"):
+        _handle_submit_gr_session(target, batch("mutated-in-preprocessing"))
+    assert not core.scheduler.requests
+    assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+
+
 pytestmark = pytest.mark.cpu_test

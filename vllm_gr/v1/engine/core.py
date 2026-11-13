@@ -57,12 +57,17 @@ def _handle_submit_gr_session(self, batch_request) -> None:
         logger.error("Rejecting an empty beam_search_v1 batch")
         return
     try:
-        from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+        from vllm_gr.v1.engine.beam_search_v1 import (
+            _GRRequestValidation,
+            validate_gr_request,
+        )
 
+        config = getattr(self, "vllm_config", None)
+        trie_count = getattr(self, "_gr_trie_count", None)
         validate_gr_request(
             batch_request,
-            config=getattr(self, "vllm_config", None),
-            trie_count=getattr(self, "_gr_trie_count", None),
+            config=config,
+            trie_count=trie_count,
         )
     except ValueError as error:
         # A malformed batch is a request rejection, not a preprocessing fault.
@@ -81,10 +86,12 @@ def _handle_submit_gr_session(self, batch_request) -> None:
     if hasattr(self, "input_queue"):
         self.input_queue.put_nowait((EngineCoreRequestType.SUBMIT_GR_SESSION, batch_request))
         return
-    _admit_gr_session(self, batch_request)
+    _admit_gr_session(
+        self, batch_request, _validation=_GRRequestValidation(batch_request, config, trie_count)
+    )
 
 
-def _admit_gr_session(self, batch_request) -> None:
+def _admit_gr_session(self, batch_request, *, _validation=None) -> None:
     """Preprocess and admit one complete GR session on the core thread."""
     if not batch_request.items:
         logger.error("Rejecting an empty beam_search_v1 batch")
@@ -93,16 +100,18 @@ def _admit_gr_session(self, batch_request) -> None:
     try:
         from vllm_gr.v1.engine.beam_search_v1 import (
             GRDeviceRequestError,
+            _GRRequestValidation,
             validate_gr_device_config,
             validate_gr_execution_config,
             validate_gr_request,
         )
 
-        validate_gr_request(
-            batch_request,
-            config=getattr(self, "vllm_config", None),
-            trie_count=getattr(self, "_gr_trie_count", None),
-        )
+        config = getattr(self, "vllm_config", None)
+        trie_count = getattr(self, "_gr_trie_count", None)
+        if not isinstance(_validation, _GRRequestValidation) or not _validation.matches(
+            batch_request, config, trie_count
+        ):
+            validate_gr_request(batch_request, config=config, trie_count=trie_count)
     except ValueError as error:
         # The request is answerable, so it must not take the preprocessing
         # error path: that one logs a traceback and sends a bare
@@ -162,6 +171,9 @@ def _admit_gr_session(self, batch_request) -> None:
         native_request.gr_batch_member_index = member_index
         # SUBMIT_GR_SESSION reaches this handler as one busy-loop message, so
         # native scheduling cannot observe a partially inserted batch.
+        # Native preprocessing can mutate values shared by the shallow copy.
+        # The scheduler must validate the final batch at ADD; the entry proof
+        # cannot certify data across that extensible boundary.
         self.add_request(*preprocessed)
 
 

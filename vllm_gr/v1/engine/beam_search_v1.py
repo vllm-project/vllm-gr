@@ -323,6 +323,23 @@ def validate_gr_request(
 
 
 @dataclass(frozen=True, slots=True)
+class _GRRequestValidation:
+    """Core-local proof for one synchronous admission, never sent over a queue.
+
+    This proof covers only the direct call into admission, before native
+    preprocessing. Preprocessing may mutate shared nested values, so ADD
+    always revalidates rather than receiving this identity-only proof.
+    """
+
+    request: BeamBatchRequest
+    config: Any
+    trie_count: int | None
+
+    def matches(self, request: BeamBatchRequest, config: Any, trie_count: int | None) -> bool:
+        return self.request is request and self.config is config and self.trie_count == trie_count
+
+
+@dataclass(frozen=True, slots=True)
 class GRDeviceStateRef:
     """Reference to Beam state that remains owned by the Worker device."""
 

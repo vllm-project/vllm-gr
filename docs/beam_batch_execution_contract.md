@@ -271,6 +271,13 @@ non-empty request IDs, positive widths and generation budgets,
 stop IDs, sampling rather than pooling, and the supported resource identity.
 Booleans are not accepted in place of integers.
 
+EngineCore may reuse a request-validation proof only on the synchronous call
+into admission before native preprocessing, while request and configuration
+identity and loaded Trie count still match. Preprocessing may mutate nested
+values shared by a shallow copy, so the proof never reaches ADD. Scheduler
+admission revalidates the final batch before inserting its first member. The
+proof also never crosses an input queue.
+
 `BeamBatchLimits` is a non-wire capacity snapshot. Runtime admission also
 checks model length, token budget, native request capacity, Beam row capacity,
 and supported device features. Logical B=1..8 is supported by admission; the

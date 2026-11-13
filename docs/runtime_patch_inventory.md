@@ -248,6 +248,8 @@ installers run or their ordering.
   utilities into EngineCore. `apply_engine_core_request_patches` calls
   `install_core_hot_update_hooks` even when the optional management listener
   is disabled; listener configuration controls external exposure separately.
+  Core-local request-validation proofs avoid repeated synchronous checks before
+  preprocessing; queued admission and scheduler ADD revalidate independently.
   The shared child plan installs the live Trie-capacity initialization wrapper
   before construction. The sanitized NPU process entry invokes this plan too;
   installing it later from Worker initialization would miss the current
@@ -361,8 +363,12 @@ and Decode capture policy remain active when this cache is disabled.
 - ModelRunner V2 dependencies:
     - native `prepare_inputs`/`add_requests` request-state contracts;
     - admitted all-new GR Prefill batches skip unused native sampler registration;
-    - fresh, complete Prefill batches on an empty request set fuse native state
-      writes only when they own all queued writes and one compatible KV group;
+    - complete Prefill batches, including cached prefixes, on an empty request
+      set fuse native state writes only when they own all queued writes and one
+      compatible KV group; two worker-owned pinned upload slots wait for their
+      last GPU consumer before reuse or growth, including failed submissions.
+      Event-recording failure permanently invalidates the affected slot and
+      preserves any original submission error;
     - pure GR Prefill input fusion preserves native row order, GPU token state,
       CPU mirrors and per-dispatch sampling indices; unsupported batches fall back;
     - instance-local CUDA graph manager and capture registry;
