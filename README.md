@@ -8,6 +8,14 @@ vLLM-based Generative Recommender Inference Engine
 
 This repository focuses on vLLM-based generative recommendation inference, including the OneRec beam-search / catalog-constrained generation pipeline, the Pangu LLM passthrough path, example scripts, test suites, and GPU / NPU runtime adaptation code.
 
+vLLM-GR is an independently maintained extension of
+[vLLM](https://github.com/vllm-project/vllm), hosted at
+[JiusiServe/vllm-gr](https://github.com/JiusiServe/vllm-gr). It is not an official
+vLLM subproject. The project is distributed under the [Apache-2.0 license](LICENSE);
+see [NOTICE](NOTICE) for third-party attribution. Documentation is maintained
+in this repository and linked below. Use the
+[project issues](https://github.com/JiusiServe/vllm-gr/issues) for support.
+
 ## Runtime version contract
 
 **vLLM-GR 0.30.0 supports vLLM 0.30.0 only.** GR patches depend on vLLM

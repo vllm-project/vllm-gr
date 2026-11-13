@@ -11,8 +11,10 @@ SID-to-IID engine.
 
 On 2026-11-02, the upgrade owner accepted the upgraded version's accuracy after
 validation and authorized replacing the pre-upgrade reference. The new baseline
-uses three actual A100 measurements from
-[PR529 run 41385992758](https://github.com/JiusiServe/vllm-gr/actions/runs/41385992758).
+uses three actual A100 measurements recorded in the checked-in accuracy
+reference linked above. That JSON contains the calibration values and source
+metadata, so readers do not need access to historical CI artifacts to inspect
+the accepted reference.
 Each SID floor remains the minimum of that task's calibration measurements;
 the stored JSON preserves their full precision.
 

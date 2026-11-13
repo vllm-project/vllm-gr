@@ -42,5 +42,5 @@ body:
   attributes:
     label: Before submitting a new issue...
     options:
-      - label: Make sure you already searched for relevant issues, and asked the chatbot living at the bottom right corner of the [documentation page](https://vllm-gr.readthedocs.io), which can answer lots of frequently asked questions.
+      - label: I searched existing issues and read the [project documentation](https://github.com/JiusiServe/vllm-gr#readme).
         required: true
