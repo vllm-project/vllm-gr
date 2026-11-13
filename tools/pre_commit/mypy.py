@@ -53,6 +53,16 @@ CUDA_STAGE_FILES = [
     "tests/tools/cuda_stage_typing_cases.py",
 ]
 
+# Check the NPU input/bookkeeping helpers together with both production callers
+# so a signature change cannot escape caller-side validation.
+NPU_WORKER_GROUP = "npu-worker"
+NPU_WORKER_FILES = [
+    "vllm_gr/v1/worker/npu_model_runner_patch.py",
+    "vllm_gr/v1/worker/npu_beam_stage_runner.py",
+    "vllm_gr/v1/worker/npu_model_runner_inputs.py",
+    "vllm_gr/v1/worker/npu_model_runner_bookkeeping.py",
+]
+
 # After fixing errors resulting from changing follow_imports
 # from "skip" to "silent", move the following directories to FILES
 SEPARATE_GROUPS = [
@@ -94,7 +104,11 @@ def group_files(changed_files: list[str]) -> dict[str, list[str]]:
     file_groups = {"": []}
     file_groups.update({k: [] for k in SEPARATE_GROUPS})
     file_groups[CUDA_STAGE_GROUP] = []
+    file_groups[NPU_WORKER_GROUP] = []
     for changed_file in changed_files:
+        if changed_file in NPU_WORKER_FILES:
+            file_groups[NPU_WORKER_GROUP] = list(NPU_WORKER_FILES)
+            continue
         if changed_file in CUDA_STAGE_FILES or changed_file == "tools/pre_commit/mypy.py":
             file_groups[CUDA_STAGE_GROUP] = list(CUDA_STAGE_FILES)
             continue
@@ -166,7 +180,7 @@ def main():
                 changed_files,
                 python_version,
                 follow_imports,
-                cuda_stage=file_group == CUDA_STAGE_GROUP,
+                cuda_stage=file_group in {CUDA_STAGE_GROUP, NPU_WORKER_GROUP},
             )
     return returncode
 

@@ -77,8 +77,8 @@ def collect_constrained_rows(
 ) -> list[tuple[Any, int, int, dict[str, Any]]]:
     """Locate constrained requests and their sampler/logits row ranges.
 
-    Walks ``request_row_configs`` with the same ``gpu_row_cursor`` traversal as
-    ``_remux_logprobs_tensors`` (model_runner_common), so the returned
+    Walks ``request_row_configs`` with the same ``sampler_row_cursor`` traversal as
+    ``_remux_logprobs_tensors`` (npu_model_runner_bookkeeping), so the returned
     ``row_start`` values index directly into the sampler-output tensors and the
     ``logits`` argument of the patched ``_sample``.
 
@@ -89,7 +89,7 @@ def collect_constrained_rows(
     chunk-only visits, so an out-of-range step fails fast.
     """
     collected: list[tuple[Any, int, int, dict[str, Any]]] = []
-    gpu_row_cursor = 0
+    sampler_row_cursor = 0
     for req_id, _, W_logits, *_ in request_row_configs:
         mdata = beam_data.get(req_id) if req_id is not None else None
         if mdata is not None and mdata.get("is_constrained", False):
@@ -106,8 +106,8 @@ def collect_constrained_rows(
                 )
             validate_constraint_step(constraint_step)
             if W_logits > 0:
-                collected.append((req_id, gpu_row_cursor, W_logits, mdata))
-        gpu_row_cursor += W_logits
+                collected.append((req_id, sampler_row_cursor, W_logits, mdata))
+        sampler_row_cursor += W_logits
     return collected
 
 

@@ -423,7 +423,7 @@ and Decode capture policy remain active when this cache is disabled.
 - Scope: `backend`; backend ID: `npu`
 
 - Source: `vllm_gr/v1/worker/npu_model_runner_patch.py`
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/model_runner_contracts.py`, `vllm_gr/v1/worker/gr_gc.py`, `vllm_gr/v1/worker/gr_context.py`, `vllm_gr/v1/worker/gr_execution.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/ascend_compat.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/npu_model_runner_inputs.py`, `vllm_gr/v1/worker/npu_model_runner_bookkeeping.py`, `vllm_gr/v1/worker/model_runner_contracts.py`, `vllm_gr/v1/worker/gr_gc.py`, `vllm_gr/v1/worker/gr_context.py`, `vllm_gr/v1/worker/gr_execution.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/ascend_compat.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
     - `NPUModelRunner.execute_model`
