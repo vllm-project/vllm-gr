@@ -106,9 +106,9 @@ def _admit_owner(scheduler: Any) -> GRSessionState | None:
 class _AdmissionQueue:
     """Filtered native queue: hidden requests retain their objects and FIFO positions."""
 
-    def __init__(self, queue: Any, owner_ids: tuple[str, ...]):
+    def __init__(self, queue: Any, owner_ids: frozenset[str]):
         self.queue = queue
-        self.owner_ids = frozenset(owner_ids)
+        self.owner_ids = owner_ids
 
     def __iter__(self):
         return (r for r in self.queue if r.request_id in self.owner_ids)
@@ -143,8 +143,7 @@ def gr_admission(scheduler: Any):
     manager = scheduler.kv_cache_manager
     allocate = manager.allocate_slots
 
-    owner_ids = owner.request_ids
-    owner_id_set = frozenset(owner_ids)
+    owner_id_set = frozenset(owner.request_ids)
 
     def reserve(request, num_new_tokens, *args, **kwargs):
         if request.request_id not in owner_id_set:
@@ -159,8 +158,8 @@ def gr_admission(scheduler: Any):
             )
         return result
 
-    scheduler.waiting = _AdmissionQueue(waiting, owner_ids)
-    scheduler.skipped_waiting = _AdmissionQueue(skipped, owner_ids)
+    scheduler.waiting = _AdmissionQueue(waiting, owner_id_set)
+    scheduler.skipped_waiting = _AdmissionQueue(skipped, owner_id_set)
     manager.allocate_slots = reserve
     if not can_issue_gr_stage(scheduler, owner):
         scheduler.max_num_scheduled_tokens = 0
@@ -376,6 +375,22 @@ def can_issue_gr_stage(scheduler: Any, session: GRSessionState) -> bool:
     )
 
 
+def _native_progress(
+    output: Any, requests: tuple[Any, ...], request_ids: tuple[str, ...]
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        {
+            "request_id": request_id,
+            "scheduled_tokens": output.num_scheduled_tokens[request_id],
+            "num_computed_tokens": native_request.num_computed_tokens,
+            "num_prompt_tokens": native_request.num_prompt_tokens,
+            "num_output_placeholders": getattr(native_request, "num_output_placeholders", None),
+            "is_prefill_chunk": bool(native_request.is_prefill_chunk),
+        }
+        for request_id, native_request in zip(request_ids, requests, strict=True)
+    )
+
+
 def attach_gr_stage_metadata(
     scheduler: Any, scheduler_output: Any, session: GRSessionState
 ) -> GRStageMetadata | None:
@@ -402,22 +417,11 @@ def attach_gr_stage_metadata(
     if not can_issue_gr_stage(scheduler, session):
         raise RuntimeError("native Scheduler selected a blocked Asynchronous scheduling dispatch")
 
-    progress = tuple(
-        {
-            "request_id": request_id,
-            "scheduled_tokens": scheduler_output.num_scheduled_tokens[request_id],
-            "num_computed_tokens": native_request.num_computed_tokens,
-            "num_prompt_tokens": native_request.num_prompt_tokens,
-            "num_output_placeholders": getattr(native_request, "num_output_placeholders", None),
-            "is_prefill_chunk": bool(native_request.is_prefill_chunk),
-        }
-        for request_id, native_request in zip(request_ids, native_requests, strict=True)
-    )
-    prefill_states = tuple(item["is_prefill_chunk"] for item in progress)
-    if any(prefill_states):
+    if any(request.is_prefill_chunk for request in native_requests):
         raise RuntimeError(
             "beam_search_v1 cannot schedule partial Prefill or recompute: "
-            f"session_id={session.session_id!r}, progress={progress!r}"
+            f"session_id={session.session_id!r}, "
+            f"progress={_native_progress(scheduler_output, native_requests, request_ids)!r}"
         )
     dispatch_id = session._next_dispatch_id
     # Native _update_after_schedule already advanced this extent, independently
@@ -431,7 +435,8 @@ def attach_gr_stage_metadata(
             "GR batch members crossed the Prefill/Decode stage boundary: "
             f"session_id={session.session_id!r}, dispatch_id={dispatch_id}, "
             f"scheduled_output_ids={tuple(scheduler_output.num_scheduled_tokens)!r}, "
-            f"stage_indices={stage_indices!r}, progress={progress!r}"
+            f"stage_indices={stage_indices!r}, "
+            f"progress={_native_progress(scheduler_output, native_requests, request_ids)!r}"
         )
     stage_index = stage_indices[0]
     if not 0 <= stage_index < session.total_stages:
@@ -439,7 +444,7 @@ def attach_gr_stage_metadata(
             "native GR stage exceeds the effective generation budget: "
             f"session_id={session.session_id!r}, dispatch_id={dispatch_id}, "
             f"stage_index={stage_index}, total_stages={session.total_stages}, "
-            f"progress={progress!r}"
+            f"progress={_native_progress(scheduler_output, native_requests, request_ids)!r}"
         )
     previous = session.latest_device_state
     expected_previous = (
@@ -455,7 +460,8 @@ def attach_gr_stage_metadata(
             f"session_request_ids={request_ids!r}, "
             f"in_flight_dispatches={tuple(sorted(session._in_flight_dispatches))!r}, "
             f"issued_stages={session.issued_stages}, "
-            f"completed_stages={session.completed_stages}, progress={progress!r}"
+            f"completed_stages={session.completed_stages}, "
+            f"progress={_native_progress(scheduler_output, native_requests, request_ids)!r}"
         )
     kind = GRStageKind.PREFILL if stage_index == 0 else GRStageKind.DECODE
     output_state = GRDeviceStateRef(session.session_id, stage_index)

@@ -663,22 +663,27 @@ def _suppress_batch_member_outputs(result, session) -> None:
             engine_outputs.finished_requests.difference_update(internal_ids)
 
 
-def _finish_native_gr_request(scheduler, request, request_id, request_status) -> None:
-    if request is None or request.is_finished():
+def _finish_native_gr_requests(scheduler, native_requests, request_status) -> None:
+    live_ids = []
+    for request_id, request in native_requests.items():
+        if request is not None and not request.is_finished():
+            request.num_output_placeholders = 0
+            live_ids.append(request_id)
+    if not live_ids:
         return
 
-    # Every physical dispatch has drained. Any remaining placeholders are
-    # speculative reservations and no longer represent real outputs.
-    request.num_output_placeholders = 0
+    # Native finish_requests accepts a batch. Keep an enclosing finalizer's
+    # markers intact if a finish callback reenters this path.
     finalizing_ids = getattr(scheduler, _GR_FINALIZING_IDS_ATTR, None)
     if finalizing_ids is None:
         finalizing_ids = set()
         setattr(scheduler, _GR_FINALIZING_IDS_ATTR, finalizing_ids)
-    finalizing_ids.add(request_id)
+    added = set(live_ids).difference(finalizing_ids)
+    finalizing_ids.update(added)
     try:
-        scheduler.finish_requests(request_id, request_status)
+        scheduler.finish_requests(live_ids[0] if len(live_ids) == 1 else live_ids, request_status)
     finally:
-        finalizing_ids.discard(request_id)
+        finalizing_ids.difference_update(added)
         if not finalizing_ids:
             delattr(scheduler, _GR_FINALIZING_IDS_ATTR)
 
@@ -719,8 +724,6 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
     )
 
     request_id = session.session_id
-    target_outputs, target_output = _find_gr_output(result, request_id)
-
     if not _gr_session_ready_to_finalize(session):
         # Native stop detection can race ahead of a queued GR successor. Keep
         # the request open at the frontend until the GR session has drained;
@@ -731,6 +734,7 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
                 _suppress_native_terminal(result, member_id, member_output)
         return
 
+    target_outputs, target_output = _find_gr_output(result, request_id)
     terminal_result = _gr_terminal_result(session)
     native_requests = {
         member_id: scheduler.requests.get(member_id) for member_id in session.request_ids
@@ -751,8 +755,7 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
         FinishReason.ERROR if terminal_result.failure is not None else FinishReason.LENGTH
     )
 
-    for member_id, member_request in native_requests.items():
-        _finish_native_gr_request(scheduler, member_request, member_id, request_status)
+    _finish_native_gr_requests(scheduler, native_requests, request_status)
 
     if target_outputs is None:
         target_outputs = result.get(client_index)

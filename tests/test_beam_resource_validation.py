@@ -32,6 +32,7 @@ def _resources() -> Any:
         pool_key_ptrs=torch.zeros(2, dtype=torch.int64),
         pool_value_ptrs=torch.zeros(2, dtype=torch.int64),
     )
+    _refresh_pointer_tables(context)
     workspace = SimpleNamespace(
         key=SimpleNamespace(beam_width=4, top_k=4),
         max_batch=1,
@@ -44,6 +45,15 @@ def _resources() -> Any:
         next_sequence=torch.zeros(1, 4, 4, dtype=torch.int32),
     )
     return context, workspace
+
+
+def _refresh_pointer_tables(context: Any) -> None:
+    context.pool_key_ptrs.copy_(
+        torch.tensor([pool.unshared_key.data_ptr() for pool in context.pools])
+    )
+    context.pool_value_ptrs.copy_(
+        torch.tensor([pool.unshared_value.data_ptr() for pool in context.pools])
+    )
 
 
 def _validate(context: Any, workspace: Any) -> Any:
@@ -98,6 +108,7 @@ def test_every_bound_address_is_live(path: str, mutation: str) -> None:
         assert current.data_ptr() != address
         if mutation != "replace":
             assert id(current) == identity
+        _refresh_pointer_tables(context)
         actual = _validate(context, workspace)
         assert actual != key
         assert actual == _full(context, workspace)
@@ -163,7 +174,36 @@ def test_invalid_live_changes_match_full_validator(case: str) -> None:
     assert str(actual.value) == str(expected.value)
 
 
-@pytest.mark.parametrize("kwargs", [{"beam_width": 5}, {"kv_slot": 2}, {"max_new_tokens": 8}])
+@pytest.mark.l1
+def test_guard_reuses_key_across_valid_kv_slots(monkeypatch: Any) -> None:
+    context, workspace = _resources()
+    monkeypatch.setattr(module, "_TensorGuards", Mock(return_value=Mock(check=lambda *args: True)))
+    full = Mock(wraps=Runner._validate_resources_full)
+    monkeypatch.setattr(Runner, "_validate_resources_full", staticmethod(full))
+    key = _validate(context, workspace)
+    other = Runner.validate_resources(context, workspace, beam_width=4, max_new_tokens=3, kv_slot=1)
+    assert other is key
+    full.assert_called_once()
+
+
+@pytest.mark.l1
+def test_pool_replacement_rejects_stale_device_pointer_table() -> None:
+    context, workspace = _resources()
+    context.pool_key_ptrs = torch.tensor(
+        [pool.unshared_key.data_ptr() for pool in context.pools], dtype=torch.int64
+    )
+    context.pool_value_ptrs = torch.tensor(
+        [pool.unshared_value.data_ptr() for pool in context.pools], dtype=torch.int64
+    )
+    _validate(context, workspace)
+    context.pools[0].unshared_key = context.pools[0].unshared_key.clone()
+    with pytest.raises(ValueError, match="pointer tables do not match"):
+        _validate(context, workspace)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"beam_width": 5}, {"kv_slot": -1}, {"kv_slot": 2}, {"max_new_tokens": 8}]
+)
 def test_changed_call_parameters_cannot_reuse_validation(kwargs: Any) -> None:
     context, workspace = _resources()
     _validate(context, workspace)

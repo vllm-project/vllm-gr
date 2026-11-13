@@ -86,6 +86,7 @@ class BeamSearchRunner:
         *,
         state_index: int = 0,
         workspace_index: int = 0,
+        _validated_resource_key: tuple[Any, ...] | None = None,
     ) -> None:
         if isinstance(state_index, bool) or not isinstance(state_index, int):
             raise TypeError("state_index must be an integer")
@@ -103,13 +104,15 @@ class BeamSearchRunner:
             raise ValueError("state must alias this session's decision buffers")
         if not session.is_active or session.beam_width != width:
             raise ValueError("session must be active with the configured beam width")
-        self._resource_key = self.validate_resources(
-            context,
-            workspace,
-            beam_width=width,
-            max_new_tokens=state.max_new_tokens,
-            kv_slot=session.slot,
-        )
+        self._resource_key = _validated_resource_key
+        if self._resource_key is None:
+            self._resource_key = self.validate_resources(
+                context,
+                workspace,
+                beam_width=width,
+                max_new_tokens=state.max_new_tokens,
+                kv_slot=session.slot,
+            )
 
         self.session = session
         first = context.pools[0].unshared_key
@@ -285,7 +288,6 @@ class BeamSearchRunner:
         parameters = (
             beam_width,
             max_new_tokens,
-            kv_slot,
             workspace.key.beam_width,
             workspace.key.top_k,
             workspace.max_batch,
@@ -297,7 +299,8 @@ class BeamSearchRunner:
             if (
                 len(tensors) == len(cached.addresses)
                 and cached.guard.check(*tensors)
-                and all(t.data_ptr() == address for t, address in zip(tensors, cached.addresses))
+                and 0 <= kv_slot < tensors[0].shape[0]
+                and tuple(t.data_ptr() for t in tensors) == cached.addresses
             ):
                 return cached.key
 
@@ -399,6 +402,15 @@ class BeamSearchRunner:
                 or not ptrs.is_contiguous()
             ):
                 raise ValueError("KV reorder requires persistent layer pointer tables")
+
+        # A pool can retain its layout while its storage changes. Validate the
+        # addresses consumed by the kernels as well as the table allocation.
+        # This runs only on a validation miss, before session reset/capture.
+        if (
+            context.pool_key_ptrs.tolist() != addresses[0::2]
+            or context.pool_value_ptrs.tolist() != addresses[1::2]
+        ):
+            raise ValueError("KV layer pointer tables do not match live pool storage")
 
         # These tensors back cached views/launch arguments. Include layout and
         # address so a valid replacement rebuilds views instead of using stale

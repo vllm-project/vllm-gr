@@ -3,6 +3,7 @@
 """Cross-request reuse must preserve reset values, ownership and live admission."""
 
 from dataclasses import replace
+from unittest.mock import Mock
 
 import msgspec
 import pytest
@@ -19,6 +20,7 @@ from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.engine.beam_search_v1 import GRDeviceStateRef
+from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
@@ -42,6 +44,51 @@ def renamed(m, name):
         ),
         output_device_state=GRDeviceStateRef(name, 0),
     )
+
+
+@pytest.mark.l2
+@pytest.mark.parametrize("batch_size", [2, 4])
+@torch.inference_mode()
+def test_batch_validates_once_and_rejects_short_pool_before_reset(monkeypatch, batch_size):
+    worker = admission_worker(max_rows=batch_size * 4)
+    m = metadata()
+    m = renamed(
+        replace(
+            m,
+            request_ids=(m.session_id,) * batch_size,
+            num_prompt_tokens=batch_size * 7,
+            num_prompt_tokens_by_request=(7,) * batch_size,
+        ),
+        m.session_id,
+    )
+    scheduled = dispatch(m)
+    scheduled.num_scheduled_tokens = dict(zip(m.request_ids, m.num_prompt_tokens_by_request))
+    validate = Mock(wraps=BeamSearchRunner.validate_resources)
+    monkeypatch.setattr(BeamSearchRunner, "validate_resources", validate)
+    owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1)
+    assert len(owner.beam.runners) == batch_size
+    validate.assert_called_once()
+    assert validate.call_args.kwargs["kv_slot"] == batch_size - 1
+    release(owner, m)
+    validate.reset_mock()
+    assert get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1) is owner
+    validate.assert_called_once()
+    release(owner, m)
+
+    # Preserve layout and addresses but make the final request's slot invalid.
+    for pool in worker._beam_context.pools:
+        pool.unshared_key = pool.unshared_key[: batch_size - 1]
+        pool.unshared_value = pool.unshared_value[: batch_size - 1]
+    begin = Mock(side_effect=AssertionError("session must not start"))
+    reset = Mock(side_effect=AssertionError("state must not reset"))
+    monkeypatch.setattr(BeamSearchSession, "begin_session", begin)
+    monkeypatch.setattr(owner.beam, "reset_for_session", reset)
+    with pytest.raises(ValueError, match="KV pool capacity"):
+        get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1)
+    begin.assert_not_called()
+    reset.assert_not_called()
+    assert not worker._beam_sessions
+    assert owner.closed
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

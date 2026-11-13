@@ -46,6 +46,7 @@ from vllm_gr.v1.engine.engine_core_patch import (
     _GR_FINALIZING_IDS_ATTR,
     _expand_gr_abort_request_ids,
     _finalize_ready_gr_session,
+    _finish_native_gr_requests,
     _patch_scheduler_reset_prefix_cache,
     _patch_scheduler_update_from_output,
     _sync_gr_sessions_after_native_finish,
@@ -809,6 +810,40 @@ def test_native_abort_overrides_a_pending_gr_terminal_result() -> None:
     assert not session.terminal_result_pending
     assert session.resource_status is GRResourceStatus.CLOSED
     assert session.session_id not in scheduler._gr_v1_sessions
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("fail", [False, True])
+def test_bulk_finish_marks_only_live_members_and_restores_outer_markers(fail: bool) -> None:
+    def member(finished: bool) -> Any:
+        return SimpleNamespace(is_finished=lambda: finished, num_output_placeholders=2)
+
+    members: dict[str, Any] = {
+        "a": member(False),
+        "done": member(True),
+        "missing": None,
+        "b": member(False),
+    }
+    scheduler = SimpleNamespace()
+    outer = {"a", "other"}
+    setattr(scheduler, _GR_FINALIZING_IDS_ATTR, outer)
+    calls = []
+
+    def finish(ids: list[str], status: str) -> None:
+        calls.append((ids, status))
+        assert outer == {"a", "b", "other"}
+        if fail:
+            raise RuntimeError("finish failed")
+
+    scheduler.finish_requests = finish
+    expected = pytest.raises(RuntimeError, match="finish failed") if fail else nullcontext()
+    with expected:
+        _finish_native_gr_requests(scheduler, members, "terminal")
+    assert calls == [(["a", "b"], "terminal")]
+    assert getattr(scheduler, _GR_FINALIZING_IDS_ATTR) is outer
+    assert outer == {"a", "other"}
+    assert members["a"].num_output_placeholders == members["b"].num_output_placeholders == 0
+    assert members["done"].num_output_placeholders == 2
 
 
 def test_internal_gr_finalization_preserves_the_pending_terminal_result() -> None:

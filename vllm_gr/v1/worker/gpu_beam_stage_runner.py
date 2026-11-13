@@ -1530,6 +1530,8 @@ def get_stage_runner(
                 workspace,
                 state_index=index,
                 workspace_index=index,
+                # Admission checked the final contiguous slot against this storage.
+                _validated_resource_key=resource_key,
             )
             for index, session in enumerate(session_tuple)
         )

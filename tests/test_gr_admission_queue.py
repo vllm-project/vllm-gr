@@ -401,6 +401,54 @@ def test_native_finish_returns_entire_gr_batch_and_drains_before_release(core, s
     assert getattr(scheduler, "_gr_owner", None) is None
 
 
+@pytest.mark.l1
+@pytest.mark.parametrize("fail_at", [1, 2])
+def test_bulk_native_free_failure_escapes_engine_loop(core, monkeypatch, fail_at):
+    from vllm_gr.v1.engine.engine_core_patch import (
+        _GR_FINALIZING_IDS_ATTR,
+        _finish_native_gr_requests,
+    )
+
+    request = _multi_batch_request()
+    core._handle_submit_gr_session(request)
+    core._process_input_queue()
+    scheduler = core.scheduler
+    members = dict(scheduler.requests)
+    assert len(members) == 2
+    failure = RuntimeError("native KV release failed")
+    original_free = scheduler._free_request
+    freed = []
+
+    def fail_free(native, *args, **kwargs):
+        # Native finish_requests has removed the entire batch before freeing.
+        assert not scheduler.running
+        assert not scheduler.waiting
+        assert not scheduler.skipped_waiting
+        freed.append(native.request_id)
+        if len(freed) == fail_at:
+            raise failure
+        return original_free(native, *args, **kwargs)
+
+    def step():
+        _finish_native_gr_requests(scheduler, members, RequestStatus.FINISHED_STOPPED)
+        return {}, False
+
+    monkeypatch.setattr(scheduler, "_free_request", fail_free)
+    core.step_fn = Mock(side_effect=step)
+    core.post_step = Mock()
+    core.enable_fault_tolerance = False
+    core._handle_shutdown = lambda: True
+    core._maybe_publish_request_counts = lambda: None
+    with pytest.raises(RuntimeError) as caught:
+        core.run_busy_loop()
+    assert caught.value is failure
+    assert len(freed) == fail_at
+    core.step_fn.assert_called_once()
+    core.post_step.assert_not_called()
+    assert core.output_queue.empty()
+    assert not getattr(scheduler, _GR_FINALIZING_IDS_ATTR, set())
+
+
 def test_native_abort_all_preserves_none_sentinel(core):
     finished = core.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
 

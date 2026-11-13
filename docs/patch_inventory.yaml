@@ -158,6 +158,7 @@ patches:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
       - tests/test_gr_async_scheduler.py
+      - tests/test_gr_admission_queue.py::test_bulk_native_free_failure_escapes_engine_loop
       - tests/test_npu_multi_trie_routing.py
       - tests/test_ascend_compat.py
       - tests/contract/test_upstream_patch_contracts.py::test_core_hot_update_utility_contracts
@@ -204,6 +205,8 @@ patches:
       - tests/sidecar/test_worker_update.py
       - tests/v1/worker/test_constraint_lifecycle.py
       - tests/test_model_runner_stage_binding.py
+      - tests/test_beam_resource_validation.py
+      - tests/kernels/test_beam_session_reuse.py::test_batch_validates_once_and_rejects_short_pool_before_reset
       - tests/test_cuda_native_output.py
       - tests/test_v2_multibatch.py
       - tests/kernels/test_gpu_beam_stage_lifecycle.py

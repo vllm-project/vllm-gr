@@ -282,6 +282,10 @@ installers run or their ordering.
 
 - Scope: `core`; backend ID: `null`
 
+Batch finalization delegates all live members to native `finish_requests`.
+A native cleanup exception escapes the EngineCore loop before publishing
+success; the partially freed batch must not resume scheduling.
+
 - Target: `Scheduler.schedule`
 - Mutation: scheduling hot-path wrapper or replacement
 - Risk: Critical
@@ -299,6 +303,11 @@ installers run or their ordering.
 ### GR-PATCH-011 — GPU ModelRunner V1/V2 Overrides
 
 - Scope: `backend`; backend ID: `cuda`
+
+Stage admission validates shared resources once per batch before session reset.
+On a validation miss, layer pointer-table contents must match live KV pool
+addresses. Same-layout pool replacement with stale pointers is rejected before
+any kernel launch; this check may synchronize a CUDA table on the admission path.
 
 Cross-batch stage-adapter caching is opt-in through
 `beam.adapter_cache_enabled` (default false). The existing same-batch reuse
