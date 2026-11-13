@@ -5,9 +5,11 @@
 from itertools import repeat
 
 import numpy as np
+from numpy.typing import NDArray
 
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchOutput,
+    BeamBatchRequest,
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
@@ -15,7 +17,9 @@ from vllm_gr.v1.beam.batch_contracts import (
 )
 
 
-def sequence_columns(sequences: BeamSequenceColumns):
+def sequence_columns(
+    sequences: BeamSequenceColumns,
+) -> tuple[NDArray[np.int32], NDArray[np.float32] | None, NDArray[np.int32] | None]:
     shape = (sequences.count, sequences.steps)
     tokens = np.frombuffer(sequences.token_ids, dtype="<i4").reshape(shape)
     scores = (
@@ -31,7 +35,9 @@ def sequence_columns(sequences: BeamSequenceColumns):
     return tokens, scores, parents
 
 
-def validate_complete_sequences(sequences: BeamSequenceColumns, request=None) -> None:
+def validate_complete_sequences(
+    sequences: BeamSequenceColumns, request: BeamBatchRequest | None = None
+) -> None:
     """Validate both the owned column shapes and request-dependent semantics."""
     if type(sequences.count) is not int or type(sequences.steps) is not int:
         raise ValueError("Beam column dimensions must be integers")

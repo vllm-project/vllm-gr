@@ -112,9 +112,7 @@ def install_numpy_request_factory() -> None:
             return initialize_numpy_request(request, block_hasher)
         return original(cls, request, block_hasher)
 
-    Request.from_engine_core_request = classmethod(  # type: ignore[method-assign,assignment]
-        from_engine_core_request
-    )
+    Request.from_engine_core_request = classmethod(from_engine_core_request)
 
 
 def install_numpy_scheduler_data() -> None:
@@ -137,6 +135,4 @@ def install_numpy_scheduler_data() -> None:
         return original(cls, request, block_ids, prefill_token_ids, uses_mrope=uses_mrope)
 
     setattr(from_request, "_gr_numpy_tokens", True)
-    NewRequestData.from_request = classmethod(  # type: ignore[method-assign,assignment]
-        from_request
-    )
+    NewRequestData.from_request = classmethod(from_request)

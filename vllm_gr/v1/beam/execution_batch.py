@@ -133,7 +133,7 @@ class BeamBatchExecutionView:
             # a stage expands ``input_width`` parents into ``candidate_width``
             # candidates each, so it can never produce more than
             # ``input_width * candidate_width`` survivors.
-            active_candidates = per_parent[self.stage_index]
+            active_candidates = cast(int, per_parent[self.stage_index])
             if self.input_width * active_candidates < self.output_width:
                 _fail(
                     f"per_parent_beam_widths[{self.stage_index}]={active_candidates} cannot "
@@ -198,7 +198,7 @@ class BeamBatchExecutionView:
         kind = getattr(raw_kind, "value", raw_kind)
         if kind not in ("prefill", "decode"):
             _fail(f"stage metadata kind is unsupported: {raw_kind!r}")
-        normalized_kind = cast(BeamExecutionStage, kind)
+        normalized_kind: BeamExecutionStage = kind
 
         params = _attribute(metadata, "beam_params")
         request_ids = _immutable_tuple("request_ids", _attribute(metadata, "request_ids"))

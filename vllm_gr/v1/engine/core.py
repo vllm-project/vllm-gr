@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 from copy import copy
-from typing import Any
+from threading import Event
+from typing import Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -17,13 +18,15 @@ from vllm.v1.engine import (
     FinishReason,
 )
 
+from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
+
 logger = init_logger(__name__)
 
 
 def loaded_constraint_trie_count(worker: Any) -> int:
     """Read the validated, live table once through the executor startup RPC."""
     backend = getattr(worker.model_runner, "constraint_backend", None)
-    return backend.info.table_metadata.trie_count if backend is not None else 1
+    return cast(int, backend.info.table_metadata.trie_count) if backend is not None else 1
 
 
 def is_gr_session_retired(self: Any, session_id: str) -> bool:
@@ -51,7 +54,7 @@ def send_gr_rejection(engine: Any, engine_request: Any, message: str) -> None:
     )
 
 
-def _handle_submit_gr_session(self, batch_request) -> None:
+def _handle_submit_gr_session(self: Any, batch_request: BeamBatchRequest) -> None:
     """Keep a caller-formed batch atomic across the input-thread boundary."""
     if not batch_request.items:
         logger.error("Rejecting an empty beam_search_v1 batch")
@@ -84,7 +87,7 @@ def _handle_submit_gr_session(self, batch_request) -> None:
     _admit_gr_session(self, batch_request)
 
 
-def _admit_gr_session(self, batch_request) -> None:
+def _admit_gr_session(self: Any, batch_request: BeamBatchRequest) -> None:
     """Preprocess and admit one complete GR session on the core thread."""
     if not batch_request.items:
         logger.error("Rejecting an empty beam_search_v1 batch")
@@ -170,7 +173,7 @@ def _admit_gr_session(self, batch_request) -> None:
 # ---------------------------------------------------------------------------
 
 
-def dispatch_gr_engine_core_input(self, request_type, payload) -> bool:
+def dispatch_gr_engine_core_input(self: Any, request_type: Any, payload: Any) -> bool:
     """Handle vLLM-GR EngineCore request types.
 
     Returns True when the type is owned by GR and has been consumed, so
@@ -192,12 +195,12 @@ def dispatch_gr_engine_core_input(self, request_type, payload) -> bool:
 
 
 def process_input_sockets(
-    self,
-    input_addresses,
-    coord_input_address,
-    identity,
-    ready_event,
-):
+    self: Any,
+    input_addresses: list[str],
+    coord_input_address: str | None,
+    identity: bytes,
+    ready_event: Event,
+) -> None:
     """vLLM-version adapter for EngineCoreProc.process_input_sockets.
 
     Handshake, READY, ABORT, and generic enqueue stay aligned with the

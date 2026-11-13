@@ -13,22 +13,22 @@ Usage:
     python tools/pre_commit/mypy.py <ci> <python_version> <changed_files...>
 
 Args:
-    ci: "1" if running in CI, "0" otherwise. In CI, follow_imports is set to
-        "silent" for the main group of files.
+    ci: Compatibility argument ("1" for CI, "0" locally). Both modes use
+        follow_imports="skip" and the same staged strict coverage.
     python_version: Python version to use (e.g., "3.10") or "local" to use
         the local Python version.
-    changed_files: List of changed files to check.
+    changed_files: List of changed files to check. Add --all-core to audit
+        runtime files outside the enforced core directories.
 """
 
 import os
 import subprocess
 import sys
+from pathlib import PurePosixPath
 
-import regex as re
-
-FILES = [
-    "vllm_gr/*.py",
-]
+# Directory roots, not glob expressions interpreted as regular expressions.
+FILES = ("vllm_gr",)
+SEPARATE_GROUPS = ("tests",)
 
 # Check the interface, implementations and execution/startup bindings together.
 # Explicit targets are checked even with --follow-imports skip; native Worker
@@ -47,64 +47,47 @@ CUDA_STAGE_FILES = [
     "tests/tools/cuda_stage_typing_cases.py",
 ]
 
-# After fixing errors resulting from changing follow_imports
-# from "skip" to "silent", move the following directories to FILES
-SEPARATE_GROUPS = [
-    "tests",
-    # v0 related
-    "vllm_gr/attention",
-    "vllm_gr/compilation",
-    "vllm_gr/lora",
-    "vllm_gr/model_executor",
-    # v1 related
-    "vllm_gr/v1/kv_offload",
-    "vllm_gr/v1/spec_decode",
-    "vllm_gr/v1/structured_output",
-]
-
-# TODO(woosuk): Include the code from Megatron and HuggingFace.
-EXCLUDE = [
-    "vllm_gr/engine/arg_utils.py",
-    "vllm_gr/model_executor/parallel_utils",
-    "vllm_gr/model_executor/models",
-    "vllm_gr/model_executor/layers/fla/ops",
-    # Ignore triton kernels in ops.
-    "vllm_gr/attention/ops",
-]
+# Enforce complete directories, including newly added modules and stubs.
+# Other runtime subsystems can be audited with --all-core before onboarding.
+CORE_DIRS = ("vllm_gr/v1/beam", "vllm_gr/v1/engine")
 
 
 def group_files(changed_files: list[str]) -> dict[str, list[str]]:
-    """
-    Group changed files into different mypy calls.
+    """Select Python files using exact path components, including nested files."""
+    groups: dict[str, list[str]] = {"": [], "tests": [], CUDA_STAGE_GROUP: []}
+    for name in dict.fromkeys(str(PurePosixPath(f)) for f in changed_files):
+        path = PurePosixPath(name)
+        if path.is_absolute() or ".." in path.parts or path.suffix not in {".py", ".pyi"}:
+            continue
+        if name in CUDA_STAGE_FILES or name == "tools/pre_commit/mypy.py":
+            groups[CUDA_STAGE_GROUP] = list(CUDA_STAGE_FILES)
+            continue
+        if path.parts[0] in FILES:
+            groups[""].append(name)
+        elif path.parts[0] in SEPARATE_GROUPS:
+            groups["tests"].append(name)
+    return groups
 
-    Args:
-        changed_files: List of changed files.
 
-    Returns:
-        A dictionary mapping file group names to lists of changed files.
-    """
-    exclude_pattern = re.compile(f"^{'|'.join(EXCLUDE)}.*")
-    files_pattern = re.compile(f"^({'|'.join(FILES)}).*")
-    file_groups = {"": []}
-    file_groups.update({k: [] for k in SEPARATE_GROUPS})
-    file_groups[CUDA_STAGE_GROUP] = []
-    for changed_file in changed_files:
-        if changed_file in CUDA_STAGE_FILES or changed_file == "tools/pre_commit/mypy.py":
-            file_groups[CUDA_STAGE_GROUP] = list(CUDA_STAGE_FILES)
-            continue
-        # Skip files which should be ignored completely
-        if exclude_pattern.match(changed_file):
-            continue
-        # Group files by mypy call
-        if files_pattern.match(changed_file):
-            file_groups[""].append(changed_file)
-            continue
+def staged_targets(targets: list[str], *, all_core: bool = False) -> list[str]:
+    """Report deferred runtime files instead of silently pretending to check them."""
+    selected = []
+    deferred = []
+    for name in targets:
+        if (
+            all_core
+            or not name.startswith("vllm_gr/")
+            or any(PurePosixPath(name).is_relative_to(directory) for directory in CORE_DIRS)
+        ):
+            selected.append(name)
         else:
-            for directory in SEPARATE_GROUPS:
-                if re.match(f"^{directory}.*", changed_file):
-                    file_groups[directory].append(changed_file)
-                    break
-    return file_groups
+            deferred.append(name)
+    if deferred:
+        print("Deferred runtime files (outside current strict coverage):", flush=True)
+        for name in deferred:
+            print(f"  {name}", flush=True)
+        print("Use --all-core to audit them; see docs/PRE_COMMIT.md.", flush=True)
+    return selected
 
 
 def mypy(
@@ -142,11 +125,15 @@ def mypy(
     return subprocess.run(args + targets, check=False).returncode
 
 
-def main():
-    ci = sys.argv[1] == "1"
+def main() -> int:
+    # Keep the CI argument for compatibility; both modes use the same coverage.
     python_version = sys.argv[2]
     # Remove duplicate files (e.g. from unmerged git conflicts) to avoid mypy duplicate module errors
-    unique_files = list(dict.fromkeys(sys.argv[3:]))
+    all_core = "--all-core" in sys.argv[3:]
+    skip_cuda_stage = "--skip-cuda-stage" in sys.argv[3:]
+    unique_files = [
+        name for name in sys.argv[3:] if name not in {"--all-core", "--skip-cuda-stage"}
+    ]
     file_groups = group_files(unique_files)
 
     if python_version == "local":
@@ -154,7 +141,11 @@ def main():
 
     returncode = 0
     for file_group, changed_files in file_groups.items():
-        follow_imports = None if ci and file_group == "" else "skip"
+        if file_group == CUDA_STAGE_GROUP and skip_cuda_stage:
+            continue
+        if file_group != CUDA_STAGE_GROUP:
+            changed_files = staged_targets(changed_files, all_core=all_core)
+        follow_imports = "skip"
         if changed_files:
             returncode |= mypy(
                 changed_files,

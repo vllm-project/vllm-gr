@@ -42,7 +42,9 @@ class BeamSearchSession:
         self.slot = slot
         self.context = context  # shared ref, not owned
 
-    def begin_session(self, beam_width: int, prefix_len: int, *, decision_index: int | None = None):
+    def begin_session(
+        self, beam_width: int, prefix_len: int, *, decision_index: int | None = None
+    ) -> None:
         """Start a beam search session. Resets slot state (lazy KV reset).
 
         ``decision_index`` selects a physical decision row for the independent
@@ -79,13 +81,13 @@ class BeamSearchSession:
             else:
                 decision.reset(decision_index)
 
-    def end_session(self):
+    def end_session(self) -> None:
         """End a beam search session. Releases slot from registry."""
         state = self._state
         state.is_active = False
         self.context.registry.release(self.session_id)
 
-    def step_complete(self, parent: torch.Tensor, *, layout_prevalidated: bool = False):
+    def step_complete(self, parent: torch.Tensor, *, layout_prevalidated: bool = False) -> None:
         """Called after beam decision: select_unshared_kv + advance_step.
 
         On the last step, skip select_unshared_kv (no need to reorder KV

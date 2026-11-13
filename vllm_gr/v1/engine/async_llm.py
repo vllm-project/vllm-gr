@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from functools import wraps
+from typing import Any, cast
 
 from vllm.logger import init_logger
 
@@ -41,7 +43,7 @@ _ADMISSION_REJECTION_MAX = 256
 _CLIENT_REQUEST_ID: ContextVar[str | None] = ContextVar("vllm_gr_client_request_id", default=None)
 
 
-def note_admission_rejections(processor, engine_core_outputs) -> None:
+def note_admission_rejections(processor: Any, engine_core_outputs: Iterable[Any]) -> None:
     """Park the reason of every refused output in ``engine_core_outputs``."""
     from vllm_gr.v1.beam.batch_contracts import admission_rejection
 
@@ -55,7 +57,9 @@ def note_admission_rejections(processor, engine_core_outputs) -> None:
             if getattr(ec_output, "finish_reason", None) is not None:
                 forget_admission_rejection(processor, getattr(ec_output, "request_id", ""))
             continue
-        rejections = getattr(processor, _ADMISSION_REJECTIONS_ATTR, None)
+        rejections = cast(
+            dict[str, str] | None, getattr(processor, _ADMISSION_REJECTIONS_ATTR, None)
+        )
         if rejections is None:
             rejections = {}
             setattr(processor, _ADMISSION_REJECTIONS_ATTR, rejections)
@@ -64,14 +68,16 @@ def note_admission_rejections(processor, engine_core_outputs) -> None:
         rejections[getattr(ec_output, "request_id", "")] = message
 
 
-def forget_admission_rejection(processor, request_id: str) -> None:
+def forget_admission_rejection(processor: Any, request_id: str) -> None:
     """Drop whatever is parked for ``request_id``, if anything is."""
-    rejections = getattr(processor, _ADMISSION_REJECTIONS_ATTR, None)
+    rejections = cast(dict[str, str] | None, getattr(processor, _ADMISSION_REJECTIONS_ATTR, None))
     if rejections:
         rejections.pop(request_id, None)
 
 
-def remember_client_request_id(processor, client_request_id: str, engine_request_id: str) -> None:
+def remember_client_request_id(
+    processor: Any, client_request_id: str, engine_request_id: str
+) -> None:
     """Record which engine request a caller-owned name was submitted as.
 
     The frontend resolves the caller's name into the id it reports and extends
@@ -80,7 +86,7 @@ def remember_client_request_id(processor, client_request_id: str, engine_request
     kept: a name the caller reuses has to find the request it was last
     submitted for, and not the one before it.
     """
-    ids = getattr(processor, _CLIENT_REQUEST_IDS_ATTR, None)
+    ids = cast(dict[str, str] | None, getattr(processor, _CLIENT_REQUEST_IDS_ATTR, None))
     if ids is None:
         ids = {}
         setattr(processor, _CLIENT_REQUEST_IDS_ATTR, ids)
@@ -89,14 +95,14 @@ def remember_client_request_id(processor, client_request_id: str, engine_request
     ids[client_request_id] = engine_request_id
 
 
-def engine_request_id_for(processor, client_request_id: str) -> str | None:
+def engine_request_id_for(processor: Any, client_request_id: str) -> str | None:
     """The engine request a caller-owned name was last submitted as, if any."""
-    ids = getattr(processor, _CLIENT_REQUEST_IDS_ATTR, None)
+    ids = cast(dict[str, str] | None, getattr(processor, _CLIENT_REQUEST_IDS_ATTR, None))
     return (ids or {}).get(client_request_id)
 
 
 def take_admission_rejection(
-    engine_client, request_id: str, client_request_id: str | None = None
+    engine_client: Any, request_id: str, client_request_id: str | None = None
 ) -> str | None:
     """Consume the parked reason for the request this caller is asking about.
 
@@ -112,7 +118,7 @@ def take_admission_rejection(
     and report a real engine fault as a client mistake.
     """
     processor = getattr(engine_client, "output_processor", None)
-    rejections = getattr(processor, _ADMISSION_REJECTIONS_ATTR, None)
+    rejections = cast(dict[str, str] | None, getattr(processor, _ADMISSION_REJECTIONS_ATTR, None))
     if not rejections:
         return None
     message = rejections.pop(request_id, None)
@@ -126,13 +132,17 @@ def take_admission_rejection(
     return rejections.pop(engine_request_id, None)
 
 
-def make_patched_process_outputs(original_process_outputs):
+def make_patched_process_outputs(
+    original_process_outputs: Callable[..., Any],
+) -> Callable[..., Any]:
     """Preserve admission reasons while forwarding every output to vLLM."""
     if getattr(original_process_outputs, _PROCESS_OUTPUTS_PATCH_MARKER, False):
         return original_process_outputs
 
     @wraps(original_process_outputs)
-    def patched_process_outputs(self, engine_core_outputs, *args, **kwargs):
+    def patched_process_outputs(
+        self: Any, engine_core_outputs: Iterable[Any], *args: Any, **kwargs: Any
+    ) -> Any:
         note_admission_rejections(self, engine_core_outputs)
         return original_process_outputs(self, engine_core_outputs, *args, **kwargs)
 

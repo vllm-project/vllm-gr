@@ -254,7 +254,8 @@ def _workspace_candidate_width(runner: Any, beam_width: int) -> int:
     if config.beam_max_width is None:
         return beam_width
     try:
-        return resolve_candidate_width(config)
+        candidate_width: int = resolve_candidate_width(config)
+        return candidate_width
     except ValueError:
         return beam_width
 

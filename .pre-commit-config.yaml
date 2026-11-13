@@ -91,22 +91,45 @@ repos:
     hooks:
     - id: mypy-3.11 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
       name: Run mypy for Python 3.11
-      entry: python tools/pre_commit/mypy.py 1 "3.11"
+      entry: python tools/pre_commit/mypy.py 1 "3.11" --skip-cuda-stage
       <<: &mypy_common
         language: python
         types_or: [python, pyi]
+        files: ^(vllm_gr/|tools/pre_commit/mypy\.py$)
         require_serial: true
-        additional_dependencies: [mypy==1.11.1, regex, types-cachetools, types-setuptools, types-PyYAML, types-requests, types-protobuf, types-torch, pydantic]
+        additional_dependencies: [mypy==2.4.1, regex, types-cachetools, types-setuptools, types-PyYAML, types-requests, types-protobuf, types-torch, pydantic, numpy==2.2.6, msgspec]
 
     - id: mypy-3.12 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
       name: Run mypy for Python 3.12
-      entry: python tools/pre_commit/mypy.py 1 "3.12"
+      entry: python tools/pre_commit/mypy.py 1 "3.12" --skip-cuda-stage
       <<: *mypy_common
 
     - id: mypy-3.13 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
       name: Run mypy for Python 3.13
-      entry: python tools/pre_commit/mypy.py 1 "3.13"
+      entry: python tools/pre_commit/mypy.py 1 "3.13" --skip-cuda-stage
       <<: *mypy_common
+
+    # Keep tests and the existing CUDA stage boundary on their pinned checker.
+    # Let CUDA_STAGE_FILES select the boundary; avoid duplicating its filenames here.
+    - id: mypy-tests-3.11
+      name: Run mypy for tests and CUDA stage (Python 3.11)
+      entry: python tools/pre_commit/mypy.py 1 "3.11"
+      <<: &mypy_tests_common
+        language: python
+        types_or: [python, pyi]
+        files: ^(tests/|tools/pre_commit/mypy\.py$|vllm_gr/v1/worker/)
+        require_serial: true
+        additional_dependencies: [mypy==1.11.1, regex, types-cachetools, types-setuptools, types-PyYAML, types-requests, types-protobuf, types-torch, pydantic]
+
+    - id: mypy-tests-3.12
+      name: Run mypy for tests and CUDA stage (Python 3.12)
+      entry: python tools/pre_commit/mypy.py 1 "3.12"
+      <<: *mypy_tests_common
+
+    - id: mypy-tests-3.13
+      name: Run mypy for tests and CUDA stage (Python 3.13)
+      entry: python tools/pre_commit/mypy.py 1 "3.13"
+      <<: *mypy_tests_common
 
     - id: shellcheck
       name: Lint shell scripts

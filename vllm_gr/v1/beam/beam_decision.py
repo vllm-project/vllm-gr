@@ -28,7 +28,10 @@ PyTorch reference path for parity tests.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from vllm_gr.v1.beam.beam_attention_context import BeamDecisionBuffers
 
 import torch
 from vllm.logger import init_logger
@@ -42,7 +45,7 @@ logger = init_logger(__name__)
 _FINAL_SELECT_ALIGNMENT = 32
 
 
-def _decision_buffers(runner: Any):
+def _decision_buffers(runner: Any) -> BeamDecisionBuffers | None:
     """Return the active beam session's BeamDecisionBuffers (or None)."""
     beam_info = getattr(runner, "_current_beam_info", None)
     if beam_info is None:
@@ -53,7 +56,7 @@ def _decision_buffers(runner: Any):
     context = getattr(session, "context", None)
     if context is None or not hasattr(context, "decision"):
         return None
-    return context.decision
+    return cast("BeamDecisionBuffers", context.decision)
 
 
 def _is_beam_decode_step(runner: Any) -> bool:
@@ -80,7 +83,7 @@ def _xllm_decode_mode_active() -> bool:
     try:
         from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
 
-        return _get_npu_decode_execution() == "xllm"
+        return cast(str, _get_npu_decode_execution()) == "xllm"
     except Exception:
         return False
 
@@ -143,7 +146,7 @@ def init_beam_decision_state(
     bufs = getattr(session.context, "decision", None)
     if bufs is None:
         return
-    width = session.beam_width
+    width: int = session.beam_width
     n_rows = top_tokens.shape[0]
     if width == 0 or n_rows == 0 or n_rows % width != 0:
         return
@@ -186,7 +189,7 @@ def init_beam_decision_from_parents(
     """
     import math
 
-    width = session.beam_width
+    width: int = session.beam_width
     if len(parent_sequences) != width or len(parent_cumulative_logprobs) != width:
         raise RuntimeError(
             f"worker beam decision parent state must contain exactly beam_width={width} rows"
@@ -595,7 +598,7 @@ def run_beam_decision(
     the cumulative ``beam_scores`` (``probs`` key), or ``None`` when the step
     cannot be decided worker-side (caller keeps the frontend path).
     """
-    width = session.beam_width
+    width: int = session.beam_width
     run_device = getattr(runner, "device", None)
     device_type = str(run_device.type) if run_device is not None else ""
     # Candidate width K is independent of the beam width W; the sampler emits
@@ -611,6 +614,8 @@ def run_beam_decision(
         return None
     # Keep the fused mapping well-defined: require one survivor per beam.
     beam_info = getattr(runner, "_current_beam_info", None)
+    if beam_info is None:
+        return None
     for mdata in (beam_info.get("beam_data") or {}).values():
         if mdata.get("is_beam_decode", False):
             parent = mdata.get("parent_beam_ids")
@@ -675,7 +680,7 @@ def run_beam_decision_candidates(
     entry point shares the persistent decision and KV-reorder machinery while
     keeping the canonical candidate ABI explicit.
     """
-    width = session.beam_width
+    width: int = session.beam_width
     if (
         top_tokens.ndim != 2
         or top_probs.shape != top_tokens.shape
@@ -730,7 +735,7 @@ def maybe_run_worker_beam_decision(
         return
     beam_info = getattr(runner, "_current_beam_info", None)
     session = beam_info.get("beam_session") if beam_info else None
-    if session is None:
+    if beam_info is None or session is None:
         runner._beam_decision_result = None
         return
 

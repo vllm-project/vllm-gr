@@ -11,7 +11,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
 from operator import attrgetter
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
@@ -375,7 +375,7 @@ class GRSessionState:
 
     @property
     def total_stages(self) -> int:
-        return cast(int, self.request.beam_params.max_tokens)
+        return self.request.beam_params.max_tokens
 
     @property
     def issued_stages(self) -> int:

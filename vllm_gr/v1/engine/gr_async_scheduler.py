@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -110,29 +110,29 @@ class _AdmissionQueue:
         self.queue = queue
         self.owner_ids = frozenset(owner_ids)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Any]:
         return (r for r in self.queue if r.request_id in self.owner_ids)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return sum(1 for _ in self)
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return any(True for _ in self)
 
-    def peek_request(self):
+    def peek_request(self) -> Any:
         return next(iter(self))
 
-    def pop_request(self):
+    def pop_request(self) -> Any:
         request = self.peek_request()
         self.queue.remove_request(request)
         return request
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         return getattr(self.queue, name)
 
 
 @contextmanager
-def gr_admission(scheduler: Any):
+def gr_admission(scheduler: Any) -> Iterator[None]:
     """Gate native selection and reserve the full logical KV extent on first allocation."""
     owner = _admit_owner(scheduler)
     if owner is None:
@@ -146,7 +146,7 @@ def gr_admission(scheduler: Any):
     owner_ids = owner.request_ids
     owner_id_set = frozenset(owner_ids)
 
-    def reserve(request, num_new_tokens, *args, **kwargs):
+    def reserve(request: Any, num_new_tokens: int, *args: Any, **kwargs: Any) -> Any:
         if request.request_id not in owner_id_set:
             raise RuntimeError("Asynchronous scheduling allocation escaped the execution owner")
         computed = request.num_computed_tokens + kwargs.get("num_new_computed_tokens", 0)
@@ -195,7 +195,8 @@ def _release_owner(scheduler: Any, session: GRSessionState) -> None:
 
 
 def attach_gr_retirement(scheduler: Any, output: Any) -> None:
-    owner = _sessions(scheduler).get(getattr(scheduler, "_gr_owner", None))
+    owner_id = getattr(scheduler, "_gr_owner", None)
+    owner = _sessions(scheduler).get(owner_id) if owner_id is not None else None
     if (
         owner is None
         or owner.resource_status is not GRResourceStatus.DRAINING
@@ -332,6 +333,8 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
         scheduling_token_budget = getattr(
             scheduler_config, "max_num_batched_tokens", total_prompt_tokens
         )
+    if scheduling_token_budget is None:
+        raise GRAdmissionError("Native scheduling token budget is not configured")
     if total_prompt_tokens > scheduling_token_budget:
         raise GRAdmissionError(
             "Beam batch Prefill exceeds the effective native scheduling token "

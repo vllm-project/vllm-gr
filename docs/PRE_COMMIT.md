@@ -88,6 +88,9 @@ type. Narrow expected-error annotations combined with `--warn-unused-ignores`
 make a weakened contract fail the same checker run.
 The group disables both cache reads and writes to avoid a mypy 1.11.1 placeholder
 serialization failure in these cyclic imports.
+It retains mypy 1.11.1 in the tests/CUDA-stage hooks. The Beam/Engine hooks use
+their newer checker with `--skip-cuda-stage`; file filters still select the
+legacy hooks when only a production stage module or the hook script changes.
 
 Runtime and checker-routing regressions live in `tests/tools/test_cuda_stage_typing.py`.
 They remain CPU-only and do not launch checker subprocesses. The ordinary test
@@ -111,3 +114,43 @@ Use that only when cache repair is needed.
 CI invokes pre-commit in its prepared runtime and runs additional benchmark
 and system gates. Local hook success does not replace those checks; see
 [Contributing](../CONTRIBUTING.md#pull-request-ci).
+
+## Staged mypy coverage
+
+`strict = true` in `pyproject.toml` applies to files actually selected by
+`tools/pre_commit/mypy.py`; it does not mean the entire runtime is type checked.
+The selector now matches the `vllm_gr` path component (including nested Python
+files), rather than interpreting a shell glob as a regular expression. Obsolete
+upstream directory groups and exclusions have been removed.
+
+The default hook checks supplied test files, the hook itself, and every Python
+module and stub under `vllm_gr/v1/beam` and `vllm_gr/v1/engine` (31 Python files
+at initial onboarding). Newly added files in those directories are included
+automatically; there is no per-file allowlist. Both CI and local hooks use
+`--follow-imports skip --ignore-missing-imports`, so imported modules and missing
+third-party packages are not fully checked. NumPy 2.2.6 (the CPU/CUDA requirement)
+and msgspec are installed in the isolated hook environment to check array and
+wire-structure types. The hook pins mypy 2.4.1: the previous 1.11.1 crashes while
+serializing NumPy 2.2.6's type cache. The accelerator-dependent vLLM package is not installed:
+its request base class has a single documented subclass exemption, and native
+patch receivers/call-through values retain explicit opaque types. Locally owned
+contracts and control flow are checked. Strict diagnostics are not globally
+disabled. Python 3.11, 3.12, and 3.13 hooks use the same selection.
+
+The `mypy-3.*` hooks check runtime files and the selector in that environment.
+The `mypy-tests-3.*` hooks retain the previous test environment (mypy 1.11.1 and
+its existing dependency set). This keeps existing test diagnostics stable while
+onboarding the core; migrating the entire test suite's checker is a separate
+change. Both groups still enforce strict checking on the supplied files.
+
+Runtime files outside this first batch are printed as deferred. To audit them,
+pass `--all-core` before an explicit list of tracked Python paths:
+
+```bash
+python tools/pre_commit/mypy.py 0 local --all-core vllm_gr/constraints/startup.py
+```
+
+This audit may fail on existing typing debt in other runtime subsystems. To
+expand enforcement, fix a directory's errors, add it to `CORE_DIRS`, and run all
+three mypy hooks on its tracked Python files. Beam and Engine are already
+enforced in full; the initial 136 diagnostics are no longer deferred.

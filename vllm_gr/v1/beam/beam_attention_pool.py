@@ -62,7 +62,7 @@ class BeamAttentionPool:
         self.unshared_key = torch.zeros(pool_shape, dtype=dtype, device=device)
         self.unshared_value = torch.zeros(pool_shape, dtype=dtype, device=device)
 
-    def reset_slot(self, slot: int):
+    def reset_slot(self, slot: int) -> None:
         """Zero out a single slot's KV for a new session."""
         self.unshared_key[slot].zero_()
         self.unshared_value[slot].zero_()

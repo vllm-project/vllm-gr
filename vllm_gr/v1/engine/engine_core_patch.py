@@ -7,7 +7,9 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from functools import wraps
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 import numpy as np
@@ -16,8 +18,17 @@ from vllm.utils.hashing import sha256 as _vllm_sha256
 
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
+if TYPE_CHECKING:
+    from types import ModuleType
+
+    from typing_extensions import Buffer
+
+    from vllm_gr.v1.engine.beam_search_v1 import GRSessionState
+
 logger = init_logger(__name__)
 
+# Any annotations at patch receivers/call-through boundaries represent native
+# vLLM objects whose private interfaces vary across supported platform plugins.
 _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
 _ENGINE_STEP_PATCH_MARKER = "_vllm_gr_progress_step"
 _CLIENT_REQUEST_PATCH_MARKER = "_vllm_gr_gr_input_dispatch"
@@ -32,13 +43,13 @@ _GR_SCHEDULE_PATCH_DEPTH_ATTR = "_vllm_gr_schedule_patch_depth"
 UPSTREAM_PROCESS_INPUT_SOCKETS = None
 
 
-def make_patched_engine_init(original):
+def make_patched_engine_init(original: Callable[..., Any]) -> Callable[..., Any]:
     """Publish the loaded table's immutable capacity before accepting requests."""
     if getattr(original, "_gr_trie_capacity_patch", False):
         return original
 
     @wraps(original)
-    def initialize(self, *args, **kwargs):
+    def initialize(self: Any, *args: Any, **kwargs: Any) -> None:
         original(self, *args, **kwargs)
         from vllm_gr.config import BeamExecutionMode, GRConfig
         from vllm_gr.v1.engine.core import loaded_constraint_trie_count
@@ -51,18 +62,18 @@ def make_patched_engine_init(original):
             raise RuntimeError("Workers disagree on the loaded constraint table Trie count")
         self._gr_trie_count = self.scheduler._gr_trie_count = counts[0]
 
-    initialize._gr_trie_capacity_patch = True
+    setattr(initialize, "_gr_trie_capacity_patch", True)
     return initialize
 
 
-def make_patched_process_engine_step(original_step):
+def make_patched_process_engine_step(original_step: Callable[..., Any]) -> Callable[..., Any]:
     """Preserve V1 progress-aware backoff while forwarding native outputs."""
 
     if getattr(original_step, _ENGINE_STEP_PATCH_MARKER, False):
         return original_step
 
     @wraps(original_step)
-    def patched_process_engine_step(self):
+    def patched_process_engine_step(self: Any) -> bool:
         progress_before = getattr(self.scheduler, "_gr_progress", 0)
         outputs, model_executed = self.step_fn()
         for output in outputs.items() if outputs else ():
@@ -77,13 +88,13 @@ def make_patched_process_engine_step(original_step):
         ):
             time.sleep(0.001)
 
-        return model_executed
+        return cast(bool, model_executed)
 
     setattr(patched_process_engine_step, _ENGINE_STEP_PATCH_MARKER, True)
     return patched_process_engine_step
 
 
-def make_patched_handle_client_request(original):
+def make_patched_handle_client_request(original: Callable[..., Any]) -> Callable[..., Any]:
     """Dispatch GR wire types and isolate expected ADD admission rejections.
 
     The socket adapter queues each complete GR batch without admitting it.
@@ -95,7 +106,9 @@ def make_patched_handle_client_request(original):
         return original
 
     @wraps(original)
-    def patched_handle_client_request(self, request_type, request, *args, **kwargs):
+    def patched_handle_client_request(
+        self: Any, request_type: Any, request: Any, *args: Any, **kwargs: Any
+    ) -> Any:
         from vllm.v1.engine import EngineCoreRequestType
 
         from vllm_gr.v1.engine.core import (
@@ -232,11 +245,11 @@ _run_engine_core_active = False
 
 
 def run_engine_core(
-    *args,
+    *args: Any,
     dp_rank: int = 0,
     local_dp_rank: int = 0,
-    **kwargs,
-):
+    **kwargs: Any,
+) -> None:
     """Wrapper for EngineCoreProc.run_engine_core that applies patches
     before the engine starts.  This is a module-level function so that
     multiprocessing 'spawn' can pickle it by qualified name.
@@ -326,7 +339,9 @@ def run_engine_core(
         _run_engine_core_active = False
 
 
-def _expand_gr_abort_request_ids(scheduler, request_ids, finished_status):
+def _expand_gr_abort_request_ids(
+    scheduler: Any, request_ids: str | Iterable[str] | None, finished_status: Any
+) -> str | Iterable[str] | None:
     """Expand cancellation of any GR member to its complete fixed batch."""
     if request_ids is None or getattr(finished_status, "name", "") != "FINISHED_ABORTED":
         return request_ids
@@ -349,7 +364,9 @@ def _expand_gr_abort_request_ids(scheduler, request_ids, finished_status):
     return expanded
 
 
-def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished_status) -> None:
+def _sync_gr_sessions_after_native_finish(
+    scheduler: Any, finished_requests: Iterable[Any], finished_status: Any
+) -> None:
     """Mirror the native finished Request objects into GR session state."""
     from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
 
@@ -388,13 +405,13 @@ def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished
         _drain_resources(scheduler, session)
 
 
-def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
+def _patch_scheduler_reset_prefix_cache(scheduler_cls: Any) -> None:
     original_reset = scheduler_cls.reset_prefix_cache
     if getattr(original_reset, _GR_RESET_PREFIX_CACHE_PATCH_MARKER, False):
         return
 
     @wraps(original_reset)
-    def patched_reset_prefix_cache(self, *args, **kwargs):
+    def patched_reset_prefix_cache(self: Any, *args: Any, **kwargs: Any) -> bool:
         reset_running_requests = kwargs.get("reset_running_requests", args[0] if args else False)
         from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, GRSessionStatus
 
@@ -413,13 +430,13 @@ def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
                 "while GR sessions are active"
             )
             return False
-        return original_reset(self, *args, **kwargs)
+        return cast(bool, original_reset(self, *args, **kwargs))
 
     setattr(patched_reset_prefix_cache, _GR_RESET_PREFIX_CACHE_PATCH_MARKER, True)
     scheduler_cls.reset_prefix_cache = patched_reset_prefix_cache
 
 
-def apply_scheduler_patch():
+def apply_scheduler_patch() -> None:
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -438,17 +455,17 @@ def apply_scheduler_patch():
         original_has_requests = Scheduler.has_requests
 
         @wraps(original_has_requests)
-        def has_requests(self):
-            return original_has_requests(self) or has_gr_cleanup_work(self)
+        def has_requests(self: Any) -> bool:
+            return cast(bool, original_has_requests(self)) or has_gr_cleanup_work(self)
 
-        has_requests._gr_retirement_work = True
+        setattr(has_requests, "_gr_retirement_work", True)
         Scheduler.has_requests = has_requests
 
     if not getattr(Scheduler.add_request, "_vllm_gr_v1_add_request", False):
         original_add_request = Scheduler.add_request
 
         @wraps(original_add_request)
-        def patched_add_request(self, request):
+        def patched_add_request(self: Any, request: Any) -> Any:
             batch_request = getattr(request, "gr_batch_request", None)
             sessions = getattr(self, "_gr_v1_sessions", {})
             if (batch_request is None and sessions) or (
@@ -507,7 +524,9 @@ def apply_scheduler_patch():
         original_finish_requests = Scheduler.finish_requests
 
         @wraps(original_finish_requests)
-        def patched_finish_requests(self, request_ids, finished_status):
+        def patched_finish_requests(
+            self: Any, request_ids: str | Iterable[str] | None, finished_status: Any
+        ) -> Any:
             request_ids = _expand_gr_abort_request_ids(self, request_ids, finished_status)
             result = original_finish_requests(self, request_ids, finished_status)
             _sync_gr_sessions_after_native_finish(self, result, finished_status)
@@ -524,7 +543,7 @@ def apply_scheduler_patch():
     _original_schedule = Scheduler.schedule
 
     @wraps(_original_schedule)
-    def patched_schedule(self, throttle_prefills: bool = False):
+    def patched_schedule(self: Any, throttle_prefills: bool = False) -> Any:
         # Some platform plugins replace Scheduler with a subclass whose
         # schedule() delegates to super().schedule(). If both implementations
         # were patched, that produces nested GR wrappers around one native
@@ -541,7 +560,7 @@ def apply_scheduler_patch():
         cached_patch = getattr(self, "_gr_cache_blocks_patch", None)
         if cached_patch is None or cached_patch[0] is not original_cache_blocks:
 
-            def cache_prompt_blocks(request, num_computed_tokens):
+            def cache_prompt_blocks(request: Any, num_computed_tokens: int) -> Any:
                 if getattr(request, "gr_batch_request", None) is not None:
                     num_computed_tokens = min(num_computed_tokens, request.num_prompt_tokens)
                 return original_cache_blocks(request, num_computed_tokens)
@@ -595,7 +614,7 @@ def apply_scheduler_patch():
     _patch_scheduler_update_from_output(Scheduler)
 
 
-def _find_gr_output(result, request_id):
+def _find_gr_output(result: dict[int, Any], request_id: str) -> tuple[Any | None, Any | None]:
     for engine_outputs in result.values():
         for engine_output in engine_outputs.outputs:
             if engine_output.request_id == request_id:
@@ -603,7 +622,7 @@ def _find_gr_output(result, request_id):
     return None, None
 
 
-def _native_request_terminated(scheduler, result, request_id) -> bool:
+def _native_request_terminated(scheduler: Any, result: dict[int, Any], request_id: str) -> bool:
     _, target_output = _find_gr_output(result, request_id)
     if target_output is not None and target_output.finish_reason is not None:
         return True
@@ -613,7 +632,9 @@ def _native_request_terminated(scheduler, result, request_id) -> bool:
     return request_id not in scheduler.requests
 
 
-def _reconcile_native_gr_termination(scheduler, result, session) -> None:
+def _reconcile_native_gr_termination(
+    scheduler: Any, result: dict[int, Any], session: GRSessionState
+) -> None:
     from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, GRSessionStatus
     from vllm_gr.v1.engine.gr_async_scheduler import _make_failure_result
 
@@ -642,7 +663,7 @@ def _reconcile_native_gr_termination(scheduler, result, session) -> None:
         )
 
 
-def _suppress_native_terminal(result, request_id, target_output) -> None:
+def _suppress_native_terminal(result: dict[int, Any], request_id: str, target_output: Any) -> None:
     if target_output is not None:
         target_output.finish_reason = None
     for engine_outputs in result.values():
@@ -650,7 +671,7 @@ def _suppress_native_terminal(result, request_id, target_output) -> None:
             engine_outputs.finished_requests.discard(request_id)
 
 
-def _suppress_batch_member_outputs(result, session) -> None:
+def _suppress_batch_member_outputs(result: dict[int, Any], session: GRSessionState) -> None:
     """Keep internal batch members off the single batch-result channel."""
     internal_ids = frozenset(session.request_ids[1:])
     if not internal_ids:
@@ -663,7 +684,9 @@ def _suppress_batch_member_outputs(result, session) -> None:
             engine_outputs.finished_requests.difference_update(internal_ids)
 
 
-def _finish_native_gr_request(scheduler, request, request_id, request_status) -> None:
+def _finish_native_gr_request(
+    scheduler: Any, request: Any, request_id: str, request_status: Any
+) -> None:
     if request is None or request.is_finished():
         return
 
@@ -684,7 +707,7 @@ def _finish_native_gr_request(scheduler, request, request_id, request_status) ->
 
 
 def _discard_pending_native_finish(
-    scheduler, client_index, request_id, *, worker_released: bool = False
+    scheduler: Any, client_index: int, request_id: str, *, worker_released: bool = False
 ) -> None:
     finished_by_client = getattr(scheduler, "finished_req_ids_dict", None)
     if finished_by_client is not None:
@@ -706,7 +729,9 @@ def _discard_pending_native_finish(
         pending_finished_ids.discard(request_id)
 
 
-def _finalize_ready_gr_session(scheduler, result, session) -> None:
+def _finalize_ready_gr_session(
+    scheduler: Any, result: dict[int, Any], session: GRSessionState
+) -> None:
     """Publish one terminal native output after speculative work drains."""
     from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
     from vllm.v1.request import RequestStatus
@@ -793,7 +818,7 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
     _close_gr_session(scheduler, session)
 
 
-def _patch_scheduler_update_from_output(scheduler_cls) -> None:
+def _patch_scheduler_update_from_output(scheduler_cls: Any) -> None:
     """Consume V1 stage/retirement receipts and publish the terminal batch result."""
     marker = "_vllm_gr_update_from_output_patch"
     if getattr(scheduler_cls.update_from_output, marker, False):
@@ -802,7 +827,9 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
     _original_update = scheduler_cls.update_from_output
 
     @wraps(_original_update)
-    def patched_update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
+    def patched_update_from_output(
+        self: Any, scheduler_output: Any, model_runner_output: Any, *args: Any, **kwargs: Any
+    ) -> dict[int, Any]:
         from vllm_gr.v1.engine.gr_async_scheduler import (
             GR_STAGE_OUTPUT_ATTR,
             consume_gr_retirement,
@@ -872,7 +899,7 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         for session in updated_sessions:
             _finalize_ready_gr_session(self, result, session)
 
-        return result
+        return cast(dict[int, Any], result)
 
     setattr(patched_update_from_output, marker, True)
     scheduler_cls.update_from_output = patched_update_from_output
@@ -898,7 +925,7 @@ _KV_HASH_MEMO_LIMIT = 65536
 _CHAIN_FALLBACK_ACTIVE = False
 
 
-def _token_bytes(tokens) -> memoryview:
+def _token_bytes(tokens: object) -> memoryview:
     """Expose token storage as contiguous bytes without copying.
 
     GR requests already carry 1-D contiguous int64 arrays. Native requests
@@ -914,10 +941,13 @@ def _token_bytes(tokens) -> memoryview:
         from vllm_gr.v1.beam.batch_contracts import to_int64_tokens
 
         tokens = to_int64_tokens(tokens, name="block tokens")
-    return memoryview(tokens).cast("B")
+    # NumPy's stubs do not declare its native buffer protocol implementation.
+    return memoryview(cast("Buffer", tokens)).cast("B")
 
 
-def _hash_block_bytes(block, parent_hash, extra_keys) -> bytes:
+def _hash_block_bytes(
+    block: bytes | memoryview, parent_hash: bytes, extra_keys: tuple[Any, ...] | None
+) -> bytes:
     """Hash token bytes, then a domain tag plus parent/extra-key metadata.
 
     The one-byte tag keeps the common no-extra-keys path free of per-block
@@ -976,11 +1006,14 @@ def apply_kv_hash_memo_patch() -> None:
     # traffic pays an ever-longer scan per eviction (measured 14-32x slowdown
     # on the saturated hashing path).  ``OrderedDict.popitem(last=False)``
     # unlinks the head of its doubly-linked list in O(1).
-    memo: OrderedDict[tuple, object] = OrderedDict()
+    memo: OrderedDict[tuple[Any, ...], object] = OrderedDict()
 
     def hash_block_tokens_memo(
-        hash_function, parent_block_hash, curr_block_token_ids, extra_keys=None
-    ):
+        hash_function: Callable[[Any], bytes],
+        parent_block_hash: bytes | None,
+        curr_block_token_ids: Any,
+        extra_keys: tuple[Any, ...] | None = None,
+    ) -> Any:
         if hash_function is not _vllm_sha256:
             # The direct-buffer encoding below is SHA-256 specific; keep the
             # configured algorithm authoritative for other hash functions.
@@ -1019,7 +1052,7 @@ def apply_kv_hash_memo_patch() -> None:
 _CHAIN_MEMO_LIMIT = 1024
 
 
-def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
+def _apply_block_hash_chain_memo_patch(kv_cache_utils: ModuleType) -> None:
     """Whole-chain memo on top of the per-block memo (from-scratch requests).
 
     The per-block memo removes the sha256 work but a repeated prompt still
@@ -1051,12 +1084,14 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
 
     original_factory = kv_cache_utils.get_request_block_hasher
     # Same constant-time FIFO rationale as the per-block memo above.
-    chain_memo: OrderedDict[tuple, list] = OrderedDict()
+    chain_memo: OrderedDict[tuple[Any, ...], list[Any]] = OrderedDict()
 
-    def get_request_block_hasher_memo(block_size, caching_hash_fn):
-        original_hasher = original_factory(block_size, caching_hash_fn)
+    def get_request_block_hasher_memo(
+        block_size: int, caching_hash_fn: Callable[..., Any]
+    ) -> Callable[..., list[Any]]:
+        original_hasher: Callable[[Any], list[Any]] = original_factory(block_size, caching_hash_fn)
 
-        def request_block_hasher_chain_memo(request):
+        def request_block_hasher_chain_memo(request: Any) -> list[Any]:
             global _CHAIN_FALLBACK_ACTIVE
             if (
                 request.block_hashes
@@ -1116,7 +1151,7 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
     get_request_block_hasher_memo._gr_chain_memo = True  # type: ignore[attr-defined]
     # Exposed for tests / diagnostics: the live chain-memo store.
     get_request_block_hasher_memo._gr_chain_memo_entries = chain_memo  # type: ignore[attr-defined]
-    kv_cache_utils.get_request_block_hasher = get_request_block_hasher_memo
+    setattr(kv_cache_utils, "get_request_block_hasher", get_request_block_hasher_memo)
     # ``vllm.v1.engine.core`` binds this factory via ``from ... import`` at
     # module load, so it holds its OWN reference — patching only the
     # kv_cache_utils attribute never reaches ``core.get_request_block_hasher``

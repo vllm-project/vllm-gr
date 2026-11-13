@@ -14,10 +14,11 @@ import array
 import math
 import sys
 from dataclasses import dataclass
-from typing import Annotated, Literal, NoReturn, TypeGuard
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, TypeGuard, cast
 
 import msgspec
 import numpy as np
+from numpy.typing import NDArray
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import (
@@ -42,13 +43,20 @@ class BeamContractError(ValueError):
     """Raised when a Beam batch value violates the contract."""
 
 
-class BeamEngineCoreRequest(EngineCoreRequest):
+# The lightweight hook environment does not install the accelerator-dependent
+# vLLM package; only this external base is opaque to mypy.
+class BeamEngineCoreRequest(EngineCoreRequest):  # type: ignore[misc]
     """GR native request with one canonical ndarray prompt wire field."""
 
-    prompt_token_ids: np.ndarray  # type: ignore[assignment,type-arg]
+    # vLLM's decoder dispatches on the exact ndarray class. A parameterized
+    # alias is useful statically but changes msgspec's runtime decode hook.
+    if TYPE_CHECKING:
+        prompt_token_ids: NDArray[np.int64]
+    else:
+        prompt_token_ids: np.ndarray
 
     def __post_init__(self) -> None:
-        if self.external_req_id is None:
+        if getattr(self, "external_req_id", None) is None:
             self.external_req_id = self.request_id
 
 
@@ -56,7 +64,7 @@ def to_int64_tokens(
     values: object,
     *,
     name: str = "prompt_token_ids",
-) -> np.ndarray:
+) -> NDArray[np.int64]:
     """Normalize edge token values into the canonical GR token array.
 
     ndarray inputs must already satisfy the contract because the engine hashes
@@ -82,16 +90,16 @@ def to_int64_tokens(
         raise BeamContractError(f"{name} must contain int64 token ids: {error}") from error
     if tokens.size == 0:
         raise BeamContractError(f"{name} must not be empty")
-    return tokens
+    return cast(NDArray[np.int64], tokens)
 
 
 class BeamBatchItem(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     item_index: int
     request: BeamEngineCoreRequest
     trie_id: int = 0
@@ -113,12 +121,12 @@ class BeamBatchItem(
 
 class BeamBatchParams(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
-    omit_defaults=True,  # type: ignore[call-arg]
+    omit_defaults=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     beam_width: int
     max_tokens: int
     temperature: float
@@ -147,11 +155,11 @@ class BeamBatchParams(
 
 class BeamOutputOptions(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     num_return_sequences: int
     include_stop_token: bool
     include_cumulative_logprob: bool
@@ -160,11 +168,11 @@ class BeamOutputOptions(
 
 class BeamBatchRequest(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     protocol_version: int
     batch_id: str
     items: tuple[BeamBatchItem, ...]
@@ -174,11 +182,11 @@ class BeamBatchRequest(
 
 class BeamOutputSequence(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     token_ids: tuple[Annotated[int, msgspec.Meta(ge=0)], ...]
     cumulative_logprob: (
         Annotated[float, msgspec.Meta(ge=-sys.float_info.max, le=sys.float_info.max)] | None
@@ -207,11 +215,11 @@ class BeamSequenceColumns(
 
 class BeamRequestOutput(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     item_index: int
     request_id: str
     sequences: tuple[BeamOutputSequence, ...] | BeamSequenceColumns
@@ -219,21 +227,21 @@ class BeamRequestOutput(
 
 class BeamBatchOutput(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     items: tuple[BeamRequestOutput, ...]
 
 
 class BeamBatchFailure(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     code: str
     message: str
     item_index: int | None
@@ -241,11 +249,11 @@ class BeamBatchFailure(
 
 class BeamBatchResult(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,
     forbid_unknown_fields=True,
     frozen=True,
     gc=False,
-):  # type: ignore[call-arg]
+):
     protocol_version: int
     batch_id: str
     output: BeamBatchOutput | None

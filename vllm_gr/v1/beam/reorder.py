@@ -25,7 +25,12 @@ cascade kernel, which handles arbitrary ``beam_index`` orderings.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
 import torch
+
+if TYPE_CHECKING:
+    from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
 
 _FALLBACK_LOGGED = False
 
@@ -34,7 +39,7 @@ def _resolve_mode() -> str:
     """Read the process-global decode execution mode (cascade | xllm)."""
     from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
 
-    return _get_npu_decode_execution()
+    return cast(str, _get_npu_decode_execution())
 
 
 def _group_token_num_from_parents(parent: torch.Tensor) -> torch.Tensor:
@@ -71,7 +76,7 @@ def _fused_reorder_applies(parent: torch.Tensor, pool_beam_width: int) -> bool:
 def reorder_unshared_kv(
     parent: torch.Tensor,
     slot: int,
-    pools: list,
+    pools: list[BeamAttentionPool],
     decode_step: int,
     aux_key_bufs: list[torch.Tensor] | None = None,
     aux_value_bufs: list[torch.Tensor] | None = None,

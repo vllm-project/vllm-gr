@@ -8,6 +8,7 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
+from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
 from vllm_gr.v1.engine.async_llm import make_patched_process_outputs
 from vllm_gr.v1.engine.core_client import submit_gr_session_async
 
@@ -15,7 +16,7 @@ from vllm_gr.v1.engine.core_client import submit_gr_session_async
 _INPROC_NATIVE: dict[str, Callable[..., Any]] = {}
 
 
-def sync_mp_submit_gr_session(self, batch_request):
+def sync_mp_submit_gr_session(self: Any, batch_request: BeamBatchRequest) -> None:
     from vllm.v1.engine import EngineCoreRequestType
 
     requests = tuple(item.request for item in batch_request.items)
@@ -99,7 +100,7 @@ def inproc_shutdown(self: Any, *args: Any, **kwargs: Any) -> Any:
             _release_failure_frames(failure)
 
 
-def inproc_submit_gr_session(self, batch_request):
+def inproc_submit_gr_session(self: Any, batch_request: BeamBatchRequest) -> None:
     _inproc_ensure_alive(self)
     self.engine_core._handle_submit_gr_session(batch_request)
 

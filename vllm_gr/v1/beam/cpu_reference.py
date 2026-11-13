@@ -546,8 +546,12 @@ def select_final_sequences(
     if state is None:
         _validate_candidate_batch(candidate_items)
         generation_step = 0
-        parent_beams_by_item = [(_initial_beam(),) for _ in candidate_items]
-        completed_by_item = [() for _ in candidate_items]
+        parent_beams_by_item: list[tuple[BeamReferenceBeam, ...]] = [
+            (_initial_beam(),) for _ in candidate_items
+        ]
+        completed_by_item: list[tuple[BeamReferenceCompletedBeam, ...]] = [
+            () for _ in candidate_items
+        ]
         for candidates in candidate_items:
             if (
                 candidates.parent_beam_indices.shape != (1,)

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
+from typing import Any
+
 from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
 
 
-async def submit_gr_session_async(self, batch_request: BeamBatchRequest) -> None:
+async def submit_gr_session_async(self: Any, batch_request: BeamBatchRequest) -> None:
     """Submit the whole GR session once; Decode stages stay inside EngineCore."""
     requests = tuple(item.request for item in batch_request.items)
     if not requests:
