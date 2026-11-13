@@ -94,8 +94,9 @@ def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
 def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
     import torch
 
-    from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-        BeamAttentionMetadataBuilder as Builder,
+    from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+        build_async,
+        build_async_batch_layout,
     )
 
     monkeypatch.setattr(policy, "policy_mode", lambda: "auto")
@@ -110,7 +111,7 @@ def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
 
     def build(length, plan):
         monkeypatch.setattr(policy, "resolve_prefix_plan", lambda shape, **kwargs: plan)
-        layout = Builder.build_async_batch_layout(
+        layout = build_async_batch_layout(
             width=2,
             prompt_lengths=[length],
             decode_step=0,
@@ -118,7 +119,7 @@ def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
             max_blocks=1024,
         )
         views = {name: torch.tensor(values, dtype=torch.int32) for name, values in layout.items()}
-        return Builder.build_async(
+        return build_async(
             layout=layout,
             views=views,
             session=SimpleNamespace(is_active=True, context=context),

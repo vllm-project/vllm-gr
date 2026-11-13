@@ -28,8 +28,10 @@ from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
-    _get_fp8_dtype_for_flashattn,
     require_beam_decode_session,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import (
+    _get_fp8_dtype_for_flashattn,
 )
 
 __all__ = [
