@@ -9,6 +9,8 @@ import argparse
 import json
 import os
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from time import perf_counter
@@ -37,7 +39,29 @@ def parse_args() -> argparse.Namespace:
         default="cuda",
         help="Constraint Table device backend (CUDA or NPU)",
     )
-    parser.add_argument("--prompt", type=Path, required=True)
+    parser.add_argument("--prompt", type=Path, help="Complete direct-mode prompt document")
+    parser.add_argument(
+        "--cache-mode",
+        choices=("off", "cold", "shared-prefix"),
+        default="cold",
+        help=(
+            "Prefix-cache benchmark mode: off disables APC, cold keeps isolated salts, "
+            "and shared-prefix uses one salt for a JSON Lines workload"
+        ),
+    )
+    parser.add_argument(
+        "--workload-jsonl",
+        type=Path,
+        help=(
+            "JSON Lines workload; each row has either text or prompt_token_ids. "
+            "The workload bypasses fixed-length prompt truncation and padding"
+        ),
+    )
+    parser.add_argument(
+        "--shared-cache-salt",
+        default="offline-beam-v1-shared-prefix",
+        help="Cache salt shared by every request in shared-prefix and off workload modes",
+    )
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
@@ -132,6 +156,21 @@ def parse_args() -> argparse.Namespace:
         parser.error("--cot and --enable-thinking are separate modes; choose one")
     if args.cot and args.cot_max_tokens <= 0:
         parser.error("--cot-max-tokens must be positive")
+    if args.workload_jsonl is not None:
+        if args.enable_thinking or args.cot:
+            parser.error("--workload-jsonl only supports direct constrained SID Beam mode")
+        if args.profile_dir is not None:
+            parser.error("--workload-jsonl currently requires --repeat, not --profile-dir")
+        if args.repeat is None:
+            parser.error("--workload-jsonl requires --repeat")
+        if args.prompt is not None:
+            parser.error("--prompt and --workload-jsonl are mutually exclusive")
+    elif args.prompt is None:
+        parser.error("--prompt is required unless --workload-jsonl is provided")
+    if args.cache_mode == "shared-prefix" and args.workload_jsonl is None:
+        parser.error("--cache-mode shared-prefix requires --workload-jsonl")
+    if not args.shared_cache_salt:
+        parser.error("--shared-cache-salt must be nonempty")
     if not args.enable_thinking and args.catalog is None:
         parser.error("--catalog is required unless --enable-thinking is set")
     if not args.enable_thinking and args.generated_steps != 3:
@@ -217,6 +256,135 @@ def isolate_prompts(prompts: list[Any], suffix: str) -> list[Any]:
         )
         for prompt in prompts
     ]
+
+
+@dataclass(frozen=True)
+class PrefixWorkload:
+    """Final token IDs for a shared-prefix benchmark workload."""
+
+    prompt_token_ids: tuple[tuple[int, ...], ...]
+    common_prefix_tokens: int
+
+    @property
+    def max_prompt_tokens(self) -> int:
+        return max(len(ids) for ids in self.prompt_token_ids)
+
+    @property
+    def prompt_lengths(self) -> tuple[int, ...]:
+        return tuple(len(ids) for ids in self.prompt_token_ids)
+
+
+def load_prefix_workload(path: Path, tokenizer: Any) -> PrefixWorkload:
+    """Load complete final prompts without truncation, padding, or chat templating."""
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_number}: workload row is not valid JSON") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{line_number}: workload row must be a JSON object")
+        keys = set(row)
+        if keys == {"text"}:
+            if not isinstance(row["text"], str):
+                raise ValueError(f"{path}:{line_number}: text must be a string")
+            ids = tokenizer.encode(row["text"], add_special_tokens=False)
+            if not isinstance(ids, list) or not all(
+                isinstance(token, int) and not isinstance(token, bool) for token in ids
+            ):
+                raise ValueError(f"{path}:{line_number}: text did not tokenize to an int array")
+        elif keys == {"prompt_token_ids"}:
+            raw_ids = row["prompt_token_ids"]
+            if not isinstance(raw_ids, list) or any(
+                not isinstance(token, int) or isinstance(token, bool) for token in raw_ids
+            ):
+                raise ValueError(
+                    f"{path}:{line_number}: prompt_token_ids must be a nonempty int array"
+                )
+            ids = raw_ids
+        else:
+            raise ValueError(
+                f"{path}:{line_number}: each row must contain exactly one of "
+                "text or prompt_token_ids"
+            )
+        if not ids:
+            raise ValueError(f"{path}:{line_number}: prompt is empty")
+        rows.append({"prompt_token_ids": [int(token) for token in ids]})
+
+    if not rows:
+        raise ValueError(f"{path}: workload is empty")
+
+    prompt_ids = tuple(tuple(row["prompt_token_ids"]) for row in rows)
+    if len(set(prompt_ids)) != len(prompt_ids):
+        raise ValueError(f"{path}: workload contains duplicate complete prompts")
+
+    common_prefix = list(prompt_ids[0])
+    for ids in prompt_ids[1:]:
+        prefix_len = 0
+        for expected, actual in zip(common_prefix, ids):
+            if expected != actual:
+                break
+            prefix_len += 1
+        del common_prefix[prefix_len:]
+    return PrefixWorkload(prompt_ids, len(common_prefix))
+
+
+def make_workload_requests(
+    workload: PrefixWorkload,
+    args: argparse.Namespace,
+    tokens_input: Callable[..., Any],
+) -> list[Any]:
+    requests = []
+    for index, ids in enumerate(workload.prompt_token_ids):
+        if args.cache_mode == "cold":
+            salt = f"offline-beam-v1-workload-{index}"
+        else:
+            salt = args.shared_cache_salt
+        requests.append(tokens_input(list(ids), cache_salt=salt))
+    return requests
+
+
+def workload_report(workload: PrefixWorkload, path: Path, required: int) -> dict[str, Any]:
+    lengths = workload.prompt_lengths
+    return {
+        "path": str(path.resolve()),
+        "requests": len(workload.prompt_token_ids),
+        "required_requests": required,
+        "common_prefix_tokens": workload.common_prefix_tokens,
+        "min_prompt_tokens": min(lengths),
+        "max_prompt_tokens": max(lengths),
+        "seed_and_measurement_strategy": (
+            "one non-timed seed batch, then every warmup and timed batch"
+        ),
+    }
+
+
+def next_benchmark_requests(
+    args: argparse.Namespace,
+    requests: list[Any],
+    workload_requests: list[Any] | None,
+    cursor: int,
+    suffix: str,
+) -> tuple[list[Any], int]:
+    if workload_requests is None:
+        selected = requests
+    else:
+        end = cursor + args.batch_size
+        selected = workload_requests[cursor:end]
+        if len(selected) != args.batch_size:
+            raise RuntimeError("prefix workload was exhausted before benchmark completion")
+        cursor = end
+    if args.cache_mode == "cold":
+        return isolate_prompts(selected, suffix), cursor
+    copied = [
+        dict(request, prompt_token_ids=list(request["prompt_token_ids"]))
+        for request in selected
+    ]
+    return copied, cursor
 
 
 def execute_beam_batch(
@@ -313,18 +481,33 @@ def execute_beam_batch(
 
 
 def benchmark_beam_search(
-    llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
+    llm: Any,
+    args: argparse.Namespace,
+    prompts: list[Any],
+    params: Any,
+    workload_requests: list[Any] | None = None,
+    workload: PrefixWorkload | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
+    cursor = 0
+    if workload_requests is not None:
+        seed, cursor = next_benchmark_requests(args, prompts, workload_requests, cursor, "seed")
+        execute_beam_batch(llm, args, seed, params)
+
     for iteration in range(args.warmup_runs):
-        execute_beam_batch(llm, args, isolate_prompts(prompts, f"warmup-{iteration}"), params)
+        warmup, cursor = next_benchmark_requests(
+            args, prompts, workload_requests, cursor, f"warmup-{iteration}"
+        )
+        execute_beam_batch(llm, args, warmup, params)
 
     latencies_ms: list[float] = []
     returned_beams: list[int] = []
     outputs: list[Any] = []
     for iteration in range(args.repeat):
-        isolated = isolate_prompts(prompts, f"benchmark-{iteration}")
+        measured, cursor = next_benchmark_requests(
+            args, prompts, workload_requests, cursor, f"benchmark-{iteration}"
+        )
         started = perf_counter()
-        outputs = execute_beam_batch(llm, args, isolated, params)
+        outputs = execute_beam_batch(llm, args, measured, params)
         latencies_ms.append((perf_counter() - started) * 1000.0)
         if len(outputs) != len(prompts):
             raise RuntimeError(f"expected {len(prompts)} request outputs, got {len(outputs)}")
@@ -340,24 +523,40 @@ def benchmark_beam_search(
         return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
     total_seconds = sum(latencies_ms) / 1000.0
+    if workload_requests is None:
+        timing_scope = (
+            "beam_search_v1 API call until output objects return; excludes engine startup, "
+            "warmup, pre-call prompt preparation and post-call result inspection/printing"
+        )
+    else:
+        timing_scope = (
+            "beam_search_v1 API call until output objects return; excludes engine startup, "
+            "seed, warmup, pre-call prompt preparation and post-call result inspection/printing"
+        )
     report: dict[str, Any] = {
         "model": str(args.model.resolve()),
         "catalog": str(args.catalog.resolve()),
-        "prompt": str(args.prompt.resolve()),
+        "prompt": str(args.prompt.resolve()) if args.prompt is not None else None,
         "constraint_backend": args.constraint_backend,
         "execution": args.execution,
         "batch_size": args.batch_size,
         "beam_width": args.beam_width,
-        "input_len": args.input_len,
+        "input_len": None if workload_requests is not None else args.input_len,
         "generated_steps": args.generated_steps,
         "length_penalty": args.length_penalty,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "warmup_runs": args.warmup_runs,
         "repeat": args.repeat,
-        "prefix_caching": "enabled; isolated salt per row and run (cold Prefill)",
-        "timing_scope": "beam_search_v1 API call until output objects return; excludes engine startup, "
-        "warmup, pre-call prompt preparation and post-call result inspection/printing",
+        "prefix_caching": (
+            f"{args.cache_mode}; isolated salt per row and run (cold Prefill)"
+            if workload_requests is None
+            else (
+                f"{args.cache_mode}; one non-timed seed batch, then unique workload rows; "
+                "cold mode still isolates salts per row and run"
+            )
+        ),
+        "timing_scope": timing_scope,
         "batch_latency_ms": {
             "mean": mean(latencies_ms),
             "p50": percentile(0.50),
@@ -377,6 +576,10 @@ def benchmark_beam_search(
         report["dynamic_beam_widths"] = list(args.dynamic_beam_widths)
     if getattr(args, "result_width", None) is not None:
         report["result_width"] = args.result_width
+    if workload is not None:
+        assert args.workload_jsonl is not None
+        required = args.batch_size * (1 + args.warmup_runs + args.repeat)
+        report["workload"] = workload_report(workload, args.workload_jsonl, required)
     if getattr(args, "cot", False):
         report.update(
             mode="cot_beam",
@@ -718,7 +921,24 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
     # width (the pre-decoupling behaviour).
     candidate_width = args.candidate_width if args.candidate_width is not None else args.beam_width
     cot_prompt_ids = None
-    prefill_capacity = args.batch_size * (args.input_len + 1)
+    workload: PrefixWorkload | None = None
+    effective_input_len = args.input_len
+    if args.workload_jsonl is not None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()), trust_remote_code=True)
+        workload = load_prefix_workload(args.workload_jsonl.resolve(), tokenizer)
+        required_requests = args.batch_size * (1 + args.warmup_runs + args.repeat)
+        if len(workload.prompt_token_ids) < required_requests:
+            raise ValueError(
+                f"--workload-jsonl needs at least {required_requests} unique prompts for "
+                f"one seed batch, {args.warmup_runs} warmup batches, and {args.repeat} "
+                "timed batches"
+            )
+        effective_input_len = workload.max_prompt_tokens + 1
+        if effective_input_len + args.generated_steps + 1 > args.max_model_len:
+            raise ValueError("workload prompt and generated tokens exceed --max-model-len")
+    prefill_capacity = args.batch_size * (effective_input_len + 1)
     if getattr(args, "cot", False):
         from transformers import AutoTokenizer
 
@@ -788,11 +1008,11 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         trust_remote_code=True,
         vllm_gr_config=vllm_gr_config,
         async_scheduling=True,
-        enable_prefix_caching=True,
+        enable_prefix_caching=args.cache_mode != "off",
         enable_chunked_prefill=False,
         max_model_len=args.max_model_len,
-        # The V1 input processor appends the begin token to every prompt, so a
-        # B-wide Prefill schedules B * (input_len + 1) tokens, not B * input_len.
+        # The V1 input processor appends the begin token to every prompt. Keep one
+        # additional token of capacity to match the pre-workload headroom.
         max_num_batched_tokens=max(args.max_model_len, prefill_capacity),
         max_num_seqs=max(args.beam_width, args.batch_size),
         max_logprobs=candidate_width,
@@ -801,23 +1021,45 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         **profiler_engine_kwargs(args),
     ) as llm:
         tokenizer = llm.get_tokenizer()
-        if cot_prompt_ids is not None:
-            prompt_token_ids = cot_prompt_ids
-            print(f"mode=cot_beam input_tokens={len(prompt_token_ids)}; --input-len is not used")
-        else:
-            prompt_token_ids = make_prompt(tokenizer, args.prompt.resolve(), args.input_len)
-        # Keep prefix caching enabled, but prevent duplicate batch rows from
-        # sharing the same prompt block before their atomic Prefill completes.
-        request_prompts = [
-            tokens_input(
-                list(prompt_token_ids),
-                cache_salt=f"offline-beam-v1-row-{request_index}",
+        workload_requests = None
+        if workload is not None:
+            workload_requests = make_workload_requests(workload, args, tokens_input)
+            request_prompts = workload_requests[: args.batch_size]
+            print(
+                f"mode=prefix_cache_{args.cache_mode} workload_requests="
+                f"{len(workload.prompt_token_ids)} common_prefix_tokens="
+                f"{workload.common_prefix_tokens} max_prompt_tokens="
+                f"{workload.max_prompt_tokens}"
             )
-            for request_index in range(args.batch_size)
-        ]
+        else:
+            if cot_prompt_ids is not None:
+                prompt_token_ids = cot_prompt_ids
+                print(
+                    f"mode=cot_beam input_tokens={len(prompt_token_ids)}; "
+                    "--input-len is not used"
+                )
+            else:
+                assert args.prompt is not None
+                prompt_token_ids = make_prompt(tokenizer, args.prompt.resolve(), args.input_len)
+            # Keep prefix caching enabled, but prevent duplicate batch rows from
+            # sharing the same prompt block before their atomic Prefill completes.
+            request_prompts = [
+                tokens_input(
+                    list(prompt_token_ids),
+                    cache_salt=f"offline-beam-v1-row-{request_index}",
+                )
+                for request_index in range(args.batch_size)
+            ]
         benchmark = None
         if args.repeat is not None:
-            outputs, benchmark = benchmark_beam_search(llm, args, request_prompts, params)
+            outputs, benchmark = benchmark_beam_search(
+                llm,
+                args,
+                request_prompts,
+                params,
+                workload_requests=workload_requests,
+                workload=workload,
+            )
         else:
             outputs = run_beam_search(llm, args, request_prompts, params)
         if getattr(args, "cot", False):
@@ -899,11 +1141,13 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    paths = (
-        (args.model, args.prompt)
-        if args.enable_thinking
-        else (args.model, args.catalog, args.prompt)
-    )
+    paths: list[Path] = [args.model]
+    if not args.enable_thinking:
+        paths.append(args.catalog)
+    if args.prompt is not None:
+        paths.append(args.prompt)
+    if args.workload_jsonl is not None:
+        paths.append(args.workload_jsonl)
     for path in paths:
         if not path.exists():
             raise FileNotFoundError(path)
@@ -912,7 +1156,11 @@ def main() -> None:
     if args.enable_thinking:
         run_thinking(args)
         return
-    if not args.cot and args.input_len + args.generated_steps + 1 > args.max_model_len:
+    if (
+        args.workload_jsonl is None
+        and not args.cot
+        and args.input_len + args.generated_steps + 1 > args.max_model_len
+    ):
         raise ValueError("prompt and generated tokens exceed --max-model-len")
     if args.print_beams <= 0:
         raise ValueError("--print-beams must be positive")

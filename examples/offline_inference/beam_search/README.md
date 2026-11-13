@@ -230,6 +230,59 @@ requested Beam graph shape to be captured and replayed in graph mode. The `fallb
 counter means Beam FULL graph was not used: native FULL is rejected, while
 native PIECEWISE/NONE is retained. It does not count exclusively eager forwards.
 
+### Benchmark a shared prompt prefix
+
+The direct SID example can consume complete prompts from a JSON Lines workload.
+Each row must contain exactly one of `text` or `prompt_token_ids`:
+
+```json
+{"prompt_token_ids": [1, 2, 3]}
+{"text": "final rendered prompt text"}
+```
+
+`text` is tokenized as the final engine input with `add_special_tokens=false`; it
+is not wrapped in another chat template. `prompt_token_ids` is passed through
+unchanged. Neither form is truncated or padded by the fixed-length `--prompt`
+path.
+
+Use `--cache-mode` to select the benchmark policy:
+
+| Mode | Prefix caching | Request policy |
+| --- | --- | --- |
+| `off` | Disabled | Same unique workload rows as the enabled modes |
+| `cold` | Enabled | Unique workload rows, with an isolated salt per row and run |
+| `shared-prefix` | Enabled | Unique workload rows sharing one cache salt |
+
+The workload path currently supports direct constrained SID benchmark runs with
+`--repeat`; it does not support thinking, CoT, or profiler runs. It consumes one
+non-timed seed batch, then one row per request for every warmup and timed batch.
+For `B` requests per batch, provide at least:
+
+```text
+B * (1 + warmup_runs + repeat)
+```
+
+unique complete prompts. The benchmark report records the measured common token
+prefix across those final prompts.
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model /path/to/OneRec-1.7B \
+  --catalog /path/to/video_constraint_triples.json \
+  --workload-jsonl /path/to/prefix-workload.jsonl \
+  --cache-mode shared-prefix \
+  --batch-size 1 --beam-width 128 --generated-steps 3 \
+  --warmup-runs 1 --repeat 20 \
+  --output-json results/shared-prefix.json
+```
+
+The report is evidence of the request policy and observed API timing, not by
+itself proof of device-level cache hits. Prefix caching reuses only complete
+blocks. On the default dense-attention Ascend configuration the block size is
+128, so a measured common prefix shorter than 128 tokens cannot reuse a block.
+Keep model, tokenizer, workload, graph mode, backend, and generation parameters
+fixed across `off`, `cold`, and `shared-prefix` comparisons.
+
 ### Optional thinking before SID generation
 
 The same `--prompt` file can be used in three modes:
