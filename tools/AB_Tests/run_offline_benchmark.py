@@ -21,9 +21,8 @@ from typing import Any
 def resolve_beam_search(llm: Any) -> Any:
     """Select the public Beam method exposed by the loaded runtime.
 
-    ``ab_runner.sh`` executes this driver against the merge-base and the head.
-    The merge-base exposes ``beam_search_v1`` while ``beam_search`` is a retired
-    stub; the head exposes only ``beam_search``.
+    Older checkouts expose ``beam_search_v1``. Newer checkouts expose
+    ``beam_search``. Prefer the older public method when it is available.
     """
     method = getattr(llm, "beam_search_v1", None)
     return method if method is not None else llm.beam_search
@@ -144,12 +143,14 @@ def create_v1_llm(args: argparse.Namespace, max_tokens: int) -> Iterator[Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--data-dir", type=Path, default=Path("/opt/vllm-gr/data"))
+    parser.add_argument(
+        "--data-dir", type=Path, required=True, help="Directory containing the OneRec dataset"
+    )
     parser.add_argument(
         "--catalog",
         type=Path,
         default=Path(__file__).resolve().parent / "constraints" / "video_constraint_triples.json",
-        help="Constraint table triples document for constrained beam decoding.",
+        help="Constraint triples JSON (uses the checkout copy when available).",
     )
     parser.add_argument("--model", default="OpenOneRec/OneRec-1.7B")
     parser.add_argument("--task", default="video")
@@ -182,6 +183,11 @@ def main() -> int:
         parser.error(
             "num-prompts and beam-width must be positive; input-length must be at least 2 "
             "(one token is reserved for <|sid_begin|>); warmup must be non-negative"
+        )
+    if not args.catalog.is_file():
+        parser.error(
+            f"constraint catalog is not a file: {args.catalog}. "
+            "Pass --catalog with a constraint triples JSON file."
         )
 
     from transformers import AutoTokenizer

@@ -1,3 +1,7 @@
+# Reference policy snapshot: 2026-11. Hardware-specific measurements and setup
+# are documented in docs/usage/benchmarks/parent_score_gate.md. These thresholds are
+# not universal performance guarantees; calibrate them for your own hardware.
+# Board keys are compatibility selectors, not required server hostnames.
 version: 2
 name: development
 

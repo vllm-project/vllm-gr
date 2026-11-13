@@ -3,16 +3,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Compare baseline vs head offline AB summaries and emit a markdown delta report.
 
-Reads one or more ``vllm-gr-summary.json`` files per side (one per A-B-B-A
-repeat) and reports, for a small set of primary latency metrics, the percent
+Reads one or more ``vllm-gr-summary.json`` files per side (one per measurement)
+and reports, for a small set of primary latency metrics, the percent
 change from baseline to head together with a noise-threshold verdict.
 
 ``delta% = (head - baseline) / baseline * 100`` — positive means slower (a
 regression), negative means faster (an improvement). Each metric is a single
 row; p50/p90/p99 are shown side by side as ``base→head (delta%)``.
 
-Multiple summaries per side are merged by averaging each percentile across
-repeats, which cancels the linear ordering effect of the A-B-B-A schedule.
+Each reported latency statistic is merged by taking its median across the
+measurements for that side. All measurements on a side must use the same Git
+revision.
 """
 
 from __future__ import annotations
@@ -51,6 +52,22 @@ def load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def common_revision(side: str, paths: list[Path], summaries: list[dict]) -> str:
+    expected_sha = ""
+    for path, summary in zip(paths, summaries, strict=True):
+        source = summary.get("source")
+        git_sha = source.get("git_sha") if isinstance(source, dict) else None
+        if not isinstance(git_sha, str) or not git_sha.strip():
+            raise ValueError(f"{side} summary {path} must provide a nonempty source.git_sha")
+        if expected_sha and git_sha != expected_sha:
+            raise ValueError(
+                f"{side} summaries use different Git revisions. "
+                f"{path} has source.git_sha {git_sha!r} and {paths[0]} has {expected_sha!r}."
+            )
+        expected_sha = git_sha
+    return expected_sha
+
+
 def metric_sources(s: dict) -> tuple[dict, dict]:
     """Return canonical and post-canonical diagnostic latency maps."""
     results = s.get("results", {})
@@ -67,9 +84,8 @@ def metric_source(s: dict, metric: str) -> dict:
     return diagnostic or canonical
 
 
-def merge_latency(paths: list[Path]) -> dict[str, dict[str, float]]:
-    """Median of each percentile of each metric across several summary files."""
-    summaries = [load(p) for p in paths]
+def merge_latency(summaries: list[dict]) -> dict[str, dict[str, float]]:
+    """Median of each percentile of each metric across several summaries."""
     merged: dict[str, dict[str, float]] = {}
     for metric in KEY_METRICS:
         row: dict[str, float] = {}
@@ -98,14 +114,14 @@ def main() -> int:
         type=Path,
         action="append",
         required=True,
-        help="baseline summary (repeatable, one per A-B-B-A repeat)",
+        help="baseline summary (repeatable, one per measurement)",
     )
     parser.add_argument(
         "--head",
         type=Path,
         action="append",
         required=True,
-        help="head summary (repeatable, one per A-B-B-A repeat)",
+        help="head summary (repeatable, one per measurement)",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--json-output", type=Path)
@@ -113,14 +129,23 @@ def main() -> int:
     parser.add_argument("--scenario", default="")
     args = parser.parse_args()
 
-    base = merge_latency(args.base)
-    head = merge_latency(args.head)
-    base_sha = load(args.base[0])["source"]["git_sha"]
-    head_sha = load(args.head[0])["source"]["git_sha"]
-    base_completed = int(load(args.base[0])["results"]["requests"]["completed"])
-    head_completed = int(load(args.head[0])["results"]["requests"]["completed"])
-    base_repeats = len(args.base)
-    head_repeats = len(args.head)
+    base_summaries = [load(path) for path in args.base]
+    head_summaries = [load(path) for path in args.head]
+    try:
+        base_sha = common_revision("Baseline", args.base, base_summaries)
+        head_sha = common_revision("Head", args.head, head_summaries)
+    except ValueError as exc:
+        parser.error(str(exc))
+    base = merge_latency(base_summaries)
+    head = merge_latency(head_summaries)
+    base_completed = [
+        int(summary["results"]["requests"]["completed"]) for summary in base_summaries
+    ]
+    head_completed = [
+        int(summary["results"]["requests"]["completed"]) for summary in head_summaries
+    ]
+    base_repeats = len(base_summaries)
+    head_repeats = len(head_summaries)
 
     # metric -> percentile -> row
     data: dict[str, dict[str, dict[str, object]]] = {}
@@ -155,10 +180,8 @@ def main() -> int:
     lines.append(f"| Baseline | `{base_sha}` |")
     lines.append(f"| Head | `{head_sha}` |")
     lines.append(f"| Scenario | `{args.scenario}` |")
-    lines.append(
-        f"| Samples | {base_completed} per baseline repeat × {base_repeats}, "
-        f"{head_completed} per head repeat × {head_repeats} (A-B-B-A, averaged) |"
-    )
+    lines.append(f"| Samples | {sum(base_completed)} baseline, {sum(head_completed)} head |")
+    lines.append(f"| Repeats | {base_repeats} baseline, {head_repeats} head |")
     lines.append("")
     lines.append(
         "> Each cell = `baseline→head (delta%)`. delta% = (head-baseline)/baseline; "
@@ -242,8 +265,9 @@ def main() -> int:
             "scenario": args.scenario,
             "base_sha": base_sha,
             "head_sha": head_sha,
-            "base_completed": base_completed,
-            "head_completed": head_completed,
+            # The JSON fields carry the first summary's counts for compatibility.
+            "base_completed": base_completed[0],
+            "head_completed": head_completed[0],
             "base_repeats": base_repeats,
             "head_repeats": head_repeats,
             "noise_limits_pct": NOISE_LIMITS,

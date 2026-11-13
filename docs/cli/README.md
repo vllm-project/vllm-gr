@@ -277,11 +277,17 @@ Options using `BooleanOptionalAction` accept both `--NAME` and `--no-NAME`.
 
 ### Offline A/B
 
+The local `ab-offline` benchmark uses your model, dataset, and constraint
+triples file. Set `--data-dir` to your local OneRec dataset directory. Set
+`--catalog` to an explicit path to support checkouts without the bundled catalog. The
+[OneRec catalog guide](https://github.com/JiusiServe/vllm-gr/blob/main/examples/online_serving/catalog/README.md#build-a-catalog-from-the-onerec-dataset)
+shows how to generate triples from your dataset.
+
 | Argument | Value / action | Default / required | Meaning |
 | --- | --- | --- | --- |
 | `--output` | type=Path | required | - |
-| `--data-dir` | type=Path | Path('/opt/vllm-gr/data') | - |
-| `--catalog` | type=Path | tools/AB_Tests/constraints/video_constraint_triples.json | Constraint table triples document for constrained beam decoding. |
+| `--data-dir` | type=Path | required | OneRec dataset directory |
+| `--catalog` | type=Path | Bundled catalog when present | Constraint triples for constrained beam decoding. Required when the checkout has no bundled catalog. |
 | `--model` | value | OpenOneRec/OneRec-1.7B | - |
 | `--task` | value | video | - |
 | `--num-prompts` | type=int | 100 | - |

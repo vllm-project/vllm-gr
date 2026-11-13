@@ -85,7 +85,7 @@ def main() -> int:
     parser.add_argument("--tasks", type=parse_tasks, default=parse_tasks("video"))
     parser.add_argument(
         "--endpoint",
-        default=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"),
+        default=os.environ.get("HF_ENDPOINT") or "https://huggingface.co",
     )
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
@@ -109,7 +109,7 @@ def main() -> int:
             except GatedRepoError:
                 print(
                     "OpenOneRec-RecIF access is not authorized. Accept the dataset terms "
-                    "in Hugging Face, then run `hf auth login` inside vllm-gr-dev.",
+                    "on Hugging Face, then run `hf auth login` in your benchmark environment.",
                     file=sys.stderr,
                 )
                 return 3

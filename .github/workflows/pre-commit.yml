@@ -429,7 +429,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Install pre-commit
         run: uv pip install pre-commit==4.6.2
@@ -556,7 +556,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache OpenOneRec dataset
         uses: corca-ai/local-cache@v2
@@ -758,7 +758,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache OpenOneRec dataset
         uses: corca-ai/local-cache@v2
@@ -925,7 +925,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache Pangu 1B model
         uses: corca-ai/local-cache@v2
@@ -1042,7 +1042,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache Pangu 1B model
         uses: corca-ai/local-cache@v2

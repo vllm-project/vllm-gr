@@ -6,15 +6,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
 import random
-import socket
 import statistics
 import subprocess
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from uuid import UUID
 
 import pandas as pd
 import torch
@@ -25,8 +26,40 @@ import vllm_gr
 SHANGHAI = timezone(timedelta(hours=8))
 
 
-def run_text(*command: str) -> str:
-    return subprocess.check_output(command, text=True).strip()
+def gpu_metadata(gpu_uuid: str | None) -> dict[str, object]:
+    """Query the measured physical device, which may differ from local device 0."""
+    if gpu_uuid is None:
+        return {
+            "uuid": None,
+            "count": None,
+            "name": None,
+            "memory_mib": None,
+            "driver_version": None,
+        }
+
+    if not gpu_uuid.startswith("GPU-") or str(UUID(gpu_uuid[4:])) != gpu_uuid[4:].lower():
+        raise ValueError("expected a full GPU UUID")
+    output = subprocess.check_output(
+        (
+            "nvidia-smi",
+            f"--id={gpu_uuid}",
+            "--query-gpu=uuid,name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ),
+        text=True,
+        timeout=10,
+    )
+    (row,) = csv.reader(output.splitlines(), skipinitialspace=True)
+    observed_uuid, name, memory, driver = (field.strip() for field in row)
+    if observed_uuid.lower() != gpu_uuid.lower():
+        raise ValueError("nvidia-smi returned a different GPU UUID")
+    return {
+        "uuid": observed_uuid,
+        "count": 1,
+        "name": name,
+        "memory_mib": int(memory),
+        "driver_version": driver,
+    }
 
 
 def file_sha256(path: Path) -> str:
@@ -227,7 +260,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-result", type=Path, required=True)
     parser.add_argument("--dataset-manifest", type=Path, required=True)
-    parser.add_argument("--repo-dir", type=Path, default=Path("/opt/vllm-gr"))
+    parser.add_argument(
+        "--repo-dir", type=Path, help="Accepted for compatibility with existing invocations"
+    )
+    parser.add_argument("--catalog-path", help="Actual server catalog path for online summaries")
+    parser.add_argument("--gpu-uuid", help="Full NVIDIA UUID of the device used for measurement")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--warmup-requests", type=int, required=True)
@@ -236,8 +273,8 @@ def main() -> int:
     parser.add_argument("--service-metrics", type=Path)
     parser.add_argument("--server-log", type=Path)
     parser.add_argument("--execution-mode", choices=("online", "offline"), default="online")
-    parser.add_argument("--host-name", default=os.environ.get("HOST_NAME") or socket.gethostname())
-    parser.add_argument("--container-name", default="vllm-gr-benchmark")
+    parser.add_argument("--host-name", default=os.environ.get("HOST_NAME") or "reference-host")
+    parser.add_argument("--container-name", default="unspecified")
     parser.add_argument("--git-sha", required=True)
     parser.add_argument("--git-subject", required=True)
     parser.add_argument("--git-branch")
@@ -250,6 +287,8 @@ def main() -> int:
 
     raw = json.loads(args.raw_result.read_text(encoding="utf-8"))
     offline = args.execution_mode == "offline" or raw.get("execution_mode") == "offline"
+    if not offline and not args.catalog_path:
+        parser.error("--catalog-path is required for online summaries")
     if not offline and args.service_metrics is None:
         parser.error("--service-metrics is required for online summaries")
     service_metrics = (
@@ -269,13 +308,10 @@ def main() -> int:
     started = started_utc.astimezone(SHANGHAI)
     finished = finished_utc.astimezone(SHANGHAI)
 
-    gpu_line = run_text(
-        "nvidia-smi",
-        "--query-gpu=name,memory.total,driver_version",
-        "--format=csv,noheader,nounits",
-        "--id=0",
-    )
-    gpu_name, gpu_memory, driver_version = [part.strip() for part in gpu_line.split(",")]
+    try:
+        gpu = gpu_metadata(args.gpu_uuid)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        parser.error(f"could not verify --gpu-uuid: {exc}")
     num_prompts = int(raw["num_prompts"])
     failed = int(raw["failed"])
     cache = service_metrics.get("prefix_cache")
@@ -371,6 +407,11 @@ def main() -> int:
         if args.source_change is not None and args.source_change.is_file()
         else None
     )
+    server_args = (
+        raw["engine_config"]
+        if offline
+        else {**(raw.get("engine_config") or {}), "catalog_path": args.catalog_path}
+    )
     summary = {
         "schema_version": "vllm-gr.daily.v1",
         "run": {
@@ -394,13 +435,8 @@ def main() -> int:
         },
         "environment": {
             "host": args.host_name,
-            "hardware": "L20",
-            "gpu": {
-                "count": 1,
-                "name": gpu_name,
-                "memory_mib": int(gpu_memory),
-                "driver_version": driver_version,
-            },
+            "hardware": gpu["name"],
+            "gpu": gpu,
             "container": {
                 "name": args.container_name,
                 "image": args.container_image,
@@ -410,7 +446,7 @@ def main() -> int:
                 "vllm_version": vllm.__version__,
                 "vllm_gr_version": vllm_gr.__version__,
                 "torch_version": torch.__version__,
-                "cuda_forward_compat": True,
+                "cuda_forward_compat": None,
             },
         },
         "model": {
@@ -459,19 +495,7 @@ def main() -> int:
                 "input_tokens": args.input_length,
             },
             "warmup_requests": args.warmup_requests,
-            "server_args": raw["engine_config"]
-            if offline
-            else {
-                "max_logprobs": 1024,
-                "beam_max_width": 1024,
-                "max_num_seqs": 1024,
-                "max_num_batched_tokens": 16384,
-                "scheduling_policy": "fcfs",
-                "gpu_memory_utilization": 0.90,
-                "catalog_path": "/opt/vllm-gr/test_profilling/video_constraint_triples.json",
-                "constraint_backend": "constraint_table",
-                "enable_thinking": False,
-            },
+            "server_args": server_args,
             "benchmark_args": {
                 "temperature": 0,
                 "max_tokens": raw["max_tokens"] if offline else None,

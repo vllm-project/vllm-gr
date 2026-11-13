@@ -392,6 +392,9 @@ command, and output location. Report skips and unavailable coverage explicitly.
 
 ## Resource helper
 
+These optional helpers are for single-host development. Use a scheduler or
+reservation mechanism to allocate devices on a shared system.
+
 Source `tools/devices/resource.sh` from the root. It delegates to `resource-npu.sh` when
 `npu-smi` is present. Device selection does not reserve the returned device, and
 it honors the runtime visibility variables: when `CUDA_VISIBLE_DEVICES` (or
@@ -425,16 +428,32 @@ CUDA_VISIBLE_DEVICES="$device_id" python -m pytest -q tests/kernels/test_rec_con
 ```
 
 Callers own the cleanup of processes returned by the lock helpers. Do not use
-device-wide process cleanup to reclaim another developer's work. The CI cleanup
-path validates CUDA device mapping before acting; consult
-`tools/ci/check_cuda_device_mapping.py` and `tools/ci/gpu_process_guard.py` when
-changing that behavior.
+device-wide process cleanup to reclaim another developer's work.
 
-`scripts/kill_vllm_on_device.sh` sends SIGTERM to matching EngineCore processes
-on the selected GPUs and then requires those GPUs to have no compute processes.
-The name and device checks do not establish which job owns a process. Use it
-only on devices allocated to the cleanup job, not on shared devices where it
-could terminate another user's work.
+### CUDA process inspection and cleanup
+
+Use only GPUs allocated to your job. From the repository root, set
+`CUDA_VISIBLE_DEVICES` to the numeric device indices assigned to the job and
+verify the mapping before running the read-only process check.
+
+```bash
+(
+  set -e
+  export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0
+  CI_CUDA_MAPPING_FILE=$(mktemp)
+  export CI_CUDA_MAPPING_FILE
+  trap 'rm -f -- "$CI_CUDA_MAPPING_FILE"' EXIT
+  python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
+  python tools/ci/gpu_process_guard.py check
+)
+```
+
+**Destructive operation.** When you intend to clean an allocated GPU, replace
+the final command with `bash scripts/kill_vllm_on_device.sh --yes` and rerun the
+block. The script sends SIGTERM to matching EngineCore processes and fails if
+any compute processes remain. Confirm job ownership before opting in. The
+wrapper requires `--yes` before querying devices or signaling processes, including
+when called from CI or external automation.
 
 ## GitHub Actions tester
 

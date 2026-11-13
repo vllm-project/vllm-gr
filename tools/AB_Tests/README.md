@@ -1,97 +1,118 @@
-# AB_Tests — A/B performance testing for vllm-gr PRs
+# A/B benchmark utilities
 
-Runs an **A-B-B-A** offline beam-search benchmark (baseline → head → head → baseline) against a vllm-gr PR and produces a base-vs-head latency comparison report. **Mode B: each developer runs their own benchmark server** — the scripts are shared, the config is private.
+Use the [`ab-offline` CLI](../../docs/cli/README.md#offline-ab) with your local
+CUDA runtime, model, and OneRec dataset. The
+[OneRec catalog guide](../../examples/online_serving/catalog/README.md#build-a-catalog-from-the-onerec-dataset)
+shows how to generate the constraint triples to pass with `--catalog`.
 
-## Directory structure
-
-| File | Where it runs | Purpose |
-| --- | --- | --- |
-| `ab_benchmark.sh` | **Local (developer machine)** | Entry point: resolves the PR's base/head SHAs → SSHes to the server to launch A-B-B-A → polls for the report → fetches and prints it |
-| `ab_runner.sh` | Server | Runs the A-B-B-A four-pass offline benchmark (checkout → docker `run_offline_benchmark.py` → `generate_summary.py`) |
-| `compare_ab.py` | Server | Compares the two sides' summaries and emits a markdown + json report |
-| `benchmark.env.example` | Server | Config template (container name / GPU / paths); copy to `benchmark.env` (git-ignored) |
-| `run_offline_benchmark.py` | Server (in container) | Offline beam-search benchmark engine, invoked directly by `ab_runner.sh` |
-| `generate_summary.py` | Server (in container) | Aggregates `raw-result.json` → `summary.json` |
-| `download_onerec_dataset.py` | Server (in container) | Verifies / downloads the OneRec dataset |
-| `instrumentation/` | Server (in container) | Lightweight CPU timing probes (`sitecustomize.py` + `vllm_gr_lightweight_timing.py`), injected via `PYTHONPATH` |
-| `constraints/` | Server (in container) | Constraint catalog triples doc (`video_constraint_triples.json`) for constrained beam decoding, committed with the tooling |
-
-**This directory is self-contained**: the benchmark engine dependencies above are committed with this directory; nothing needs to be copied from `tools/daily_benchmark/`.
-
-## Prerequisites
-
-**Local**: `bash`, `ssh`; [`gh`](https://cli.github.com/) (with `gh auth login`) only if you resolve a PR number.
-
-**Server** (all four required):
-
-1. **SSH access** — an alias in `~/.ssh/config` using your own key (never share private keys).
-2. **A benchmark container with the vllm-gr image** — inside the container `/opt/vllm-gr` mounts the vllm-gr repo, and `nvidia-smi` / `torch.cuda` work.
-3. **The OneRec dataset** — at `/opt/vllm-gr/data` in the container (`download_onerec_dataset.py --tasks video` downloads/verifies it).
-4. **HF model access** — the container can pull `OpenOneRec/OneRec-1.7B` (`HF_ENDPOINT` can point at a mirror).
-
-## One-time setup
-
-### 1. Server side: `benchmark.env`
+The video benchmark uses the gated OpenOneRec dataset. Accept its terms, run
+`hf auth login`, and use the downloader to write the data and its manifest.
 
 ```bash
-# in the vllm-gr worktree on the server
-cd tools/AB_Tests
-cp benchmark.env.example benchmark.env
-vi benchmark.env    # set PROJECT_DIR / CONTAINER_NAME / GPU_INDEX / CONTAINER_DATA_DIR / ...
+python tools/AB_Tests/download_onerec_dataset.py --data-dir /path/to/onerec
+
+vllm bench ab-offline --gr \
+  --model /path/to/OneRec --data-dir /path/to/onerec --catalog /path/to/triples.json \
+  --beam-width 128 --input-length 1024 --output /path/to/ab-result.json
 ```
 
-### 2. Local: SSH alias + env vars
+## Compare revisions
+
+Use a separate virtual environment for each source checkout. The benchmark CLI
+prefers the checkout from which `vllm_gr` is loaded, so changing only the
+working directory can measure the same revision twice.
+
+In Bash, set the two checkout paths and choose two fresh virtual environment
+paths. Follow the [CUDA installation guide](../../docs/getting_started/installation/cuda.md)
+and apply the [GR CLI patch](../../docs/cli/README.md#enable-gr-dispatch) in each
+environment. The following setup uses the vLLM wheel installed by `pip`.
 
 ```bash
-# ~/.ssh/config
-Host my-gpu
-    HostName <your server IP>
-    User <username>
-    IdentityFile ~/.ssh/id_ed25519
+BASE_CHECKOUT=/path/to/baseline-checkout
+HEAD_CHECKOUT=/path/to/head-checkout
+BASE_VENV=/path/to/venvs/onerec-baseline
+HEAD_VENV=/path/to/venvs/onerec-head
+BASE_SHA=$(git -C "$BASE_CHECKOUT" rev-parse HEAD)
+HEAD_SHA=$(git -C "$HEAD_CHECKOUT" rev-parse HEAD)
+
+prepare_checkout() (
+  set -eu
+  cd -- "$1"
+  if [[ -e "$2" || -L "$2" ]]; then
+    printf 'Choose a fresh virtual environment path for %s\n' "$PWD" >&2
+    exit 1
+  fi
+  unset PYTHONPATH PYTHONHOME
+  uv venv --python 3.12 --seed "$2"
+  source "$2/bin/activate"
+  VLLM_GR_TARGET_DEVICE=cuda python -m pip install -e .
+  site_packages=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+  cli_patch=docs/cli/patches/vllm-0.30.0-gr-cli.patch
+  patch --dry-run --forward -d "$site_packages" -p1 < "$cli_patch"
+  patch --forward -d "$site_packages" -p1 < "$cli_patch"
+)
+
+(
+  set -e
+  prepare_checkout "$BASE_CHECKOUT" "$BASE_VENV"
+  prepare_checkout "$HEAD_CHECKOUT" "$HEAD_VENV"
+)
 ```
+
+Confirm that `BASE_SHA` and `HEAD_SHA` are the intended commit IDs. Before
+each measurement, verify the loaded package and benchmark checkout. Use the
+same model, data, and catalog paths for both runs and save separate outputs.
 
 ```bash
-# optional: set defaults in your local shell so you don't pass --server every time
-export AB_SERVER=my-gpu
-export AB_REMOTE_DIR=/path/on/server/to/vllm-gr
+MODEL=/path/to/OneRec
+DATA_DIR=/path/to/onerec
+CATALOG=/path/to/triples.json
+
+measure_checkout() (
+  set -eu
+  cd -- "$1"
+  git diff --quiet HEAD --
+  unset PYTHONPATH PYTHONHOME
+  export PYTHONNOUSERSITE=1
+  source "$2/bin/activate"
+  "$VIRTUAL_ENV/bin/python" -I - "$3" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+import vllm_gr
+from vllm_gr.benchmarks import scenarios
+
+checkout = Path.cwd().resolve()
+package = Path(vllm_gr.__file__).resolve()
+root = scenarios._REPO_ROOT
+if package != checkout / "vllm_gr" / "__init__.py" or root != checkout:
+    raise SystemExit(f"Expected {checkout}, loaded package {package} and benchmark checkout {root}")
+script = (root / scenarios.SCENARIOS["ab-offline"].path).resolve(strict=True)
+if not script.is_relative_to(checkout):
+    raise SystemExit(f"Benchmark script escapes checkout {checkout}: {script}")
+sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+if sha != sys.argv[1]:
+    raise SystemExit(f"Expected Git SHA {sys.argv[1]}, loaded {sha}")
+print(f"GR package {package}\nBenchmark script {script}\nGit SHA {sha}")
+PY
+  "$VIRTUAL_ENV/bin/vllm" bench ab-offline --gr \
+    --model "$MODEL" --data-dir "$DATA_DIR" --catalog "$CATALOG" \
+    --beam-width 128 --input-length 1024 --output "$4"
+)
+
+(
+  set -e
+  measure_checkout "$BASE_CHECKOUT" "$BASE_VENV" "$BASE_SHA" /path/to/baseline.json
+  measure_checkout "$HEAD_CHECKOUT" "$HEAD_VENV" "$HEAD_SHA" /path/to/head.json
+)
 ```
 
-## Usage
+Keep the dataset manifest and verified Git SHAs with the results. Convert the
+raw results with `generate_summary.py` and compare the resulting summaries with
+`compare_ab.py`.
 
-```bash
-# A/B PR #358 with the default scenario (beam 128, input 1024)
-./ab_benchmark.sh 358
-
-# pick server / scenario
-./ab_benchmark.sh 358 --server my-gpu --scenario 256:1024
-
-# compare any two commits (no gh needed)
-./ab_benchmark.sh --base <base_sha> --head <head_sha>
-
-# also download the report locally
-./ab_benchmark.sh 358 --save-dir ./reports
-```
-
-The **scenario** defaults to `128:1024` (`beam_width:input_tokens`; beam width is restricted to 64/128/256). Tuning such as the number of prompts and warmup requests lives in the server's `benchmark.env`.
-
-A PR's four A-B-B-A passes (each reloads the model + 100 requests) take roughly **10–15 minutes**; the script polls until the report is generated or it times out (default 1 hour).
-
-## Reading the results
-
-The report is a `base→head (delta%)` table; **positive delta% = slower (regression), negative = faster (improvement)**. Noise thresholds: mean/p50 +/-2%, p90 +/-3%, p99 +/-5%; values beyond threshold are flagged ⚠️.
-
-Pitfalls to know:
-
-- **The baseline is the merge base (fork point) of the PR head and `origin/decode_graph`, not the current `origin/decode_graph` tip** — the tip may already include other merged PRs and would mix in unrelated changes. `ab_runner.sh` computes `git merge-base origin/decode_graph <head>` server-side; `ab_benchmark.sh` passes only the head, so a stale "Base: xxx" from the PR body is never used.
-- **A p50 ⚠️ is often just the hit/miss bimodal boundary**: prefill / total_beam's p50 lands in the fast (hit ~13ms / ~53ms) sample band, while mean/p90/p99 land in the slow (miss ~43ms / ~82ms) band. Judge a real regression by whether **mean/p90/p99 move in the same direction**; a p50-only move is usually not real.
-- The primary signal is `e2el` / `e2el_hit` / `decode` / `decode_hit` — those are the end-to-end latencies.
-
-## Known limitations
-
-- `run_offline_benchmark.py` measures `GRLLM.beam_search()` through public text materialization. It reports cold/hit E2E; legacy frontend stage diagnostics are retired. Keep model, catalog, width, input length, warmup, and output consumption identical on both sides.
-- The report is only saved/printed; it is **not** auto-commented to the PR — whether to post it is up to you.
-- Server-side `ab_runner.sh` requires the worktree to be on a clean `decode_graph` branch, and it runs `git fetch origin decode_graph` and `git fetch origin pull/<N>/head` (the server must be able to reach GitHub).
-
-## How it survives `git checkout`
-
-`ab_runner.sh` switches the worktree between base and head with `git checkout --detach <sha>`. Because the benchmark engine now lives in the *tracked* `tools/AB_Tests/` directory, checking out a base/head commit that predates this directory would delete those files from the working tree mid-run. To avoid that, `ab_runner.sh` first copies the engine (`run_offline_benchmark.py`, `generate_summary.py`, `download_onerec_dataset.py`, `compare_ab.py`, `instrumentation/`, and `constraints/`) into the git-ignored `results/ab/.tooling/` directory and runs everything from there. That staging dir sits under `results/`, which is git-ignored and holds only untracked files, so `git checkout` never touches it — the A/B can run against any base/head commit regardless of when this tooling was added.
+Direct `generate_summary.py` invocations accept `--repo-dir` for compatibility.
+Online summaries require `--catalog-path` matching the server configuration.
+Supply `--gpu-uuid` when you have the full UUID of the device that ran the benchmark.
+Without a UUID, the summary records the GPU identity as unknown.
