@@ -20,19 +20,23 @@ may need network access and tool downloads on their first run.
 | --- | --- |
 | `pre-commit run markdownlint --files docs/development.md` | One hook on the named Markdown file |
 | `pre-commit run ruff-check --files vllm_gr/plugin.py` | One hook on the named Python file; may apply fixes |
-| `pre-commit run --files <paths>` | Every applicable hook for those paths, including `run-tests` |
-| `pre-commit run` | Applicable hooks for staged files, including the test hook when selected |
-| `pre-commit run --all-files` | All applicable hooks, including the full slow test suite |
-| `SKIP=run-tests pre-commit run --all-files` | Other applicable hooks; explicitly omits pytest coverage |
+| `pre-commit run --files <paths>` | Applicable lint and validation hooks for those paths; no pytest |
+| `pre-commit run` | Applicable lint and validation hooks for staged files; no pytest |
+| `pre-commit run --all-files` | Applicable lint and validation hooks across tracked files; no pytest |
+| `pre-commit run run-tests --hook-stage manual --all-files` | Explicitly run the test hook |
+| `pre-commit run --hook-stage manual --all-files` | All applicable hooks, including the test hook |
+| `SKIP=run-tests pre-commit run --hook-stage manual --all-files` | Manual-stage checks with pytest explicitly omitted |
 
-The local `run-tests` hook calls `tools/pre_commit/run_tests.sh`, which executes:
+The `run-tests` hook runs only in the manual stage, so normal commits do not
+start pytest. It calls `tools/pre_commit/run_tests.sh`, which defaults to:
 
 ```bash
 python3 -m pytest -x --run-slow --durations=10 -s tests
 ```
 
-It uses `pass_filenames: false`, so selecting changed files does not restrict
-pytest to those files. Use explicit hook IDs for documentation-only checks.
+When `VLLM_GR_TEST_LEVEL` is set, the wrapper runs that level instead. It uses
+`pass_filenames: false`, so selecting changed files does not restrict pytest
+to those files. Use explicit hook IDs for documentation-only checks.
 See [validation levels](tools/README.md#validation-levels) for targeted tests,
 hardware requirements, and the platform-specific behavior of `tools/run_test.sh`.
 
@@ -108,6 +112,9 @@ needed merely because the configuration changed. If an environment is corrupt,
 `pre-commit clean` removes the local hook cache, and the next run rebuilds it.
 Use that only when cache repair is needed.
 
-CI invokes pre-commit in its prepared runtime and runs additional benchmark
-and system gates. Local hook success does not replace those checks; see
+CI explicitly selects the manual stage in its prepared runtime, with
+`VLLM_GR_TEST_LEVEL=pr`, and runs additional benchmark and system gates.
+External CI callers that expect the test hook must also select
+`--hook-stage manual`; a default pre-commit invocation runs no pytest.
+Local hook success does not replace those checks; see
 [Contributing](../CONTRIBUTING.md#pull-request-ci).

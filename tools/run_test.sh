@@ -153,7 +153,7 @@ if [ "${npu_state:-false}" == "true" ]; then
 else
     NODEENV_SSL_NO_VERIFY=1 \
     CUDA_VISIBLE_DEVICES=$idle_gpu \
-    pre-commit run --all-files
+    pre-commit run --hook-stage manual --all-files
 fi
 
 if [[ "$RUN_WHEEL" == "true" ]]; then

@@ -53,7 +53,8 @@ python -c 'import vllm_gr; print(vllm_gr.__file__)'
 
 ## Validation and reporting
 
-`pre-commit run --all-files` includes the full pytest suite with `--run-slow`.
+`pre-commit run --all-files` runs lint and validation hooks. Tests require the
+manual stage; see [hook scope](docs/PRE_COMMIT.md#choose-the-scope).
 Use explicit hook IDs for documentation changes. `tools/run_test.sh` selects an
 accelerator and may build NPU operators; check its documented prerequisites.
 

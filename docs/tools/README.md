@@ -13,7 +13,7 @@ targeted check does not satisfy every CI gate.
 | Level | Entry point | Requirements and evidence |
 | --- | --- | --- |
 | Documentation | Explicit Markdown, character, typo, and whitespace hooks | No accelerator; also check local links and commands |
-| Other pre-commit hooks | `SKIP=run-tests pre-commit run --all-files` | Prepared hook environments; explicitly excludes pytest |
+| Lint and validation hooks | `pre-commit run --all-files` | Prepared hook environments; does not run pytest |
 | Targeted regression | `python -m pytest -q <test-file-or-node>` | Dependencies and fixtures of the selected tests; inspect device checks |
 | Kernel/integration | Selected `tests/kernels/` or `tests/integration/` files | Matching CUDA or Ascend runtime and a usable device |
 | Model/system | Selected `tests/st/` files or documented probes | Device, model snapshot, configuration/artifact, and any test data |
@@ -25,7 +25,7 @@ targeted check does not satisfy every CI gate.
 
 Use the [documentation checklist](../PRE_COMMIT.md#documentation-checks) for
 Markdown changes and [hook scope](../PRE_COMMIT.md#choose-the-scope) for other
-edits. Explicit hook IDs avoid launching the full pytest suite.
+edits. Tests run only when the manual stage is explicitly selected.
 
 ### Regression design
 
@@ -145,10 +145,12 @@ for that accelerator; `cpu` selects CPU tests only. Without a target it
 does not apply a platform filter. An unknown or unclassified test is an error.
 An empty L5 selection reports that no stability tests ran; an empty selection
 at another level is an error. Additional pytest
-arguments may be supplied after the level. The full local `run-tests` hook
-continues to run all tests unless `VLLM_GR_TEST_LEVEL` is explicitly set.
+arguments may be supplied after the level. Explicitly invoke the local hook with
+`pre-commit run run-tests --hook-stage manual --all-files`; it runs all tests
+unless `VLLM_GR_TEST_LEVEL` is set. Normal commits do not invoke the test hook.
 
-The pre-commit CI job sets `VLLM_GR_TEST_LEVEL=pr` to run L1/L2. The separate
+The pre-commit CI job selects the manual stage and sets
+`VLLM_GR_TEST_LEVEL=pr` to run L1/L2. The separate
 level workflow selects L3 on pushes to `main`, L4 nightly, and L5 weekly; it
 also supports manual level selection. These level runs require a GPU runner.
 The shared self-hosted pool has no GPU/NPU labels, so it can assign an NPU
@@ -311,8 +313,8 @@ The script performs these steps:
     - Selection respects the runtime visibility variables: when
       `CUDA_VISIBLE_DEVICES` (or `ASCEND_RT_VISIBLE_DEVICES`) is set, only the
       listed indices are considered (see [Resource helper](#resource-helper)).
-3. On CUDA, runs `pre-commit run --all-files` with the selected device, including
-   the `run-tests` hook.
+3. On CUDA, runs `pre-commit run --hook-stage manual --all-files` with the
+   selected device, including the `run-tests` hook.
 4. On NPU, probes/builds xllm-ops through `tools/install_xllm_ops.sh`, loads the
    custom operator environment, sets spawn-related variables, and directly runs
    `tools/pre_commit/run_tests.sh`. This branch does not run the other pre-commit
