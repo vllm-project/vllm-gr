@@ -331,6 +331,9 @@ def _columns_result(session_id: str, request: Any) -> BeamBatchResult:
     tokens = np.arange(6, dtype="<i4").reshape(2, 3)
     scores = np.array([-1.0, -2.0], dtype="<f4")
     parents = np.array([[0, 0, 0], [0, 1, 0]], dtype="<i4")
+    parent_bytes = (
+        parents.tobytes() if request.output_options.include_parent_beam_indices else None
+    )
     return BeamBatchResult(
         protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
         batch_id=session_id,
@@ -345,7 +348,7 @@ def _columns_result(session_id: str, request: Any) -> BeamBatchResult:
                         steps=3,
                         token_ids=tokens.tobytes(),
                         cumulative_logprobs=scores.tobytes(),
-                        parent_beam_indices=parents.tobytes(),
+                        parent_beam_indices=parent_bytes,
                     ),
                 )
                 for index, item in enumerate(request.items)
@@ -375,7 +378,8 @@ def test_binary_beam_output_is_opt_in_over_grpc() -> None:
             assert list(item.beams.output_ids) == [0, 1, 2, 3, 4, 5]
             assert list(item.beams.output_offsets) == [0, 3, 6]
             assert list(item.beams.cumulative_logprobs) == [-1.0, -2.0]
-            assert list(item.beams.parent_beam_indices) == [0, 0, 0, 0, 1, 0]
+            assert not list(item.beams.parent_beam_indices)
+            assert list(item.beams.parent_offsets) == [0, 0, 0]
 
     asyncio.run(run())
 
@@ -385,8 +389,11 @@ def test_binary_beam_output_round_trips_columns_over_grpc() -> None:
     async def run() -> None:
         async with connection() as (stub, backend, submitted, servicer):
             _install_columns_wait(backend)
-            request = pb.BatchGenerateRequest(requests=[message()], binary_beam_output=True)
+            member = message()
+            member.beam_search.include_parent_beam_indices = True
+            request = pb.BatchGenerateRequest(requests=[member], binary_beam_output=True)
             response = await stub.GenerateBatch(request, timeout=5)
+            assert submitted[0].output_options.include_parent_beam_indices
             item = response.items[0]
             assert item.HasField("binary_beams")
             assert not item.HasField("beams")
@@ -444,6 +451,7 @@ def test_binary_beam_output_falls_back_for_small_results_over_grpc() -> None:
             response = await stub.GenerateBatch(request, timeout=5)
             first, second = response.items
             assert first.HasField("binary_beams")
+            assert not first.binary_beams.HasField("parent_beam_indices_i32_le")
             assert not first.HasField("beams")
             assert second.HasField("beams")
             assert not second.HasField("binary_beams")
@@ -452,6 +460,7 @@ def test_binary_beam_output_falls_back_for_small_results_over_grpc() -> None:
             assert list(second.beams.stop_token_ids) == [7]
 
     asyncio.run(run())
+
 @pytest.mark.parametrize("fault", ["stream", "penalty", "mm", "kv", "mixed", "duplicate"])  # type: ignore[misc]
 def test_incompatible_inputs_are_rejected_not_ignored(fault: str) -> None:
     servicer = BeamVllmEngineServicer(engine(), 0.0)
@@ -524,7 +533,9 @@ async def connection() -> AsyncIterator[tuple[Any, SimpleNamespace, list[Any], A
     port = server.add_insecure_port("127.0.0.1:0")
     await server.start()
     try:
-        async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+        async with grpc.aio.insecure_channel(
+            f"127.0.0.1:{port}", options=(("grpc.enable_http_proxy", 0),)
+        ) as channel:
             yield rpc.VllmEngineStub(channel), backend, submitted, servicer
     finally:
         await server.stop(0)
@@ -1165,7 +1176,9 @@ def test_upstream_startup_keeps_health_reflection_stats_and_cleanup_order(
             task = asyncio.create_task(upstream.serve_grpc(args))
             try:
                 await asyncio.wait_for(signals_ready.wait(), timeout=5)
-                async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+                async with grpc.aio.insecure_channel(
+                    f"127.0.0.1:{port}", options=(("grpc.enable_http_proxy", 0),)
+                ) as channel:
                     health = health_pb2_grpc.HealthStub(channel)
                     for service in ("", "vllm.grpc.engine.VllmEngine"):
                         response = await health.Check(
