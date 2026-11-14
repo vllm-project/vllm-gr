@@ -20,6 +20,7 @@ from tests.kernels.test_gpu_beam_stage_runner import (
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 
@@ -35,7 +36,7 @@ def test_admission_rejects_later_candidate_width_beyond_backend_capacity(per_par
         ),
     )
     with pytest.raises(ValueError, match="constraint backend capacity"):
-        get_stage_runner(worker, dispatch(m))
+        get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     assert not hasattr(worker, "_beam_context")
     assert not hasattr(worker, "_gr_gpu_stage_runner")
     worker._beam_postprocess_workspaces.require.assert_not_called()
@@ -113,7 +114,7 @@ def test_dynamic_stage_execution_and_reuse(
             scheduled.num_scheduled_tokens = {
                 req: (7 + i if stage == 0 else 1) for i, req in enumerate(m.request_ids)
             }
-            owner = get_stage_runner(worker, scheduled)
+            owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1)
             assert (owner.dynamic is not None) == (
                 per_parent_beam_widths is not None or any(width != 4 for width in widths)
             )

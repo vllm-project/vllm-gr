@@ -84,12 +84,37 @@ cleanup removes it before model replacement or shutdown.
 The switch is read from service configuration, not from individual requests;
 it does not add startup pre-capture or change schedule-miss behavior.
 
-The default stage hooks implement that V1 policy. `V2StageExecutionHooks`
-selects fixed storage, startup-only graph replay, batched Backend admission
-and full-member retirement. The V2 installer alone supplies the extended
+`CudaStageHooksV1` and `CudaStageHooksV2` subclass the `CudaStageHooks` abstract
+base class in `gpu_stage_hooks.py`. The ABC rejects missing operations and policy
+flags at construction. The class-side `CudaStageHooksType` Protocol additionally
+checks constructor compatibility at binding sites; mypy checks operation signatures
+and policy types. Hooks are constructed before session admission or graph-cache
+invalidation, so construction failure leaves those resources available for retry.
+The installed CUDA entrypoints explicitly bind
+hooks for both execution and startup capture; the shared stage core has no V1
+default. A Worker cannot switch its concrete hooks type after releasing a stage
+owner, including during repeated startup: `validate_stage_hooks_type` compares
+the bound class with the requested class. NPU dispatch retains its separate
+adapter and does not import either CUDA implementation.
+
+V1 retains stage-owned storage and lazy graph capture. V2 selects fixed Worker
+storage, configured startup graph capture, batched Backend admission and
+full-member retirement; its existing dynamic-shape recapture and recoverable
+failure handling remain in the V2 implementation. The V2 installer alone supplies the extended
 Backend capacity and runtime cleanup callback. Shared graph construction has
 an optional graph class; V2 uses a subclass for storage/model validation.
 There is no new environment switch or duplicated Beam state machine.
+
+The contracts document the existing eleven operations and two policy flags,
+including Prefill row ordering/counter updates, the V1 Host-input fence, input
+storage lifetime and capture recovery. They do not move remaining native field
+cleanup out of the core or unify graph policies. The dedicated mypy group checks
+the ABC, class-side Protocol, both implementations, core and binding sites together;
+see [CUDA stage hooks contract](PRE_COMMIT.md#cuda-stage-hooks-contract).
+
+Both runners retain upstream's opt-in vocabulary-sliced LM head. Decode hooks
+may return `None` after staging hidden states for sliced sampling; those states
+must remain valid when a later graph replay overwrites its output buffer.
 
 ## Configuration and scope
 

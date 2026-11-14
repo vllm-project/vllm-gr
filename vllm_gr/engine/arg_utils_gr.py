@@ -677,17 +677,13 @@ def create_engine_config(self, usage_context=None, headless=False):
             "sequence capacity or select smaller batch sizes"
         )
 
-    if (
-        effective_gr_config != existing_gr_config
-        or canonical_input is not None
-        or retired_input_present
-    ):
-        # vLLM config classes forbid undeclared fields. Keep GR-only values in
-        # VllmConfig.additional_config so they survive process serialization.
-        if canonical_source:
-            write_canonical_gr_config(config, effective_gr_config)
-        else:
-            effective_gr_config.write_to_vllm_config(config)
+    if canonical_source:
+        # vLLM hashes the raw additional_config for compilation. Normalize both
+        # canonical input paths even when their parsed values are unchanged, so
+        # omitted defaults cannot give equivalent engines different AOT caches.
+        write_canonical_gr_config(config, effective_gr_config)
+    elif effective_gr_config != existing_gr_config or retired_input_present:
+        effective_gr_config.write_to_vllm_config(config)
 
     if effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM:
         attention_config = getattr(config, "attention_config", None)

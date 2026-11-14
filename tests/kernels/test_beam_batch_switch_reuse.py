@@ -20,6 +20,7 @@ from tests.kernels.test_gpu_beam_stage_runner import (
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
 pytestmark = [
     pytest.mark.gpu_test,
@@ -70,7 +71,7 @@ def run(
         scheduled.num_scheduled_tokens = dict(
             zip(m.request_ids, lengths if stage == 0 else (1,) * batch)
         )
-        owner = get_stage_runner(worker, scheduled)
+        owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1)
 
         def prefill(w: Any, scheduled: Any) -> None:
             w.execute_model_state = SimpleNamespace(logits=base.repeat(batch, 1))
@@ -171,7 +172,7 @@ def test_cancelled_adapter_can_be_reused_after_another_batch() -> None:
         m, beam_params=msgspec.structs.replace(m.beam_params, dynamic_beam_widths=(2, 3, 4))
     )
     scheduled = dispatch(m)
-    owner = get_stage_runner(worker, scheduled)
+    owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1)
 
     def prefill(w: Any, scheduled: Any) -> None:
         w.execute_model_state = SimpleNamespace(logits=base[None, :])

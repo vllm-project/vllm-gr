@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 from vllm_gr.v1.worker.gpu_dynamic_beam import uses_dynamic_beam
 
 
@@ -113,7 +113,7 @@ def test_runtime_capture_recovery(monkeypatch, failure):
         else BeamDecodeCaptureUnsupported("capture refused")
     )
     graph.capture.side_effect = error
-    hooks = V2StageExecutionHooks(worker)
+    hooks = CudaStageHooksV2(worker)
     monkeypatch.setattr(hooks, "decode_graph", Mock(return_value=graph))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: failure == "capturing")
     sync = Mock(side_effect=RuntimeError("unhealthy") if failure == "unhealthy" else None)

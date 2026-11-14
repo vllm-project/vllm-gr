@@ -20,6 +20,7 @@ from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.engine.beam_search_v1 import GRDeviceStateRef
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
@@ -61,7 +62,7 @@ def test_rebind_preserves_views_and_resets_every_state_field(dtype, steps, batch
     )
     scheduled = dispatch(m)
     scheduled.num_scheduled_tokens = dict(zip(m.request_ids, m.num_prompt_tokens_by_request))
-    owner = get_stage_runner(worker, scheduled)
+    owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1)
     beam, state = owner.beam, owner.beam.state
     runners = beam.runners
     views = [dict(runner._state) for runner in runners]
@@ -82,7 +83,7 @@ def test_rebind_preserves_views_and_resets_every_state_field(dtype, steps, batch
         m = renamed(m, f"reused-{iteration}")
         scheduled = dispatch(m)
         scheduled.num_scheduled_tokens = dict(zip(m.request_ids, m.num_prompt_tokens_by_request))
-        assert get_stage_runner(worker, scheduled) is owner
+        assert get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1) is owner
         assert owner.beam is beam
         assert beam.runners is runners
         for index, (runner, row_views) in enumerate(zip(runners, views)):
@@ -135,7 +136,7 @@ def test_fused_reset_matches_full_reset_for_nonzero_row_and_preserves_other_rows
 def test_only_state_configuration_changes_rebuild_state():
     worker = admission_worker()
     m = metadata()
-    owner = get_stage_runner(worker, dispatch(m))
+    owner = get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     original = owner.beam
     release(owner, m)
     params = msgspec.structs.replace(m.beam_params, temperature=0.5, length_penalty=-1.0)
@@ -145,13 +146,13 @@ def test_only_state_configuration_changes_rebuild_state():
         num_prompt_tokens=17,
         num_prompt_tokens_by_request=(17,),
     )
-    get_stage_runner(worker, dispatch(m))
+    get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     assert owner.beam is original
     assert owner.beam.sessions[0]._state.prefix_len == 17
     release(owner, m)
     params = msgspec.structs.replace(params, stop_token_ids=(2,), ignore_stop_tokens=True)
     m = replace(renamed(m, "changed-state-params"), beam_params=params)
-    get_stage_runner(worker, dispatch(m))
+    get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     assert owner.beam is not original
     assert owner.beam.state.stop_token_ids.tolist() == [[2]] * owner.beam.state.max_batch_size
     assert owner.beam.state.ignore_stop_tokens.all().item()
@@ -172,11 +173,11 @@ def test_rebind_preserves_request_major_kv_slot():
     )
     worker._beam_postprocess_workspaces.require.return_value = workspace
     m = metadata()
-    owner = get_stage_runner(worker, dispatch(m))
+    owner = get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     beam = owner.beam
     assert owner.binding.kv_slot == 0
     release(owner, m)
-    get_stage_runner(worker, dispatch(m))
+    get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     assert owner.beam is beam
     assert owner.binding.kv_slot == 0
     first = worker._beam_context.pools[0].unshared_key
@@ -210,7 +211,7 @@ def test_request_local_rebind_updates_changed_kv_slot():
 def test_changed_resource_address_rebuilds_views_or_rejects_captured_binding(captured):
     worker = admission_worker()
     m = metadata()
-    owner = get_stage_runner(worker, dispatch(m))
+    owner = get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     old = owner.beam
     if captured:
         owner.graph = object()
@@ -219,12 +220,12 @@ def test_changed_resource_address_rebuilds_views_or_rejects_captured_binding(cap
     old.workspace.selected_token_ids = old.workspace.selected_token_ids.clone()
     if captured:
         with pytest.raises(ValueError, match="resource addresses or layouts changed"):
-            get_stage_runner(worker, dispatch(m))
+            get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
         assert (old.state.sequence == 321).all().item()
         assert not worker._beam_sessions
         assert owner.closed
     else:
-        owner = get_stage_runner(worker, dispatch(m))
+        owner = get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
         assert owner.beam is not old
         assert (
             owner.beam.runners[0]._selected_tokens.data_ptr()
@@ -237,13 +238,13 @@ def test_changed_resource_address_rebuilds_views_or_rejects_captured_binding(cap
 def test_invalid_pool_layout_is_rejected_before_reuse_reset():
     worker = admission_worker()
     m = metadata()
-    owner = get_stage_runner(worker, dispatch(m))
+    owner = get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     release(owner, m)
     owner.beam.state.sequence.fill_(123)
     pool = worker._beam_context.pools[1]
     pool.unshared_value = pool.unshared_value[..., :16]
     with pytest.raises(ValueError, match="identical layouts"):
-        get_stage_runner(worker, dispatch(m))
+        get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     assert (owner.beam.state.sequence == 123).all().item()
     assert owner.closed
     assert not worker._beam_sessions
@@ -253,13 +254,13 @@ def test_invalid_pool_layout_is_rejected_before_reuse_reset():
 def test_replaced_decision_storage_rebuilds_state_aliases_before_reset():
     worker = admission_worker()
     m = metadata()
-    owner = get_stage_runner(worker, dispatch(m))
+    owner = get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     old_state = owner.beam.state
     release(owner, m)
     decision = worker._beam_context.decision
     decision.sequence = torch.full_like(decision.sequence, 45)
     decision.beam_scores = torch.full_like(decision.beam_scores, 67)
-    owner = get_stage_runner(worker, dispatch(m))
+    owner = get_stage_runner(worker, dispatch(m), hooks_type=CudaStageHooksV1)
     state = owner.beam.state
     assert state is not old_state
     assert state.sequence.data_ptr() == decision.sequence.data_ptr()

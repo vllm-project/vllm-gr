@@ -222,9 +222,9 @@ def test_capture_order_and_failure_propagation(
 
 
 def test_stage_hooks_require_native_prefill_output_and_scheduler_kv() -> None:
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
-    hooks = V2StageExecutionHooks(SimpleNamespace())
+    hooks = CudaStageHooksV2(SimpleNamespace())
     with pytest.raises(RuntimeError, match="hidden states"):
         hooks.prefill_logits(lambda worker, scheduled: object(), object())
     with pytest.raises(RuntimeError, match="kv_blocks"):

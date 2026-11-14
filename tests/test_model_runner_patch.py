@@ -436,6 +436,8 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
 def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     monkeypatch: pytest.MonkeyPatch, mode: BeamExecutionMode | None
 ) -> None:
+    import builtins
+
     from vllm_gr.v1.worker import gr_startup
 
     fake_platforms = ModuleType("vllm.platforms")
@@ -472,8 +474,22 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
         )
 
     monkeypatch.setattr(model_runner_patch, "import_module", import_npu)
-    monkeypatch.setattr(gr_startup, "capture_async_forward", lambda _: events.append("stages"))
+    monkeypatch.setattr(
+        gr_startup,
+        "capture_async_forward",
+        lambda _, *, hooks_type: events.append("stages")
+        if hooks_type is None
+        else pytest.fail("NPU received CUDA hooks"),
+    )
     monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
+
+    original_import = builtins.__import__
+
+    def without_cuda_hooks(name: str, *args: Any, **kwargs: Any) -> Any:
+        assert not name.startswith("vllm_gr.v1.worker.gpu_beam_stage_runner")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_cuda_hooks)
     model_runner_patch.apply_worker_patches()
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert Runner().capture_model() == 17

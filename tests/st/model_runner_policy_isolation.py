@@ -27,11 +27,9 @@ class PolicyWorkerExtension:
 
     def policy_observe(self) -> None:
         from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
-        from vllm_gr.v1.worker.gpu_beam_stage_runner import (
-            GPUBeamStageRunner,
-            _StageExecutionHooks,
-        )
-        from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+        from vllm_gr.v1.worker.gpu_beam_stage_runner import GPUBeamStageRunner
+        from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+        from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
         self._policy_counts = {"capture": 0, "replay": 0, "eager": 0}
         self._policy_queries: list[list[int]] = []
@@ -52,11 +50,7 @@ class PolicyWorkerExtension:
                 return _fn(obj, *args, **kwargs)
 
             self._policy_probes.enter_context(patch.object(cls, method, observe))
-        hooks = (
-            V2StageExecutionHooks
-            if hasattr(self.model_runner, "req_states")
-            else _StageExecutionHooks
-        )
+        hooks = CudaStageHooksV2 if hasattr(self.model_runner, "req_states") else CudaStageHooksV1
         original_prefill = hooks.prefill_logits
 
         @wraps(original_prefill)
@@ -66,7 +60,7 @@ class PolicyWorkerExtension:
             return original_prefill(hook, original, scheduled, *args, **kwargs)
 
         self._policy_probes.enter_context(patch.object(hooks, "prefill_logits", prefill))
-        if hooks is _StageExecutionHooks:
+        if hooks is CudaStageHooksV1:
             from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
             original_execute = GPUPrefillGraphRunner.execute_model_prefill

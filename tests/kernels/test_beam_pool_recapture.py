@@ -15,7 +15,7 @@ from tests.kernels.test_gpu_beam_stage_runner import (
     install_decode_model,
 )
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
 from vllm_gr.v1.worker.gr_startup import _capture_batch
 
@@ -68,8 +68,7 @@ def test_recapture_after_last_graph_retired_with_live_output(
     assert retained[0].numel() > 0
 
     assert (
-        _capture_batch(worker, 1, hooks_type=V2StageExecutionHooks, allow_eager_fallback=False)
-        is None
+        _capture_batch(worker, 1, hooks_type=CudaStageHooksV2, allow_eager_fallback=False) is None
     )
     assert worker._beam_decode_graph is graph
     assert graph.select(1, 4).ready
@@ -114,8 +113,7 @@ def test_recapture_preserves_other_live_geometry(
     assert graph.select(2, 4).ready
     survivor = weakref.ref(graph.wrapper.concrete_cudagraph_entries[graph.descriptor].cudagraph)
     assert (
-        _capture_batch(worker, 1, hooks_type=V2StageExecutionHooks, allow_eager_fallback=False)
-        is None
+        _capture_batch(worker, 1, hooks_type=CudaStageHooksV2, allow_eager_fallback=False) is None
     )
     assert graph.wrapper.graph_pool == pool
     assert survivor() is not None
@@ -132,8 +130,7 @@ def test_recapture_preserves_other_live_geometry(
     gc.collect()
     assert survivor() is None
     assert (
-        _capture_batch(worker, 1, hooks_type=V2StageExecutionHooks, allow_eager_fallback=False)
-        is None
+        _capture_batch(worker, 1, hooks_type=CudaStageHooksV2, allow_eager_fallback=False) is None
     )
     assert graph.select(1, 4).ready
     assert graph.wrapper.graph_pool != pool

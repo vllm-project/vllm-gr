@@ -156,7 +156,7 @@ patches:
 
   - id: GR-PATCH-011
     owner: vllm_gr/v1/worker/gpu_model_runner_patch.py and gpu_model_runner_v2_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/gpu_prefill_requests_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/gpu_prefill_requests_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/gpu_stage_hooks.py, vllm_gr/v1/worker/gpu_beam_stage_runner.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the selected CUDA ModelRunner V1 or V2 is discovered and its hooks are incomplete; the common installer mounts Worker utilities and model-load hooks regardless of the management listener; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
     validator_or_test:
@@ -169,6 +169,9 @@ patches:
       - tests/test_model_runner_patch.py::test_active_cuda_worker_hot_update_utility_contract
       - tests/sidecar/test_worker_update.py
       - tests/v1/worker/test_constraint_lifecycle.py
+      - tests/test_model_runner_stage_binding.py
+      - tests/test_gr_startup.py
+      - tests/tools/test_cuda_stage_typing.py
       - tests/st/test_modelrunner_v2_stage_parity_st.py
     process_roles: [gpu_worker]
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner, vllm.v1.worker.gpu.model_runner.GPUModelRunner, and vllm.v1.worker.gpu_worker.Worker.reload_trie

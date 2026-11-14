@@ -26,8 +26,9 @@ that surface onto the V2 ModelRunner
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from vllm.logger import init_logger
@@ -38,19 +39,19 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
     _hidden_logits,
-    _StageExecutionHooks,
     should_replay_decode_graph,
 )
+from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
 
 logger = init_logger(__name__)
 
 
-class V2StageExecutionHooks(_StageExecutionHooks):
-    """_StageExecutionHooks bound to the V2 GPUModelRunner surface."""
+class CudaStageHooksV2(CudaStageHooks):
+    """V2 native operations and graph policy for the shared CUDA stage core."""
 
-    persistent_graph_install = False
+    persistent_graph_install: ClassVar[bool] = False
     # Both runners allocate and use the transposed head only when slicing is requested.
-    supports_transposed_head = True
+    supports_transposed_head: ClassVar[bool] = True
 
     def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
         from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2InputBuffers
@@ -100,6 +101,7 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         )
 
     def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
+        assert owner.inputs is not None
         from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
         worker = self.worker
@@ -202,7 +204,7 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             )
 
     def prefill_logits(
-        self, original: Any, scheduler_output: Any, *args: Any, **kwargs: Any
+        self, original: Callable[..., Any], scheduler_output: Any, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
         worker = self.worker
         from contextlib import nullcontext

@@ -214,6 +214,7 @@ def test_production_routes_forward_arguments_and_map_errors() -> None:
 @pytest.mark.l1
 def test_runner_keeps_the_same_wrapper_across_reload() -> None:
     from vllm_gr.v1.worker import gpu_beam_stage_runner as stages
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     old, new = _backend(), _backend()
     table = VersionedConstraintTable(old, loader=lambda _: new)
@@ -221,10 +222,10 @@ def test_runner_keeps_the_same_wrapper_across_reload() -> None:
     owner = SimpleNamespace(
         closed=False,
         backend=table,
-        hooks=stages._StageExecutionHooks.__new__(stages._StageExecutionHooks),
+        hooks=CudaStageHooksV1(SimpleNamespace()),
     )
     runner = SimpleNamespace(constraint_backend=table, _gr_gpu_stage_runner=owner)
-    assert stages.get_stage_runner(runner, object()) is owner
+    assert stages.get_stage_runner(runner, object(), hooks_type=CudaStageHooksV1) is owner
     assert owner.backend is runner.constraint_backend
     assert owner.backend.info is new.info
     assert not hasattr(runner, "_gr_versioned_constraint_table")

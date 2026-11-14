@@ -27,7 +27,7 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     get_stage_runner,
 )
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import (
-    V2StageExecutionHooks,
+    CudaStageHooksV2,
 )
 from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
 from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
@@ -54,7 +54,7 @@ def test_runtime_recapture_refusal_preserves_live_request(monkeypatch):
     worker._gr_dynamic_graphs_discarded = True
     m = metadata()
     scheduled = dispatch(m)
-    owner = get_stage_runner(worker, scheduled, hooks_type=V2StageExecutionHooks)
+    owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV2)
     decode = replace(m, kind=GRStageKind.DECODE, stage_index=1, decode_step=0, kv_blocks=((1,),))
     owner.prepared = owner.prepare_cpu(decode, 0)
     owner._bind_attention(decode)
@@ -98,7 +98,7 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     # Refuse every capture attempt the way an unsupported op does. Only the
     # capture call is refused, so the shape stays servable through eager.
     refuse = [True]
-    original = V2StageExecutionHooks.forward_hidden
+    original = CudaStageHooksV2.forward_hidden
 
     def forward(
         self: Any,
@@ -112,13 +112,13 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
             raise RuntimeError("operation not supported when stream is capturing")
         return original(self, ids, positions, attention, slots, capture)
 
-    monkeypatch.setattr(V2StageExecutionHooks, "forward_hidden", forward)
+    monkeypatch.setattr(CudaStageHooksV2, "forward_hidden", forward)
     slots = iter((0, 1))
 
     def serve_decode() -> Any:
         m = metadata()
         scheduled = dispatch(m)
-        owner = get_stage_runner(worker, scheduled, hooks_type=V2StageExecutionHooks)
+        owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV2)
         decode = replace(
             m, kind=GRStageKind.DECODE, stage_index=1, decode_step=0, kv_blocks=((1,),)
         )
@@ -194,7 +194,7 @@ def test_all_batches_capture_at_startup_and_reuse_storage(
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
-    original = V2StageExecutionHooks.forward_hidden
+    original = CudaStageHooksV2.forward_hidden
 
     def forward(
         self: Any,
@@ -208,7 +208,7 @@ def test_all_batches_capture_at_startup_and_reuse_storage(
             raise RuntimeError("operation not supported when stream is capturing")
         return original(self, ids, positions, attention, slots, capture)
 
-    monkeypatch.setattr(V2StageExecutionHooks, "forward_hidden", forward)
+    monkeypatch.setattr(CudaStageHooksV2, "forward_hidden", forward)
     assert capture_multibatch_forward(worker)
     graph = worker._beam_decode_graph
     assert {s.batch_size for s in graph._bindings} == (
@@ -238,7 +238,7 @@ def test_all_batches_capture_at_startup_and_reuse_storage(
         )
         scheduled = dispatch(m)
         scheduled.num_scheduled_tokens = dict.fromkeys(ids, 7)
-        owner = get_stage_runner(worker, scheduled, hooks_type=V2StageExecutionHooks)
+        owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV2)
         decode = replace(
             m, kind=GRStageKind.DECODE, stage_index=1, decode_step=0, kv_blocks=((1,),) * b
         )

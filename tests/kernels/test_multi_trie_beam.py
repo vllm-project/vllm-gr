@@ -22,6 +22,7 @@ from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 
@@ -81,7 +82,7 @@ def test_mixed_roots_beam_selection_and_reuse(graph, widths, independent_k):
         expected: list[list[tuple[tuple[int, ...], float]]] = [[((), 0.0)] for _ in roots]
         for stage in range(3):
             scheduled = root_dispatch(stage, roots, widths, factors)
-            owner = get_stage_runner(worker, scheduled)
+            owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1)
             if owner_before is None:
                 owner_before = owner
                 pointers = {w: tensor.data_ptr() for w, tensor in owner.trie_ids_by_width.items()}
@@ -124,7 +125,7 @@ def test_mixed_roots_beam_selection_and_reuse(graph, widths, independent_k):
 def test_unknown_root_is_rejected_before_registry_allocation():
     worker = admission_worker(max_rows=8)
     with pytest.raises(ValueError, match="trie_id"):
-        get_stage_runner(worker, root_dispatch(0, (0, 1)))
+        get_stage_runner(worker, root_dispatch(0, (0, 1)), hooks_type=CudaStageHooksV1)
     assert not getattr(worker, "_beam_sessions", {})
     assert getattr(worker, "_beam_context", None) is None
 
@@ -135,7 +136,9 @@ def test_multi_trie_expansion_capacity_is_checked_before_allocation():
     backend._mark_ready()
     worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     with pytest.raises(ValueError, match="constraint backend capacity"):
-        get_stage_runner(worker, root_dispatch(0, (0, 1), factors=(4, 8, 1)))
+        get_stage_runner(
+            worker, root_dispatch(0, (0, 1), factors=(4, 8, 1)), hooks_type=CudaStageHooksV1
+        )
     assert not getattr(worker, "_beam_sessions", {})
     assert getattr(worker, "_beam_context", None) is None
 
@@ -152,7 +155,9 @@ def test_multi_trie_startup_capture_and_request_reuse():
     worker._vllm_gr_config.beam_graph_enabled = True
     base = torch.arange(6, device=worker.device, dtype=torch.float16)
     install_decode_model(worker, lambda ids, positions: base.expand(ids.numel(), -1).contiguous())
-    assert _capture_batch(worker, 2, hooks_type=None, allow_eager_fallback=False) is None
+    assert (
+        _capture_batch(worker, 2, hooks_type=CudaStageHooksV1, allow_eager_fallback=False) is None
+    )
     owner = worker._gr_gpu_stage_runner
     assert owner.closed and owner.graph.ready
     assert worker._beam_context.registry.num_active_sessions == 0
@@ -161,7 +166,7 @@ def test_multi_trie_startup_capture_and_request_reuse():
         assert not ids.any()
     # Real mixed-Trie requests replace capture's default selectors in place.
     scheduled = root_dispatch(0, (1, 0))
-    assert get_stage_runner(worker, scheduled) is owner
+    assert get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV1) is owner
     for w, ids in owner.trie_ids_by_width.items():
         assert ids.data_ptr() == pointers[w]
         assert ids.tolist() == [1] * w + [0] * w

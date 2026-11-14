@@ -58,7 +58,8 @@ dev = [
     "types-protobuf",
     "tblib",
     "ruff",
-    "mypy",
+    # Match the isolated pre-commit hooks and the subprocess contract tests.
+    "mypy==1.11.1",
     "psutil",
     "PyYAML>=6.0",
     # Regenerates vllm_gr/entrypoints/grpc/generated/. Pinned: the bundled protoc

@@ -252,8 +252,18 @@ and Decode capture policy remain active when this cache is disabled.
     - `vllm_gr/v1/worker/gpu_model_runner_patch.py`
     - `vllm_gr/v1/worker/gpu_model_runner_v2_patch.py`
     - `vllm_gr/v1/worker/gpu_model_runner_v2_graph.py`
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/gpu_prefill_requests_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`
+    - `vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py` (`CudaStageHooksV1`)
+    - `vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py` (`CudaStageHooksV2`)
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/gpu_prefill_requests_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/gpu_stage_hooks.py`, `vllm_gr/v1/worker/gpu_beam_stage_runner.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
+- CUDA stage binding: execution and startup entrypoints explicitly select the
+  independent V1/V2 implementations of `CudaStageHooks`. The shared core has no
+  V1 fallback; graph policies remain version-specific. NPU retains its own
+  adapter and lazy imports. `CudaStageHooks` is an abstract base class, so an
+  incomplete implementation fails at construction on any device. Binding and
+  startup regressions live in `tests/test_model_runner_stage_binding.py` and
+  `tests/test_gr_startup.py`; `tests/tools/test_cuda_stage_typing.py` pins the
+  abstract method set and both subclasses.
 - ModelRunner V1 targets:
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`

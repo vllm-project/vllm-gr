@@ -6,9 +6,9 @@
 from typing import Any
 
 from tests.st.test_modelrunner_v2_stage_parity_st import OneRecV2ParityWorkerExtension
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
-_forward_hidden = V2StageExecutionHooks.forward_hidden
+_forward_hidden = CudaStageHooksV2.forward_hidden
 
 
 def _refuse_capture(
@@ -22,7 +22,7 @@ def _refuse_capture(
     return _forward_hidden(self, input_ids, positions, attention, slot_mappings, capture)
 
 
-V2StageExecutionHooks.forward_hidden = _refuse_capture
+CudaStageHooksV2.forward_hidden = _refuse_capture
 
 
 class FailedDecodeWorkerExtension(OneRecV2ParityWorkerExtension):

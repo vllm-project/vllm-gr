@@ -19,13 +19,13 @@ _WORKER_V2_PROFILE_PATCH_MARKER = "_vllm_gr_beam_profile_v2_patch"
 logger = init_logger(__name__)
 
 
-def make_patched_initialize_kv_cache_v2(original):
+def make_patched_initialize_kv_cache_v2(original: Any) -> Any:
     """Publish the GR plan before the native profiler snapshots its manager."""
     if getattr(original, _WORKER_V2_KV_PATCH_MARKER, False):
         return original
 
     @wraps(original)
-    def initialize_kv_cache(self, *args, **kwargs):
+    def initialize_kv_cache(self: Any, *args: Any, **kwargs: Any) -> Any:
         result = original(self, *args, **kwargs)
         if _get_gr_config(self).beam_max_width is not None:
             from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
@@ -39,13 +39,13 @@ def make_patched_initialize_kv_cache_v2(original):
     return initialize_kv_cache
 
 
-def make_patched_profile_cudagraph_memory_v2(original):
+def make_patched_profile_cudagraph_memory_v2(original: Any) -> Any:
     """Keep native temporary KV/pool orchestration and retire GR resources too."""
     if getattr(original, _WORKER_V2_PROFILE_PATCH_MARKER, False):
         return original
 
     @wraps(original)
-    def profile_cudagraph_memory(self, *args, **kwargs):
+    def profile_cudagraph_memory(self: Any, *args: Any, **kwargs: Any) -> Any:
         if _get_gr_config(self).beam_max_width is None:
             return original(self, *args, **kwargs)
         # Profiling is a startup operation. Never discard a serving owner or
@@ -73,13 +73,13 @@ def make_patched_profile_cudagraph_memory_v2(original):
     return profile_cudagraph_memory
 
 
-def make_patched_capture_model_v2(_orig_capture_model):
+def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
     """Install the Prefill plan, run native capture, then capture Beam Decode."""
     if getattr(_orig_capture_model, _WORKER_V2_GRAPH_PATCH_MARKER, False):
         return _orig_capture_model
 
     @wraps(_orig_capture_model)
-    def patched_capture_model(self, *args, **kwargs):
+    def patched_capture_model(self: Any, *args: Any, **kwargs: Any) -> Any:
         profile_only = kwargs.get("profile_only", False)
         # The Engine admits only beam_search_v1 for V2 Beam engines. The
         # execution layer checks whether Beam is enabled, not its protocol.
@@ -145,50 +145,52 @@ def make_patched_capture_model_v2(_orig_capture_model):
 __all__ = ["make_patched_capture_model_v2"]
 
 
-@torch.inference_mode()
 def capture_multibatch_forward(worker: Any, *, allow_eager_fallback: bool = True) -> bool:
     """Publish configured V2 Decode shapes, with shape-local fallback."""
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
-    from vllm_gr.v1.worker.gr_startup import _capture_batch, _capture_enabled
+    with torch.inference_mode():
+        from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+        from vllm_gr.v1.worker.gpu_stage_hooks import validate_stage_hooks_type
+        from vllm_gr.v1.worker.gr_startup import _capture_batch, _capture_enabled
 
-    if not _capture_enabled(worker) or str(worker.device).split(":")[0] != "cuda":
-        return False
-    cfg = _get_gr_config(worker)
-    max_reqs = worker.vllm_config.scheduler_config.max_num_seqs
-    batches = tuple(b for b in cfg.beam_online_batch_sizes if b <= max_reqs)
-    if hasattr(worker, "_gr_decode_capture_failures"):
-        owner = getattr(worker, "_gr_gpu_stage_runner", None)
-        if owner is None or not owner.closed:
+        if not _capture_enabled(worker) or str(worker.device).split(":")[0] != "cuda":
+            return False
+        cfg = _get_gr_config(worker)
+        max_reqs = worker.vllm_config.scheduler_config.max_num_seqs
+        batches = tuple(b for b in cfg.beam_online_batch_sizes if b <= max_reqs)
+        if hasattr(worker, "_gr_decode_capture_failures"):
+            owner = getattr(worker, "_gr_gpu_stage_runner", None)
+            if owner is None or not owner.closed:
+                raise RuntimeError(
+                    "Asynchronous scheduling startup encountered an incomplete capture state"
+                )
+            validate_stage_hooks_type(owner.hooks, CudaStageHooksV2)
+            graph = getattr(worker, "_beam_decode_graph", None)
+            for batch in batches:
+                if batch not in worker._gr_decode_capture_failures and (
+                    graph is None or not graph.select(batch, cfg.beam_max_width).ready
+                ):
+                    raise RuntimeError("Published Decode graph is not ready")
+            return len(worker._gr_decode_capture_failures) < len(batches)
+        if getattr(worker, "_gr_gpu_stage_runner", None) is not None:
             raise RuntimeError(
                 "Asynchronous scheduling startup encountered an incomplete capture state"
             )
-        graph = getattr(worker, "_beam_decode_graph", None)
-        for batch in batches:
-            if batch not in worker._gr_decode_capture_failures and (
-                graph is None or not graph.select(batch, cfg.beam_max_width).ready
-            ):
-                raise RuntimeError("Published Decode graph is not ready")
-        return len(worker._gr_decode_capture_failures) < len(batches)
-    if getattr(worker, "_gr_gpu_stage_runner", None) is not None:
-        raise RuntimeError(
-            "Asynchronous scheduling startup encountered an incomplete capture state"
+        from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
+            ensure_prefix_calibration,
         )
-    from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
-        ensure_prefix_calibration,
-    )
 
-    ensure_prefix_calibration(worker)
-    failures = {}
-    for batch in batches:
-        error = _capture_batch(
-            worker,
-            batch,
-            hooks_type=V2StageExecutionHooks,
-            allow_eager_fallback=allow_eager_fallback,
-        )
-        if error is not None:
-            failures[batch] = error
-    worker._gr_decode_capture_failures = failures
-    worker._gr_async_decode_graph_capture_failed = len(failures) == len(batches)
-    worker._gr_async_decode_graph_capture_error = next(iter(failures.values()), None)
-    return len(failures) < len(batches)
+        ensure_prefix_calibration(worker)
+        failures = {}
+        for batch in batches:
+            error = _capture_batch(
+                worker,
+                batch,
+                hooks_type=CudaStageHooksV2,
+                allow_eager_fallback=allow_eager_fallback,
+            )
+            if error is not None:
+                failures[batch] = error
+        worker._gr_decode_capture_failures = failures
+        worker._gr_async_decode_graph_capture_failed = len(failures) == len(batches)
+        worker._gr_async_decode_graph_capture_error = next(iter(failures.values()), None)
+        return len(failures) < len(batches)

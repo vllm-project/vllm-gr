@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -436,6 +437,64 @@ def test_engine_creation_writes_enabled_canonical_config(
         pytest.raises(ValueError, match="cannot be combined"),
     ):
         create_engine_config(conflicting_engine_args)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("explicit_defaults", [False, True], ids=["sparse", "explicit-defaults"])  # type: ignore[misc]
+def test_canonical_input_paths_share_serialization_and_compile_hash(
+    monkeypatch: pytest.MonkeyPatch, explicit_defaults: bool
+) -> None:
+    from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
+
+    from vllm_gr.engine import arg_utils_gr
+
+    raw = {
+        "schema_version": 1,
+        "beam": {
+            "graph_enabled": True,
+            "max_width": 128,
+            "max_decode_steps": 3,
+            "worker_decision": True,
+        },
+        "constraint_table": {"enabled": False, "max_top_k": 128},
+        "attention_backend": "CUSTOM",
+        "constrained_generation": False,
+    }
+    expected = gr_config_from_mapping(raw)
+    if explicit_defaults:
+        raw = gr_config_to_mapping(expected)
+    original_raw = deepcopy(raw)
+    unrelated = {"enabled": True}
+    offline = VllmConfig(additional_config={"other_plugin": unrelated})
+    online = VllmConfig(additional_config={"other_plugin": unrelated, GR_CONFIG_KEY: deepcopy(raw)})
+    # Isolate configuration normalization from accelerator startup policy.
+    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: False)
+    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: False)
+    for host, engine_args in (
+        (offline, SimpleNamespace(_vllm_gr_config_input=raw)),
+        (online, SimpleNamespace()),
+    ):
+        # Replace platform defaults after VllmConfig initialization so hashing
+        # needs only native IR providers, without loading device kernels/models.
+        host.kernel_config.ir_op_priority = IrOpPriorityConfig(
+            rms_norm=["native"],
+            fused_add_rms_norm=["native"],
+            gelu_and_mul_sparse=["native"],
+        )
+        # Both entry paths may already have a cached parse before writeback.
+        GRConfig.from_vllm_config(host)
+        monkeypatch.setattr(
+            arg_utils_gr, "origin_create_engine_config", mock.Mock(return_value=host)
+        )
+        assert arg_utils_gr.create_engine_config(engine_args) is host
+        assert GRConfig.from_vllm_config(host) == expected
+        assert isinstance(host.additional_config, dict)
+        assert host.additional_config["other_plugin"] is unrelated
+
+    assert raw == original_raw
+    assert offline.additional_config == online.additional_config
+    assert offline.compute_hash() == online.compute_hash()
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
