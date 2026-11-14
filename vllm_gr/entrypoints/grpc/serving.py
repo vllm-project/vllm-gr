@@ -193,6 +193,28 @@ class BeamVllmEngineServicer(VllmEngineServicer):
     def build_response(
         self, request, identities, result, response_batch_id="", *, compact=True, binary=False
     ):
+        """Build a batch gRPC response from finalized Beam results.
+
+        Args:
+            request: Validated batch request that produced ``result``.
+            identities: Request IDs aligned positionally with request items and
+                result items.
+            result: Finalized engine result containing Beam sequences.
+            response_batch_id: Response batch ID. An empty value uses the ID
+                from ``request``.
+            compact: Select the compact repeated ``beams`` representation when
+                true; select per-item ``responses`` when false. Non-compact
+                replies require materialized sequences.
+            binary: Select the optional compact ``binary_beams`` representation
+                for eligible owned-column results. Small, stopped, variable-
+                length, and materialized results retain ``beams``/``responses``.
+
+        Returns:
+            The populated ``BatchGenerateResponse``.
+
+        Raises:
+            TypeError: If a non-compact reply receives owned-column sequences.
+        """
         response = pb.BatchGenerateResponse(batch_id=response_batch_id or request.batch_id)
         for identity, source, item in zip(
             identities, request.items, result.output.items, strict=True
