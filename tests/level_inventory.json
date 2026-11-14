@@ -190,12 +190,12 @@
               {
                 "in": [
                   [
-                    8,
+                    1,
                     8,
                     8
                   ],
                   [
-                    8,
+                    1,
                     32,
                     8
                   ],
@@ -272,7 +272,7 @@
               {
                 "in": [
                   [
-                    8,
+                    1,
                     32,
                     8
                   ],
@@ -282,7 +282,7 @@
                     1
                   ],
                   [
-                    4,
+                    1,
                     32,
                     7
                   ]
@@ -333,42 +333,6 @@
                 "ref": "params.case.dtype"
               }
             ]
-          }
-        }
-      ]
-    },
-    "tests/kernels/attention/test_merge_tnd_interleaved_pool.py::test_extract_suffix_kv_contiguous_unchanged": {
-      "rules": [
-        {
-          "level": "l1",
-          "when": {
-            "eq": "cpu",
-            "ref": "params.device"
-          }
-        },
-        {
-          "level": "l2",
-          "when": {
-            "eq": "npu",
-            "ref": "params.device"
-          }
-        }
-      ]
-    },
-    "tests/kernels/attention/test_merge_tnd_interleaved_pool.py::test_extract_suffix_kv_on_interleaved_layout": {
-      "rules": [
-        {
-          "level": "l1",
-          "when": {
-            "eq": "cpu",
-            "ref": "params.device"
-          }
-        },
-        {
-          "level": "l2",
-          "when": {
-            "eq": "npu",
-            "ref": "params.device"
           }
         }
       ]
@@ -1190,7 +1154,6 @@
     "tests/test_beam_resource_validation.py::test_invalid_live_changes_match_full_validator": "l1",
     "tests/test_beam_resource_validation.py::test_storage_offset_is_included_by_live_address": "l1",
     "tests/test_beam_resource_validation.py::test_unavailable_guard_api_uses_full_validation": "l1",
-    "tests/test_beam_runtime_primitives.py::test_compute_beam_bounds_behavior": "l1",
     "tests/test_beam_search_dispatch.py::test_completion_fallback_binds_ids_before_iteration": "l1",
     "tests/test_beam_search_dispatch.py::test_completion_schema_accepts_trie_id_list": "l1",
     "tests/test_beam_search_dispatch.py::test_dispatch_preserves_native_session_hint_for_both_engines": "l1",
@@ -2110,7 +2073,6 @@
     "tests/test_model_runner_common.py::test_materialize_logits_indices_contiguous_device_range": "l1",
     "tests/test_model_runner_common.py::test_materialize_logits_indices_reuses_runner_buffer": "l1",
     "tests/test_model_runner_common.py::test_mixed_batch_remap_installs_functional_proxy": "l1",
-    "tests/test_model_runner_common.py::test_position_helpers_support_buffer_forms_and_partial_beam": "l1",
     "tests/test_model_runner_common.py::test_sampling_metadata_batched_gather_matches_per_attr_index": "l1",
     "tests/test_model_runner_common.py::test_sampling_metadata_batched_gather_mixed_presence": "l1",
     "tests/test_model_runner_common.py::test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment": "l1",

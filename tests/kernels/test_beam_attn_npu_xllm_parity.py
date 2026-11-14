@@ -66,6 +66,7 @@ MAX_DECODE_STEPS = 8
 NUM_LAYERS = 1
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("case", "expected"),
     [
@@ -141,22 +142,30 @@ def _build_incremental_metadata(
     incremental path (``is_incremental=True``).
     """
     beam_seq_len = prefix_len + beam_width * (decode_step + 1)
-    num_reqs = block_tables.shape[0] + (1 if std_req else 0)
+    # One block-table row per request, as the production builder expects: the
+    # std request and the Beam request are distinct rows.
+    num_reqs = block_tables.shape[0]
 
-    # std tokens are not part of the beam query tensor here
+    # Each request owns its own rows exclusively: Decode gives a Beam request
+    # exactly one query token per beam, and the std request in a mixed batch is
+    # a separate request, never extra rows appended to the Beam request.
     query_start_loc_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32)
-    # Requests occupy consecutive w-row groups; each beam contributes 1.
     if std_req is None:
-        query_start_loc_cpu[:] = torch.arange(num_reqs + 1) * beam_width
-        num_actual_tokens = num_reqs * beam_width
+        q_lens = [beam_width] * num_reqs
     else:
         std_idx, std_q_len, _ = std_req
-        # std rows come first (std_indices gather), beam rows after.
-        query_start_loc_cpu[1 : std_idx + 1] = std_q_len
-        query_start_loc_cpu[std_idx + 1 :] = std_q_len + beam_width
-        num_actual_tokens = std_q_len + beam_width
+        q_lens = [std_q_len if index == std_idx else beam_width for index in range(num_reqs)]
+    query_start_loc_cpu[1:] = torch.tensor(q_lens, dtype=torch.int32).cumsum(dim=0)
+    num_actual_tokens = sum(q_lens)
 
-    seq_lens = torch.tensor([beam_seq_len] * num_reqs, dtype=torch.int32, device=DEVICE)
+    seq_lens = torch.tensor(
+        [
+            prefix_len if std_req is not None and i == std_req[0] else beam_seq_len
+            for i in range(num_reqs)
+        ],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
 
     class _Common:
         num_reqs: int
@@ -183,7 +192,11 @@ def _build_incremental_metadata(
     common.slot_mapping = torch.zeros(num_actual_tokens, dtype=torch.long, device=DEVICE)
 
     req_ids = request_ids or tuple(f"req_{i}" for i in range(num_reqs))
-    beam_req_ids = req_ids if std_req is None else ("req_0",)
+    if std_req is None:
+        beam_req_ids = req_ids
+    else:
+        # The std request and the Beam request are distinct requests.
+        beam_req_ids = tuple(req_id for index, req_id in enumerate(req_ids) if index != std_req[0])
     beam_data: dict[str, object] = {
         req_id: {
             "is_beam_decode": True,
@@ -684,13 +697,18 @@ def test_xllm_mixed_std_beam_batch_falls_back_to_cascade() -> None:
     pool.unshared_key[slot, :beam_width, :, :steps, :] = hist_k.to(DEVICE)
     pool.unshared_value[slot, :beam_width, :, :steps, :] = hist_v.to(DEVICE)
 
-    blocks_per_req = prefix_len // BLOCK_SIZE
+    # Two independent requests: a std request and a Beam-decode request, each
+    # with its own paged prefix blocks. The Beam request's sequence covers the
+    # shared prefix plus its per-beam suffix, so it needs the extra block the
+    # std request does not.
+    beam_seq_len = prefix_len + beam_width * (decode_step + 1)
+    blocks_per_req = -(-beam_seq_len // BLOCK_SIZE)
+    num_blocks = 2 * blocks_per_req
     key_cache = torch.randn(
-        blocks_per_req + 1, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE
+        num_blocks, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE
     )
     value_cache = torch.randn_like(key_cache)
-    # std request occupies block `blocks_per_req`
-    block_tables = torch.arange(blocks_per_req + 1, dtype=torch.int32).unsqueeze(0)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32).view(2, blocks_per_req)
 
     # 1 std token + w beam tokens
     query = (torch.randn(1 + beam_width, NUM_HEADS, HEAD_DIM, dtype=DTYPE) * scale).to(DEVICE)
@@ -706,16 +724,16 @@ def test_xllm_mixed_std_beam_batch_falls_back_to_cascade() -> None:
         block_tables=block_tables,
         std_req=(0, 1, prefix_len),
     )
-    # Force a mixed batch: std rows exist alongside beam rows.  The std
-    # branch needs the std routing fields the builder would have produced
-    # (std_block_table / std_cu_seqlens_q_cpu / std_seqlens_kv_cpu).
-    metadata.std_indices = torch.tensor([0], dtype=torch.long, device=DEVICE)
-    metadata.num_std_indices = 1
-    metadata.prefix_indices = torch.arange(1, 1 + beam_width, dtype=torch.long, device=DEVICE)
-    metadata.num_prefix_indices = beam_width
-    metadata.std_block_table = block_tables.to(DEVICE)
-    metadata.std_cu_seqlens_q_cpu = [1]
-    metadata.std_seqlens_kv_cpu = [prefix_len]
+    # The builder routes the std request's single row and the Beam request's
+    # one-row-per-beam rows itself; assert that routing instead of overwriting
+    # it, so this exercises the real mixed-batch metadata.
+    assert metadata.std_indices is not None and metadata.std_indices.tolist() == [0]
+    assert metadata.num_std_indices == 1
+    assert metadata.prefix_indices is not None
+    assert metadata.prefix_indices.tolist() == list(range(1, 1 + beam_width))
+    assert metadata.num_prefix_indices == beam_width
+    assert metadata.std_cu_seqlens_q_cpu == [1]
+    assert metadata.std_seqlens_kv_cpu == [prefix_len]
 
     xllm_out = _run_mode(beam_attn_npu_xllm, metadata, query, key_cache, value_cache, pool, scale)
     cascade_out = _run_mode(beam_attn_npu, metadata, query, key_cache, value_cache, pool, scale)

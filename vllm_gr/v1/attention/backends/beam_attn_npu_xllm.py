@@ -5,7 +5,7 @@
 NPU-only execution module selected by ``_get_platform_execution_module`` when
 ``vllm_gr_npu_decode_execution == "xllm"``.  It replaces the cascade
 per-operator path only for the incremental beam decode branch; every other
-branch (std requests, prefill, suffix recompute) forwards to
+branch (std requests, prefill) forwards to
 ``beam_attn_npu`` unchanged, and the CUDA path is never touched.
 
 The incremental branch becomes a single fused ``x_attention`` call that
@@ -28,6 +28,7 @@ from vllm_gr.ops.npu import beam_ops
 from vllm_gr.v1.attention.backends import beam_attn_npu
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
+    require_beam_decode_session,
 )
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     interleaved_pool_base,
@@ -461,6 +462,7 @@ def cascade_attention(
 
     Mixed std/beam batches and missing prefix_indices/pool are delegated
     to ``beam_attn_npu.cascade_attention``, which handles those layouts.
+    Invalid Beam decode metadata is rejected before either execution path.
     Sliding-window, softcap, ALiBi and sink configurations are unsupported
     by both NPU execution paths and rejected by ``BeamAttentionImpl`` at
     initialization; delegation does not add support for those semantics.
@@ -481,6 +483,9 @@ def cascade_attention(
             alibi_slopes=alibi_slopes,
             beam_pool=beam_pool,
         )
+
+    if getattr(attn_metadata, "is_beam_decode", False) or attn_metadata.prefix_indices is not None:
+        require_beam_decode_session(attn_metadata)
 
     fallback_reason = _cascade_fallback_reason(
         attn_metadata,

@@ -391,6 +391,46 @@ def test_engine_creation_preserves_flat_graph_batch_size(
     assert config.additional_config.get("vllm_gr_beam_graph_batch_size", 1) == batch_size
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("use_v2", [False, True])  # type: ignore[misc]
+def test_canonical_inputs_produce_identical_worker_configuration(
+    monkeypatch: pytest.MonkeyPatch, use_v2: bool
+) -> None:
+    from vllm_gr.engine import arg_utils_gr
+
+    raw = {
+        "schema_version": 1,
+        "beam": {
+            "execution_mode": "v1",
+            "max_width": 128,
+            "max_decode_steps": 3,
+            "worker_decision": True,
+        },
+        "constraint_table": {"enabled": False, "max_top_k": 128},
+        "constrained_generation": False,
+    }
+    original = json.dumps(raw, sort_keys=True)
+    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: True)
+    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: False)
+    outputs = []
+    for additional in (False, True):
+        host = SimpleNamespace(
+            additional_config={"unrelated": 1, **({GR_CONFIG_KEY: raw} if additional else {})},
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+            use_v2_model_runner=use_v2,
+        )
+        monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: host)
+        args = SimpleNamespace(_vllm_gr_config_input=None if additional else raw)
+        arg_utils_gr.create_engine_config(args)
+        assert host.additional_config["unrelated"] == 1
+        assert json.dumps(raw, sort_keys=True) == original
+        outputs.append(json.dumps(host.additional_config, sort_keys=True))
+        # Repeated resolution must retain the same serialized configuration.
+        arg_utils_gr.create_engine_config(SimpleNamespace())
+        assert json.dumps(host.additional_config, sort_keys=True) == outputs[-1]
+    assert outputs[0] == outputs[1]
+
+
 def test_engine_creation_writes_enabled_canonical_config(
     tmp_path: Path,
 ) -> None:

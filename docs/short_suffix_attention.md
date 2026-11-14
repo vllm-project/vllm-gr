@@ -21,7 +21,11 @@ The dispatch is restricted to pure incremental decode and unwindowed
 attention without ALiBi, softcap, or sinks. Head dimensions of 64/128/256 use
 the FA2-aligned MMA fast path; other head sizes that FlashAttention 2 accepts
 (a multiple of 8, at most 256) use the generic Triton merge kernel.
-With the optimization disabled, configurations use the original implementation.
+With the optimization disabled, configurations use the generic incremental
+implementation (pool packing, suffix FlashAttention and merge). Beam decode
+requires an active session, a persistent suffix KV pool and one query per beam;
+the old paged-suffix recompute path is no longer supported. Standard requests,
+Prefill and prefix-only chunks remain separate from beam suffix execution.
 The kernel itself supports FP32 for independent correctness validation, in addition
 to the FP16/BF16 activation types used by the model runner.
 
@@ -54,9 +58,9 @@ static configurations raise an error before execution; explicitly disable
 fusion for those configurations.
 
 At runtime, the GPU dispatcher uses the fused kernel only for pure beam decode
-batches with one query per beam. Mixed standard/beam batches, prefix
-recomputation and other batch shapes use the existing packed-suffix and
-merge path without raising a metadata error. Fixed-membership multi-request
+batches with one query per beam. Valid mixed standard/beam batches use
+the packed pool suffix and merge path. Missing sessions and multi-query
+beam suffixes are rejected before attention or cache writes. Fixed-membership multi-request
 decode batches remain eligible: the check uses the session's flattened
 `B * beam_width` rows. Prefill selection is independent of decode prefix plans.
 
