@@ -134,7 +134,7 @@ def test_prefix_workload_benchmark_consumes_unique_rows(
         + ["--repeat", "2", "--warmup-runs", "1", "--cache-mode", cache_mode],
     )
     args = example.parse_args()
-    token_groups = [[10, 20, index], [30, 40, index], [50, 60, index], [70, 80, index]]
+    token_groups = [[10, 20, 0], [30, 40, 1], [50, 60, 2], [70, 80, 3]]
     workload_requests = [
         {
             "prompt_token_ids": ids,
@@ -169,7 +169,7 @@ def test_prefix_workload_benchmark_consumes_unique_rows(
 
     assert len(outputs) == 1
     assert len(calls) == 4
-    assert [[ids["prompt_token_ids"] for ids in call] for call in calls] == token_groups
+    assert [call[0]["prompt_token_ids"] for call in calls] == token_groups
     if cache_mode == "cold":
         assert [call[0]["cache_salt"] for call in calls] == [
             "offline-beam-v1-workload-0-seed",
