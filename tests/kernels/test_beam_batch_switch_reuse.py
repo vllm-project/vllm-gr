@@ -22,6 +22,7 @@ from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
 
 pytestmark = [
+    pytest.mark.gpu_test,
     pytest.mark.l2,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"),
 ]

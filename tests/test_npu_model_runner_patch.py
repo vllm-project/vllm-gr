@@ -1452,6 +1452,7 @@ def test_npu_capture_logs_requested_and_retained_resources(
     assert "excludes graph and scratch memory" in messages[-1]
 
 
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("decode_step", "expected_positions"),
     [(0, [2, 2, 2, 3, 3, 3, -1, -1]), (1, [3, 3, 3, 4, 4, 4, -1, -1])],

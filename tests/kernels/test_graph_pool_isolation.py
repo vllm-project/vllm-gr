@@ -10,7 +10,10 @@ from pathlib import Path
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    pytest.mark.gpu_test,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+]
 
 
 @pytest.mark.l2  # type: ignore[misc]

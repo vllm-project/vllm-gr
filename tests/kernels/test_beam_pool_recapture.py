@@ -19,7 +19,10 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
 from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
 from vllm_gr.v1.worker.gr_startup import _capture_batch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    pytest.mark.gpu_test,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+]
 
 
 @pytest.mark.l2  # type: ignore[misc]

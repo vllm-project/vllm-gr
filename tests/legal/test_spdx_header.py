@@ -8,10 +8,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import types
 import unittest
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 import pytest
 
@@ -23,13 +23,31 @@ SLASH_LICENSE = "// SPDX-License-Identifier: Apache-2.0\n"
 SLASH_PROJECT = "// SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project\n"
 
 
-def load_hook() -> types.ModuleType:
+class SPDXHook(Protocol):
+    """Interface used by tests of the dynamically loaded hook."""
+
+    POLICY_PATH: Path
+    REPO_ROOT: Path
+    tracked_sources: Callable[[], list[str]]
+
+    def check_all_tracked(self) -> list[str]: ...
+
+    def policy_errors(
+        self,
+        relative: str,
+        licenses: list[str],
+        copyrights: list[str],
+        policy: dict[str, Any],
+    ) -> list[str]: ...
+
+
+def load_hook() -> SPDXHook:
     """Import the hook by path; tools/pre_commit is not a package."""
     spec = importlib.util.spec_from_file_location("check_spdx_header", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
+    return cast(SPDXHook, module)
 
 
 class SPDXHeaderTests(unittest.TestCase):
@@ -181,7 +199,7 @@ class SPDXHeaderTests(unittest.TestCase):
 class AttributionPolicyTests(unittest.TestCase):
     """The --all-tracked pass enforces who may be named on which file."""
 
-    hook: types.ModuleType
+    hook: SPDXHook
     policy: dict[str, Any]
 
     @classmethod
@@ -261,7 +279,7 @@ class AttributionPolicyTests(unittest.TestCase):
 class EmptyFileTests(unittest.TestCase):
     """A zero-byte file is exempt only when it is an empty __init__.py."""
 
-    hook: types.ModuleType
+    hook: SPDXHook
 
     def setUp(self) -> None:
         self.hook = load_hook()
