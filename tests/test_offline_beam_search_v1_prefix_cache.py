@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Device-free coverage for the offline shared-prefix cache workload."""
 
 import json
@@ -256,4 +256,4 @@ def test_prefix_cache_run_controls_engine_caching_and_workload_requests(
     assert engine_kwargs["max_num_batched_tokens"] == 7
 
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
