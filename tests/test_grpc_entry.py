@@ -331,9 +331,7 @@ def _columns_result(session_id: str, request: Any) -> BeamBatchResult:
     tokens = np.arange(6, dtype="<i4").reshape(2, 3)
     scores = np.array([-1.0, -2.0], dtype="<f4")
     parents = np.array([[0, 0, 0], [0, 1, 0]], dtype="<i4")
-    parent_bytes = (
-        parents.tobytes() if request.output_options.include_parent_beam_indices else None
-    )
+    parent_bytes = parents.tobytes() if request.output_options.include_parent_beam_indices else None
     return BeamBatchResult(
         protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
         batch_id=session_id,
@@ -460,6 +458,7 @@ def test_binary_beam_output_falls_back_for_small_results_over_grpc() -> None:
             assert list(second.beams.stop_token_ids) == [7]
 
     asyncio.run(run())
+
 
 @pytest.mark.parametrize("fault", ["stream", "penalty", "mm", "kv", "mixed", "duplicate"])  # type: ignore[misc]
 def test_incompatible_inputs_are_rejected_not_ignored(fault: str) -> None:
