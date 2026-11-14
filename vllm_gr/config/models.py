@@ -213,6 +213,15 @@ class GRConfig:
     beam_adapter_cache_enabled: bool = False
     """Opt into CUDA stage-adapter and Decode graph reuse across batch sizes."""
 
+    enable_kv_pool_ping_pong: bool = True
+    """Gather CUDA fixed-width KV into the next bank; False restores write-back."""
+
+    enable_full_step_graph: bool = False
+    """Capture model, logits, candidate selection and fixed-width CUDA Beam update."""
+
+    enable_streaming_constrained_head: bool = False
+    """Stream full-window CUDA projection and normalization into legal candidate storage."""
+
     def __post_init__(self) -> None:
         if type(self.beam_adapter_cache_enabled) is not bool:
             raise ValueError("beam.adapter_cache_enabled must be a boolean")
@@ -231,7 +240,10 @@ class GRConfig:
             validate_catalog_path,
             validate_constrained_generation,
             validate_constraint_backend,
+            validate_enable_full_step_graph,
+            validate_enable_kv_pool_ping_pong,
             validate_enable_short_suffix_attention,
+            validate_enable_streaming_constrained_head,
             validate_npu_decode_execution,
             validate_prefill_flash_attn_version,
             validate_schema_version,
@@ -333,6 +345,9 @@ class GRConfig:
                 "beam.max_decode_steps <= 3"
             )
         validate_enable_short_suffix_attention(self.enable_short_suffix_attention)
+        validate_enable_streaming_constrained_head(self.enable_streaming_constrained_head)
+        validate_enable_full_step_graph(self.enable_full_step_graph)
+        validate_enable_kv_pool_ping_pong(self.enable_kv_pool_ping_pong)
         validate_prefill_flash_attn_version(self.prefill_flash_attn_version)
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE

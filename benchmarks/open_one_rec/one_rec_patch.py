@@ -466,6 +466,9 @@ def patched_add_cli_args(parser):
         action="store_true",
         help="Select Beam benchmarking (all GR Beam benchmarks use V1)",
     )
+    from vllm_gr.config.benchmark_options import add_recogem_arguments
+
+    add_recogem_arguments(parser)
     parser.add_argument("--constraint-triples", help="Canonical three-step constraint JSON for V1")
     parser.add_argument(
         "--warmup-requests",

@@ -260,6 +260,12 @@ def validate_enable_short_suffix_attention(value: object) -> bool:
     return value
 
 
+def validate_enable_kv_pool_ping_pong(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError("beam.enable_kv_pool_ping_pong must be a boolean")
+    return value
+
+
 def validate_beam_sid_stage_vocab(value: object) -> bool:
     if not isinstance(value, bool):
         raise TypeError("beam.sid_stage_vocab must be a boolean")
@@ -370,3 +376,15 @@ def validate_beam_max_decode_steps(value: object) -> int:
         value if value is not None else _BEAM_MAX_DECODE_STEPS_DEFAULT,
         "beam_max_decode_steps",
     )
+
+
+def validate_enable_full_step_graph(value: object) -> bool:
+    if type(value) is not bool:
+        raise TypeError("beam.enable_full_step_graph must be a boolean")
+    return value
+
+
+def validate_enable_streaming_constrained_head(value: object) -> bool:
+    if type(value) is not bool:
+        raise TypeError("beam.enable_streaming_constrained_head must be a boolean")
+    return value

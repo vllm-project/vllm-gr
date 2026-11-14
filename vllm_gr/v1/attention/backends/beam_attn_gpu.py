@@ -50,7 +50,13 @@ else:
 class GPUBeamAttentionBatch:
     """Zero-copy request-major attention view over contiguous Beam slots."""
 
-    def __init__(self, sessions: tuple[Any, ...], *, width: int | None = None) -> None:
+    def __init__(
+        self,
+        sessions: tuple[Any, ...],
+        *,
+        width: int | None = None,
+        kv_pool_ping_pong: bool = True,
+    ) -> None:
         if not sessions:
             raise ValueError("GPU Beam attention batch must not be empty")
         first = sessions[0]
@@ -85,6 +91,14 @@ class GPUBeamAttentionBatch:
             pool.unshared_value = source.unshared_value[: self.batch_size].reshape(
                 1, storage_rows, *source.unshared_value.shape[2:]
             )
+            pool.standby_key = pool.standby_value = None
+            if kv_pool_ping_pong and getattr(source, "standby_key", None) is not None:
+                pool.standby_key = source.standby_key[: self.batch_size].reshape(
+                    1, storage_rows, *source.standby_key.shape[2:]
+                )
+                pool.standby_value = source.standby_value[: self.batch_size].reshape(
+                    1, storage_rows, *source.standby_value.shape[2:]
+                )
             self.pools.append(pool)
 
     @property
@@ -611,6 +625,11 @@ def cascade_attention(
                     decode_step_buf,
                     scale,
                     getattr(attn_metadata, "beam_active_mask", None),
+                    **(
+                        {"standby_key": pool.standby_key, "standby_value": pool.standby_value}
+                        if getattr(pool, "standby_key", None) is not None
+                        else {}
+                    ),
                 )
                 return
 
@@ -639,12 +658,20 @@ def cascade_attention(
                     decode_step_buf,
                     beam_width=W,
                     active_mask=getattr(attn_metadata, "beam_active_mask", None),
+                    **(
+                        {"standby_key": pool.standby_key, "standby_value": pool.standby_value}
+                        if getattr(pool, "standby_key", None) is not None
+                        else {}
+                    ),
                 )
             else:
                 # Eager fallback: host-int slice copy (packed layout)
                 step = beam_session.decode_step  # host int
-                pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
-                pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
+                use_standby = (step & 1) and getattr(pool, "standby_key", None) is not None
+                key_pool = pool.standby_key if use_standby else pool.unshared_key
+                value_pool = pool.standby_value if use_standby else pool.unshared_value
+                pool_k = key_pool[slot, :W, :, : step + 1, :]
+                pool_v = value_pool[slot, :W, :, : step + 1, :]
 
                 # Copy to suffix_buf in packed layout: [W*(step+1), H, D]
                 # Beam 0's KV rows first, then beam 1's, etc.

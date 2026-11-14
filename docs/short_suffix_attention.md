@@ -8,6 +8,14 @@ with the prefix attention output and natural-log LSE. It writes the final
 attention output directly.
 
 Prefix attention exposes canonical out + FP32 natural-log LSE states; persistent KV writes are unchanged.
+With `beam.enable_kv_pool_ping_pong` enabled (the CUDA fixed-width default),
+KV writes and both suffix implementations select one of two fixed-address
+banks from the device Decode step. Selection gathers history into the other
+bank for the next step, omitting the write-back scatter. The step counter
+already advances after selection, so bank selection adds no kernel or graph
+recapture. Set the field to `False` to restore the original single-bank
+gather/scatter path. Dynamic-width and NPU execution keep their existing KV
+reorder paths. The Qwen benchmark documents the controlled A/B switch.
 The fast path removes packed suffix copies, suffix FlashAttention,
 intermediate suffix outputs, FA2 GQA LSE conversion, and a separate merge.
 It supports CUDA graph replay: the step and active mask are device inputs,

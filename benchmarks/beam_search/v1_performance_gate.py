@@ -71,6 +71,7 @@ def prepare(args: argparse.Namespace) -> None:
         "beam": {
             "execution_mode": "v1",
             "graph_enabled": True,
+            "enable_kv_pool_ping_pong": getattr(args, "kv_pool_ping_pong", True),
             "worker_decision": True,
             "max_width": args.beam_width,
             "max_decode_steps": args.generated_steps,
@@ -114,6 +115,7 @@ def prepare(args: argparse.Namespace) -> None:
             "tokenizer_digest": tokenizer_digest,
             "execution_mode": "v1",
             "graph_enabled": True,
+            "enable_kv_pool_ping_pong": getattr(args, "kv_pool_ping_pong", True),
             "prefix_caching": False,
             "chunked_prefill": False,
             "timing": "end-to-end caller time; warmup excluded; generated beam IDs/scores/text materialized offline (full/compact normalized)",
@@ -182,6 +184,7 @@ def _measure_offline_batch(
     prompt_token_ids: list[list[int]],
     count: int,
     beam_width: int,
+    output_snapshots: list[Any] | None = None,
 ) -> float:
     """Consume and validate one batch, releasing its outputs before the next call."""
     import torch
@@ -234,6 +237,18 @@ def _measure_offline_batch(
             if not math.isfinite(score) or not isinstance(text, str):
                 raise RuntimeError(f"{context}: invalid score/text")
             validate_sid_tokens(tokenizer, tokens, context)
+    if output_snapshots is not None:
+        # Store only ordinary Python values after timing and validation. Keep
+        # the output-release contract and the measured consumption work intact.
+        output_snapshots.append(
+            [
+                [
+                    {"token_ids": [int(token) for token in tokens], "score": score}
+                    for tokens, score, _ in row
+                ]
+                for row in consumed
+            ]
+        )
     return elapsed
 
 
@@ -250,6 +265,7 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
             raise RuntimeError(f"benchmark imported the wrong runtime: {runtime_source}")
     result["runtime_source"] = str(runtime_source)
     config = yaml.safe_load((args.output_dir / "vllm_gr_config.yaml").read_text())
+    result["gr_config"] = config
     engine_args = {
         "model": args.model,
         "trust_remote_code": True,
@@ -299,9 +315,21 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
         for count in args.batch_sizes:
             prompts = [{"prompt_token_ids": tokens} for tokens in prompt_token_ids[:count]]
             group_samples = []
+            snapshots: list[Any] | None = [] if getattr(args, "record_outputs", False) else None
             for iteration in range(args.warmup_runs + args.measured_runs):
                 elapsed = _measure_offline_batch(
-                    llm, prompts, params, tokenizer, prompt_token_ids, count, args.beam_width
+                    llm,
+                    prompts,
+                    params,
+                    tokenizer,
+                    prompt_token_ids,
+                    count,
+                    args.beam_width,
+                    **(
+                        {"output_snapshots": snapshots}
+                        if snapshots is not None and iteration >= args.warmup_runs
+                        else {}
+                    ),
                 )
                 if iteration >= args.warmup_runs:
                     group_samples.append(elapsed)
@@ -313,9 +341,16 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
                 args,
             )
             case["prompt_tokens_including_sid_begin"] = [args.input_len] * count
+            if snapshots is not None:
+                case["outputs"] = snapshots
             result["cases"].append(case)
             write_json(args.output_dir / "offline.json", result)
-            print(json.dumps(case, sort_keys=True), flush=True)
+            print(
+                json.dumps(
+                    {key: value for key, value in case.items() if key != "outputs"}, sort_keys=True
+                ),
+                flush=True,
+            )
 
 
 async def run_online(args: argparse.Namespace, result: dict[str, Any]) -> None:
@@ -408,6 +443,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--port", type=int, default=7001)
+    parser.add_argument(
+        "--kv-pool-ping-pong",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Gather into the next KV bank; disable for the optimization baseline.",
+    )
+    parser.add_argument(
+        "--record-outputs",
+        action="store_true",
+        help="Save measured beam token IDs and scores after the timed section.",
+    )
     args = parser.parse_args()
     if (
         args.beam_width <= 0

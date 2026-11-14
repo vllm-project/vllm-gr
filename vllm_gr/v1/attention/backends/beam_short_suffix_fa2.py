@@ -47,6 +47,8 @@ def _short_suffix_fa2_merge_kernel(
     SCALE: gl.constexpr,
     SCALE_LOG2: gl.constexpr,
     MASKED: gl.constexpr,
+    StandbyK=None,
+    StandbyV=None,
 ):
     q_layout: gl.constexpr = BlockedLayout([1, 8], [2, 16], [4, 1], [1, 0])
     k_layout: gl.constexpr = BlockedLayout([8, 1], [16, 2], [1, 4], [0, 1])
@@ -74,6 +76,9 @@ def _short_suffix_fa2_merge_kernel(
     )
 
     step = gl.load(Step)
+    if StandbyK is not None:
+        K = gl.where((step & 1) != 0, StandbyK, K)
+        V = gl.where((step & 1) != 0, StandbyV, V)
     extent = gl.maximum(step + 1, 1)
 
     kd = gl.arange(0, DIM, layout=SliceLayout(1, k_layout))
@@ -203,6 +208,9 @@ def merge_short_suffix_fa2(
     decode_step: torch.Tensor,
     scale: float,
     active_mask: torch.Tensor | None,
+    *,
+    standby_key: torch.Tensor | None = None,
+    standby_value: torch.Tensor | None = None,
 ) -> None:
     width, heads, dim = query.shape
     kv_heads = pool_key.shape[2]
@@ -231,6 +239,8 @@ def merge_short_suffix_fa2(
         scale,
         _float32(scale * math.log2(math.e)),
         active_mask is not None,
+        StandbyK=standby_key,
+        StandbyV=standby_value,
         num_warps=4,
         enable_fp_fusion=False,
     )

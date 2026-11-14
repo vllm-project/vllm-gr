@@ -37,6 +37,7 @@ def copy_suffix_kv_kernel(
     stride_s,  # pool stride for step dim
     active_mask,
     MASKED: tl.constexpr,
+    standby_ptr=None,
 ):
     """Copy the valid suffix KV rows from the pool into the packed suffix buffer.
 
@@ -64,6 +65,8 @@ def copy_suffix_kv_kernel(
     beam = pid // (H * max_steps)
 
     step = tl.load(decode_step_buf).to(tl.int32)
+    if standby_ptr is not None:
+        pool_ptr = tl.where((step & 1) != 0, standby_ptr, pool_ptr)
     if MASKED:
         live = tl.load(active_mask + beam) & (step >= 0)
         extent = tl.maximum(step + 1, 1)
@@ -94,6 +97,9 @@ def copy_suffix_kv_graph(
     decode_step_buf: torch.Tensor,  # [1] int32 device tensor
     beam_width: int | None = None,  # session beam width; None -> infer from buffer
     active_mask: torch.Tensor | None = None,
+    *,
+    standby_key: torch.Tensor | None = None,
+    standby_value: torch.Tensor | None = None,
 ) -> None:
     """Graph-compatible pool→suffix_buf packed copy using a Triton kernel.
 
@@ -109,7 +115,10 @@ def copy_suffix_kv_graph(
         beam_width = suffix_k_buf.shape[0] // max_steps
     grid = (beam_width * max_steps * H,)
 
-    for pool, buf in ((pool_key, suffix_k_buf), (pool_value, suffix_v_buf)):
+    for pool, standby, buf in (
+        (pool_key, standby_key, suffix_k_buf),
+        (pool_value, standby_value, suffix_v_buf),
+    ):
         copy_suffix_kv_kernel[grid](
             pool,
             buf,
@@ -125,6 +134,7 @@ def copy_suffix_kv_graph(
             stride_s=pool.stride(3),
             active_mask=active_mask,
             MASKED=active_mask is not None,
+            standby_ptr=standby,
         )
 
 
@@ -144,6 +154,7 @@ def cache_unshared_kv_kernel(
     stride_s,  # pool stride for step dim
     active_mask,
     MASKED: tl.constexpr,
+    standby_ptr=None,
     # NOTE: the last (head_dim) pool dimension is assumed contiguous
     # (stride == 1); the pool is allocated as one contiguous 5D tensor.
 ):
@@ -162,6 +173,8 @@ def cache_unshared_kv_kernel(
 
     # Device-side read of decode_step (key enabler for CUDA Graph replay)
     decode_step = tl.load(decode_step_buf).to(tl.int32)
+    if standby_ptr is not None:
+        pool_ptr = tl.where((decode_step & 1) != 0, standby_ptr, pool_ptr)
     # Defense-in-depth: a stale decode_step_buf under CUDA Graph replay
     # could exceed max_steps; skip to avoid OOB pool writes.
     if decode_step < 0 or decode_step >= max_steps:
@@ -194,6 +207,9 @@ def cache_unshared_kv_graph(
     slot: int,  # session slot index
     decode_step_buf: torch.Tensor,  # [1] int32 device tensor
     active_mask: torch.Tensor | None = None,
+    *,
+    standby_key: torch.Tensor | None = None,
+    standby_value: torch.Tensor | None = None,
 ) -> None:
     """Graph-compatible cache_unshared_kv using Triton kernels.
 
@@ -224,6 +240,7 @@ def cache_unshared_kv_graph(
         stride_s=pool_key.stride(3),
         active_mask=active_mask,
         MASKED=active_mask is not None,
+        standby_ptr=standby_key,
     )
 
     # Launch value write
@@ -242,4 +259,5 @@ def cache_unshared_kv_graph(
         stride_s=pool_value.stride(3),
         active_mask=active_mask,
         MASKED=active_mask is not None,
+        standby_ptr=standby_value,
     )

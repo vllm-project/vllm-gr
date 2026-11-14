@@ -20,8 +20,9 @@ SID_TEXT = "<|sid_begin|><s_a_1><s_b_2><s_c_3><|sid_end|>"
 
 
 @pytest.mark.parametrize("compact", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("record", [False, True])  # type: ignore[misc]
 def test_offline_releases_consumed_outputs_before_next_call(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compact: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compact: bool, record: bool
 ) -> None:
     import torch
 
@@ -147,6 +148,7 @@ def test_offline_releases_consumed_outputs_before_next_call(
         batch_sizes=[1, 2],
         warmup_runs=2,
         measured_runs=3,
+        record_outputs=record,
     )
     result: dict[str, Any] = {"cases": []}
     gc_policy = gc.isenabled(), gc.get_threshold()
@@ -154,6 +156,15 @@ def test_offline_releases_consumed_outputs_before_next_call(
 
     assert (gc.isenabled(), gc.get_threshold()) == gc_policy
     assert [case["group_samples_ms"] for case in result["cases"]] == [[1.0] * 3] * 2
+    for count, case in zip(args.batch_sizes, result["cases"]):
+        if record:
+            assert (
+                case["outputs"]
+                == [[[{"token_ids": SID_IDS, "score": -1.0}] * args.beam_width] * count]
+                * args.measured_runs
+            )
+        else:
+            assert "outputs" not in case
     assert events == [
         event
         for count in args.batch_sizes
