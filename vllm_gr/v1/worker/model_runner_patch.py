@@ -43,6 +43,10 @@ def close_constraint_backend(runner: object) -> None:
     if projection is not None:
         cast(Any, runner)._gr_npu_stage_projection = None
         projection.close()
+    gpu_projection = getattr(runner, "_gr_gpu_stage_projection", None)
+    if gpu_projection is not None:
+        cast(Any, runner)._gr_gpu_stage_projection = None
+        gpu_projection.close()
     for processor in getattr(runner, "_gr_vocab_slice_processors", ()):
         processor._gr_vocab_slice = None
     runner._gr_vocab_slice_processors = ()
@@ -186,10 +190,21 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
                 processors = tuple(
                     module for module in self.model.modules() if isinstance(module, LogitsProcessor)
                 )
-                for processor in processors:
-                    # Explicit None also overrides unrelated legacy global settings.
-                    processor._gr_vocab_slice = window
-                self._gr_vocab_slice_processors = processors
+                if window is not None and gr_config.beam_execution_mode is BeamExecutionMode.V1:
+                    from vllm_gr.ops.gpu_stage_logits import (
+                        install_gpu_stage_projection,
+                    )
+
+                    projection = install_gpu_stage_projection(processors, window)
+                    self._gr_gpu_stage_projection = projection
+                    # Own the sliced weight before the native KV-memory profile.
+                    projection.prime(self)
+                    self.model_memory_usage += projection.cached_bytes
+                else:
+                    for processor in processors:
+                        # Explicit None also overrides unrelated legacy global settings.
+                        processor._gr_vocab_slice = window
+                    self._gr_vocab_slice_processors = processors
             elif (
                 getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.NPU
                 and getattr(backend, "stage_vocab", None) is not None
@@ -206,6 +221,10 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
             self.constraint_backend = versioned_constraint_table(self, backend)
             return result
         except BaseException:
+            gpu_projection = getattr(self, "_gr_gpu_stage_projection", None)
+            if gpu_projection is not None:
+                self._gr_gpu_stage_projection = None
+                gpu_projection.close()
             projection = getattr(self, "_gr_npu_stage_projection", None)
             if projection is not None:
                 self._gr_npu_stage_projection = None
@@ -311,7 +330,10 @@ def _install_active_worker_resource_hook() -> None:
         return
     from vllm.v1.worker.gpu_worker import Worker
 
+    from vllm_gr.ops.gpu_stage_logits import install_gpu_weight_update_hooks
+
     install_worker_utility_hooks(Worker)
+    install_gpu_weight_update_hooks(Worker)
 
 
 def _install_numpy_token_staging() -> None:

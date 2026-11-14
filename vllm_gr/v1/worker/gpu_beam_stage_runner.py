@@ -1091,6 +1091,13 @@ class GPUBeamStageRunner:
                             f"{tuple(tensor.shape)} {tensor.dtype} {tensor.device}"
                         )
                 if self.backend is not None:
+                    # A stage that did not leave the Beam projection scope would
+                    # hand full-vocabulary logits to a window-indexed table.
+                    projection = getattr(self.worker, "_gr_gpu_stage_projection", None)
+                    if projection is not None and self.logits.shape[-1] != projection.window[1]:
+                        raise RuntimeError(
+                            "CUDA Beam stage did not use its configured vocabulary window"
+                        )
                     self.backend.select_out_unchecked(
                         self.logits,
                         ConstraintMetadata(

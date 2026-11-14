@@ -47,6 +47,12 @@ logger = init_logger(__name__)
 _BEAM_POSTPROCESS_LOAD_PATCH_MARKER = "_vllm_gr_beam_postprocess_load_patched"
 
 
+def make_patched_reload_weights(original):
+    from vllm_gr.ops.gpu_stage_logits import make_gpu_stage_reload_weights
+
+    return make_gpu_stage_reload_weights(original)
+
+
 def initialize_beam_postprocess_workspaces(
     runner,
     *,

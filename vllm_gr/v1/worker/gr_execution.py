@@ -3,6 +3,7 @@
 """Device routing and input ownership for native GR dispatches."""
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import copy, deepcopy
 from typing import Any
 
@@ -109,8 +110,12 @@ def execute_gr_stage(
         stage_runner = get_npu_stage_runner(worker, local)
     else:
         raise ValueError("beam_search_v1 has no execution adapter for this device")
+    projection = (
+        getattr(worker, "_gr_gpu_stage_projection", None) if device_type == "cuda" else None
+    )
     try:
-        return stage_runner.execute(local, original, *args, **kwargs)
+        with projection.beam_scope() if projection is not None else nullcontext():
+            return stage_runner.execute(local, original, *args, **kwargs)
     except Exception as error:
         # Native BatchQueue consumes sample first. Stale logits must never hide
         # an execute failure from the corresponding sample Future.
