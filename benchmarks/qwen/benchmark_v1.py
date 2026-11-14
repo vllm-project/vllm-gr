@@ -23,6 +23,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from vllm_gr.config.benchmark_options import (
+    add_recogem_arguments,
+    beam_optimization_config,
+    configure_benchmark_precision,
+    optimization_settings,
+)
+
 MAX_BEAM_STEPS = 3
 
 
@@ -318,6 +325,8 @@ def canonical_gr_config(args: argparse.Namespace, artifact: ConstraintArtifact) 
         "beam": {
             "execution_mode": "v1",
             "graph_enabled": not args.disable_beam_graph,
+            "enable_kv_pool_ping_pong": args.kv_pool_ping_pong,
+            **beam_optimization_config(args),
             "max_width": args.beam_width,
             "max_decode_steps": args.beam_steps,
         },
@@ -527,12 +536,14 @@ def _environment(torch: Any) -> dict[str, Any]:
         "vllm_gr": package_version("vllm-gr"),
         "cuda_available": cuda_available,
         "cuda_device_name": torch.cuda.get_device_name(0) if cuda_available else None,
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         "cuda_device_capability": (torch.cuda.get_device_capability(0) if cuda_available else None),
     }
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     multiprocessing_method = configure_multiprocessing()
+    precision = configure_benchmark_precision(args)
     import torch
 
     from vllm_gr.entrypoints.gr import GRLLM
@@ -682,11 +693,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "ignore_eos": args.ignore_eos,
             "length_penalty": args.length_penalty,
         },
+        "beam_optimizations": optimization_settings(args),
+        "precision": precision,
         "engine_config": {
             "worker_multiprocessing_method": multiprocessing_method,
             "async_scheduling": True,
             "constraint_backend": "canonical_cuda_constraint_table",
             "beam_graph_enabled": not args.disable_beam_graph,
+            "enable_kv_pool_ping_pong": args.kv_pool_ping_pong,
             "max_model_len": max_model_len,
             "max_num_batched_tokens": max_num_batched_tokens,
             "max_num_seqs": 1,
@@ -747,6 +761,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--disable-beam-graph", action="store_true")
+    parser.add_argument(
+        "--kv-pool-ping-pong",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Gather KV directly into the next Decode bank; disable for write-back A/B.",
+    )
+    add_recogem_arguments(parser)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument(

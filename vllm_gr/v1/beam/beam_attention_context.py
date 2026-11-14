@@ -104,7 +104,13 @@ class BeamAttentionContext:
         device: torch.device,
         dtype: torch.dtype,
         enable_short_suffix_attention: bool = False,
+        enable_kv_pool_ping_pong: bool = False,
     ):
+        if type(enable_kv_pool_ping_pong) is not bool:
+            raise TypeError("enable_kv_pool_ping_pong must be a boolean")
+        if enable_kv_pool_ping_pong and device.type != "cuda":
+            raise ValueError("KV pool ping-pong requires CUDA")
+        self.enable_kv_pool_ping_pong = enable_kv_pool_ping_pong
         if enable_short_suffix_attention:
             if device.type != "cuda":
                 raise ValueError("Short suffix attention requires CUDA")
@@ -210,16 +216,44 @@ class BeamAttentionContext:
         # stage through its own slice (a single shared buffer would make
         # layers clobber each other's staging data). The Python fallback
         # and the cascade reorder path index the same buffer with [layer].
-        self.aux_key_buf = torch.zeros(
-            (num_layers, max_beams, num_kv_heads, max_decode_steps, head_dim),
-            dtype=dtype,
-            device=device,
-        )
-        self.aux_value_buf = torch.zeros(
-            (num_layers, max_beams, num_kv_heads, max_decode_steps, head_dim),
-            dtype=dtype,
-            device=device,
-        )
+        self.standby_key_buf: torch.Tensor | None = None
+        self.standby_value_buf: torch.Tensor | None = None
+        self.standby_key_ptrs: torch.Tensor | None = None
+        self.standby_value_ptrs: torch.Tensor | None = None
+        if enable_kv_pool_ping_pong:
+            standby_shape = (
+                num_layers,
+                max_batch,
+                max_beams,
+                num_kv_heads,
+                max_decode_steps,
+                head_dim,
+            )
+            self.standby_key_buf = torch.zeros(standby_shape, dtype=dtype, device=device)
+            self.standby_value_buf = torch.zeros_like(self.standby_key_buf)
+            for layer, pool in enumerate(self.pools):
+                pool.standby_key = self.standby_key_buf[layer]
+                pool.standby_value = self.standby_value_buf[layer]
+            self.standby_key_ptrs = torch.tensor(
+                [self.standby_key_buf[layer].data_ptr() for layer in range(num_layers)],
+                dtype=torch.int64,
+                device=device,
+            )
+            self.standby_value_ptrs = torch.tensor(
+                [self.standby_value_buf[layer].data_ptr() for layer in range(num_layers)],
+                dtype=torch.int64,
+                device=device,
+            )
+            # Retain the legacy contiguous scratch ABI without another
+            # allocation. Dynamic-width execution uses bank zero exclusively
+            # and may reuse these slices as temporary storage. Fixed-width
+            # execution gives every slot its own persistent standby history.
+            self.aux_key_buf = self.standby_key_buf.flatten(0, 1)[:num_layers]
+            self.aux_value_buf = self.standby_value_buf.flatten(0, 1)[:num_layers]
+        else:
+            aux_shape = (num_layers, max_beams, num_kv_heads, max_decode_steps, head_dim)
+            self.aux_key_buf = torch.zeros(aux_shape, dtype=dtype, device=device)
+            self.aux_value_buf = torch.zeros_like(self.aux_key_buf)
 
         # Device-resident beam-decision state .
         self.decision = BeamDecisionBuffers(max_batch, max_beams, max_decode_steps, device, dtype)

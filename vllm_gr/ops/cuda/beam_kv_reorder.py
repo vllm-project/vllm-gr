@@ -9,6 +9,64 @@ import triton.language as tl
 
 
 @triton.jit
+def _select_kv_ping_pong_kernel(
+    pool_k_ptrs,
+    pool_v_ptrs,
+    standby_k_ptrs,
+    standby_v_ptrs,
+    pool_slot_offset,
+    n,
+    steps,
+    beam_index_ptr,
+    H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    D,
+    stride_pw,
+    stride_ph,
+    stride_ps,
+    active_mask=None,
+    execute=None,
+    DEVICE_STEPS: tl.constexpr = False,
+):
+    """Gather all-layer parent histories directly into the next Decode bank.
+
+    Banks have identical layouts and disjoint, persistent addresses. Selecting
+    them from the existing step counter needs neither a pointer-table update
+    nor a bank-switch kernel, including under CUDA graph replay.
+    """
+    pid = tl.program_id(0)
+    per_layer = n * H
+    layer = pid // per_layer
+    i = (pid % per_layer) // H
+    h = pid % H
+    if DEVICE_STEPS:
+        step = tl.load(steps)
+        enabled = tl.load(execute) & tl.load(active_mask + i)
+        steps = tl.where(enabled, step + 1, 0)
+    else:
+        step = steps - 1
+    bank = step & 1
+    k0 = tl.load(pool_k_ptrs + layer)
+    v0 = tl.load(pool_v_ptrs + layer)
+    k1 = tl.load(standby_k_ptrs + layer)
+    v1 = tl.load(standby_v_ptrs + layer)
+    k_src = (tl.where(bank == 0, k0, k1) + pool_slot_offset).to(tl.pointer_type(tl.uint16))
+    v_src = (tl.where(bank == 0, v0, v1) + pool_slot_offset).to(tl.pointer_type(tl.uint16))
+    k_dst = (tl.where(bank == 0, k1, k0) + pool_slot_offset).to(tl.pointer_type(tl.uint16))
+    v_dst = (tl.where(bank == 0, v1, v0) + pool_slot_offset).to(tl.pointer_type(tl.uint16))
+    parent = tl.load(beam_index_ptr + i)
+    d = tl.arange(0, BLOCK_D)
+    mask = d < D
+    src_off = parent * stride_pw + h * stride_ph
+    dst_off = i * stride_pw + h * stride_ph
+    for s in range(steps):
+        src = src_off + s * stride_ps + d
+        dst = dst_off + s * stride_ps + d
+        tl.store(k_dst + dst, tl.load(k_src + src, mask=mask), mask=mask)
+        tl.store(v_dst + dst, tl.load(v_src + src, mask=mask), mask=mask)
+
+
+@triton.jit
 def _select_kv_gather_kernel(
     pool_k_ptrs,  # int64 [L]: per-layer key pool base byte addresses
     pool_v_ptrs,  # int64 [L]: per-layer value pool base byte addresses

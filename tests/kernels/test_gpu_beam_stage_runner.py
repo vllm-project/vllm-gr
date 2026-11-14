@@ -239,6 +239,7 @@ def admission_worker(
             beam_max_decode_steps=3,
             beam_execution_mode=BeamExecutionMode.V1,
             enable_short_suffix_attention=False,
+            enable_kv_pool_ping_pong=False,
             # resolve_candidate_width reads this; None keeps K == W for the
             # fixture's W=4 workspace.
             constraint_table=None,

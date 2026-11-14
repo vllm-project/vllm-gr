@@ -19,6 +19,7 @@ import triton
 
 from vllm_gr.ops.cuda.beam_kv_reorder import (
     _select_kv_gather_kernel,
+    _select_kv_ping_pong_kernel,
     _select_kv_scatter_kernel,
 )
 
@@ -130,6 +131,93 @@ def select_unshared_kv(
 # beam_index is not a permutation (fan-out — several beams may select the
 # same parent), so an in-place single kernel would race cross-program reads
 # against writes.
+
+
+def select_unshared_kv_ping_pong(
+    beam_index: torch.Tensor,
+    slot: int,
+    unshared_key_caches: list[torch.Tensor],
+    unshared_value_caches: list[torch.Tensor],
+    standby_key_caches: list[torch.Tensor | None],
+    standby_value_caches: list[torch.Tensor | None],
+    decode_step: int,
+    pool_key_ptrs: torch.Tensor,
+    pool_value_ptrs: torch.Tensor,
+    standby_key_ptrs: torch.Tensor,
+    standby_value_ptrs: torch.Tensor,
+    *,
+    validate_layout: bool = True,
+) -> None:
+    """Write selected history into the bank consumed by the next Decode.
+
+    The step selects both source and destination, so callers retain the same
+    tensor objects and pointer tables for every session and graph replay.
+    """
+    if not unshared_key_caches:
+        raise ValueError("KV ping-pong requires at least one layer")
+    first = unshared_key_caches[0]
+    layers = len(unshared_key_caches)
+    banks = (unshared_key_caches, unshared_value_caches, standby_key_caches, standby_value_caches)
+    if not first.is_cuda or first.element_size() != 2:
+        raise ValueError("KV ping-pong requires two-byte CUDA pools")
+    if any(len(bank) != layers for bank in banks):
+        raise ValueError("KV ping-pong layer counts must agree")
+    if validate_layout:
+        ranges = []
+        for bank in banks:
+            for tensor in bank:
+                if (
+                    tensor is None
+                    or tensor.shape != first.shape
+                    or tensor.stride() != first.stride()
+                    or tensor.dtype != first.dtype
+                    or tensor.device != first.device
+                ):
+                    raise ValueError("KV ping-pong banks must have identical layouts")
+                start = tensor.data_ptr()
+                ranges.append((start, start + tensor.numel() * tensor.element_size()))
+        ranges.sort()
+        if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+            raise ValueError("KV ping-pong banks must not overlap")
+        for ptrs in (pool_key_ptrs, pool_value_ptrs, standby_key_ptrs, standby_value_ptrs):
+            if (
+                ptrs.shape != (layers,)
+                or ptrs.dtype != torch.int64
+                or ptrs.device != first.device
+                or not ptrs.is_contiguous()
+            ):
+                raise ValueError("KV ping-pong requires matching persistent pointer tables")
+    n = beam_index.numel()
+    if n == 0:
+        return
+    if (
+        beam_index.ndim != 1
+        or beam_index.dtype not in (torch.int32, torch.int64)
+        or beam_index.device != first.device
+        or not beam_index.is_contiguous()
+        or n > first.shape[1]
+        or not first.is_contiguous()
+    ):
+        raise ValueError("KV ping-pong parent layout or width is incompatible")
+    if not 0 <= decode_step < first.shape[3] or not 0 <= slot < first.shape[0]:
+        raise ValueError("KV ping-pong step or slot exceeds capacity")
+    H, D = first.shape[2], first.shape[4]
+    _select_kv_ping_pong_kernel[(layers * n * H,)](
+        pool_key_ptrs,
+        pool_value_ptrs,
+        standby_key_ptrs,
+        standby_value_ptrs,
+        slot * first.stride(0) * first.element_size(),
+        n,
+        decode_step + 1,
+        beam_index,
+        H=H,
+        BLOCK_D=triton.next_power_of_2(D),
+        D=D,
+        stride_pw=first.stride(1),
+        stride_ph=first.stride(2),
+        stride_ps=first.stride(3),
+    )
 
 
 def select_unshared_kv_fused(

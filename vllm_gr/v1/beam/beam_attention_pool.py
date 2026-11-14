@@ -61,8 +61,16 @@ class BeamAttentionPool:
         pool_shape = (max_batch, max_beams, num_kv_heads, max_decode_steps, head_dim)
         self.unshared_key = torch.zeros(pool_shape, dtype=dtype, device=device)
         self.unshared_value = torch.zeros(pool_shape, dtype=dtype, device=device)
+        # Optional second bank, owned by BeamAttentionContext. Both addresses
+        # stay fixed; CUDA kernels select the bank from the device Decode step.
+        self.standby_key: torch.Tensor | None = None
+        self.standby_value: torch.Tensor | None = None
 
     def reset_slot(self, slot: int):
         """Zero out a single slot's KV for a new session."""
         self.unshared_key[slot].zero_()
         self.unshared_value[slot].zero_()
+        if self.standby_key is not None:
+            assert self.standby_value is not None
+            self.standby_key[slot].zero_()
+            self.standby_value[slot].zero_()

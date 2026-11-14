@@ -347,8 +347,8 @@ class _StageExecutionHooks:
 
         return get_beam_decode_graph(self.worker, batch_size=batch_size, beam_width=beam_width)
 
-    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
-        """V1 can capture a missing graph against a new stage's buffers."""
+    def ready_decode_graph(self, owner: GPUBeamStageRunner) -> Any:
+        """Resolve the native model graph without running projection."""
         worker = self.worker
         from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
@@ -368,11 +368,11 @@ class _StageExecutionHooks:
                     persistent_install=self.persistent_graph_install,
                 )
             owner.graph = graph
-        if should_replay_decode_graph(worker, owner.graph):
-            return _hidden_logits(owner, owner.graph.replay())
-        # Eager Decode keeps the stage's ``_forward`` entry point; ``_forward``
-        # publishes ``hidden`` itself when the LM head is sliced.
-        return owner._forward()
+        return owner.graph if should_replay_decode_graph(worker, owner.graph) else None
+
+    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
+        graph = self.ready_decode_graph(owner)
+        return _hidden_logits(owner, graph.replay()) if graph is not None else owner._forward()
 
     def consume_retirement_state(
         self, scheduler_output: Any, bindings: tuple[BeamRequestBinding, ...]
@@ -696,6 +696,17 @@ class GPUBeamStageRunner:
         self.metadata: Any = None
         self.graph: Any = None
         self.logits: torch.Tensor | None = None
+        self._full_step_consumed = False
+        self._full_step_graphs: dict[tuple[Any, ...], Any] = {}
+        self._full_step_tensors: tuple[torch.Tensor, ...] | None = None
+        self.enable_full_step_graph = False
+        if getattr(worker, "vllm_config", None) is not None:
+            from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+            cfg = _get_gr_config(worker)
+            self.enable_full_step_graph = getattr(cfg, "enable_full_step_graph", False) and getattr(
+                cfg, "beam_graph_enabled", False
+            )
         batch_size = len(bindings)
         rows = batch_size * beam.state.beam_width
         slice_request = (
@@ -811,6 +822,7 @@ class GPUBeamStageRunner:
             if slot is None:
                 raise RuntimeError("both GR dispatch control slots await output consumption")
             self.control_busy[slot] = True
+        self._full_step_consumed = False
         execution = BeamDispatchExecution(tuple(entries), offset)
         self.pending = execution, slot
         self.previous = stages[0]
@@ -867,6 +879,7 @@ class GPUBeamStageRunner:
             session=GPUBeamAttentionBatch(
                 self.beam.sessions,
                 width=BeamBatchExecutionView.from_stage_metadata(m).input_width,
+                kv_pool_ping_pong=self.dynamic is None,
             ),
             mask=self.execution_mask,
             slots=self.slots,
@@ -1041,8 +1054,191 @@ class GPUBeamStageRunner:
                 self.hooks.consume_native_state(scheduler_output)
                 self._bind_attention(m)
                 self.prepare_decode(entry)
-                self.logits = self.hooks.decode_logits(self)
+                if not self._try_full_step(entry):
+                    self.logits = self.hooks.decode_logits(self)
         return None
+
+    def _try_full_step(self, entry: BeamDispatchEntry) -> bool:
+        """Capture/replay one fixed-width step with request state on the GPU."""
+        if (
+            not self.enable_full_step_graph
+            or not self.hooks.persistent_graph_install
+            or getattr(self.worker, "_gr_async_decode_graph_capture_failed", False)
+            or self.dynamic is not None
+            or self.backend is None
+            or self.cancelled
+            or not entry.metadata.produces_output
+            or self.worker.model_config.enforce_eager
+            or self.pending is None
+            or len(self.pending[0].entries) != 1
+        ):
+            return False
+        from vllm_gr.v1.worker.beam_full_step_graph import FullBeamStepGraph
+
+        slot = self.pending[1]
+
+        if self._full_step_tensors is None:
+            tensors = [
+                value for value in vars(self.beam.state).values() if isinstance(value, torch.Tensor)
+            ]
+            for pool in self.beam.session.context.pools:
+                for name in ("unshared_key", "unshared_value", "standby_key", "standby_value"):
+                    value = getattr(pool, name, None)
+                    if value is not None:
+                        tensors.append(value)
+            tensors.append(self.device_control)
+            self._full_step_tensors = tuple(tensors)
+        from vllm_gr.v1.worker.beam_decode_graph import _BeamDecodeModel
+
+        if isinstance(self.worker.model, _BeamDecodeModel):
+            source = self.hooks.ready_decode_graph(self)
+            if source is None:
+                return False
+            hidden = source.replay()
+        else:
+            hidden = self._forward_hidden(False)
+        key = (
+            entry.metadata.stage_index,
+            entry.row_count,
+            entry.metadata.beam_params,
+            getattr(self.metadata, "prefix_length_bucket", 0),
+            id(self.inputs),
+            id(self.backend),
+            id(self.beam.state),
+            id(self.worker.model),
+            slot,
+            hidden.data_ptr(),
+            hidden.shape,
+            hidden.stride(),
+        )
+        captured = self._full_step_graphs.get(key)
+        if captured is None:
+
+            def operation() -> None:
+                self.logits = _hidden_logits(self, hidden)
+                self._sample_device(entry)
+                self._write_control(slot)
+
+            # Native Forward and this postprocess graph execute in stream order.
+            captured = FullBeamStepGraph(operation, self._full_step_tensors)
+            # A raw CUDA executable does not retain Python tensor arguments.
+            # Keep metadata, model inputs and captured outputs alive just as
+            # the native model graph retains its input/attention bindings.
+            captured.bindings = (
+                self.inputs,
+                getattr(self, "attention", None),
+                self.metadata,
+                getattr(self, "slot_mappings", None),
+                self.input_ids,
+                self.positions,
+                self.execution_mask,
+                self.slots,
+                hidden,
+                self.logits,
+                self.hidden,
+            )
+            captured.logits = self.logits
+            self._full_step_graphs[key] = captured
+        captured.replay()
+        self.logits = captured.logits
+        self._full_step_consumed = True
+        return True
+
+    def _sample_device(self, entry: BeamDispatchEntry) -> None:
+        """Select candidates and advance device state without host output work."""
+        m = entry.metadata
+        if self.logits is None and self.hidden is None:
+            raise RuntimeError("GR output stage has no native model logits")
+        layout = BeamBatchExecutionView.from_stage_metadata(m)
+        rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
+        candidate_width = layout.candidate_top_k
+        device = self.hidden.device if self.hidden is not None else self.logits.device
+        candidates = (
+            self.dynamic.candidate_buffers(rows, candidate_width)
+            if self.dynamic is not None
+            else (self.tokens[:rows], self.scores[:rows], self.valid[:rows])
+        )
+        # The backend's unchecked entry point validates nothing: it
+        # addresses outputs as ``row * K + offset`` and skips shape
+        # checks.  A candidate buffer whose column count disagrees with
+        # the requested K would write past its allocation (K < rows of
+        # the view) or leave candidate columns unwritten (K larger).
+        # Check the geometry here, before the launch.
+        expected = (rows, candidate_width)
+        for name, tensor, dtype in (
+            ("candidate token ids", candidates[0], torch.int32),
+            ("candidate logprobs", candidates[1], torch.float32),
+            ("candidate valid mask", candidates[2], torch.bool),
+        ):
+            if (
+                tuple(tensor.shape) != expected
+                or tensor.dtype != dtype
+                or tensor.device != device
+                or not tensor.is_contiguous()
+            ):
+                raise RuntimeError(
+                    f"GR candidate {name} must be contiguous {dtype} "
+                    f"{expected} on {device}, got "
+                    f"{tuple(tensor.shape)} {tensor.dtype} {tensor.device}"
+                )
+        if self.backend is not None:
+            self.backend.select_out_unchecked(
+                self.logits,
+                ConstraintMetadata(
+                    self.prefixes[:rows],
+                    self.temperatures[:rows],
+                    0,
+                    layout.candidate_top_k,
+                    trie_ids=self.trie_ids_by_width.get(layout.input_width),
+                ),
+                out_token_ids=candidates[0],
+                out_logprobs=candidates[1],
+                out_valid_mask=candidates[2],
+                out_valid_counts=self.counts[:rows],
+                device_step=self.constraint_steps,
+            )
+        else:
+            sliced = self.hidden is not None
+            logits = None if sliced else self.logits[:rows]
+            vocab_size = int(self._head_layout[0].shape[1]) if sliced else int(logits.shape[-1])
+            if (
+                self.unconstrained_topk_scratch is None
+                or self.unconstrained_topk_scratch.top_k != layout.candidate_top_k
+                or self.unconstrained_topk_scratch.vocab_size != vocab_size
+            ):
+                self.unconstrained_topk_scratch = allocate_unconstrained_topk_scratch(
+                    batch_size=len(self.bindings) * self.beam.state.beam_width,
+                    vocab_size=vocab_size,
+                    top_k=layout.candidate_top_k,
+                    device=device,
+                )
+            if sliced:
+                self._select_from_hidden_slices(
+                    self.hidden,
+                    rows,
+                    layout.candidate_top_k,
+                    self.unconstrained_topk_scratch,
+                    candidates,
+                    self.counts[:rows],
+                )
+            else:
+                unconstrained_topk_out(
+                    logits,
+                    self.temperatures[:rows],
+                    layout.candidate_top_k,
+                    self.unconstrained_topk_scratch,
+                    candidates[0],
+                    candidates[1],
+                    candidates[2],
+                    self.counts[:rows],
+                )
+        candidate_batch = BeamCandidateBatch(layout, *candidates)
+        if self.dynamic is not None:
+            self.dynamic.advance(layout, candidates, m.is_last_stage)
+        elif m.kind is GRStageKind.PREFILL:
+            self.beam.initialize_from_prefill(candidate_batch)
+        else:
+            self.beam.advance(candidate_batch)
 
     def sample(self, grammar_output: Any = None) -> AsyncGPUBeamOutput:
         if self.execution_error is not None:
@@ -1055,113 +1251,11 @@ class GPUBeamStageRunner:
         terminal_payload = False
         for entry in execution.entries:
             m = entry.metadata
-            if m.produces_output and not self.cancelled:
-                if self.logits is None and self.hidden is None:
-                    raise RuntimeError("GR output stage has no native model logits")
-                layout = BeamBatchExecutionView.from_stage_metadata(m)
-                rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
-                candidate_width = layout.candidate_top_k
-                device = self.hidden.device if self.hidden is not None else self.logits.device
-                candidates = (
-                    self.dynamic.candidate_buffers(rows, candidate_width)
-                    if self.dynamic is not None
-                    else (self.tokens[:rows], self.scores[:rows], self.valid[:rows])
-                )
-                # The backend's unchecked entry point validates nothing: it
-                # addresses outputs as ``row * K + offset`` and skips shape
-                # checks.  A candidate buffer whose column count disagrees with
-                # the requested K would write past its allocation (K < rows of
-                # the view) or leave candidate columns unwritten (K larger).
-                # Check the geometry here, before the launch.
-                expected = (rows, candidate_width)
-                for name, tensor, dtype in (
-                    ("candidate token ids", candidates[0], torch.int32),
-                    ("candidate logprobs", candidates[1], torch.float32),
-                    ("candidate valid mask", candidates[2], torch.bool),
-                ):
-                    if (
-                        tuple(tensor.shape) != expected
-                        or tensor.dtype != dtype
-                        or tensor.device != device
-                        or not tensor.is_contiguous()
-                    ):
-                        raise RuntimeError(
-                            f"GR candidate {name} must be contiguous {dtype} "
-                            f"{expected} on {device}, got "
-                            f"{tuple(tensor.shape)} {tensor.dtype} {tensor.device}"
-                        )
-                if self.backend is not None:
-                    self.backend.select_out_unchecked(
-                        self.logits,
-                        ConstraintMetadata(
-                            self.prefixes[:rows],
-                            self.temperatures[:rows],
-                            0,
-                            layout.candidate_top_k,
-                            trie_ids=self.trie_ids_by_width.get(layout.input_width),
-                        ),
-                        out_token_ids=candidates[0],
-                        out_logprobs=candidates[1],
-                        out_valid_mask=candidates[2],
-                        out_valid_counts=self.counts[:rows],
-                        device_step=self.constraint_steps,
-                    )
-                else:
-                    sliced = self.hidden is not None
-                    logits = None if sliced else self.logits[:rows]
-                    vocab_size = (
-                        int(self._head_layout[0].shape[1]) if sliced else int(logits.shape[-1])
-                    )
-                    if (
-                        self.unconstrained_topk_scratch is None
-                        or self.unconstrained_topk_scratch.top_k != layout.candidate_top_k
-                        or self.unconstrained_topk_scratch.vocab_size != vocab_size
-                    ):
-                        self.unconstrained_topk_scratch = allocate_unconstrained_topk_scratch(
-                            batch_size=len(self.bindings) * self.beam.state.beam_width,
-                            vocab_size=vocab_size,
-                            top_k=layout.candidate_top_k,
-                            device=device,
-                        )
-                    if sliced:
-                        self._select_from_hidden_slices(
-                            self.hidden,
-                            rows,
-                            layout.candidate_top_k,
-                            self.unconstrained_topk_scratch,
-                            candidates,
-                            self.counts[:rows],
-                        )
-                    else:
-                        unconstrained_topk_out(
-                            logits,
-                            self.temperatures[:rows],
-                            layout.candidate_top_k,
-                            self.unconstrained_topk_scratch,
-                            candidates[0],
-                            candidates[1],
-                            candidates[2],
-                            self.counts[:rows],
-                        )
-                candidate_batch = BeamCandidateBatch(layout, *candidates)
-                if self.dynamic is not None:
-                    self.dynamic.advance(layout, candidates, m.is_last_stage)
-                elif m.kind is GRStageKind.PREFILL:
-                    self.beam.initialize_from_prefill(candidate_batch)
-                else:
-                    self.beam.advance(candidate_batch)
-            state_rows = slice(0, len(self.bindings))
+            if m.produces_output and not self.cancelled and not self._full_step_consumed:
+                self._sample_device(entry)
             control = self.device_control[slot, 0]
-            control[:1].copy_(
-                self.beam.state.num_generated_tokens[state_rows].amax().reshape(1) - control[:1]
-            )
-            control[1:2].copy_(
-                _batch_finished(
-                    self.beam.state.is_finished[state_rows],
-                    self.beam.state.error_code[state_rows],
-                ).reshape(1)
-            )
-            control[2:3].copy_(self.beam.state.error_code[state_rows].amax().reshape(1))
+            if not self._full_step_consumed:
+                self._write_control(slot)
             # The fixed-length terminal stage returns one packed payload whose
             # header replaces the separate per-stage control D2H.
             if m.is_last_stage:
@@ -1178,6 +1272,20 @@ class GPUBeamStageRunner:
         self.worker.kv_connector_output = None
         self.pending = None
         return AsyncGPUBeamOutput(self, execution, slot, terminal_payload)
+
+    def _write_control(self, slot: int) -> None:
+        state_rows = slice(0, len(self.bindings))
+        control = self.device_control[slot, 0]
+        control[:1].copy_(
+            self.beam.state.num_generated_tokens[state_rows].amax().reshape(1) - control[:1]
+        )
+        control[1:2].copy_(
+            _batch_finished(
+                self.beam.state.is_finished[state_rows],
+                self.beam.state.error_code[state_rows],
+            ).reshape(1)
+        )
+        control[2:3].copy_(self.beam.state.error_code[state_rows].amax().reshape(1))
 
     def completion_view(self, binding: BeamRequestBinding) -> dict[str, torch.Tensor]:
         if self.closed or binding not in self.bindings:
@@ -1645,6 +1753,9 @@ def get_stage_runner(
     if reuse_adapter:
         assert existing is not None
         adapter = existing
+        if not reuse_beam:
+            adapter._full_step_graphs.clear()
+            adapter._full_step_tensors = None
         adapter.beam, adapter.bindings, adapter.backend = beam, binding_tuple, backend
         adapter.binding, adapter.batch_view = binding_tuple[0], view
         adapter.previous, adapter.pending = None, None
