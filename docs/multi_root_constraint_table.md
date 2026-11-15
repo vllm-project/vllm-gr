@@ -21,6 +21,10 @@ Build each Trie's triples document with the existing
 ```
 
 IDs must be consecutive, starting at zero; paths are relative to the manifest.
+The builder checks local JSON objects, manifest entries, and referenced files
+before resolving a remote revision or loading the tokenizer and model config.
+File errors identify the manifest, Trie ID, and referenced path. Semantic-token
+and tokenizer validation still run in the compiler.
 
 ```bash
 python tools/build_constraint_table.py \
