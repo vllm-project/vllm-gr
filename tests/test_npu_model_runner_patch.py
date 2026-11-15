@@ -2535,6 +2535,79 @@ def _terminal_result_runner(
     return stage
 
 
+@pytest.mark.l1
+@pytest.mark.parametrize("batch,width,steps", [(1, 64, 1), (1, 128, 3), (4, 64, 2), (4, 128, 3)])
+@pytest.mark.parametrize(
+    "include_score,include_parents", [(True, True), (False, False), (True, False), (False, True)]
+)
+@pytest.mark.parametrize("penalty", [0.0, 1.0, -1.0])
+def test_npu_cpu_columns_materialize_identically_to_stop_aware_rows(
+    batch: int, width: int, steps: int, include_score: bool, include_parents: bool, penalty: float
+) -> None:
+    from vllm_gr.v1.beam.batch_contracts import BeamSequenceColumns
+    from vllm_gr.v1.beam.output_columns import materialize_beam_result, validate_complete_sequences
+
+    stage = _terminal_result_runner(
+        batch,
+        returned=width,
+        penalty=penalty,
+        include_score=include_score,
+        include_parents=include_parents,
+    )
+    stage.session_request.beam_params.max_tokens = steps
+    tokens = torch.arange(batch * width * steps, dtype=torch.int32).view(batch, width, steps)
+    parents = torch.zeros_like(tokens)
+    # Ties, both signed zeros, and nonfinite candidates exercise the original
+    # Python ranking. Scores are transported as their original float32 bits.
+    scores = (torch.arange(batch * width, dtype=torch.float32).view(batch, width) % 7) * -0.125
+    scores[:, :5] = torch.tensor([float("nan"), float("inf"), -float("inf"), -0.0, 0.0])
+    columns = stage._build_terminal_result(tokens, scores, parents)
+    assert columns.output is not None
+    for item in columns.output.items:
+        assert isinstance(item.sequences, BeamSequenceColumns)
+        validate_complete_sequences(item.sequences)
+    # A stop ID absent from the input selects the unchanged row path without
+    # changing any sequence's length, score normalization, or return limit.
+    stage.session_request.beam_params.stop_token_ids = (2**31 - 1,)
+    rows = stage._build_terminal_result(tokens, scores, parents)
+    materialized = materialize_beam_result(columns)
+    assert materialized == rows
+    if include_score:
+        for left, right in zip(materialized.output.items, rows.output.items, strict=True):
+            assert [struct.pack("<f", x.cumulative_logprob) for x in left.sequences] == [
+                struct.pack("<f", x.cumulative_logprob) for x in right.sequences
+            ]
+    # Serialized columns own their bytes even after worker tensors are reused.
+    tokens.fill_(99)
+    parents.fill_(99)
+    scores.fill_(99)
+    assert materialize_beam_result(columns) == rows
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    "width,returned,steps,budget,stop_ids",
+    [(32, 32, 3, 3, ()), (128, 2, 3, 3, ()), (64, 64, 2, 3, ()), (64, 64, 3, 3, (99,))],
+)
+def test_npu_cpu_columns_keep_unsupported_results_on_rows(width, returned, steps, budget, stop_ids):
+    stage = _terminal_result_runner(1, returned=returned, stop_ids=stop_ids)
+    stage.session_request.beam_params.max_tokens = budget
+    tokens = torch.full((1, width, steps), 99, dtype=torch.int32)
+    result = stage._build_terminal_result(tokens, torch.zeros(1, width), torch.zeros_like(tokens))
+    assert result.output is not None
+    assert isinstance(result.output.items[0].sequences, tuple)
+
+
+@pytest.mark.l1
+def test_npu_cpu_columns_all_invalid_preserves_lazy_normalization_failure():
+    stage = _terminal_result_runner(4, returned=64, penalty=1e6)
+    stage.session_request.beam_params.max_tokens = 3
+    tokens = torch.zeros(4, 64, 3, dtype=torch.int32)
+    result = stage._build_terminal_result(tokens, torch.full((4, 64), -float("inf")), tokens)
+    assert result.output is None
+    assert (result.failure.code, result.failure.item_index) == ("no_valid_beams", 0)
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     "batch,steps,include_score,include_parents",
     [
