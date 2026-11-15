@@ -266,11 +266,18 @@ class CudaStageHooksV2(CudaStageHooks):
         # GR bypasses native sample_tokens/postprocess, which normally advances
         # this GPU counter. update_requests only updates its CPU mirror; without
         # the device update a continuation gathers the previous chunk again.
-        # Every prefill chunk consumes its actual query length (not graph
-        # padding), even when it produces no Beam output. Generated token
-        # history remains owned by GR, so use the count-only native update.
+        # Complete GR Prefill consumes its actual query length (not graph
+        # padding), including after a Prefix Cache hit. Generated token history
+        # remains owned by GR, so use the count-only native update.
         worker.postprocess_num_computed_tokens(batch)
         return logits
+
+    def finish_native_output(self) -> None:
+        """Finish output submission without repeating native Prefill updates."""
+        self.worker.execute_model_state = None
+        # Preserve the existing GR reset even if native V2 did not create this
+        # V1-style field. This does not invoke a connector or clear GR buffers.
+        self.worker.kv_connector_output = None
 
     def prefill_stage_fence(self) -> None:
         # V2 prepares a fresh InputBatch per execute_model call; there are no

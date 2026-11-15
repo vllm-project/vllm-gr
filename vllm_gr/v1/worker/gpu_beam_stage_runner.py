@@ -1054,8 +1054,7 @@ class GPUBeamStageRunner:
                 self.copy_stream.wait_event(self.produced_ready[slot])
                 self.host_control[slot].copy_(self.device_control[slot], non_blocking=True)
                 self.copy_done[slot].record(self.copy_stream)
-        self.worker.execute_model_state = None
-        self.worker.kv_connector_output = None
+        self.hooks.finish_native_output()
         self.pending = None
         return AsyncGPUBeamOutput(self, execution, slot, terminal_payload)
 

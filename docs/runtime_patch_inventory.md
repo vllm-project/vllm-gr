@@ -264,6 +264,15 @@ and Decode capture policy remain active when this cache is disabled.
   startup regressions live in `tests/test_model_runner_stage_binding.py` and
   `tests/test_gr_startup.py`; `tests/tools/test_cuda_stage_typing.py` pins the
   abstract method set and both subclasses.
+- Native output completion: the shared CUDA stage calls
+  `CudaStageHooksV1/V2.finish_native_output()` after device output submission and
+  before clearing its pending dispatch. The hooks own the native result field
+  resets, including cancelled dispatches. Earlier failures retain their existing
+  failure state. V2 Prefill consumption and token updates remain in Prefill.
+  No dispatch/output-consumer drain or GR resource release occurs in this hook.
+  Coverage: `tests/test_cuda_native_output.py`, `tests/test_v2_multibatch.py`,
+  `tests/kernels/test_gpu_beam_stage_lifecycle.py`, and
+  `tests/kernels/test_gpu_beam_stage_v2_state.py`.
 - ModelRunner V1 targets:
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`

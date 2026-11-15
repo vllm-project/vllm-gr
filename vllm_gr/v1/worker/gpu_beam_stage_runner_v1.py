@@ -65,6 +65,11 @@ class CudaStageHooksV1(CudaStageHooks):
             raise RuntimeError("native GR Prefill must return logits through execute_model_state")
         return worker.execute_model_state.logits
 
+    def finish_native_output(self) -> None:
+        """Drop native results after GR has submitted its output work."""
+        self.worker.execute_model_state = None
+        self.worker.kv_connector_output = None
+
     def prefill_stage_fence(self) -> None:
         """Wait for any native prefill reads of reused CPU input buffers.
 

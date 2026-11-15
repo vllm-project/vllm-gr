@@ -22,6 +22,11 @@ class WrongReturn(CudaStageHooks):
         return "not block IDs"
 
 
+class WrongFinishReturn(CudaStageHooks):
+    def finish_native_output(self) -> int:  # type: ignore[override]
+        return 1
+
+
 class WrongConstructor(CudaStageHooksV1):
     def __init__(self, worker: Any, required_argument: int) -> None:
         super().__init__(worker)

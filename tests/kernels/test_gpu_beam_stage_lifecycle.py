@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -17,11 +18,14 @@ from tests.kernels.test_gpu_beam_stage_runner import (
     prepare_binding,
     runtime,
 )
+from tests.kernels.v2_input_test_utils import make_native_v2_worker
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
 from vllm_gr.v1.worker.gpu_beam_stage_runner import AsyncGPUBeamOutput
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
@@ -46,6 +50,118 @@ def release(owner):
     done = torch.Event()
     done.record()
     owner.release(owner.binding, consumer_done=done)
+
+
+@pytest.mark.l2
+@pytest.mark.parametrize("hooks_cls", [CudaStageHooksV1, CudaStageHooksV2])
+@pytest.mark.parametrize("case", ["prefill", "decode", "terminal", "cancelled"])
+@torch.inference_mode()
+def test_native_output_completion_preserves_async_receipt(monkeypatch, hooks_cls, case):
+    n = 1 if case == "terminal" else 3
+    owner = runtime(n=n, hooks_cls=hooks_cls)
+    if hooks_cls is CudaStageHooksV2:
+        worker = make_native_v2_worker(list(range(7)))
+        worker._beam_sessions = owner.worker._beam_sessions
+        worker._gr_input_buffers = owner.inputs
+        owner.worker = worker
+        owner.hooks = CudaStageHooksV2(worker)
+    owner.admit(dispatch(metadata(n=n)))
+    owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
+    if case in ("decode", "cancelled"):
+        owner.sample().get_output()
+        if case == "cancelled":
+            owner.cancel(owner.binding)
+        execution = owner.admit(dispatch(metadata(stage=1, n=n)))
+        if case == "decode":
+            prepare_binding(owner, execution.entries[0])
+            owner.logits = torch.zeros((4, 6), device="cuda", dtype=torch.float16)
+        else:
+            owner.logits = None
+    owner.worker.execute_model_state = object()
+    owner.worker.kv_connector_output = object()
+    inputs = owner.inputs
+    finish = Mock(wraps=owner.hooks.finish_native_output)
+    monkeypatch.setattr(owner.hooks, "finish_native_output", finish)
+    receipt = owner.sample()
+    finish.assert_called_once_with()
+    assert owner.pending is None
+    assert owner.worker.execute_model_state is None
+    assert owner.worker.kv_connector_output is None
+    assert owner.inputs is inputs
+    result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+    assert result.produced_token_count == (0 if case == "cancelled" else 1)
+    assert result.finished == (case in ("terminal", "cancelled"))
+    if not owner.closed:
+        release(owner)
+    # Exercise the installed execute/sample wrappers after the GR receipt has
+    # drained. Native work must consume its own fresh output, not old GR state.
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_sample_tokens_gpu
+    from vllm_gr.v1.worker.gpu_model_runner_v2_patch import (
+        make_patched_sample_tokens_v2,
+    )
+    from vllm_gr.v1.worker.model_runner_common import (
+        make_patched_execute_model,
+        make_patched_execute_model_v2,
+    )
+
+    worker = owner.worker
+    worker._gr_gpu_stage_runner = owner
+    state, output = object(), object()
+    scheduled = SchedulerOutput.make_empty()
+
+    def native_execute(runner, frame):
+        assert runner is worker and frame is scheduled
+        assert runner.execute_model_state is None
+        runner.execute_model_state = state
+
+    def native_sample(runner, grammar):
+        assert runner is worker and grammar is None
+        assert runner.execute_model_state is state
+        runner.execute_model_state = None
+        return output
+
+    if hooks_cls is CudaStageHooksV2:
+        execute = make_patched_execute_model_v2(native_execute)
+        sample = make_patched_sample_tokens_v2(native_sample)
+    else:
+        execute = make_patched_execute_model(native_execute, hooks_type=hooks_cls)
+        sample = make_patched_sample_tokens_gpu(native_sample)
+    assert execute(worker, scheduled) is None
+    assert sample(worker, None) is output
+    finish.assert_called_once_with()
+
+
+@pytest.mark.l2
+@pytest.mark.parametrize("hooks_cls", [CudaStageHooksV1, CudaStageHooksV2])
+@pytest.mark.parametrize("fault", ["no_output", "partial_extent"])
+def test_partial_gr_prefill_rejected_without_native_side_effects(monkeypatch, hooks_cls, fault):
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_gr.v1.worker.gr_execution import execute_gr_stage
+
+    state, connector = object(), object()
+    worker = SimpleNamespace(
+        device="cuda", execute_model_state=state, kv_connector_output=connector
+    )
+    before = vars(worker).copy()
+    scheduled = SchedulerOutput.make_empty()
+    m = metadata(output=fault != "no_output")
+    scheduled.gr_stage_metadata = {m.session_id: m}
+    scheduled.num_scheduled_tokens = {m.session_id: 3}
+    scheduled.total_num_scheduled_tokens = 3
+    scheduled.scheduled_cached_reqs.req_ids = [m.session_id]
+    scheduled.scheduled_cached_reqs.num_computed_tokens = [0]
+    native = Mock(side_effect=AssertionError("partial GR Prefill executed"))
+    finish = Mock(side_effect=AssertionError("partial GR Prefill cleaned native state"))
+    monkeypatch.setattr(hooks_cls, "finish_native_output", finish)
+    message = "complete, output-producing Prefill" if fault == "no_output" else "partial Prefill"
+    with pytest.raises(ValueError, match=message):
+        execute_gr_stage(worker, scheduled, native, hooks_type=hooks_cls)
+    native.assert_not_called()
+    finish.assert_not_called()
+    assert vars(worker) == before
 
 
 def warm_stage_kernels(dtype):

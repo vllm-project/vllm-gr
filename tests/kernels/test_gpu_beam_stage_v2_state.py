@@ -126,6 +126,68 @@ def test_terminal_output_retires_native_v2_request():
     assert worker.req_states.num_reqs == 1
 
 
+@pytest.mark.l2
+def test_ordinary_prefill_chunks_keep_native_state_and_token_progress():
+    """Use native input/count operations and stand-in forward/sampling callbacks."""
+    from unittest.mock import Mock
+
+    from vllm_gr.v1.worker.gpu_model_runner_v2_patch import (
+        make_patched_sample_tokens_v2,
+    )
+    from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model_v2
+
+    prompt = list(range(10, 18))
+    worker = make_native_v2_worker(prompt)
+    worker.execute_model_state = None
+    finish = Mock(side_effect=AssertionError("ordinary chunk reached GR cleanup"))
+    worker._gr_gpu_stage_runner = SimpleNamespace(
+        pending=None, closed=True, hooks=SimpleNamespace(finish_native_output=finish)
+    )
+    observed = []
+
+    def native_execute(runner, scheduled):
+        assert runner.execute_model_state is None
+        runner.update_requests(scheduled)
+        desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, scheduled.total_num_scheduled_tokens, 1)
+        batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
+        batch = runner.prepare_inputs(scheduled, batch_state, desc)
+        count = scheduled.total_num_scheduled_tokens
+        observed.append((batch.input_ids[:count].clone(), batch.positions[:count].clone()))
+        runner.execute_model_state = SimpleNamespace(input_batch=batch)
+
+    def native_sample(runner, grammar):
+        assert grammar is None
+        state = runner.execute_model_state
+        assert state is not None
+        runner.execute_model_state = None
+        runner.postprocess_num_computed_tokens(state.input_batch)
+        return state
+
+    execute = make_patched_execute_model_v2(native_execute)
+    sample = make_patched_sample_tokens_v2(native_sample)
+    computed = 0
+    req_index = worker.req_states.req_id_to_index["session-0"]
+    for count in (2, 3, 3):
+        scheduled = SchedulerOutput.make_empty()
+        scheduled.num_scheduled_tokens = {"session-0": count}
+        scheduled.total_num_scheduled_tokens = count
+        scheduled.scheduled_cached_reqs.req_ids = ["session-0"]
+        scheduled.scheduled_cached_reqs.num_computed_tokens = [computed]
+        scheduled.scheduled_cached_reqs.new_block_ids = [None]
+        assert execute(worker, scheduled) is None
+        state = worker.execute_model_state
+        assert state is not None
+        assert sample(worker, None) is state
+        assert worker.execute_model_state is None
+        ids, positions = observed[-1]
+        assert ids.tolist() == prompt[computed : computed + count]
+        assert positions.tolist() == list(range(computed, computed + count))
+        computed += count
+        assert worker.req_states.num_computed_tokens.gpu[req_index].item() == computed
+    finish.assert_not_called()
+    assert worker.req_states.total_len.gpu[req_index].item() == len(prompt)
+
+
 def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
     from dataclasses import replace
 

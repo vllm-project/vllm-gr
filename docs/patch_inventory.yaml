@@ -171,6 +171,10 @@ patches:
       - tests/sidecar/test_worker_update.py
       - tests/v1/worker/test_constraint_lifecycle.py
       - tests/test_model_runner_stage_binding.py
+      - tests/test_cuda_native_output.py
+      - tests/test_v2_multibatch.py
+      - tests/kernels/test_gpu_beam_stage_lifecycle.py
+      - tests/kernels/test_gpu_beam_stage_v2_state.py
       - tests/test_gr_startup.py
       - tests/tools/test_cuda_stage_typing.py
       - tests/st/test_modelrunner_v2_stage_parity_st.py

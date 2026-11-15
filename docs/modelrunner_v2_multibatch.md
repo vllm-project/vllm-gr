@@ -121,12 +121,65 @@ Shared graph construction has an optional graph class; V2 uses a subclass for
 storage/model validation.
 There is no new environment switch or duplicated Beam state machine.
 
-The contracts document eleven operations and three policy flags,
-including Prefill row ordering/counter updates, the V1 Host-input fence, input
-storage lifetime and capture recovery. They do not move remaining native field
-cleanup out of the core or unify graph policies. The dedicated mypy group checks
-the ABC, class-side Protocol, both implementations, core and binding sites together;
-see [CUDA stage hooks contract](PRE_COMMIT.md#cuda-stage-hooks-contract).
+### Native output completion boundary
+
+`GPUBeamStageRunner.sample()` calls `hooks.finish_native_output()` after
+submitting GR device output work and recording its producer/copy events,
+immediately before clearing the pending dispatch and returning the asynchronous receipt.
+This includes cancelled dispatches that still need an asynchronous receipt.
+Admission continues to require complete, output-producing Prefill; the hook
+does not enable Chunked Prefill.
+
+Partial GR Prefill is rejected before native execution or cleanup. Ordinary
+non-GR chunks retain their native execution and sampling path. A Prefix Cache
+hit can reduce the query length of complete GR Prefill; it is not a non-final
+chunk. The V2 native-state device tests cover actual query-length accounting
+and ordinary chunk progress with native input/count operations and stand-in
+forward/sampling callbacks.
+
+The hook drops native result references; it does not wait for the output
+consumer, release GR resources, advance native counters, or retire requests.
+
+The call is deliberately outside a `finally` block. An earlier execute,
+sampling or output-enqueue failure leaves the native result and pending stage
+at their existing failure boundary. A hook exception propagates and prevents
+the receipt from being returned or the pending dispatch from being cleared.
+
+Both CUDA implementations clear `execute_model_state` followed by
+`kv_connector_output`. V1 retains native Prefill logits until this boundary.
+V2 continues to clear its pending native state inside `prefill_logits`, before
+selecting hidden rows and updating computed-token counters; completion does
+not move or repeat those operations. Native V2 obtains connector output through
+its connector rather than a persistent V1-style Worker field. Its hook preserves
+the previous GR assignment of `kv_connector_output = None`, including when
+that attribute was absent; it does not invoke the connector.
+
+State and operations at the native-output boundary have these owners:
+
+| State or operation | Owner and responsibility |
+| --- | --- |
+| Completion writes to `execute_model_state` and `kv_connector_output` | V1/V2 `finish_native_output()`, called after device output submission and before clearing `pending` |
+| Prefill logits/hidden rows, native computed-token updates and Host input fence | Version hooks, with runner-specific state consumption, bookkeeping and fence ordering |
+| `pending`, execution failures, cancellation and asynchronous receipts | Shared stage orchestration |
+| `_current_scheduler_output`, `_current_beam_data`, `_current_beam_info` | Shared stage GR dispatch metadata |
+| Model/head, configuration and attention/KV metadata reads | Shared stage and head helpers |
+| Input buffers, graph/cache handles, workspace, context and sessions | Worker/stage resource owners retain allocation and invalidation responsibility; output completion does not release these resources |
+
+Host tests in `tests/test_cuda_native_output.py` cover the completion and failure
+ordering. `tests/kernels/test_gpu_beam_stage_lifecycle.py` exercises real CUDA
+output consumption for both hook implementations, including cancellation and
+terminal output. The ABC rejects missing completion implementations at
+construction; the complete-boundary mypy fixture rejects an incompatible
+completion return type.
+Pytest does not start checker subprocesses.
+
+The contracts describe eleven instance operations and three policy flags,
+plus class-side construction and admission sizing. They cover Prefill row
+ordering/counter updates, output completion, the V1 Host-input fence, input
+storage lifetime and capture recovery. Version-specific graph policies remain
+in their implementations. The dedicated mypy group checks the ABC, class-side
+Protocol, both implementations, core and binding sites together; see
+[CUDA stage hooks contract](PRE_COMMIT.md#cuda-stage-hooks-contract).
 
 Both runners retain upstream's opt-in vocabulary-sliced LM head. Decode hooks
 may return `None` after staging hidden states for sliced sampling; those states
