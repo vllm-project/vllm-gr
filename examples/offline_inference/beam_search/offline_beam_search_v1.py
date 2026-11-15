@@ -322,6 +322,10 @@ def load_prefix_workload(path: Path, tokenizer: Any) -> PrefixWorkload:
     if len(set(prompt_ids)) != len(prompt_ids):
         raise ValueError(f"{path}: workload contains duplicate complete prompts")
 
+    return PrefixWorkload(prompt_ids, common_prefix_length(prompt_ids))
+
+
+def common_prefix_length(prompt_ids: tuple[tuple[int, ...], ...]) -> int:
     common_prefix = list(prompt_ids[0])
     for ids in prompt_ids[1:]:
         prefix_len = 0
@@ -330,7 +334,20 @@ def load_prefix_workload(path: Path, tokenizer: Any) -> PrefixWorkload:
                 break
             prefix_len += 1
         del common_prefix[prefix_len:]
-    return PrefixWorkload(prompt_ids, len(common_prefix))
+    return len(common_prefix)
+
+
+def restrict_workload(workload: PrefixWorkload, required: int) -> PrefixWorkload:
+    """Restrict statistics and requests to the rows this run consumes."""
+    if required >= len(workload.prompt_token_ids):
+        return workload
+    selected = workload.prompt_token_ids[:required]
+    return PrefixWorkload(selected, common_prefix_length(selected))
+
+
+def prompt_fits_context(effective_input_len: int, generated_steps: int, max_model_len: int) -> bool:
+    """Accept an exact fit; ``effective_input_len`` already includes SID begin."""
+    return effective_input_len + generated_steps <= max_model_len
 
 
 def make_workload_requests(
@@ -935,8 +952,11 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
                 f"one seed batch, {args.warmup_runs} warmup batches, and {args.repeat} "
                 "timed batches"
             )
+        workload = restrict_workload(workload, required_requests)
         effective_input_len = workload.max_prompt_tokens + 1
-        if effective_input_len + args.generated_steps + 1 > args.max_model_len:
+        if not prompt_fits_context(
+            effective_input_len, args.generated_steps, args.max_model_len
+        ):
             raise ValueError("workload prompt and generated tokens exceed --max-model-len")
     prefill_capacity = args.batch_size * (effective_input_len + 1)
     if getattr(args, "cot", False):

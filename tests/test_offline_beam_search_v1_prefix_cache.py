@@ -256,4 +256,37 @@ def test_prefix_cache_run_controls_engine_caching_and_workload_requests(
     assert engine_kwargs["max_num_batched_tokens"] == 7
 
 
+@pytest.mark.l1
+def test_restrict_workload_excludes_unused_rows_from_statistics() -> None:
+    workload = example.PrefixWorkload(
+        prompt_token_ids=((1, 2, 3), (1, 2, 4), (1, 2, 5), (1, 2, 6), (9, 9, 9, 9, 9)),
+        common_prefix_tokens=0,
+    )
+
+    restricted = example.restrict_workload(workload, 4)
+
+    assert restricted.prompt_token_ids == ((1, 2, 3), (1, 2, 4), (1, 2, 5), (1, 2, 6))
+    assert restricted.common_prefix_tokens == 2
+    assert restricted.max_prompt_tokens == 3
+    assert example.restrict_workload(workload, 99) is workload
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    ("effective_input_len", "generated_steps", "max_model_len", "fits"),
+    [
+        (6, 3, 9, True),
+        (6, 3, 8, False),
+        (2, 3, 5, True),
+    ],
+)  # type: ignore[misc]
+def test_prompt_fits_context_accepts_exact_fit_and_rejects_one_over(
+    effective_input_len: int, generated_steps: int, max_model_len: int, fits: bool
+) -> None:
+    assert (
+        example.prompt_fits_context(effective_input_len, generated_steps, max_model_len)
+        == fits
+    )
+
+
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
