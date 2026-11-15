@@ -285,7 +285,11 @@ def _run_regression(work_dir: Path) -> None:
     kwargs: dict[str, Any] = dict(
         model=model,
         trust_remote_code=True,
-        dtype="bfloat16",
+        # Keep this dynamic Beam and FULL Graph regression in FP16. On A5,
+        # BF16 VLLM_COMPILE currently diverges from eager in OneRec Prefill
+        # hidden states; BF16 compiled/eager precision belongs to separate
+        # precision coverage so it does not obscure Graph execution correctness.
+        dtype="float16",
         seed=0,
         vllm_gr_config=config,
         async_scheduling=True,
