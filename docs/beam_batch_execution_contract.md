@@ -250,6 +250,9 @@ preparation failure preserves the original exception, clears pending stage and
 logit state, and requires matching owner retirement before retry. New attention
 batches are published only after session and buffer initialization succeeds;
 failed initialization releases only the registry slots acquired by that attempt.
+Registry allocation rejects an already registered session ID before consuming a
+slot, preserving the existing session state and available capacity. Releasing
+the session permits the same ID to be allocated again.
 An occupied attention context is rejected before shared decision buffers are
 reset. An already-published batch remains owned until normal retirement. These
 rules do not provide automatic EngineCore recovery or certify retirement after
