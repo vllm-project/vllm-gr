@@ -9,6 +9,10 @@ from typing import Any
 import pytest
 import torch
 
+from tests.kernels.beam_selection_test_utils import (
+    assert_selection_equal,
+)
+from tests.kernels.beam_selection_test_utils import make_selection_inputs as _inputs
 from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_fused
 from vllm_gr.ops.cuda.beam_selection import (
     allocate_beam_selection_scratch,
@@ -30,44 +34,6 @@ from vllm_gr.v1.beam.reorder import select_unshared_kv
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 
 
-def _inputs(
-    batch_size: int,
-    beam_width: int,
-    current_step: int,
-    *,
-    max_steps: int = 3,
-    candidate_width: int | None = None,
-) -> tuple[torch.Tensor, ...]:
-    # Rows are Beam rows; columns are the candidate width K, which is
-    # independent of the Beam width W.  Default keeps the legacy K == W square.
-    candidates = beam_width if candidate_width is None else candidate_width
-    generator = torch.Generator(device="cuda").manual_seed(20260827)
-    cumulative = torch.randn(
-        (batch_size * beam_width, 1),
-        dtype=torch.float32,
-        device="cuda",
-        generator=generator,
-    )
-    top_tokens = torch.arange(
-        batch_size * beam_width * candidates,
-        dtype=torch.int32,
-        device="cuda",
-    ).reshape(batch_size * beam_width, candidates)
-    top_logprobs = torch.randn(
-        (batch_size * beam_width, candidates),
-        dtype=torch.float32,
-        device="cuda",
-        generator=generator,
-    )
-    sequence = torch.arange(
-        batch_size * beam_width * max_steps,
-        dtype=torch.int32,
-        device="cuda",
-    ).reshape(batch_size, beam_width, max_steps)
-    assert current_step < max_steps
-    return cumulative, top_tokens, top_logprobs, sequence
-
-
 @pytest.mark.parametrize("beam_width", [1, 2, 4, 8, 32, 64, 128, 256])
 @pytest.mark.parametrize("current_step", [1, 2])
 def test_group_cuda_matches_fixed_extent_torch(
@@ -77,8 +43,7 @@ def test_group_cuda_matches_fixed_extent_torch(
     inputs = _inputs(1, beam_width, current_step)
     expected = _beam_search_group_torch(*inputs, current_step, beam_width)
     actual = beam_search_group_cuda(*inputs, current_step, beam_width)
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+    assert_selection_equal(actual, expected)
     assert actual[-1].shape == (1, beam_width, 3)
 
 
@@ -93,7 +58,6 @@ def test_group_cuda_matches_fixed_extent_torch(
         (64, 256),
         (128, 64),
         (256, 64),
-        (256, 256),
         (512, 256),
         (1024, 256),
     ],
@@ -115,8 +79,7 @@ def test_group_cuda_matches_torch_across_candidate_widths(
     # entry point always emits exactly W survivors and takes the per-row
     # candidate width K instead.
     actual = beam_search_group_cuda(*inputs, current_step, candidate_width)
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+    assert_selection_equal(actual, expected)
     assert actual[-1].shape == (1, beam_width, 3)
 
 
@@ -125,8 +88,7 @@ def test_group_cuda_multi_request_global_parent_and_prefix() -> None:
     inputs = _inputs(batch_size, beam_width, current_step)
     actual = beam_search_group_cuda(*inputs, current_step, beam_width)
     expected = _beam_search_group_torch(*inputs, current_step, beam_width)
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+    assert_selection_equal(actual, expected)
     assert torch.all(actual[1][1] >= beam_width)
     assert actual[3][0, -1] == beam_width
     assert actual[3][1, -1] == 2 * beam_width
@@ -186,8 +148,7 @@ def test_group_cuda_step_zero_accepts_compact_rectopk_rows() -> None:
         compact_valid,
     )
 
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+    assert_selection_equal(actual, expected)
 
 
 def test_group_cuda_exact_tie_uses_flat_index_then_stable_parent_grouping() -> None:
@@ -234,8 +195,7 @@ def test_group_cuda_explicit_candidate_validity() -> None:
         beam_width,
         valid_mask,
     )
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+    assert_selection_equal(actual, expected)
     assert torch.equal(actual[1], torch.zeros_like(actual[1]))
     assert torch.isneginf(actual[2][:, 3:]).all()
     assert actual[3][0, -1] == beam_width
@@ -289,8 +249,7 @@ def test_group_cuda_out_variant_graph_replay_uses_fixed_addresses() -> None:
     graph.replay()
     torch.accelerator.synchronize()
     assert tuple(tensor.data_ptr() for tensor in (*outputs, *scratch_tensors)) == addresses
-    for actual_tensor, expected_tensor in zip(outputs, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+    assert_selection_equal(outputs, expected)
 
 
 def test_public_group_dispatches_to_cuda() -> None:
@@ -301,8 +260,7 @@ def test_public_group_dispatches_to_cuda() -> None:
         torch.ops.vllm_gr.beam_search_group(*inputs, 1, 4),
     )
     for actual in results:
-        for actual_tensor, expected_tensor in zip(actual, expected):
-            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+        assert_selection_equal(actual, expected)
 
 
 def test_group_parent_indices_drive_existing_select_unshared_kv_fused() -> None:
@@ -479,8 +437,7 @@ def test_group_public_cuda_accepts_survivor_count_equal_to_beam_width() -> None:
     inputs = _inputs(1, beam_width, 1, candidate_width=candidate_width)
     actual = beam_search_group(*inputs, 1, beam_width)
     expected = _beam_search_group_torch(*inputs, 1, beam_width)
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+    assert_selection_equal(actual, expected)
 
 
 @pytest.mark.parametrize("compact", [False, True])
