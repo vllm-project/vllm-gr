@@ -155,7 +155,12 @@ def test_prefix_workload_benchmark_consumes_unique_rows(
     def beam_search(prompts: list[Any], params: Any, *, output_mode: str) -> list[Any]:
         assert output_mode == "full"
         calls.append(prompts)
-        return [SimpleNamespace(sequences=[]) for _ in prompts]
+        return [
+            SimpleNamespace(
+                sequences=[SimpleNamespace(token_ids=(7, 8), cumulative_logprob=-1.0)]
+            )
+            for _ in prompts
+        ]
 
     llm = SimpleNamespace(beam_search_v1=beam_search)
     outputs, report = example.benchmark_beam_search(
@@ -183,6 +188,11 @@ def test_prefix_workload_benchmark_consumes_unique_rows(
     assert report["workload"]["common_prefix_tokens"] == 0
     assert report["workload"]["required_requests"] == 4
     assert "seed" in report["timing_scope"]
+    measured_rows = report["workload"]["measured_rows"]
+    assert [(row["run"], row["row"]) for row in measured_rows] == [(0, 2), (1, 3)]
+    assert all(row["sid_order"] == [[7, 8]] for row in measured_rows)
+    assert all(row["scores"] == [-1.0] for row in measured_rows)
+    assert report["workload"]["block_size_requested"] is None
 
 
 @pytest.mark.parametrize("cache_mode,expected_caching", [("off", False), ("shared-prefix", True)])
@@ -287,6 +297,35 @@ def test_prompt_fits_context_accepts_exact_fit_and_rejects_one_over(
         example.prompt_fits_context(effective_input_len, generated_steps, max_model_len)
         == fits
     )
+
+
+@pytest.mark.l1
+def test_block_size_cli_override_parses(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(sys, "argv", _cli_args(tmp_path) + ["--block-size", "32"])
+    assert example.parse_args().block_size == 32
+    monkeypatch.setattr(sys, "argv", _cli_args(tmp_path))
+    assert example.parse_args().block_size is None
+
+
+@pytest.mark.l1
+def test_beam_row_evidence_records_sid_order_and_scores() -> None:
+    request = {"cache_salt": "salt-a"}
+    output = SimpleNamespace(
+        sequences=[
+            SimpleNamespace(token_ids=(7, 8), cumulative_logprob=-1.5),
+            SimpleNamespace(token_ids=(9,), cumulative_logprob=-2.0),
+        ]
+    )
+
+    evidence = example.beam_row_evidence(3, 11, request, output)
+
+    assert evidence == {
+        "run": 3,
+        "row": 11,
+        "cache_salt": "salt-a",
+        "sid_order": [[7, 8], [9]],
+        "scores": [-1.5, -2.0],
+    }
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

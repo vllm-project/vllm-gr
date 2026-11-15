@@ -120,6 +120,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Candidates per beam row (1..256); defaults to --beam-width",
     )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=None,
+        help="KV cache block size override for reproducible cache-reuse comparisons "
+        "(for example Ascend block_size=32)",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -380,6 +387,44 @@ def workload_report(workload: PrefixWorkload, path: Path, required: int) -> dict
     }
 
 
+def observed_prefix_cache_stats(llm: Any) -> dict[str, Any] | None:
+    """Best-effort engine prefix-cache counters for benchmark evidence."""
+    try:
+        observed = llm.collective_rpc("get_prefix_cache_hit_rate")[0]
+    except Exception:
+        return None
+    if isinstance(observed, dict):
+        return dict(observed)
+    if isinstance(observed, (int, float)):
+        return {"hit_rate": float(observed)}
+    return None
+
+
+def observed_block_size(llm: Any) -> int | None:
+    """Resolve the effective KV cache block size when the engine exposes it."""
+    engine = getattr(llm, "llm_engine", None)
+    vllm_config = getattr(engine, "vllm_config", None)
+    for config in (vllm_config, engine, getattr(llm, "llm_config", None)):
+        cache_config = getattr(config, "cache_config", None) or config
+        block_size = getattr(cache_config, "block_size", None)
+        if isinstance(block_size, int):
+            return block_size
+    return None
+
+
+def beam_row_evidence(run: int, row: int, request: Any, output: Any) -> dict[str, Any]:
+    """Per-row SID order and scores collected outside the timing window."""
+    return {
+        "run": run,
+        "row": row,
+        "cache_salt": request["cache_salt"],
+        "sid_order": [
+            [int(token) for token in sequence.token_ids] for sequence in output.sequences
+        ],
+        "scores": [float(sequence.cumulative_logprob) for sequence in output.sequences],
+    }
+
+
 def next_benchmark_requests(
     args: argparse.Namespace,
     requests: list[Any],
@@ -519,7 +564,12 @@ def benchmark_beam_search(
     latencies_ms: list[float] = []
     returned_beams: list[int] = []
     outputs: list[Any] = []
+    measured_rows: list[dict[str, Any]] = []
+    prefix_cache_before = (
+        observed_prefix_cache_stats(llm) if workload_requests is not None else None
+    )
     for iteration in range(args.repeat):
+        row_start = cursor
         measured, cursor = next_benchmark_requests(
             args, prompts, workload_requests, cursor, f"benchmark-{iteration}"
         )
@@ -528,8 +578,16 @@ def benchmark_beam_search(
         latencies_ms.append((perf_counter() - started) * 1000.0)
         if len(outputs) != len(prompts):
             raise RuntimeError(f"expected {len(prompts)} request outputs, got {len(outputs)}")
-        # Count candidates outside timing; do not tokenize/decode or print here.
+        # Candidate counting and cache/output evidence stay outside timing.
         returned_beams.append(sum(len(output.sequences) for output in outputs))
+        if workload_requests is not None:
+            measured_rows.extend(
+                beam_row_evidence(iteration, row_start + index, request, output)
+                for index, (request, output) in enumerate(zip(measured, outputs, strict=True))
+            )
+    prefix_cache_after = (
+        observed_prefix_cache_stats(llm) if workload_requests is not None else None
+    )
 
     ordered = sorted(latencies_ms)
 
@@ -597,6 +655,15 @@ def benchmark_beam_search(
         assert args.workload_jsonl is not None
         required = args.batch_size * (1 + args.warmup_runs + args.repeat)
         report["workload"] = workload_report(workload, args.workload_jsonl, required)
+        report["workload"]["block_size_requested"] = getattr(args, "block_size", None)
+        report["workload"]["block_size_effective"] = observed_block_size(llm)
+        if workload_requests is not None:
+            report["workload"]["prefix_cache_stats"] = {
+                "before_seed": prefix_cache_before,
+                "after_measured": prefix_cache_after,
+                "source": "collective_rpc:get_prefix_cache_hit_rate; null means unavailable",
+            }
+            report["workload"]["measured_rows"] = measured_rows
     if getattr(args, "cot", False):
         report.update(
             mode="cot_beam",
@@ -1030,6 +1097,7 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         async_scheduling=True,
         enable_prefix_caching=args.cache_mode != "off",
         enable_chunked_prefill=False,
+        block_size=args.block_size,
         max_model_len=args.max_model_len,
         # The V1 input processor appends the begin token to every prompt. Keep one
         # additional token of capacity to match the pre-workload headroom.
