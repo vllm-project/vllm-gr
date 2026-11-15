@@ -90,6 +90,18 @@ def _read_env_flag(name: str, default: bool) -> bool:
     return default
 
 
+def has_prefill_graph_bucket_override() -> bool:
+    """Whether a GR token-bucket grid was explicitly configured."""
+    return any(
+        name in os.environ
+        for name in (
+            ENV_PREFILL_GRAPH_BUCKETS,
+            ENV_PREFILL_GRAPH_BUCKET_STEP,
+            ENV_PREFILL_GRAPH_MAX_BUCKET,
+        )
+    )
+
+
 class PrefillGraphEnv:
     """Process-wide prefill-graph environment switch, read once at import.
 
