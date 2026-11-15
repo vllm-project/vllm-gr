@@ -103,4 +103,40 @@ def test_cleanup_change_after_cached_probe_preserves_decode_parity() -> None:
             )
 
 
+@pytest.mark.l1
+@pytest.mark.parametrize("skip_special_tokens", [False, True])
+def test_special_tokens_use_verified_backend_with_explicit_flags(
+    monkeypatch, skip_special_tokens
+) -> None:
+    tokenizer = _make_tokenizer(False)
+    tokenizer.add_special_tokens({"additional_special_tokens": ["<sid>"]})
+    special = tokenizer.convert_tokens_to_ids("<sid>")
+    backend = _rust_backend(tokenizer)
+    assert backend.decode([special]) == ""
+    assert tokenizer.decode([special], skip_special_tokens=False) == "<sid>"
+    sequences = [[special], [special, 0, 1, special], [0, special, 3]]
+    expected = tokenizer.batch_decode(sequences, skip_special_tokens=skip_special_tokens)
+    assert _rust_decode_verified(tokenizer, backend) is True
+
+    def unexpected_wrapper(*args, **kwargs):
+        raise AssertionError("Compatible special-token tokenizer should use the raw backend")
+
+    monkeypatch.setattr(tokenizer, "_decode", unexpected_wrapper)
+    assert fast_batch_decode(tokenizer, sequences, skip_special_tokens) == expected
+    assert [fast_decode(tokenizer, seq, skip_special_tokens) for seq in sequences] == expected
+
+
+@pytest.mark.l1
+def test_matching_flags_do_not_bypass_wrapper_specific_behavior(monkeypatch) -> None:
+    tokenizer = _make_tokenizer(False)
+    tokenizer.add_special_tokens({"additional_special_tokens": ["<sid>"]})
+    original = tokenizer.decode
+
+    def custom_decode(ids, **kwargs):
+        return original(ids, **kwargs) + " wrapper-specific"
+
+    monkeypatch.setattr(tokenizer, "decode", custom_decode)
+    assert _rust_decode_verified(tokenizer, _rust_backend(tokenizer)) is False
+
+
 pytestmark = pytest.mark.cpu_test
