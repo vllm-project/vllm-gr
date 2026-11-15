@@ -387,6 +387,107 @@ def test_expired_table_is_released_by_api_without_session_notifications(
 
 
 @pytest.mark.l1
+@pytest.mark.parametrize("cleanup", ["expiry", "close"])
+def test_versioned_table_failed_close_is_retryable_and_other_versions_are_released(
+    monkeypatch: pytest.MonkeyPatch, cleanup: str
+) -> None:
+    from vllm_gr.constraints import versioned_table
+
+    now = [0.0]
+    monkeypatch.setattr(versioned_table, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    old, middle, current = _backend(), _backend(), _backend()
+    backends = iter((middle, current))
+    release = Mock()
+    table = VersionedConstraintTable(
+        old, loader=lambda _: next(backends), retention_seconds=10, before_release=release
+    )
+    table.reload("middle", "v2")
+    table.reload("current", "v3")
+    failure = RuntimeError("old table close failed")
+    old.close.side_effect = [failure, None]
+    now[0] = 20.0
+    collect = table.get if cleanup == "expiry" else table.close
+
+    with pytest.raises(RuntimeError) as error:
+        collect()
+    assert error.value is failure
+    assert table.tables[INITIAL_CONSTRAINT_VERSION] is old
+    assert INITIAL_CONSTRAINT_VERSION in table._retired_at
+    assert "v2" not in table.tables and "v2" not in table._retired_at
+    middle.close.assert_called_once()
+    release.assert_called_once()
+
+    if cleanup == "expiry":
+        current.close.assert_not_called()
+        assert collect() is current
+        assert table.tables == {"v3": current}
+    else:
+        current.close.assert_called_once()
+        collect()
+        assert not table.tables
+        current.close.assert_called_once()
+        collect()  # Successful repeated close does not synchronize or release again.
+    assert old.close.call_count == 2
+    assert release.call_count == 2
+    assert not table._retired_at
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("cleanup", ["expiry", "close"])
+def test_versioned_table_sync_failure_preserves_all_versions_for_retry(
+    monkeypatch: pytest.MonkeyPatch, cleanup: str
+) -> None:
+    from vllm_gr.constraints import versioned_table
+
+    now = [0.0]
+    monkeypatch.setattr(versioned_table, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    old, new = _backend(), _backend()
+    release = Mock(side_effect=[RuntimeError("sync failed"), None])
+    table = VersionedConstraintTable(
+        old, loader=lambda _: new, retention_seconds=10, before_release=release
+    )
+    table.reload("new", "v2")
+    versions, retired = dict(table.tables), dict(table._retired_at)
+    now[0] = 20.0
+    collect = table.get if cleanup == "expiry" else table.close
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        collect()
+    assert table.tables == versions and table._retired_at == retired
+    old.close.assert_not_called()
+    new.close.assert_not_called()
+
+    collect()
+    old.close.assert_called_once()
+    assert not table._retired_at
+    if cleanup == "expiry":
+        assert table.get() is new
+        new.close.assert_not_called()
+    else:
+        assert not table.tables
+        new.close.assert_called_once()
+
+
+@pytest.mark.l1
+def test_versioned_table_multiple_close_failures_are_reported_and_retried() -> None:
+    old, new = _backend(), _backend()
+    table = VersionedConstraintTable(old, loader=lambda _: new)
+    table.reload("new", "v2")
+    failures = [RuntimeError("old failed"), ValueError("new failed")]
+    old.close.side_effect = [failures[0], None]
+    new.close.side_effect = [failures[1], None]
+
+    with pytest.raises(ExceptionGroup) as error:
+        table.close()
+    assert error.value.exceptions == tuple(failures)
+    assert len(table.tables) == 2
+
+    table.close()
+    assert old.close.call_count == new.close.call_count == 2
+    assert not table.tables and not table._retired_at
+
+
+@pytest.mark.l1
 def test_status_has_one_enum_state_and_both_resource_versions() -> None:
     core = Core()
     current = service_status(core)

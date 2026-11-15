@@ -13,8 +13,13 @@ import torch
 
 from vllm_gr.config import ConstraintTableConfig, GRConfig
 from vllm_gr.config.parser import gr_config_to_mapping
+from vllm_gr.constraints.versioned_table import (
+    INITIAL_CONSTRAINT_VERSION,
+    VersionedConstraintTable,
+)
 from vllm_gr.v1.worker.model_runner_patch import (
     _runner_vocab_size,
+    close_constraint_backend,
     make_load_model_with_constraint_backend,
     make_shutdown_with_constraint_backend,
 )
@@ -244,6 +249,162 @@ def test_shutdown_is_installed_when_runner_has_no_native_method() -> None:
 
     assert backend.close_calls == 1
     assert runner.constraint_backend is None
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("failure", ["close", "before_release"])
+@pytest.mark.parametrize("entrypoint", ["helper", "native", "no_native", "npu", "v2"])
+def test_runner_cleanup_retains_failed_versions_for_retry(failure: str, entrypoint: str) -> None:
+    from unittest.mock import Mock
+
+    runner = _runner()
+    error = RuntimeError("cleanup failed once")
+    backend = Mock(vocab_slice=None)
+    other = Mock(vocab_slice=None)
+    for item in (backend, other):
+        item.info = SimpleNamespace(table_metadata=SimpleNamespace(trie_count=1))
+    sync = Mock()
+    table = VersionedConstraintTable(backend, loader=lambda _: other, before_release=sync)
+    table.reload("other", "v2")
+    runner.constraint_backend = table
+    native = Mock(return_value="stopped")
+
+    def native_shutdown(self: Any) -> Any:
+        return native(self)
+
+    if failure == "close":
+        backend.close.side_effect = [error, None]
+
+    def check_detached() -> None:
+        assert runner.constraint_backend is None
+        assert runner._gr_constraint_backends_pending_cleanup == (table,)
+
+    if failure == "close":
+        sync.side_effect = check_detached
+    else:
+
+        def fail_sync_once() -> None:
+            check_detached()
+            if sync.call_count == 1:
+                raise error
+
+        sync.side_effect = fail_sync_once
+
+    if entrypoint == "helper":
+        cleanup = close_constraint_backend
+    elif entrypoint == "no_native":
+        cleanup = make_shutdown_with_constraint_backend()
+    else:
+        options = {}
+        if entrypoint == "v2":
+            from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+
+            options["close_runtime"] = close_v2_runtime
+        cleanup = make_shutdown_with_constraint_backend(native_shutdown, **options)
+        if entrypoint == "npu":
+            from vllm_gr.v1.worker.npu_model_runner_patch import make_patched_shutdown
+
+            runner._gr_npu_sid_stage_vocab = object()
+            cleanup = make_patched_shutdown(cleanup)
+
+    with pytest.raises(RuntimeError) as raised:
+        cleanup(runner)
+    assert raised.value is error
+    check_detached()
+    assert INITIAL_CONSTRAINT_VERSION in table.tables
+    assert backend.close.call_count == (1 if failure == "close" else 0)
+    assert other.close.call_count == (1 if failure == "close" else 0)
+    native.assert_not_called()
+    if entrypoint == "npu":
+        assert runner._gr_npu_sid_stage_vocab is None
+
+    cleanup(runner)
+    assert sync.call_count == 2
+    assert backend.close.call_count == (2 if failure == "close" else 1)
+    assert other.close.call_count == 1
+    assert not table.tables and not table._retired_at
+    assert runner.constraint_backend is None
+    assert runner._gr_constraint_backends_pending_cleanup == ()
+    cleanup(runner)
+    assert sync.call_count == 2
+    assert other.close.call_count == 1
+    assert native.call_count == (0 if entrypoint in ("helper", "no_native") else 2)
+
+
+@pytest.mark.l1
+def test_reload_waits_for_pending_backend_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    runner = _runner()
+    backend = Mock()
+    error = RuntimeError("cleanup not ready")
+    backend.close.side_effect = [error, error, None]
+    runner.constraint_backend = backend
+    with pytest.raises(RuntimeError) as raised:
+        close_constraint_backend(runner)
+    assert raised.value is error
+
+    replacement = _Backend()
+    loader = Mock(return_value=replacement)
+    native = Mock(return_value="loaded")
+
+    def native_load(self: Any) -> Any:
+        return native(self)
+
+    monkeypatch.setattr("vllm_gr.constraints.loader.load_constraint_backend", loader)
+    load = make_load_model_with_constraint_backend(native_load)
+    with pytest.raises(RuntimeError) as raised:
+        load(runner)
+    assert raised.value is error
+    assert runner.constraint_backend is None
+    assert runner._gr_constraint_backends_pending_cleanup == (backend,)
+    native.assert_not_called()
+    loader.assert_not_called()
+
+    assert load(runner) == "loaded"
+    assert backend.close.call_count == 3
+    assert runner._gr_constraint_backends_pending_cleanup == ()
+    assert runner.constraint_backend.get() is replacement
+    native.assert_called_once_with(runner)
+    loader.assert_called_once()
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("published", [False, True])
+def test_failed_load_retains_cleanup_without_publishing_backend(
+    monkeypatch: pytest.MonkeyPatch, published: bool
+) -> None:
+    from unittest.mock import Mock
+
+    runner = _runner()
+    backend = _Backend()
+    original_error = RuntimeError("publication failed")
+    cleanup_error = RuntimeError("close failed once")
+    close = Mock(side_effect=[cleanup_error, None])
+    backend.close = close  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "vllm_gr.constraints.loader.load_constraint_backend", lambda **kwargs: backend
+    )
+    if published:
+        monkeypatch.setattr(
+            "vllm_gr.v1.worker.hot_update.versioned_constraint_table",
+            Mock(side_effect=original_error),
+        )
+    else:
+        # Memory accounting happens after loading but before publication.
+        backend.info.device_memory_bytes = object()
+
+    with pytest.raises((RuntimeError, TypeError)) as raised:
+        make_load_model_with_constraint_backend(lambda _: None)(runner)
+    assert raised.value is cleanup_error
+    assert isinstance(raised.value.__context__, RuntimeError if published else TypeError)
+    if published:
+        assert raised.value.__context__ is original_error
+    assert runner.constraint_backend is None
+    assert runner._gr_constraint_backends_pending_cleanup == (backend,)
+    close_constraint_backend(runner)
+    assert close.call_count == 2
+    assert runner._gr_constraint_backends_pending_cleanup == ()
 
 
 @pytest.mark.parametrize("shutdown_fails", [False, True])  # type: ignore[misc]

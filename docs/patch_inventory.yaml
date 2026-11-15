@@ -203,6 +203,7 @@ patches:
       - tests/test_model_runner_patch.py::test_active_cuda_worker_hot_update_utility_contract
       - tests/sidecar/test_worker_update.py
       - tests/v1/worker/test_constraint_lifecycle.py
+      - tests/v1/worker/test_constraint_lifecycle.py::test_runner_cleanup_retains_failed_versions_for_retry
       - tests/test_model_runner_stage_binding.py
       - tests/test_cuda_native_output.py
       - tests/test_v2_multibatch.py
@@ -233,6 +234,7 @@ patches:
       - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
       - tests/sidecar/test_management.py::test_trie_rejects_unsupported_execution_before_worker_rpc
       - tests/sidecar/test_worker_update.py
+      - tests/v1/worker/test_constraint_lifecycle.py::test_runner_cleanup_retains_failed_versions_for_retry
     process_roles: [npu_worker]
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner and vllm_ascend.worker.worker.NPUWorker.reload_trie
     risk: critical

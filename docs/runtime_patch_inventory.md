@@ -394,7 +394,10 @@ and Decode capture policy remain active when this cache is disabled.
   checks active Worker installation, RPC dispatch, repeat installation and
   preservation of the native weight loader. `tests/sidecar/test_worker_update.py`
   covers table replacement/expiry and native cache reloads;
-  `tests/v1/worker/test_constraint_lifecycle.py` covers load/shutdown ownership.
+  `tests/v1/worker/test_constraint_lifecycle.py` covers load/shutdown ownership,
+  including failed cleanup retained outside the serving Backend and retried
+  before native shutdown or replacement loading. The same shared closer owns
+  cleanup for CUDA V1/V2 and NPU runners.
 - Removal condition: upstream provides stable hooks for grouped input/output,
   Worker utilities and constraint-backend lifecycle.
 
