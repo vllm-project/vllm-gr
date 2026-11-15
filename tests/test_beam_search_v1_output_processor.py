@@ -140,6 +140,252 @@ def test_output_boundaries_and_lazy_materialization(
     assert request.items[0].request.prompt_token_ids.tolist() == prefix
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("first_field", ["tokens", "text", "logprobs"])  # type: ignore[misc]
+@pytest.mark.parametrize("failure_point", ["full", "prefix", "suffix"])  # type: ignore[misc]
+@pytest.mark.parametrize("failures", [1, 2])  # type: ignore[misc]
+def test_lazy_decode_failure_preserves_beam_until_retry(
+    monkeypatch: pytest.MonkeyPatch, first_field: str, failure_point: str, failures: int
+) -> None:
+    import vllm_gr.entrypoints.beam_search_v1.output_processor as output_processor
+
+    processor, call, request, result, tokenizer = _case()
+    beams = processor.process_outputs(call, request, result)[0].sequences
+    beam = beams[0]
+    materializer = vars(beam)["_lazy_materializer"]
+    suffix = vars(beam)["_v1_suffix"]
+    prefix = (1, 2, 10)
+    full = (*prefix, 3, 4, 20)
+    failing_ids = {"full": full, "prefix": prefix, "suffix": suffix}[failure_point]
+    attempts = []
+    remaining = failures
+
+    def decode(ids: Any) -> str:
+        nonlocal remaining
+        ids = tuple(ids)
+        attempts.append(ids)
+        if ids == failing_ids and remaining:
+            remaining -= 1
+            raise ValueError("transient decode failure")
+        # Concatenative text makes shared-prefix and full decoding equivalent.
+        return "".join(map(str, ids))
+
+    monkeypatch.setattr(tokenizer, "decode", decode)
+    monkeypatch.setattr(
+        output_processor, "_can_share_prompt_decode", lambda *_: failure_point != "full"
+    )
+    for _ in range(failures):
+        with pytest.raises(ValueError, match="transient decode failure"):
+            getattr(beam, first_field)
+        assert type(beam) is _LazyMaterializedBeamSequence
+        assert vars(beam)["_v1_suffix"] is suffix
+        assert vars(beam)["_lazy_materializer"] is materializer
+        assert vars(beam)["tokens"] == []
+        assert vars(beam)["logprobs"] == []
+        assert vars(beam)["text"] is None
+        assert "_lazy_materializing" not in vars(beam)
+        assert beam.cum_logprob == -1.25
+        assert type(beams[1]) is _LazyMaterializedBeamSequence
+
+    getattr(beam, first_field)
+    assert type(beam) is BeamSearchSequence
+    assert beam.tokens == list(full)
+    assert beam.logprobs == []
+    assert beam.text == "12103420"
+    assert beam.cum_logprob == -1.25
+    assert beam.finish_reason == "length" and beam.stop_reason is None
+    assert "_v1_suffix" not in vars(beam)
+    assert vars(beam)["_lazy_materializer"] is None
+    assert "_lazy_materializing" not in vars(beam)
+    attempts_after_success = len(attempts)
+    assert (beam.tokens, beam.text, beam.logprobs) == (list(full), "12103420", [])
+    assert len(attempts) == attempts_after_success
+    if failure_point == "suffix":
+        assert attempts.count(prefix) == 1
+
+
+def _fast_tokenizer_with_decode_failure(
+    monkeypatch: pytest.MonkeyPatch, decoder_path: str, failing_ids: tuple[int, ...]
+) -> tuple[Any, list[tuple[int, ...]], list[tuple[int, ...]]]:
+    from tokenizers import Tokenizer, decoders, models
+    from transformers import PreTrainedTokenizerFast
+
+    tokens = [f"id_{index}" for index in range(21)]
+    tokens[10], tokens[20] = "begin", "end"
+    backend = Tokenizer(models.WordLevel(dict(zip(tokens, range(21), strict=True))))
+    backend.decoder = decoders.Fuse()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, clean_up_tokenization_spaces=decoder_path == "_decode"
+    )
+    # Exercise the real added-token parity probe before the native fast path.
+    tokenizer.add_tokens(["added"])
+    attempts: list[tuple[int, ...]] = []
+    shortcut_calls: list[tuple[int, ...]] = []
+    failed = False
+
+    def check_failure(ids: Any) -> None:
+        nonlocal failed
+        ids = tuple(ids)
+        attempts.append(ids)
+        if ids == failing_ids and not failed:
+            failed = True
+            raise ValueError("optimized decode failure")
+
+    original_decode = tokenizer._decode
+
+    def shortcut(token_ids: Any, **kwargs: Any) -> str:
+        shortcut_calls.append(tuple(token_ids))
+        if decoder_path == "_decode":
+            check_failure(token_ids)
+        return cast(str, original_decode(token_ids, **kwargs))
+
+    monkeypatch.setattr(tokenizer, "_decode", shortcut)
+    if decoder_path == "native":
+        native_backend = tokenizer._tokenizer
+
+        class FailingBackend:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(native_backend, name)
+
+            def decode(self, ids: Any, **kwargs: Any) -> str:
+                check_failure(ids)
+                return cast(str, native_backend.decode(ids, **kwargs))
+
+        monkeypatch.setattr(tokenizer, "_tokenizer", FailingBackend())
+    return tokenizer, attempts, shortcut_calls
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("decoder_path", ["native", "_decode"])  # type: ignore[misc]
+@pytest.mark.parametrize("first_field", ["tokens", "text", "logprobs"])  # type: ignore[misc]
+def test_lazy_output_retries_optimized_decode_branch(
+    monkeypatch: pytest.MonkeyPatch, decoder_path: str, first_field: str
+) -> None:
+    _, call, request, result, _ = _case()
+    full = (1, 2, 10, 3, 4, 20)
+    tokenizer, attempts, shortcut_calls = _fast_tokenizer_with_decode_failure(
+        monkeypatch, decoder_path, full
+    )
+    beam = (
+        BeamSearchOutputProcessor(tokenizer).process_outputs(call, request, result)[0].sequences[0]
+    )
+    materializer = vars(beam)["_lazy_materializer"]
+    suffix = vars(beam)["_v1_suffix"]
+    assert attempts == []
+
+    with pytest.raises(ValueError, match="optimized decode failure"):
+        getattr(beam, first_field)
+    assert type(beam) is _LazyMaterializedBeamSequence
+    assert vars(beam)["_lazy_materializer"] is materializer
+    assert vars(beam)["_v1_suffix"] is suffix
+    assert vars(beam)["tokens"] == [] and vars(beam)["text"] is None
+    assert "_lazy_materializing" not in vars(beam)
+
+    getattr(beam, first_field)
+    assert type(beam) is BeamSearchSequence
+    assert beam.tokens == list(full)
+    assert beam.text == "id_1id_2beginid_3id_4end"
+    assert beam.logprobs == [] and beam.cum_logprob == -1.25
+    assert beam.finish_reason == "length" and beam.stop_reason is None
+    assert attempts.count(full) == 2
+    assert (full in shortcut_calls) is (decoder_path == "_decode")
+    completed_attempts = len(attempts)
+    assert (beam.tokens, beam.text, beam.logprobs) == (list(full), "id_1id_2beginid_3id_4end", [])
+    assert len(attempts) == completed_attempts
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("decoder_path", ["native", "_decode"])  # type: ignore[misc]
+def test_shared_prompt_decode_retry_keeps_materialized_sibling(
+    monkeypatch: pytest.MonkeyPatch, decoder_path: str
+) -> None:
+    import vllm_gr.entrypoints.beam_search_v1.output_processor as output_processor
+
+    _, call, request, result, _ = _case()
+    prefix, first_suffix, second_suffix = (1, 2, 10), (3, 4, 20), (5, 20)
+    tokenizer, attempts, shortcut_calls = _fast_tokenizer_with_decode_failure(
+        monkeypatch, decoder_path, second_suffix
+    )
+    monkeypatch.setattr(output_processor, "_can_share_prompt_decode", lambda *_: True)
+    first, second = (
+        BeamSearchOutputProcessor(tokenizer).process_outputs(call, request, result)[0].sequences
+    )
+    materializer = vars(second)["_lazy_materializer"]
+    suffix = vars(second)["_v1_suffix"]
+    assert vars(first)["_lazy_materializer"] is materializer
+    assert first.text == "id_1id_2beginid_3id_4end"
+    completed_first = asdict(first)
+
+    with pytest.raises(ValueError, match="optimized decode failure"):
+        _ = second.text
+    assert type(first) is BeamSearchSequence
+    assert asdict(first) == completed_first
+    assert type(second) is _LazyMaterializedBeamSequence
+    assert vars(second)["_lazy_materializer"] is materializer
+    assert vars(second)["_v1_suffix"] is suffix
+    assert "_lazy_materializing" not in vars(second)
+
+    assert second.text == "id_1id_2beginid_5end"
+    assert second.tokens == [1, 2, 10, 5, 20]
+    assert second.logprobs == [] and second.cum_logprob == -2.5
+    assert second.finish_reason == "stop" and second.stop_reason == 20
+    assert asdict(first) == completed_first
+    assert attempts.count(prefix) == attempts.count(first_suffix) == 1
+    assert attempts.count(second_suffix) == 2
+    assert (second_suffix in shortcut_calls) is (decoder_path == "_decode")
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_recursive_lazy_field_access_does_not_publish_placeholders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor, call, request, result, tokenizer = _case()
+    beam = processor.process_outputs(call, request, result)[0].sequences[0]
+    materializer = vars(beam)["_lazy_materializer"]
+    suffix = vars(beam)["_v1_suffix"]
+    decode = tokenizer.decode
+
+    def reentrant_decode(ids: Any) -> str:
+        return cast(str, beam.text)
+
+    monkeypatch.setattr(tokenizer, "decode", reentrant_decode)
+    with pytest.raises(RuntimeError, match="recursive Beam output materialization"):
+        _ = beam.tokens
+    assert type(beam) is _LazyMaterializedBeamSequence
+    assert vars(beam)["_lazy_materializer"] is materializer
+    assert vars(beam)["_v1_suffix"] is suffix
+    assert "_lazy_materializing" not in vars(beam)
+    monkeypatch.setattr(tokenizer, "decode", decode)
+    assert beam.tokens == [1, 2, 10, 3, 4, 20]
+    assert beam.text == "1|2|10|3|4|20"
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_lazy_class_transition_failure_keeps_the_accepted_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.entrypoints.generate.beam_search.utils as beam_utils
+
+    class IncompatibleSequence:
+        __slots__ = ("different_layout",)
+
+    processor, call, request, result, _ = _case()
+    beam = processor.process_outputs(call, request, result)[0].sequences[0]
+    materializer = vars(beam)["_lazy_materializer"]
+    suffix = vars(beam)["_v1_suffix"]
+    with monkeypatch.context() as patch:
+        patch.setattr(beam_utils, "BeamSearchSequence", IncompatibleSequence)
+        with pytest.raises(TypeError, match="__class__ assignment"):
+            _ = beam.text
+    assert type(beam) is _LazyMaterializedBeamSequence
+    assert vars(beam)["_lazy_materializer"] is materializer
+    assert vars(beam)["_v1_suffix"] is suffix
+    assert vars(beam)["tokens"] == [] and vars(beam)["text"] is None
+    assert "_lazy_materializing" not in vars(beam)
+    assert beam.tokens == [1, 2, 10, 3, 4, 20]
+    assert type(beam) is BeamSearchSequence
+
+
 @pytest.mark.parametrize("operation", [copy.copy, replace, asdict])  # type: ignore[misc]
 def test_public_dataclass_contract(operation: Any) -> None:
     processor, call, request, result, _ = _case()

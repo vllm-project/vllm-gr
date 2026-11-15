@@ -173,6 +173,12 @@ fields; an explicit binary response is described in the
 [gRPC guide](grpc_numpy_upgrade.md#binary-beam-results). As with other internal
 schema changes, frontend, Core, and Workers must restart on the same revision.
 
+Offline `output_mode="full"` defers public Beam fields until first access.
+If detokenization fails, access raises while retaining the accepted tail and
+materializer so a later access can retry. Recursive field access during
+materialization raises instead of returning incomplete placeholder values.
+Successful materialization retains the ordinary public sequence type.
+
 Internal Decode state contains `B * W` Beam rows. Final output contains up to
 `B * R` compact sequences, where:
 
