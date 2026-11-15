@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
     install_decode_model,

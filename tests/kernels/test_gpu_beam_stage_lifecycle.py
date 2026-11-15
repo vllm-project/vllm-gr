@@ -11,7 +11,7 @@ import pytest
 import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_stage_test_utils import (
     dispatch,
     install_decode_model,
     metadata,

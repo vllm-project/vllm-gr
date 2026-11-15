@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 import torch
 
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     install_decode_model,
 )

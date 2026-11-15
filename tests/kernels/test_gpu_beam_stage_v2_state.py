@@ -11,7 +11,7 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
     metadata,

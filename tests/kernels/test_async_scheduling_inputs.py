@@ -13,7 +13,7 @@ import msgspec
 import pytest
 import torch
 
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_stage_test_utils import (
     dispatch,
     metadata,
     prepare_binding,
@@ -248,7 +248,7 @@ def test_legal_eos_is_an_ordinary_candidate_with_delayed_receipts(dtype):
 
 @torch.inference_mode()
 def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch):
-    from tests.kernels.test_gpu_beam_stage_runner import (
+    from tests.kernels.beam_stage_test_utils import (
         admission_worker,
         install_decode_model,
     )
