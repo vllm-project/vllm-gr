@@ -1,76 +1,26 @@
-# Using catalog to constrain recommendation results
+# Using a catalog to constrain recommendation results
 
-## Table of Contents
+Use a compiled Constraint Table to limit OneRec Beam Search V1 candidates to
+items in a catalog.
 
-- [Overview](#overview)
-- [Installation](#installation)
-- [Getting the Catalog](#getting-the-catalog)
-- [Invoking the Server](#invoking-the-server)
-- [Invoking the Client](#invoking-the-client)
+## Getting the catalog
 
-## Overview
+Download [OpenOneRec-RecIF](../../../docs/benchmarks/dataset.md#get-dataset)
+and use the [catalog tools](../../../benchmarks/open_one_rec/tools/README.md)
+to convert the dataset's `sid2pid.json` into a SID catalog. Follow the
+[Constraint Table instructions](../../offline_inference/beam_search/README.md#constraint-table-artifact)
+to build the artifact with the same model and tokenizer snapshot that the
+server will use.
 
-This example demonstrates using an items catalog to eliminate non-existing items given by the recommendation system.
-Limiting the available items increases accuracy and enables reducing the search space to get the same accuracy but with less latency.
+## Invoking the server
 
-## Installation
+Follow the [online Beam Search V1 guide](../beam_search/README.md#prepare-the-canonical-configuration)
+to configure the artifact and start the HTTP server. Set the artifact path and
+digests in the canonical `--vllm-gr-config` file. The legacy `--catalog-path`
+server option is retired.
 
-- Refer to [quickstart.md](../../../docs/quickstart.md) for installation.
+## Invoking the client
 
-## Getting the Catalog
-
-- Follow [Open One Rec Benchmark Dataset](../../../docs/benchmarks/README.md#open-one-rec-benchmark-dataset) for One Rec Benchmark Dataset retrieval.
-
-- Use `benchmarks/open_one_rec/tools/convert_catalog.py` to convert OpenOneRec sid2pid.json file to vllm-gr catalog format.
-- For full usage/options, see [OpenOneRec tools README](../../../benchmarks/open_one_rec/tools/README.md).
-- OpenOneRec's list of acceptable SIDs is in `<OpenOneRecFolder>/sid2pid.json`.
-
-Here's an example where `--dataset-path` must point to the directory containing `sid2pid.json`.
-
-```bash
-python benchmarks/open_one_rec/tools/convert_catalog.py \
-    --dataset-path ./data \
-    --output-path ${MyFolder}/catalog.json
-```
-
-## Invoking the Server
-
-- Add the catalog attribute to server invocation
-
-```bash
- vllm-gr serve OpenOneRec/OneRec-1.7B \
-    --default-chat-template-kwargs '{"enable_thinking": false}' \
-    --max-logprobs 1024 \
-    --max-num-seqs 1024 \
-    --max-num-batched-tokens 16384 \
-    --scheduling-policy priority \
-    --catalog-path ${MyFolder}/catalog.json
-
-```
-
-## Invoking the Client
-
-- Client execution does not change
-- see beam_search example [README.md](../beam_search/README.md#run-client-on-another-terminal) for client single prompt execution.
-- see benchmark documentation [README.md](../../../docs/benchmarks/README.md) for available benchmarks for online serving.
-
-## Result verification
-
-A utility was added to check if client results are all within the catalog
-
-```bash
-bash examples/online_serving/beam_search/client.sh > result.json
-python examples/online_serving/catalog/verify_catalog.py result.json ${MyFolder}/catalog.json
-```
-
-Expected results:
-
-```text
-Loading results from ../vllm/trc/test/result.json...
-Loading catalog from OpenOneRec/benchmark_data/catalog.json...
-Catalog loaded with 1519078 items.
-First 10 items in catalog: ['<|sid_begin|><s_a_7060><s_b_18><s_c_1748><|sid_end|>', '<|sid_begin|><s_a_522><s_b_2833><s_c_5018><|sid_end|>', '<|sid_begin|><s_a_5368><s_b_7001><s_c_5852><|sid_end|>', '<|sid_begin|><s_a_6118><s_b_1302><s_c_4114><|sid_end|>', '<|sid_begin|><s_a_4990><s_b_5835><s_c_5629><|sid_end|>', '<|sid_begin|><s_a_3492><s_b_2549><s_c_384><|sid_end|>', '<|sid_begin|><s_a_1280><s_b_6846><s_c_7175><|sid_end|>', '<|sid_begin|><s_a_1848><s_b_3131><s_c_3721><|sid_end|>', '<|sid_begin|><s_a_5001><s_b_2547><s_c_7816><|sid_end|>', '<|sid_begin|><s_a_4616><s_b_4751><s_c_2473><|sid_end|>']
-Verifying 512 generated choices...
-
-SUCCESS: All generated items exist in the catalog.
-```
+[Send a sample Beam request](../beam_search/README.md#send-a-request) to verify
+the server setup. Use the [OneRec benchmark guides](../../../docs/benchmarks/README.md)
+to measure serving performance or evaluate recommendation quality.

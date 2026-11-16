@@ -87,8 +87,8 @@ running tests. Local gRPC tests skip when optional dependencies are missing or
 grpcio/protobuf are below the generated bindings' required versions.
 
 The GPU example creates random tiny Llama weights and checks real production
-CLI requests. Generate bindings with `python tools/generate_grpc_proto.py`
-after installing `grpcio-tools==1.84.0`.
+CLI requests. See the [binding regeneration guide](../vllm_gr/entrypoints/grpc/generated/README.md#regenerating)
+for the pinned generator and command.
 
 Focused tests cover pinned upstream wire compatibility, both token encodings,
 input/beam validation, batch/single output fields, cancellation/error cleanup,

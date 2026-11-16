@@ -20,7 +20,7 @@ All paths below are relative to the repository root.
 | Worker, Attention, and graph execution | `vllm_gr/v1/worker/`, `vllm_gr/v1/attention/backends/`, `vllm_gr/ops/` | [Prefill capture](prefill_graph_capture.md), [ModelRunner V2](modelrunner_v2_multibatch.md), [NPU Prefill](npu_prefill_bsnd.md) |
 | Artifact loading and constrained Top-K | `vllm_gr/constraints/`, `tools/build_constraint_table.py` | [Artifact setup](onerec_v1_async_quickstart.md), [multi-Trie contract](multi_root_constraint_table.md) |
 | Platform registration and activation | `vllm_gr/platforms/` | [Platform contract](platform_backend_contract.md) |
-| Pangu and optional LMCache | `vllm_gr/pangu_compat.py`, `vllm_gr/lmcache_patch.py` | [Pangu examples](../examples/offline_inference/pangu1b/README.md), [LMCache](lmcache.md) |
+| Pangu inference | `vllm_gr/pangu_compat.py` | [Pangu examples](../examples/offline_inference/pangu1b/README.md) |
 
 The sections below identify distinctions that are easy to miss across modules.
 Detailed lifecycle and numerical rules stay in the linked contracts.

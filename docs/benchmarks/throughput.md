@@ -1,90 +1,81 @@
-# Throughput Benchmark
+# OneRec throughput and latency
 
-## Overview
+[Benchmark overview](README.md) | [Troubleshooting](troubleshooting.md)
 
-This guide explains how to run the throughput benchmark using the [`one_rec_main.py`](../../benchmarks/open_one_rec/one_rec_main.py) script.
+Use [`one_rec_main.py`](../../benchmarks/open_one_rec/one_rec_main.py) to
+measure sequential offline latency or performance under HTTP load.
 
 ## Prerequisites
 
-- Ensure that **vllm-gr** is installed. See the [Quickstart](../quickstart.md) guide.
-
-- Ensure that you have downloaded the [OneRec benchmark dataset](README.md#open-one-rec-benchmark-dataset).
-
----
+- Install the [CUDA](../quickstart.md) or [Ascend NPU](../quickstart-ascend.md)
+  runtime and run commands from the repository root.
+- Download the [OneRec dataset](dataset.md#get-dataset).
 
 ## Running the Benchmark
 
-### 1. Offline Throughput Mode (Simple, Local)
+### Offline CUDA cache-miss latency
+
+Prepare a local model snapshot and [constraint triples](dataset.md#prepare-the-constraint-catalog).
+The runner builds a temporary CUDA artifact and times requests one at a time.
+It resets the prefix cache before each request and excludes warmup from the
+measurements.
 
 ```bash
-# Single command — everything runs in one process
+export ONEREC_MODEL=/absolute/path/to/OneRec-1.7B
+export ONEREC_TRIPLES=/absolute/path/to/video_constraint_triples.json
 python -m benchmarks.open_one_rec.one_rec_main bench throughput \
-  --model OpenOneRec/OneRec-1.7B \
-  --max-logprobs 1024 \
+  --model "$ONEREC_MODEL" \
   --dataset-name onerec \
   --dataset-path ./data \
   --task-types video \
   --num-prompts 100 \
-  --output-json results/throughput.json  \
-  --use-beam-search \
+  --output-json results/throughput.json \
+  --constraint-triples "$ONEREC_TRIPLES" \
+  --output-len 5 --beam-search-v1 \
   --n 128
 ```
 
-### 2. Online, API Server Mode (Production-like)
+### Online HTTP benchmark
 
-Run the server and client separately for a production‑style setup.
+Start the server using the [online V1 guide](../../examples/online_serving/beam_search/README.md#start-the-server).
+The client uses a local tokenizer from the same model snapshot as the server.
 
-#### Terminal 1 — Start the vLLM API server
-
-```bash
-
-  vllm-gr serve OpenOneRec/OneRec-1.7B \
-  --max-logprobs 1024 \
-  --default-chat-template-kwargs '{"enable_thinking": false}' \
-  --max-num-seqs 1024 \
-  --max-num-batched-tokens 16384 \
-  --scheduling-policy priority
-```
-
-#### Terminal 2 — Run the throughput benchmark against the server
+Run the client in another terminal:
 
 ```bash
-
+export ONEREC_MODEL=/absolute/path/to/OneRec-1.7B
 python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --endpoint /v1/chat/completions \
-  --backend openai-chat  \
-  --model OpenOneRec/OneRec-1.7B  \
-  --dataset-name  onerec \
-  --dataset-path ./data  \
-  --task-types video  \
+  --backend openai-chat \
+  --model onerec --tokenizer "$ONEREC_MODEL" \
+  --dataset-name onerec \
+  --dataset-path ./data \
+  --task-types video \
   --num-prompts 100 \
   --use-beam-search \
   --n 128
 ```
+
+For a server configured with an API key, set `OPENAI_API_KEY` in the client
+environment.
 
 ## Usage
 
 ### Command Line Arguments
 
-#### Server Core Arguments
-
-| Argument         | Type | Default | Description                                                     |
-|------------------|------|---------|-----------------------------------------------------------------|
-| `--model`        | str  | -       | Model ID or path to load                                        |
-| `--max-logprobs` | int  | -       | Max log Probabilities output by model -- to support beam search |
-
 #### Benchmark related parameters
 
-| Argument             | Type | Default | Description                                             |
-|----------------------|------|---------|---------------------------------------------------------|
-| `--dataset-name`     | str  | -       | Must be `onerec` for OneRec benchmark                   |
-| `--dataset-path`     | str  | -       | Path to benchmark data directory                        |
-| `--num-prompts`      | int  | -       | Number of prompts to sample                             |
-| `--task-types`       | str  | -       | Comma-separated list of task types to run               |
-| `--custom-input-len` | int  | -       | Prompt length; prompts are trimmed or repeated to match |
-| `--output-json`      | str  | -       | Path to save benchmark results as JSON                  |
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--model` | str | - | Local model snapshot offline; served model name online |
+| `--dataset-name` | str | - | Must be `onerec` for OneRec benchmark |
+| `--dataset-path` | str | - | Path to benchmark data directory |
+| `--num-prompts` | int | - | Number of prompts to sample |
+| `--task-types` | str | - | Comma-separated list of task types to run |
+| `--custom-input-len` | int | - | Prompt length; prompts are trimmed or repeated to match |
+| `--output-json` | str | - | Path to save offline benchmark results as JSON |
 
-### OpenOneRec Length Caveats
+#### OpenOneRec length caveats
 
 - For OpenOneRec, effective prompt length comes from each task input after task formatting, not from a strict benchmark-spec template length.
 - `--custom-input-len` normalizes length by trimming or repeating prompt tokens per sample.
@@ -92,30 +83,37 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 
 #### Beam Search Parameters (Optional)
 
-| Argument            | Type | Default | Description                          |
-|---------------------|------|---------|--------------------------------------|
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--beam-search-v1` | flag | `False` | Select the offline V1 Beam benchmark |
+| `--constraint-triples` | path | - | Required with offline Beam V1, along with `--output-json` |
+| `--output-len` | int | task-specific | Offline public token budget including SID markers; use 5 for `video` |
+| `--warmup-requests` | int | 10 | Offline requests to run before measuring |
 | `--use-beam-search` | flag | `False` | Enable beam search during generation |
-| `--n`               | int  | -       | Number of beams for beam search      |
+| `--n` | int | - | Number of beams for beam search |
 
 #### Arguments for Online benchmark
 
-| Argument            | Type  | Default       | Description                                                                                      |
-|---------------------|-------|---------------|--------------------------------------------------------------------------------------------------|
-| `--endpoint`        | str   | -             | API endpoint URL for online benchmark                                                            |
-| `--backend`         | str   | 'openai-chat' | Must be `openai-chat` for OneRec online benchmark                                                |
-| `--max-concurrency` | int   | `None`        | Maximum number of concurrent requests; if not set, requests are sent as fast as possible         |
-| `--request-rate`    | float | `inf`         | Number of requests per second to send; `inf` means all requests are sent as soon as possible     |
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--endpoint` | str | - | HTTP endpoint path, such as `/v1/chat/completions` |
+| `--tokenizer` | str | - | Local tokenizer snapshot matching the server |
+| `--backend` | str | 'openai-chat' | Must be `openai-chat` for OneRec online benchmark |
+| `--max-concurrency` | int | `None` | Maximum number of concurrent requests; if not set, requests are sent as fast as possible |
+| `--request-rate` | float | `inf` | Number of requests per second to send; `inf` means all requests are sent as soon as possible |
 
 ## CPU SIMD and Latency
 
 On some CPUs, including older Intel Xeon generations, NumPy AVX-512 kernels
 can trigger frequency changes that also slow subsequent scalar CPU work.
 Small token-array reductions may therefore increase end-to-end Beam latency
-despite being fast themselves. Local tests on a Xeon Gold 6133 with NumPy
-2.2.6 showed lower offline latency when NumPy AVX-512 dispatch was disabled;
-CPU frequency changes were not measured directly. This is CPU- and
+despite being fast themselves. One historical comparison found lower offline latency with NumPy AVX-512
+dispatch disabled. CPU frequency was not measured directly. This is CPU- and
 workload-dependent, so keep the default unless an A/B test shows a benefit.
 See Intel's [power level and frequency transition explanation][intel-avx512].
+
+> Measured on Intel Xeon Gold 6133 / date not recorded / NumPy 2.2.6.
+> Not a performance guarantee.
 
 For diagnosis with NumPy 2.2.6, prefix the same benchmark command with the
 setting below. Use your actual dataset directory and constraint JSON path.
@@ -123,9 +121,9 @@ setting below. Use your actual dataset directory and constraint JSON path.
 ```bash
 NPY_DISABLE_CPU_FEATURES=AVX512F,AVX512CD,AVX512_KNL,AVX512_KNM,AVX512_SKX,AVX512_CLX,AVX512_CNL,AVX512_ICL \
   python -m benchmarks.open_one_rec.one_rec_main bench throughput \
-  --model OpenOneRec/OneRec-1.7B --dataset-name onerec --dataset-path ./data \
-  --task-types video --num-prompts 100 --use-beam-search --n 128 \
-  --constraint-triples /path/to/video_constraint_triples.json \
+  --model "$ONEREC_MODEL" --dataset-name onerec --dataset-path ./data \
+  --task-types video --num-prompts 100 --beam-search-v1 --n 128 \
+  --output-len 5 --constraint-triples "$ONEREC_TRIPLES" \
   --output-json results/throughput-no-avx512.json
 ```
 
@@ -144,9 +142,11 @@ recommendation.
 
 ## Expected Output
 
-The output will include throughput metrics that can be used to evaluate the model's performance under load conditions.
+Offline output includes the cache-miss latency distribution, workload identity,
+and per-request Beam results in the JSON file. The numbers below illustrate
+the HTTP report format.
 
-```bash
+```text
 
 ============ Serving Benchmark Result ============
 Successful requests:                     100

@@ -38,9 +38,9 @@ body:
     value: >
       Thanks for contributing 🎉!
 - type: checkboxes
-  id: askllm
+  id: prior-search
   attributes:
     label: Before submitting a new issue...
     options:
-      - label: Make sure you already searched for relevant issues, and asked the chatbot living at the bottom right corner of the [documentation page](https://vllm-gr.readthedocs.io), which can answer lots of frequently asked questions.
+      - label: I have checked the [repository documentation](https://github.com/JiusiServe/vllm-gr/blob/main/docs/index.md) and searched [existing issues](https://github.com/JiusiServe/vllm-gr/issues).
         required: true
