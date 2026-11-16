@@ -266,7 +266,7 @@ def test_prefix_cache_run_controls_engine_caching_and_workload_requests(
     assert engine_kwargs["max_num_batched_tokens"] == 7
 
 
-@pytest.mark.l1
+@pytest.mark.l1  # type: ignore[misc]
 def test_restrict_workload_excludes_unused_rows_from_statistics() -> None:
     workload = example.PrefixWorkload(
         prompt_token_ids=((1, 2, 3), (1, 2, 4), (1, 2, 5), (1, 2, 6), (9, 9, 9, 9, 9)),
@@ -281,7 +281,7 @@ def test_restrict_workload_excludes_unused_rows_from_statistics() -> None:
     assert example.restrict_workload(workload, 99) is workload
 
 
-@pytest.mark.l1
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize(
     ("effective_input_len", "generated_steps", "max_model_len", "fits"),
     [
@@ -299,7 +299,7 @@ def test_prompt_fits_context_accepts_exact_fit_and_rejects_one_over(
     )
 
 
-@pytest.mark.l1
+@pytest.mark.l1  # type: ignore[misc]
 def test_block_size_cli_override_parses(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(sys, "argv", _cli_args(tmp_path) + ["--block-size", "32"])
     assert example.parse_args().block_size == 32
@@ -307,7 +307,7 @@ def test_block_size_cli_override_parses(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert example.parse_args().block_size is None
 
 
-@pytest.mark.l1
+@pytest.mark.l1  # type: ignore[misc]
 def test_beam_row_evidence_records_sid_order_and_scores() -> None:
     request = {"cache_salt": "salt-a"}
     output = SimpleNamespace(
