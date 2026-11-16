@@ -310,6 +310,17 @@ clone/build dependencies when they are unavailable, so
 prepare the vendor image and operator library before using this as a test gate.
 This runner is not the full set of standalone CI benchmarks.
 
+#### Full-suite startup timing
+
+Scheduler subprocess `*-evidence.json` files record
+`engine_startup_seconds` and `engine_shutdown_seconds` for offline/reference
+and asynchronous engines. Compare full runs on the same allocated device,
+runtime, model, input identity, and warm-cache state. Retain pytest durations,
+pass/skip counts, graph replay evidence, and end-to-end gate time. Timing
+instrumentation does not reduce engine starts or establish a measured speedup.
+Keep the complete capture grids when comparing runs: even buckets not replayed
+by a request exercise startup allocation, warmup, and graph capture.
+
 For a locally cached OneRec model:
 
 ```bash
