@@ -11,12 +11,16 @@ decision logic or cross-step request state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 if TYPE_CHECKING:
+    from vllm_gr.ops.cuda.beam_radix_topk import (
+        BeamRadixScratch,
+        BeamRadixSelectionGraph,
+    )
     from vllm_gr.ops.cuda.beam_state import BeamStateScratch
 
 
@@ -94,6 +98,10 @@ class BeamPostprocessWorkspace:
     # Ordinary postprocess callers retain their existing allocations and ABI.
     state_scratch: BeamStateScratch | None = None
     execution_owner: Any = None
+    # Request-local selection runs serially on the owning stream. Each graph
+    # binds one input row while sharing the same output scratch.
+    radix_scratch: BeamRadixScratch | None = None
+    radix_graphs: dict[int, BeamRadixSelectionGraph] = field(default_factory=dict)
 
     @classmethod
     def allocate(
@@ -106,6 +114,7 @@ class BeamPostprocessWorkspace:
         device: torch.device | str,
         logits_dtype: torch.dtype,
         pin_host: bool | None = None,
+        enable_radix_topk: bool = False,
     ) -> BeamPostprocessWorkspace:
         """Allocate every tensor once; callers retain the returned object."""
 
@@ -143,6 +152,13 @@ class BeamPostprocessWorkspace:
             beam_width,
             resolved_device,
         )
+        radix_scratch = None
+        if enable_radix_topk:
+            from vllm_gr.ops.cuda.beam_radix_topk import allocate_beam_radix_scratch
+
+            radix_scratch = allocate_beam_radix_scratch(
+                1, beam_width, top_k, beam_width, resolved_device
+            )
         host_prefix_token_ids = host_empty((max_batch, beam_width, 3), torch.int32)
 
         return cls(
@@ -170,6 +186,7 @@ class BeamPostprocessWorkspace:
                 (max_batch * beam_width,), dtype=torch.int64, device=resolved_device
             ),
             selection_scratch=selection_scratch,
+            radix_scratch=radix_scratch,
         )
 
     def device_tensors(self) -> tuple[torch.Tensor, ...]:
@@ -196,6 +213,8 @@ class BeamPostprocessWorkspace:
         )
         if self.state_scratch is not None:
             tensors += self.state_scratch.device_tensors()
+        if self.radix_scratch is not None:
+            tensors += self.radix_scratch.device_tensors()
         return tensors
 
     @property

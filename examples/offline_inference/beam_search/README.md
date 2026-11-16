@@ -175,9 +175,19 @@ belong to `offline_beam_search.py`. Library defaults can differ.
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
 | `beam_graph_enabled` | `true` on CUDA | On Ascend, `--execution graph` enables Beam graphs and `--execution eager` disables them. CUDA ignores this flag. |
+| `enable_radix_topk` | `false` | Library default; configure `gr.enable_radix_topk` to enable Radix selection on CUDA. |
 | `worker_decision` | `true` | The script enables Beam selection on the Worker. |
 | `beam_width` | `[128, 128, 128]` | `--beam-width` sets both the engine capacity and the request width. |
 | `max_decode_steps` | `3` | `--generated-steps` sets the effective token count. The three-layer Constraint Table requires `3`. |
+
+Set `gr.enable_radix_topk: true` to use Radix for fixed-width CUDA Decode
+with the engine's configured beam and candidate widths. Selection replays a
+CUDA graph on workspace rows captured at startup and runs eagerly on other
+rows or with `gr.beam_graph_enabled: false`.
+If selection capture reports a recoverable CUDA refusal after eager warmup,
+startup verifies that capture has ended and the device synchronizes, then uses
+eager Radix for that row. V2 teardown clears selection graphs after its drain
+checks while retaining workspace tensors for subsequent serving capture.
 
 With `gr.constraint_mode: none` and `gr.constraint_table: null`, one engine can
 accept per-request effective lengths from `1` through its configured

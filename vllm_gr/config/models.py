@@ -528,6 +528,18 @@ class GRConfig:
     constrained_generation: InitVar[bool | None] = None
     constraint_table: InitVar[ConstraintTableSpec | None] = None
 
+    enable_radix_topk: bool = field(
+        default=False,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_enable_radix_topk",
+                canonical_path=("gr", "enable_radix_topk"),
+                legacy_key="vllm_gr_enable_radix_topk",
+            )
+        },
+    )
+    """Opt into radix Top-K for request-level CUDA Beam Decode selection."""
+
     def __post_init__(
         self,
         catalog_path: str | None,
