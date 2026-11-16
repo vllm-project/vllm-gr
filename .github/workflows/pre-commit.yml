@@ -2,7 +2,7 @@ name: Pre-commit and Benchmark
 
 # Keep this metadata protocol in sync with the default-branch retest router.
 run-name: >-
-  ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+  ${{ github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
       !((github.event.pull_request.base.ref == 'decode_graph' ||
                  github.event.pull_request.base.ref == 'main') &&
@@ -30,8 +30,6 @@ on:
       - converted_to_draft
       - labeled
       - unlabeled
-  pull_request_review:
-    types: [submitted, edited, dismissed]
   workflow_dispatch:
     inputs:
       rebuild_pre_commit_cache:
@@ -43,7 +41,7 @@ on:
 concurrency:
   # Keep A/B-only requests out of the full validation's single pending slot.
   group: >-
-    ${{ github.workflow }}-${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') && 'pull_request' || github.event_name }}-${{
+    ${{ github.workflow }}-${{ github.event_name }}-${{
       github.event.pull_request.number || github.ref
     }}-${{
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
@@ -55,7 +53,7 @@ concurrency:
        github.event.label.name == 'abtest' && 'abtest' || 'ci')
     }}
   cancel-in-progress: >-
-    ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+    ${{ github.event_name == 'pull_request' &&
         !(github.event.action == 'labeled' &&
           github.event.label.name == 'abtest') }}
 
@@ -72,7 +70,7 @@ jobs:
   docs-scope:
     name: Classify documentation changes
     if: >-
-      (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+      github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
       (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'decode_graph') &&
       ((contains(github.event.pull_request.labels.*.name, 'ready') &&
@@ -198,7 +196,7 @@ jobs:
     needs: docs-scope
     if: >-
       !cancelled() && needs.docs-scope.outputs.docs-only != 'true' &&
-      (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+      github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
       (github.event.pull_request.base.ref == 'decode_graph' ||
                  github.event.pull_request.base.ref == 'main') &&
@@ -222,6 +220,7 @@ jobs:
             let fresh = false;
             let passed = false;
             try {
+              // Review events can still have A/B reports from older workflow revisions.
               for (const event of ['pull_request', 'pull_request_review']) {
                 for (let page = 1; page <= 10 && !fresh; page++) {
                   const {data} = await github.rest.actions.listWorkflowRuns({
@@ -276,7 +275,7 @@ jobs:
     needs: docs-scope
     if: >-
       !cancelled() && needs.docs-scope.outputs.docs-only != 'true' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_review') ||
+      (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
        (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'decode_graph') &&
        !((github.event.pull_request.base.ref == 'decode_graph' ||
@@ -685,7 +684,7 @@ jobs:
     if: >-
       !cancelled() &&
       needs.docs-scope.outputs.docs-only != 'true' &&
-      (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+      github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
       (github.event.pull_request.base.ref == 'decode_graph' ||
                  github.event.pull_request.base.ref == 'main') &&
@@ -1081,17 +1080,13 @@ jobs:
   benchmark-blocking:
     # Ignored label events must not replace the required check with a skipped one.
     name: >-
-      ${{ github.event_name == 'pull_request_review' &&
-          github.event.pull_request.base.ref != 'main' &&
-          github.event.pull_request.base.ref != 'decode_graph' &&
-          'Ignored review event' ||
-          github.event_name == 'pull_request' &&
+      ${{ github.event_name == 'pull_request' &&
           (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
           github.event.label.name != 'ready' &&
           (github.event.label.name != 'abtest' ||
            github.event.action == 'unlabeled') &&
           'Ignored label event' ||
-          (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+          github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref == 'decode_graph' ||
                  github.event.pull_request.base.ref == 'main') &&
           contains(github.event.pull_request.labels.*.name, 'abtest') &&
@@ -1116,10 +1111,7 @@ jobs:
       always() &&
       !(needs.docs-scope.outputs.docs-only == 'true' &&
         github.event.action == 'labeled' && github.event.label.name == 'abtest') &&
-      (github.event_name != 'pull_request_review' ||
-       github.event.pull_request.base.ref == 'main' ||
-       github.event.pull_request.base.ref == 'decode_graph') &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_review') ||
+      (github.event_name != 'pull_request' ||
        (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
        github.event.label.name == 'ready' ||
        (github.event.label.name == 'abtest' &&
@@ -1173,7 +1165,7 @@ jobs:
       - name: Require every blocking check to pass
         env:
           ABTEST_ONLY: >-
-            ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+            ${{ github.event_name == 'pull_request' &&
                 (github.event.pull_request.base.ref == 'decode_graph' ||
                  github.event.pull_request.base.ref == 'main') &&
                 contains(github.event.pull_request.labels.*.name, 'abtest') &&
@@ -1186,7 +1178,7 @@ jobs:
           ABTEST_FRESH: ${{ needs.resolve-ab-freshness.outputs.fresh }}
           ABTEST_PASSED: ${{ needs.resolve-ab-freshness.outputs.passed }}
           ABTEST_REQUIRED: >-
-            ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+            ${{ github.event_name == 'pull_request' &&
                 (github.event.pull_request.base.ref == 'decode_graph' ||
                  github.event.pull_request.base.ref == 'main') &&
                 contains(github.event.pull_request.labels.*.name, 'ready') &&
