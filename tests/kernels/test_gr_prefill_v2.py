@@ -23,8 +23,10 @@ from tests.kernels.v2_input_test_utils import (
     make_native_v2_worker,
     make_prefill_metadata,
 )
-from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs_v2
-from vllm_gr.v1.worker.gpu_prefill_requests_v2 import try_add_gr_prefill_requests
+from vllm_gr.v1.worker.gpu_prefill_v2 import (
+    try_add_gr_prefill_requests,
+    try_prepare_gr_prefill_inputs_v2,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"

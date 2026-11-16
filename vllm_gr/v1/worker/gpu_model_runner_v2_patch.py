@@ -19,8 +19,8 @@ been removed, so this module installs only the slim hook set:
   unsupported inputs fall through to the native V2 InputBatch builder.
 - ``add_requests``: guarded GR Prefill registration without unused native
   sampler initialization/refresh; other dispatches retain native behavior.
-- ``load_model``/``shutdown``: canonical Constraint Backend + postprocess
-  workspace wiring (reusing the V1 wrappers, which only read V2-present attrs).
+- ``load_model``/``shutdown``: canonical Constraint Backend + shared CUDA
+  postprocess workspace wiring.
 
 Beam CUDA-graph capture (prefill FULL + async-forward decode) lives in
 ``gpu_model_runner_v2_graph`` and is wired via ``capture_model``.
@@ -34,12 +34,15 @@ from typing import Any
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
-from vllm_gr.v1.worker.gpu_model_runner_patch import (
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+from vllm_gr.v1.worker.gpu_postprocess_workspace import (
     _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
     make_load_model_with_beam_postprocess_workspace,
 )
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
-from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs_v2
+from vllm_gr.v1.worker.gpu_prefill_v2 import (
+    try_add_gr_prefill_requests,
+    try_prepare_gr_prefill_inputs_v2,
+)
 from vllm_gr.v1.worker.model_runner_common import (
     _CONSTRAINT_LOAD_PATCH_MARKER,
     _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
@@ -127,8 +130,6 @@ def make_patched_add_requests_v2(_orig_add_requests):
     """Keep native registration outside an admitted, supported GR Prefill."""
     if getattr(_orig_add_requests, _WORKER_V2_ADD_REQUESTS_PATCH_MARKER, False):
         return _orig_add_requests
-
-    from vllm_gr.v1.worker.gpu_prefill_requests_v2 import try_add_gr_prefill_requests
 
     @wraps(_orig_add_requests)
     def patched_add_requests(self, scheduler_output):

@@ -65,7 +65,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(
         desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 8, 1)
         batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
         if specialized:
-            from vllm_gr.v1.worker.gpu_prefill_inputs import (
+            from vllm_gr.v1.worker.gpu_prefill_v2 import (
                 try_prepare_gr_prefill_inputs_v2,
             )
 

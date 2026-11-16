@@ -310,7 +310,7 @@ and Decode capture policy remain active when this cache is disabled.
     - `vllm_gr/v1/worker/gpu_model_runner_v2_graph.py`
     - `vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py` (`CudaStageHooksV1`)
     - `vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py` (`CudaStageHooksV2`)
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/gpu_prefill_requests_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/gpu_stage_hooks.py`, `vllm_gr/v1/worker/gpu_beam_stage_runner.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/gpu_postprocess_workspace.py`, `vllm_gr/v1/worker/gpu_prefill_inputs.py`, `vllm_gr/v1/worker/gpu_prefill_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/gpu_stage_hooks.py`, `vllm_gr/v1/worker/gpu_beam_stage_runner.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - CUDA stage binding: execution and startup entrypoints explicitly select the
   independent V1/V2 implementations of `CudaStageHooks`. The shared core has no
@@ -380,8 +380,16 @@ and Decode capture policy remain active when this cache is disabled.
 - V2 Prefill fast-path validation: `tests/kernels/test_gr_prefill_v2.py` compares
   registration and fused inputs with native CUDA state, including reused slots,
   cached/chunked inputs, padding, pending-write fallback and failed submission
-  without queue loss. `gpu_prefill_requests_v2.py` owns registration and the
+  without queue loss. `gpu_prefill_v2.py` owns registration, input preparation and the
   packed native-state write contract, separate from stage execution hooks.
+  `gpu_postprocess_workspace.py` owns workspace initialization, the load-wrapper
+  marker and load-time device-memory accounting shared by CUDA V1/V2. V1 input
+  preparation remains in `gpu_prefill_inputs.py`; V2 does not import the V1
+  integration module.
+- Shared workspace coverage: `tests/test_gpu_postprocess_workspace.py` checks
+  load ordering, failure propagation, fixed-storage reuse and memory accounting.
+  `tests/platforms/test_import_isolation.py` rejects V1/NPU implementation
+  imports while loading shared workspace support and V2 integration.
 - Hot-update coverage: `tests/test_model_runner_patch.py::test_active_cuda_worker_hot_update_utility_contract`
   checks active Worker installation, RPC dispatch, repeat installation and
   preservation of the native weight loader. `tests/sidecar/test_worker_update.py`

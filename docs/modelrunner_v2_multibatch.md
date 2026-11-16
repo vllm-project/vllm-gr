@@ -13,8 +13,11 @@ skips unused native sampler initialization and refresh, while preserving
 request removal, model state, block IDs and per-slot prompt-logprob resets.
 Every member must pass admission before any slot changes. Ordinary, mixed,
 new-plus-cached and unsupported batches retain native registration.
-`gpu_prefill_requests_v2` owns this registration and its staged-write ABI;
-the V2 stage hooks own execution and lifecycle transitions.
+`gpu_prefill_v2` owns registration, the staged-write ABI and guarded V2
+input preparation. V1 preparation remains in `gpu_prefill_inputs`; the V2
+stage hooks own execution and lifecycle transitions. Both CUDA integrations
+use `gpu_postprocess_workspace` for workspace initialization and load-time
+device-memory accounting; V2 does not import V1 patch implementation code.
 
 Fresh batches on an empty native request set can flush token, total-length,
 computed-token and single-group block-table writes through one packed transfer

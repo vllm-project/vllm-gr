@@ -367,10 +367,17 @@ def apply_worker_patches() -> None:
     platform_module = _get_active_platform_module()
     # Bind both execution and startup to the installed runner, not a dispatch-time flag.
     cuda_hooks_type: CudaStageHooksType | None = None
+    workspace_load_patcher = getattr(
+        platform_module, "make_load_model_with_beam_postprocess_workspace", None
+    )
     if _active_platform_module_name() == _GPU_PATCH_MODULE:
         from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+        from vllm_gr.v1.worker.gpu_postprocess_workspace import (
+            make_load_model_with_beam_postprocess_workspace,
+        )
 
         cuda_hooks_type = CudaStageHooksV1
+        workspace_load_patcher = make_load_model_with_beam_postprocess_workspace
     constraint_max_batch = 1
     if _active_platform_module_name() == _NPU_PATCH_MODULE:
         from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
@@ -403,11 +410,6 @@ def apply_worker_patches() -> None:
         if reload_patcher is not None and callable(reload_weights):
             runner_class.reload_weights = reload_patcher(reload_weights)
 
-        workspace_load_patcher = getattr(
-            platform_module,
-            "make_load_model_with_beam_postprocess_workspace",
-            None,
-        )
         if workspace_load_patcher is not None and callable(
             getattr(runner_class, "load_model", None)
         ):

@@ -109,4 +109,44 @@ assert not any(name in sys.modules for name in blocked)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "module_name",
+    [
+        "vllm_gr.v1.worker.gpu_postprocess_workspace",
+        "vllm_gr.v1.worker.gpu_model_runner_v2_patch",
+    ],
+)
+def test_shared_workspace_and_v2_do_not_import_v1_integration(module_name: str) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    code = """
+import importlib
+import importlib.abc
+import sys
+
+forbidden = {
+    "vllm_gr.v1.worker.gpu_model_runner_patch",
+    "vllm_gr.v1.worker.gpu_prefill_inputs",
+    "vllm_gr.v1.worker.npu_model_runner_patch",
+}
+
+class RejectInactiveIntegration(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in forbidden:
+            raise AssertionError(f"unexpected integration dependency: {fullname}")
+
+sys.meta_path.insert(0, RejectInactiveIntegration())
+importlib.import_module(sys.argv[1])
+assert not forbidden.intersection(sys.modules)
+"""
+    subprocess.run(
+        [sys.executable, "-c", code, module_name],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
 pytestmark = pytest.mark.cpu_test
