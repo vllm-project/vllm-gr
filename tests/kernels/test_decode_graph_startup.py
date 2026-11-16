@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Real Decode capture recovery; device-invalidating failures run in isolation."""
 
 import os
@@ -15,7 +15,7 @@ from tests.kernels.test_gpu_beam_stage_runner import (
     install_decode_model,
 )
 from vllm_gr.v1.worker.gpu_beam_stage_runner import should_replay_decode_graph
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -50,9 +50,7 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
     original = worker.model
     if failure == "invalidated":
         with pytest.raises(RuntimeError) as raised:
-            capture_async_forward(
-                worker, hooks_type=V2StageExecutionHooks, allow_eager_fallback=True
-            )
+            capture_async_forward(worker, hooks_type=CudaStageHooksV2, allow_eager_fallback=True)
         assert invalidations == [True]
         errors = []
         error: BaseException | None = raised.value
@@ -64,9 +62,7 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
         assert worker._gr_gpu_stage_runner.graph is None
         return
 
-    captured = capture_async_forward(
-        worker, hooks_type=V2StageExecutionHooks, allow_eager_fallback=True
-    )
+    captured = capture_async_forward(worker, hooks_type=CudaStageHooksV2, allow_eager_fallback=True)
     owner = worker._gr_gpu_stage_runner
     assert owner.closed and not worker._beam_sessions
     assert worker.model is original

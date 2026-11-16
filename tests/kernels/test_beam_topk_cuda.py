@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Reference guards for the bounded-retention Top-K and its candidate merge.
 
 Both pipelines must reproduce the stable ``(-score, index)`` order of the CPU

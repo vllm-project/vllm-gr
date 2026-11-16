@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 """Compatibility patches for vLLM-Ascend integration points."""
 
@@ -272,6 +272,12 @@ def _sanitize_engine_core_entry(
         _run_engine_core_patch_func as ascend_entry,
     )
 
+    # This NPU entry replaces the generic GR process wrapper. Repair the
+    # child's Core capabilities before native initialization begins; applying
+    # them from NPUWorker.init_device is too late for this Core's __init__.
+    from vllm_gr.patch import initialize_engine_core_beam_patches
+
+    initialize_engine_core_beam_patches()
     return ascend_entry(*args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """CUDA adapter for shared stage-width selection and request-local KV banks.
 
 Selection stays outside model graphs. Each input width owns stable forward

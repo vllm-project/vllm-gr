@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Standalone latency benchmark for the cascade beam-attention GPU backend.
 
 This is a benchmark, not a correctness test -- it has no pass/fail assertion,

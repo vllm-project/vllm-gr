@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 set -euo pipefail
 export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
@@ -101,7 +101,12 @@ VLLM_GR_TARGET_DEVICE=cuda uv pip install \
 for path in \
   benchmarks/beam_search/v1_sid_validation.py \
   tests/resources/single_one_rec_prompt.txt; do
-  if ! git -C "$candidate_root" diff --quiet "$base_sha" "$candidate_sha" -- "$path"; then
+  diff_options=(--quiet)
+  if [[ "$path" == benchmarks/beam_search/v1_sid_validation.py ]]; then
+    # The SPDX copyright header does not affect SID validation.
+    diff_options+=(-I '^# SPDX-FileCopyrightText: Copyright contributors to the vLLM(-GR)? project$')
+  fi
+  if ! git -C "$candidate_root" diff "${diff_options[@]}" "$base_sha" "$candidate_sha" -- "$path"; then
     echo "A/B workload changed between base and PR: $path" >&2
     exit 1
   fi

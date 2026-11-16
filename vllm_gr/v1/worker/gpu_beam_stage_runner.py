@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GPU V1 adapter for asynchronous scheduling dispatches and persistent Beam state.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+"""Shared CUDA core for asynchronous scheduling and persistent Beam state.
 
-Bindings are views of the existing Worker session registry. The only supported
-execution is one item on TP=1. Resource rows and physical model rows are explicit
+Bindings are views of the existing Worker session registry. Runner-specific
+operations are supplied explicitly. Resource rows and physical model rows are explicit
 so expanding storage capacity does not implicitly enable concurrent scratch use.
 """
 
@@ -70,6 +70,11 @@ from vllm_gr.v1.worker.beam_search_runner import (
     BeamCandidateBatch,
     BeamSearchRunner,
 )
+from vllm_gr.v1.worker.gpu_stage_hooks import (
+    CudaStageHooks,
+    CudaStageHooksType,
+    validate_stage_hooks_type,
+)
 from vllm_gr.v1.worker.gr_inputs import (
     GRInputBuffers,
     PreparedGRInputs,
@@ -112,6 +117,7 @@ class BeamDispatchExecution:
     metadata_abi: int = METADATA_ABI
 
 
+# The upstream base is intentionally outside the explicit mypy boundary.
 class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
     """Only the executor's output consumer waits and constructs the IPC value."""
 
@@ -190,7 +196,7 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         setattr(out, GR_WORKER_RESULT_ATTR, results)
         return out
 
-    def _convert(self, controls, *, final_ready: bool) -> ModelRunnerOutput:
+    def _convert(self, controls: list[list[int]], *, final_ready: bool) -> ModelRunnerOutput:
         if len(controls) != len(self.execution.entries):
             raise ValueError("Asynchronous scheduling control snapshot has the wrong row count")
         req_ids, sampled, results = [], [], {}
@@ -246,138 +252,6 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         )
         setattr(out, GR_WORKER_RESULT_ATTR, results)
         return out
-
-
-class _StageExecutionHooks:
-    """Per-runner execution surface bridging the persistent GR stage core.
-
-    The stage-runner core (session/state/workspace/constraint/inputs) is
-    ModelRunner-agnostic; only the native execution surface differs between
-    the V1 and V2 runners.  Each hook maps one such surface.  The default
-    implementation below is the V1 surface (``_model_forward`` /
-    ``execute_model_state.logits`` / ``prepare_inputs_event`` /
-    ``_update_states`` / ``requests[..].block_ids``); the V2 runner installs
-    its own via :mod:`vllm_gr.v1.worker.gpu_beam_stage_runner_v2`.
-    """
-
-    persistent_graph_install = True
-    supports_transposed_head = True
-
-    def __init__(self, worker: Any):
-        self.worker = worker
-
-    def forward_hidden(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        attention: Any,
-        slot_mappings: Any,
-        capture: bool,
-    ) -> torch.Tensor:
-        """Run one beam-decode forward, returning hidden states."""
-        from vllm.config import CUDAGraphMode
-        from vllm.forward_context import set_forward_context
-        from vllm.v1.cudagraph_dispatcher import BatchDescriptor
-
-        worker = self.worker
-        with set_forward_context(
-            attention,
-            worker.vllm_config,
-            num_tokens=input_ids.numel(),
-            cudagraph_runtime_mode=CUDAGraphMode.FULL if capture else CUDAGraphMode.NONE,
-            batch_descriptor=BatchDescriptor(num_tokens=input_ids.numel(), uniform=True),
-            slot_mapping=slot_mappings,
-        ):
-            return worker._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=None,
-                inputs_embeds=None,
-            )
-
-    def prefill_logits(
-        self, original: Callable[..., Any], scheduler_output: Any, *args: Any, **kwargs: Any
-    ) -> torch.Tensor:
-        """Run the native prefill execution and extract its logits."""
-        worker = self.worker
-        out = original(worker, scheduler_output, *args, **kwargs)
-        if out is not None or worker.execute_model_state is None:
-            raise RuntimeError("native GR Prefill must return logits through execute_model_state")
-        return worker.execute_model_state.logits
-
-    def prefill_stage_fence(self) -> None:
-        """Wait for any native prefill reads of reused CPU input buffers.
-
-        V1: the pinned InputBatch buffers the Prefill forward reads
-        asynchronously are mutated on the CPU by ``_update_states``; a stream
-        wait on the decode stream cannot protect those Host writes.  V2
-        builds a fresh InputBatch per step and needs no fence.
-        """
-        event = getattr(self.worker, "prepare_inputs_event", None)
-        if event is not None:
-            event.synchronize()
-
-    def consume_native_state(self, scheduler_output: Any) -> None:
-        """Apply the runner's native request-state bookkeeping."""
-        self.worker._update_states(scheduler_output)
-
-    def decode_block_ids(self, session_id: str) -> list[list[int]]:
-        """Host KV block ids for the session's prompt, grouped per KV group."""
-        native = self.worker.requests[session_id]
-        return native.block_ids
-
-    def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
-        """V1 model inputs belong to the stage; upload storage stays lazy."""
-        owner.input_ids = torch.empty(rows, device=owner.beam.state.device, dtype=torch.int32)
-        owner.positions = torch.empty_like(owner.input_ids, dtype=torch.int64)
-        owner.slots = torch.full_like(owner.positions, -1)
-        owner.execution_mask = torch.empty_like(owner.input_ids, dtype=torch.bool)
-
-    @staticmethod
-    def required_constraint_rows(batch_size: int, beam_width: int) -> int:
-        return beam_width
-
-    def prepare_new_adapter(self, view: BeamBatchExecutionView) -> None:
-        graph = getattr(self.worker, "_beam_decode_graph", None)
-        if graph is not None:
-            graph.discard_geometry(view.batch_size, view.beam_width)
-
-    def decode_graph(self, batch_size: int, beam_width: int) -> Any:
-        from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
-
-        return get_beam_decode_graph(self.worker, batch_size=batch_size, beam_width=beam_width)
-
-    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
-        """V1 can capture a missing graph against a new stage's buffers."""
-        worker = self.worker
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
-
-        graph_enabled = (
-            not worker.model_config.enforce_eager
-            and _get_gr_config(worker).beam_graph_enabled
-            and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
-        )
-        if graph_enabled:
-            graph = self.decode_graph(len(owner.bindings), owner.inputs.width)
-            bucket = getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0)
-            if bucket:
-                graph.select(len(owner.bindings), owner.inputs.width, bucket)
-            if not graph.ready:
-                graph.capture(
-                    owner._forward_hidden,
-                    persistent_install=self.persistent_graph_install,
-                )
-            owner.graph = graph
-        if should_replay_decode_graph(worker, owner.graph):
-            return _hidden_logits(owner, owner.graph.replay())
-        # Eager Decode keeps the stage's ``_forward`` entry point; ``_forward``
-        # publishes ``hidden`` itself when the LM head is sliced.
-        return owner._forward()
-
-    def consume_retirement_state(
-        self, scheduler_output: Any, bindings: tuple[BeamRequestBinding, ...]
-    ) -> None:
-        self.consume_native_state(scheduler_output)
 
 
 def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
@@ -442,23 +316,19 @@ def _get_unconstrained_head_layout(
         or weight.shape[0] != processor.org_vocab_size
     ):
         return None
-    source_key = (
-        id(weight),
-        weight.data_ptr(),
-        weight._version,
-        tuple(weight.shape),
-        weight.dtype,
-    )
+    # Weight-only reload preserves shape/dtype. Refresh the head-owned cache in
+    # the post-load hooks installed at model load instead of a tensor-version key:
+    # existing stage runners retain this storage and must see the new weights.
     with _UNCONSTRAINED_HEAD_LAYOUT_LOCK:
-        cached = getattr(worker, "_gr_unconstrained_head_layout", None)
-        if cached is not None and cached[0] == source_key:
-            return cached[1], cached[2]
+        cached = getattr(head, "_gr_unconstrained_head_layout", None)
+        if cached is not None:
+            return cast(tuple[Any, Any], cached)
         transposed = weight.detach().T.contiguous()
         # CUDA-specific external events preserve this dependency as a wait
         # node in captured heads; torch.Event does not expose that option.
         ready = CUDAEvent(external=True)
         ready.record(torch.cuda.current_stream(weight.device))
-        worker._gr_unconstrained_head_layout = (source_key, transposed, ready)
+        head._gr_unconstrained_head_layout = (transposed, ready)
         return transposed, ready
 
 
@@ -641,7 +511,7 @@ class GPUBeamStageRunner:
         beam: BeamBatchSearchRunner,
         bindings: tuple[BeamRequestBinding, ...],
         backend: CUDAConstraintBackend | None,
-        hooks: _StageExecutionHooks | None = None,
+        hooks: CudaStageHooks,
         trie_ids: tuple[int, ...] | None = None,
     ):
         expected = tuple(range(len(bindings)))
@@ -670,7 +540,7 @@ class GPUBeamStageRunner:
             dtype=torch.long,
             device=beam.state.device,
         )
-        self.hooks = hooks if hooks is not None else _StageExecutionHooks(worker)
+        self.hooks: CudaStageHooks = hooks
         self.previous: GRStageMetadata | None = None
         self.pending: tuple[BeamDispatchExecution, int] | None = None
         self._validated_dispatch: tuple[Any, tuple[GRStageMetadata, ...]] | None = None
@@ -909,6 +779,7 @@ class GPUBeamStageRunner:
         )
         bucket = getattr(getattr(self, "metadata", None), "prefix_length_bucket", 0)
         if bucket:
+            assert self.inputs is not None
             graph.select(len(self.bindings), self.inputs.width, bucket)
         graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
         return graph
@@ -1034,6 +905,7 @@ class GPUBeamStageRunner:
                 self.logits = self.hooks.prefill_logits(original, scheduler_output, *args, **kwargs)
             else:
                 # Pure CPU work can run before the native Prefill staging fence.
+                assert self.pending is not None
                 self.prepared = self.prepare_cpu(m, self.pending[1])
                 if previous_kind is GRStageKind.PREFILL:
                     # Native Prefill may asynchronously read reused CPU input
@@ -1060,12 +932,13 @@ class GPUBeamStageRunner:
         for entry in execution.entries:
             m = entry.metadata
             if m.produces_output and not self.cancelled:
-                if self.logits is None and self.hidden is None:
+                model_output = self.hidden if self.hidden is not None else self.logits
+                if model_output is None:
                     raise RuntimeError("GR output stage has no native model logits")
                 layout = BeamBatchExecutionView.from_stage_metadata(m)
                 rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
                 candidate_width = layout.candidate_top_k
-                device = self.hidden.device if self.hidden is not None else self.logits.device
+                device = model_output.device
                 candidates = (
                     self.dynamic.candidate_buffers(rows, candidate_width)
                     if self.dynamic is not None
@@ -1109,13 +982,16 @@ class GPUBeamStageRunner:
                         out_valid_mask=candidates[2],
                         out_valid_counts=self.counts[:rows],
                         device_step=self.constraint_steps,
+                        specialize_steps=self.hooks.specialize_constraint_steps,
                     )
                 else:
                     sliced = self.hidden is not None
-                    logits = None if sliced else self.logits[:rows]
-                    vocab_size = (
-                        int(self._head_layout[0].shape[1]) if sliced else int(logits.shape[-1])
-                    )
+                    logits = None if sliced else model_output[:rows]
+                    if sliced:
+                        assert self._head_layout is not None
+                        vocab_size = int(self._head_layout[0].shape[1])
+                    else:
+                        vocab_size = int(model_output.shape[-1])
                     if (
                         self.unconstrained_topk_scratch is None
                         or self.unconstrained_topk_scratch.top_k != layout.candidate_top_k
@@ -1248,7 +1124,7 @@ class GPUBeamStageRunner:
         self.hooks.consume_native_state(cleanup)
         return True
 
-    @torch.inference_mode()
+    @torch.inference_mode()  # type: ignore[misc]
     def cancel(self, binding: BeamRequestBinding) -> None:
         if binding not in self.bindings:
             raise ValueError("cancel binding mismatch")
@@ -1282,15 +1158,16 @@ class GPUBeamStageRunner:
             self.worker._beam_sessions.pop(member.native_request_id, None)
 
 
-class AsyncGRRetireOutput(AsyncModelRunnerOutput):
+# The upstream base is intentionally outside the explicit mypy boundary.
+class AsyncGRRetireOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
     """Release proof is constructed only after GPU work and output consumers drain."""
 
-    def __init__(self, owner, metadata):
+    def __init__(self, owner: GPUBeamStageRunner, metadata: GRRetireMetadata) -> None:
         self.owner, self.metadata = owner, metadata
         self._lock = Lock()
         self._output = None
 
-    def get_output(self):
+    def get_output(self) -> ModelRunnerOutput:
         with self._lock:
             if self._output is not None:
                 return self._output
@@ -1324,7 +1201,7 @@ class AsyncGRRetireOutput(AsyncModelRunnerOutput):
             return out
 
 
-def execute_gr_retirement(worker, scheduler_output):
+def execute_gr_retirement(worker: Any, scheduler_output: Any) -> AsyncGRRetireOutput:
     metadata = getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR)
     if (
         not isinstance(metadata, GRRetireMetadata)
@@ -1334,10 +1211,10 @@ def execute_gr_retirement(worker, scheduler_output):
         or metadata.session_id not in scheduler_output.finished_req_ids
     ):
         raise ValueError("invalid Asynchronous scheduling retirement control frame")
-    previous = getattr(worker, "_gr_retirement_output", None)
+    previous: AsyncGRRetireOutput | None = getattr(worker, "_gr_retirement_output", None)
     if previous is not None and previous.metadata == metadata:
         return previous
-    owner = getattr(worker, "_gr_gpu_stage_runner", None)
+    owner: GPUBeamStageRunner | None = getattr(worker, "_gr_gpu_stage_runner", None)
     if owner is None or owner.closed:
         raise RuntimeError("Asynchronous scheduling retirement has no matching live Worker owner")
     result = owner.request_release(metadata)
@@ -1352,13 +1229,13 @@ def get_stage_runner(
     worker: Any,
     scheduler_output: Any,
     *,
-    hooks_type: type[_StageExecutionHooks] = _StageExecutionHooks,
+    hooks_type: CudaStageHooksType,
     for_startup_capture: bool = False,
 ) -> GPUBeamStageRunner:
-    """Admit first, then derive the adapter from existing Worker resources."""
+    """Validate and construct hooks before admitting sessions to Worker resources."""
     existing = getattr(worker, "_gr_gpu_stage_runner", None)
-    if existing is not None and type(existing.hooks) is not hooks_type:
-        raise ValueError("GR execution hooks cannot change during the runner lifetime")
+    if existing is not None:
+        validate_stage_hooks_type(existing.hooks, hooks_type)
     if existing is not None and not existing.closed:
         if getattr(worker, "constraint_backend", None) is not existing.backend:
             raise ValueError("GR constraint backend binding changed before session release")
@@ -1396,7 +1273,9 @@ def get_stage_runner(
     # A GRConfig without the switch (or a partial config object) keeps the
     # constrained default: only an explicit ``False`` selects full vocabulary.
     unconstrained = getattr(cfg, "constrained_generation", None) is False
-    if not unconstrained and not isinstance(backend, CUDAConstraintBackend):
+    if not unconstrained and (
+        backend is None or not isinstance(backend.get(), CUDAConstraintBackend)
+    ):
         raise ValueError("persistent GR requires a loaded canonical CUDA Constraint Table")
     if (
         existing is not None
@@ -1524,6 +1403,34 @@ def get_stage_runner(
     )
 
     dynamic_requested = uses_dynamic_beam(m.beam_params)
+    # Captures refer to an adapter's input/attention buffers. Keep one drained
+    # adapter per B instead of replacing those addresses on every B transition.
+    # A new schedule or resource binding invalidates the whole bounded cache.
+    cache_enabled = (
+        getattr(cfg, "beam_adapter_cache_enabled", False)
+        and not getattr(worker.model_config, "enforce_eager", False)
+        and getattr(cfg, "beam_graph_enabled", False)
+    )
+    cache = getattr(worker, "_gr_gpu_stage_runner_cache", {})
+    cache_key = (
+        hooks_type,
+        id(context),
+        id(workspace),
+        id(context.decision),
+        id(backend),
+        resource_key,
+        m.beam_params.beam_width,
+        view.dynamic_beam_widths,
+        dynamic_requested,
+    )
+    cache_matches = cache_enabled and (
+        getattr(worker, "_gr_gpu_stage_runner_cache_key", None) == cache_key
+    )
+    if cache_matches and view.batch_size in cache:
+        existing = cache[view.batch_size]
+        resources_match = all(
+            runner._resource_key == resource_key for runner in existing.beam.runners
+        )
     existing_dynamic = getattr(existing, "dynamic", None)
     reuse_adapter = (
         existing is not None
@@ -1540,8 +1447,22 @@ def get_stage_runner(
             runner._scratch_owner is workspace.state_scratch for runner in existing.beam.runners
         )
     )
+    # Construction can reject an incomplete implementation or raise from its
+    # initializer. Do it before invalidating graphs, resetting shared state or
+    # reserving sessions, so the same Worker can admit a subsequent request.
+    # A reused adapter retains its original hooks instance.
+    hooks = None if reuse_adapter else hooks_type(worker)
+    cache_cleared = False
+    if (cache and not cache_matches) or (
+        cache_matches and cache.get(view.batch_size) is existing and not reuse_adapter
+    ):
+        # A cached owner still has to pass every original compatibility check.
+        discard_dynamic_graphs(worker, context)
+        cache.clear()
+        cache_cleared = True
     reuse_beam = (
         reuse_adapter
+        and existing is not None
         and existing.beam.state.max_new_tokens == m.beam_params.max_tokens
         and existing.beam.state.stop_token_ids_config == m.beam_params.stop_token_ids
         and existing.beam.state.ignore_stop_tokens_config == m.beam_params.ignore_stop_tokens
@@ -1564,7 +1485,12 @@ def get_stage_runner(
             # width, which would undersize a schedule that widens later.
             candidate_width=candidate_width,
         )
-    if not reuse_adapter and (existing_dynamic is not None or dynamic_requested):
+    if (
+        not reuse_adapter
+        and not cache_matches
+        and not cache_cleared
+        and (existing_dynamic is not None or dynamic_requested)
+    ):
         discard_dynamic_graphs(worker, context)
     sessions = []
     bindings = []
@@ -1616,7 +1542,7 @@ def get_stage_runner(
         context._gr_execution_owner = adapter
         workspace.execution_owner = adapter
     else:
-        hooks = hooks_type(worker)
+        assert hooks is not None
         hooks.prepare_new_adapter(view)
         adapter = GPUBeamStageRunner(
             worker, beam, binding_tuple, backend, hooks=hooks, trie_ids=trie_ids
@@ -1633,5 +1559,11 @@ def get_stage_runner(
         binding.native_request_id: session for binding, session in zip(binding_tuple, session_tuple)
     }
     worker._gr_gpu_stage_runner = adapter
+    if cache_enabled:
+        cache[view.batch_size] = adapter
+        worker._gr_gpu_stage_runner_cache = cache
+        worker._gr_gpu_stage_runner_cache_key = cache_key
+    elif hasattr(worker, "_gr_gpu_stage_runner_cache_key"):
+        del worker._gr_gpu_stage_runner_cache_key
     adapter._validated_dispatch = (scheduler_output, stages)
     return cast(GPUBeamStageRunner, adapter)

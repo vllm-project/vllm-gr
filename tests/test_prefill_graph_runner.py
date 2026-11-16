@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Unit tests for BeamPrefillGraphRunner."""
 
 from types import SimpleNamespace
@@ -1223,10 +1223,12 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
 ) -> None:
     from contextlib import nullcontext
     from types import SimpleNamespace
+    from unittest.mock import Mock
 
     from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.worker import gpu_model_runner_patch as patch
     from vllm_gr.v1.worker import gr_async_output, gr_startup, model_runner_patch
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     stream = SimpleNamespace(wait_stream=lambda _other: None)
     monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
@@ -1278,8 +1280,17 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
         "_active_runner_module_name",
         lambda: model_runner_patch._GPU_PATCH_MODULE,
     )
+    # Pin the platform selector too: the installer binds the CUDA hooks class by
+    # reading the real vLLM platform, so this test must not depend on the host
+    # device (it fails on an NPU machine where the selector reports NPU).
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_active_platform_module_name",
+        lambda: model_runner_patch._GPU_PATCH_MODULE,
+    )
     monkeypatch.setattr(model_runner_patch, "_get_active_platform_module", lambda: platform)
-    monkeypatch.setattr(gr_startup, "capture_async_forward", lambda _runner: None)
+    capture_async = Mock(return_value=None)
+    monkeypatch.setattr(gr_startup, "capture_async_forward", capture_async)
     monkeypatch.setattr(
         model_runner_patch,
         "freeze_gc_after_graph_capture",
@@ -1287,8 +1298,10 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     )
 
     model_runner_patch.apply_worker_patches()
+    worker = Runner()
     with pytest.raises(RuntimeError) as raised:
-        Runner().capture_model()
+        worker.capture_model()
+    capture_async.assert_called_once_with(worker, hooks_type=CudaStageHooksV1)
     assert raised.value is error
     assert events == ["native"]
 

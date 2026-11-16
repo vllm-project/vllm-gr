@@ -136,7 +136,7 @@ class BeamOutputSequence:
 class BeamRequestOutput:
     item_index: int
     request_id: str
-    sequences: tuple[BeamOutputSequence, ...]
+    sequences: tuple[BeamOutputSequence, ...] | BeamSequenceColumns
 
 
 class BeamBatchOutput:
@@ -158,6 +158,20 @@ class BeamBatchResult:
 
 Exactly one of `output` and `failure` is present. A failure never carries a
 partial output.
+
+For complete, equal-length, non-stopped results, `BeamRequestOutput.sequences`
+can instead carry `BeamSequenceColumns`: a count, step count, and owned
+little-endian int32 token/parent buffers with optional FP32 scores. The CUDA
+output packer uses this representation for at least 64 returned candidates.
+Small, stopped, and variable-length results keep the sequence representation.
+Both forms receive structural and request-dependent validation. Host output
+storage can be reused immediately without changing an already-published result.
+
+HTTP and offline clients materialize the existing public sequence objects by
+default. gRPC consumes columns directly while preserving its default response
+fields; an explicit binary response is described in the
+[gRPC guide](grpc_numpy_upgrade.md#binary-beam-results). As with other internal
+schema changes, frontend, Core, and Workers must restart on the same revision.
 
 Internal Decode state contains `B * W` Beam rows. Final output contains up to
 `B * R` compact sequences, where:
@@ -204,12 +218,29 @@ advances native accounting by one logical token while Worker execution uses
 physical Beam rows. NPU stage widths and CUDA fixed-width state have their
 own adapter checks.
 
+NPU Decode binds the previous stage's latest winner tensor directly through
+`NPUEagerStagePlan.prepare_decode_inputs`, for both the first and subsequent
+Decode steps. Prefill winners must have shape `(B, output_width)` before they
+become the latest tokens; Decode consumes `(B, input_width)` previous winners.
+Request-level sampling metadata expands through the active `InputBatchProxy`.
+There is no separate first-Decode handoff or attention-layout state.
+
 The runtime currently admits one execution owner with two dispatch slots.
 Persistent buffers are rebound/reset under matching ownership; physical KV
 zeroing is not a wire-protocol requirement. Completion, cancellation, and
 failure must drain outstanding work before resources are reused. Terminal
 results are delivered only after matching resource-release confirmation.
 See [asynchronous scheduling](async_scheduling.md) for receipts and retirement.
+
+NPU stage preparation is part of the Worker's execution error boundary. A
+preparation failure preserves the original exception, clears pending stage and
+logit state, and requires matching owner retirement before retry. New attention
+batches are published only after session and buffer initialization succeeds;
+failed initialization releases only the registry slots acquired by that attempt.
+An occupied attention context is rejected before shared decision buffers are
+reset. An already-published batch remains owned until normal retirement. These
+rules do not provide automatic EngineCore recovery or certify retirement after
+a failed first Prefill with no previous execution owner.
 
 ## Validation boundaries
 

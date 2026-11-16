@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Native full-vocabulary candidate baseline for Ascend Beam V1.
 
 Selection runs outside the model graph. Log probabilities retain the complete

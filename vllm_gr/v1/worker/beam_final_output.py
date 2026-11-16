@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 """Compact final output for the persistent GPU Beam runner."""
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import triton
 
@@ -28,6 +29,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputOptions,
     BeamOutputSequence,
     BeamRequestOutput,
+    BeamSequenceColumns,
 )
 
 _CONTROL_WORDS = 3
@@ -73,6 +75,7 @@ def _build_batch_result(
     session_id: str,
     bindings: tuple[BeamRequestBinding, ...],
     options: BeamOutputOptions,
+    columnar: bool = False,
 ) -> BeamBatchResult:
     values = payload.numpy() if isinstance(payload, torch.Tensor) else payload
     outputs = []
@@ -82,6 +85,35 @@ def _build_batch_result(
         start = _CONTROL_WORDS + request_index * layout.member_stride
         count = int(values[start])
         rows = values[start + 1 : start + layout.member_stride].reshape(layout.width, stride)
+        valid_rows = rows[:count]
+        if (
+            columnar
+            and count >= 64
+            and np.all(valid_rows[:, -3] == steps)
+            and not np.any(valid_rows[:, -2] == FINISH_STOP)
+        ):
+            outputs.append(
+                BeamRequestOutput(
+                    binding.item_index,
+                    binding.native_request_id,
+                    BeamSequenceColumns(
+                        count,
+                        steps,
+                        valid_rows[:, :steps].astype("<i4", copy=False).tobytes(),
+                        (
+                            valid_rows.view(np.float32)[:, -4].astype("<f4", copy=False).tobytes()
+                            if options.include_cumulative_logprob
+                            else None
+                        ),
+                        (
+                            valid_rows[:, steps : 2 * steps].astype("<i4", copy=False).tobytes()
+                            if options.include_parent_beam_indices
+                            else None
+                        ),
+                    ),
+                )
+            )
+            continue
         sequences = []
         for row in struct.iter_unpack(f"={2 * steps}ifiii", rows[:count].tobytes()):
             length, reason, stop_token = row[-3:]
@@ -341,6 +373,7 @@ class GPUBeamFinalOutput:
                 session_id=self.binding.session_id,
                 bindings=self.bindings,
                 options=self.options,
+                columnar=True,
             )
             self._delivered = True
             self._record_done(owner)

@@ -86,8 +86,9 @@ satisfy full validation. A full `ready` run reuses an eligible A/B result for
 the current revision or runs A/B when needed. Confirmed documentation-only PRs
 do not run A/B tests, including when `abtest` is added.
 
-Benchmark policy depends on the PR base and device. Video-100/Pangu policy
-resolution uses the PR base and can use a changed candidate policy from the PR;
+Video-100/Pangu benchmarks use the policy and resolver from the same workflow
+commit as the tests, with the existing branch and device settings. Policy and
+test changes can be reviewed together in one PR. See the
+[CI policy guide](docs/ci/benchmark-policy-approvals.md) and
+[benchmark guide](docs/tools/README.md#benchmark-acceptance).
 Recall baseline provenance has separate rules.
-Use the [benchmark guide](docs/tools/README.md#benchmark-acceptance) and inspect
-the target revision's workflows when interpreting a result.

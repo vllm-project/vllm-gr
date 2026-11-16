@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disable-error-code="no-untyped-def,no-untyped-call,misc"
 """CUDA asynchronous scheduling preparation, output drain and fixed-address graph contracts."""
 
@@ -27,6 +27,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_RETIRE_RESULT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.gr_inputs import ERROR_DISPATCH_STATE, GRInputBuffers
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
@@ -290,7 +291,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         worker,
         lambda ids, positions: ids[:, None].to(torch.float16).expand(-1, 6) + positions[:, None],
     )
-    assert capture_async_forward(worker)
+    assert capture_async_forward(worker, hooks_type=CudaStageHooksV1)
     assert freezes == []
     owner = worker._gr_gpu_stage_runner
     graph = owner.graph
@@ -312,7 +313,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
             num_prompt_tokens=prompt,
             num_prompt_tokens_by_request=(prompt,),
         )
-        assert get_stage_runner(worker, dispatch(first)) is owner
+        assert get_stage_runner(worker, dispatch(first), hooks_type=CudaStageHooksV1) is owner
         assert owner.beam.state.max_new_tokens == budget
         if budget != previous_state.max_new_tokens:
             assert owner.beam.state is not previous_state

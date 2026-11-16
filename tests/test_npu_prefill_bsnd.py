@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Host-side regressions runnable without vLLM, torch, or an NPU.
 
 Execute selected real methods via AST extraction to avoid importing the NPU

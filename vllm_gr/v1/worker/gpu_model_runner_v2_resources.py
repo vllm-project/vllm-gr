@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Worker-owned input storage and graph bindings for ModelRunner V2."""
 
 from collections.abc import Callable
@@ -70,6 +70,8 @@ def close_v2_runtime(runner: Any) -> None:
     for name in (
         "_gr_input_buffers",
         "_gr_gpu_stage_runner",
+        "_gr_gpu_stage_runner_cache",
+        "_gr_gpu_stage_runner_cache_key",
         "_gr_decode_capture_failures",
         "_gr_runtime_decode_capture_failures",
         "_gr_dynamic_graphs_discarded",

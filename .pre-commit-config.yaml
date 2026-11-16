@@ -135,11 +135,14 @@ repos:
       stages: [commit-msg]
 
     - id: check-spdx-header
-      name: Check SPDX headers
-      entry: python tools/pre_commit/check_spdx_header.py
+      name: Check SPDX headers and attribution policy
+      entry: python tools/pre_commit/check_spdx_header.py --all-tracked
       language: python
       additional_dependencies: [packaging==26.3]
-      types: [python]
+      # The script enumerates git ls-files itself, so the global generated/
+      # exclude and the staged-file list do not decide what gets checked.
+      always_run: true
+      pass_filenames: false
 
     - id: check-filenames
       name: Check for spaces in all filenames

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Native worker and Prefill metadata builders for V2 state and input tests."""
 
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"

@@ -2,11 +2,42 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # Adapted from https://github.com/vllm-project/vllm
 
+"""Check and complete file-level SPDX headers.
+
+Two modes:
+
+- ``--all-tracked`` enumerates every tracked source file, checks it against
+  ``spdx_policy.json`` and never writes. This is the pre-commit hook.
+- given file names (a manual developer convenience, not the hook), it
+  completes a file that has no header at all and reports everything else. A
+  file that already states a license, states a copyright in any form, or
+  cannot be decoded is never rewritten: a license expression does not determine
+  who holds the copyright, and a plain "Copyright" comment is often the only
+  notice an upstream copy carries.
+"""
+
+import json
+import re
+import subprocess
 import sys
 from enum import Enum
 from pathlib import Path
 
 from packaging.licenses import InvalidLicenseExpression, canonicalize_license_expression
+
+POLICY_PATH = Path(__file__).with_name("spdx_policy.json")
+REPO_ROOT = POLICY_PATH.parents[2]
+SOURCE_SUFFIXES = {".py", ".pyi", ".sh", ".js", ".cjs", ".mjs", ".proto"}
+LICENSE_PREFIXES = ("# SPDX-License-Identifier:", "// SPDX-License-Identifier:")
+COPYRIGHT_PREFIXES = ("# SPDX-FileCopyrightText:", "// SPDX-FileCopyrightText:")
+COMMENT_PREFIXES = ("#", "//")
+HASH_COMMENT_SUFFIXES = {".py", ".pyi", ".sh"}
+SLASH_COMMENT_SUFFIXES = {".proto", ".js", ".cjs", ".mjs"}
+# Only the leading comment block is a header. A tag further down is prose, a
+# fixture inside a test, or a heredoc, and must not satisfy the check.
+BOM = "\ufeff"  # UTF-8 byte order mark, kept as an escape so it stays visible
+ENCODING_COOKIE = re.compile(r"^[#/]{1,2}.*coding[:=]\s*[-\w.]+")
+PLAIN_COPYRIGHT = re.compile(r"^[#/]{1,2}\s*Copyright\b", re.IGNORECASE)
 
 
 class SPDXStatus(Enum):
@@ -14,16 +45,12 @@ class SPDXStatus(Enum):
 
     EMPTY = "empty"  # empty __init__.py
     COMPLETE = "complete"
-    MISSING_LICENSE = "missing_license"  # Only has copyright line
-    MISSING_COPYRIGHT = "missing_copyright"  # Only has license line
-    MISSING_BOTH = "missing_both"  # Completely missing
+    MISSING_LICENSE = "missing_license"  # Only has copyright tag lines
+    MISSING_COPYRIGHT = "missing_copyright"  # Only has license tag lines
+    MISSING_BOTH = "missing_both"  # No tag and no plain copyright comment
+    PLAIN_COPYRIGHT = "plain_copyright"  # No tag, but a plain copyright comment
     INVALID = "invalid"  # Empty value or invalid license expression
-
-
-LICENSE_PREFIXES = ("# SPDX-License-Identifier:", "// SPDX-License-Identifier:")
-COPYRIGHT_PREFIXES = ("# SPDX-FileCopyrightText:", "// SPDX-FileCopyrightText:")
-HASH_COMMENT_SUFFIXES = {".py", ".pyi", ".sh"}
-SLASH_COMMENT_SUFFIXES = {".proto", ".js", ".cjs", ".mjs"}
+    UNDECODABLE = "undecodable"  # Not UTF-8; the header cannot be read or written
 
 
 def comment_prefix(file_path):
@@ -40,11 +67,21 @@ def comment_prefix(file_path):
     return None
 
 
-def spdx_header(prefix):
+def is_empty_init(relative_path):
+    """True for the zero-byte ``__init__.py`` files an empty package needs.
+
+    Only those are exempt. Every other empty tracked source is a mistake that
+    the policy must see: a truncated verbatim copy would otherwise keep a clean
+    report while silently dropping the notice it is registered for.
+    """
+    return Path(relative_path).name == "__init__.py"
+
+
+def spdx_header(prefix, newline):
     """The two-line header written into a file that has neither line."""
     return (
-        f"{prefix} SPDX-License-Identifier: Apache-2.0\n"
-        f"{prefix} SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project"
+        f"{prefix} SPDX-License-Identifier: Apache-2.0{newline}"
+        f"{prefix} SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project{newline}"
     )
 
 
@@ -60,151 +97,254 @@ def valid_license(value):
     return True
 
 
+def read_lines(file_path):
+    """Return (lines, bom) with line endings intact, or (None, False) if not UTF-8.
+
+    A BOM is stripped and handed back so a rewrite can put it back where it was;
+    decoding with the endings intact means a rewrite cannot convert CRLF to LF.
+    """
+    raw = Path(file_path).read_bytes()
+    bom = raw.startswith(BOM.encode("utf-8"))
+    if bom:
+        raw = raw[len(BOM.encode("utf-8")) :]
+    try:
+        return raw.decode("utf-8").splitlines(keepends=True), bom
+    except UnicodeDecodeError:
+        return None, bom
+
+
+def leading_block(lines):
+    """The lines a header may live in: shebang, then blank and comment lines.
+
+    Stops at the first line that is neither, so a module docstring, a string
+    literal or a statement ends the block.
+    """
+    block = []
+    for index, line in enumerate(lines):
+        text = line.rstrip("\r\n")
+        if index == 0 and text.startswith("#!"):
+            block.append(text)
+            continue
+        if text.strip() == "" or text.lstrip().startswith(COMMENT_PREFIXES):
+            block.append(text)
+            continue
+        break
+    return block
+
+
+def scan_header(file_path):
+    """Return (status, licenses, copyrights) read from the leading comment block."""
+    lines, _ = read_lines(file_path)
+    if lines is None:
+        return SPDXStatus.UNDECODABLE, [], []
+    if not lines:
+        return SPDXStatus.EMPTY, [], []
+
+    licenses, copyrights, plain = [], [], False
+    for line in leading_block(lines):
+        tag = line.strip()
+        for prefix in LICENSE_PREFIXES:
+            if tag.startswith(prefix):
+                licenses.append(tag[len(prefix) :].strip())
+        for prefix in COPYRIGHT_PREFIXES:
+            if tag.startswith(prefix):
+                copyrights.append(tag[len(prefix) :].strip())
+        if not plain and PLAIN_COPYRIGHT.match(tag):
+            plain = True
+
+    if any(not valid_license(value) for value in licenses) or any(
+        not value for value in copyrights
+    ):
+        return SPDXStatus.INVALID, licenses, copyrights
+    if licenses and copyrights:
+        return SPDXStatus.COMPLETE, licenses, copyrights
+    if licenses:
+        return SPDXStatus.MISSING_COPYRIGHT, licenses, copyrights
+    if copyrights:
+        return SPDXStatus.MISSING_LICENSE, licenses, copyrights
+    if plain:
+        return SPDXStatus.PLAIN_COPYRIGHT, licenses, copyrights
+    return SPDXStatus.MISSING_BOTH, licenses, copyrights
+
+
 def check_spdx_header_status(file_path):
     """Check SPDX header status of the file"""
-    with open(file_path, encoding="UTF-8") as file:
-        lines = file.readlines()
-        if not lines:
-            # Empty file
-            return SPDXStatus.EMPTY
-
-        # Skip shebang line
-        start_idx = 0
-        if lines and lines[0].startswith("#!"):
-            start_idx = 1
-
-        has_license = False
-        has_copyright = False
-        invalid = False
-
-        # Check all lines for SPDX headers (not just the first two)
-        for i in range(start_idx, len(lines)):
-            line = lines[i].strip()
-            for prefix in LICENSE_PREFIXES:
-                if line.startswith(prefix):
-                    has_license = True
-                    invalid |= not valid_license(line[len(prefix) :])
-            for prefix in COPYRIGHT_PREFIXES:
-                if line.startswith(prefix):
-                    has_copyright = True
-                    invalid |= not line[len(prefix) :].strip()
-
-        # Determine status based on what we found
-        if invalid:
-            return SPDXStatus.INVALID
-        if has_license and has_copyright:
-            return SPDXStatus.COMPLETE
-        elif has_license and not has_copyright:
-            # Only has license line
-            return SPDXStatus.MISSING_COPYRIGHT
-            # Only has copyright line
-        elif not has_license and has_copyright:
-            return SPDXStatus.MISSING_LICENSE
-        else:
-            # Completely missing both lines
-            return SPDXStatus.MISSING_BOTH
+    return scan_header(file_path)[0]
 
 
-def add_header(file_path, status):
-    """Add or supplement SPDX header based on status"""
+def cookie_line(lines):
+    """Index of the line a coding cookie occupies, or None.
+
+    PEP 263 honours a cookie on line one or two only, after an optional shebang
+    and after an ordinary comment. Inserting the header above such a cookie
+    would push it out of that window and change how the file decodes.
+    """
+    index = 0
+    if lines and lines[0].startswith("#!"):
+        index = 1
+    for candidate in (index, index + 1):
+        if candidate < len(lines) and ENCODING_COOKIE.match(lines[candidate].rstrip("\r\n")):
+            return candidate
+    return None
+
+
+def add_header(file_path):
+    """Write the two-line header into a file that has neither line.
+
+    Only MISSING_BOTH reaches here. The BOM, the encoding cookie, the shebang
+    and the line endings are all left as they were: a coding cookie is only
+    honoured on the first two lines, and a BOM that moved would break the file.
+    """
     prefix = comment_prefix(file_path)
     if prefix is None:
         return
-    with open(file_path, "r+", encoding="UTF-8") as file:
-        lines = file.readlines()
-        file.seek(0, 0)
-        file.truncate()
+    lines, bom = read_lines(file_path)
+    if lines is None:
+        return
 
-        if status == SPDXStatus.MISSING_BOTH:
-            # Completely missing, add complete header
-            if lines and lines[0].startswith("#!"):
-                # Preserve shebang line
-                file.write(lines[0])
-                file.write(spdx_header(prefix) + "\n")
-                file.writelines(lines[1:])
-            else:
-                # Add header directly
-                file.write(spdx_header(prefix) + "\n")
-                file.writelines(lines)
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    cookie = cookie_line(lines)
+    if cookie is not None:
+        insert_at = cookie + 1
+    else:
+        # No cookie: the header still goes below a shebang, which must stay first.
+        insert_at = 1 if lines and lines[0].startswith("#!") else 0
 
-        elif status == SPDXStatus.MISSING_COPYRIGHT:
-            # Only has license line, need to add copyright line
-            # Find the license line and add copyright line after it
-            for i, line in enumerate(lines):
-                if line.strip().startswith(f"{prefix} SPDX-License-Identifier:"):
-                    # Insert copyright line after license line
-                    lines.insert(
-                        i + 1,
-                        f"{prefix} SPDX-FileCopyrightText: "
-                        "Copyright contributors to the vLLM-GR project\n",
-                    )
-                    break
+    text = "".join(lines[:insert_at]) + spdx_header(prefix, newline) + "".join(lines[insert_at:])
+    data = text.encode("utf-8")
+    Path(file_path).write_bytes((BOM.encode("utf-8") if bom else b"") + data)
 
-            file.writelines(lines)
 
-        else:
-            # MISSING_LICENSE / INVALID: leave the file untouched.
-            file.writelines(lines)
+def policy_errors(relative_path, licenses, copyrights, policy):
+    """Return the reasons the file disagrees with the attribution policy."""
+    copy = policy["verbatim_copies"].get(relative_path)
+    if copy is None:
+        errors = []
+        if policy["copyright"] not in copyrights:
+            errors.append(f"missing '{policy['copyright']}'")
+        extra = [value for value in copyrights if value != policy["copyright"]]
+        if extra:
+            errors.append(
+                f"copyright holder(s) not registered in verbatim_copies: {', '.join(extra)}"
+            )
+        return errors
+
+    errors = []
+    missing = [value for value in copy["copyrights"] if value not in copyrights]
+    if missing:
+        errors.append(f"missing registered holder(s): {', '.join(missing)}")
+    extra = [value for value in copyrights if value not in copy["copyrights"]]
+    if extra:
+        errors.append(f"unregistered holder(s): {', '.join(extra)}")
+    if any(
+        canonicalize_license_expression(value) != canonicalize_license_expression(copy["license"])
+        for value in licenses
+        if valid_license(value)
+    ):
+        errors.append(f"license must be '{copy['license']}'")
+    return errors
+
+
+def tracked_sources():
+    """Every tracked file whose suffix we check, as repository-relative paths.
+
+    ``--full-name`` and an explicit cwd keep the paths repository-relative even
+    when the hook is run from a subdirectory; otherwise the policy keys stop
+    matching and every file outside that subdirectory goes unchecked.
+    """
+    out = subprocess.run(
+        ["git", "ls-files", "--full-name", "-z"],
+        capture_output=True,
+        check=True,
+        cwd=REPO_ROOT,
+    ).stdout.decode()
+    return [path for path in out.split("\0") if Path(path).suffix in SOURCE_SUFFIXES]
+
+
+def check_all_tracked():
+    """Read-only pass over every tracked source file; return the error list."""
+    policy = json.loads(POLICY_PATH.read_text(encoding="UTF-8"))
+    tracked = tracked_sources()
+    errors = []
+
+    registered = set(policy["verbatim_copies"])
+    for path in sorted(registered - set(tracked)):
+        errors.append(f"{path}: registered in spdx_policy.json but not tracked")
+
+    for path in tracked:
+        full = REPO_ROOT / path
+        status, licenses, copyrights = scan_header(full)
+        if status == SPDXStatus.EMPTY and is_empty_init(path):
+            continue
+        if status != SPDXStatus.COMPLETE:
+            errors.append(f"{path}: {status.value}")
+            continue
+        for error in policy_errors(path, licenses, copyrights, policy):
+            errors.append(f"{path}: {error}")
+    return errors
+
+
+def report(status, file_path):
+    """Print the message for one file; return True when the run must not pass.
+
+    A completed header fails the run as well: pre-commit passes the hook only
+    when it changed nothing, so a rewritten file has to be staged again.
+    """
+    if status == SPDXStatus.MISSING_BOTH:
+        print("The following files are missing the SPDX header:")
+        print(f"  {file_path}")
+        add_header(file_path)
+        return True
+    if status == SPDXStatus.MISSING_LICENSE:
+        print("Copyright line without a license line; confirm the license and add it:")
+    elif status == SPDXStatus.MISSING_COPYRIGHT:
+        print(
+            "License line without a copyright line; confirm who holds the copyright and add it "
+            "(a license expression does not name the holder):"
+        )
+    elif status == SPDXStatus.PLAIN_COPYRIGHT:
+        print(
+            "Plain copyright comment with no SPDX header; confirm the holder and add the header "
+            "(it may be an upstream copy):"
+        )
+    elif status == SPDXStatus.INVALID:
+        print("Empty value or invalid SPDX license expression:")
+    elif status == SPDXStatus.UNDECODABLE:
+        print("Not UTF-8, so the header cannot be read or completed:")
+    elif status == SPDXStatus.EMPTY:
+        if is_empty_init(file_path):
+            return False
+        print("Empty source file that is not an __init__.py; restore it or add the header:")
+    else:
+        return False
+    print(f"  {file_path}")
+    return True
 
 
 def main():
     """Main function"""
-    files_missing_both = []
-    files_missing_copyright = []
-    files_missing_license = []
-    files_invalid = []
-    files_unsupported = []
+    if "--all-tracked" in sys.argv[1:]:
+        errors = check_all_tracked()
+        for error in errors:
+            print(error)
+        sys.exit(1 if errors else 0)
 
-    for file_path in sys.argv[1:]:
-        status = check_spdx_header_status(file_path)
+    files = sys.argv[1:]
+    undecodable = [f for f in files if comment_prefix(f) is None]
+    reportable = [f for f in files if comment_prefix(f) is not None]
 
-        if comment_prefix(file_path) is None:
-            # Unknown comment syntax: a guess would corrupt the file.
-            if status not in (SPDXStatus.COMPLETE, SPDXStatus.EMPTY):
-                files_unsupported.append(file_path)
-            continue
+    needs_a_person = False
+    for file_path in reportable:
+        status = scan_header(file_path)[0]
+        needs_a_person |= report(status, file_path)
 
-        if status == SPDXStatus.MISSING_BOTH:
-            files_missing_both.append(file_path)
-        elif status == SPDXStatus.MISSING_COPYRIGHT:
-            files_missing_copyright.append(file_path)
-        elif status == SPDXStatus.MISSING_LICENSE:
-            files_missing_license.append(file_path)
-        elif status == SPDXStatus.INVALID:
-            files_invalid.append(file_path)
-        else:
-            continue
-
-    # Files that need a human decision are never rewritten
-    manual = files_missing_license + files_invalid + files_unsupported
-    if files_unsupported:
+    if undecodable:
         print("Unknown comment syntax for this file type; add the SPDX header by hand:")
-        for file_path in files_unsupported:
+        for file_path in undecodable:
             print(f"  {file_path}")
-    if files_missing_license:
-        print("Copyright line without a license line; confirm the license and add it:")
-        for file_path in files_missing_license:
-            print(f"  {file_path}")
-    if files_invalid:
-        print("Empty value or invalid SPDX license expression:")
-        for file_path in files_invalid:
-            print(f"  {file_path}")
+        needs_a_person = True
 
-    # Collect all files that can be fixed automatically
-    all_files_to_fix = files_missing_both + files_missing_copyright
-    if all_files_to_fix:
-        print("The following files are missing the SPDX header:")
-        if files_missing_both:
-            for file_path in files_missing_both:
-                print(f"  {file_path}")
-                add_header(file_path, SPDXStatus.MISSING_BOTH)
-
-        if files_missing_copyright:
-            for file_path in files_missing_copyright:
-                print(f"  {file_path}")
-                add_header(file_path, SPDXStatus.MISSING_COPYRIGHT)
-
-    sys.exit(1 if all_files_to_fix or manual else 0)
+    sys.exit(1 if needs_a_person else 0)
 
 
 if __name__ == "__main__":

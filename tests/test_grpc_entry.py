@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # ruff: noqa: E402 -- Optional gRPC dependencies must be checked before imports.
 """Full-schema compatibility, binary conversion and actual gRPC transport tests."""
 
@@ -32,6 +32,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
+    BeamSequenceColumns,
 )
 
 scheduler = _admission_scheduler_fixture
@@ -123,28 +124,39 @@ def test_full_request_to_numpy_batch(binary: bool) -> None:
 
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
-def test_constrained_length_is_checked_before_grpc_token_decoding(binary: bool) -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "backend,table_format,trie_id",
+    [("cuda", "constraint_table_v1", 0), ("npu", "constraint_table_v2", 1)],
+)
+def test_constrained_length_is_checked_before_grpc_token_decoding(
+    binary: bool, backend: str, table_format: str, trie_id: int
+) -> None:
     from tests.test_beam_search_v1_input_processor import _canonical_gr_config
 
-    config = _canonical_gr_config()
+    config = _canonical_gr_config(backend=backend)
+    config["constraint_table"]["format"] = table_format
     config["beam"]["max_decode_steps"] = 7
-    backend = engine()
-    backend.vllm_config = SimpleNamespace(additional_config={"vllm_gr": config})
-    servicer = BeamVllmEngineServicer(backend, 0.0)
+    runtime = engine()
+    runtime.vllm_config = SimpleNamespace(
+        additional_config={"vllm_gr": config}, device_config=SimpleNamespace(device=backend)
+    )
+    servicer = BeamVllmEngineServicer(runtime, 0.0)
     decode = Mock(wraps=servicer.decode_tokens)
     servicer.decode_tokens = decode
     request = message(binary=binary)
+    request.trie_id = trie_id
     for length in (1, 2, 4, 7):
         request.sampling_params.max_tokens = length
         with pytest.raises(
             ValueError,
-            match=f"effective generation length {length} must equal constraint_table_v1 depth",
+            match=f"effective generation length {length} must equal {table_format} depth",
         ):
             servicer.build_batch([request])
         decode.assert_not_called()
     request.sampling_params.max_tokens = 3
     batch, _ = servicer.build_batch([request])
     assert batch.beam_params.max_tokens == 3
+    assert batch.items[0].trie_id == trie_id
     decode.assert_called_once()
 
 
@@ -167,12 +179,8 @@ def test_npu_trie_selector_matches_http_validation(trie_id: int) -> None:
     request = message()
     request.trie_id = trie_id
     servicer = BeamVllmEngineServicer(backend, 0.0)
-    if trie_id:
-        with pytest.raises(ValueError, match="multi-trie requests currently require CUDA"):
-            servicer.build_batch([request])
-    else:
-        batch, _ = servicer.build_batch([request])
-        assert batch.items[0].trie_id == 0
+    batch, _ = servicer.build_batch([request])
+    assert batch.items[0].trie_id == trie_id
 
 
 @pytest.mark.parametrize("result_width", [None, 1, 2])  # type: ignore[misc]
@@ -318,6 +326,140 @@ def test_dynamic_beam_default_result_width_over_grpc() -> None:
     asyncio.run(run())
 
 
+def _columns_result(session_id: str, request: Any) -> BeamBatchResult:
+    """Equal-length columnar terminal result for binary-response wiring."""
+    tokens = np.arange(6, dtype="<i4").reshape(2, 3)
+    scores = np.array([-1.0, -2.0], dtype="<f4")
+    parents = np.array([[0, 0, 0], [0, 1, 0]], dtype="<i4")
+    parent_bytes = parents.tobytes() if request.output_options.include_parent_beam_indices else None
+    return BeamBatchResult(
+        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+        batch_id=session_id,
+        failure=None,
+        output=BeamBatchOutput(
+            items=tuple(
+                BeamRequestOutput(
+                    item_index=index,
+                    request_id=item.request.request_id,
+                    sequences=BeamSequenceColumns(
+                        count=2,
+                        steps=3,
+                        token_ids=tokens.tobytes(),
+                        cumulative_logprobs=scores.tobytes(),
+                        parent_beam_indices=parent_bytes,
+                    ),
+                )
+                for index, item in enumerate(request.items)
+            )
+        ),
+    )
+
+
+def _install_columns_wait(backend: SimpleNamespace) -> None:
+    async def wait(session_id: str, request: Any) -> BeamBatchResult:
+        return _columns_result(session_id, request)
+
+    backend.wait_gr_session = wait
+
+
+@pytest.mark.l2  # type: ignore[misc]
+def test_binary_beam_output_is_opt_in_over_grpc() -> None:
+    async def run() -> None:
+        async with connection() as (stub, backend, submitted, servicer):
+            _install_columns_wait(backend)
+            response = await stub.GenerateBatch(
+                pb.BatchGenerateRequest(requests=[message()]), timeout=5
+            )
+            assert submitted[0].output_options.num_return_sequences == 2
+            item = response.items[0]
+            assert not item.HasField("binary_beams")
+            assert list(item.beams.output_ids) == [0, 1, 2, 3, 4, 5]
+            assert list(item.beams.output_offsets) == [0, 3, 6]
+            assert list(item.beams.cumulative_logprobs) == [-1.0, -2.0]
+            assert not list(item.beams.parent_beam_indices)
+            assert list(item.beams.parent_offsets) == [0, 0, 0]
+
+    asyncio.run(run())
+
+
+@pytest.mark.l2  # type: ignore[misc]
+def test_binary_beam_output_round_trips_columns_over_grpc() -> None:
+    async def run() -> None:
+        async with connection() as (stub, backend, submitted, servicer):
+            _install_columns_wait(backend)
+            member = message()
+            member.beam_search.include_parent_beam_indices = True
+            request = pb.BatchGenerateRequest(requests=[member], binary_beam_output=True)
+            response = await stub.GenerateBatch(request, timeout=5)
+            assert submitted[0].output_options.include_parent_beam_indices
+            item = response.items[0]
+            assert item.HasField("binary_beams")
+            assert not item.HasField("beams")
+            encoded = item.binary_beams
+            assert (encoded.count, encoded.steps, encoded.prompt_tokens) == (2, 3, 3)
+            np.testing.assert_array_equal(
+                np.frombuffer(encoded.output_ids_i32_le, dtype="<i4").reshape(2, 3),
+                np.arange(6, dtype="<i4").reshape(2, 3),
+            )
+            np.testing.assert_array_equal(
+                np.frombuffer(encoded.cumulative_logprobs_f32_le, dtype="<f4"),
+                np.array([-1.0, -2.0], dtype="<f4"),
+            )
+            np.testing.assert_array_equal(
+                np.frombuffer(encoded.parent_beam_indices_i32_le, dtype="<i4").reshape(2, 3),
+                np.array([[0, 0, 0], [0, 1, 0]], dtype="<i4"),
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.l2  # type: ignore[misc]
+def test_binary_beam_output_falls_back_for_small_results_over_grpc() -> None:
+    async def run() -> None:
+        async with connection() as (stub, backend, submitted, servicer):
+
+            async def wait(session_id: str, request: Any) -> BeamBatchResult:
+                result = _columns_result(session_id, request)
+                assert result.output is not None
+                columns_item = result.output.items[0]
+                small_item = BeamRequestOutput(
+                    item_index=1,
+                    request_id=request.items[1].request.request_id,
+                    sequences=(
+                        BeamOutputSequence(
+                            token_ids=(7,),
+                            cumulative_logprob=-3.0,
+                            parent_beam_indices=(),
+                            finish_reason="stop",
+                            stop_token_id=7,
+                        ),
+                    ),
+                )
+                return BeamBatchResult(
+                    protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                    batch_id=session_id,
+                    failure=None,
+                    output=BeamBatchOutput(items=(columns_item, small_item)),
+                )
+
+            backend.wait_gr_session = wait
+            request = pb.BatchGenerateRequest(
+                requests=[message(0), message(1)], binary_beam_output=True
+            )
+            response = await stub.GenerateBatch(request, timeout=5)
+            first, second = response.items
+            assert first.HasField("binary_beams")
+            assert not first.binary_beams.HasField("parent_beam_indices_i32_le")
+            assert not first.HasField("beams")
+            assert second.HasField("beams")
+            assert not second.HasField("binary_beams")
+            assert list(second.beams.output_ids) == [7]
+            assert list(second.beams.finish_reasons) == ["stop"]
+            assert list(second.beams.stop_token_ids) == [7]
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("fault", ["stream", "penalty", "mm", "kv", "mixed", "duplicate"])  # type: ignore[misc]
 def test_incompatible_inputs_are_rejected_not_ignored(fault: str) -> None:
     servicer = BeamVllmEngineServicer(engine(), 0.0)
@@ -390,7 +532,9 @@ async def connection() -> AsyncIterator[tuple[Any, SimpleNamespace, list[Any], A
     port = server.add_insecure_port("127.0.0.1:0")
     await server.start()
     try:
-        async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+        async with grpc.aio.insecure_channel(
+            f"127.0.0.1:{port}", options=(("grpc.enable_http_proxy", 0),)
+        ) as channel:
             yield rpc.VllmEngineStub(channel), backend, submitted, servicer
     finally:
         await server.stop(0)
@@ -398,9 +542,11 @@ async def connection() -> AsyncIterator[tuple[Any, SimpleNamespace, list[Any], A
 
 @pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("method", ["Generate", "GenerateBatch"])  # type: ignore[misc]
-def test_trie_selection_over_grpc(binary: bool, method: str) -> None:
+@pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
+def test_trie_selection_over_grpc(binary: bool, method: str, device: str) -> None:
     async def run() -> None:
         async with connection() as (stub, backend, submitted, servicer):
+            backend.vllm_config = SimpleNamespace(device_config=SimpleNamespace(device=device))
             if method == "Generate":
                 request = message(binary=binary)
                 request.trie_id = 1
@@ -425,8 +571,9 @@ def test_trie_selection_over_grpc(binary: bool, method: str) -> None:
 
 @pytest.mark.parametrize("trie_count", [1, 2])  # type: ignore[misc]
 @pytest.mark.parametrize("method", ["Generate", "GenerateBatch"])  # type: ignore[misc]
+@pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
 def test_invalid_trie_uses_core_admission_and_service_recovers(
-    trie_count: int, method: str
+    trie_count: int, method: str, device: str
 ) -> None:
     from queue import Queue
 
@@ -437,6 +584,7 @@ def test_invalid_trie_uses_core_admission_and_service_recovers(
 
     async def run() -> None:
         async with connection() as (stub, backend, submitted, servicer):
+            backend.vllm_config = SimpleNamespace(device_config=SimpleNamespace(device=device))
             original_submit = backend.submit_gr_session
             core = SimpleNamespace(_gr_trie_count=trie_count, input_queue=Queue())
 
@@ -1027,7 +1175,9 @@ def test_upstream_startup_keeps_health_reflection_stats_and_cleanup_order(
             task = asyncio.create_task(upstream.serve_grpc(args))
             try:
                 await asyncio.wait_for(signals_ready.wait(), timeout=5)
-                async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+                async with grpc.aio.insecure_channel(
+                    f"127.0.0.1:{port}", options=(("grpc.enable_http_proxy", 0),)
+                ) as channel:
                     health = health_pb2_grpc.HealthStub(channel)
                     for service in ("", "vllm.grpc.engine.VllmEngine"):
                         response = await health.Check(

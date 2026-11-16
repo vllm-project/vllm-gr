@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import BeamSearchParams as BaseBeamSearchParams

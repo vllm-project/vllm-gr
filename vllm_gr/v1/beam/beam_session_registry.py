@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """BeamSessionRegistry — per-request session registry with slot allocation.
 
 Manages the mapping from session_id to pool slot, and holds per-request

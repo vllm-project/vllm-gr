@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Core contracts for active-platform ModelRunner patch dispatch."""
 
 import sys
@@ -10,6 +10,39 @@ import pytest
 
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
 from vllm_gr.v1.worker import gpu_model_runner_patch, model_runner_patch
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_active_cuda_worker_hot_update_utility_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    class Worker:
+        model_runner: Any
+
+        def reload_weights(self, weights_path: str) -> str:
+            return weights_path
+
+    module = ModuleType("vllm.v1.worker.gpu_worker")
+    setattr(module, "Worker", Worker)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_active_platform_module_name",
+        lambda: model_runner_patch._GPU_PATCH_MODULE,
+    )
+    native_reload = Worker.reload_weights
+    model_runner_patch._install_active_worker_resource_hook()
+    reload_trie = getattr(Worker, "reload_trie")
+    model_runner_patch._install_active_worker_resource_hook()
+    assert getattr(Worker, "reload_trie") is reload_trie
+    assert Worker.reload_weights is native_reload
+
+    worker = Worker()
+    backend = Mock()
+    worker.model_runner = SimpleNamespace(constraint_backend=backend)
+    assert getattr(worker, "reload_trie")("/tries/v2", "v2") == {"version": "v2", "ready": True}
+    backend.reload.assert_called_once_with("/tries/v2", "v2")
+    assert worker.reload_weights("/weights/v2") == "/weights/v2"
 
 
 def test_dispatcher_selects_one_platform_module(
@@ -403,6 +436,8 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
 def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     monkeypatch: pytest.MonkeyPatch, mode: BeamExecutionMode | None
 ) -> None:
+    import builtins
+
     from vllm_gr.v1.worker import gr_startup
 
     fake_platforms = ModuleType("vllm.platforms")
@@ -439,8 +474,22 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
         )
 
     monkeypatch.setattr(model_runner_patch, "import_module", import_npu)
-    monkeypatch.setattr(gr_startup, "capture_async_forward", lambda _: events.append("stages"))
+    monkeypatch.setattr(
+        gr_startup,
+        "capture_async_forward",
+        lambda _, *, hooks_type: events.append("stages")
+        if hooks_type is None
+        else pytest.fail("NPU received CUDA hooks"),
+    )
     monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
+
+    original_import = builtins.__import__
+
+    def without_cuda_hooks(name: str, *args: Any, **kwargs: Any) -> Any:
+        assert not name.startswith("vllm_gr.v1.worker.gpu_beam_stage_runner")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_cuda_hooks)
     model_runner_patch.apply_worker_patches()
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert Runner().capture_model() == 17

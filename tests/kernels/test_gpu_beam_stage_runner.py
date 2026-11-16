@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """CUDA adapter tests: independent resources, dispatch snapshots and terminal KV."""
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 import subprocess
 import sys
+from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +24,7 @@ from tests.constraints.test_table import make_table
 from tests.test_gr_async_scheduler import _batch_request
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
 from vllm_gr.constraints.loader import _upload_cuda_backend
+from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
     cache_unshared_kv_graph,
@@ -54,6 +56,7 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     head_slice_plan,
     validate_dispatch,
 )
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.gr_inputs import GRInputBuffers, bind_device_inputs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
@@ -107,7 +110,7 @@ def runtime(
     candidate_width=None,
     *,
     unconstrained=False,
-    hooks_cls=None,
+    hooks_cls=CudaStageHooksV1,
 ):
     context = BeamAttentionContext(3, 4, 1, 5, 8, 2, torch.device("cuda"), dtype)
     top_k = 4 if candidate_width is None else candidate_width
@@ -154,7 +157,7 @@ def runtime(
         beam,
         (BeamRequestBinding("session-0", 0, "session-0", 0, 0, 0),),
         None if unconstrained else backend,
-        hooks=hooks_cls(worker) if hooks_cls is not None else None,
+        hooks=hooks_cls(worker),
     )
     owner.metadata = SimpleNamespace(
         suffix_cu_seqlens_q_device=torch.arange(5, device="cuda", dtype=torch.int32),
@@ -242,7 +245,7 @@ def admission_worker(
             # fixture's W=4 workspace.
             constraint_table=None,
         ),
-        constraint_backend=backend,
+        constraint_backend=VersionedConstraintTable(backend, loader=lambda _: backend),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
                 SimpleNamespace(
@@ -280,7 +283,7 @@ def install_decode_model(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_admission_accepts_full_attention(dtype):
     worker = admission_worker(dtype=dtype)
-    owner = get_stage_runner(worker, dispatch(metadata()))
+    owner = get_stage_runner(worker, dispatch(metadata()), hooks_type=CudaStageHooksV1)
     assert owner.beam.session.is_active
     assert worker._beam_context.registry.num_active_sessions == 1
     assert worker._beam_context._gr_execution_owner is owner
@@ -292,6 +295,45 @@ def test_admission_accepts_full_attention(dtype):
     owner.release(owner.binding, consumer_done=done)
 
 
+@pytest.mark.l2
+@pytest.mark.parametrize("failure", ["abstract", "constructor"])
+@pytest.mark.parametrize("stale_cache", [False, True])
+def test_failed_hooks_construction_preserves_admission(failure, stale_cache):
+    class Incomplete(CudaStageHooksV1):  # type: ignore[misc]
+        @abstractmethod
+        def decode_block_ids(self, session_id):
+            raise NotImplementedError
+
+    class BrokenConstructor(CudaStageHooksV1):  # type: ignore[misc]
+        def __init__(self, worker):
+            raise RuntimeError("hooks construction failed")
+
+    worker = admission_worker()
+    cache = {1: object()} if stale_cache else {}
+    worker._gr_gpu_stage_runner_cache = cache
+    before_cache = dict(cache)
+    hooks_type = Incomplete if failure == "abstract" else BrokenConstructor
+    error = TypeError if failure == "abstract" else RuntimeError
+    with pytest.raises(error):
+        get_stage_runner(worker, dispatch(metadata()), hooks_type=hooks_type)
+
+    context = worker._beam_context
+    assert context.registry.num_active_sessions == 0
+    assert getattr(context, "_gr_execution_owner", None) is None
+    assert worker._beam_postprocess_workspaces.require.return_value.execution_owner is None
+    assert not getattr(worker, "_beam_sessions", {})
+    assert getattr(worker, "_gr_gpu_stage_runner", None) is None
+    assert cache == before_cache
+    assert not getattr(worker, "_gr_dynamic_graphs_discarded", False)
+
+    owner = get_stage_runner(worker, dispatch(metadata()), hooks_type=CudaStageHooksV1)
+    assert context.registry.num_active_sessions == 1
+    done = torch.Event()
+    done.record()
+    owner.release(owner.binding, consumer_done=done)
+    assert context.registry.num_active_sessions == 0
+
+
 @pytest.mark.parametrize("windows", [(4, 4), (None, 4), (4, None), (None, 1)])
 def test_admission_rejects_sliding_window_before_resource_creation(windows, monkeypatch):
     from vllm_gr.v1.worker import model_runner_common
@@ -300,7 +342,7 @@ def test_admission_rejects_sliding_window_before_resource_creation(windows, monk
     create_context = Mock(wraps=model_runner_common._create_beam_context)
     monkeypatch.setattr(model_runner_common, "_create_beam_context", create_context)
     with pytest.raises(ValueError, match="does not support sliding-window attention") as exc:
-        get_stage_runner(worker, dispatch(metadata()))
+        get_stage_runner(worker, dispatch(metadata()), hooks_type=CudaStageHooksV1)
     first_window_layer = next(i for i, window in enumerate(windows) if window is not None)
     assert f"layer.{first_window_layer}" in str(exc.value)
     create_context.assert_not_called()
@@ -312,7 +354,7 @@ def test_admission_rejects_sliding_window_before_resource_creation(windows, monk
 
 def test_admission_rejects_sliding_window_before_reuse_reset(monkeypatch):
     worker = admission_worker()
-    owner = get_stage_runner(worker, dispatch(metadata()))
+    owner = get_stage_runner(worker, dispatch(metadata()), hooks_type=CudaStageHooksV1)
     owner.previous = metadata(2)
     state = owner.beam.state
     state.sequence.fill_(123)
@@ -329,7 +371,7 @@ def test_admission_rejects_sliding_window_before_reuse_reset(monkeypatch):
     worker.compilation_config.static_forward_context["layer.1"].impl.sliding_window = (3, 0)
 
     with pytest.raises(ValueError, match="does not support sliding-window attention"):
-        get_stage_runner(worker, dispatch(metadata()))
+        get_stage_runner(worker, dispatch(metadata()), hooks_type=CudaStageHooksV1)
     reset.assert_not_called()
     allocate.assert_not_called()
     worker._beam_postprocess_workspaces.require.assert_not_called()
@@ -964,7 +1006,7 @@ def test_head_logits_buffers_are_allocated_lazily_per_mode() -> None:
 @pytest.mark.parametrize("slice_setting", [None, "0", "off", "auto", "16384"])
 def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version, slice_setting):
     from vllm_gr.v1.worker import gpu_beam_stage_runner as stage_runner
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
     monkeypatch.setenv("VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT", "transposed")
     if slice_setting is None:
@@ -973,16 +1015,16 @@ def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version
         monkeypatch.setenv("VLLM_GR_HEAD_SLICE", slice_setting)
     # Isolate the head-allocation boundary from V2's native input storage.
     monkeypatch.setattr(
-        V2StageExecutionHooks,
+        CudaStageHooksV2,
         "initialize_inputs",
-        stage_runner._StageExecutionHooks.initialize_inputs,
+        CudaStageHooksV1.initialize_inputs,
     )
     layout = (torch.empty((8, 32768), dtype=torch.bfloat16, device="cuda"), None)
     get_layout = Mock(return_value=layout)
     monkeypatch.setattr(stage_runner, "_get_unconstrained_head_layout", get_layout)
     owner = runtime(
         unconstrained=True,
-        hooks_cls=V2StageExecutionHooks if runner_version == "v2" else None,
+        hooks_cls=CudaStageHooksV2 if runner_version == "v2" else CudaStageHooksV1,
     )
     if slice_setting in (None, "0", "off"):
         get_layout.assert_not_called()

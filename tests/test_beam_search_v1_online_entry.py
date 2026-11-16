@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """What the online V1 entry point supplies, refuses, and preserves itself.
 
 The V1 engine accepts exactly one value for ``ignore_eos``: a beam that stopped

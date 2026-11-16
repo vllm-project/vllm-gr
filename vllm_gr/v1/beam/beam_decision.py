@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Worker-side beam decision for incremental beam decode (asynchronous scheduling).
 
 After the accelerator model forward produces top-k candidates (from the sampler's

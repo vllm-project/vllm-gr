@@ -1,6 +1,6 @@
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 from types import SimpleNamespace
 
 import pytest
@@ -59,7 +59,7 @@ def test_length_graphs_do_not_alias_and_new_storage_invalidates_all_buckets():
 def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
@@ -68,7 +68,7 @@ def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
     )
     graph = Mock(ready=False)
     graph.capture.side_effect = lambda *args, **kwargs: setattr(graph, "ready", True)
-    hooks = V2StageExecutionHooks(worker)
+    hooks = CudaStageHooksV2(worker)
     monkeypatch.setattr(hooks, "decode_graph", Mock(return_value=graph))
     owner = SimpleNamespace(
         bindings=(None,),

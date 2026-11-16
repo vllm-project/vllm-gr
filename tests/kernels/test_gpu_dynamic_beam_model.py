@@ -1,6 +1,6 @@
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Opt-in real-model smoke: random tiny Llama, no downloads or business data.
 
 Run in a fresh process with VLLM_GR_RUN_MODEL_SMOKE=1 and

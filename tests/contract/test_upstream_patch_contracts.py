@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: ignore-errors
 
 from __future__ import annotations
@@ -50,6 +50,44 @@ def test_engine_core_method_contracts() -> None:
     run_signature = inspect.signature(EngineCoreProc.run_engine_core)
     assert run_signature.parameters["dp_rank"].default == 0
     assert run_signature.parameters["local_dp_rank"].default == 0
+
+
+@pytest.mark.l1
+def test_core_hot_update_utility_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from concurrent.futures import Future
+    from unittest.mock import Mock
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    from vllm_gr.v1.engine import hot_update
+
+    assert _parameter_names(EngineCoreProc.pause_scheduler) == ["self", "mode", "clear_cache"]
+    assert _parameter_names(EngineCoreProc.resume_scheduler) == ["self"]
+
+    class Core(EngineCoreProc):
+        pass
+
+    native_pause, native_resume = Core.pause_scheduler, Core.resume_scheduler
+    hot_update.install_core_hot_update_hooks(Core)
+    installed = {
+        name: getattr(Core, name) for name in ("service_status", "pause", "resume", "reload_trie")
+    }
+    hot_update.install_core_hot_update_hooks(Core)
+    assert all(getattr(Core, name) is method for name, method in installed.items())
+    assert Core.pause_scheduler is native_pause and Core.resume_scheduler is native_resume
+
+    core = object.__new__(Core)
+    pending = Future()
+    native_pause_call = Mock(return_value=pending)
+    native_resume_call = Mock()
+    monkeypatch.setattr(core, "pause_scheduler", native_pause_call)
+    monkeypatch.setattr(core, "resume_scheduler", native_resume_call)
+    assert getattr(core, "pause")() is pending
+    native_pause_call.assert_called_once_with(mode="wait", clear_cache=True)
+    assert not pending.done()
+    pending.set_result(None)
+    assert getattr(core, "resume")() == {"ok": True}
+    native_resume_call.assert_called_once_with()
 
 
 def test_scheduler_contracts() -> None:

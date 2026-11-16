@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Core contracts for ModelRunner V2 GPU wrappers."""
 
 import logging
@@ -82,8 +82,11 @@ def test_apply_v2_runner_patches_stamps_markers(
             return 0
 
     native_methods = {name: getattr(Runner, name) for name in ("sample", "finish_requests")}
+    constraint_load = Mock(wraps=v2.make_load_model_with_constraint_backend)
+    monkeypatch.setattr(v2, "make_load_model_with_constraint_backend", constraint_load)
     monkeypatch.setattr(v2, "discover_worker_runners", lambda: (("GPUModelRunnerV2", Runner),))
     v2._apply_v2_runner_patches()
+    assert constraint_load.call_args.kwargs["prepare_backend"] is v2._warmup_constraint_backend
 
     # Input preparation/registration have guarded GR specializations; native
     # sampling and request retirement remain unchanged.
@@ -222,9 +225,9 @@ def test_capture_order_and_failure_propagation(
 
 
 def test_stage_hooks_require_native_prefill_output_and_scheduler_kv() -> None:
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
-    hooks = V2StageExecutionHooks(SimpleNamespace())
+    hooks = CudaStageHooksV2(SimpleNamespace())
     with pytest.raises(RuntimeError, match="hidden states"):
         hooks.prefill_logits(lambda worker, scheduled: object(), object())
     with pytest.raises(RuntimeError, match="kv_blocks"):

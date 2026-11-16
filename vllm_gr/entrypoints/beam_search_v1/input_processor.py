@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 """Convert offline and online inputs into validated native beam session requests."""
 
@@ -252,9 +252,6 @@ def _create_batch_request(
         or any(type(trie_id) is not int or trie_id < 0 for trie_id in trie_ids)
     ):
         raise BeamSearchRequestError("trie_ids must contain one non-negative integer per prompt")
-    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
-    if str(device).split(":")[0] == "npu" and any(trie_ids):
-        raise BeamSearchRequestError("multi-trie requests currently require CUDA")
     if not engine_requests or engine_requests[0].request_id != session_id:
         raise BeamSearchRequestError(
             "the first EngineCoreRequest.request_id must equal the GR session ID"

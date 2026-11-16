@@ -46,7 +46,8 @@ outputs = llm.beam_search_v1(
 Omitting `trie_ids` selects Trie 0 for every prompt. An explicit list must have
 one non-negative integer per prompt; a single prompt selecting Trie 1 uses
 `trie_ids=[1]`. Trie selection is separate from `BeamSearchParams`.
-It works with `per_parent_beam_widths` and both compact and full offline outputs.
+Both compact and full offline outputs preserve the selectors. CUDA also supports
+`per_parent_beam_widths`; the NPU path retains its existing per-parent width rules.
 Online completion requests use `vllm_xargs: {"trie_ids": [0, 1]}` in prompt order.
 When a request cannot run as one supported Beam batch, the upstream per-prompt
 fallback preserves each prompt's Trie selector. Non-Beam requests cannot use selectors.
@@ -62,6 +63,31 @@ separate artifacts can change scores and Beam rankings if their windows differ.
 Unquantized heads support weight slicing; quantized heads use full projection
 followed by output slicing. The canonical Worker disables slicing for TP > 1.
 Each logical request keeps its Trie selection across all stages and parent-beam changes.
+
+## NPU execution
+
+The NPU loader splits a v2 artifact into one set of six native constraint tables
+per Trie. Each set uses local offsets and pair keys, while output token IDs keep
+their original model vocabulary values. This reuses the existing
+`RecConstrainedTopK` operator without rebuilding native operators. Legacy
+single-Trie artifacts retain the original selection path.
+
+NPU stage vocabulary slicing builds one shared token map for each SID stage
+from the union of all loaded Tries. Changing `trie_id` therefore does not change
+the projection shape or omit another Trie's tokens. Constraint lookup still uses
+only the selected Trie's candidates. NPU scores retain their existing
+normalization over legal candidates at the current prefix; the shared projection
+map does not change that denominator. These scores need not match CPU/CUDA
+scores normalized over their logits window.
+
+For mixed-Trie batches, the Worker expands validated request selectors in
+request-major beam order and dispatches contiguous runs to their native tables.
+Selectors remain on the host in this dispatch path. Selection happens outside
+the captured model forward, so the existing model graph and parent/KV reordering
+paths are shared across Tries. Fixed and dynamic retained beam widths use the
+same selectors, including when a selection chunk splits a logical request.
+NPU Multi-Trie execution retains the existing three-token SID depth and the
+backend's candidate-degree and beam-width limits.
 
 ## Layout and compatibility
 
@@ -87,10 +113,10 @@ normalizes their SA boundaries to `[0, len(first_token_ids)]`. For `T=1`, CUDA
 uses the original addressing: root buffers are not uploaded, and the Triton
 compile-time Trie count removes root-dependent loads and arithmetic.
 
-Multi-Trie table selection is implemented for CPU and CUDA. CUDA supports mixed
-Tries in fixed and dynamic-width batches; the existing W/K rules still apply.
-NPU accepts only a single Trie and rejects multi-trie artifacts. Participating
-processes must use the same request schema; mixed-version IPC is not supported.
+Multi-Trie table selection is implemented for CPU, CUDA and NPU. Mixed Tries
+work in fixed and dynamic-width batches within each backend's existing W/K
+rules. Participating processes must use the same request schema; mixed-version
+IPC is not supported.
 The existing 512 MiB artifact limit and kernel candidate-degree limits remain
 in force. This change does not add hot reload, arbitrary-depth Tries or NPZ
 import.

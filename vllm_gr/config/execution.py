@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Beam interface selection shared by request admission and Workers."""
 
 from vllm_gr.config.models import BeamExecutionMode, GRConfig

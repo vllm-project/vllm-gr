@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
 set -Eeuo pipefail
 
 # Server-side AB benchmark executor. Runs the offline beam-search benchmark

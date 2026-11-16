@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disallow-untyped-decorators=False
 """Paged-KV gathers on the vllm-ascend 0.30 interleaved cache layout.
 

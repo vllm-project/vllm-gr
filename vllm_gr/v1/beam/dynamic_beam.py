@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Device-side state and contiguous KV banks for per-stage Beam widths.
 
 The native KV operators derive request strides from the physical pool width.

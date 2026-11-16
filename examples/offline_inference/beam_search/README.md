@@ -155,6 +155,16 @@ effective tokens.
 Use an absolute artifact path. Do not combine this canonical configuration with
 legacy `vllm_gr_*` keys in `additional_config`.
 
+The Python `vllm_gr_config` input and
+`additional_config["vllm_gr"]` use the same canonical serialization. Engine
+creation normalizes default fields in both forms and preserves unrelated
+`additional_config` entries. Equivalent GR settings therefore contribute the
+same configuration hash to vLLM's compilation cache, including when a disabled
+Constraint Table omits optional fields.
+Normalization can change the cache key of a previously sparse configuration,
+so the first run after upgrading may compile again. Subsequent runs with the
+same normalized settings reuse the new cache key.
+
 #### Important `GRLLM` parameters
 
 | Parameter | Purpose |

@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Device routing and input ownership for native GR dispatches."""
+
+from __future__ import annotations
 
 from collections.abc import Callable
 from copy import copy, deepcopy
 from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+
+from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooksType
 
 
 def _copy_record(value: Any) -> Any:
@@ -87,21 +91,22 @@ def execute_gr_stage(
     scheduled: Any,
     original: Callable[..., Any],
     *args: Any,
-    hooks_type: type[Any] | None = None,
+    hooks_type: CudaStageHooksType | None = None,
     **kwargs: Any,
 ) -> Any:
     local = worker_input(scheduled)
     device_type = str(worker.device).split(":")[0]
     if device_type == "cuda":
         from vllm_gr.v1.worker.gpu_beam_stage_runner import (
-            _StageExecutionHooks,
             get_stage_runner,
         )
 
+        if hooks_type is None:
+            raise ValueError("CUDA GR execution requires explicit stage hooks")
         stage_runner = get_stage_runner(
             worker,
             local,
-            hooks_type=hooks_type or _StageExecutionHooks,
+            hooks_type=hooks_type,
         )
     elif device_type == "npu":
         from vllm_gr.v1.worker.npu_beam_stage_runner import get_npu_stage_runner
@@ -126,9 +131,9 @@ def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
             execute_gr_retirement as retire,
         )
     elif device_type == "npu":
-        from vllm_gr.v1.worker.npu_beam_stage_runner import (
-            execute_npu_gr_retirement as retire,
-        )
+        from vllm_gr.v1.worker.npu_beam_stage_runner import execute_npu_gr_retirement
+
+        return execute_npu_gr_retirement(worker, local)
     else:
         raise ValueError("beam_search_v1 has no retirement adapter for this device")
 

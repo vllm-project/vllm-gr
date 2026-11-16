@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Prepare the persistent stage execution view for shared Beam Forward capture."""
 
 from __future__ import annotations
@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -27,6 +27,10 @@ from vllm_gr.v1.engine.beam_search_v1 import (
 )
 from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
+from vllm_gr.v1.worker.gpu_stage_hooks import (
+    CudaStageHooksType,
+    validate_stage_hooks_type,
+)
 
 logger = init_logger(__name__)
 ENV_V1_STARTUP_CAPTURE_BATCH_SIZE = "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"
@@ -48,71 +52,73 @@ def _startup_capture_batch_size() -> int:
     return batch_size
 
 
-if TYPE_CHECKING:
-    from vllm_gr.v1.worker.gpu_beam_stage_runner import _StageExecutionHooks
-
-
-@torch.inference_mode()
 def capture_async_forward(
     worker: Any,
     *,
-    hooks_type: type[_StageExecutionHooks] | None = None,
+    hooks_type: CudaStageHooksType | None = None,
     allow_eager_fallback: bool = False,
 ) -> bool:
-    if not _capture_enabled(worker):
-        return False
-    device_type = str(worker.device).split(":")[0]
-    if device_type == "npu":
-        from vllm_gr.v1.worker.npu_model_runner_patch import capture_beam_decode_graph
+    with torch.inference_mode():
+        if not _capture_enabled(worker):
+            return False
+        device_type = str(worker.device).split(":")[0]
+        if device_type == "npu":
+            from vllm_gr.v1.worker.npu_model_runner_patch import (
+                capture_beam_decode_graph,
+            )
 
-        return capture_beam_decode_graph(worker)
-    if device_type != "cuda":
-        return False
-    # Measure (or load) the device-local prefix cost model before any Beam graph
-    # is captured: the cache write is a YAML file and the probe needs the GPU to
-    # itself. Failures degrade to "no calibration", never to a failed start-up.
-    from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
-        ensure_prefix_calibration,
-    )
-    from vllm_gr.v1.attention.backends.beam_prefix_policy import (
-        remember_worker_flash_attn_version,
-    )
-
-    # The request path may run without a vLLM config context, so persist the
-    # operator's explicit FlashAttention choice while it is still available.
-    remember_worker_flash_attn_version(worker)
-    ensure_prefix_calibration(worker)
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
-
-    if getattr(_get_gr_config(worker), "beam_graph_widths", None) is not None:
-        logger.warning(
-            "beam.graph_widths is NPU-only startup pre-capture; CUDA captures "
-            "dynamic Decode (batch, width) shapes lazily on first use."
+            captured: bool = capture_beam_decode_graph(worker)
+            return captured
+        if device_type != "cuda":
+            return False
+        if hooks_type is None:
+            raise ValueError("CUDA GR startup capture requires explicit stage hooks")
+        # Measure (or load) the device-local prefix cost model before any Beam graph
+        # is captured: the cache write is a YAML file and the probe needs the GPU to
+        # itself. Failures degrade to "no calibration", never to a failed start-up.
+        from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
+            ensure_prefix_calibration,
+        )
+        from vllm_gr.v1.attention.backends.beam_prefix_policy import (
+            remember_worker_flash_attn_version,
         )
 
-    existing = getattr(worker, "_gr_gpu_stage_runner", None)
-    if existing is not None:
-        if (
-            existing.graph is None
-            or not existing.graph.ready
-            or not existing.closed
-            or getattr(worker, "_gr_async_decode_graph_capture_failed", False)
-        ):
-            raise RuntimeError(
-                "Asynchronous scheduling startup encountered an incomplete capture state"
+        # The request path may run without a vLLM config context, so persist the
+        # operator's explicit FlashAttention choice while it is still available.
+        remember_worker_flash_attn_version(worker)
+        ensure_prefix_calibration(worker)
+        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+        if getattr(_get_gr_config(worker), "beam_graph_widths", None) is not None:
+            logger.warning(
+                "beam.graph_widths is NPU-only startup pre-capture; CUDA captures "
+                "dynamic Decode (batch, width) shapes lazily on first use."
             )
+
+        existing = getattr(worker, "_gr_gpu_stage_runner", None)
+        if existing is not None:
+            validate_stage_hooks_type(existing.hooks, hooks_type)
+            if (
+                existing.graph is None
+                or not existing.graph.ready
+                or not existing.closed
+                or getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+            ):
+                raise RuntimeError(
+                    "Asynchronous scheduling startup encountered an incomplete capture state"
+                )
+            return True
+        error = _capture_batch(
+            worker,
+            _startup_capture_batch_size(),
+            hooks_type=hooks_type,
+            allow_eager_fallback=allow_eager_fallback,
+        )
+        if error is not None:
+            worker._gr_async_decode_graph_capture_failed = True
+            worker._gr_async_decode_graph_capture_error = error
+            return False
         return True
-    error = _capture_batch(
-        worker,
-        _startup_capture_batch_size(),
-        hooks_type=hooks_type,
-        allow_eager_fallback=allow_eager_fallback,
-    )
-    if error is not None:
-        worker._gr_async_decode_graph_capture_failed = True
-        worker._gr_async_decode_graph_capture_error = error
-        return False
-    return True
 
 
 def _capture_enabled(worker: Any) -> bool:
@@ -148,12 +154,11 @@ def _capture_batch(
     worker: Any,
     batch_size: int,
     *,
-    hooks_type: type[_StageExecutionHooks] | None,
+    hooks_type: CudaStageHooksType,
     allow_eager_fallback: bool,
 ) -> str | None:
     """Capture the explicit batch selected by the V1 or V2 entry point."""
     from vllm_gr.v1.worker.gpu_beam_stage_runner import (
-        _StageExecutionHooks,
         get_stage_runner,
     )
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
@@ -187,9 +192,7 @@ def _capture_batch(
     )
     scheduled = SimpleNamespace(num_scheduled_tokens=dict.fromkeys(request_ids, 1))
     setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {name: m})
-    owner = get_stage_runner(
-        worker, scheduled, hooks_type=hooks_type or _StageExecutionHooks, for_startup_capture=True
-    )
+    owner = get_stage_runner(worker, scheduled, hooks_type=hooks_type, for_startup_capture=True)
     owner.previous = m
     # The null block is a safe capture prefix. Real requests replace its
     # contents and actual length while the device table address stays fixed.
@@ -214,6 +217,7 @@ def _capture_batch(
             # Keep the startup fallback graph at model capacity. Measured
             # length buckets are captured lazily against real request buffers.
             if getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0):
+                assert owner.inputs is not None
                 owner.metadata.prefix_length_bucket = 0
                 owner.metadata.prefix_max_seq_len = (
                     (owner.inputs.max_model_len + owner.inputs.block_size - 1)

@@ -21,12 +21,34 @@ Local files adapted from vLLM, with the upstream path at the revision above:
     vllm/benchmarks/lib/endpoint_request_func.py
   collect_env.py
     vllm/collect_env.py
+  tests/kernels/attention/test_beam_short_suffix.py
+    tests/kernels/test_compressor_kv_cache.py
   tools/pre_commit/check_spdx_header.py
     tools/pre_commit/check_spdx_header.py
+  tools/pre_commit/check_torch_cuda.py
+    tools/pre_commit/check_torch_cuda.py
+  tools/pre_commit/mypy.py
+    tools/pre_commit/mypy.py
+  vllm_gr/entrypoints/cli/main.py
+    vllm/entrypoints/cli/main.py
   vllm_gr/entrypoints/openai/protocol.py
     vllm/entrypoints/openai/chat_completion/protocol.py
   vllm_gr/v1/attention/backends/beam_attn.py
     vllm/v1/attention/backends/flash_attn.py
+  vllm_gr/v1/engine/core.py
+    vllm/v1/engine/core.py
+
+The following are adapted from earlier vLLM revisions, at the same upstream
+path, and are not present at the revision above:
+  tests/kernels/attention/test_cascade_beam_attn_gpu.py
+    tests/kernels/attention/test_cascade_flash_attn.py (0.14.1, d7de043d55d1dd629554467e23874097e1c48993)
+  tools/pre_commit/shellcheck.sh (0.22.1, 0decac0d96c42b49572498019f0a0e3600f50398)
+
+Local files copied from vLLM without changes, at the same upstream path:
+  tools/pre_commit/check_boolean_context_manager.py (revision above)
+  tools/pre_commit/png-lint.sh (revision above)
+  tools/pre_commit/enforce_regex_import.py (0.14.1, d7de043d55d1dd629554467e23874097e1c48993)
+  tools/pre_commit/validate_config.py (0.14.1, d7de043d55d1dd629554467e23874097e1c48993)
 
 OpenOneRec evaluation code and template
 --------------------------------------

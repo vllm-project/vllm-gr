@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Active-platform ModelRunner Beam patch dispatcher."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import wraps
 from importlib import import_module
 from types import ModuleType
@@ -12,6 +13,7 @@ from typing import Any, cast
 from vllm.logger import init_logger
 
 from vllm_gr.config import ConstraintTableBackendEnum
+from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooksType
 from vllm_gr.v1.worker.model_runner_common import (
     _CONSTRAINT_LOAD_PATCH_MARKER,
     _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
@@ -38,14 +40,14 @@ def close_constraint_backend(runner: object) -> None:
     backend = getattr(runner, "constraint_backend", None)
     # Detach first so no concurrent observer can discover a Backend while it is
     # being closed, and so repeated shutdown/load calls are naturally idempotent.
-    runner.constraint_backend = None
+    setattr(runner, "constraint_backend", None)
     projection = getattr(runner, "_gr_npu_stage_projection", None)
     if projection is not None:
         cast(Any, runner)._gr_npu_stage_projection = None
         projection.close()
     for processor in getattr(runner, "_gr_vocab_slice_processors", ()):
         processor._gr_vocab_slice = None
-    runner._gr_vocab_slice_processors = ()
+    setattr(runner, "_gr_vocab_slice_processors", ())
     if backend is not None:
         backend.close()
 
@@ -79,17 +81,23 @@ def _runner_vocab_size(runner: object) -> int:
         raise RuntimeError(
             f"constraint backend requires a positive model vocab_size, got {vocab_size!r}"
         )
-    return vocab_size
+    return cast(int, vocab_size)
 
 
-def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, close_runtime=None):
+def make_load_model_with_constraint_backend(
+    original: Any,
+    *,
+    max_batch: int = 1,
+    close_runtime: Any = None,
+    prepare_backend: Callable[[Any, Any], None] | None = None,
+) -> Any:
     """Load weights first, then atomically publish a ready canonical Backend."""
 
     if getattr(original, _CONSTRAINT_LOAD_PATCH_MARKER, False):
         return original
 
     @wraps(original)
-    def load_model_with_constraint_backend(self, *args, **kwargs):
+    def load_model_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
         from vllm_gr.config import BeamExecutionMode, GRConfig
 
         # A complete load replaces the model runtime. Release the previous
@@ -103,6 +111,9 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
         result = original(self, *args, **kwargs)
 
+        from vllm_gr.ops.lm_head_cache import install_lm_head_cache_reload_hooks
+
+        install_lm_head_cache_reload_hooks(self.model)
         backend = None
         try:
             gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
@@ -161,10 +172,6 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
             model_memory_usage = int(getattr(self, "model_memory_usage", 0))
             self.model_memory_usage = model_memory_usage + backend.info.device_memory_bytes
 
-            # Publication is the atomic boundary. The loader returns an NPU
-            # Backend only after readiness and returns an immediately usable CPU
-            # Backend, so requests never observe a partially initialized object.
-            self.constraint_backend = backend
             if getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.CUDA:
                 # Import GPU layers only after selecting the CUDA backend.
                 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -198,6 +205,12 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
                 if projection is not None:
                     self._gr_npu_stage_projection = projection
                     self.model_memory_usage += projection.device_memory_bytes
+            from vllm_gr.v1.worker.hot_update import versioned_constraint_table
+
+            # Publish only after readiness and runner-specific kernel warmup.
+            self.constraint_backend = versioned_constraint_table(
+                self, backend, prepare_backend=prepare_backend
+            )
             return result
         except BaseException:
             projection = getattr(self, "_gr_npu_stage_projection", None)
@@ -213,7 +226,9 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
     return load_model_with_constraint_backend
 
 
-def make_shutdown_with_constraint_backend(original=None, *, close_runtime=None):
+def make_shutdown_with_constraint_backend(
+    original: Any = None, *, close_runtime: Any = None
+) -> Any:
     """Release model callbacks and Backend before native runner shutdown."""
 
     if original is not None and getattr(original, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
@@ -221,7 +236,7 @@ def make_shutdown_with_constraint_backend(original=None, *, close_runtime=None):
 
     if original is None:
 
-        def shutdown_with_constraint_backend(self, *args, **kwargs):
+        def shutdown_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
             del args, kwargs
             _remove_model_bytecode_hooks(self)
             if close_runtime is not None:
@@ -231,7 +246,7 @@ def make_shutdown_with_constraint_backend(original=None, *, close_runtime=None):
     else:
 
         @wraps(original)
-        def shutdown_with_constraint_backend(self, *args, **kwargs):
+        def shutdown_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
             _remove_model_bytecode_hooks(self)
             if close_runtime is not None:
                 close_runtime(self)
@@ -278,14 +293,18 @@ def _get_active_platform_module() -> ModuleType:
 
 def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
     """Discover ModelRunner targets for only the active platform."""
-    return _get_active_platform_module().discover_worker_runners()
+    return cast(
+        tuple[tuple[str, type], ...], _get_active_platform_module().discover_worker_runners()
+    )
 
 
 def install_worker_utility_hooks(worker_cls: type) -> None:
     """Install named utility RPCs shared by CUDA and NPU Worker classes."""
     from vllm_gr.constraints.worker_inject import install_worker_resource_hook
+    from vllm_gr.v1.worker.hot_update import install_worker_hot_update_hooks
 
     install_worker_resource_hook(worker_cls)
+    install_worker_hot_update_hooks(worker_cls)
     if not getattr(worker_cls, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
         # Utility RPC dispatch resolves named Worker methods. Keep these
         # importable functions instead of relying on callable serialization.
@@ -346,6 +365,12 @@ def apply_worker_patches() -> None:
         return
 
     platform_module = _get_active_platform_module()
+    # Bind both execution and startup to the installed runner, not a dispatch-time flag.
+    cuda_hooks_type: CudaStageHooksType | None = None
+    if _active_platform_module_name() == _GPU_PATCH_MODULE:
+        from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+
+        cuda_hooks_type = CudaStageHooksV1
     constraint_max_batch = 1
     if _active_platform_module_name() == _NPU_PATCH_MODULE:
         from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
@@ -398,7 +423,9 @@ def apply_worker_patches() -> None:
         if platform_shutdown_patcher is not None:
             runner_class.shutdown = platform_shutdown_patcher(runner_class.shutdown)
 
-        runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
+        runner_class.execute_model = make_patched_execute_model(
+            runner_class.execute_model, hooks_type=cuda_hooks_type
+        )
         update_states_patch = getattr(platform_module, "make_patched_update_states", None)
         if update_states_patch is not None:
             runner_class._update_states = update_states_patch(runner_class._update_states)
@@ -439,16 +466,21 @@ def apply_worker_patches() -> None:
         ):
             _orig_capture_model = runner_class.capture_model
 
-            def make_patched_capture_model(_orig, _beam_capture, _prefill_capture):
+            def make_patched_capture_model(
+                _orig: Callable[..., Any],
+                _beam_capture: Callable[..., Any] | None,
+                _prefill_capture: Callable[..., Any] | None,
+                hooks_type: CudaStageHooksType | None,
+            ) -> Callable[..., Any]:
                 @wraps(_orig)
-                def patched_capture_model(self, *args, **kwargs):
+                def patched_capture_model(self: Any, *args: Any, **kwargs: Any) -> Any:
                     res = _orig(self, *args, **kwargs)
                     from vllm_gr.config import BeamExecutionMode
                     from vllm_gr.v1.worker.gr_startup import capture_async_forward
                     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
                     if _get_gr_config(self).beam_execution_mode is BeamExecutionMode.V1:
-                        capture_async_forward(self)
+                        capture_async_forward(self, hooks_type=hooks_type)
                     elif _beam_capture is not None:
                         try:
                             _beam_capture(self)
@@ -491,7 +523,9 @@ def apply_worker_patches() -> None:
 
                 return patched_capture_model
 
-            patched = make_patched_capture_model(_orig_capture_model, beam_capture, prefill_capture)
+            patched = make_patched_capture_model(
+                _orig_capture_model, beam_capture, prefill_capture, cuda_hooks_type
+            )
             setattr(patched, _WORKER_CAPTURE_PATCH_MARKER, True)
             runner_class.capture_model = patched
 

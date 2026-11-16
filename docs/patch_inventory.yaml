@@ -124,18 +124,22 @@ patches:
     removal_condition: stable upstream messages carry grouped Beam operations without Enum mutation
 
   - id: GR-PATCH-009
-    owner: vllm_gr/v1/engine/core.py and engine_core_patch.py
+    owner: vllm_gr/v1/engine/core.py, engine_core_patch.py, and hot_update.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
-    activation: the EngineCore patch plan detects request dispatch is incomplete
+    activation: the shared EngineCore plan, including the sanitized NPU child entrypoint, detects incomplete request dispatch or Trie-capacity initialization; the same installer mounts hot-update utilities independently of the optional management listener
     validator_or_test:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
       - tests/test_gr_async_scheduler.py
+      - tests/test_npu_multi_trie_routing.py
+      - tests/test_ascend_compat.py
+      - tests/contract/test_upstream_patch_contracts.py::test_core_hot_update_utility_contracts
+      - tests/sidecar/test_management.py
     process_roles: [engine_core]
-    target: vllm.v1.engine.core.EngineCoreProc
+    target: vllm.v1.engine.core.EngineCoreProc and EngineCore.service_status/pause/resume/reload_trie
     risk: critical
     contract: engine-core-signatures
-    removal_condition: vLLM exposes stable control-message and request-dispatch extension points
+    removal_condition: vLLM exposes stable control-message, request-dispatch, and named management utility extension points
 
   - id: GR-PATCH-010
     owner: vllm_gr/v1/engine/engine_core_patch.py and gr_async_scheduler.py
@@ -152,38 +156,49 @@ patches:
 
   - id: GR-PATCH-011
     owner: vllm_gr/v1/worker/gpu_model_runner_patch.py and gpu_model_runner_v2_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/gpu_prefill_requests_v2.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/gpu_prefill_requests_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/gpu_stage_hooks.py, vllm_gr/v1/worker/gpu_beam_stage_runner.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
-    activation: the selected CUDA ModelRunner V1 or V2 is discovered and its hooks are incomplete; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
+    activation: the selected CUDA ModelRunner V1 or V2 is discovered and its hooks are incomplete; the common installer mounts Worker utilities and model-load hooks regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_gpu_model_runner_patch.py
+      - tests/kernels/test_beam_batch_switch_reuse.py
       - tests/test_gpu_model_runner_v2_patch.py
       - tests/kernels/test_gr_prefill_v2.py
+      - tests/kernels/test_stage_topk_v2.py
       - tests/test_model_runner_patch.py
+      - tests/test_model_runner_patch.py::test_active_cuda_worker_hot_update_utility_contract
+      - tests/sidecar/test_worker_update.py
+      - tests/v1/worker/test_constraint_lifecycle.py
+      - tests/test_model_runner_stage_binding.py
+      - tests/test_gr_startup.py
+      - tests/tools/test_cuda_stage_typing.py
       - tests/st/test_modelrunner_v2_stage_parity_st.py
     process_roles: [gpu_worker]
-    target: vllm.v1.worker.gpu_model_runner.GPUModelRunner and vllm.v1.worker.gpu.model_runner.GPUModelRunner
+    target: vllm.v1.worker.gpu_model_runner.GPUModelRunner, vllm.v1.worker.gpu.model_runner.GPUModelRunner, and vllm.v1.worker.gpu_worker.Worker.reload_trie
     risk: critical
     contract: gpu-model-runner-signatures
-    removal_condition: stable upstream grouped input and output hooks replace private runner mutation
+    removal_condition: stable upstream grouped input/output, Worker utility, and constraint-backend lifecycle hooks replace private runner mutation
 
   - id: GR-PATCH-012
     owner: vllm_gr/v1/worker/npu_model_runner_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
-    activation: NPUModelRunner is discovered for the active platform and its hooks are incomplete
+    activation: NPUModelRunner is discovered for the active platform and its hooks are incomplete; the delayed NPUWorker.init_device wrapper mounts common Worker utilities before native initialization, independently of the management listener; online Trie reload remains rejected by Core on NPU
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_npu_model_runner_patch.py
       - tests/test_model_runner_patch.py
       - tests/test_npu_prefill_bsnd.py
       - tests/test_prefill_graph_runner.py
+      - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+      - tests/sidecar/test_management.py::test_trie_rejects_unsupported_execution_before_worker_rpc
+      - tests/sidecar/test_worker_update.py
     process_roles: [npu_worker]
-    target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
+    target: vllm_ascend.worker.model_runner_v1.NPUModelRunner and vllm_ascend.worker.worker.NPUWorker.reload_trie
     risk: critical
     contract: docs/npu_prefill_bsnd.md
-    removal_condition: vLLM-Ascend exposes stable grouped input and output hooks
+    removal_condition: vLLM-Ascend exposes stable grouped input/output, Worker utility, and constraint-backend lifecycle hooks
 
   - id: GR-PATCH-013
     owner: vllm_gr/v1/attention/backends/beam_attn.py
@@ -211,14 +226,16 @@ patches:
 
   - id: GR-PATCH-015
     owner: vllm_gr/ops/sliced_logits.py
+    shared_helpers: vllm_gr/ops/lm_head_cache.py
     installer: vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch
-    activation: hooks install at runtime initialization and execute only with a valid vocabulary slice
+    activation: projection hooks execute with a valid slice; cache reload hooks install after model load by ParallelLMHead type, independent of module names
     validator_or_test:
       - vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch return value
       - tests/test_sliced_logits.py
+      - tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload
       - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
     process_roles: [worker]
-    target: LogitsProcessor, Sampler.gather_logprobs, and V2 compute_topk_scores (defining module and sampler import bindings)
+    target: LogitsProcessor, Sampler.gather_logprobs, V2 compute_topk_scores, and quant_method.process_weights_after_loading for dense ParallelLMHead weights and tied owners
     risk: medium
     contract: sliced-vocabulary-projection
     removal_condition: vLLM exposes stable output-projection and logprob-width hooks
@@ -253,7 +270,7 @@ patches:
   - id: GR-PATCH-019
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer and patch_npu_worker_init_device
-    activation: NPU engine configuration and worker plugin initialization; entrypoint re-asserted on every create_engine_config call
+    activation: NPU engine configuration and worker plugin initialization; entrypoint re-asserted on every create_engine_config call and initializes the shared EngineCore plan before native construction
     validator_or_test:
       - vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer return value
       - tests/test_ascend_compat.py::test_ascend_config_filter_preserves_engine_identity_and_gr_config

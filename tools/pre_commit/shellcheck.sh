@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+# Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm
 set -e
 
 scversion="v0.11.0"

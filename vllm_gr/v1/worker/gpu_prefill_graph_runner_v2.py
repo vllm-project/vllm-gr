@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """GR Prefill policy over the native V2 capture and replay implementation.
 
 One instance owns the FULL/PW plan. PW is captured first at the same sizes as

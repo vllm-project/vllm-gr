@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Update ordinary CUSTOM attention inside the native Ascend FULL graph.
 
 Beam decode and the private prefill runner own different graphs and never use

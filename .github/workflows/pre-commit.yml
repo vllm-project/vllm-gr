@@ -289,175 +289,24 @@ jobs:
     # Resolve device overrides on the same runner class used by the gates.
     runs-on: self-hosted
     outputs:
-      policy-json: ${{ steps.normalize-policy.outputs.policy-json }}
-      policy-mode: ${{ steps.benchmark-policy.outputs.mode }}
-      policy-digest: ${{ steps.benchmark-policy.outputs.digest }}
+      policy-json: ${{ steps.benchmark-policy.outputs.policy-json }}
     steps:
+      # Resolve policy and execute tests from the same immutable workflow commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install policy parser dependency
-        working-directory: ${{ runner.temp }}
         run: python -I -m pip install 'PyYAML>=6.0'
 
-      - name: Fetch target branch benchmark policy runtime
+      - name: Resolve benchmark policy
         id: benchmark-policy
-        uses: actions/github-script@v7
         env:
-          POLICY_REF: >-
-            ${{ github.event.pull_request.base.sha || github.sha }}
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const crypto = require('crypto');
-            const {owner, repo} = context.repo;
-            const verifyFinal = process.env.POLICY_VERIFY_FINAL === 'true';
-            if (verifyFinal && !/^[0-9a-f]{64}$/i.test(process.env.EXPECTED_POLICY_DIGEST || '')) {
-              throw new Error('Final verification requires a valid expected policy digest.');
-            }
-            const ref = process.env.POLICY_REF || process.env.POLICY_BASE;
-            if (!/^[0-9a-f]{40}$/i.test(ref)) {
-              throw new Error('Policy base must be a full commit SHA.');
-            }
-            const fetchFile = async (repoPath, commit, optional = false, fileOwner = owner, fileRepo = repo) => {
-              try {
-                const {data} = await github.rest.repos.getContent({
-                  owner: fileOwner, repo: fileRepo, path: repoPath, ref: commit,
-                });
-                if (!data || Array.isArray(data) || data.type !== 'file' ||
-                    data.encoding !== 'base64' || typeof data.content !== 'string' ||
-                    !Number.isSafeInteger(data.size) || data.size < 0 || data.size > 1048576) {
-                  throw new Error(`${repoPath}@${commit} is not a readable bounded file`);
-                }
-                const encoded = data.content.replace(/\s/g, '');
-                if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
-                  throw new Error(`${repoPath}@${commit} has invalid base64 content`);
-                }
-                const bytes = Buffer.from(encoded, 'base64');
-                if (bytes.length !== data.size ||
-                    !Buffer.from(bytes.toString('utf8'), 'utf8').equals(bytes)) {
-                  throw new Error(`${repoPath}@${commit} has invalid content`);
-                }
-                return bytes.toString('utf8');
-              } catch (error) {
-                if (optional && error.status === 404) return null;
-                throw error;
-              }
-            };
-            const runtime = await fetchFile('tools/ci/benchmark_policy_runtime.js', ref, true);
-            let result;
-            if (runtime !== null) {
-              const dir = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'policy-runtime-'));
-              const runtimePath = path.join(dir, 'benchmark_policy_runtime.js');
-              fs.writeFileSync(runtimePath, runtime, {encoding: 'utf8', mode: 0o600});
-              const {preparePolicy} = require(runtimePath);
-              result = await preparePolicy({github, context, core, tempDir: process.env.RUNNER_TEMP});
-            } else {
-              // Bootstrap is explicitly inlined in this workflow; no executable
-              // candidate file is loaded. Protect changes to this workflow with
-              // required trusted checks and code-owner review.
-              const policyName = '.github/benchmark-gate.yaml';
-              const basePolicy = await fetchFile(policyName, ref);
-              const digest = text => crypto.createHash('sha256').update(text).digest('hex');
-              let policy = basePolicy;
-              let mode = 'base';
-              let sourceRef = ref;
-              if (context.payload.pull_request) {
-                const pr = context.payload.pull_request;
-                const shaPattern = /^[0-9a-f]{40}$/i;
-                if (!Number.isSafeInteger(pr.number) || pr.number <= 0 ||
-                    !pr.head || !pr.base || !shaPattern.test(pr.head.sha || '') ||
-                    !shaPattern.test(pr.base.sha || '') || !shaPattern.test(context.sha || '') ||
-                    pr.base.sha !== ref) {
-                  throw new Error('Missing pinned PR revision information.');
-                }
-                const currentPr = async () => {
-                  const {data: live} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
-                  if (!live || live.state !== 'open' || live.number !== pr.number ||
-                      !live.head || !live.base || !live.user || !live.user.login ||
-                      !live.head.repo || !live.head.repo.owner || !live.head.repo.owner.login ||
-                      !live.head.repo.name || live.head.sha !== pr.head.sha ||
-                      live.base.sha !== pr.base.sha || live.merge_commit_sha !== context.sha) {
-                    throw new Error('PR head, base or merge changed; rerun the workflow.');
-                  }
-                  return live;
-                };
-                const initial = await currentPr();
-                const mergePolicy = await fetchFile(policyName, context.sha);
-                if (mergePolicy !== basePolicy) {
-                  const candidate = await fetchFile(policyName, pr.head.sha);
-                  if (candidate !== mergePolicy) {
-                    throw new Error('Merged policy differs from the head policy; update the branch.');
-                  }
-                  if (!core.summary || typeof core.summary.addRaw !== 'function') {
-                    throw new Error('Cannot publish the required policy proposal summary.');
-                  }
-                  const escape = text => text.slice(0, 65536)
-                    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
-                      c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
-                    .replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;',
-                      '"': '&quot;', "'": '&#39;'})[c]) +
-                    (text.length > 65536 ? '\n[Preview truncated; inspect the full PR diff.]' : '');
-                  await core.summary.addRaw(
-                    `### Proposed benchmark policy change\n\nBase commit: \`${ref}\`  \n` +
-                    `Base policy SHA-256: \`${digest(basePolicy)}\`  \n` +
-                    `Candidate commit: \`${pr.head.sha}\`  \n` +
-                    `Candidate policy SHA-256: \`${digest(candidate)}\`\n\n` +
-                    `#### Base policy\n\n<pre><code>${escape(basePolicy)}</code></pre>\n\n` +
-                    `#### Candidate policy\n\n<pre><code>${escape(candidate)}</code></pre>\n\n` +
-                    'Review this exact candidate policy and its associated tests.\n'
-                  ).write();
-                  const live = await currentPr();
-                  if (live.user.login.toLowerCase() !== initial.user.login.toLowerCase()) {
-                    throw new Error('The PR author changed during verification.');
-                  }
-                  policy = candidate;
-                  mode = 'candidate';
-                  sourceRef = pr.head.sha;
-                } else {
-                  await currentPr();
-                }
-              }
-              const resolver = await fetchFile('tools/ci/resolve_benchmark_policy.py', ref);
-              const normalizer = await fetchFile('tools/ci/normalize_benchmark_policy_env.py', ref);
-              const dir = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'policy-bootstrap-'));
-              const code = path.join(dir, 'tools', 'ci');
-              fs.mkdirSync(code, {recursive: true});
-              fs.writeFileSync(path.join(dir, 'tools', '__init__.py'), '');
-              fs.writeFileSync(path.join(code, '__init__.py'), '');
-              const policyPath = path.join(dir, 'benchmark-gate.yaml');
-              const resolverPath = path.join(code, 'resolve_benchmark_policy.py');
-              const normalizerPath = path.join(code, 'normalize_benchmark_policy_env.py');
-              fs.writeFileSync(policyPath, policy);
-              fs.writeFileSync(resolverPath, resolver);
-              fs.writeFileSync(normalizerPath, normalizer);
-              const policySha256 = digest(policy);
-              core.info(`Benchmark policy mode=${mode} source=${sourceRef} base=${ref} sha256=${policySha256}`);
-              result = {policyPath, resolverPath, normalizerPath, sourceRef, policyMode: mode, policySha256};
-            }
-            if (result.policyMode === 'candidate' && !/^[0-9a-f]{64}$/i.test(result.policySha256 || '')) {
-              throw new Error('Candidate policy has an invalid digest.');
-            }
-            if (verifyFinal &&
-                (result.policyMode !== 'candidate' ||
-                 result.policySha256 !== process.env.EXPECTED_POLICY_DIGEST)) {
-              throw new Error('Candidate benchmark policy changed during testing.');
-            }
-            core.setOutput('policy-path', result.policyPath);
-            core.setOutput('resolver-path', result.resolverPath);
-            core.setOutput('normalizer-path', result.normalizerPath);
-            core.setOutput('ref', result.sourceRef);
-            core.setOutput('mode', result.policyMode);
-            core.setOutput('digest', result.policySha256 || '');
-
-      - name: Resolve base-owned benchmark policy
-        working-directory: ${{ runner.temp }}
-        env:
-          POLICY_FILE: ${{ steps.benchmark-policy.outputs.policy-path }}
-          POLICY_REF: ${{ steps.benchmark-policy.outputs.ref }}
-          POLICY_RESOLVER: ${{ steps.benchmark-policy.outputs.resolver-path }}
+          POLICY_REF: ${{ github.sha }}
           POLICY_TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name }}
         run: |
           device="gpu"
@@ -484,21 +333,11 @@ jobs:
             --device "$device"
             --board-id "$board_id"
             --source-ref "$POLICY_REF"
-            --github-env "$RUNNER_TEMP/resolved-benchmark-policy.env"
+            --github-output "$GITHUB_OUTPUT"
             --github-step-summary "$GITHUB_STEP_SUMMARY"
           )
-          args+=(--policy-file "$POLICY_FILE")
-          python -I "$POLICY_RESOLVER" "${args[@]}"
-
-      - name: Normalize v1/v2 policy outputs
-        id: normalize-policy
-        working-directory: ${{ runner.temp }}
-        env:
-          POLICY_NORMALIZER: ${{ steps.benchmark-policy.outputs.normalizer-path }}
-        run: >-
-          python -I "$POLICY_NORMALIZER"
-          --env-file "$RUNNER_TEMP/resolved-benchmark-policy.env"
-          --github-output "$GITHUB_OUTPUT"
+          args+=(--policy-file .github/benchmark-gate.yaml)
+          python -I tools/ci/resolve_benchmark_policy.py "${args[@]}"
 
   pre-commit:
     name: Pre-commit
@@ -517,6 +356,8 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -648,6 +489,8 @@ jobs:
       P99_TPOT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_THRESHOLD }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -860,6 +703,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           # A/B checks that the event base is an ancestor of the merge's first
           # parent. The base can advance after the event, so retain its history.
           fetch-depth: 0
@@ -1020,6 +864,8 @@ jobs:
       PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -1135,6 +981,8 @@ jobs:
       PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -1278,158 +1126,6 @@ jobs:
         github.event.action == 'labeled'))
     runs-on: ubuntu-latest
     steps:
-      - name: Revalidate candidate benchmark policy
-        if: needs.benchmark-policy.result == 'success' && needs.benchmark-policy.outputs.policy-mode == 'candidate'
-        uses: actions/github-script@v7
-        env:
-          POLICY_VERIFY_FINAL: 'true'
-          EXPECTED_POLICY_DIGEST: ${{ needs.benchmark-policy.outputs.policy-digest }}
-          POLICY_BASE: ${{ github.event.pull_request.base.sha }}
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const crypto = require('crypto');
-            const {owner, repo} = context.repo;
-            const verifyFinal = process.env.POLICY_VERIFY_FINAL === 'true';
-            if (verifyFinal && !/^[0-9a-f]{64}$/i.test(process.env.EXPECTED_POLICY_DIGEST || '')) {
-              throw new Error('Final verification requires a valid expected policy digest.');
-            }
-            const ref = process.env.POLICY_REF || process.env.POLICY_BASE;
-            if (!/^[0-9a-f]{40}$/i.test(ref)) {
-              throw new Error('Policy base must be a full commit SHA.');
-            }
-            const fetchFile = async (repoPath, commit, optional = false, fileOwner = owner, fileRepo = repo) => {
-              try {
-                const {data} = await github.rest.repos.getContent({
-                  owner: fileOwner, repo: fileRepo, path: repoPath, ref: commit,
-                });
-                if (!data || Array.isArray(data) || data.type !== 'file' ||
-                    data.encoding !== 'base64' || typeof data.content !== 'string' ||
-                    !Number.isSafeInteger(data.size) || data.size < 0 || data.size > 1048576) {
-                  throw new Error(`${repoPath}@${commit} is not a readable bounded file`);
-                }
-                const encoded = data.content.replace(/\s/g, '');
-                if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
-                  throw new Error(`${repoPath}@${commit} has invalid base64 content`);
-                }
-                const bytes = Buffer.from(encoded, 'base64');
-                if (bytes.length !== data.size ||
-                    !Buffer.from(bytes.toString('utf8'), 'utf8').equals(bytes)) {
-                  throw new Error(`${repoPath}@${commit} has invalid content`);
-                }
-                return bytes.toString('utf8');
-              } catch (error) {
-                if (optional && error.status === 404) return null;
-                throw error;
-              }
-            };
-            const runtime = await fetchFile('tools/ci/benchmark_policy_runtime.js', ref, true);
-            let result;
-            if (runtime !== null) {
-              const dir = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'policy-runtime-'));
-              const runtimePath = path.join(dir, 'benchmark_policy_runtime.js');
-              fs.writeFileSync(runtimePath, runtime, {encoding: 'utf8', mode: 0o600});
-              const {preparePolicy} = require(runtimePath);
-              result = await preparePolicy({github, context, core, tempDir: process.env.RUNNER_TEMP});
-            } else {
-              // Bootstrap is explicitly inlined in this workflow; no executable
-              // candidate file is loaded. Protect changes to this workflow with
-              // required trusted checks and code-owner review.
-              const policyName = '.github/benchmark-gate.yaml';
-              const basePolicy = await fetchFile(policyName, ref);
-              const digest = text => crypto.createHash('sha256').update(text).digest('hex');
-              let policy = basePolicy;
-              let mode = 'base';
-              let sourceRef = ref;
-              if (context.payload.pull_request) {
-                const pr = context.payload.pull_request;
-                const shaPattern = /^[0-9a-f]{40}$/i;
-                if (!Number.isSafeInteger(pr.number) || pr.number <= 0 ||
-                    !pr.head || !pr.base || !shaPattern.test(pr.head.sha || '') ||
-                    !shaPattern.test(pr.base.sha || '') || !shaPattern.test(context.sha || '') ||
-                    pr.base.sha !== ref) {
-                  throw new Error('Missing pinned PR revision information.');
-                }
-                const currentPr = async () => {
-                  const {data: live} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
-                  if (!live || live.state !== 'open' || live.number !== pr.number ||
-                      !live.head || !live.base || !live.user || !live.user.login ||
-                      !live.head.repo || !live.head.repo.owner || !live.head.repo.owner.login ||
-                      !live.head.repo.name || live.head.sha !== pr.head.sha ||
-                      live.base.sha !== pr.base.sha || live.merge_commit_sha !== context.sha) {
-                    throw new Error('PR head, base or merge changed; rerun the workflow.');
-                  }
-                  return live;
-                };
-                const initial = await currentPr();
-                const mergePolicy = await fetchFile(policyName, context.sha);
-                if (mergePolicy !== basePolicy) {
-                  const candidate = await fetchFile(policyName, pr.head.sha);
-                  if (candidate !== mergePolicy) {
-                    throw new Error('Merged policy differs from the head policy; update the branch.');
-                  }
-                  if (!core.summary || typeof core.summary.addRaw !== 'function') {
-                    throw new Error('Cannot publish the required policy proposal summary.');
-                  }
-                  const escape = text => text.slice(0, 65536)
-                    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
-                      c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
-                    .replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;',
-                      '"': '&quot;', "'": '&#39;'})[c]) +
-                    (text.length > 65536 ? '\n[Preview truncated; inspect the full PR diff.]' : '');
-                  await core.summary.addRaw(
-                    `### Proposed benchmark policy change\n\nBase commit: \`${ref}\`  \n` +
-                    `Base policy SHA-256: \`${digest(basePolicy)}\`  \n` +
-                    `Candidate commit: \`${pr.head.sha}\`  \n` +
-                    `Candidate policy SHA-256: \`${digest(candidate)}\`\n\n` +
-                    `#### Base policy\n\n<pre><code>${escape(basePolicy)}</code></pre>\n\n` +
-                    `#### Candidate policy\n\n<pre><code>${escape(candidate)}</code></pre>\n\n` +
-                    'Review this exact candidate policy and its associated tests.\n'
-                  ).write();
-                  const live = await currentPr();
-                  if (live.user.login.toLowerCase() !== initial.user.login.toLowerCase()) {
-                    throw new Error('The PR author changed during verification.');
-                  }
-                  policy = candidate;
-                  mode = 'candidate';
-                  sourceRef = pr.head.sha;
-                } else {
-                  await currentPr();
-                }
-              }
-              const resolver = await fetchFile('tools/ci/resolve_benchmark_policy.py', ref);
-              const normalizer = await fetchFile('tools/ci/normalize_benchmark_policy_env.py', ref);
-              const dir = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'policy-bootstrap-'));
-              const code = path.join(dir, 'tools', 'ci');
-              fs.mkdirSync(code, {recursive: true});
-              fs.writeFileSync(path.join(dir, 'tools', '__init__.py'), '');
-              fs.writeFileSync(path.join(code, '__init__.py'), '');
-              const policyPath = path.join(dir, 'benchmark-gate.yaml');
-              const resolverPath = path.join(code, 'resolve_benchmark_policy.py');
-              const normalizerPath = path.join(code, 'normalize_benchmark_policy_env.py');
-              fs.writeFileSync(policyPath, policy);
-              fs.writeFileSync(resolverPath, resolver);
-              fs.writeFileSync(normalizerPath, normalizer);
-              const policySha256 = digest(policy);
-              core.info(`Benchmark policy mode=${mode} source=${sourceRef} base=${ref} sha256=${policySha256}`);
-              result = {policyPath, resolverPath, normalizerPath, sourceRef, policyMode: mode, policySha256};
-            }
-            if (result.policyMode === 'candidate' && !/^[0-9a-f]{64}$/i.test(result.policySha256 || '')) {
-              throw new Error('Candidate policy has an invalid digest.');
-            }
-            if (verifyFinal &&
-                (result.policyMode !== 'candidate' ||
-                 result.policySha256 !== process.env.EXPECTED_POLICY_DIGEST)) {
-              throw new Error('Candidate benchmark policy changed during testing.');
-            }
-            core.setOutput('policy-path', result.policyPath);
-            core.setOutput('resolver-path', result.resolverPath);
-            core.setOutput('normalizer-path', result.normalizerPath);
-            core.setOutput('ref', result.sourceRef);
-            core.setOutput('mode', result.policyMode);
-            core.setOutput('digest', result.policySha256 || '');
-
       - name: Revalidate documentation classification
         if: needs.docs-scope.outputs.docs-only == 'true'
         uses: actions/github-script@v7
@@ -1524,6 +1220,42 @@ jobs:
             fi
             exit 0
           fi
+          # A skipped required check still fails the gate: an unrun check is not
+          # a pass. Report the jobs that actually failed first and mark the rest
+          # as blocked by them, so one root-cause failure does not read as six
+          # separate validation failures.
+          failed_jobs=()
+          skipped_jobs=()
+          for result_name in \
+            POLICY_RESULT \
+            PRE_COMMIT_RESULT \
+            DECODE_RESULT \
+            PANGU_OFFLINE_RESULT \
+            PANGU_ONLINE_RESULT; do
+            result="${!result_name}"
+            echo "$result_name=$result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              failed_jobs+=("$result_name:$result")
+            elif [[ "$result" != "success" ]]; then
+              skipped_jobs+=("$result_name:$result")
+            fi
+          done
+          if (( ${#failed_jobs[@]} > 0 )); then
+            printf '::error::%s failed and blocked the gate: %s\n' \
+              "${failed_jobs[0]%%:*}" "${failed_jobs[*]}"
+          fi
+          if (( ${#skipped_jobs[@]} > 0 )); then
+            if (( ${#failed_jobs[@]} > 0 )); then
+              printf '::error::Not evaluated because %s failed: %s\n' \
+                "${failed_jobs[0]%%:*}" "${skipped_jobs[*]}"
+            else
+              printf '::error::Required validations did not run: %s. Skipped validation is not a pass.\n' \
+                "${skipped_jobs[*]}"
+            fi
+          fi
+          if (( ${#failed_jobs[@]} > 0 || ${#skipped_jobs[@]} > 0 )); then
+            exit 1
+          fi
           if [[ "$ABTEST_REQUIRED" == true ]]; then
             if [[ "$ABTEST_FRESH" == true && "$ABTEST_PASSED" != true ]]; then
               echo "::error::The current revision's A/B report failed. Re-add abtest to rerun it."
@@ -1534,21 +1266,7 @@ jobs:
               exit 1
             fi
           fi
-          failed=0
-          for result_name in \
-            POLICY_RESULT \
-            PRE_COMMIT_RESULT \
-            DECODE_RESULT \
-            PANGU_OFFLINE_RESULT \
-            PANGU_ONLINE_RESULT; do
-            result="${!result_name}"
-            echo "$result_name=$result"
-            if [[ "$result" != "success" ]]; then
-              echo "::error::$result_name did not pass. Skipped validation is not a pass."
-              failed=1
-            fi
-          done
-          exit "$failed"
+          exit 0
 
       - name: Reject cancelled workflow
         if: cancelled()

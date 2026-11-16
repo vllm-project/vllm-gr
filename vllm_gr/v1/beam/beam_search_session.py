@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """BeamSearchSession — per-request facade for incremental beam decode.
 
 Manages the full lifecycle of a beam search request.  References a shared

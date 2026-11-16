@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+# Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm
 # mypy: disallow-untyped-decorators=False
 """Dense references and exact FA2 comparisons for short-suffix attention."""
 

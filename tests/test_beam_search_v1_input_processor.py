@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 from __future__ import annotations
 
@@ -374,12 +374,19 @@ def test_offline_compact_output_preserves_accepted_prompt_snapshot(
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
-@pytest.mark.parametrize("independent_k", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "device,independent_k", [("cuda", False), ("cuda", True), ("npu", False)]
+)
 @pytest.mark.parametrize(  # type: ignore[misc]
     "trie_ids", [None, [0, 1], [1, 1], (1, 0), [True, 0], [-1, 0], [None, 1], [0]]
 )
-def test_per_prompt_trie_selection(trie_ids: Any, online: bool, independent_k: bool) -> None:
-    engine = _make_engine()
+def test_per_prompt_trie_selection(
+    trie_ids: Any, online: bool, independent_k: bool, device: str
+) -> None:
+    canonical = _canonical_gr_config(backend=device)
+    canonical["constraint_table"]["format"] = "constraint_table_v2"
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device=device)
     params = BeamSearchParams(
         beam_width=2,
         max_tokens=3,
@@ -892,21 +899,60 @@ def test_npu_unconstrained_request_needs_no_constraint_artifact(
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
-def test_npu_unconstrained_request_rejects_unsupported_generation_length(online: bool) -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "steps,accepted", [(4, True), (5, True), (6, True), (7, False)]
+)
+def test_npu_unconstrained_request_enforces_supported_generation_length(
+    online: bool, steps: int, accepted: bool
+) -> None:
     canonical = _canonical_gr_config(enabled=False, backend="npu")
     canonical["constrained_generation"] = False
-    canonical["beam"]["max_decode_steps"] = 4
+    canonical["beam"]["max_decode_steps"] = 6
     engine = _make_engine(additional_config={"vllm_gr": canonical})
     engine.vllm_config.device_config = SimpleNamespace(device="npu")
+    engine.vllm_config.model_config.get_num_kv_heads = lambda parallel: 8
+    engine.vllm_config.model_config.get_head_size = lambda: 128
+    process_inputs = Mock(wraps=engine.input_processor.process_inputs)
+    engine.input_processor.process_inputs = process_inputs
 
-    with pytest.raises(BeamSearchRequestError, match="NPU.*3|NPU.*three"):
-        _prepare_request(
+    def prepare() -> BeamBatchRequest:
+        return _prepare_request(
             engine,
             [1, 2],
-            BeamSearchParams(beam_width=2, max_tokens=4, ignore_eos=True),
+            BeamSearchParams(beam_width=2, max_tokens=steps, ignore_eos=True),
             online=online,
         )
 
+    if accepted:
+        assert prepare().beam_params.max_tokens == steps
+    else:
+        with pytest.raises(
+            BeamSearchRequestError, match=r"^Decode steps 7 exceed runtime limit 6$"
+        ):
+            prepare()
+        process_inputs.assert_not_called()
+
+    engine.submit_gr_session.assert_not_called()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+def test_npu_extended_capacity_rejects_unsafe_kv_geometry_before_submission(online: bool) -> None:
+    canonical = _canonical_gr_config(enabled=False, backend="npu")
+    canonical["constrained_generation"] = False
+    canonical["beam"]["max_decode_steps"] = 6
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device="npu")
+    engine.vllm_config.model_config.get_num_kv_heads = lambda parallel: 64
+    engine.vllm_config.model_config.get_head_size = lambda: 128
+
+    with pytest.raises(BeamSearchRequestError, match="SelectUnsharedKV 95 KiB buffer"):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+            online=online,
+        )
     engine.submit_gr_session.assert_not_called()
 
 

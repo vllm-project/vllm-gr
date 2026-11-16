@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Default kernel tests to the GPU tier.
 
 Markers are descriptive, so a CPU runner selects them away with ``-m``
@@ -7,6 +7,7 @@ rather than relying on an implicit skip. A test that declares any tier itself
 (the NPU suites, or host-side reference cases marked ``cpu_test``) keeps it.
 """
 
+import gc
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -29,7 +30,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def isolate_cuda_graph_pool(request: pytest.FixtureRequest) -> Iterator[None]:
-    """Keep independently scoped GPU tests from reusing a retired graph pool."""
+    """Isolate GPU tests from retired pools and deferred graph destruction."""
     if request.node.get_closest_marker("gpu_test") is None:
         yield
         return
@@ -38,6 +39,10 @@ def isolate_cuda_graph_pool(request: pytest.FixtureRequest) -> Iterator[None]:
     if current_platform.device_type != "cuda":
         yield
         return
+    # An automatic cyclic GC inside capture can destroy a previous graph and
+    # invalidate the active capture. Collection can resume between tests.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
     # vLLM caches the handle at class scope. A previous test may destroy its
     # last graph while an output allocation remains alive; reusing that pool
     # in a later test then trips PyTorch's allocator assertion.
@@ -48,3 +53,7 @@ def isolate_cuda_graph_pool(request: pytest.FixtureRequest) -> Iterator[None]:
     finally:
         # Do not restore a previous handle: its last graph may be gone.
         platform_type._global_graph_pool = None
+        if gc_was_enabled:
+            gc.enable()
+        else:
+            gc.disable()

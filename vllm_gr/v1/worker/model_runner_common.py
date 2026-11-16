@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Device-neutral ModelRunner helpers for grouped Beam execution."""
 
 from __future__ import annotations
@@ -7,14 +7,16 @@ from __future__ import annotations
 import gc
 import threading
 import time
+from collections.abc import Callable
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
+from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooksType
 
 logger = init_logger(__name__)
 
@@ -99,7 +101,7 @@ def _write_position_segments(
     starts = np.asarray(seg_starts, dtype=np.int64)
     # Output offset where each segment begins (prefix sum minus own length).
     seg_off = np.cumsum(lens) - lens
-    gidx = np.arange(total, dtype=np.int64)
+    gidx: np.ndarray[Any, np.dtype[np.int64]] = np.arange(total, dtype=np.int64)
     # positions[start:end] = st + arange(len) for each segment, vectorized:
     # repeat the per-segment start/offset by the segment length and add the
     # within-segment index (gidx - seg_off_rep).
@@ -281,35 +283,35 @@ def _remux_logprobs_tensors(
     )
 
 
-class BeamReqIdsProxy(list):
-    def __init__(self, original_list, req_id_map):
+class BeamReqIdsProxy(list[Any]):
+    def __init__(self, original_list: Any, req_id_map: Any) -> None:
         super().__init__(original_list)
         self.req_id_map = req_id_map
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: Any) -> Any:
         try:
             return self.req_id_map[index]
         except IndexError as e:
             logger.error("Out of bounds in BeamReqIdsProxy for index %s", index)
             raise e
 
-    def copy(self):
+    def copy(self) -> Any:
         return list(self.req_id_map)
 
 
 class Mock1DArray:
-    def __init__(self, original, batch_idx_map):
+    def __init__(self, original: Any, batch_idx_map: Any) -> None:
         self.original = original
         self.batch_idx_map = batch_idx_map
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: Any) -> Any:
         try:
             return self.original[self.batch_idx_map[idx]]
         except IndexError as e:
             logger.error("Out of bounds in Mock1DArray getitem for index %s", idx)
             raise e
 
-    def __setitem__(self, idx, value):
+    def __setitem__(self, idx: Any, value: Any) -> None:
         try:
             self.original[self.batch_idx_map[idx]] = value
         except IndexError as e:
@@ -318,11 +320,11 @@ class Mock1DArray:
 
 
 class Mock2DArray:
-    def __init__(self, original, batch_idx_map):
+    def __init__(self, original: Any, batch_idx_map: Any) -> None:
         self.original = original
         self.batch_idx_map = batch_idx_map
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: Any, value: Any) -> None:
         idx, slc = key
         try:
             self.original[self.batch_idx_map[idx], slc] = value
@@ -330,10 +332,10 @@ class Mock2DArray:
             logger.error("Out of bounds in Mock2DArray setitem for key %s", key)
             raise e
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: Any) -> Any:
         return getattr(self.original, name)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: Any) -> Any:
         idx, slc = key
         try:
             return self.original[self.batch_idx_map[idx], slc]
@@ -358,7 +360,7 @@ _SAMPLING_META_ATTRS = (
 )
 
 
-def _first_device_of(s_meta) -> Any:
+def _first_device_of(s_meta: Any) -> Any:
     """Return the device of the first tensor sampling attribute, or None."""
     for attr in _SAMPLING_META_ATTRS:
         val = getattr(s_meta, attr, None)
@@ -370,14 +372,14 @@ def _first_device_of(s_meta) -> Any:
 class InputBatchProxy:
     def __init__(
         self,
-        obj,
-        req_map,
-        idx_map,
-        logits_map,
-        shared_idx_cache=None,
-        shared_sampling_cache=None,
-        req_ids_key=None,
-    ):
+        obj: Any,
+        req_map: Any,
+        idx_map: Any,
+        logits_map: Any,
+        shared_idx_cache: Any = None,
+        shared_sampling_cache: Any = None,
+        req_ids_key: Any = None,
+    ) -> None:
         object.__setattr__(self, "_obj", obj)
         object.__setattr__(self, "_req_id_map", req_map)
         object.__setattr__(self, "_batch_idx_map", idx_map)
@@ -420,7 +422,7 @@ class InputBatchProxy:
         # (device, tensor) cache for the shared logits-row index tensor.
         object.__setattr__(self, "_logits_idx_tensor_cache", None)
 
-    def _logits_idx_tensor(self, device):
+    def _logits_idx_tensor(self, device: Any) -> Any:
         cache = object.__getattribute__(self, "_logits_idx_tensor_cache")
         if cache is not None and cache[0] == device:
             return cache[1]
@@ -444,7 +446,7 @@ class InputBatchProxy:
         object.__setattr__(self, "_logits_idx_tensor_cache", (device, idx))
         return idx
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: Any) -> Any:
         obj = object.__getattribute__(self, "_obj")
         idx_map = object.__getattribute__(self, "_batch_idx_map")
         logits_map = object.__getattribute__(self, "_logit_idx_map")
@@ -548,7 +550,7 @@ class InputBatchProxy:
             )
         return getattr(obj, name)
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: Any, value: Any) -> None:
         if name == "sampling_metadata":
             # The underlying metadata object is being replaced; drop the
             # remapped cache so the next read reindexes fresh tensors.
@@ -556,7 +558,7 @@ class InputBatchProxy:
         setattr(object.__getattribute__(self, "_obj"), name, value)
 
 
-def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[int]:
+def _beam_remap_inputs(runner: Any, scheduler_output: Any, num_scheduled_tokens: Any) -> list[int]:
     """Expand a packed beam-decode batch into per-beam rows.
 
     Device-neutral. Overwrites per-beam RoPE position ids (Job B), builds the
@@ -605,6 +607,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
     except (TypeError, ValueError):
         layout_key = None
         all_incremental = False
+    new_logits_indices: list[int]
     if layout_key is not None and all_incremental:
         cached_layout = layout_cache.get(layout_key)
         if cached_layout is not None:
@@ -648,7 +651,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
             _ = runner.input_batch.sampling_metadata
             return new_logits_indices
 
-    new_logits_indices: list[int] = []
+    new_logits_indices = []
     token_offset = 0
     row_to_req_id, row_to_batch_idx, logits_to_batch_idx, request_row_configs = ([], [], [], [])
     input_row_idx = 0
@@ -815,7 +818,11 @@ def _is_contiguous_range(indices: list[int]) -> bool:
 
 
 def _beam_collapse_bookkeeping(
-    runner, orig_input_batch, request_row_configs, beam_data, sampler_output
+    runner: Any,
+    orig_input_batch: Any,
+    request_row_configs: Any,
+    beam_data: Any,
+    sampler_output: Any,
 ) -> tuple[list[Any], dict[Any, int], int]:
     """Collapse per-beam sampler output back onto logical (session) requests.
 
@@ -1005,11 +1012,13 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
     scores = decision.get("out_log_probs")
     if not torch.is_tensor(token_ids) or not torch.is_tensor(scores):
         return False
+    token_ids = cast(torch.Tensor, token_ids)
+    scores = cast(torch.Tensor, scores)
     if token_ids.ndim != 2 or scores.shape != token_ids.shape or token_ids.shape[0] < 1:
         return False
 
     ranks = getattr(lp_tensors, "selected_token_ranks", None)
-    rank_dtype = ranks.dtype if torch.is_tensor(ranks) else torch.int64
+    rank_dtype = cast(torch.Tensor, ranks).dtype if torch.is_tensor(ranks) else torch.int64
     workspace = getattr(runner, "_beam_postprocess_workspaces", None)
     selected_ids = token_ids
     selected_scores = scores
@@ -1028,14 +1037,14 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
         and torch.is_tensor(host_ids)
         and torch.is_tensor(host_scores)
         and torch.is_tensor(host_ranks)
-        and host_ids.device.type == "cpu"
-        and host_scores.device.type == "cpu"
-        and host_ranks.device.type == "cpu"
+        and cast(torch.Tensor, host_ids).device.type == "cpu"
+        and cast(torch.Tensor, host_scores).device.type == "cpu"
+        and cast(torch.Tensor, host_ranks).device.type == "cpu"
     )
     if host_ready:
         selected_ids = host_ids
         selected_scores = host_scores
-        selected_sampled = host_ids[:, :1]
+        selected_sampled = cast(torch.Tensor, host_ids)[:, :1]
         selected_ranks = host_ranks
     elif bool(getattr(runner, "use_async_scheduling", False)):
         # AsyncGPUModelRunnerOutput starts its D2H copies only after this
@@ -1123,7 +1132,7 @@ def _attach_beam_search_result(runner: Any, model_output: Any) -> None:
     target.beam_search_result = decision
 
 
-def _get_gr_config(runner) -> Any:
+def _get_gr_config(runner: Any) -> Any:
     """Return the worker's GRConfig, cached on the runner (frozen dataclass).
 
     Configuration flows exclusively through the engine config chain
@@ -1149,9 +1158,9 @@ def _beam_full_graph_ready(runner: Any, num_tokens: int) -> bool:
     return beam_keys is not None and num_tokens in beam_keys
 
 
-def _beam_graph_enabled_for_run(runner) -> bool:
+def _beam_graph_enabled_for_run(runner: Any) -> bool:
     """Beam graphs are only used when the config enables them (GRConfig)."""
-    return _get_gr_config(runner).beam_graph_enabled
+    return cast(bool, _get_gr_config(runner).beam_graph_enabled)
 
 
 def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
@@ -1192,6 +1201,7 @@ def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
     manager = getattr(runner, "cudagraph_manager", None)
     counts = getattr(manager, "dispatch_counts", None)
     if counts is not None:
+        assert manager is not None
         stats["prefill_graph_captured_buckets"] = sorted(
             {desc.num_tokens for desc in manager._successful if desc.cg_mode.name == "FULL"}
         )
@@ -1503,7 +1513,7 @@ def freeze_gc_after_warmup(worker: Any) -> dict[str, Any]:
         return {"frozen": False, "error": str(e)}
 
 
-def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
+def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
     """Create a BeamAttentionContext with sizing derived from model + GRConfig.
 
     Shared by the dummy-capture paths (GPU/NPU ``capture_beam_decode_graph``)
@@ -1552,7 +1562,7 @@ def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     )
 
 
-def _dispatch_retirement_frame(self, scheduler_output):
+def _dispatch_retirement_frame(self: Any, scheduler_output: Any) -> Any:
     """Handle a GR retirement control frame; returns the retire output.
 
     Returns None when ``scheduler_output`` is not a retirement frame (the
@@ -1568,8 +1578,13 @@ def _dispatch_retirement_frame(self, scheduler_output):
 
 
 def _dispatch_stage_frame(
-    self, scheduler_output, orig_execute_model, *args, hooks_type=None, **kwargs
-):
+    self: Any,
+    scheduler_output: Any,
+    orig_execute_model: Callable[..., Any],
+    *args: Any,
+    hooks_type: CudaStageHooksType | None = None,
+    **kwargs: Any,
+) -> Any:
     """Handle a persistent GR stage frame (beam_search_v1 execution).
 
     Returns ``_NOT_A_STAGE_FRAME`` when ``scheduler_output`` is not a stage
@@ -1594,7 +1609,9 @@ def _dispatch_stage_frame(
 _NOT_A_STAGE_FRAME = object()
 
 
-def make_patched_execute_model_v2(_orig_execute_model):
+def make_patched_execute_model_v2(
+    _orig_execute_model: Callable[..., Any],
+) -> Callable[..., Any]:
     """Slim execute_model wrapper for the V2 ModelRunner (beam_search_v1 only).
 
     Refactor design §4.2: under V2 the beam surface is the persistent GR
@@ -1613,10 +1630,12 @@ def make_patched_execute_model_v2(_orig_execute_model):
     if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
         return _orig_execute_model
 
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
     @wraps(_orig_execute_model)
-    def _patched_execute_model_step_v2(self, scheduler_output, *args, **kwargs):
+    def _patched_execute_model_step_v2(
+        self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
+    ) -> Any:
         retirement = _dispatch_retirement_frame(self, scheduler_output)
         if retirement is not None:
             return retirement
@@ -1626,7 +1645,7 @@ def make_patched_execute_model_v2(_orig_execute_model):
             scheduler_output,
             _orig_execute_model,
             *args,
-            hooks_type=V2StageExecutionHooks,
+            hooks_type=CudaStageHooksV2,
             **kwargs,
         )
         if stage is not _NOT_A_STAGE_FRAME:
@@ -1641,7 +1660,9 @@ def make_patched_execute_model_v2(_orig_execute_model):
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)
 
     @wraps(_orig_execute_model)
-    def patched_execute_model_v2(self, scheduler_output, *args, **kwargs):
+    def patched_execute_model_v2(
+        self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
+    ) -> Any:
         # Same quiescent-boundary tracking as the V1 wrapper: the GC-freeze
         # daemon waits for in-flight executions to drain before collecting.
         _enter_worker_execute()
@@ -1654,7 +1675,11 @@ def make_patched_execute_model_v2(_orig_execute_model):
     return patched_execute_model_v2
 
 
-def make_patched_execute_model(_orig_execute_model):
+def make_patched_execute_model(
+    _orig_execute_model: Callable[..., Any],
+    *,
+    hooks_type: CudaStageHooksType | None = None,
+) -> Callable[..., Any]:
     """Wrap execute_model to publish beam-request context for the run.
 
     Shared by GPU and NPU runners.
@@ -1663,7 +1688,9 @@ def make_patched_execute_model(_orig_execute_model):
         return _orig_execute_model
 
     @wraps(_orig_execute_model)
-    def _patched_execute_model_step(self, scheduler_output, *args, **kwargs):
+    def _patched_execute_model_step(
+        self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
+    ) -> Any:
         from vllm_gr.config import BeamExecutionMode
         from vllm_gr.config.execution import require_beam_execution_mode
         from vllm_gr.v1.engine.gr_async_scheduler import (
@@ -1681,7 +1708,9 @@ def make_patched_execute_model(_orig_execute_model):
         if retirement is not None:
             return retirement
 
-        stage = _dispatch_stage_frame(self, scheduler_output, _orig_execute_model, *args, **kwargs)
+        stage = _dispatch_stage_frame(
+            self, scheduler_output, _orig_execute_model, *args, hooks_type=hooks_type, **kwargs
+        )
         if stage is not _NOT_A_STAGE_FRAME:
             return stage
         if getattr(scheduler_output, "beam_data", {}):
@@ -1731,7 +1760,7 @@ def make_patched_execute_model(_orig_execute_model):
             BEAM_DATA_VAR.reset(token)
 
     @wraps(_orig_execute_model)
-    def patched_execute_model(self, scheduler_output, *args, **kwargs):
+    def patched_execute_model(self: Any, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
         # Track in-flight model execution so the automatic post-warmup GC
         # freeze finds a quiescent boundary: the teardown signal (and hence
         # the freeze scheduling) happens at the START of this wrapper, and
@@ -1748,7 +1777,7 @@ def make_patched_execute_model(_orig_execute_model):
     return patched_execute_model
 
 
-def is_worker_runner_v2_patched(runner_class) -> bool:
+def is_worker_runner_v2_patched(runner_class: Any) -> bool:
     """Return whether all grouped-beam hooks are present on a V2 runner class.
 
     The V2 runner (``vllm.v1.worker.gpu.model_runner.GPUModelRunner``) exposes
@@ -1770,7 +1799,7 @@ def is_worker_runner_v2_patched(runner_class) -> bool:
     )
 
 
-def is_worker_runner_patched(runner_class) -> bool:
+def is_worker_runner_patched(runner_class: Any) -> bool:
     """Return whether all grouped-beam hooks are present on a runner class.
 
     Dispatches between the V1 and V2 method surfaces: the V2 runner has a

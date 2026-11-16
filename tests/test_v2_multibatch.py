@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """GR/native row boundary and independent multi-B capture policy."""
 
 from types import SimpleNamespace
@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_gr.v1.worker.gpu_beam_stage_runner import _StageExecutionHooks
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
 
 def test_prefill_restores_member_order_without_reordering_native_state(
@@ -41,7 +41,7 @@ def test_prefill_restores_member_order_without_reordering_native_state(
     )
     scheduled = SimpleNamespace(gr_stage_metadata={"a": SimpleNamespace(request_ids=logical)})
     state = worker.execute_model_state
-    result = V2StageExecutionHooks(worker).prefill_logits(lambda *args: None, scheduled)
+    result = CudaStageHooksV2(worker).prefill_logits(lambda *args: None, scheduled)
     expected = {"a": 9, "b": 2, "c": 5, "d": 0}
     assert result[:, 0].tolist() == [expected[r] for r in logical]
     assert batch.req_ids == list(native)
@@ -50,7 +50,7 @@ def test_prefill_restores_member_order_without_reordering_native_state(
     worker.execute_model_state = state
     scheduled.gr_stage_metadata["a"].request_ids = ("a", "a", "c", "d")
     with pytest.raises(ValueError, match="one logit row"):
-        V2StageExecutionHooks(worker).prefill_logits(lambda *args: None, scheduled)
+        CudaStageHooksV2(worker).prefill_logits(lambda *args: None, scheduled)
 
 
 def test_capture_attention_bounds_are_local_to_v2_pure_prefill() -> None:
@@ -88,7 +88,7 @@ def test_retirement_preserves_runner_policy_and_scheduler_output(v2: bool) -> No
     scheduled = SchedulerOutput.make_empty()
     scheduled.gr_retire_metadata = GRRetireMetadata("a", 0, 1)
     scheduled.finished_req_ids = {"a", "unrelated"}
-    hooks = (V2StageExecutionHooks if v2 else _StageExecutionHooks)(SimpleNamespace())
+    hooks = (CudaStageHooksV2 if v2 else CudaStageHooksV1)(SimpleNamespace())
     hooks.prefill_stage_fence = Mock()
     hooks.consume_native_state = Mock()
     owner = SimpleNamespace(
@@ -112,7 +112,7 @@ def test_retirement_preserves_runner_policy_and_scheduler_output(v2: bool) -> No
 def test_stage_replacement_and_capacity_are_runner_specific(v2: bool) -> None:
     graph = Mock()
     worker = SimpleNamespace(_beam_decode_graph=graph)
-    hooks = (V2StageExecutionHooks if v2 else _StageExecutionHooks)(worker)
+    hooks = (CudaStageHooksV2 if v2 else CudaStageHooksV1)(worker)
     hooks.prepare_new_adapter(SimpleNamespace(batch_size=2, beam_width=4))
     if v2:
         # Every V2 adapter shares the Worker storage, so captures survive.
@@ -121,6 +121,7 @@ def test_stage_replacement_and_capacity_are_runner_specific(v2: bool) -> None:
         # A new V1 stage replaces the input storage: drop every length bucket.
         graph.discard_geometry.assert_called_once_with(2, 4)
     assert hooks.required_constraint_rows(2, 4) == (8 if v2 else 4)
+    assert hooks.specialize_constraint_steps is v2
 
 
 pytestmark = pytest.mark.cpu_test

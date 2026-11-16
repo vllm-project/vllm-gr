@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Parity tests: xllm fused decode vs the cascade incremental path on NPU.
 
 Drives the real ``BeamAttentionMetadataBuilder`` with a live

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Scoped GR bindings for the upstream vLLM gRPC server lifecycle."""
 
 import asyncio
+import os
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 
@@ -47,11 +48,32 @@ def patch_grpc_server():
 
         def register(servicer, server):
             stop = server.stop
+            admin = None
+            port = os.environ.get("VLLM_GR_ADMIN_PORT")
+            if port is not None:
+                from vllm_gr.entrypoints.management import AdminServer
+
+                admin = AdminServer(
+                    servicer.engine, int(port), os.environ.get("VLLM_GR_ADMIN_HOST", "127.0.0.1")
+                )
+                start = server.start
+
+                async def start_with_control():
+                    try:
+                        await admin.start()
+                        await start()
+                    except BaseException:
+                        await admin.stop()
+                        raise
+
+                replace(server, "start", start_with_control)
 
             async def stop_and_drain(grace):
                 try:
                     return await stop(grace)
                 finally:
+                    if admin is not None:
+                        await admin.stop()
                     # Request cancellation may leave retrying cleanup tasks.
                     # Finish them before upstream calls AsyncLLM.shutdown().
                     while _ASYNC_CLEANUP_TASKS:

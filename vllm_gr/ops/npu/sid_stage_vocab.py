@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Tokenizer-derived SID stage vocabularies, independent of catalog tables.
 
 Each stage permits every tokenizer SID token of its corresponding family.

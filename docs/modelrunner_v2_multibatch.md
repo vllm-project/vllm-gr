@@ -59,6 +59,21 @@ installs a fresh GR plan and allocates output storage for the new model.
 Decode replay also checks the captured model, context and input storage before
 launching.
 
+V2 constrained selection branches on the current device SID stage. Each branch
+calls the shared CUDA Top-K kernel with that stage's complete maximum candidate
+degree. Full-window score normalization and exact score/tie ordering remain
+shared. This avoids processing first-stage padding in later stages without
+predicting progress on the Host. V1 retains table-wide capacity for
+device-driven selection. The `CudaStageHooks` contract requires an explicit
+`specialize_constraint_steps` policy: `False` for V1 and `True` for V2.
+
+V2 warms the stage-specialized kernel before publishing the initial constraint
+backend or a replacement Trie. Warmup covers every supported power-of-two K
+capacity for the model and configured output-head dtypes, including the table's
+current stage degrees and Trie count. A capacity change therefore compiles
+during table loading rather than the first request. Failed warmup releases the
+candidate backend before it can become active.
+
 ### V1 compatibility boundary
 
 ModelRunner V1 retains the behavior of the rebased parent `7ee1d95`: the GR
@@ -68,12 +83,54 @@ buffers when a new batch needs a graph. Its Backend row bound, retirement and
 shutdown semantics remain unchanged. Upstream V1/NPU fixes in that parent,
 including B=2 Prefill capture, are retained.
 
-The default stage hooks implement that V1 policy. `V2StageExecutionHooks`
-selects fixed storage, startup-only graph replay, batched Backend admission
-and full-member retirement. The V2 installer alone supplies the extended
-Backend capacity and runtime cleanup callback. Shared graph construction has
-an optional graph class; V2 uses a subclass for storage/model validation.
+Set `beam.adapter_cache_enabled: true` in the canonical service configuration
+to opt into cross-batch adapter caching. It defaults to false, preserving the
+previous latest-adapter reuse and lazy capture policy. Disabling this cache
+does not disable Decode CUDA Graphs or same-batch adapter reuse. The legacy
+configuration key is `vllm_gr_beam_adapter_cache_enabled`.
+
+When this option and Decode graphs are enabled, the shared runner retains one drained
+adapter per logical batch size while the context, workspace and search geometry
+remain compatible. Returning to an already-warmed B reuses that adapter's fixed
+input/attention addresses and its Decode graphs instead of clearing and
+recapturing them. Each session still rebinds its own inputs and selectors.
+Incompatible resources or geometry invalidate the bounded cache; V2 runtime
+cleanup removes it before model replacement or shutdown.
+The switch is read from service configuration, not from individual requests;
+it does not add startup pre-capture or change schedule-miss behavior.
+
+`CudaStageHooksV1` and `CudaStageHooksV2` subclass the `CudaStageHooks` abstract
+base class in `gpu_stage_hooks.py`. The ABC rejects missing operations and policy
+flags at construction. The class-side `CudaStageHooksType` Protocol additionally
+checks constructor compatibility at binding sites; mypy checks operation signatures
+and policy types. Hooks are constructed before session admission or graph-cache
+invalidation, so construction failure leaves those resources available for retry.
+The installed CUDA entrypoints explicitly bind
+hooks for both execution and startup capture; the shared stage core has no V1
+default. A Worker cannot switch its concrete hooks type after releasing a stage
+owner, including during repeated startup: `validate_stage_hooks_type` compares
+the bound class with the requested class. NPU dispatch retains its separate
+adapter and does not import either CUDA implementation.
+
+V1 retains stage-owned storage and lazy graph capture. V2 selects fixed Worker
+storage, configured startup graph capture, batched Backend admission and
+full-member retirement; its existing dynamic-shape recapture and recoverable
+failure handling remain in the V2 implementation. The V2 installer alone supplies
+the extended Backend capacity, kernel preparation and runtime cleanup callbacks.
+Shared graph construction has an optional graph class; V2 uses a subclass for
+storage/model validation.
 There is no new environment switch or duplicated Beam state machine.
+
+The contracts document eleven operations and three policy flags,
+including Prefill row ordering/counter updates, the V1 Host-input fence, input
+storage lifetime and capture recovery. They do not move remaining native field
+cleanup out of the core or unify graph policies. The dedicated mypy group checks
+the ABC, class-side Protocol, both implementations, core and binding sites together;
+see [CUDA stage hooks contract](PRE_COMMIT.md#cuda-stage-hooks-contract).
+
+Both runners retain upstream's opt-in vocabulary-sliced LM head. Decode hooks
+may return `None` after staging hidden states for sliced sampling; those states
+must remain valid when a later graph replay overwrites its output buffer.
 
 ## Configuration and scope
 
@@ -155,6 +212,7 @@ state and actual CUDA replay check request order and storage reuse.
 | Logical member order, retirement and Backend capacity policy | `tests/test_v2_multibatch.py` |
 | Native row/slot reuse and unchanged request state | `tests/kernels/test_gpu_beam_stage_v2_state.py` |
 | Batched registration and fused input parity, cached offsets, token-block boundaries, padding and atomic fallback | `tests/kernels/test_gr_prefill_v2.py` |
+| SID-stage capacity, exact outputs and changing device step under replay | `tests/kernels/test_stage_topk_v2.py` |
 | B-switch replay, fixed storage, configured B=3/7 and 6/8, per-shape fallback | `tests/kernels/test_v2_multibatch_graphs.py` |
 | Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
 | Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |

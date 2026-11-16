@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Low-overhead, aggregate-only CPU timing for vLLM EngineCore workers.
 
 This is deliberately not a profiler.  Each wrapped call reads two monotonic

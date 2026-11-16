@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Device-independent execution geometry for a fixed Beam batch session.
 
 This module deliberately contains no tensor, KV-cache, attention, or graph
