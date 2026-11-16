@@ -49,15 +49,20 @@ def _is_npu_spawn_wrapper(function: object) -> bool:
 def apply_npu_spawn_patch() -> bool:
     """Wrap upstream `_maybe_force_spawn` to also force spawn for NPU.
 
-    Returns True if the wrapper was installed by this call. Idempotent: a
-    already-wrapped target (including after a module reload) is left alone.
+    Returns True if a wrapper or executor binding was installed by this call.
+    An already-wrapped target is reused and its executor binding is verified.
     """
     import vllm.utils.system_utils as system_utils
     import vllm.v1.executor.multiproc_executor as multiproc_executor
 
     current = getattr(system_utils, "_maybe_force_spawn", None)
-    if current is None or _is_npu_spawn_wrapper(current):
+    if current is None:
         return False
+    if _is_npu_spawn_wrapper(current):
+        if multiproc_executor._maybe_force_spawn is current:
+            return False
+        multiproc_executor._maybe_force_spawn = current
+        return True
 
     def _maybe_force_spawn_with_npu() -> None:
         current()

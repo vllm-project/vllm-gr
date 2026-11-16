@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from .protocol import BeamAttentionExecution, ModelRunnerPatchHooks
 
@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class CUDABackendProvider:
     device_type: str = "cuda"
+    # Semantic ownership includes hooks still installed by shared dispatch.
+    patch_ids: ClassVar[tuple[str, ...]] = ("GR-PATCH-011",)
 
     def check_environment(self) -> dict[str, str]:
         from vllm.platforms import current_platform

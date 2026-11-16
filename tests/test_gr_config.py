@@ -516,7 +516,7 @@ def test_engine_config_rejects_invalid_raw_gr_value_without_cli_override() -> No
 
 
 def test_attention_selector_config_reader_propagates_validation_errors() -> None:
-    from vllm_gr.v1.ascend_compat import _get_current_gr_attention_backend
+    from vllm_gr.v1.attention.selector_patch import _get_current_gr_attention_backend
 
     with (
         mock.patch(

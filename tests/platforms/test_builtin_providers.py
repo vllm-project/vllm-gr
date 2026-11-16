@@ -90,26 +90,26 @@ def test_cuda_runtime_patch_is_noop() -> None:
 def test_npu_runtime_patches_preserve_order_and_sum_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import v1
+    from vllm_gr import npu_spawn_patch, v1
 
     events: list[tuple[str, bool | None]] = []
 
-    def apply_attention(*, force: bool = False) -> int:
-        events.append(("attention", force))
-        return 2
+    def apply_spawn() -> bool:
+        events.append(("spawn", None))
+        return True
 
     def patch_worker() -> int:
         events.append(("worker", None))
         return 3
 
     ascend_compat = SimpleNamespace(
-        apply_ascend_attention_backend_patch=apply_attention,
         patch_npu_worker_init_device=patch_worker,
     )
     monkeypatch.setattr(v1, "ascend_compat", ascend_compat, raising=False)
+    monkeypatch.setattr(npu_spawn_patch, "apply_npu_spawn_patch", apply_spawn)
 
-    assert npu.NPU_BACKEND.apply_runtime_patches(force=True) == 5
-    assert events == [("attention", True), ("worker", None)]
+    assert npu.NPU_BACKEND.apply_runtime_patches(force=True) == 4
+    assert events == [("spawn", None), ("worker", None)]
 
 
 def test_cuda_environment_check_validates_platform_and_versions(

@@ -22,7 +22,8 @@ def initialize_runtime() -> dict[str, object]:
 
     Safe to call repeatedly. The underlying patch helper is idempotent, so
     this can be used both by the vLLM plugin loader and by explicit engine
-    startup paths in the main process.
+    startup paths in the main process. Environment validation activates the
+    process-local provider before runtime patches can import its backend.
     """
     from vllm_gr._env_check import check_environment, configure_model_runner_default
 
