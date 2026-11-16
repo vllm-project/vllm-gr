@@ -318,6 +318,7 @@ def canonical_gr_config(args: argparse.Namespace, artifact: ConstraintArtifact) 
         "beam": {
             "execution_mode": "v1",
             "graph_enabled": not args.disable_beam_graph,
+            "enable_kv_pool_ping_pong": args.kv_pool_ping_pong,
             "max_width": args.beam_width,
             "max_decode_steps": args.beam_steps,
         },
@@ -687,6 +688,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "async_scheduling": True,
             "constraint_backend": "canonical_cuda_constraint_table",
             "beam_graph_enabled": not args.disable_beam_graph,
+            "enable_kv_pool_ping_pong": args.kv_pool_ping_pong,
             "max_model_len": max_model_len,
             "max_num_batched_tokens": max_num_batched_tokens,
             "max_num_seqs": 1,
@@ -747,6 +749,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--disable-beam-graph", action="store_true")
+    parser.add_argument(
+        "--kv-pool-ping-pong",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Gather KV directly into the next Decode bank; disable for write-back A/B.",
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument(

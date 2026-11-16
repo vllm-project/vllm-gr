@@ -31,6 +31,34 @@ The result JSON includes per-run wall latency, request latency, QPS, generated
 tokens/s, Beam candidates/s, output token IDs/scores, runtime versions, and
 the exact vllm-gr commit.
 
+## KV pool ping-pong comparison
+
+Fixed-width CUDA Beam Decode defaults to two persistent KV banks. After
+selection, one all-layer gather writes surviving histories directly into the
+bank read by the next Decode. The write-back scatter is omitted. Both banks
+retain fixed addresses; KV writes and suffix attention select the bank using
+the existing device Decode step, including during CUDA graph replay.
+
+Set `KV_POOL_PING_PONG=0` in the shell entry point, or pass
+`--no-kv-pool-ping-pong` to the Python entry point, to restore gather plus
+scatter. The canonical service field is `beam.enable_kv_pool_ping_pong`.
+The selected value is recorded in `engine_config` in the result JSON.
+
+Compare fresh engines with the same model, workload JSONL, constraint tokens,
+artifact digest, dtype, runner, graph mode, warmups and measured repetitions.
+Use distinct `OUT_DIR` values to retain both result files. Enable a separate
+timeline in each arm to verify `_select_kv_ping_pong_kernel` replaces
+`_select_kv_gather_kernel` and `_select_kv_scatter_kernel`; profiled runs remain
+excluded from latency samples. Compare ordered output tokens and scores as
+well as latency. Kernel-count reductions alone do not establish request
+latency improvements.
+
+The optimization applies to fixed-width CUDA execution. Dynamic-width Beam
+uses its existing stage-bank reorder, and NPU execution retains its operator
+ABI. For B=1, the standby bank replaces the existing reorder scratch without
+increasing KV storage. Multi-request execution retains a full standby bank
+per slot so the next request cannot overwrite another request's history.
+
 ## Timeline
 
 Enable a gzip-compressed PyTorch CPU/CUDA timeline that can be opened directly

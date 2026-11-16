@@ -260,6 +260,12 @@ def validate_enable_short_suffix_attention(value: object) -> bool:
     return value
 
 
+def validate_enable_kv_pool_ping_pong(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError("beam.enable_kv_pool_ping_pong must be a boolean")
+    return value
+
+
 def validate_beam_sid_stage_vocab(value: object) -> bool:
     if not isinstance(value, bool):
         raise TypeError("beam.sid_stage_vocab must be a boolean")

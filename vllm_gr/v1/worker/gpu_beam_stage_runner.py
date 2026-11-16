@@ -741,6 +741,7 @@ class GPUBeamStageRunner:
             session=GPUBeamAttentionBatch(
                 self.beam.sessions,
                 width=BeamBatchExecutionView.from_stage_metadata(m).input_width,
+                kv_pool_ping_pong=self.dynamic is None,
             ),
             mask=self.execution_mask,
             slots=self.slots,

@@ -115,6 +115,14 @@ class BeamSearchSession:
                 pool_key_ptrs=pool_key_ptrs,
                 pool_value_ptrs=pool_value_ptrs,
                 layout_prevalidated=layout_prevalidated,
+                **(
+                    {
+                        "standby_key_ptrs": self.context.standby_key_ptrs,
+                        "standby_value_ptrs": self.context.standby_value_ptrs,
+                    }
+                    if getattr(self.context, "enable_kv_pool_ping_pong", False)
+                    else {}
+                ),
             )
         state.decode_step += 1
 

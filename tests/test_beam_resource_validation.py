@@ -198,4 +198,42 @@ def test_dispatch_mode_change_revalidates_safely() -> None:
     assert _validate(context, workspace) == key
 
 
+def _ping_pong_resources() -> Any:
+    context, workspace = _resources()
+    context.enable_kv_pool_ping_pong = True
+    shape = (len(context.pools), *context.pools[0].unshared_key.shape)
+    context.standby_key_buf = torch.empty(shape, dtype=torch.float16)
+    context.standby_value_buf = torch.empty_like(context.standby_key_buf)
+    context.standby_key_ptrs = torch.zeros(len(context.pools), dtype=torch.int64)
+    context.standby_value_ptrs = torch.zeros_like(context.standby_key_ptrs)
+    for layer, pool in enumerate(context.pools):
+        pool.standby_key = context.standby_key_buf[layer]
+        pool.standby_value = context.standby_value_buf[layer]
+    return context, workspace
+
+
+@pytest.mark.l1
+def test_ping_pong_key_tracks_standby_view_replacement() -> None:
+    context, workspace = _ping_pong_resources()
+    key = _validate(context, workspace)
+    context.pools[0].standby_key = context.pools[0].standby_key.clone()
+    assert _validate(context, workspace) != key
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("malformed", ["missing", "overlap"])
+def test_ping_pong_rejects_invalid_standby_storage(malformed: str) -> None:
+    context, workspace = _ping_pong_resources()
+    _validate(context, workspace)
+    if malformed == "missing":
+        context.pools[0].standby_key = None
+    else:
+        # Cross K/V aliasing is unsafe even when the key bank does not alias
+        # its corresponding source key. All source/destination banks must be
+        # disjoint before a duplicate-parent gather can run safely.
+        context.pools[0].standby_key = context.pools[0].unshared_value
+    with pytest.raises(ValueError, match="ping-pong"):
+        _validate(context, workspace)
+
+
 pytestmark = pytest.mark.cpu_test

@@ -68,6 +68,24 @@ Recall gate.
 
 ## Local validation
 
+For a local KV pool comparison, the Recall driver accepts
+`--kv-pool-ping-pong` (default) or `--no-kv-pool-ping-pong`. The selected value
+is stored in task metrics and in diagnostic GR configuration. Keep the same
+model files, source Parquet hashes, sample IDs, constraint artifact, tokenizer,
+batch size, graph profile and temperature on both sides.
+
+The performance driver `benchmarks.beam_search.v1_performance_gate` accepts
+the same switch during `prepare`, which writes the engine configuration used
+by `offline`. Pass `--record-outputs` to `offline` to retain measured candidate
+token IDs and scores. Recording happens after the timed consumption and
+validation section and retains ordinary Python values, preserving output
+release before the next call. The result records the effective GR configuration.
+
+Local comparisons with a checkpoint verified by file hashes do not establish
+the pinned Hugging Face revision required by the CI performance gate. Keep
+local A/B results separate from calibrated CI acceptance; the existing model
+identity, sample, graph and metric checks remain unchanged.
+
 ```bash
 python -m pytest -q tests/test_v1_recall_summary.py
 SKIP=run-tests pre-commit run --all-files

@@ -1559,6 +1559,7 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
         enable_short_suffix_attention=(
             runner.device.type == "cuda" and gr_cfg.enable_short_suffix_attention
         ),
+        enable_kv_pool_ping_pong=(runner.device.type == "cuda" and gr_cfg.enable_kv_pool_ping_pong),
     )
 
 

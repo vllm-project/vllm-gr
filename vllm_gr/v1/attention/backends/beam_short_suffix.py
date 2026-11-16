@@ -37,6 +37,8 @@ def _short_suffix_merge_kernel(
     MASKED: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    StandbyK=None,
+    StandbyV=None,
 ):
     row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     beam, head = row // HEADS, row % HEADS
@@ -71,6 +73,9 @@ def _short_suffix_merge_kernel(
     accumulator = tl.where(has_prefix[:, None], prefix, 0.0)
 
     step = tl.load(Step)
+    if StandbyK is not None:
+        K = tl.where((step & 1) != 0, StandbyK, K)
+        V = tl.where((step & 1) != 0, StandbyV, V)
     live = valid & (step >= 0)
     if MASKED:
         live = live & tl.load(Active + beam, valid, other=False)
@@ -129,6 +134,9 @@ def merge_short_suffix_attention(
     decode_step: torch.Tensor,
     scale: float,
     active_mask: torch.Tensor | None = None,
+    *,
+    standby_key: torch.Tensor | None = None,
+    standby_value: torch.Tensor | None = None,
 ) -> None:
     """Merge one query/beam with the valid pool suffix and a prefix attention state.
 
@@ -149,6 +157,16 @@ def merge_short_suffix_attention(
     assert steps >= 1
     assert pool_key.shape == pool_value.shape and pool_key.stride() == pool_value.stride()
     assert heads % pool_key.shape[2] == 0
+    assert (standby_key is None) == (standby_value is None)
+    if standby_key is not None:
+        assert standby_value is not None
+        assert standby_key.shape == pool_key.shape and standby_key.stride() == pool_key.stride()
+        assert (
+            standby_value.shape == pool_value.shape
+            and standby_value.stride() == pool_value.stride()
+        )
+        assert standby_key.dtype == pool_key.dtype and standby_key.device == pool_key.device
+        assert standby_value.dtype == pool_value.dtype and standby_value.device == pool_value.device
 
     if (
         query.is_cuda
@@ -174,6 +192,11 @@ def merge_short_suffix_attention(
             decode_step,
             scale,
             active_mask,
+            **(
+                {"standby_key": standby_key, "standby_value": standby_value}
+                if standby_key is not None
+                else {}
+            ),
         )
         return
 
@@ -201,5 +224,7 @@ def merge_short_suffix_attention(
         active_mask is not None,
         4,
         triton.next_power_of_2(dim),
+        StandbyK=standby_key,
+        StandbyV=standby_value,
         num_warps=4,
     )

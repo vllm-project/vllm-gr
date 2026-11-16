@@ -38,6 +38,7 @@ from vllm_gr.config.validation import (
     validate_constraint_table_format,
     validate_constraint_table_max_top_k,
     validate_constraint_table_path,
+    validate_enable_kv_pool_ping_pong,
     validate_enable_short_suffix_attention,
     validate_npu_decode_execution,
     validate_prefill_flash_attn_version,
@@ -56,6 +57,7 @@ VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
 VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
 PREFILL_FA_VERSION_KEY: Final = "vllm_gr_prefill_flash_attn_version"
 SHORT_SUFFIX_ATTENTION_KEY: Final = "vllm_gr_enable_short_suffix_attention"
+KV_POOL_PING_PONG_KEY: Final = "vllm_gr_enable_kv_pool_ping_pong"
 BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
 BEAM_ADAPTER_CACHE_ENABLED_KEY: Final = "vllm_gr_beam_adapter_cache_enabled"
 BEAM_GRAPH_BATCH_SIZE_KEY: Final = "vllm_gr_beam_graph_batch_size"
@@ -80,6 +82,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         BEAM_GRAPH_ENABLED_KEY,
         BEAM_ADAPTER_CACHE_ENABLED_KEY,
         SHORT_SUFFIX_ATTENTION_KEY,
+        KV_POOL_PING_PONG_KEY,
         PREFILL_FA_VERSION_KEY,
         BEAM_GRAPH_BATCH_SIZE_KEY,
         BEAM_GRAPH_WIDTHS_KEY,
@@ -102,6 +105,7 @@ _BEAM_KEYS: Final = frozenset(
         "graph_enabled",
         "adapter_cache_enabled",
         "enable_short_suffix_attention",
+        "enable_kv_pool_ping_pong",
         "prefill_flash_attn_version",
         "graph_batch_size",
         "graph_widths",
@@ -221,6 +225,9 @@ def gr_config_from_mapping(
         enable_short_suffix_attention=validate_enable_short_suffix_attention(
             beam_raw.get("enable_short_suffix_attention", True)
         ),
+        enable_kv_pool_ping_pong=validate_enable_kv_pool_ping_pong(
+            beam_raw.get("enable_kv_pool_ping_pong", True)
+        ),
         beam_graph_batch_size=validate_beam_graph_batch_size(beam_raw.get("graph_batch_size", 1)),
         beam_graph_widths=validate_beam_graph_widths(beam_raw.get("graph_widths")),
         beam_online_batch_sizes=validate_beam_online_batch_sizes(
@@ -283,6 +290,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         beam["adapter_cache_enabled"] = True
     if not config.enable_short_suffix_attention:
         beam["enable_short_suffix_attention"] = False
+    if not config.enable_kv_pool_ping_pong:
+        beam["enable_kv_pool_ping_pong"] = False
     if config.beam_graph_batch_size != 1:
         beam["graph_batch_size"] = config.beam_graph_batch_size
     if config.beam_graph_widths is not None:
@@ -404,6 +413,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         enable_short_suffix_attention=validate_enable_short_suffix_attention(
             additional_config.get(SHORT_SUFFIX_ATTENTION_KEY, True)
         ),
+        enable_kv_pool_ping_pong=validate_enable_kv_pool_ping_pong(
+            additional_config.get(KV_POOL_PING_PONG_KEY, True)
+        ),
         beam_graph_enabled=validate_beam_graph_enabled(
             additional_config.get(BEAM_GRAPH_ENABLED_KEY, True)
         ),
@@ -498,6 +510,11 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(SHORT_SUFFIX_ATTENTION_KEY, None)
     else:
         additional_config[SHORT_SUFFIX_ATTENTION_KEY] = False
+
+    if gr_config.enable_kv_pool_ping_pong:
+        additional_config.pop(KV_POOL_PING_PONG_KEY, None)
+    else:
+        additional_config[KV_POOL_PING_PONG_KEY] = False
 
     if constrained_generation is None:
         additional_config.pop(CONSTRAINED_GENERATION_KEY, None)

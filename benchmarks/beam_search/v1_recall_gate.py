@@ -207,6 +207,12 @@ def parse_args():
     parser.add_argument(
         "--validate-only", action="store_true", help="Load/tokenize data without an engine"
     )
+    parser.add_argument(
+        "--kv-pool-ping-pong",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Gather into the next KV bank; disable for the optimization baseline.",
+    )
     args = parser.parse_args()
     if args.task_types is not None and len(set(args.task_types)) != len(args.task_types):
         parser.error("--task-types must not contain duplicates")
@@ -400,6 +406,7 @@ def main():
             "beam": {
                 "execution_mode": "v1",
                 "graph_enabled": True,
+                "enable_kv_pool_ping_pong": args.kv_pool_ping_pong,
                 "worker_decision": True,
                 "max_width": args.n,
                 "max_decode_steps": 3,
@@ -485,6 +492,7 @@ def main():
                     model_revision=args.model_revision,
                     task=task,
                     beam_width=args.n,
+                    enable_kv_pool_ping_pong=args.kv_pool_ping_pong,
                     temperature=args.temperature,
                     batch_size=args.batch_size,
                     sample_ids=item["source_ids"],
