@@ -96,7 +96,11 @@ class GRLLM(LLM):
             beam_graph_enabled: Optional Beam graph capability override. When
                 set, it is forwarded through ``additional_config``.
             beam_max_width: Optional positive engine Beam capacity. It is
-                validated before engine construction and is limited to 256.
+                validated before engine construction and is limited to 1024.
+                Candidate width is independent; when unset it follows Beam
+                width, so widths above 256 require an explicit
+                ``constraint_table.candidate_width`` no greater than 256.
+                Backend/platform limits may be stricter.
             beam_max_decode_steps: Optional positive effective Decode-step
                 capacity. ``None`` keeps the engine default.
             vllm_gr_config: Canonical GR configuration, supplied through
