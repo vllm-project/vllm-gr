@@ -74,7 +74,7 @@ this limits reachability but does not add authentication.
 Install `pip install -e '.[grpc]'`, then use existing GR settings:
 
 ```bash
-vllm-gr serve /path/to/model --vllm-gr-config /path/to/gr-config.json --grpc --host 127.0.0.1 --port 50051
+vllm serve /path/to/model --gr --vllm-gr-config /path/to/gr-config.json --grpc --host 127.0.0.1 --port 50051
 python examples/online_serving/grpc/client.py --address 127.0.0.1:50051
 python examples/online_serving/grpc/run_smoke.py --output /tmp/gr-grpc-smoke
 ```

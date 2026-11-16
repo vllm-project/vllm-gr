@@ -34,7 +34,7 @@ classifiers = [
 # See README.md for platform installation instructions.
 
 [project.optional-dependencies]
-# Experimental gRPC entrypoint (`vllm-gr serve --grpc`). The smg-* packages come
+# Experimental gRPC entrypoint (`vllm serve MODEL --gr --grpc`). The smg-* packages come
 # from https://github.com/lightseekorg/smg and are Apache-2.0 licensed; the
 # extended .proto copies and their generated bindings live under
 # vllm_gr/entrypoints/grpc/ (see generated/README.md).
@@ -84,7 +84,6 @@ Issues = "https://github.com/JiusiServe/vllm-gr/issues"
 vllm_gr = "vllm_gr.plugin:register"
 
 [project.scripts]
-vllm-gr = "vllm_gr.entrypoints.cli.main:main"
 vllm-gr-sidecar = "vllm_gr.sidecar.__main__:main"
 
 [tool.setuptools.packages.find]

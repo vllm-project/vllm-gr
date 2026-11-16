@@ -10,13 +10,14 @@ platform. The Ascend path relies on the vendor runtime; a CPU package install
 does not provide accelerator inference.
 
 Install the [pre-commit hooks](docs/PRE_COMMIT.md). Before runtime validation,
-confirm that the active interpreter imports this checkout, then run:
+confirm that the active interpreter imports this checkout, apply the
+[CLI dispatch patch](docs/cli.md), then run:
 
 ```bash
-vllm-gr check-env
+vllm check-env --gr
 ```
 
-Use `vllm-gr check-env --npu` for Ascend. This checks compatibility in an
+Use `vllm check-env --gr --npu` for Ascend. This checks compatibility in an
 installed runtime; it does not run inference. Keep model and dataset paths in
 the documented environment variables.
 

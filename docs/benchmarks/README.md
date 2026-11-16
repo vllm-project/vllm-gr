@@ -3,6 +3,14 @@
 Install the runtime using the [CUDA](../quickstart.md) or
 [Ascend](../quickstart-ascend.md) guide and prepare the dataset below.
 
+See the [CLI reference](../cli.md) for workload options and the vLLM 0.30.0
+patch required by `vllm ... --gr`.
+
+Run `vllm bench --gr --list` to list the available workloads. For example,
+`vllm bench qwen-v1 --gr --help` shows the Qwen scenario options. Workloads
+and their data live in the source tree. With a wheel installation, run the
+command from the repository checkout or one of its subdirectories.
+
 - [Throughput and latency](throughput.md) covers offline and HTTP benchmarks.
 - [Accuracy](accuracy.md) covers offline and HTTP evaluation.
 - [OneRec cache-miss benchmark](../../benchmarks/open_one_rec/V1_BENCHMARK.md)
@@ -69,3 +77,25 @@ path.
 | `video` | Recommendation | Video recommendation scoring | 38781 |
 | `interactive` | Recommendation | Interactive engagement prediction | 1000 |
 | `label_pred` | Classification | User engagement classification | 346190 |
+
+## Scenario command contracts
+
+- `vllm bench serve --gr` is a short form of
+  `vllm bench open-one-rec serve --gr`, with the same online benchmark options.
+- `vllm bench open-one-rec throughput --gr --help` displays the upstream
+  throughput options with the OneRec extensions loaded. For a measurement,
+  supply the model and dataset required by that subcommand. Device support
+  follows the selected vLLM backend and model.
+- `qwen-v1`, `beam-performance`, `beam-recall`, and `ab-offline` require CUDA.
+  The offline A/B workload fixes the constraint-table backend to `cuda`.
+  Use `vllm bench <scenario> --gr --help` to see the model and artifact inputs.
+- To compare existing measurement directories on the host, use the Git commit
+  that produced each set of results. The
+  `tests/system/run_beam_v1_performance_ab.sh` harness collects the CUDA ABBA runs.
+
+  ```bash
+  vllm bench beam-performance-ab --gr \
+    --base results/base --base-sha "$(cat results/base/1/commit.txt)" \
+    --pr results/pr --pr-sha "$(cat results/pr/1/commit.txt)" \
+    --output-dir results/report
+  ```

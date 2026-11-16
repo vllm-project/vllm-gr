@@ -28,7 +28,7 @@ See the [security policy](../../../SECURITY.md).
 
 ```bash
 export ONEREC_MODEL=/absolute/path/to/OneRec-1.7B
-vllm-gr serve "$ONEREC_MODEL" \
+vllm serve "$ONEREC_MODEL" --gr \
   --served-model-name onerec \
   --vllm-gr-config ./vllm_gr_config.yaml \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
