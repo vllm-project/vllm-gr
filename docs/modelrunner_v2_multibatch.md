@@ -77,12 +77,41 @@ current stage degrees and Trie count. A capacity change therefore compiles
 during table loading rather than the first request. Failed warmup releases the
 candidate backend before it can become active.
 
+### Graph installation and startup ownership
+
+`gpu_model_runner_v2_patch.py` owns the marker-guarded factories for native
+KV initialization, graph-memory profiling and model capture. The existing
+`gpu_model_runner_v2_resources.py` owns multi-batch Decode capture together
+with fixed input storage, graph bindings and runtime invalidation.
+`gpu_prefill_graph_runner_v2.py` owns native FULL/PIECEWISE planning and replay.
+
+```mermaid
+flowchart LR
+    I["V2 patch integration"] -->|"native plan and capture"| P["Prefill graph manager"]
+    I -->|"Decode capture and lifecycle callbacks"| R["V2 resource support"]
+    R -->|"explicit V2 hooks binding"| S["Shared startup capture"]
+```
+
+Startup installs the Prefill plan, runs native capture, then captures configured
+Decode batches. Profiling measures the complete GR plan in the native temporary
+pool and includes Decode/fixed-state memory. It restores the native capture flag
+after Decode capture, including failures, and never freezes GC for profiling.
+The native profiler tears down its temporary KV state before GR cleanup runs.
+Ordinary non-Beam capture retains native behavior; graph hooks remain optional
+capabilities of the native runner. Moving these operations does not change
+resource ownership, consumer-drain prerequisites or release timing.
+
 ### V1 compatibility boundary
 
 ModelRunner V1 uses the GR Prefill grid, clamps capture to the per-request
 capacity and requires exact native input extents for async Prefill admission.
 It captures B=1 Decode at startup and can lazily capture against stage-owned
 buffers when a new batch needs a graph.
+
+Beam attention uses incremental Decode with one query token per beam;
+full-suffix recomputation is not supported. NPU retains incremental row views
+and B=2 Prefill capture support. Backend row bounds, retirement and shutdown
+remain the responsibility of their existing implementations.
 
 Set `beam.adapter_cache_enabled: true` in the canonical service configuration
 to opt into cross-batch adapter caching. It defaults to false, preserving the

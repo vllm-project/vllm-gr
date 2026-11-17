@@ -113,7 +113,16 @@ def test_implementations_subclass_the_contract() -> None:
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "changed_file", [*mypy_hook.CUDA_STAGE_FILES, "tools/pre_commit/mypy.py"]
+    "changed_file",
+    sorted(
+        {
+            *mypy_hook.CUDA_STAGE_FILES,
+            "tools/pre_commit/mypy.py",
+            # Pin moved owners independently of the routing list itself.
+            "vllm_gr/v1/worker/gpu_model_runner_v2_patch.py",
+            "vllm_gr/v1/worker/gpu_model_runner_v2_resources.py",
+        }
+    ),
 )
 def test_mypy_checks_complete_boundary(changed_file: str) -> None:
     """Changing any boundary member checks its peers and negative cases too."""

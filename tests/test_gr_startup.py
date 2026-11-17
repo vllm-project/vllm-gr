@@ -16,7 +16,7 @@ from vllm_gr.v1.worker import gr_startup as startup
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import capture_multibatch_forward
 from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
 
 CaptureRuntime = tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace, Mock, Mock]

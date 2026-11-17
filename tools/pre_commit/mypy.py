@@ -43,7 +43,10 @@ CUDA_STAGE_FILES = [
     "vllm_gr/v1/worker/gr_startup.py",
     "vllm_gr/v1/worker/model_runner_common.py",
     "vllm_gr/v1/worker/model_runner_patch.py",
-    "vllm_gr/v1/worker/gpu_model_runner_v2_graph.py",
+    "vllm_gr/v1/worker/gpu_model_runner_v2_patch.py",
+    "vllm_gr/v1/worker/gpu_model_runner_v2_resources.py",
+    "vllm_gr/v1/worker/gr_inputs.py",
+    "vllm_gr/v1/worker/beam_decode_graph.py",
     "tests/tools/cuda_stage_typing_cases.py",
 ]
 

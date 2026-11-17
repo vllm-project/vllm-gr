@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Worker-owned input storage and graph bindings for ModelRunner V2."""
+"""Worker-owned input storage, graph bindings and Decode startup for ModelRunner V2."""
 
 from collections.abc import Callable
 from typing import Any
@@ -81,3 +81,55 @@ def close_v2_runtime(runner: Any) -> None:
     ):
         if hasattr(runner, name):
             delattr(runner, name)
+
+
+def capture_multibatch_forward(worker: Any, *, allow_eager_fallback: bool = True) -> bool:
+    """Publish configured V2 Decode shapes, with shape-local fallback."""
+    with torch.inference_mode():
+        from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+        from vllm_gr.v1.worker.gpu_stage_hooks import validate_stage_hooks_type
+        from vllm_gr.v1.worker.gr_startup import _capture_batch, _capture_enabled
+        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+        if not _capture_enabled(worker) or str(worker.device).split(":")[0] != "cuda":
+            return False
+        cfg = _get_gr_config(worker)
+        max_reqs = worker.vllm_config.scheduler_config.max_num_seqs
+        batches = tuple(b for b in cfg.beam_online_batch_sizes if b <= max_reqs)
+        if hasattr(worker, "_gr_decode_capture_failures"):
+            owner = getattr(worker, "_gr_gpu_stage_runner", None)
+            if owner is None or not owner.closed:
+                raise RuntimeError(
+                    "Asynchronous scheduling startup encountered an incomplete capture state"
+                )
+            validate_stage_hooks_type(owner.hooks, CudaStageHooksV2)
+            graph = getattr(worker, "_beam_decode_graph", None)
+            for batch in batches:
+                if batch not in worker._gr_decode_capture_failures and (
+                    graph is None or not graph.select(batch, cfg.beam_max_width).ready
+                ):
+                    raise RuntimeError("Published Decode graph is not ready")
+            return len(worker._gr_decode_capture_failures) < len(batches)
+        if getattr(worker, "_gr_gpu_stage_runner", None) is not None:
+            raise RuntimeError(
+                "Asynchronous scheduling startup encountered an incomplete capture state"
+            )
+        from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
+            ensure_prefix_calibration,
+        )
+
+        ensure_prefix_calibration(worker)
+        failures = {}
+        for batch in batches:
+            error = _capture_batch(
+                worker,
+                batch,
+                hooks_type=CudaStageHooksV2,
+                allow_eager_fallback=allow_eager_fallback,
+            )
+            if error is not None:
+                failures[batch] = error
+        worker._gr_decode_capture_failures = failures
+        worker._gr_async_decode_graph_capture_failed = len(failures) == len(batches)
+        worker._gr_async_decode_graph_capture_error = next(iter(failures.values()), None)
+        return len(failures) < len(batches)

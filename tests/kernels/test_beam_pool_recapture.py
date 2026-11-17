@@ -16,7 +16,7 @@ from tests.kernels.test_gpu_beam_stage_runner import (
 )
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import capture_multibatch_forward
 from vllm_gr.v1.worker.gr_startup import _capture_batch
 
 pytestmark = [

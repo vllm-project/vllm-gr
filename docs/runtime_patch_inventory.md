@@ -307,10 +307,9 @@ and Decode capture policy remain active when this cache is disabled.
 - Sources:
     - `vllm_gr/v1/worker/gpu_model_runner_patch.py`
     - `vllm_gr/v1/worker/gpu_model_runner_v2_patch.py`
-    - `vllm_gr/v1/worker/gpu_model_runner_v2_graph.py`
     - `vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py` (`CudaStageHooksV1`)
     - `vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py` (`CudaStageHooksV2`)
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/gpu_postprocess_workspace.py`, `vllm_gr/v1/worker/gpu_prefill_inputs.py`, `vllm_gr/v1/worker/gpu_prefill_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/gpu_stage_hooks.py`, `vllm_gr/v1/worker/gpu_beam_stage_runner.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/gpu_postprocess_workspace.py`, `vllm_gr/v1/worker/gpu_model_runner_v2_resources.py`, `vllm_gr/v1/worker/gpu_prefill_inputs.py`, `vllm_gr/v1/worker/gpu_prefill_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/gpu_stage_hooks.py`, `vllm_gr/v1/worker/gpu_beam_stage_runner.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - CUDA stage binding: execution and startup entrypoints explicitly select the
   independent V1/V2 implementations of `CudaStageHooks`. The shared core has no
@@ -358,6 +357,15 @@ and Decode capture policy remain active when this cache is disabled.
     - the 3-item `_prepare_inputs` result (`logits_indices`, speculative-decode metadata, maximum sampled-token count);
     - native execute/sample separation and asynchronous output consumption;
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
+- V2 graph integration: `gpu_model_runner_v2_patch.py` owns the KV,
+  profiling and capture patch factories and their installation markers.
+  `gpu_model_runner_v2_resources.py` owns multi-batch Decode capture with explicit
+  V2 hooks binding through `gr_startup.py`. The native Prefill manager remains
+  separate. Profiling teardown, capture-state restoration, shape-local fallback,
+  memory accounting and GC-freeze ordering retain their existing execution points.
+  Coverage: `tests/test_gpu_model_runner_v2_patch.py`, `tests/test_gr_startup.py`,
+  `tests/kernels/test_v2_multibatch_graphs.py`, and
+  `tests/kernels/test_beam_pool_recapture.py`.
 - ModelRunner V2 dependencies:
     - native `prepare_inputs`/`add_requests` request-state contracts;
     - admitted all-new GR Prefill batches skip unused native sampler registration;

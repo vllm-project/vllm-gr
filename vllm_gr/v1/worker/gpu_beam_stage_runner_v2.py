@@ -9,7 +9,7 @@ that surface onto the V2 ModelRunner
 
 - forward: ``set_forward_context`` + the torch.compile'd ``runner.model``
   (V2 has no ``_model_forward`` helper; the same route is proven by the V2
-  beam-decode graph capture, ``gpu_model_runner_v2_graph``).
+  beam-decode graph capture, ``gpu_model_runner_v2_resources``).
 - prefill logits: native ``execute_model`` publishes ``ExecuteModelState``
   carrying ``hidden_states``; logits are computed from
   ``hidden_states[logits_indices]`` (the ``patched_sample_v2`` contract).
