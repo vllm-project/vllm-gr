@@ -81,6 +81,11 @@ the persistent state. On reuse, order final consumption before `runner.reset()`
 and the next initialization. Legacy `begin_session()` still resets all decision
 rows; it must not run over another user's persistent buffers.
 
+Callers that just reset this row through `reset_for_session` (batching its rows
+into one launch) may pass `reset_decision=False` together with an explicit
+`decision_index`; the keyword is rejected without one, because only the full
+buffer reset also clears the legacy host counter.
+
 Candidate tensors must be contiguous CUDA int32 IDs, FP32 logprobs and bool
 masks on the state's device. Prefill has shape `[1,W]`; Decode has `[W,W]`.
 Candidates need not be sorted. Shape/dtype/layout checks inspect tensor metadata

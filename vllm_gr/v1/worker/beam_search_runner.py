@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import triton
@@ -62,6 +62,81 @@ class _BeamResourceValidation:
     guard: Any
     addresses: tuple[int, ...]
     key: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionResetPlan:
+    """One-launch reset covering a contiguous range of request-major rows."""
+
+    tensors: tuple[torch.Tensor, ...]
+    row_sizes: tuple[int, ...]
+    row_blocks: tuple[int, ...]
+    block_totals: tuple[int, ...]
+    negative_infinity: tuple[bool, ...]
+    rows: int
+
+    @property
+    def grid(self) -> tuple[int]:
+        return (self.block_totals[-1] * self.rows,)
+
+
+def build_session_reset_plan(
+    state: BeamSearchState,
+    decision_rows: Sequence[torch.Tensor],
+    first_row: int,
+    rows: int,
+) -> _SessionResetPlan:
+    """Return the one-launch plan that resets ``rows`` rows from ``first_row``.
+
+    ``decision_rows`` holds the full physical decision tensors, including
+    ``sequence`` and ``beam_scores`` aliased by the state. Those state views
+    are excluded from the reset set so each physical decision row is cleared
+    once at its full width.
+    Every tensor contributes ``ceil(row_size / BLOCK)`` program blocks per
+    row; the returned block totals make the row count a runtime grid factor,
+    so one compiled variant serves every batch size.
+    """
+    selected = [
+        (value, name in BeamSearchState.NEGATIVE_INFINITY_TENSORS)
+        for name, value in vars(state).items()
+        if isinstance(value, torch.Tensor)
+        and name not in BeamSearchState.CONFIGURATION_TENSORS
+        and name not in BeamSearchState.ALIASED_TENSORS
+    ]
+    selected.extend((value, False) for value in decision_rows)
+    tensors = tuple(value[first_row : first_row + rows] for value, _ in selected)
+    for value in tensors:
+        # A non-contiguous row would make the flat offset arithmetic write the
+        # wrong cells; reject at plan time, before any launch.
+        if value.dim() < 1 or not value.is_contiguous():
+            raise ValueError("Session reset requires contiguous request-major state rows")
+    row_sizes = tuple(value.numel() // rows for value in tensors)
+    row_blocks = tuple(triton.cdiv(size, ops.SESSION_RESET_BLOCK) for size in row_sizes)
+    block_totals: list[int] = [0]
+    for blocks in row_blocks:
+        block_totals.append(block_totals[-1] + blocks)
+    return _SessionResetPlan(
+        tensors,
+        row_sizes,
+        row_blocks,
+        tuple(block_totals),
+        tuple(fill for _, fill in selected),
+        rows,
+    )
+
+
+def launch_session_reset(plan: _SessionResetPlan) -> None:
+    """Enqueue one reset launch for the plan's rows."""
+    ops._reset_session_state_kernel[plan.grid](
+        plan.tensors,
+        plan.row_sizes,
+        plan.row_blocks,
+        plan.block_totals,
+        plan.negative_infinity,
+        plan.rows,
+        BLOCK=ops.SESSION_RESET_BLOCK,
+        num_warps=4,
+    )
 
 
 class BeamSearchRunner:
@@ -173,7 +248,7 @@ class BeamSearchRunner:
             execute=self._scratch["reorder"],
             DEVICE_STEPS=True,
         )
-        self._session_reset: tuple[Any, ...] | None = None
+        self._session_reset: _SessionResetPlan | None = None
         self._scratch_owner = scratch
 
     def rebind_session(self, session: BeamSearchSession) -> None:
@@ -208,33 +283,11 @@ class BeamSearchRunner:
             raise RuntimeError("Session reset requires a released Beam runner")
         plan = self._session_reset
         if plan is None:
-            excluded = {
-                "sequence",
-                "beam_scores",
-                "max_new_tokens_tensor",
-                "stop_token_ids",
-                "num_stop_tokens",
-                "ignore_stop_tokens",
-            }
-            rows = [
-                (value, name == "completed_scores")
-                for name, value in self._state.items()
-                if name not in excluded
-            ]
-            decision = self.state.decision
-            for value in (decision.sequence, decision.beam_scores, decision.group_token_num):
-                rows.append((value[self.state_index], False))
-            tensors = tuple(value for value, _ in rows)
-            sizes = tuple(value.numel() for value in tensors)
-            starts = [0]
-            for size in sizes:
-                starts.append(starts[-1] + triton.cdiv(size, 256))
-            plan = (tensors, sizes, tuple(starts), tuple(fill for _, fill in rows))
+            plan = build_session_reset_plan(
+                self.state, self.state.decision.reset_tensors(), self.state_index, 1
+            )
             self._session_reset = plan
-        tensors, sizes, starts, negative_infinity = plan
-        ops._reset_session_state_kernel[(starts[-1],)](
-            tensors, sizes, starts, negative_infinity, BLOCK=256, num_warps=4
-        )
+        launch_session_reset(plan)
 
     def initialize_from_prefill(
         self, token_ids: torch.Tensor, logprobs: torch.Tensor, valid_mask: torch.Tensor
@@ -677,6 +730,7 @@ class BeamBatchSearchRunner:
         self.workspace = first.workspace
         self.state_index = 0
         self.workspace_index = 0
+        self._batch_reset: _SessionResetPlan | None = None
 
     @property
     def session(self) -> BeamSearchSession:
@@ -697,8 +751,24 @@ class BeamBatchSearchRunner:
             raise ValueError("Beam batch size changed after resource binding")
 
     def reset_for_session(self) -> None:
+        """Reset rows 0..B-1 of the shared state in a single launch.
+
+        A batch always owns the request-major rows ``0..batch_size-1`` of one
+        shared state, so the per-row resets that ``BeamSearchRunner`` would
+        launch one after another cover one contiguous range of the same
+        tensors. Writing them in one launch produces the same values with B-1
+        fewer kernels.
+        """
         for runner in self.runners:
-            runner.reset_for_session()
+            if not runner._closed:
+                raise RuntimeError("Session reset requires a released Beam runner")
+        plan = self._batch_reset
+        if plan is None:
+            plan = build_session_reset_plan(
+                self.state, self.state.decision.reset_tensors(), 0, len(self.runners)
+            )
+            self._batch_reset = plan
+        launch_session_reset(plan)
 
     def initialize_from_prefill(self, candidates: BeamCandidateBatch) -> None:
         candidates.validate(

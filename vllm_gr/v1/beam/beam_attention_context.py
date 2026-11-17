@@ -57,6 +57,15 @@ class BeamDecisionBuffers:
         # so the decision module owns it entirely and reset() clears it.
         self.worker_decode_steps = 0
 
+    def reset_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Device tensors that a persistent-state reset clears at whole rows.
+
+        ``BeamSearchState`` aliases ``sequence`` and ``beam_scores`` at the
+        narrower beam width, so a reset that covers the physical row takes
+        these three and leaves the aliases to the state owner.
+        """
+        return (self.sequence, self.beam_scores, self.group_token_num)
+
     def reset(self, batch_index: int | None = None) -> None:
         """Clear all legacy state, or only one physical device row.
 
@@ -64,18 +73,16 @@ class BeamDecisionBuffers:
         persistent CUDA runner owns separate per-row device counters.
         """
         if batch_index is None:
-            self.sequence.zero_()
-            self.beam_scores.zero_()
-            self.group_token_num.zero_()
+            for value in self.reset_tensors():
+                value.zero_()
             self.worker_decode_steps = 0
         else:
             if isinstance(batch_index, bool) or not isinstance(batch_index, int):
                 raise TypeError("batch_index must be an integer")
             if not 0 <= batch_index < self.sequence.shape[0]:
                 raise ValueError("batch_index exceeds decision capacity")
-            self.sequence[batch_index : batch_index + 1].zero_()
-            self.beam_scores[batch_index : batch_index + 1].zero_()
-            self.group_token_num[batch_index : batch_index + 1].zero_()
+            for value in self.reset_tensors():
+                value[batch_index : batch_index + 1].zero_()
 
 
 class BeamAttentionContext:
@@ -129,7 +136,6 @@ class BeamAttentionContext:
         self.max_batch = max_batch
         self.max_beams = max_beams
         self.max_decode_steps = max_decode_steps
-        self.num_layers = num_layers
         self.device = device
         self.dtype = dtype
 

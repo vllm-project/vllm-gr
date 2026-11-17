@@ -21,24 +21,40 @@ FINISH_STOP = 1
 FINISH_LENGTH = 2
 
 
-@triton.jit
+SESSION_RESET_BLOCK = 256
+
+
+@triton.jit(do_not_specialize=["rows"])
 def _reset_session_state_kernel(
     tensors,
-    SIZES: tl.constexpr,
-    STARTS: tl.constexpr,
+    ROW_SIZES: tl.constexpr,
+    ROW_BLOCKS: tl.constexpr,
+    FIRST_BLOCK: tl.constexpr,
     NEGATIVE_INFINITY: tl.constexpr,
+    rows,
     BLOCK: tl.constexpr,
 ):
-    """Reset disjoint contiguous rows in one launch, without touching config."""
+    """Reset ``rows`` contiguous rows of every tensor in one launch.
+
+    ``rows`` is a runtime value on purpose: the batch size must not enter the
+    compiled signature, or every batch size would JIT its own variant on the
+    first request that reuses a runner. Tensor ``i`` owns ``ROW_BLOCKS[i]``
+    program blocks per row and ``FIRST_BLOCK`` holds their running totals for
+    one row, so its blocks start at ``FIRST_BLOCK[i] * rows``. Configuration
+    tensors are not passed in.
+    """
     block = tl.program_id(0)
-    for i in tl.static_range(len(SIZES)):
-        if (block >= STARTS[i]) & (block < STARTS[i + 1]):
-            offset = (block - STARTS[i]) * BLOCK + tl.arange(0, BLOCK)
+    for i in tl.static_range(len(ROW_SIZES)):
+        first = FIRST_BLOCK[i] * rows
+        if (block >= first) & (block < FIRST_BLOCK[i + 1] * rows):
+            local = block - first
+            row = local // ROW_BLOCKS[i]
+            column = (local - row * ROW_BLOCKS[i]) * BLOCK + tl.arange(0, BLOCK)
             if NEGATIVE_INFINITY[i]:
                 value = -float("inf")
             else:
                 value = 0
-            tl.store(tensors[i] + offset, value, mask=offset < SIZES[i])
+            tl.store(tensors[i] + row * ROW_SIZES[i] + column, value, mask=column < ROW_SIZES[i])
 
 
 @dataclass(slots=True)

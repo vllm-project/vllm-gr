@@ -96,6 +96,39 @@ def test_begin_session_resets_decision_buffers() -> None:
     assert torch.equal(bufs.group_token_num, torch.zeros_like(bufs.group_token_num))
 
 
+def test_reset_decision_false_requires_a_decision_index() -> None:
+    """Only the full-buffer reset clears the legacy host counter.
+
+    A row reset leaves ``worker_decode_steps`` alone, so a caller that skips
+    the reset without naming a row would keep the previous session's counter
+    and silently skip ``init_beam_decision_state``.
+    """
+    context = _make_context()
+    session = _make_session(context)
+    with pytest.raises(ValueError, match="decision_index"):
+        session.begin_session(beam_width=4, prefix_len=8, reset_decision=False)
+
+
+def test_reset_decision_false_leaves_the_row_to_the_batched_reset() -> None:
+    context = _make_context(max_batch=2)
+    session = _make_session(context)
+    bufs = context.decision
+    bufs.sequence.fill_(7)
+    bufs.beam_scores.fill_(7)
+    bufs.group_token_num.fill_(7)
+
+    session.begin_session(beam_width=4, prefix_len=8, decision_index=1, reset_decision=False)
+
+    assert (bufs.sequence == 7).all().item()
+    assert (bufs.beam_scores == 7).all().item()
+    assert (bufs.group_token_num == 7).all().item()
+
+    session.begin_session(beam_width=4, prefix_len=8, decision_index=1)
+    assert not bufs.sequence[1].any().item()
+    assert (bufs.sequence[0] == 7).all().item()
+    assert not bufs.group_token_num[1].any().item()
+
+
 def test_first_decode_inherits_parent_cumulative_scores() -> None:
     """The first decode adds local scores once to the prefill parent scores."""
     context = _make_context(max_beams=2)

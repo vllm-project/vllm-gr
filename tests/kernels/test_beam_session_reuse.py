@@ -15,10 +15,19 @@ from tests.kernels.test_gpu_beam_stage_runner import (
     metadata,
     runtime,
 )
-from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+from vllm_gr.ops.cuda.beam_state import SESSION_RESET_BLOCK
+from vllm_gr.v1.beam.beam_attention_context import (
+    BeamAttentionContext,
+    BeamDecisionBuffers,
+)
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.engine.beam_search_v1 import GRDeviceStateRef
+from vllm_gr.v1.worker.beam_search_runner import (
+    build_session_reset_plan,
+    launch_session_reset,
+)
 from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
@@ -268,4 +277,135 @@ def test_replaced_decision_storage_rebuilds_state_aliases_before_reset():
     assert not state.sequence.any().item()
     assert not state.beam_scores[0].any().item()
     assert torch.isneginf(state.beam_scores[1:]).all().item()
+    release(owner, m)
+
+
+def batch_metadata(name, batch):
+    """Prefill metadata for ``batch`` requests with request-major ids."""
+    m = renamed(metadata(n=2), name)
+    return replace(
+        m,
+        request_ids=tuple(name if index == 0 else f"{name}:{index}" for index in range(batch)),
+        num_prompt_tokens=7 * batch,
+        num_prompt_tokens_by_request=(7,) * batch,
+    )
+
+
+def batch_dispatch(m):
+    scheduled = dispatch(m)
+    scheduled.num_scheduled_tokens = dict(zip(m.request_ids, m.num_prompt_tokens_by_request))
+    return scheduled
+
+
+def fill_distinct(value):
+    """Junk that differs per element, so a row or offset mix-up shows."""
+    pattern = torch.arange(1, value.numel() + 1, device=value.device) % 97 + 1
+    value.copy_(pattern.reshape(value.shape).to(value.dtype))
+
+
+@pytest.mark.parametrize("batch", [1, 3, 8])
+@torch.inference_mode()
+def test_batched_reset_writes_the_same_values_as_one_reset_per_runner(batch):
+    worker = admission_worker(max_rows=batch * 4)
+    m = batch_metadata("batched-reset", batch)
+    owner = get_stage_runner(worker, batch_dispatch(m), hooks_type=CudaStageHooksV1)
+    beam = owner.beam
+    beam.end_session()
+    state = beam.state
+    tensors = [value for value in vars(state).values() if isinstance(value, torch.Tensor)]
+    tensors.extend(state.decision.reset_tensors())
+
+    def fill_junk():
+        for value in tensors:
+            fill_distinct(value)
+
+    fill_junk()
+    for runner in beam.runners:
+        runner.reset_for_session()
+    expected = [value.clone() for value in tensors]
+
+    fill_junk()
+    beam.reset_for_session()
+    for value, wanted in zip(tensors, expected):
+        torch.testing.assert_close(value, wanted)
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8])
+@torch.inference_mode()
+def test_session_reset_plan_matches_row_resets_across_block_boundaries(rows):
+    # Rows larger than one 256-element block and not a multiple of it, so the
+    # per-tensor block totals and the tail masks are both exercised.
+    decision = BeamDecisionBuffers(8, 24, 12, torch.device("cuda"), torch.float16)
+    state = BeamSearchState(decision, beam_width=16, max_new_tokens=3, candidate_width=16)
+    tensors = [value for value in vars(state).values() if isinstance(value, torch.Tensor)]
+    tensors.extend(decision.reset_tensors())
+    assert state.completed_capacity > SESSION_RESET_BLOCK
+    assert state.completed_capacity % SESSION_RESET_BLOCK
+    assert decision.sequence[0].numel() > SESSION_RESET_BLOCK
+
+    for value in tensors:
+        fill_distinct(value)
+    for index in range(rows):
+        state.reset(index)
+        decision.reset(index)
+    expected = [value.clone() for value in tensors]
+
+    for value in tensors:
+        fill_distinct(value)
+    plan = build_session_reset_plan(state, decision.reset_tensors(), 0, rows)
+    launch_session_reset(plan)
+    for value, wanted in zip(tensors, expected):
+        torch.testing.assert_close(value, wanted)
+
+
+@torch.inference_mode()
+def test_session_reset_plan_rejects_non_contiguous_rows():
+    decision = BeamDecisionBuffers(2, 4, 3, torch.device("cuda"), torch.float16)
+    state = BeamSearchState(decision, beam_width=4, max_new_tokens=3)
+    strided = torch.zeros(4, 2, dtype=torch.int32, device="cuda").t()
+    with pytest.raises(ValueError, match="contiguous"):
+        build_session_reset_plan(state, (strided,), 0, 2)
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+@torch.inference_mode()
+def test_reuse_path_relies_on_the_batched_reset_for_decision_rows(batch, monkeypatch):
+    calls = []
+    original = BeamDecisionBuffers.reset
+
+    def spy(self, batch_index=None):
+        calls.append(batch_index)
+        original(self, batch_index)
+
+    monkeypatch.setattr(BeamDecisionBuffers, "reset", spy)
+    worker = admission_worker(max_rows=batch * 4)
+    m = batch_metadata("decision-rows", batch)
+    owner = get_stage_runner(worker, batch_dispatch(m), hooks_type=CudaStageHooksV1)
+    beam = owner.beam
+    # A fresh state is never batch-reset, so every member resets its own row.
+    assert calls == list(range(batch))
+    decision = beam.state.decision
+    release(owner, m)
+    # Junk left by the previous session; only the batched reset may clear it.
+    for value in decision.reset_tensors():
+        value.fill_(7)
+    calls.clear()
+    m = batch_metadata("decision-rows-reused", batch)
+    assert get_stage_runner(worker, batch_dispatch(m), hooks_type=CudaStageHooksV1) is owner
+    assert owner.beam is beam
+    assert calls == []
+    for value in decision.reset_tensors():
+        assert not value[0:batch].any().item()
+        assert (value[batch:] == 7).all().item()
+    release(owner, m)
+
+    # Without the batched reset the junk would survive the reuse admission:
+    # begin_session no longer clears these rows on this path.
+    for value in decision.reset_tensors():
+        value.fill_(7)
+    monkeypatch.setattr(type(beam), "reset_for_session", lambda self: None)
+    m = batch_metadata("decision-rows-unreset", batch)
+    assert get_stage_runner(worker, batch_dispatch(m), hooks_type=CudaStageHooksV1) is owner
+    for value in decision.reset_tensors():
+        assert (value == 7).all().item()
     release(owner, m)

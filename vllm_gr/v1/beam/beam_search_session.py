@@ -42,13 +42,27 @@ class BeamSearchSession:
         self.slot = slot
         self.context = context  # shared ref, not owned
 
-    def begin_session(self, beam_width: int, prefix_len: int, *, decision_index: int | None = None):
+    def begin_session(
+        self,
+        beam_width: int,
+        prefix_len: int,
+        *,
+        decision_index: int | None = None,
+        reset_decision: bool = True,
+    ):
         """Start a beam search session. Resets slot state (lazy KV reset).
 
         ``decision_index`` selects a physical decision row for the independent
         CUDA runner; it need not equal the KV slot. Omission preserves the
         legacy full-buffer reset. Persistent state must be reset separately,
         after final consumers, before its next Prefill initialization.
+
+        ``reset_decision=False`` is for callers that just reset this row through
+        ``BeamSearchRunner.reset_for_session`` (or its batched form): that
+        launch already writes the same zeros to ``sequence``, ``beam_scores``
+        and ``group_token_num``, so repeating it per member only adds launches.
+        It needs an explicit ``decision_index``; the full-buffer reset also
+        clears the legacy host counter, which a row reset leaves alone.
 
         Pool KV is NOT zeroed here. ``cache_unshared_kv_kernel`` is an exact
         overwrite (writes only ``pool[slot, beam, head, decode_step, :]`` per
@@ -60,6 +74,8 @@ class BeamSearchSession:
         its gather→scatter to ``[:decode_step+1]``, so aux buffers stay clean.
         """
         state = self._state
+        if not reset_decision and decision_index is None:
+            raise ValueError("reset_decision=False requires an explicit decision_index")
         state.decode_step = 0
         state.beam_width = beam_width
         state.prefix_len = prefix_len
@@ -73,7 +89,7 @@ class BeamSearchSession:
         # ``worker_decode_steps != 0`` — every subsequent decision then reads
         # a corrupted cumulative state.
         decision = getattr(self.context, "decision", None)
-        if decision is not None:
+        if decision is not None and reset_decision:
             if decision_index is None:
                 decision.reset()
             else:

@@ -27,6 +27,22 @@ class BeamSearchState:
     explicit events). This storage class neither waits nor releases KV slots.
     """
 
+    #: Fixed-state tensors that survive every reset; they hold the request
+    #: configuration rather than per-step progress.
+    CONFIGURATION_TENSORS = frozenset(
+        {
+            "max_new_tokens_tensor",
+            "stop_token_ids",
+            "num_stop_tokens",
+            "ignore_stop_tokens",
+        }
+    )
+    #: Tensors whose rows are reset to ``-inf`` instead of zero.
+    NEGATIVE_INFINITY_TENSORS = frozenset({"beam_scores", "completed_scores"})
+    #: Views of the decision storage. A reset covers the whole decision row,
+    #: so these must not be written a second time at the narrower beam width.
+    ALIASED_TENSORS = frozenset({"sequence", "beam_scores"})
+
     def __init__(
         self,
         decision: BeamDecisionBuffers,
@@ -153,16 +169,10 @@ class BeamSearchState:
             raise TypeError("state_index must be an integer")
         if not 0 <= state_index < self.max_batch_size:
             raise ValueError("state_index exceeds state capacity")
-        configuration = {
-            "max_new_tokens_tensor",
-            "stop_token_ids",
-            "num_stop_tokens",
-            "ignore_stop_tokens",
-        }
         for name, value in vars(self).items():
-            if isinstance(value, torch.Tensor) and name not in configuration:
+            if isinstance(value, torch.Tensor) and name not in self.CONFIGURATION_TENSORS:
                 row = value[state_index : state_index + 1]
-                if name in ("beam_scores", "completed_scores"):
+                if name in self.NEGATIVE_INFINITY_TENSORS:
                     row.fill_(-float("inf"))
                 else:
                     row.zero_()

@@ -83,7 +83,6 @@ from vllm_gr.v1.worker.gr_inputs import (
     bind_device_inputs,
 )
 
-METADATA_ABI = 1
 _UNCONSTRAINED_HEAD_LAYOUT_LOCK = Lock()
 CONTROL_CAPACITY = 2
 SUPPORTED_BATCH_SIZES = SUPPORTED_BEAM_BATCH_SIZES
@@ -108,15 +107,12 @@ class BeamRequestBinding:
 class BeamDispatchEntry:
     binding: BeamRequestBinding
     metadata: GRStageMetadata
-    row_offset: int
     row_count: int
 
 
 @dataclass(frozen=True)
 class BeamDispatchExecution:
     entries: tuple[BeamDispatchEntry, ...]
-    num_model_rows: int
-    metadata_abi: int = METADATA_ABI
 
 
 # The upstream base is intentionally outside the explicit mypy boundary.
@@ -201,7 +197,7 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
     def _convert(self, controls: list[list[int]], *, final_ready: bool) -> ModelRunnerOutput:
         if len(controls) != len(self.execution.entries):
             raise ValueError("Asynchronous scheduling control snapshot has the wrong row count")
-        req_ids, sampled, results = [], [], {}
+        results = {}
         for entry, (produced, finished, error) in zip(self.execution.entries, controls):
             m = entry.metadata
             terminal = None
@@ -534,7 +530,6 @@ class GPUBeamStageRunner:
             raise RuntimeError("Beam context already has an execution owner")
         self.worker, self.beam, self.bindings, self.backend = worker, beam, bindings, backend
         self.binding = bindings[0]
-        self.batch_view = beam.layout
         # Device indexing is part of Decode binding and must not upload a CPU
         # index tensor while a CUDA graph is being captured.
         self.state_rows = torch.tensor(
@@ -682,18 +677,17 @@ class GPUBeamStageRunner:
                 self.final_output = GPUBeamFinalOutput(
                     self, self.bindings, first.beam_params, first.output_options
                 )
-        entries, offset = [], 0
+        entries = []
         for m in stages:
             view = BeamBatchExecutionView.from_stage_metadata(m)
             count = view.num_execution_rows if m.kind is GRStageKind.DECODE else view.batch_size
-            entries.append(BeamDispatchEntry(self.binding, m, offset, count))
-            offset += count
+            entries.append(BeamDispatchEntry(self.binding, m, count))
         with self.control_lock:
             slot = next((i for i, busy in enumerate(self.control_busy) if not busy), None)
             if slot is None:
                 raise RuntimeError("both GR dispatch control slots await output consumption")
             self.control_busy[slot] = True
-        execution = BeamDispatchExecution(tuple(entries), offset)
+        execution = BeamDispatchExecution(tuple(entries))
         self.pending = execution, slot
         self.previous = stages[0]
         torch.cuda.current_stream(self.beam.state.device).wait_event(self.last_work)
@@ -1479,8 +1473,13 @@ def get_stage_runner(
     if reuse_beam:
         assert existing is not None
         existing.beam.reset_for_session()
+        # The batched reset above zeroed every decision row of this batch, so
+        # the per-member begin_session must not repeat it. A fresh state never
+        # sees a reset, so it keeps the default per-row decision reset.
+        decision_reset_by_batch = True
         state = existing.beam.state
     else:
+        decision_reset_by_batch = False
         state = BeamSearchState(
             context.decision,
             beam_width=m.beam_params.beam_width,
@@ -1509,7 +1508,15 @@ def get_stage_runner(
         if slot != item_index:
             raise RuntimeError("GR batch requires contiguous request-major KV slots")
         session = BeamSearchSession(request_id, slot, context)
-        session.begin_session(m.beam_params.beam_width, prompt_tokens, decision_index=item_index)
+        session.begin_session(
+            m.beam_params.beam_width,
+            prompt_tokens,
+            decision_index=item_index,
+            # ``reset_for_session`` already zeroed this row's decision buffers
+            # above; repeating it per member only costs a launch and three
+            # ``zero_()`` calls.
+            reset_decision=not decision_reset_by_batch,
+        )
         sessions.append(session)
         bindings.append(
             BeamRequestBinding(m.session_id, item_index, request_id, item_index, slot, item_index)
@@ -1538,7 +1545,7 @@ def get_stage_runner(
         assert existing is not None
         adapter = existing
         adapter.beam, adapter.bindings, adapter.backend = beam, binding_tuple, backend
-        adapter.binding, adapter.batch_view = binding_tuple[0], view
+        adapter.binding = binding_tuple[0]
         adapter.previous, adapter.pending = None, None
         adapter._dispatch_session, adapter._validated_dispatch = None, None
         adapter.closed, adapter.cancelled = False, False
