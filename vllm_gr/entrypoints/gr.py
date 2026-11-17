@@ -82,6 +82,35 @@ class GRLLM(LLM):
         beam_max_decode_steps: int | None = None,
         **kwargs,
     ):
+        """Initialize an offline GR LLM with the Beam Search V1 lifecycle.
+
+        Args:
+            model: Model path or identifier forwarded to the vLLM ``LLM``
+                constructor.
+            catalog_path: Retired. Use ``vllm_gr_config`` with a canonical
+                Constraint Table artifact instead.
+            constraint_backend: Retired. Configure the backend through
+                ``vllm_gr_config`` instead.
+            constrained_generation: Optional override forwarded to the GR
+                engine configuration.
+            beam_graph_enabled: Optional Beam graph capability override. When
+                set, it is forwarded through ``additional_config``.
+            beam_max_width: Optional positive engine Beam capacity. It is
+                validated before engine construction and is limited to 1024.
+                Candidate width is independent; when unset it follows Beam
+                width, so widths above 256 require an explicit
+                ``constraint_table.candidate_width`` no greater than 256.
+                Backend/platform limits may be stricter.
+            beam_max_decode_steps: Optional positive effective Decode-step
+                capacity. ``None`` keeps the engine default.
+            vllm_gr_config: Canonical GR configuration, supplied through
+                ``kwargs`` as a path or equivalent mapping.
+            **kwargs: Additional arguments forwarded to ``vllm.LLM``.
+
+        Raises:
+            ValueError: If retired catalog arguments are supplied or a Beam
+                capacity override fails validation.
+        """
         if catalog_path is not None or constraint_backend is not None:
             raise ValueError(
                 "Legacy catalog_path/constraint_backend arguments have been removed. "

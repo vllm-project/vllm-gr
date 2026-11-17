@@ -271,6 +271,7 @@ when comparing runs.
 | Online V1 validation is needed | The system test calls `OpenAIServing.beam_search_v1()` with a real asynchronous multiprocess engine. Legacy HTTP gates remain separate. |
 | EOS or Prefill admission error | Set `ignore_eos=True`, disable Chunked Prefill and allow the complete prompt in `max_num_batched_tokens`. |
 | A prompt list did not batch | Check `Beam batch declined`: the count must be in `beam.online_batch_sizes`, and sequence capacity, the token budget and equal generation budgets must all allow it. |
+| `No free beam session slots (max_batch=N)` | Concurrent V1 Beam sessions exceed the N-slot worker registry. Let active sessions finish or abort/close them before submitting more. This registry is sized from the Beam worker context, not by `beam.online_batch_sizes` or `--max-num-seqs`; on the current CUDA path it is fixed at 8. Sustained concurrency above 8 requires a code-level capacity change. |
 
 ## Further reading
 

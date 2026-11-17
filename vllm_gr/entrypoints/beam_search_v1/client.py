@@ -127,7 +127,11 @@ def _submission_failure(exc: Exception) -> BeamBatchFailure:
 
 
 class BeamSearchClient:
-    """Offline A2 adapter. A3 supplies the EngineCore transport methods."""
+    """Adapt offline requests to synchronous EngineCore Beam sessions.
+
+    The engine transport must expose the submit, wait, abort and release
+    session methods consumed by this adapter.
+    """
 
     def __init__(self, llm: Any) -> None:
         self.llm = llm
@@ -136,6 +140,11 @@ class BeamSearchClient:
         self._original_prompt_token_ids: tuple[tuple[int, ...], ...] | None = None
 
     def prepare_request(self, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
+        """Validate offline inputs and build one canonical batch request.
+
+        The processor also records boundary token IDs and original prompt IDs
+        for use by ``build_output``.
+        """
         processor = BeamSearchInputProcessor(self.engine)
         request = processor.process_offline_inputs(self.llm, call)
         self._boundary_tokens = (request.batch_id, processor.boundary_token_ids)
@@ -143,6 +152,12 @@ class BeamSearchClient:
         return request
 
     def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
+        """Submit one prepared request and return its EngineCore session.
+
+        A submission failure rolls back before it can leave an unowned session.
+        Admission rejection raises ``VLLMValidationError``; other submission
+        failures raise ``BeamSearchEngineError``. ``EngineDeadError`` propagates.
+        """
         submit = _get_engine_method(self.engine, "submit_gr_session")
         abort = _get_engine_method(self.engine, "abort_gr_session")
         _get_engine_method(self.engine, "release_gr_session")
@@ -161,6 +176,11 @@ class BeamSearchClient:
         )
 
     def wait_final(self, session: BeamSearchSession) -> BeamBatchResult:
+        """Wait for terminal output and materialize public sequence tuples.
+
+        Ordinary execution failures are represented as a ``BeamBatchResult``
+        carrying ``failure``. ``EngineDeadError`` propagates to the caller.
+        """
         try:
             result = _get_engine_method(self.engine, "wait_gr_session")(
                 session.session_id, session.handle
@@ -184,6 +204,20 @@ class BeamSearchClient:
         request: BeamBatchRequest,
         result: BeamBatchResult,
     ) -> list[Any]:
+        """Decode a successful offline result into public output objects.
+
+        Args:
+            call: Original offline request.
+            request: Prepared request associated with ``result``.
+            result: Successful terminal Beam result.
+
+        Returns:
+            Processed Beam output objects.
+
+        Raises:
+            VLLMValidationError: For an admission-style terminal failure.
+            BeamSearchEngineError: For another terminal failure.
+        """
         if result.failure is not None:
             raise failure_exception(result.failure)
         prepared = self._boundary_tokens
@@ -202,11 +236,17 @@ class BeamSearchClient:
         ).process_outputs(call, request, result)
 
     def abort(self, session: BeamSearchSession) -> None:
+        """Abort a nonterminal session; terminal and closed sessions are no-ops."""
         if session.terminal or session.closed:
             return
         self.close(session)
 
     def close(self, session: BeamSearchSession) -> None:
+        """Release a terminal session or abort a nonterminal session.
+
+        This method is idempotent. Ordinary cleanup errors are logged and
+        retried; ``EngineDeadError`` propagates.
+        """
         if session.closed:
             return
         _run_sync_cleanup(lambda: self._close_session(session), session.session_id)
@@ -220,7 +260,11 @@ class BeamSearchClient:
 
 
 class AsyncBeamSearchClient:
-    """Online A2 adapter using the same request and EngineCore session ID."""
+    """Adapt online requests to asynchronous EngineCore Beam sessions.
+
+    Use either an ``OpenAIServing``-like object or a raw engine client. The
+    serving object additionally owns request validation and output decoding.
+    """
 
     def __init__(self, serving: Any = None, *, engine_client: Any = None) -> None:
         if (serving is None) == (engine_client is None):
@@ -231,6 +275,13 @@ class AsyncBeamSearchClient:
         self._close_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def prepare_request(self, call: OnlineBeamSearchRequest) -> BeamBatchRequest:
+        """Validate online inputs and build one canonical batch request.
+
+        The processor also records boundary token IDs for ``build_output``.
+
+        Raises:
+            ValueError: If this engine-only client receives an online request.
+        """
         if self.serving is None:
             raise ValueError("engine-only client accepts prepared BeamBatchRequest inputs")
         processor = BeamSearchInputProcessor(self.engine)
@@ -239,6 +290,14 @@ class AsyncBeamSearchClient:
         return request
 
     async def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
+        """Submit one prepared request and return its EngineCore session.
+
+        The transport must support submission, abort and release before any
+        session is accepted. Cancellation, submission failure and rollback are
+        handled before returning the session. Admission rejection raises
+        ``VLLMValidationError``; other submission failures raise
+        ``BeamSearchEngineError``. ``EngineDeadError`` propagates.
+        """
         submit = _get_engine_method(self.engine, "submit_gr_session")
         # Reject unsupported transports before they can accept a session that
         # this client has no way to roll back.
@@ -293,6 +352,12 @@ class AsyncBeamSearchClient:
     async def wait_final(
         self, session: BeamSearchSession, *, materialize: bool = True
     ) -> BeamBatchResult:
+        """Wait for terminal output and optionally materialize public tuples.
+
+        With ``materialize=False``, return the terminal result while preserving
+        its owned-column representation. Ordinary execution failures return a
+        result carrying ``failure``; ``EngineDeadError`` propagates.
+        """
         try:
             result = _get_engine_method(self.engine, "wait_gr_session")(
                 session.session_id, session.handle
@@ -320,6 +385,22 @@ class AsyncBeamSearchClient:
         request: BeamBatchRequest,
         result: BeamBatchResult,
     ) -> list[Any]:
+        """Decode a successful online result into public output objects.
+
+        Args:
+            call: Original online request.
+            request: Prepared request associated with ``result``.
+            result: Successful terminal Beam result.
+
+        Returns:
+            Processed online Beam output objects.
+
+        Raises:
+            ValueError: If configured as an engine-only client.
+            VLLMValidationError: For an admission-style failure or a missing
+                tokenizer.
+            BeamSearchEngineError: For another terminal failure.
+        """
         if result.failure is not None:
             raise failure_exception(result.failure)
         if self.serving is None:
@@ -340,6 +421,7 @@ class AsyncBeamSearchClient:
         ).process_online_outputs(call, request, result)
 
     async def abort(self, session: BeamSearchSession) -> None:
+        """Abort a nonterminal session; terminal and closed sessions are no-ops."""
         if session.terminal or session.closed:
             return
         await self.close(session)
@@ -350,6 +432,12 @@ class AsyncBeamSearchClient:
             await result
 
     async def close(self, session: BeamSearchSession) -> None:
+        """Release a terminal session or abort a nonterminal session.
+
+        This method is idempotent. A retained task retries ordinary cleanup
+        failures; the first attempt is shielded and its ``EngineDeadError`` is
+        surfaced to the caller.
+        """
         if session.closed:
             return
         task = self._close_tasks.get(session.session_id)

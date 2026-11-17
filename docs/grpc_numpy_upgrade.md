@@ -91,8 +91,9 @@ CLI requests. Generate bindings with `python tools/generate_grpc_proto.py`
 after installing `grpcio-tools==1.84.0`.
 
 Focused tests cover pinned upstream wire compatibility, both token encodings,
-input/beam validation, batch/single output fields, cancellation/error cleanup,
-standard health/reflection/stats, array passthrough, codec transport, prefix
+input/beam validation, batch/single output fields, optional binary batch output
+and its ordinary `beams` fallback, cancellation/error cleanup, standard
+health/reflection/stats, array passthrough, codec transport, prefix
 hash identity, token growth and Worker staging. The affected test selection
 passes 493 cases; full repository CI and V2 graph/NPU model validation were
 not run. GPU verification includes the example and the workload below.
