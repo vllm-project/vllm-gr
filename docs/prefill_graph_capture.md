@@ -20,11 +20,20 @@ in steps of 128. `VLLM_GR_PREFILL_GRAPH_BUCKET_STEP` and
 `cudagraph_capture_sizes` does not replace it. Explicit internal constructor
 `buckets` retain their existing precedence.
 
-V1 clamps buckets to the smaller of `max_num_batched_tokens` and the
+`VLLM_GR_PREFILL_GRAPH_BUCKETS=128,256,512` selects an explicit, strictly
+increasing list of positive token buckets instead of the step/max grid.
+When the list is set, the step/max variables are ignored. An invalid or empty
+list is rejected rather than falling back to another capture policy.
+
+By default, V1 clamps buckets to the smaller of `max_num_batched_tokens` and the
 per-request `max_model_len`; clamping can add that limit as an endpoint.
 For `max_model_len=2048`, the GR Prefill runner therefore does not capture
 T=4096 even if several requests make that total valid. Such requests retain
 the original fallback path.
+
+For an explicit bucket list with Beam V1 execution, buckets describe the total
+tokens across requests and are bounded by `max_num_batched_tokens` instead.
+Each request still has to fit `max_model_len`.
 
 `VLLM_GR_PREFILL_GRAPH_KV_BOUND` sets the captured Attention bound to
 `max(2 * token_bucket, override)` and retains the existing small-bucket
@@ -59,11 +68,12 @@ compilation_config={
 }
 ```
 
-Setting either GR bucket step/max variable explicitly makes V2 use the GR
-grid instead. V2 still filters the resulting sizes against multi-request
-capacity. Unset those two variables to use native capture sizes. The KV-bound
-variable alone does not extend V2's native list. V2's Attention capture
-builder establishes per-request context bounds.
+Setting `VLLM_GR_PREFILL_GRAPH_BUCKETS` or either GR bucket step/max variable
+explicitly makes V2 use the GR grid instead, with the explicit list taking
+precedence over step/max. V2 still filters the resulting sizes against
+multi-request capacity. Unset all three bucket variables to use native capture
+sizes. The KV-bound variable alone does not extend V2's native list. V2's
+Attention capture builder establishes per-request context bounds.
 
 ## Compare actual execution
 

@@ -9,7 +9,6 @@ Only successfully captured candidates become visible to serving dispatch.
 
 from __future__ import annotations
 
-import os
 from bisect import bisect_left
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -26,11 +25,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
-    ENV_PREFILL_GRAPH_BUCKET_STEP,
-    ENV_PREFILL_GRAPH_MAX_BUCKET,
     get_default_buckets,
     get_max_context_len,
     get_prefill_graph_capture_num_reqs,
+    has_prefill_graph_bucket_override,
     is_prefill_graph_enabled,
 )
 
@@ -38,19 +36,17 @@ logger = init_logger(__name__)
 
 
 def get_gpu_prefill_buckets(runner: Any) -> list[int]:
-    """Use native capture sizes unless the legacy GR grid is explicitly set.
+    """Use native capture sizes unless a GR bucket grid is explicitly set.
 
     Native config has already resolved its default/list/maximum precedence.
     Do not union in extra sizes or capacity endpoints: capacity is not a
     capture budget. An empty native list must stay empty. The KV-bound knob
     changes attention coverage, not an explicitly configured native list.
     """
-    if any(
-        name in os.environ for name in (ENV_PREFILL_GRAPH_BUCKET_STEP, ENV_PREFILL_GRAPH_MAX_BUCKET)
-    ):
+    if has_prefill_graph_bucket_override():
         logger.info(
             "Explicit GR Prefill bucket grid overrides native cudagraph_capture_sizes; "
-            "unset the GR bucket step/max variables to use native capture configuration."
+            "unset the GR bucket list/step/max variables to use native capture configuration."
         )
         return get_default_buckets()
     compilation = getattr(runner, "compilation_config", None)

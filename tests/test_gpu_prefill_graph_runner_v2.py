@@ -26,6 +26,7 @@ from vllm_gr.v1.worker.prefill_graph_common import PrefillGraphEnv
 def runner(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(PrefillGraphEnv, "enabled", True)
     for name in (
+        common.ENV_PREFILL_GRAPH_BUCKETS,
         common.ENV_PREFILL_GRAPH_BUCKET_STEP,
         common.ENV_PREFILL_GRAPH_MAX_BUCKET,
         common.ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS,
@@ -252,6 +253,35 @@ def test_legacy_grid_overrides_native_without_adding_capacity_endpoints(
     monkeypatch.delenv(common.ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = [1, 2, 512]
     assert pg2.PrefillCapturePlan.for_runner(runner).buckets == (128, 256)
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("native_sizes", [[], [1, 2, 512]])  # type: ignore[misc]
+@pytest.mark.parametrize("legacy_grid", [False, True])  # type: ignore[misc]
+def test_explicit_bucket_list_overrides_native_and_legacy_grids(
+    runner: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    native_sizes: list[int],
+    legacy_grid: bool,
+) -> None:
+    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_BUCKETS, "128,256")
+    monkeypatch.delenv(common.ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
+    if legacy_grid:
+        # The explicit list takes precedence, including over invalid legacy knobs.
+        monkeypatch.setenv(common.ENV_PREFILL_GRAPH_BUCKET_STEP, "0")
+        monkeypatch.setenv(common.ENV_PREFILL_GRAPH_MAX_BUCKET, "not-an-integer")
+    runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = native_sizes
+    assert pg2.PrefillCapturePlan.for_runner(runner).buckets == (128, 256)
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("raw", ["", "256,128", "128,128", "0,128", "128,a"])  # type: ignore[misc]
+def test_invalid_explicit_bucket_list_rejected_before_native_fallback(
+    runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_BUCKETS, raw)
+    with pytest.raises(ValueError, match=common.ENV_PREFILL_GRAPH_BUCKETS):
+        pg2.PrefillCapturePlan.for_runner(runner)
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
