@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
+    from .services import StageExecutionService
+
 
 @dataclass(frozen=True)
 class CUDABackendProvider:
@@ -64,11 +66,35 @@ class CUDABackendProvider:
             import_module("vllm_gr.v1.worker.gpu_model_runner_patch"),
         )
 
+    def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:
+        """Return the CUDA runner patch module, honoring an explicit V2 opt-in.
+
+        CUDA is the only backend that implements ModelRunner V2, so the V2 flag
+        selects its V2 module here rather than in shared dispatch.
+        """
+        if prefer_v2:
+            return "vllm_gr.v1.worker.gpu_model_runner_v2_patch"
+        return "vllm_gr.v1.worker.gpu_model_runner_patch"
+
+    def supports_v2_model_runner(self) -> bool:
+        """CUDA ships a ModelRunner V2 patch module in this release."""
+        return True
+
     def get_attention_execution(self) -> BeamAttentionExecution:
         return cast(
             BeamAttentionExecution,
             import_module("vllm_gr.v1.attention.backends.beam_attn_gpu"),
         )
+
+    def create_stage_execution_service(self) -> StageExecutionService:
+        """Return the CUDA stage execution service.
+
+        The service defers its own imports, so building it loads no CUDA module
+        and this provider keeps its import-light contract.
+        """
+        from .cuda_services import CudaStageExecutionService
+
+        return CudaStageExecutionService()
 
     def create_constrained_topk_execution(
         self,

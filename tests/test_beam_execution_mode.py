@@ -62,6 +62,12 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
 ) -> None:
     from vllm_gr.v1.worker import gr_startup, npu_model_runner_patch
 
+    import vllm_gr.platforms.loader as loader
+    from vllm_gr.platforms.npu import NPU_BACKEND
+
+    # Startup capture asks the selected backend. This test builds an NPU worker
+    # on whatever host runs the suite, so it must also select Ascend.
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
     capture = Mock(return_value=True)
     monkeypatch.setattr(
         npu_model_runner_patch,

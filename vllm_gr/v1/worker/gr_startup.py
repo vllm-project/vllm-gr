@@ -22,7 +22,6 @@ from vllm_gr.v1.engine.beam_search_v1 import (
     GRExecutionCapacity,
     GRStageKind,
     GRStageMetadata,
-    validate_gr_device_config,
     validate_gr_execution_runtime,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
@@ -52,6 +51,17 @@ def _startup_capture_batch_size() -> int:
     return batch_size
 
 
+def _stage_execution_service() -> Any:
+    """Return the selected backend's GR stage execution service.
+
+    Resolution goes through the provider registry, never through a device name,
+    so this module carries no hardware-specific startup branch.
+    """
+    from vllm_gr.platforms.loader import activate_current_backend
+
+    return activate_current_backend().create_stage_execution_service()
+
+
 def capture_async_forward(
     worker: Any,
     *,
@@ -61,64 +71,72 @@ def capture_async_forward(
     with torch.inference_mode():
         if not _capture_enabled(worker):
             return False
-        device_type = str(worker.device).split(":")[0]
-        if device_type == "npu":
-            from vllm_gr.v1.worker.npu_model_runner_patch import (
-                capture_beam_decode_graph,
+        # The selected backend owns its startup capture policy: which graph it
+        # captures, whether hooks are required, and what a failed capture means.
+        return bool(
+            _stage_execution_service().capture_startup_graph(
+                worker,
+                hooks_type=hooks_type,
+                allow_eager_fallback=allow_eager_fallback,
             )
-
-            captured: bool = capture_beam_decode_graph(worker)
-            return captured
-        if device_type != "cuda":
-            return False
-        if hooks_type is None:
-            raise ValueError("CUDA GR startup capture requires explicit stage hooks")
-        # Measure (or load) the device-local prefix cost model before any Beam graph
-        # is captured: the cache write is a YAML file and the probe needs the GPU to
-        # itself. Failures degrade to "no calibration", never to a failed start-up.
-        from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
-            ensure_prefix_calibration,
-        )
-        from vllm_gr.v1.attention.backends.beam_prefix_policy import (
-            remember_worker_flash_attn_version,
         )
 
-        # The request path may run without a vLLM config context, so persist the
-        # operator's explicit FlashAttention choice while it is still available.
-        remember_worker_flash_attn_version(worker)
-        ensure_prefix_calibration(worker)
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
-        if getattr(_get_gr_config(worker), "beam_graph_widths", None) is not None:
-            logger.warning(
-                "beam.graph_widths is NPU-only startup pre-capture; CUDA captures "
-                "dynamic Decode (batch, width) shapes lazily on first use."
+def capture_cuda_startup_graph(
+    worker: Any,
+    *,
+    hooks_type: CudaStageHooksType | None = None,
+    allow_eager_fallback: bool = False,
+) -> bool:
+    """Capture the CUDA startup Decode graph for the admitted batch plan."""
+    if hooks_type is None:
+        raise ValueError("CUDA GR startup capture requires explicit stage hooks")
+    # Measure (or load) the device-local prefix cost model before any Beam graph
+    # is captured: the cache write is a YAML file and the probe needs the GPU to
+    # itself. Failures degrade to "no calibration", never to a failed start-up.
+    from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
+        ensure_prefix_calibration,
+    )
+    from vllm_gr.v1.attention.backends.beam_prefix_policy import (
+        remember_worker_flash_attn_version,
+    )
+
+    # The request path may run without a vLLM config context, so persist the
+    # operator's explicit FlashAttention choice while it is still available.
+    remember_worker_flash_attn_version(worker)
+    ensure_prefix_calibration(worker)
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    if getattr(_get_gr_config(worker), "beam_graph_widths", None) is not None:
+        logger.warning(
+            "beam.graph_widths is NPU-only startup pre-capture; CUDA captures "
+            "dynamic Decode (batch, width) shapes lazily on first use."
+        )
+
+    existing = getattr(worker, "_gr_gpu_stage_runner", None)
+    if existing is not None:
+        validate_stage_hooks_type(existing.hooks, hooks_type)
+        if (
+            existing.graph is None
+            or not existing.graph.ready
+            or not existing.closed
+            or getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+        ):
+            raise RuntimeError(
+                "Asynchronous scheduling startup encountered an incomplete capture state"
             )
-
-        existing = getattr(worker, "_gr_gpu_stage_runner", None)
-        if existing is not None:
-            validate_stage_hooks_type(existing.hooks, hooks_type)
-            if (
-                existing.graph is None
-                or not existing.graph.ready
-                or not existing.closed
-                or getattr(worker, "_gr_async_decode_graph_capture_failed", False)
-            ):
-                raise RuntimeError(
-                    "Asynchronous scheduling startup encountered an incomplete capture state"
-                )
-            return True
-        error = _capture_batch(
-            worker,
-            _startup_capture_batch_size(),
-            hooks_type=hooks_type,
-            allow_eager_fallback=allow_eager_fallback,
-        )
-        if error is not None:
-            worker._gr_async_decode_graph_capture_failed = True
-            worker._gr_async_decode_graph_capture_error = error
-            return False
         return True
+    error = _capture_batch(
+        worker,
+        _startup_capture_batch_size(),
+        hooks_type=hooks_type,
+        allow_eager_fallback=allow_eager_fallback,
+    )
+    if error is not None:
+        worker._gr_async_decode_graph_capture_failed = True
+        worker._gr_async_decode_graph_capture_error = error
+        return False
+    return True
 
 
 def _capture_enabled(worker: Any) -> bool:
@@ -138,10 +156,10 @@ def _capture_enabled(worker: Any) -> bool:
             "Beam V1 requires worker decisions, fixed width and either an enabled "
             "canonical table or constrained_generation=False"
         )
-    if unconstrained and str(worker.device).split(":")[0] not in ("cuda", "npu"):
-        raise ValueError("unconstrained Beam V1 requires CUDA or NPU")
-    if unconstrained and str(worker.device).split(":")[0] == "npu":
-        validate_gr_device_config(worker.vllm_config)
+    if unconstrained:
+        # The selected backend decides whether it can serve an unconstrained
+        # session; shared startup code must not test the device name.
+        _stage_execution_service().admit_unconstrained_beam(worker)
     # A one-token session completes in Prefill and never replays a Decode graph.
     return (
         not worker.model_config.enforce_eager

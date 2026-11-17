@@ -261,23 +261,42 @@ def make_shutdown_with_constraint_backend(
     return shutdown_with_constraint_backend
 
 
-def _active_platform_module_name() -> str:
-    """Return the patch module for the platform selected by vLLM."""
-    from vllm.platforms import current_platform
+def _active_provider() -> Any:
+    """Return the backend selected for this process.
 
-    if str(current_platform.device_type).lower() == "npu":
-        return _NPU_PATCH_MODULE
-    return _GPU_PATCH_MODULE
+    The usual ordering is that ``patch._apply_patches`` already activated the
+    provider before runner patches install. A freshly spawned EngineCore child
+    can install runner patches first, so selection activates on demand; the
+    activation path is idempotent and still fails loudly when no registered
+    backend matches the native platform.
+    """
+    from vllm_gr.platforms.loader import activate_current_backend
+
+    return activate_current_backend()
+
+
+def _active_platform_module_name() -> str:
+    """Return the patch module name declared by the selected backend.
+
+    The provider owns backend identity, so shared bootstrapping never reads
+    ``current_platform.device_type`` to choose a patch module.
+    """
+    return str(_active_provider().select_runner_patch_module_name(prefer_v2=False))
 
 
 def _active_runner_module_name() -> str:
-    """Select the platform first; only CUDA can opt into the V2 patches."""
-    from vllm.platforms import current_platform
+    """Let the selected backend choose between its V1 and V2 patch modules.
 
-    platform_module = _active_platform_module_name()
-    if str(current_platform.device_type).lower() == "cuda" and _use_v2_model_runner():
-        return _V2_GPU_PATCH_MODULE
-    return platform_module
+    A backend without a V2 runner is never asked about the V2 opt-in, so the
+    flag cannot silently reroute an unsupported backend to another backend's
+    module.
+    """
+    provider = _active_provider()
+    # A backend that does not declare a V2 runner does not have one, so the
+    # opt-in is never read for it.
+    supports_v2 = getattr(provider, "supports_v2_model_runner", None)
+    prefer_v2 = bool(callable(supports_v2) and supports_v2() and _use_v2_model_runner())
+    return str(provider.select_runner_patch_module_name(prefer_v2=prefer_v2))
 
 
 def _use_v2_model_runner() -> bool:

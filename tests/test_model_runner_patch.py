@@ -9,7 +9,20 @@ from typing import Any
 import pytest
 
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
+from vllm_gr.platforms.cuda import CUDA_BACKEND
+from vllm_gr.platforms.npu import NPU_BACKEND
 from vllm_gr.v1.worker import gpu_model_runner_patch, model_runner_patch
+
+
+def _use_backend(monkeypatch: pytest.MonkeyPatch, provider: Any) -> Any:
+    """Pin the activated backend so patch dispatch has a provider to consult.
+
+    Module selection reads the activated provider rather than the native
+    platform, so a test supplies that decision directly instead of faking
+    ``vllm.platforms.current_platform``.
+    """
+    monkeypatch.setattr(model_runner_patch, "_active_provider", lambda: provider)
+    return provider
 
 
 @pytest.mark.l1  # type: ignore[misc]
@@ -52,15 +65,12 @@ def test_dispatcher_selects_one_platform_module(
     # ambient VLLM_USE_V2_MODEL_RUNNER=1 (e.g. a V2 CI shard) cannot reroute
     # _active_runner_module_name to the V2 module.
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
-    # Fake vllm.platforms so the test runs without a real vLLM install.
-    fake_platforms = ModuleType("vllm.platforms")
-    setattr(fake_platforms, "current_platform", SimpleNamespace(device_type="npu"))
-    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
 
+    _use_backend(monkeypatch, NPU_BACKEND)
     assert model_runner_patch._active_platform_module_name() == (
         model_runner_patch._NPU_PATCH_MODULE
     )
-    getattr(fake_platforms, "current_platform").device_type = "cuda"
+    _use_backend(monkeypatch, CUDA_BACKEND)
     assert model_runner_patch._active_platform_module_name() == (
         model_runner_patch._GPU_PATCH_MODULE
     )
@@ -72,11 +82,7 @@ def test_dispatcher_selects_one_platform_module(
         imported.append(name)
         return selected
 
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_active_platform_module_name",
-        lambda: model_runner_patch._NPU_PATCH_MODULE,
-    )
+    _use_backend(monkeypatch, NPU_BACKEND)
     monkeypatch.setattr(
         model_runner_patch,
         "import_module",
@@ -131,6 +137,7 @@ def test_dispatcher_installs_required_and_optional_hooks_once(
         "_get_active_platform_module",
         lambda: platform_module,
     )
+    _use_backend(monkeypatch, CUDA_BACKEND)
 
     bookkeeping = Runner._bookkeeping_sync
     model_runner_patch.apply_worker_patches()
@@ -168,8 +175,11 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
     # V1-platform install test: pin the V2 flag off (see
     # test_dispatcher_selects_one_platform_module).
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
-    monkeypatch.setattr(
-        model_runner_patch, "_active_platform_module_name", lambda: platform_module_name
+    _use_backend(
+        monkeypatch,
+        NPU_BACKEND
+        if platform_module_name == model_runner_patch._NPU_PATCH_MODULE
+        else CUDA_BACKEND,
     )
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
     from vllm_gr.v1.worker.model_runner_patch import (
@@ -323,6 +333,7 @@ def test_dispatcher_installs_sample_tokens_hook_when_exposed(
         "_get_active_platform_module",
         lambda: platform_module,
     )
+    _use_backend(monkeypatch, NPU_BACKEND)
 
     model_runner_patch.apply_worker_patches()
 
@@ -343,22 +354,26 @@ def test_dispatcher_routes_platform_before_v2_flag(
     device_type: str,
     use_v2: bool,
 ) -> None:
-    """Only CUDA opts into V2; Ascend fallback keeps the NPU patch module."""
-    fake_platforms = ModuleType("vllm.platforms")
-    monkeypatch.setattr(
-        fake_platforms, "current_platform", SimpleNamespace(device_type=device_type), raising=False
-    )
-    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    """Only a backend with a V2 runner consults the V2 flag.
+
+    The flag is never read for a backend that has no V2 patch module, so an
+    ambient VLLM_USE_V2_MODEL_RUNNER cannot reroute an unsupported backend to
+    another backend's module.
+    """
+    provider = CUDA_BACKEND if device_type == "cuda" else NPU_BACKEND
 
     def v2_flag() -> bool:
-        assert device_type == "cuda", "non-CUDA routing must not consult the V2 flag"
+        assert provider.supports_v2_model_runner(), (
+            "a backend without a V2 runner must not consult the V2 flag"
+        )
         return use_v2
 
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", v2_flag)
+    _use_backend(monkeypatch, provider)
     expected = model_runner_patch._GPU_PATCH_MODULE
-    if device_type == "npu":
+    if device_type != "cuda":
         expected = model_runner_patch._NPU_PATCH_MODULE
-    elif device_type == "cuda" and use_v2:
+    elif use_v2:
         expected = model_runner_patch._V2_GPU_PATCH_MODULE
     assert model_runner_patch._active_runner_module_name() == expected
 
@@ -410,11 +425,7 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
 
     import vllm_gr.v1.worker.gpu_model_runner_v2_patch as v2_patch_module
 
-    fake_platforms = ModuleType("vllm.platforms")
-    monkeypatch.setattr(
-        fake_platforms, "current_platform", SimpleNamespace(device_type="cuda"), raising=False
-    )
-    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    _use_backend(monkeypatch, CUDA_BACKEND)
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: True)
     monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
     monkeypatch.setattr(
@@ -440,11 +451,7 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
 
     from vllm_gr.v1.worker import gr_startup
 
-    fake_platforms = ModuleType("vllm.platforms")
-    monkeypatch.setattr(
-        fake_platforms, "current_platform", SimpleNamespace(device_type="npu"), raising=False
-    )
-    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    _use_backend(monkeypatch, NPU_BACKEND)
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: True)
     monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
     events: list[str] = []

@@ -54,6 +54,13 @@ class FakeProvider:
     def get_attention_execution(self) -> Any:
         return object()
 
+    def create_stage_execution_service(self) -> Any:
+        return object()
+
+    def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:
+        del prefer_v2
+        return "tests.platforms.fakes.patch"
+
     def create_constrained_topk_execution(self, *, device: Any = None) -> None:
         del device
         return None
@@ -235,6 +242,13 @@ def test_provider_missing_only_constrained_topk_execution_is_rejected() -> None:
 
         def get_attention_execution(self) -> Any:
             return object()
+
+        def create_stage_execution_service(self) -> Any:
+            return object()
+
+        def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:
+            del prefer_v2
+            return "tests.platforms.fakes.patch"
 
     # Deliberately a structurally-invalid provider: typing it as Any keeps
     # strict mypy from rejecting the call site (the point is that the runtime

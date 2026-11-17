@@ -92,6 +92,37 @@ class LegacyProviderAdapter:
     def get_attention_execution(self) -> BeamAttentionExecution:
         return cast(BeamAttentionExecution, self.legacy.get_attention_execution())
 
+    def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:
+        """Return the fixed patch module of the version-1 identity.
+
+        A version-1 provider never declared a runner patch module, so the alias
+        that version 1 used for selection still applies. Capabilities are not
+        inferred from optional attributes: the V2 opt-in is accepted only where
+        version 1 already honored it.
+        """
+        del prefer_v2
+        if self.device_type == "npu":
+            return "vllm_gr.v1.worker.npu_model_runner_patch"
+        return "vllm_gr.v1.worker.gpu_model_runner_patch"
+
+    def supports_v2_model_runner(self) -> bool:
+        """A version-1 provider never declared a V2 runner module.
+
+        API version 1 predates the V2 patch layer, so the opt-in is not honored
+        rather than inferred from the provider's device type.
+        """
+        return False
+
+    def create_stage_execution_service(self) -> Any:
+        """Return the fixed stage service of the version-1 identity."""
+        if self.device_type == "npu":
+            from .ascend_services import AscendStageExecutionService
+
+            return AscendStageExecutionService()
+        from .cuda_services import CudaStageExecutionService
+
+        return CudaStageExecutionService()
+
     def create_constrained_topk_execution(
         self,
         *,

@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
 
+    from .services import StageExecutionService
+
 #: Qualified name of the vendor platform class this provider supports. The
 #: check is a lineage lookup on the already-selected platform instance, so it
 #: imports no vendor code and core keeps no platform table.
@@ -77,11 +79,35 @@ class NPUBackendProvider:
             import_module("vllm_gr.v1.worker.npu_model_runner_patch"),
         )
 
+    def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:
+        """Return the Ascend runner patch module.
+
+        Ascend has no ModelRunner V2 implementation in this release, so the V2
+        opt-in does not apply here and the flag is ignored rather than silently
+        falling back to another backend's module.
+        """
+        del prefer_v2
+        return "vllm_gr.v1.worker.npu_model_runner_patch"
+
+    def supports_v2_model_runner(self) -> bool:
+        """Ascend has no ModelRunner V2 patch module in this release."""
+        return False
+
     def get_attention_execution(self) -> BeamAttentionExecution:
         return cast(
             BeamAttentionExecution,
             import_module("vllm_gr.v1.attention.backends.beam_attn_npu"),
         )
+
+    def create_stage_execution_service(self) -> StageExecutionService:
+        """Return the Ascend stage execution service.
+
+        The service defers its own imports, so building it loads no vendor
+        runtime and this provider keeps its import-light contract.
+        """
+        from .ascend_services import AscendStageExecutionService
+
+        return AscendStageExecutionService()
 
     def create_constrained_topk_execution(
         self,

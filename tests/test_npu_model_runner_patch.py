@@ -27,6 +27,20 @@ from vllm_gr.v1.worker.npu_beam_stage_adapter import (
 from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
 
 
+def _use_ascend_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the activated backend to Ascend for stage-dispatch tests.
+
+    Stage dispatch asks the selected backend rather than the worker's device
+    name, and a process has exactly one selected backend. These tests build an
+    NPU worker on whatever host runs the suite, so they must also select the
+    Ascend provider explicitly.
+    """
+    import vllm_gr.platforms.loader as loader
+    from vllm_gr.platforms.npu import NPU_BACKEND
+
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
+
+
 def _eager_stage_output(
     *,
     kind: str,
@@ -1908,34 +1922,71 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler(
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu", "cpu"])  # type: ignore[misc]
-def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
+def test_shared_stage_dispatch_consults_the_provider_not_the_device(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    """Stage dispatch asks the selected backend; the worker device is irrelevant.
+
+    Hardware selection used to be a device-name comparison here. It now belongs
+    to the provider, so the same worker device routes through whichever service
+    the provider returns, and an unsupported backend fails before any executor
+    module is imported.
+    """
     from unittest.mock import Mock
 
+    import vllm_gr.platforms.loader as loader
     import vllm_gr.v1.worker.model_runner_common as common
     from vllm_gr.v1.worker import gpu_beam_stage_runner, npu_beam_stage_runner
 
     output = object()
-    stage = SimpleNamespace(execute=Mock(return_value=output))
-    cuda = Mock(return_value=stage)
-    npu = Mock(return_value=stage)
+    runner = SimpleNamespace(execute=Mock(return_value=output), execution_error=None)
+    cuda = Mock(return_value=runner)
+    npu = Mock(return_value=runner)
     monkeypatch.setattr(gpu_beam_stage_runner, "get_stage_runner", cuda)
     monkeypatch.setattr(npu_beam_stage_runner, "get_npu_stage_runner", npu)
+
+    service = SimpleNamespace(
+        execute=Mock(return_value=output),
+        retire=Mock(),
+        capture_startup_graph=Mock(),
+        admit_unconstrained_beam=Mock(),
+    )
+    provider = SimpleNamespace(create_stage_execution_service=Mock(return_value=service))
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: provider)
+
     hooks = object()
     worker = SimpleNamespace(device=device)
     scheduled = _eager_stage_output(kind="prefill")
-    if device == "cpu":
-        with pytest.raises(ValueError, match="no execution adapter"):
-            common._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
-        cuda.assert_not_called()
-        npu.assert_not_called()
-    else:
-        assert common._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks) is output
-        if device == "cuda":
-            assert cuda.call_args.kwargs["hooks_type"] is hooks
-            npu.assert_not_called()
-        else:
-            npu.assert_called_once()
-            cuda.assert_not_called()
+
+    assert common._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks) is output
+    provider.create_stage_execution_service.assert_called_once_with()
+    service.execute.assert_called_once()
+    # The hooks frame reaches the service; the service, not shared dispatch,
+    # decides how its backend consumes it.
+    assert service.execute.call_args.kwargs["hooks_type"] is hooks
+    cuda.assert_not_called()
+    npu.assert_not_called()
+
+
+def test_shared_stage_dispatch_surfaces_an_unselected_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsupported platform fails through the provider, not a device check."""
+
+    import vllm_gr.platforms.loader as loader
+    import vllm_gr.v1.worker.model_runner_common as common
+    from vllm_gr.platforms.errors import UnsupportedBackendError
+
+    def unsupported() -> None:
+        raise UnsupportedBackendError("no backend matches the selected platform")
+
+    monkeypatch.setattr(loader, "activate_current_backend", unsupported)
+
+    scheduled = _eager_stage_output(kind="prefill")
+    with pytest.raises(UnsupportedBackendError, match="no backend matches"):
+        common._dispatch_stage_frame(
+            SimpleNamespace(device="cpu"), scheduled, object(), hooks_type=object()
+        )
 
 
 def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2005,6 +2056,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     from vllm_gr.v1.worker import model_runner_common as common
     from vllm_gr.v1.worker import npu_beam_stage_runner
 
+    _use_ascend_backend(monkeypatch)
     logical = _eager_stage_output(kind="decode")
     metadata = next(iter(logical.gr_stage_metadata.values()))
     metadata.is_last_stage = False
@@ -2112,6 +2164,7 @@ def test_npu_failed_execute_reaches_sample_without_native_fallback(
     from vllm_gr.v1.worker import model_runner_common as common
     from vllm_gr.v1.worker import npu_beam_stage_runner
 
+    _use_ascend_backend(monkeypatch)
     failure = ValueError("injected execute failure")
     worker = SimpleNamespace(device="npu", execute_model_state=None)
     stage = object.__new__(NPUEagerBeamStageRunner)

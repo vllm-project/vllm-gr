@@ -9,7 +9,7 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -36,12 +36,9 @@ from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
 )
-from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
-from vllm_gr.ops.npu.rec_constrained_topk import (
-    MAX_TOP_K,
-    NPUConstraintOp,
-    resolve_rec_constrained_topk_npu,
-)
+
+if TYPE_CHECKING:
+    from vllm_gr.ops.npu.rec_constrained_topk import NPUConstraintOp
 
 _LOGIT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _READINESS_BACKGROUND_LOGIT = -0.25
@@ -269,6 +266,8 @@ def _upload_cuda_backend(
     max_top_k: int,
     max_rows: int,
 ) -> tuple[CUDAConstraintBackend, tuple[_ReadyCase, ...]]:
+    from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
+
     validate_cuda_sort_capacity(
         table.max_first_degree,
         table.metadata.max_prefix1_degree,
@@ -593,6 +592,9 @@ def load_constraint_backend(
 
     op: NPUConstraintOp | None = None
     if config.backend is ConstraintTableBackendEnum.CUDA:
+        # The CUDA sort-capacity check runs in _upload_cuda_backend, after the
+        # artifact is loaded. Only the dtype and placement gates are decidable
+        # from configuration alone, so only they are checked here.
         if config.max_top_k > MAX_CANDIDATE_WIDTH:
             raise ValueError(
                 f"CUDA constraint max_top_k must be <= {MAX_CANDIDATE_WIDTH}, "
@@ -603,6 +605,11 @@ def load_constraint_backend(
         if device.type != "cuda":
             raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
     if config.backend is ConstraintTableBackendEnum.NPU:
+        from vllm_gr.ops.npu.rec_constrained_topk import (
+            MAX_TOP_K,
+            resolve_rec_constrained_topk_npu,
+        )
+
         if config.max_top_k > MAX_TOP_K:
             raise ValueError(
                 f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {config.max_top_k}"

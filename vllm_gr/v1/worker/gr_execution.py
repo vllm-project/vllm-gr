@@ -13,6 +13,18 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooksType
 
 
+def _stage_execution_service() -> Any:
+    """Return the selected backend's GR stage execution service.
+
+    Resolution goes through the provider registry, never through the worker's
+    device name. An unselected backend fails here with its own diagnostic, which
+    keeps this module free of hardware-specific branches.
+    """
+    from vllm_gr.platforms.loader import activate_current_backend
+
+    return activate_current_backend().create_stage_execution_service()
+
+
 def _copy_record(value: Any) -> Any:
     # These native dataclasses store their fields (including GR metadata) in
     # __dict__. Preserve the complete shallow state without copy's reducer.
@@ -95,46 +107,19 @@ def execute_gr_stage(
     **kwargs: Any,
 ) -> Any:
     local = worker_input(scheduled)
-    device_type = str(worker.device).split(":")[0]
-    if device_type == "cuda":
-        from vllm_gr.v1.worker.gpu_beam_stage_runner import (
-            get_stage_runner,
-        )
-
-        if hooks_type is None:
-            raise ValueError("CUDA GR execution requires explicit stage hooks")
-        stage_runner = get_stage_runner(
-            worker,
-            local,
-            hooks_type=hooks_type,
-        )
-    elif device_type == "npu":
-        from vllm_gr.v1.worker.npu_beam_stage_runner import get_npu_stage_runner
-
-        stage_runner = get_npu_stage_runner(worker, local)
-    else:
-        raise ValueError("beam_search_v1 has no execution adapter for this device")
-    try:
-        return stage_runner.execute(local, original, *args, **kwargs)
-    except Exception as error:
-        # Native BatchQueue consumes sample first. Stale logits must never hide
-        # an execute failure from the corresponding sample Future.
-        stage_runner.execution_error = error
-        raise
+    # The selected backend owns executor selection. Shared dispatch must not
+    # compare the worker device against a device name to pick one.
+    service = _stage_execution_service()
+    return service.execute(
+        worker,
+        local,
+        original,
+        *args,
+        hooks_type=hooks_type,
+        **kwargs,
+    )
 
 
 def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
     local = worker_input(scheduled)
-    device_type = str(worker.device).split(":")[0]
-    if device_type == "cuda":
-        from vllm_gr.v1.worker.gpu_beam_stage_runner import (
-            execute_gr_retirement as retire,
-        )
-    elif device_type == "npu":
-        from vllm_gr.v1.worker.npu_beam_stage_runner import execute_npu_gr_retirement
-
-        return execute_npu_gr_retirement(worker, local)
-    else:
-        raise ValueError("beam_search_v1 has no retirement adapter for this device")
-
-    return retire(worker, local)
+    return _stage_execution_service().retire(worker, local)

@@ -25,6 +25,8 @@ _REQUIRED_PROVIDER_METHODS = (
     "apply_runtime_patches",
     "get_model_runner_hooks",
     "get_attention_execution",
+    "create_stage_execution_service",
+    "select_runner_patch_module_name",
     "create_constrained_topk_execution",
 )
 _REQUIRED_PROVIDER_METHODS_REQUIRED = ("matches",)

@@ -10,10 +10,44 @@ execution primitives, environment validation, and any platform-specific
 compatibility patches.
 
 Production startup already uses provider activation, environment validation,
-runtime compatibility patches, and the constrained TopK execution factory.
-The worker and attention dispatchers still select their implementations
-directly; the two provider getters describe available modules but do not
-replace those dispatchers.
+runtime compatibility patches, stage execution, and the constrained TopK
+execution factory. Shared stage dispatch, startup graph capture, and ModelRunner
+patch selection no longer compare a device name: each asks the selected provider
+for its bound execution service or its declared patch module.
+
+## Stage execution services
+
+`vllm_gr.platforms.services.StageExecutionService` is the contract shared stage
+code calls. A provider returns its service from
+`create_stage_execution_service()`, and the service answers the questions that
+would otherwise be device-name branches:
+
+| Service method | Question it answers |
+| --- | --- |
+| `execute(worker, scheduled, original, ...)` | Which executor runs this GR stage, and how does a failure reach sampling |
+| `retire(worker, scheduled)` | Which owner releases a drained stage |
+| `capture_startup_graph(worker, ...)` | Whether this backend captures a startup graph, and what a skip or failure means |
+| `admit_unconstrained_beam(worker)` | Whether this backend serves an unconstrained session |
+
+`vllm_gr/v1/worker/gr_execution.py` and `gr_startup.py` call the service returned
+by `activate_current_backend().create_stage_execution_service()`; neither file
+inspects `worker.device`. A backend whose service raises fails with its own
+diagnostic instead of a shared "no adapter for this device" message.
+
+`capture_startup_graph` returns `True` for a completed capture, `False` when
+capture does not apply to the runner, and raises when an attempted capture
+failed. Callers record the failure on the worker exactly as before.
+
+Services import their hardware modules inside method bodies, so building one
+keeps the import-isolation guarantee described below.
+
+## Runner patch module selection
+
+`select_runner_patch_module_name(prefer_v2=...)` returns the module that owns a
+backend's ModelRunner patches, and `supports_v2_model_runner()` declares whether
+that backend has a V2 implementation at all. `model_runner_patch` consults both,
+so the V2 opt-in is never paired with a device name and a backend without a V2
+runner cannot be rerouted to another backend's module.
 
 ## Lifecycle and process model
 

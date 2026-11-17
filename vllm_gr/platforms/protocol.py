@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
     from .identity import PlatformIdentity
+    from .services import StageExecutionService
 
 #: Provider API implemented by built-in and external providers in this release.
 PROVIDER_API_VERSION = 2
@@ -113,7 +114,33 @@ class GRBackendProvider(Protocol):
 
     def get_model_runner_hooks(self) -> ModelRunnerPatchHooks: ...
 
+    def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:
+        """Return the module name that owns this backend's ModelRunner patches.
+
+        Only a backend with a ModelRunner V2 implementation honors ``prefer_v2``.
+        Answering here keeps the V2 flag and the device name from being combined
+        in shared dispatch.
+        """
+        ...
+
+    def supports_v2_model_runner(self) -> bool:
+        """Whether this backend implements a ModelRunner V2 patch module.
+
+        Shared dispatch consults this before reading the V2 opt-in, so the flag
+        is never evaluated on a backend that has no V2 runner.
+        """
+        ...
+
     def get_attention_execution(self) -> BeamAttentionExecution: ...
+
+    def create_stage_execution_service(self) -> "StageExecutionService":
+        """Return the bound GR stage execution service for this backend.
+
+        Shared stage dispatch calls this instead of comparing ``worker.device``
+        against a device name. The service owns executor selection, retirement
+        and the backend's startup capture policy.
+        """
+        ...
 
     def create_constrained_topk_execution(
         self,
