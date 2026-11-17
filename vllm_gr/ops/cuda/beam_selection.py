@@ -824,8 +824,8 @@ def beam_search_group_cuda_out(
             out_parent_indices,
             out_scores,
             (
-                out_grouped_flat_indices 
-                if out_grouped_flat_indices is not None 
+                out_grouped_flat_indices
+                if out_grouped_flat_indices is not None
                 else out_parent_indices
             ),
             beam_width,
