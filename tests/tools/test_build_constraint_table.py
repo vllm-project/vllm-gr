@@ -132,10 +132,12 @@ def test_build_tool_is_reproducible(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert first.read_bytes() == second.read_bytes()
 
 
-def test_remote_model_requires_revision_before_loading() -> None:
+def test_remote_model_requires_revision_before_loading(tmp_path: Path) -> None:
+    triples = tmp_path / "triples.json"
+    triples.write_text(json.dumps(compile_relations_json([["1", "2", "3"]])))
     with pytest.raises(ValueError, match="requires --revision"):
         build_constraint_table(
-            triples_path="unused.json",
+            triples_path=triples,
             model="organization/remote-model",
             revision=None,
             output_path="unused.safetensors",
@@ -213,6 +215,124 @@ def test_local_model_directory_allows_omitted_revision(tmp_path: Path) -> None:
     model_path.mkdir()
 
     assert _resolve_model_revision(str(model_path), None) is None
+
+
+def _forbid_model_access(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    resolve_revision = MagicMock(side_effect=AssertionError("must validate local inputs first"))
+    monkeypatch.setattr(
+        build_constraint_table_module,
+        "_resolve_model_revision",
+        resolve_revision,
+    )
+    return resolve_revision
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("source_count", [0, 2])
+def test_rejects_invalid_sources_before_model_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_count: int
+) -> None:
+    resolve_revision = _forbid_model_access(monkeypatch)
+    source = tmp_path / "unused.json" if source_count else None
+    with pytest.raises(ValueError, match="provide exactly one"):
+        build_constraint_table(
+            triples_path=source,
+            multi_trie_manifest_path=source,
+            model="organization/remote-model",
+            revision="release",
+            output_path=tmp_path / "unused.safetensors",
+        )
+    resolve_revision.assert_not_called()
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("source_kind", ["triples", "manifest"])
+@pytest.mark.parametrize("contents", [None, b"{", b"\xff", b"[]"])
+def test_local_json_failures_precede_model_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: str,
+    contents: bytes | None,
+) -> None:
+    resolve_revision = _forbid_model_access(monkeypatch)
+    source = tmp_path / "source.json"
+    if contents is not None:
+        source.write_bytes(contents)
+    output = tmp_path / "unused.safetensors"
+    with pytest.raises(ValueError) as error:
+        build_constraint_table(
+            triples_path=source if source_kind == "triples" else None,
+            multi_trie_manifest_path=source if source_kind == "manifest" else None,
+            model="organization/remote-model",
+            revision="release",
+            output_path=output,
+        )
+    assert repr(str(source)) in str(error.value)
+    context = "constraint triples document" if source_kind == "triples" else "tries manifest"
+    assert context in str(error.value)
+    resolve_revision.assert_not_called()
+    assert not output.exists()
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {},
+        {"tries": []},
+        {"tries": {}},
+        {"tries": [None]},
+        {"tries": [{"trie_id": 1, "triples_path": "trie.json"}]},
+        {"tries": [{"trie_id": False, "triples_path": "trie.json"}]},
+        {"tries": [{"trie_id": 0, "triples_path": 1}]},
+        {"tries": [{"trie_id": 0, "triples_path": ""}]},
+    ],
+)
+def test_manifest_structure_precedes_model_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest: dict[str, object]
+) -> None:
+    resolve_revision = _forbid_model_access(monkeypatch)
+    source = tmp_path / "tries.json"
+    source.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="tries manifest") as error:
+        build_constraint_table(
+            triples_path=None,
+            multi_trie_manifest_path=source,
+            model="organization/remote-model",
+            revision="release",
+            output_path=tmp_path / "unused.safetensors",
+        )
+    assert repr(str(source)) in str(error.value)
+    resolve_revision.assert_not_called()
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("contents", [None, b"{", b"\xff", b"[]"])
+def test_child_json_failures_include_manifest_and_trie_before_model_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contents: bytes | None
+) -> None:
+    resolve_revision = _forbid_model_access(monkeypatch)
+    (tmp_path / "trie0.json").write_text("{}", encoding="utf-8")
+    source = tmp_path / "tries.json"
+    source.write_text(
+        json.dumps({"tries": [{"trie_id": i, "triples_path": f"trie{i}.json"} for i in range(2)]}),
+        encoding="utf-8",
+    )
+    child = tmp_path / "trie1.json"
+    if contents is not None:
+        child.write_bytes(contents)
+    with pytest.raises(ValueError) as error:
+        build_constraint_table(
+            triples_path=None,
+            multi_trie_manifest_path=source,
+            model="organization/remote-model",
+            revision="release",
+            output_path=tmp_path / "unused.safetensors",
+        )
+    assert "Trie 1" in str(error.value)
+    assert repr(str(source)) in str(error.value)
+    assert repr(str(child)) in str(error.value)
+    resolve_revision.assert_not_called()
 
 
 pytestmark = pytest.mark.cpu_test

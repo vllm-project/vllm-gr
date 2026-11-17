@@ -22,6 +22,59 @@ logger = logging.getLogger(__name__)
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
+def _load_json_object(path: Path, *, context: str) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as input_file:
+            document: Any = json.load(input_file)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read {context} {str(path)!r}: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"{context} {str(path)!r} must be a JSON object")
+    return document
+
+
+def _load_trie_documents(
+    triples_path: str | Path | None,
+    multi_trie_manifest_path: str | Path | None,
+) -> list[dict[str, Any]]:
+    """Validate local input structure before resolving or loading a model."""
+
+    if (triples_path is None) == (multi_trie_manifest_path is None):
+        raise ValueError("provide exactly one of --triples or --tries")
+    if triples_path is not None:
+        return [_load_json_object(Path(triples_path), context="constraint triples document")]
+
+    assert multi_trie_manifest_path is not None
+    manifest_path = Path(multi_trie_manifest_path)
+    manifest = _load_json_object(manifest_path, context="tries manifest")
+    tries = manifest.get("tries")
+    if not isinstance(tries, list) or not tries:
+        raise ValueError(
+            f"tries manifest {str(manifest_path)!r} must contain a non-empty tries list"
+        )
+    documents = []
+    for trie_id, trie in enumerate(tries):
+        if (
+            not isinstance(trie, dict)
+            or type(trie.get("trie_id")) is not int
+            or trie["trie_id"] != trie_id
+            or not isinstance(trie.get("triples_path"), str)
+            or not trie["triples_path"]
+        ):
+            raise ValueError(
+                f"tries manifest {str(manifest_path)!r} entry #{trie_id} must have "
+                "consecutive trie_id values and a non-empty triples_path"
+            )
+        source = manifest_path.parent / trie["triples_path"]
+        documents.append(
+            _load_json_object(
+                source,
+                context=f"Trie {trie_id} triples document from manifest {str(manifest_path)!r}",
+            )
+        )
+    return documents
+
+
 def _resolve_model_revision(model: str, revision: str | None) -> str | None:
     """Pin a remote model reference once; local snapshots need no revision.
 
@@ -90,8 +143,11 @@ def build_constraint_table(
 
     Provide either ``triples_path`` for one Trie or ``multi_trie_manifest_path``
     for a JSON manifest listing each Trie's triples document.
+    Local input structure is validated before resolving or loading the model;
+    semantic and tokenizer-dependent validation stays in the compiler.
     """
 
+    documents = _load_trie_documents(triples_path, multi_trie_manifest_path)
     resolved_revision = _resolve_model_revision(model, revision)
 
     from transformers import AutoConfig, AutoTokenizer
@@ -106,17 +162,6 @@ def build_constraint_table(
     if type(vocab_size) is not int or vocab_size <= 0:
         raise ValueError(f"model {model!r} does not expose a positive integer vocab_size")
 
-    if (triples_path is None) == (multi_trie_manifest_path is None):
-        raise ValueError("provide exactly one of --triples or --tries")
-    triples_file = Path(triples_path if triples_path is not None else multi_trie_manifest_path)
-    try:
-        with triples_file.open("r", encoding="utf-8") as input_file:
-            document: Any = json.load(input_file)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read triples document {str(triples_file)!r}: {exc}") from exc
-    if not isinstance(document, dict):
-        raise ValueError("constraint triples document must be a JSON object")
-
     tokenizer_digest = compute_tokenizer_digest(tokenizer)
     compiler = ConstraintTableArtifactCompiler(
         tokenizer,
@@ -124,27 +169,8 @@ def build_constraint_table(
         tokenizer_digest=tokenizer_digest,
     )
     if multi_trie_manifest_path is None:
-        table = compiler.compile(document)
+        table = compiler.compile(documents[0])
     else:
-        tries = document.get("tries")
-        if not isinstance(tries, list) or not tries:
-            raise ValueError("tries manifest must contain a non-empty tries list")
-        documents = []
-        for trie_id, trie in enumerate(tries):
-            if (
-                not isinstance(trie, dict)
-                or type(trie.get("trie_id")) is not int
-                or trie["trie_id"] != trie_id
-                or not isinstance(trie.get("triples_path"), str)
-                or not trie["triples_path"]
-            ):
-                raise ValueError("tries must have consecutive trie_id values and triples_path")
-            source = triples_file.parent / trie["triples_path"]
-            with source.open(encoding="utf-8") as stream:
-                trie_document = json.load(stream)
-            if not isinstance(trie_document, dict):
-                raise ValueError("trie triples document must be a JSON object")
-            documents.append(trie_document)
         table = compiler.compile_tries(documents)
     artifact_digest = save_constraint_table_artifact(table, output_path)
     return artifact_digest, tokenizer_digest, vocab_size
