@@ -57,6 +57,7 @@ def _backend_label(provider: Any) -> str:
 def create_constraint_execution(
     *,
     device: str | Any | None = None,
+    plan: Any = None,
 ) -> Any:
     """Create the platform constrained-top-k adapter, failing explicitly.
 
@@ -85,7 +86,14 @@ def create_constraint_execution(
     from vllm_gr.platforms.loader import activate_current_backend
 
     provider = activate_current_backend()
-    adapter = provider.create_constrained_topk_execution(device=device)
+    if plan is None:
+        adapter = provider.create_constrained_topk_execution(device=device)
+    else:
+        from vllm_gr.platforms.services import planning_provider
+
+        adapter = planning_provider(provider).create_constrained_topk_execution(
+            plan=plan, device=device
+        )
     if adapter is None:
         raise RuntimeError(
             "constraint_backend='constraint_table' cannot start: the active "

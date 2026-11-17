@@ -109,6 +109,7 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_engine_args_patch
       - tests/test_attention_backend_custom.py
+      - tests/test_backend_plan_engine_args.py
     process_roles: [main, api_server]
     target: vllm.engine.arg_utils.EngineArgs
     risk: high
@@ -153,12 +154,13 @@ patches:
     backend_id: null
     owner: vllm_gr/v1/engine/core.py, engine_core_patch.py, and hot_update.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
-    activation: the shared EngineCore plan, including the sanitized NPU child entrypoint, detects incomplete request dispatch or Trie-capacity initialization; the same installer mounts hot-update utilities independently of the optional management listener
+    activation: the shared EngineCore plan, including the sanitized NPU child entrypoint, detects incomplete request dispatch or Trie-capacity initialization; the constructor also verifies backend plan readiness before accepting requests; the same installer mounts hot-update utilities independently of the optional management listener
     validator_or_test:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
       - tests/test_gr_async_scheduler.py
       - tests/test_npu_multi_trie_routing.py
+      - tests/platforms/test_backend_plan.py
       - tests/test_ascend_compat.py
       - tests/contract/test_upstream_patch_contracts.py::test_core_hot_update_utility_contracts
       - tests/sidecar/test_management.py

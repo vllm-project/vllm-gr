@@ -40,6 +40,9 @@ def make_patched_engine_init(original):
     @wraps(original)
     def initialize(self, *args, **kwargs):
         original(self, *args, **kwargs)
+        from vllm_gr.platforms.binding import verify_engine_backend_readiness
+
+        verify_engine_backend_readiness(self)
         from vllm_gr.config import BeamExecutionMode, GRConfig
         from vllm_gr.v1.engine.core import loaded_constraint_trie_count
 

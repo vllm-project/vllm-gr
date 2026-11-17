@@ -143,6 +143,12 @@ def _validate_backend_provider(provider: Any, *, source: str) -> str:
             f"missing={missing!r}; {_origin(normalized, source)}; "
             f"{_registry_context(requested=normalized)}"
         )
+    from .services import validate_planning_api
+
+    try:
+        validate_planning_api(provider)
+    except ValueError as exc:
+        raise InvalidBackendProviderError(f"{exc}; {_origin(normalized, source)}") from exc
     return normalized
 
 
