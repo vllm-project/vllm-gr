@@ -104,9 +104,9 @@ EOF
 
 ## Change the beam width
 
-Set the request width to match the first entry of `gr.beam_width`. The first
-candidate width also matches the request width because Prefill expands one
-prompt into that many beams. Set `gr.constraint_table.max_top_k` to cover
+Set the request width to `max(gr.beam_width)`. The first entries of
+`gr.candidate_width` and `gr.beam_width` must match because Prefill expands
+each prompt once. Set `gr.constraint_table.max_top_k` to cover
 the largest configured candidate count. Set
 `--max-logprobs` to at least the candidate width and `--max-num-seqs` to at
 least the beam width for these server examples.

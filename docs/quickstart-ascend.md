@@ -190,8 +190,7 @@ of installed package metadata are separate questions.
 
 ## NPU decode execution options
 
-Beam Search V1 uses a fixed request width equal to the first entry of
-`gr.beam_width`. A smaller
+Beam Search V1 uses a fixed request width equal to `max(gr.beam_width)`. A smaller
 request width is rejected before submission; the NPU batch pool is not a
 variable-width view. Native request state advances by one token per request
 at Decode, while the NPU model executes `batch_size * beam_width` tokens.

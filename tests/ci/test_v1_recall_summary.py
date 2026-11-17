@@ -12,14 +12,7 @@ from benchmarks.beam_search.v1_recall_summary import TASKS, main, summarize
 from tests.helpers.paths import REPO_ROOT
 
 
-def make_repeated_results(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for name, value in {
-        "VLLM_GR_PREFILL_GRAPH_BUCKETS": "16,24,32,48",
-        "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS": "4",
-        "VLLM_GR_PREFILL_GRAPH_KV_BOUND": "8192",
-        "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE": "4",
-    }.items():
-        monkeypatch.setenv(name, value)
+def make_repeated_results(root: Path) -> None:
     (root / "commit.txt").write_text("test-commit\n", encoding="utf-8")
     (root / "total_wall_seconds.txt").write_text("1050\n", encoding="utf-8")
     for number in range(1, 11):
@@ -101,10 +94,8 @@ def _set_sid_recall(root: Path, run: int, task: str, recall: float) -> None:
     file.write_text(json.dumps(metrics), encoding="utf-8")
 
 
-def test_ten_repeats_report_variation_and_confirm_task_specific_regression(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+def test_ten_repeats_report_variation_and_confirm_task_specific_regression(tmp_path: Path) -> None:
+    make_repeated_results(tmp_path)
     candidate, result, summary, failures = summarize(tmp_path, 10)
     assert not failures
     assert len(result["runs"]) == 10
@@ -155,10 +146,8 @@ def test_ten_repeats_report_variation_and_confirm_task_specific_regression(
     assert "Baseline check: FAILED." in summary
 
 
-def test_repeated_gate_rejects_changed_sample_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+def test_repeated_gate_rejects_changed_sample_identity(tmp_path: Path) -> None:
+    make_repeated_results(tmp_path)
     file = tmp_path / "runs" / "run-02" / "ad" / "model_ad_bw128_bs4_1000.json"
     metrics = json.loads(file.read_text(encoding="utf-8"))
     metrics["sample_ids"][0] = -1
@@ -169,9 +158,9 @@ def test_repeated_gate_rejects_changed_sample_identity(
 
 @pytest.mark.parametrize("calibration_repeats", [3, 10])  # type: ignore[misc]
 def test_declared_calibration_count_keeps_screening_and_confirmation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calibration_repeats: int
+    tmp_path: Path, calibration_repeats: int
 ) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+    make_repeated_results(tmp_path)
     candidate, result, _, _ = summarize(tmp_path, calibration_repeats)
     candidate["source_ci"] = {"calibration_repeats": calibration_repeats}
     candidate["calibration_sid_recall32"] = {
@@ -194,10 +183,8 @@ def test_declared_calibration_count_keeps_screening_and_confirmation(
 
 
 @pytest.mark.parametrize("calibration_repeats", [0, 1, 2, True, 3.0, "3"])  # type: ignore[misc]
-def test_invalid_calibration_count_is_rejected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calibration_repeats: object
-) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+def test_invalid_calibration_count_is_rejected(tmp_path: Path, calibration_repeats: object) -> None:
+    make_repeated_results(tmp_path)
     candidate, result, _, _ = summarize(tmp_path, 3)
     candidate["source_ci"] = {"calibration_repeats": calibration_repeats}
     candidate["calibration_sid_recall32"] = {
@@ -209,10 +196,8 @@ def test_invalid_calibration_count_is_rejected(
         summarize(tmp_path, 1, baseline)
 
 
-def test_calibration_samples_must_match_declared_count(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+def test_calibration_samples_must_match_declared_count(tmp_path: Path) -> None:
+    make_repeated_results(tmp_path)
     candidate, result, _, _ = summarize(tmp_path, 3)
     candidate["source_ci"] = {"calibration_repeats": 3}
     candidate["calibration_sid_recall32"] = {
@@ -243,7 +228,7 @@ def test_committed_baseline_uses_measured_upgrade_calibration() -> None:
 def test_cli_writes_repeat_artifacts_and_step_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+    make_repeated_results(tmp_path)
     step_summary = tmp_path / "github-summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(step_summary))
     monkeypatch.delenv("V1_RECALL_BASELINE_FILE", raising=False)
@@ -261,7 +246,7 @@ def test_cli_writes_repeat_artifacts_and_step_summary(
 def test_cli_confirmed_failure_preserves_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+    make_repeated_results(tmp_path)
     candidate, result, _, _ = summarize(tmp_path, 10)
     candidate["calibration_sid_recall32"] = {
         task: [run["tasks"][task]["recall@32"] for run in result["runs"]] for task in TASKS
@@ -284,7 +269,7 @@ def test_cli_confirmed_failure_preserves_reports(
 def test_graph_profile_comes_from_metrics_and_requires_b4_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+    make_repeated_results(tmp_path)
     monkeypatch.setenv("VLLM_GR_PREFILL_GRAPH_KV_BOUND", "changed")
     candidate, _, _, _ = summarize(tmp_path, 1)
     assert candidate["graph_profile"]["prefill_kv_bound"] == "8192"
@@ -296,10 +281,8 @@ def test_graph_profile_comes_from_metrics_and_requires_b4_replay(
         summarize(tmp_path, 1)
 
 
-def test_different_tasks_dipping_in_different_rounds_do_not_fail(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    make_repeated_results(tmp_path, monkeypatch)
+def test_different_tasks_dipping_in_different_rounds_do_not_fail(tmp_path: Path) -> None:
+    make_repeated_results(tmp_path)
     candidate, result, _, _ = summarize(tmp_path, 10)
     candidate["calibration_sid_recall32"] = {
         task: [run["tasks"][task]["recall@32"] for run in result["runs"]] for task in TASKS

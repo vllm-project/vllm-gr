@@ -105,7 +105,7 @@ def parse_args(*, quickstart: bool = False) -> argparse.Namespace:
     parser.add_argument(
         "--candidate-width",
         type=int,
-        help="Candidates per beam row (1..256); defaults to --beam-width",
+        help="Candidates per parent after Prefill (table: 1..256, unconstrained CUDA: 1..1024); defaults to --beam-width",
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--length-penalty", type=float, default=1.0)

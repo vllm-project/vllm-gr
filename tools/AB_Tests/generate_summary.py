@@ -447,6 +447,8 @@ def main() -> int:
             "request_rate": "sequential" if offline else raw["request_rate"],
             "beam_search": True,
             "n": args.beam_width,
+            "catalog_path": raw.get("catalog_path")
+            or (raw.get("engine_config") or {}).get("catalog_path"),
             "input_tokens_target": args.input_length,
             "input_tokens_observed": {
                 "min": min(observed_input_lengths),
@@ -459,19 +461,7 @@ def main() -> int:
                 "input_tokens": args.input_length,
             },
             "warmup_requests": args.warmup_requests,
-            "server_args": raw["engine_config"]
-            if offline
-            else {
-                "max_logprobs": 1024,
-                "beam_max_width": 1024,
-                "max_num_seqs": 1024,
-                "max_num_batched_tokens": 16384,
-                "scheduling_policy": "fcfs",
-                "gpu_memory_utilization": 0.90,
-                "catalog_path": "/opt/vllm-gr/test_profilling/video_constraint_triples.json",
-                "constraint_backend": "constraint_table",
-                "enable_thinking": False,
-            },
+            "server_args": raw["engine_config"] if offline else raw.get("engine_config"),
             "benchmark_args": {
                 "temperature": 0,
                 "max_tokens": raw["max_tokens"] if offline else None,

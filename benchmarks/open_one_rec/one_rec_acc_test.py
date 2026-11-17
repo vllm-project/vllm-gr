@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ except ImportError:
     from vllm.sampling_params import BeamSearchParams
 
 logger = logging.getLogger(__name__)
+DEFAULT_MODEL = "OpenOneRec/OneRec-1.7B"
 
 
 def get_sampling_params(gen_config: dict[str, Any]) -> SamplingParams:
@@ -103,6 +105,7 @@ def run_offline_v1_inference(
     batch_size: int,
     *,
     sample_ids: list[str] | None = None,
+    expected_beams: int | None = None,
 ) -> list[MockRequestOutput]:
     """Preserve sample order and decode only the generated SID token suffix."""
     if batch_size not in (1, 2, 4):
@@ -124,10 +127,11 @@ def run_offline_v1_inference(
             reason = f"V1 returned an unexpected number of items: {len(raw_outputs)} of {size}"
             raise InferenceError(dict.fromkeys(batch_ids, reason))
         for sample_id, prompt, output in zip(batch_ids, batch, raw_outputs, strict=True):
-            if len(output.sequences) != params.beam_width:
+            expected = params.beam_width if expected_beams is None else expected_beams
+            if len(output.sequences) != expected:
                 reason = (
                     f"V1 returned an unexpected number of beams: "
-                    f"{len(output.sequences)} of {params.beam_width}"
+                    f"{len(output.sequences)} of {expected}"
                 )
                 raise InferenceError({sample_id: reason})
             # Compact output excludes the original prompt. Keep the public SID
@@ -258,10 +262,54 @@ def _report_failure(args: argparse.Namespace, reason: str, **diagnostics: Any) -
     return 1
 
 
+def _offline_settings(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    from vllm_gr.config import gr_config_to_mapping
+    from vllm_gr.config.parser import (
+        common_engine_defaults,
+        load_engine_gr_config,
+        read_settings,
+    )
+    from vllm_gr.engine.startup import native_settings
+
+    document = read_settings(args.config) if args.config else {}
+    native = native_settings(document)
+    gr = load_engine_gr_config(None, None, args.gr, startup_document=document)
+    width = gr.beam_max_width
+    if width is None or args.n not in (None, width) or args.beam_max_width not in (None, width):
+        raise ValueError(
+            "Offline Beam requires --n and --beam-max-width to match max(gr.beam_width)"
+        )
+    settings = {
+        "model": DEFAULT_MODEL,
+        "trust_remote_code": True,
+        "attention_config": {"backend": "CUSTOM"},
+        "gpu_memory_utilization": 0.7,
+        "max_num_seqs": max(width, args.batch_size),
+        "max_logprobs": max(gr.deployment.candidate_width or (width,)),
+        **native,
+        "gr": gr_config_to_mapping(gr)["gr"],
+    }
+    # With a fixed context, reserve one full prompt per member unless YAML
+    # specifies the scheduler budget. Native auto length is resolved at startup.
+    model_len = native.get("max_model_len", common_engine_defaults()["max_model_len"])
+    if isinstance(model_len, int) and model_len > 0 and "max_num_batched_tokens" not in native:
+        settings["max_num_batched_tokens"] = model_len * args.batch_size
+    if args.model is not None:
+        settings["model"] = args.model
+    if args.backend is not None:
+        settings["attention_config"] = {
+            **(settings["attention_config"] or {}),
+            "backend": args.backend,
+        }
+    if args.enforce_eager:
+        settings["enforce_eager"] = True
+    return settings, width
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run OpenOneRec Benchmark")
     parser.add_argument(
-        "--model", type=str, default="OpenOneRec/OneRec-1.7B", help="Path to model or HF hub name"
+        "--model", help="Override the deployment model (default: OpenOneRec/OneRec-1.7B)"
     )
     parser.add_argument("--dataset-name", default="onerec", help="Name of the dataset to use.")
     parser.add_argument("--dataset-path", type=str, default="./data", help="Path to data directory")
@@ -304,8 +352,12 @@ def main() -> int:
         help="Offline V1 logical batch size; partial tails split into 4/2/1",
     )
     parser.add_argument(
-        "--gr", nargs="?", const={}, type=json.loads, help="Explicit GR settings as a JSON object"
+        "--gr-config",
+        dest="gr",
+        type=json.loads,
+        help="Override YAML gr settings with a JSON object",
     )
+    parser.add_argument("--gr", nargs="?", const={}, type=json.loads, help=argparse.SUPPRESS)
 
     parser.add_argument(
         "--result-dir",
@@ -368,9 +420,9 @@ def main() -> int:
 
     # 1. Load Configuration
     if args.gr is not None and not isinstance(args.gr, dict):
-        parser.error("--gr must be a JSON object")
-    if args.gr is not None:
-        logger.info("Detected --gr flag, enabling vllm-gr mode for accuracy test.")
+        parser.error("--gr-config must be a JSON object")
+    if args.endpoint and (args.config or args.gr):
+        parser.error("Set --config and --gr-config on the server for online accuracy testing")
 
     if args.task_type not in TASK_REGISTRY:
         print(f"Task {args.task_type} not found in configuration.")
@@ -409,21 +461,17 @@ def main() -> int:
     # 2. Initialize Engine
     engine_kwargs = {}
     if args.endpoint:
+        args.model = args.model or DEFAULT_MODEL
         logger.info(f"\nUsing OpenAI-compatible API at: {args.endpoint}")
         logger.info(f"Model: {args.model}")
     else:
-        if not args.config and not args.gr:
-            parser.error(
-                "Offline accuracy testing requires a V1 constraint artifact in --gr or --config"
-            )
-        width = gen_config.get("num_beams", 1)
+        if not args.config and args.gr is None:
+            parser.error("Supply the offline deployment with --config or --gr-config")
         steps = gen_config.get("max_new_tokens", 5) - 2
         if steps not in (1, 2, 3):
             parser.error(
                 "V1 supports only 1/2/3 generated SID tokens; long reasoning is unsupported"
             )
-        if args.beam_max_width not in (None, width):
-            parser.error("Request beam width must equal the canonical V1 max_width")
         if args.catalog_path or args.constraint_backend:
             parser.error("Supply the compiled artifact in gr.constraint_table")
         if args.backend not in (None, "CUSTOM"):
@@ -431,96 +479,75 @@ def main() -> int:
         if args.max_concurrency is not None:
             parser.error("Use --batch-size 1/2/4 for offline V1 batching")
         if args.no_constrained_generation:
-            parser.error("Select constraint_mode in --gr")
-        engine_kwargs = {
-            "model": args.model,
-            "trust_remote_code": True,
-            "config": args.config,
-            "gr": args.gr,
-            **({"attention_config": {"backend": "CUSTOM"}} if args.gr and not args.config else {}),
-            "async_scheduling": True,
-            "enforce_eager": args.enforce_eager,
-            "enable_chunked_prefill": False,
-            "max_model_len": 8192,
-            "max_num_batched_tokens": 8192 * args.batch_size,
-            "max_num_seqs": max(width, args.batch_size),
-            "max_logprobs": width,
-            "gpu_memory_utilization": 0.7,
-        }
-
-    # 3. Prepare Data
-    # prompts = mock_data_loader(task_config, args.num_prompts)  # Replace with real data loading
-    logger.info(f"Loading real data from {args.dataset_path}...")
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    loader = DataLoaderWrapper(tokenizer=tokenizer, data_dir=args.dataset_path)
-    split = task_config.get("splits", ["test"])[0]
-    dataset = loader.load_data(
-        task_name=args.task_type,
-        split=split,
-        sample_size=args.num_prompts if args.num_prompts else None,
-    )
-
-    prompts = []
-    references = {}
-    sample_ids = []
-
-    for sample_id, item in dataset.items():
-        prompt = item["prompt"]
-        prompts.append(prompt)
-        references[sample_id] = item["ground_truth"]
-        sample_ids.append(sample_id)
-
-    if not prompts:
-        return _report_failure(args, "no samples to evaluate")
-
-    # 4. Run Inference
-    logger.info("\nStarting Inference...")
-    gen_start = 0.0
-    gen_end = 0.0
-    if args.endpoint:
-        gen_start = time.perf_counter()
-        api_url = f"http://{args.host}:{args.port}{args.endpoint}"
+            parser.error("Select constraint_mode in --gr-config")
         try:
-            outputs = run_api_inference(
-                prompts,
-                args.model,
-                api_url,
-                args.api_key,
-                gen_config,
-                max_concurrency=args.max_concurrency,
-                chat_template_kwargs=args.chat_template_kwargs,
-                samples=list(dataset.items()),
-                request_timeout=args.request_timeout,
-            )
-        except InferenceError as exc:
-            return _report_failure(args, str(exc), sample_errors=exc.failures)
-        gen_end = time.perf_counter()
-    else:
-        params = BeamSearchParams(
-            beam_width=gen_config["num_beams"],
-            max_tokens=gen_config["max_new_tokens"],
-            temperature=gen_config["temperature"],
-            ignore_eos=True,
-            begin_token="<|sid_begin|>",
-            end_token="<|sid_end|>",
-            include_stop_str_in_output=True,
+            engine_kwargs, width = _offline_settings(args)
+        except ValueError as error:
+            parser.error(str(error))
+        args.model = engine_kwargs["model"]
+        gen_config["num_beams"] = width
+
+    with nullcontext() if args.endpoint else GRLLM(**engine_kwargs) as llm:
+        if llm is None:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        else:
+            tokenizer = llm.get_tokenizer()
+        loader = DataLoaderWrapper(tokenizer=tokenizer, data_dir=args.dataset_path)
+        dataset = loader.load_data(
+            task_name=args.task_type,
+            split=task_config.get("splits", ["test"])[0],
+            sample_size=args.num_prompts or None,
         )
-        from vllm_gr.config import GRConfig
-
+        if not dataset:
+            return _report_failure(args, "no samples to evaluate")
+        sample_ids = list(dataset)
+        prompts = [item["prompt"] for item in dataset.values()]
         try:
-            with GRLLM(**engine_kwargs) as llm:
-                config = GRConfig.from_vllm_config(llm.llm_engine.vllm_config)
-                if config.beam_max_width is None or width != config.beam_max_width:
-                    parser.error(
-                        "Offline accuracy testing requires V1 and the configured beam width"
-                    )
+            if llm is None:
+                gen_start = time.perf_counter()
+                outputs = run_api_inference(
+                    prompts,
+                    args.model,
+                    f"http://{args.host}:{args.port}{args.endpoint}",
+                    args.api_key,
+                    gen_config,
+                    max_concurrency=args.max_concurrency,
+                    chat_template_kwargs=args.chat_template_kwargs,
+                    samples=list(dataset.items()),
+                    request_timeout=args.request_timeout,
+                )
+            else:
+                from vllm_gr.entrypoints.beam_search.request_params import (
+                    apply_beam_request_defaults,
+                )
+
+                params = apply_beam_request_defaults(
+                    llm.llm_engine.vllm_config,
+                    BeamSearchParams(
+                        beam_width=gen_config["num_beams"],
+                        max_tokens=gen_config["max_new_tokens"],
+                        temperature=gen_config["temperature"],
+                        ignore_eos=True,
+                        begin_token="<|sid_begin|>",
+                        end_token="<|sid_end|>",
+                        include_stop_str_in_output=True,
+                    ),
+                )
+                expected = (
+                    params.result_width or (params.dynamic_beam_widths or [params.beam_width])[-1]
+                )
                 gen_start = time.perf_counter()
                 outputs = run_offline_v1_inference(
-                    llm, prompts, params, args.batch_size, sample_ids=sample_ids
+                    llm,
+                    prompts,
+                    params,
+                    args.batch_size,
+                    sample_ids=sample_ids,
+                    expected_beams=expected,
                 )
-                gen_end = time.perf_counter()
+            gen_end = time.perf_counter()
         except InferenceError as exc:
             return _report_failure(args, str(exc), sample_errors=exc.failures)
 

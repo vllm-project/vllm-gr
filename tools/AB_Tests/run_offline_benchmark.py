@@ -141,6 +141,26 @@ def create_v1_llm(args: argparse.Namespace, max_tokens: int) -> Iterator[Any]:
             yield llm
 
 
+def resolved_engine_config(vllm_config: Any) -> dict[str, Any]:
+    from vllm_gr.config import GRConfig, gr_config_to_mapping
+
+    scheduler = vllm_config.scheduler_config
+    backend = vllm_config.attention_config.backend
+    return {
+        "attention_config": {"backend": backend.name if backend is not None else None},
+        "gr": gr_config_to_mapping(GRConfig.from_vllm_config(vllm_config))["gr"],
+        "max_logprobs": vllm_config.model_config.max_logprobs,
+        "max_model_len": vllm_config.model_config.max_model_len,
+        "max_num_seqs": scheduler.max_num_seqs,
+        "max_num_batched_tokens": scheduler.max_num_batched_tokens,
+        "scheduling_policy": scheduler.policy,
+        "async_scheduling": scheduler.async_scheduling,
+        "enable_chunked_prefill": scheduler.enable_chunked_prefill,
+        "gpu_memory_utilization": vllm_config.cache_config.gpu_memory_utilization,
+        "enable_prefix_caching": vllm_config.cache_config.enable_prefix_caching,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -219,17 +239,10 @@ def main() -> int:
     )
     params.begin_token = "<|sid_begin|>"
     params.end_token = "<|sid_end|>"
-    # GR beam search prepends begin_token after the dataset has already shaped
-    # the prompt to input_length. Reserve both that token and the full requested
-    # generation budget at the 8K/10K boundaries.
-    engine_max_model_len = max(8192, args.input_length + max_tokens)
-
     miss_samples: list[dict[str, Any]] = []
     hit_samples: list[dict[str, Any]] = []
     with create_v1_llm(args, max_tokens) as llm:
-        effective = llm.llm_engine.vllm_config
-        prefix_caching = effective.cache_config.enable_prefix_caching
-        chunked_prefill = effective.scheduler_config.enable_chunked_prefill
+        engine_config = resolved_engine_config(llm.llm_engine.vllm_config)
         for prompt_token_ids in prompt_token_ids_list[: args.warmup_requests]:
             if not llm.reset_prefix_cache():
                 raise RuntimeError("prefix cache reset failed during warmup")
@@ -308,23 +321,8 @@ def main() -> int:
             "cache_protocol": "paired cold miss followed by identical warm hit",
             "internal_stages": "not measured by this frontend E2E benchmark",
         },
-        "engine_config": {
-            "attention_backend": "CUSTOM",
-            "beam_graph_enabled": True,
-            "beam_max_width": args.beam_width,
-            "max_logprobs": args.beam_width,
-            "max_num_seqs": args.beam_width,
-            "max_num_batched_tokens": max(16384, engine_max_model_len),
-            "max_model_len": engine_max_model_len,
-            "scheduling_policy": "fcfs",
-            "gpu_memory_utilization": 0.90,
-            "catalog_path": str(args.catalog),
-            "constraint_backend": "canonical_cuda",
-            "single_request": True,
-            "async_scheduling": True,
-            "enable_prefix_caching": prefix_caching,
-            "enable_chunked_prefill": chunked_prefill,
-        },
+        "catalog_path": str(args.catalog.resolve()),
+        "engine_config": engine_config,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

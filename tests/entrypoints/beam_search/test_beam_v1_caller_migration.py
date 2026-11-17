@@ -67,42 +67,82 @@ def test_accuracy_rejects_mismatched_output_counts() -> None:
             )
 
 
-@pytest.mark.parametrize("eager", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("explicit", [False, True])  # type: ignore[misc]
 def test_accuracy_cli_configures_beam_capacity(
-    monkeypatch: pytest.MonkeyPatch, eager: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit: bool
 ) -> None:
-    import transformers
-
     import benchmarks.open_one_rec.one_rec_acc_test as benchmark
 
-    class EngineReached(Exception):
+    config = tmp_path / "accuracy.yaml"
+    (tmp_path / "base.yaml").write_text(
+        "model: deployed\nmax-model-len: 4k\nmax-num-batched-tokens: 8192\n"
+        f"gpu-memory-utilization: 0.35\ntrust-remote-code: false\nenforce-eager: {str(not explicit).lower()}\n"
+        "gr:\n  beam_width: [2, 4, 2]\n  candidate_width: [2, 2, 2]\n"
+        "  prefix_calibration_path: calibration.yaml\n"
+    )
+    config.write_text("import: base.yaml\ngr:\n  result_width: 1\n")
+    expected_results = 2 if explicit else 1
+    engine_tokenizer = object()
+
+    class Engine:
+        def __init__(self, **kwargs: Any) -> None:
+            assert kwargs["model"] == ("override" if explicit else "deployed")
+            assert kwargs["enforce_eager"] is True
+            assert kwargs["trust_remote_code"] is False
+            assert kwargs["max_model_len"] == 4000
+            assert kwargs["max_num_batched_tokens"] == 8192
+            assert kwargs["gpu_memory_utilization"] == 0.35
+            assert kwargs["gr"]["prefix_calibration_path"] == str(tmp_path / "calibration.yaml")
+            self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(additional_config={"vllm_gr": {"gr": kwargs["gr"]}})
+            )
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def get_tokenizer(self) -> object:
+            return engine_tokenizer
+
+    def dataset(tokenizer: object, **kwargs: Any) -> Any:
+        assert tokenizer is engine_tokenizer
+        return SimpleNamespace(
+            load_data=lambda **kw: {"0": {"prompt": "test", "ground_truth": "SID"}}
+        )
+
+    class InferenceReached(Exception):
         pass
 
-    def engine(**kwargs: Any) -> None:
-        assert kwargs["enforce_eager"] is eager
-        assert kwargs["async_scheduling"] is True
-        raise EngineReached
+    def infer(llm: Any, prompts: list[str], params: Any, batch_size: int, **kwargs: Any) -> None:
+        assert params.beam_width == 4
+        assert params.dynamic_beam_widths == [2, 4, 2]
+        assert kwargs["expected_beams"] == expected_results
+        raise InferenceReached
 
-    monkeypatch.setattr(
-        "vllm_gr.config.parser.load_gr_config",
-        lambda _: SimpleNamespace(beam_max_width=128),
-    )
-    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **kw: object())
-    monkeypatch.setattr(
-        benchmark,
-        "DataLoaderWrapper",
-        lambda **kw: SimpleNamespace(
-            load_data=lambda **kw: {"0": {"prompt": "test", "ground_truth": "a SID"}}
-        ),
-    )
-    monkeypatch.setattr(benchmark, "GRLLM", engine)
+    monkeypatch.setattr(benchmark, "GRLLM", Engine)
+    monkeypatch.setattr(benchmark, "DataLoaderWrapper", dataset)
+    monkeypatch.setattr(benchmark, "run_offline_v1_inference", infer)
     monkeypatch.setattr(
         sys,
         "argv",
-        ["accuracy", "--task-type", "video", "--config", "config.json"]
-        + (["--enforce-eager"] if eager else []),
+        ["accuracy", "--task-type", "video", "--config", str(config)]
+        + (
+            [
+                "--n",
+                "4",
+                "--enforce-eager",
+                "--model",
+                "override",
+                "--gr-config",
+                '{"result_width":2}',
+            ]
+            if explicit
+            else []
+        ),
     )
-    with pytest.raises(EngineReached):
+    with pytest.raises(InferenceReached):
         benchmark.main()
 
 
@@ -145,6 +185,7 @@ def test_accuracy_http_forwards_template_options(
     "options,message",
     [
         (["--endpoint", "/v1/chat/completions", "--enforce-eager"], "on the server"),
+        (["--endpoint", "/v1/chat/completions", "--config", "server.yaml"], "on the server"),
         (["--endpoint", "/v1/chat/completions", "--chat-template-kwargs", "[]"], "JSON object"),
         (["--chat-template-kwargs", "{}"], "only to online"),
     ],
@@ -158,6 +199,52 @@ def test_accuracy_cli_rejects_misleading_execution_options(
     with pytest.raises(SystemExit, match="2"):
         benchmark.main()
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_ab_records_resolved_engine_config() -> None:
+    from tools.AB_Tests.run_offline_benchmark import resolved_engine_config
+
+    config = SimpleNamespace(
+        additional_config={
+            "vllm_gr": {
+                "gr": {
+                    "beam_width": [8, 4, 2],
+                    "candidate_width": [8, 4, 2],
+                    "constraint_mode": "none",
+                    "beam_graph_enabled": False,
+                }
+            }
+        },
+        attention_config=SimpleNamespace(backend=SimpleNamespace(name="CUSTOM")),
+        model_config=SimpleNamespace(max_logprobs=11, max_model_len=4096),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=13,
+            max_num_batched_tokens=6144,
+            policy="priority",
+            async_scheduling=True,
+            enable_chunked_prefill=False,
+        ),
+        cache_config=SimpleNamespace(gpu_memory_utilization=0.65, enable_prefix_caching=False),
+    )
+
+    recorded = json.loads(json.dumps(resolved_engine_config(config)))
+    gr = recorded.pop("gr")
+    assert gr["beam_width"] == [8, 4, 2]
+    assert gr["candidate_width"] == [8, 4, 2]
+    assert gr["beam_graph_enabled"] is False
+    assert recorded == {
+        "attention_config": {"backend": "CUSTOM"},
+        "max_logprobs": 11,
+        "max_model_len": 4096,
+        "max_num_seqs": 13,
+        "max_num_batched_tokens": 6144,
+        "scheduling_policy": "priority",
+        "async_scheduling": True,
+        "enable_chunked_prefill": False,
+        "gpu_memory_utilization": 0.65,
+        "enable_prefix_caching": False,
+    }
 
 
 def test_e2e_includes_lazy_text_and_uses_only_v1(monkeypatch: Any) -> None:

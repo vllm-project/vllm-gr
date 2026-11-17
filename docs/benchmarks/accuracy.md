@@ -19,7 +19,11 @@ This guide explains how to run the accuracy benchmark using the [`one_rec_acc_te
 Prepare the matching model snapshot and a canonical V1 configuration with a
 compiled Constraint Table. Follow the [artifact and engine setup](../../examples/offline_inference/beam_search/README.md#constraint-table-artifact).
 Use the same model and tokenizer snapshot for evaluation and artifact
-compilation. Set `--n` to match the first entry of `gr.beam_width` in the config. An enabled
+compilation. The offline benchmark uses the deployment model, tokenizer, native
+engine settings, and Beam widths. Use `--model` or `--gr-config` for explicit
+overrides. An optional `--n` must equal `max(gr.beam_width)`, the request
+capacity. The number of expected results follows `gr.result_width` or the
+last retained width for the request. An enabled
 Constraint Table fixes generation to exactly three generated SID tokens,
 including the token sampled during Prefill; with both OneRec boundary tokens
 configured that is public `max_tokens=5`. The video task below uses three. The
@@ -107,9 +111,10 @@ the reported mean can be fractional.
 | `--task-type`      | str   | -                | Task to run (ad, product, label_cond, video, interactive)                 |
 | `--result-dir`     | str   | -                | Directory to save debug evaluation files                                  |
 | `--debug`          | -     | -                | Enable debug mode for evaluators                                          |
-| `--config`         | path  | -                | Offline engine YAML. Use `--gr` for JSON overrides.                       |
+| `--config`         | path  | -                | Offline deployment YAML, including any imported settings.                 |
+| `--gr-config`      | JSON  | -                | Explicit overrides for the offline deployment's `gr` mapping.             |
 | `--batch-size`     | int   | 1                | Offline V1 batch size (1, 2 or 4)                                         |
-| `--n`              | int   | dataset-specific | Override the dataset default beam width (number of beams) for beam search |
+| `--n`              | int   | mode-specific    | Uses the engine capacity offline and the task default online.             |
 | `--temperature`    | float | dataset-specific | Override the dataset default temperature                                  |
 
 #### Arguments for Online benchmark

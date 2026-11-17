@@ -195,7 +195,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --batch-size 1 \
   --use-beam-search \
   --task-type video \
-  --gr "$gr_overrides" \
+  --gr-config "$gr_overrides" \
   --n "$beam_width")
 offline_status=$?
 printf '%s\n' "$output"

@@ -121,7 +121,7 @@ Both modes require:
 - Logical B=1..8 with shared generation parameters; online batch/capture policy
   defaults to `[1, 2, 4]` and must fit engine capacity.
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
-- Match the request `beam_width` to the first entry in `gr.beam_width`.
+- Match the request `beam_width` to `max(gr.beam_width)`.
 - Token/text prompts rather than embedding prompts.
 - No speculative decoding, LoRA, quantization, hybrid model, encoder-decoder
   model, or multimodal model.
@@ -194,26 +194,18 @@ compiles a temporary artifact and fills in its path and digests.
 | Parameter | Example value | How to set it |
 | --- | --- | --- |
 | `gr.constraint_mode` | `table` | The script enables the table when you pass `--catalog`. It selects `none` for full-vocabulary Beam Search. |
-| `backend` | `cuda` | Use `--constraint-backend npu` on Ascend. |
-| `max_top_k` | `128` | The script sets this capacity to the candidate width. In YAML, set it to at least that width. |
-| `candidate_width` | Omitted, resolves to `128` | Use `--candidate-width` to set the candidates per Beam row independently of `--beam-width`. The accepted range is 1 through 256. Set it explicitly when the Beam width exceeds 256. |
-| `path` | `/absolute/path/to/video_constraint_table.safetensors` | In YAML, use the absolute path to the compiled artifact. |
-| `format` | `constraint_table_v1` | Use this format for the three-layer table. |
-| `artifact_digest` | `sha256:REPLACE_WITH_ARTIFACT_DIGEST` | In YAML, substitute the artifact digest printed by `build_constraint_table.py`. |
-| `tokenizer_digest` | `sha256:REPLACE_WITH_TOKENIZER_DIGEST` | In YAML, substitute the tokenizer digest printed by the same command. |
+| `gr.constraint_table.backend` | `cuda` | Use `--constraint-backend npu` on Ascend. |
+| `gr.candidate_width` | `[128, 128, 128]` | The first stage uses `--beam-width`. Later stages use `--candidate-width` when supplied, otherwise `--beam-width`. Table mode supports 1 through 256 candidates per parent. |
+| `gr.constraint_table.max_top_k` | `128` | The script sets this to the largest candidate width across stages. |
+| `gr.constraint_table.path` | `/absolute/path/to/video_constraint_table.safetensors` | YAML also accepts an artifact path relative to the file that declares it. |
+| `gr.constraint_table.format` | `constraint_table_v1` | Use this format for the three-layer table. |
+| `gr.constraint_table.digests.artifact` | `sha256:REPLACE_WITH_ARTIFACT_DIGEST` | Copy the artifact digest printed by `build_constraint_table.py`. |
+| `gr.constraint_table.digests.tokenizer` | `sha256:REPLACE_WITH_TOKENIZER_DIGEST` | Copy the tokenizer digest from the same build. |
 
-Use an absolute artifact path. Do not combine this canonical configuration with
-legacy `vllm_gr_*` keys in `additional_config`.
-
-The Python `vllm_gr_config` input and
-`additional_config["vllm_gr"]` use the same canonical serialization. Engine
-creation normalizes default fields in both forms and preserves unrelated
-`additional_config` entries. Equivalent GR settings therefore contribute the
-same configuration hash to vLLM's compilation cache, including when a disabled
-Constraint Table omits optional fields.
-Normalization can change the cache key of a previously sparse configuration,
-so the first run after upgrading may compile again. Subsequent runs with the
-same normalized settings reuse the new cache key.
+Python accepts the complete deployment YAML through `GRLLM(config=...)`.
+Pass explicit GR overrides in `gr={...}` and native vLLM overrides as keyword
+arguments. The driver resolves the deployment once and passes the settings to
+workers. See the [configuration guide](../../../docs/configuration.md).
 
 #### Important `GRLLM` parameters
 
@@ -222,14 +214,14 @@ These values apply to the single-request CUDA command in
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `vllm_gr_config` | In-memory mapping | The script builds the mapping from its arguments. The Python API also accepts a YAML path. |
+| `gr` | In-memory mapping | The script builds the GR settings from its arguments. |
 | `async_scheduling` | `True` | EngineCore requires it for Beam Search V1 sessions. |
 | `enable_prefix_caching` | `True` | Enables Prefill prefix reuse. Correctness is independent of prefix caching. |
 | `enable_chunked_prefill` | `False` | The script processes the complete prompt in Prefill. |
 | `max_model_len` | `8192` | Set with `--max-model-len`. It must cover the prompt and generation budget. |
 | `max_num_batched_tokens` | `8192` | The script uses the larger of `max_model_len` and the batch's Prefill token budget. The full batch must fit when chunked Prefill is disabled. |
 | `max_num_seqs` | `128` | The script uses the larger of `--beam-width` and `--batch-size`. |
-| `max_logprobs` | `128` | The script uses `--candidate-width` when set and `--beam-width` otherwise. |
+| `max_logprobs` | `128` | The script uses the largest candidate width across stages. |
 | `enforce_eager` | `False` | The script sets it to `True` on Ascend with `--execution eager`. |
 
 ### Request parameters
@@ -239,7 +231,7 @@ these values for the fixed-width example.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `beam_width` | `128` | Taken from `--beam-width`. Match the first entry in `gr.beam_width`. |
+| `beam_width` | `128` | Taken from `--beam-width`. Match `max(gr.beam_width)`. |
 | `max_tokens` | `5` | The script adds two boundary positions to `--generated-steps`. |
 | `temperature` | `0.0` | Fixed by the script for Beam Search. |
 | `ignore_eos` | `True` | Ignores stop and EOS tokens during the fixed-length search. |
@@ -565,7 +557,8 @@ The first stage requires `K_1=W_1`. Each later stage must satisfy
 up to 1024; current constraint-table operators cap K at 256.
 
 An explicit `per_parent_beam_widths` overrides the startup
-`constraint_table.candidate_width`, subject to backend `max_top_k` capacity.
+`gr.candidate_width` schedule. In table mode, the candidate widths must fit
+`gr.constraint_table.max_top_k`.
 Without it, existing behavior and startup configuration restrictions remain.
 Each configured per-parent K is an upper bound: the shared execution policy uses
 `min(K, W_out)` candidates per parent because no parent can supply more than
@@ -580,8 +573,9 @@ selection, even when its widths happen to match.
 HTTP clients can pass the schedule in `vllm_xargs` through Completion or Chat;
 native non-GR Beam rejects an explicit schedule.
 
-`beam_width` remains the engine capacity in `[1, 256]` and must equal
-the first entry of `gr.beam_width`.
+The offline example uses `--beam-width` as its request width and engine
+capacity. Retained widths can reach 1024. In this example the first candidate
+width also equals `--beam-width`, so table mode limits that argument to 256.
 The schedule has exactly one integer in `[1, beam_width]` per effective generated
 step N, which must equal 3 when the constraint table is enabled. Without
 constraints, N can range from 1 through `gr.max_decode_steps`, subject to the
