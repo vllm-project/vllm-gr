@@ -58,7 +58,7 @@ aligned with it.
 | GR-PATCH-011 | GPU V1/V2 runner patches; `worker/hot_update.py` | `model_runner_patch.apply_worker_patches` | selected CUDA runner hooks are incomplete; common installer mounts Worker utilities | runner validator; GPU, utility contract, reload and lifecycle tests | GPU worker |
 | GR-PATCH-012 | NPU runner patch; `worker/hot_update.py`, `ascend_compat.py` | `model_runner_patch.apply_worker_patches`; delayed `NPUWorker.init_device` | active NPU runner hooks are incomplete; delayed initialization mounts Worker utilities | NPU runner, delayed-install and unsupported-reload guard tests | NPU worker |
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
-| GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
+| GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py`, `vllm_gr/ops/gpu_stage_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch`, CUDA ModelRunner constraint loader | hooks install at startup; canonical CUDA Beam V1 uses runner-local stage routing | installer result; sliced-logits, GPU-stage and optional patch-count tests | worker |
 | GR-PATCH-016 | `vllm_gr/npu_spawn_patch.py` | `vllm_gr.npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
 | GR-PATCH-018 | `vllm_gr/v1/ascend_compat.py` | `apply_penalties_warmup_oom_guard` | NPUWorker `init_device` runs and the native penalties warmup is present | installer result; NPU startup at `--max_num_seqs 2048` | NPU worker |
 | GR-PATCH-019 | `vllm_gr/v1/ascend_compat.py` | `apply_engine_core_config_sanitizer`, `patch_npu_worker_init_device` | NPU engine configuration and worker plugin initialization | Ascend config preservation and initialization tests; NPU startup | main, EngineCore, worker |
@@ -394,22 +394,35 @@ and Decode capture policy remain active when this cache is disabled.
 
 ### GR-PATCH-015 — Sliced Vocabulary Projection
 
-- Source: `vllm_gr/ops/sliced_logits.py`
+- Source: `vllm_gr/ops/sliced_logits.py` and `vllm_gr/ops/gpu_stage_logits.py`
 - Reload helper: `vllm_gr/ops/lm_head_cache.py` installs post-load hooks for dense
   `ParallelLMHead` instances by type, including heads named `output` and aliases.
   Shared-weight owners retain their hooks; existing caches refresh in place.
   Coverage: `tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload`.
-- Installer: `vllm_gr/ops/sliced_logits_patch.py`
+- Installer: `vllm_gr/ops/sliced_logits_patch.py` and the CUDA ModelRunner constraint loader
 - Orchestration: `vllm_gr/patch.py`
 - Targets:
     - `LogitsProcessor.__init__`
     - `LogitsProcessor._get_logits`
+    - CUDA ModelRunner V1/V2 `reload_weights` and Worker weight-transfer methods
     - `Sampler.gather_logprobs`
     - `vllm.v1.worker.gpu.sample.logprob.compute_topk_scores` and its bindings
       in the V2 sampler and rejection sampler
 - Risk: Medium
-- Activation: hooks are installed during runtime initialization; sliced projection is
-  used only when a valid vocabulary slice is configured.
+- Activation: hooks are installed during runtime initialization. With a canonical
+  CUDA Constraint Table, Beam `execution_mode="v1"` and a vocabulary window,
+  runner-local hooks use sliced projection only inside an admitted Beam stage;
+  ordinary requests retain full vocabulary. Native CUDA ModelRunner V1 and V2
+  share this scope. A stage that projects anything other than its configured
+  window width fails instead of scoring against a mismatched token space.
+- Lifecycle: CUDA ModelRunner reload and Worker weight-transfer hooks retire the
+  cached slice so the next Beam stage re-clones from the updated parameter. An
+  unusable head keeps the full-projection-then-slice fallback, which preserves
+  window scoring at higher projection cost. A failed update requires a complete
+  model reload. Direct parameter writes outside the native update APIs require a
+  complete model reload.
+- Validation: `tests/test_gpu_stage_logits.py`, sliced-logits tests and CUDA
+  model execution tests cover projection routing, cleanup and scoring.
 - Removal condition: vLLM exposes stable output-projection and logprob-width extension points.
 
 ### GR-PATCH-016 — NPU-aware Spawn Start Method

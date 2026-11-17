@@ -225,17 +225,18 @@ patches:
     removal_condition: vLLM supports named third-party backend identities without a shared CUSTOM slot
 
   - id: GR-PATCH-015
-    owner: vllm_gr/ops/sliced_logits.py
+    owner: vllm_gr/ops/sliced_logits.py and vllm_gr/ops/gpu_stage_logits.py
     shared_helpers: vllm_gr/ops/lm_head_cache.py
-    installer: vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch
-    activation: projection hooks execute with a valid slice; cache reload hooks install after model load by ParallelLMHead type, independent of module names
+    installer: vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch and CUDA ModelRunner constraint loader
+    activation: projection hooks execute with a valid slice; cache reload hooks install after model load by ParallelLMHead type, independent of module names; canonical CUDA Beam execution_mode v1 applies the window only inside an admitted Beam stage and ordinary requests retain full vocabulary
     validator_or_test:
       - vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch return value
       - tests/test_sliced_logits.py
+      - tests/test_gpu_stage_logits.py
       - tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload
       - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
     process_roles: [worker]
-    target: LogitsProcessor, Sampler.gather_logprobs, V2 compute_topk_scores, and quant_method.process_weights_after_loading for dense ParallelLMHead weights and tied owners
+    target: LogitsProcessor, Sampler.gather_logprobs, V2 compute_topk_scores, and quant_method.process_weights_after_loading for dense ParallelLMHead weights and tied owners, CUDA ModelRunner reload_weights, and Worker weight-transfer methods
     risk: medium
     contract: sliced-vocabulary-projection
     removal_condition: vLLM exposes stable output-projection and logprob-width hooks

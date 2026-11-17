@@ -246,6 +246,44 @@ dedicated `<think>` and `</think>` tokenizer tokens and a compatible SID catalog
 It exposes a checkpoint's capabilities; it does not add reasoning proficiency
 to a checkpoint that was not trained for it.
 
+#### CUDA setup and commands
+
+Run from the repository root in the configured vLLM CUDA environment. Replace
+the model and prompt paths; the combined workflow uses the same complete prompt
+for thinking and SID generation.
+
+```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export CUDA_VISIBLE_DEVICES=0
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_USE_V2_MODEL_RUNNER=0
+export USE_TF=0
+
+MODEL=/absolute/path/to/OneRec_Qwen3_1.7B
+CATALOG=tools/AB_Tests/constraints/video_constraint_triples.json
+PROMPT=/absolute/path/to/recommendation_prompt.txt
+mkdir -p results/cot
+
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --catalog "$CATALOG" --prompt "$PROMPT" \
+  --constraint-backend cuda --batch-size 1 --beam-width 8 --generated-steps 3 \
+  --cot --cot-max-tokens 1536 --max-model-len 4096 \
+  --temperature 0 --top-p 1 --top-k -1 --seed 0 --print-beams 8 \
+  --output-json results/cot/cuda_beam.json
+```
+
+`--batch-size 4` repeats the prompt across four independent requests. A loaded
+CUDA Constraint Table uses full-vocabulary projection for ordinary generation;
+eligible V1 Beam execution uses the catalog window for its SID scoring. When
+the cached sliced head cannot be used, Beam can project the full vocabulary and
+then select the window, with higher projection cost. The mode does not transfer
+KV ownership between phases. Direct Beam retains its existing window scoring.
+
+In this example, `--execution` selects the NPU Beam execution mode. CUDA Beam
+keeps its existing graph behavior; passing `--execution eager` does not force a
+CUDA Beam eager run. A graph capture or configuration alone does not establish
+replay for an individual request.
+
 #### NPU setup and commands
 
 Run from the repository root in the configured vLLM-Ascend environment. Set
@@ -386,8 +424,8 @@ quality improvement claimed. Optional existing timing/profiling arguments are
 diagnostics. Change `--execution eager` to `--execution graph` to request the
 existing NPU graph path; normal runtime fallbacks remain applicable. A graph
 configuration or a SID Decode replay does not prove FULL Prefill replay, and
-this feature does not extend Prefill graph coverage. CUDA hardware validation
-of the combined workflow is not included.
+this feature does not extend Prefill graph coverage. GPU correctness and
+performance should be assessed against the target hardware and model.
 
 ### NPU graph correctness regression
 

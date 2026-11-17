@@ -174,6 +174,12 @@ def _apply_v2_runner_patches() -> None:
                 prepare_backend=_warmup_constraint_backend,
             )
 
+        reload_weights = getattr(runner_class, "reload_weights", None)
+        if callable(reload_weights):
+            from vllm_gr.ops.gpu_stage_logits import make_gpu_stage_reload_weights
+
+            runner_class.reload_weights = make_gpu_stage_reload_weights(reload_weights)
+
         shutdown = getattr(runner_class, "shutdown", None)
         if not getattr(shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
             runner_class.shutdown = make_shutdown_with_constraint_backend(
