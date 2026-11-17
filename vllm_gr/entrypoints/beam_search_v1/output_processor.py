@@ -124,7 +124,7 @@ class _V1BeamTailMaterializer:
     def __call__(self, beam: Any) -> None:
         from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 
-        suffix = beam.__dict__.pop("_v1_suffix")
+        suffix = beam.__dict__["_v1_suffix"]
         full = self._prepared.copy()
         full.extend(suffix)
         if self._shared_prompt is None:
@@ -135,11 +135,13 @@ class _V1BeamTailMaterializer:
             text = self._prompt_text + fast_decode(self._tokenizer, suffix)
         else:
             text = fast_decode(self._tokenizer, full)
+        # Decode and validate the class transition before publishing fields.
+        # A failed attempt keeps the lazy beam and its accepted tail intact.
+        beam.__class__ = BeamSearchSequence
         beam.__dict__["tokens"] = full
         beam.__dict__["logprobs"] = []
         beam.__dict__["text"] = text
-        beam.__dict__["_lazy_materializer"] = None
-        beam.__class__ = BeamSearchSequence
+        beam.__dict__.pop("_v1_suffix")
 
 
 class BeamSearchOutputProcessor:
