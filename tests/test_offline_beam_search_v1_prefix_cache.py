@@ -35,9 +35,7 @@ def _cli_args(
 
 
 def _fake_tokenizer() -> Any:
-    return SimpleNamespace(
-        encode=lambda text, *, add_special_tokens: [ord(char) for char in text]
-    )
+    return SimpleNamespace(encode=lambda text, *, add_special_tokens: [ord(char) for char in text])
 
 
 def test_prefix_workload_preserves_final_tokens_and_reports_common_prefix(
@@ -45,10 +43,7 @@ def test_prefix_workload_preserves_final_tokens_and_reports_common_prefix(
 ) -> None:
     path = tmp_path / "workload.jsonl"
     path.write_text(
-        json.dumps({"prompt_token_ids": [1, 2, 3, 4]})
-        + "\n"
-        + json.dumps({"text": "abx"})
-        + "\n",
+        json.dumps({"prompt_token_ids": [1, 2, 3, 4]}) + "\n" + json.dumps({"text": "abx"}) + "\n",
         encoding="utf-8",
     )
 
@@ -156,9 +151,7 @@ def test_prefix_workload_benchmark_consumes_unique_rows(
         assert output_mode == "full"
         calls.append(prompts)
         return [
-            SimpleNamespace(
-                sequences=[SimpleNamespace(token_ids=(7, 8), cumulative_logprob=-1.0)]
-            )
+            SimpleNamespace(sequences=[SimpleNamespace(token_ids=(7, 8), cumulative_logprob=-1.0)])
             for _ in prompts
         ]
 
@@ -201,8 +194,10 @@ def test_prefix_cache_run_controls_engine_caching_and_workload_requests(
 ) -> None:
     workload_path = tmp_path / "workload.jsonl"
     workload_path.write_text(
-        json.dumps({"prompt_token_ids": [10, 11]}) + "\n"
-        + json.dumps({"prompt_token_ids": [10, 12]}) + "\n",
+        json.dumps({"prompt_token_ids": [10, 11]})
+        + "\n"
+        + json.dumps({"prompt_token_ids": [10, 12]})
+        + "\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -243,9 +238,7 @@ def test_prefix_cache_run_controls_engine_caching_and_workload_requests(
         "transformers": {
             "AutoTokenizer": SimpleNamespace(from_pretrained=lambda *_args, **_kwargs: object())
         },
-        "vllm.inputs": {
-            "tokens_input": lambda ids, **kwargs: dict(prompt_token_ids=ids, **kwargs)
-        },
+        "vllm.inputs": {"tokens_input": lambda ids, **kwargs: dict(prompt_token_ids=ids, **kwargs)},
         "vllm_gr.entrypoints.gr": {"GRLLM": make_llm},
         "vllm_gr.sampling_params": {"BeamSearchParams": lambda **kwargs: SimpleNamespace(**kwargs)},
     }
@@ -293,10 +286,7 @@ def test_restrict_workload_excludes_unused_rows_from_statistics() -> None:
 def test_prompt_fits_context_accepts_exact_fit_and_rejects_one_over(
     effective_input_len: int, generated_steps: int, max_model_len: int, fits: bool
 ) -> None:
-    assert (
-        example.prompt_fits_context(effective_input_len, generated_steps, max_model_len)
-        == fits
-    )
+    assert example.prompt_fits_context(effective_input_len, generated_steps, max_model_len) == fits
 
 
 @pytest.mark.l1  # type: ignore[misc]

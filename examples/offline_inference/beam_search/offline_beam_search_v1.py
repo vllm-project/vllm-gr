@@ -284,9 +284,7 @@ class PrefixWorkload:
 def load_prefix_workload(path: Path, tokenizer: Any) -> PrefixWorkload:
     """Load complete final prompts without truncation, padding, or chat templating."""
     rows: list[dict[str, Any]] = []
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -443,8 +441,7 @@ def next_benchmark_requests(
     if args.cache_mode == "cold":
         return isolate_prompts(selected, suffix), cursor
     copied = [
-        dict(request, prompt_token_ids=list(request["prompt_token_ids"]))
-        for request in selected
+        dict(request, prompt_token_ids=list(request["prompt_token_ids"])) for request in selected
     ]
     return copied, cursor
 
@@ -585,9 +582,7 @@ def benchmark_beam_search(
                 beam_row_evidence(iteration, row_start + index, request, output)
                 for index, (request, output) in enumerate(zip(measured, outputs, strict=True))
             )
-    prefix_cache_after = (
-        observed_prefix_cache_stats(llm) if workload_requests is not None else None
-    )
+    prefix_cache_after = observed_prefix_cache_stats(llm) if workload_requests is not None else None
 
     ordered = sorted(latencies_ms)
 
@@ -1021,9 +1016,7 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
             )
         workload = restrict_workload(workload, required_requests)
         effective_input_len = workload.max_prompt_tokens + 1
-        if not prompt_fits_context(
-            effective_input_len, args.generated_steps, args.max_model_len
-        ):
+        if not prompt_fits_context(effective_input_len, args.generated_steps, args.max_model_len):
             raise ValueError("workload prompt and generated tokens exceed --max-model-len")
     prefill_capacity = args.batch_size * (effective_input_len + 1)
     if getattr(args, "cot", False):
@@ -1123,8 +1116,7 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
             if cot_prompt_ids is not None:
                 prompt_token_ids = cot_prompt_ids
                 print(
-                    f"mode=cot_beam input_tokens={len(prompt_token_ids)}; "
-                    "--input-len is not used"
+                    f"mode=cot_beam input_tokens={len(prompt_token_ids)}; --input-len is not used"
                 )
             else:
                 assert args.prompt is not None
