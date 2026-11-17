@@ -9,9 +9,8 @@ dataclass.  Under V2 the beam surface is the beam_search_v1 persistent GR
 stage path (``execution_mode=v1``); the LEGACY ``beam_data`` frame stack has
 been removed, so this module installs only the slim hook set:
 
-- ``execute_model``: the slim wrapper (retirement/stage dispatch + beam_data
-  fail-fast), from
-  ``model_runner_common.make_patched_execute_model_v2``.
+- ``execute_model``: the local slim wrapper (retirement/stage dispatch and
+  legacy beam_data rejection), preserving ordinary native execution.
 - ``sample_tokens``: stage bypass (``stage_runner.pending`` → the stage
   runner's own constraint sampling); ordinary frames fall through to the
   native sampler.
@@ -39,6 +38,7 @@ from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.v1.worker import gpu_model_runner_v2_resources as v2_resources
+from vllm_gr.v1.worker import gr_execution, gr_gc
 from vllm_gr.v1.worker.gpu_postprocess_workspace import (
     _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
     make_load_model_with_beam_postprocess_workspace,
@@ -47,15 +47,17 @@ from vllm_gr.v1.worker.gpu_prefill_v2 import (
     try_add_gr_prefill_requests,
     try_prepare_gr_prefill_inputs_v2,
 )
-from vllm_gr.v1.worker.model_runner_common import (
+from vllm_gr.v1.worker.gr_context import (
+    _get_gr_config,
+)
+from vllm_gr.v1.worker.model_runner_contracts import (
     _CONSTRAINT_LOAD_PATCH_MARKER,
     _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
+    _WORKER_EXECUTE_PATCH_MARKER,
     _WORKER_V2_ADD_REQUESTS_PATCH_MARKER,
     _WORKER_V2_PREPARE_PATCH_MARKER,
     _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
-    _get_gr_config,
     is_worker_runner_v2_patched,
-    make_patched_execute_model_v2,
 )
 from vllm_gr.v1.worker.model_runner_patch import (
     make_load_model_with_constraint_backend,
@@ -93,6 +95,72 @@ def discover_worker_runners() -> tuple[tuple[str, type[Any]], ...]:
         logger.debug("GPUModelRunnerV2 import traceback", exc_info=True)
         return ()
     return (("GPUModelRunnerV2", GPUModelRunnerV2),)
+
+
+def make_patched_execute_model_v2(
+    _orig_execute_model: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Slim execute_model wrapper for the V2 ModelRunner (beam_search_v1 only).
+
+    Refactor design §4.2: under V2 the beam surface is the persistent GR
+    stage path; the LEGACY ``beam_data`` frame stack (M1 remap / M2 inline
+    sample / session refresh) is not supported.  The
+    wrapper therefore:
+
+    - dispatches retirement and stage control frames (shared helpers);
+    - FAILS FAST on a ``beam_data`` frame — the historical alternative was a
+      silent wrong-beam-results mode when the V1/V2 flag resolved differently
+      than the patch layer assumed (ISSUES §1.1); a loud error names both
+      remediations (execution_mode=v1, or unset the V2 flag);
+
+    Everything else is the untouched native ``execute_model``.
+    """
+    if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
+        return _orig_execute_model
+
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+
+    @wraps(_orig_execute_model)
+    def _patched_execute_model_step_v2(
+        self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        retirement = gr_execution._dispatch_retirement_frame(self, scheduler_output)
+        if retirement is not None:
+            return retirement
+
+        stage = gr_execution._dispatch_stage_frame(
+            self,
+            scheduler_output,
+            _orig_execute_model,
+            *args,
+            hooks_type=CudaStageHooksV2,
+            **kwargs,
+        )
+        if stage is not gr_execution._NOT_A_STAGE_FRAME:
+            return stage
+
+        if getattr(scheduler_output, "beam_data", {}):
+            raise ValueError(
+                "legacy beam_data frames are not supported under ModelRunnerV2; "
+                "use beam.execution_mode='v1' or unset VLLM_USE_V2_MODEL_RUNNER"
+            )
+
+        return _orig_execute_model(self, scheduler_output, *args, **kwargs)
+
+    @wraps(_orig_execute_model)
+    def patched_execute_model_v2(
+        self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        # Same quiescent-boundary tracking as the V1 wrapper: the GC-freeze
+        # daemon waits for in-flight executions to drain before collecting.
+        gr_gc._enter_worker_execute()
+        try:
+            return _patched_execute_model_step_v2(self, scheduler_output, *args, **kwargs)
+        finally:
+            gr_gc._exit_worker_execute()
+
+    setattr(patched_execute_model_v2, _WORKER_EXECUTE_PATCH_MARKER, True)
+    return patched_execute_model_v2
 
 
 def make_patched_sample_tokens_v2(
@@ -267,7 +335,7 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
         # heap is fully built. Freeze it so long-lived post-startup objects
         # are not rescanned by gen-1/gen-2 GC during serving (V1 parity;
         # measured 29-36ms collected=0 pauses when missing).
-        from vllm_gr.v1.worker.model_runner_common import (
+        from vllm_gr.v1.worker.gr_gc import (
             freeze_gc_after_graph_capture,
         )
 
@@ -288,9 +356,6 @@ def _apply_v2_runner_patches() -> None:
     Backend load wrapper last, so the final ``load_model`` carries the
     constraint marker that the V2 validation gate checks.
     """
-    from vllm_gr.v1.worker.numpy_staging import install_numpy_staging
-
-    install_numpy_staging()
     runners_to_patch = [
         (runner_name, runner_class)
         for runner_name, runner_class in discover_worker_runners()
@@ -351,6 +416,7 @@ def _apply_v2_runner_patches() -> None:
 __all__ = [
     "_apply_v2_runner_patches",
     "discover_worker_runners",
+    "make_patched_execute_model_v2",
     "make_patched_add_requests_v2",
     "make_patched_capture_model_v2",
     "make_patched_initialize_kv_cache_v2",

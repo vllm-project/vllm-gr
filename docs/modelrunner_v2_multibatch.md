@@ -101,6 +101,47 @@ Ordinary non-Beam capture retains native behavior; graph hooks remain optional
 capabilities of the native runner. Moving these operations does not change
 resource ownership, consumer-drain prerequisites or release timing.
 
+### Execution and shared support ownership
+
+V2 owns `make_patched_execute_model_v2` in `gpu_model_runner_v2_patch.py`.
+`model_runner_common.py` is limited to native V1 execution adaptation and active
+input proxies/row/logprob bookkeeping used by NPU. The public installer imports
+that V1 wrapper only after selecting V1; V2 does not load this adaptation module.
+
+Shared responsibilities have explicit owners:
+
+- `model_runner_contracts.py`: hardware-free patch markers and completeness checks.
+- `gr_execution.py`: frame classification, input isolation, stage/retirement
+  execution and failure propagation. Its one sentinel distinguishes an ordinary
+  frame from a handled stage whose legitimate result is `None`.
+- `gr_gc.py`: all Worker-side process-level GC state, locks, execute-depth accounting,
+  background freeze coordination and capture/warmup RPC functions.
+- `gr_context.py`: cached GR configuration, context construction and graph
+  diagnostics. Configuration remains cached on the native runner.
+
+```mermaid
+flowchart LR
+    V1["V1 integration and native adaptation"] --> D["GR dispatch and input isolation"]
+    V2["V2 integration"] --> D
+    V1 --> G["One process-level GC coordinator"]
+    V2 --> G
+    V1 --> C["GR configuration and context support"]
+    V2 --> C
+    I["Public patch installer"] --> K["Lightweight installation contracts"]
+```
+
+Both execute wrappers enter/leave the same GC coordination boundary, including
+exceptions. The existing freeze thresholds, timeout, retry and acknowledgement
+semantics are retained. Async sampling keeps V1 request context alive past
+`execute_model`; ordinary V2 frames continue to execute natively. Public Worker
+RPC names are unchanged and their functions remain importable in spawned workers.
+The public CUDA installer owns NumPy staging installation for both versions;
+version-specific sampling delegates retain their own installation markers and
+call the shared stage sampler. Resource invalidation and consumer-drain timing
+are unchanged. Frontend request guards and startup-heap leases retain their
+separate owner in `utils/engine_lifecycle.py`; these guard a different request
+lifetime, including when engines run in process.
+
 ### V1 compatibility boundary
 
 ModelRunner V1 uses the GR Prefill grid, clamps capture to the per-request

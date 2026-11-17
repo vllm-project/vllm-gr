@@ -14,25 +14,18 @@ from vllm_gr.v1.beam.execution_batch import (
     BeamExecutionContractError,
 )
 from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
+from vllm_gr.v1.worker.gr_context import (
+    _beam_full_graph_ready,
+    _beam_graph_enabled_for_run,
+    _create_beam_context,
+)
 
-# Shared device-neutral beam-graph helpers live in model_runner_common; they
-# are re-exported here so callers/tests that historically reached them via
-# this module keep working (and monkeypatching this alias still patches the
-# GPU patch behavior, which resolves them through this module's globals).
-from vllm_gr.v1.worker.model_runner_common import (
+# Shared context helpers and installation contracts have independent owners.
+from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_DETERMINE_PATCH_MARKER,
     _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
-)
-from vllm_gr.v1.worker.model_runner_common import (  # noqa: E402,F401
-    _beam_full_graph_ready as _common_beam_full_graph_ready,
-)
-from vllm_gr.v1.worker.model_runner_common import (
-    _beam_graph_enabled_for_run as _common_beam_graph_enabled_for_run,
-)
-from vllm_gr.v1.worker.model_runner_common import (
-    _create_beam_context as _common_create_beam_context,
 )
 from vllm_gr.v1.worker.prefill_graph_runner import (
     SUPPORTED_NUM_REQS,
@@ -89,21 +82,6 @@ def make_patched_sample_tokens_gpu(_orig_sample_tokens):
 
     setattr(patched_sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, True)
     return patched_sample_tokens
-
-
-def _beam_full_graph_ready(runner, num_tokens: int) -> bool:
-    """Deprecated local alias — see model_runner_common._beam_full_graph_ready.
-
-    Kept (delegating) so tests and callers that monkeypatch THIS module's
-    attribute affect the GPU determine patch, which resolves the helper
-    through this module's globals.
-    """
-    return _common_beam_full_graph_ready(runner, num_tokens)
-
-
-def _beam_graph_enabled_for_run(runner) -> bool:
-    """Deprecated local alias — see model_runner_common._beam_graph_enabled_for_run."""
-    return _common_beam_graph_enabled_for_run(runner)
 
 
 def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
@@ -248,14 +226,6 @@ def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
 # ---------------------------------------------------------------------------
 
 _BEAM_DUMMY_REQ_ID = "vllm-gr-beam-graph-dummy"
-
-
-def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
-    """Deprecated local alias — see model_runner_common._create_beam_context.
-
-    Kept (delegating) for callers/tests importing it from this module.
-    """
-    return _common_create_beam_context(runner, gr_cfg, max_batch=max_batch)
 
 
 def _capture_create_dummy_context(
@@ -426,7 +396,9 @@ def capture_beam_decode_graph(runner) -> bool:
     Returns True if a graph was captured.
     """
     from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     gr_cfg = _get_gr_config(runner)
     if not gr_cfg.beam_graph_active or runner.model_config.enforce_eager:

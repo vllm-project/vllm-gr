@@ -119,6 +119,9 @@ def test_implementations_subclass_the_contract() -> None:
             *mypy_hook.CUDA_STAGE_FILES,
             "tools/pre_commit/mypy.py",
             # Pin moved owners independently of the routing list itself.
+            "vllm_gr/v1/worker/model_runner_contracts.py",
+            "vllm_gr/v1/worker/gr_gc.py",
+            "vllm_gr/v1/worker/gr_context.py",
             "vllm_gr/v1/worker/gpu_model_runner_v2_patch.py",
             "vllm_gr/v1/worker/gpu_model_runner_v2_resources.py",
         }

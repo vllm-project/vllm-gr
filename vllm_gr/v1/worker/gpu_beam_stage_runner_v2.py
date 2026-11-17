@@ -103,7 +103,9 @@ class CudaStageHooksV2(CudaStageHooks):
 
     def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
         assert owner.inputs is not None
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         worker = self.worker
         batch_size = len(owner.bindings)
@@ -309,7 +311,9 @@ class CudaStageHooksV2(CudaStageHooks):
 
 def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -> bool:
     """Unselected/refused shapes fall back; missing selected graphs remain fatal."""
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     cfg = _get_gr_config(worker)
     requested = not worker.model_config.enforce_eager and cfg.beam_graph_enabled

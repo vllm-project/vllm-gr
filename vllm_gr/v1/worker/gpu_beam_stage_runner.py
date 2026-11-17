@@ -258,7 +258,9 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
 
 def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
     """Resolve decode graph replay, preserving unexpected-missing invariants."""
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     requested = not worker.model_config.enforce_eager and _get_gr_config(worker).beam_graph_enabled
     if not requested:
@@ -1200,7 +1202,7 @@ class AsyncGRRetireOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
             # serving session has fully drained and released its resources,
             # so the one-shot freeze covers lazily-created persistent state
             # without being consumed by the startup dummy session.
-            from vllm_gr.v1.worker.model_runner_common import (
+            from vllm_gr.v1.worker.gr_gc import (
                 schedule_warmup_gc_freeze,
             )
 
@@ -1250,7 +1252,7 @@ def get_stage_runner(
     dispatch_session = validate_dispatch_session(scheduler_output)
     stages = validate_dispatch(scheduler_output, session=dispatch_session)
     (m,) = stages
-    from vllm_gr.v1.worker.model_runner_common import (
+    from vllm_gr.v1.worker.gr_context import (
         _create_beam_context,
         _get_gr_config,
     )

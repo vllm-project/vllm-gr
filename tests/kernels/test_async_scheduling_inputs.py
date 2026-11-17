@@ -27,6 +27,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_RETIRE_RESULT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
+from vllm_gr.v1.worker import gr_gc as _gc_runtime
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.gr_inputs import ERROR_DISPATCH_STATE, GRInputBuffers
 
@@ -178,11 +179,9 @@ def test_planned_state_mismatch_is_a_device_error_with_no_generated_successor(dt
 
 
 def test_retirement_waits_for_output_consumer_and_returns_release_proof(monkeypatch):
-    from vllm_gr.v1.worker import model_runner_common
-
     freezes: list[str] = []
     monkeypatch.setattr(
-        model_runner_common,
+        _gc_runtime,
         "schedule_warmup_gc_freeze",
         lambda: freezes.append("scheduled"),
     )
@@ -252,7 +251,6 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         admission_worker,
         install_decode_model,
     )
-    from vllm_gr.v1.worker import model_runner_common
     from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
     from vllm_gr.v1.worker.gpu_beam_stage_runner import (
         GPUBeamStageRunner,
@@ -273,7 +271,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
     worker = admission_worker()
     freezes: list[str] = []
     monkeypatch.setattr(
-        model_runner_common,
+        _gc_runtime,
         "schedule_warmup_gc_freeze",
         lambda: freezes.append("scheduled"),
     )

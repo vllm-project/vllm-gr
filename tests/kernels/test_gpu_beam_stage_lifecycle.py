@@ -99,11 +99,11 @@ def test_native_output_completion_preserves_async_receipt(monkeypatch, hooks_cls
 
     from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_sample_tokens_gpu
     from vllm_gr.v1.worker.gpu_model_runner_v2_patch import (
+        make_patched_execute_model_v2,
         make_patched_sample_tokens_v2,
     )
     from vllm_gr.v1.worker.model_runner_common import (
         make_patched_execute_model,
-        make_patched_execute_model_v2,
     )
 
     worker = owner.worker
@@ -261,7 +261,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
         lambda: SimpleNamespace(is_last_rank=True),
     )
     monkeypatch.setattr(
-        "vllm_gr.v1.worker.model_runner_common._get_gr_config",
+        "vllm_gr.v1.worker.gr_context._get_gr_config",
         lambda _: SimpleNamespace(beam_graph_enabled=graph),
     )
 

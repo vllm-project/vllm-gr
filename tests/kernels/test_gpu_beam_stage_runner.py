@@ -39,6 +39,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
+from vllm_gr.v1.worker import gr_context as _gr_context
 from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
 from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     LOCAL_TILE_SIZE,
@@ -119,11 +120,9 @@ def test_failed_hooks_construction_preserves_admission(failure, stale_cache):
 
 @pytest.mark.parametrize("windows", [(4, 4), (None, 4), (4, None), (None, 1)])
 def test_admission_rejects_sliding_window_before_resource_creation(windows, monkeypatch):
-    from vllm_gr.v1.worker import model_runner_common
-
     worker = admission_worker(windows)
-    create_context = Mock(wraps=model_runner_common._create_beam_context)
-    monkeypatch.setattr(model_runner_common, "_create_beam_context", create_context)
+    create_context = Mock(wraps=_gr_context._create_beam_context)
+    monkeypatch.setattr(_gr_context, "_create_beam_context", create_context)
     with pytest.raises(ValueError, match="does not support sliding-window attention") as exc:
         get_stage_runner(worker, dispatch(metadata()), hooks_type=CudaStageHooksV1)
     first_window_layer = next(i for i, window in enumerate(windows) if window is not None)

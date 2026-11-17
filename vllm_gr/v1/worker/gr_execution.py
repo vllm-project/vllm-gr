@@ -138,3 +138,46 @@ def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
         raise ValueError("beam_search_v1 has no retirement adapter for this device")
 
     return retire(worker, local)
+
+
+def _dispatch_retirement_frame(self: Any, scheduler_output: Any) -> Any:
+    """Handle a GR retirement control frame; returns the retire output.
+
+    Returns None when ``scheduler_output`` is not a retirement frame (the
+    caller continues with the normal dispatch).
+    """
+    from vllm_gr.v1.engine.gr_async_scheduler import GR_RETIRE_OUTPUT_ATTR
+
+    if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is None:
+        return None
+    return execute_gr_retirement(self, scheduler_output)
+
+
+def _dispatch_stage_frame(
+    self: Any,
+    scheduler_output: Any,
+    orig_execute_model: Callable[..., Any],
+    *args: Any,
+    hooks_type: CudaStageHooksType | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Handle a persistent GR stage frame (beam_search_v1 execution).
+
+    Returns ``_NOT_A_STAGE_FRAME`` when ``scheduler_output`` is not a stage
+    frame; otherwise the stage runner's execute() result.  On an execution
+    failure the error is recorded on the stage runner before re-raising —
+    the native BatchQueue associates the execute and sample Futures, so
+    sampling must also fail or valid-looking stale logits could hide a
+    failed execute Future from that native path.
+    """
+    from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+
+    if not getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
+        return _NOT_A_STAGE_FRAME
+    return execute_gr_stage(
+        self, scheduler_output, orig_execute_model, *args, hooks_type=hooks_type, **kwargs
+    )
+
+
+# Sentinel distinguishing "not a stage frame" from a legitimate None result.
+_NOT_A_STAGE_FRAME = object()

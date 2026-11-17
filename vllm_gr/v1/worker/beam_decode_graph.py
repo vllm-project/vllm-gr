@@ -280,7 +280,9 @@ def get_beam_decode_graph(
     beam_width: int | None = None,
     graph_type: type[BeamDecodeGraph] = BeamDecodeGraph,
 ) -> BeamDecodeGraph:
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     graph = getattr(worker, "_beam_decode_graph", None)
     if graph is None:

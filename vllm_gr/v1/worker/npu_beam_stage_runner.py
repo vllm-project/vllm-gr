@@ -121,7 +121,7 @@ class NPUEagerBeamStageRunner:
                     plan.execution, self.attention_batch.sessions
                 )
             return
-        from vllm_gr.v1.worker.model_runner_common import (
+        from vllm_gr.v1.worker.gr_context import (
             _create_beam_context,
             _get_gr_config,
         )
@@ -452,7 +452,9 @@ class NPUEagerBeamStageRunner:
         plan = self.pending_plan
         if grammar_output is not None or plan is None or self.logits is None:
             raise RuntimeError("NPU GR sample requires one pending stage and no grammar")
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         stage_metadata = self._metadata(self.worker._current_scheduler_output)
         if _get_gr_config(self.worker).constrained_generation is False:
@@ -603,7 +605,9 @@ class NPUEagerBeamStageRunner:
             dtype=torch.float32,
             device=logits.device,
         )
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         if getattr(_get_gr_config(self.worker), "beam_sid_stage_vocab", False):
             from vllm_gr.ops.npu.sid_stage_vocab import select_sid_stage_candidates

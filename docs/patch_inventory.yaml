@@ -188,7 +188,7 @@ patches:
     scope: backend
     backend_id: cuda
     owner: vllm_gr/v1/worker/gpu_model_runner_patch.py and gpu_model_runner_v2_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/gpu_postprocess_workspace.py, vllm_gr/v1/worker/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/gpu_prefill_inputs.py, vllm_gr/v1/worker/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/gpu_stage_hooks.py, vllm_gr/v1/worker/gpu_beam_stage_runner.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/gpu_postprocess_workspace.py, vllm_gr/v1/worker/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/gpu_prefill_inputs.py, vllm_gr/v1/worker/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/gpu_stage_hooks.py, vllm_gr/v1/worker/gpu_beam_stage_runner.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the selected CUDA ModelRunner V1 or V2 is discovered and its hooks are incomplete; the common installer mounts Worker utilities and model-load hooks regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
     validator_or_test:
@@ -224,7 +224,7 @@ patches:
     scope: backend
     backend_id: npu
     owner: vllm_gr/v1/worker/npu_model_runner_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: NPUModelRunner is discovered for the active platform and its hooks are incomplete; the delayed NPUWorker.init_device wrapper mounts common Worker utilities before native initialization, independently of the management listener; online Trie reload remains rejected by Core on NPU
     validator_or_test:

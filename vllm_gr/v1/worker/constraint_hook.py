@@ -508,7 +508,9 @@ def _has_constrained_metadata(
 
 
 def _canonical_constraint_table_enabled(runner: Any) -> bool:
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     config = _get_gr_config(runner)
     table_config = config.constraint_table
@@ -808,7 +810,9 @@ def try_sample_with_constraint_backend(
                 "is forbidden"
             )
         from vllm_gr.config import ConstraintBackend
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         gr_config = _get_gr_config(runner)
         if gr_config.constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE:
