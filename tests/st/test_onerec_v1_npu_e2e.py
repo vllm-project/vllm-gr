@@ -401,7 +401,7 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
     engine_kwargs: dict[str, Any] = {
         "model": model,
         "trust_remote_code": True,
-        "dtype": "bfloat16",
+        "dtype": "float16",
         "seed": 0,
         "vllm_gr_config": config,
         "async_scheduling": True,
