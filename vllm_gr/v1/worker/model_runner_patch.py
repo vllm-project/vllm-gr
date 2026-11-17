@@ -34,12 +34,17 @@ _V2_GPU_PATCH_MODULE = "vllm_gr.v1.worker.gpu_model_runner_v2_patch"
 _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 
 
-def close_constraint_backend(runner: object) -> None:
-    """Detach and idempotently close the runner-owned canonical Backend."""
+def close_constraint_backend(runner: object, *, unpublished_backend: Any = None) -> None:
+    """Detach the Backend, retaining failed cleanup outside the inference path."""
 
     backend = getattr(runner, "constraint_backend", None)
-    # Detach first so no concurrent observer can discover a Backend while it is
-    # being closed, and so repeated shutdown/load calls are naturally idempotent.
+    pending = list(getattr(runner, "_gr_constraint_backends_pending_cleanup", ()))
+    for candidate in (backend, unpublished_backend):
+        if candidate is not None and all(candidate is not item for item in pending):
+            pending.append(candidate)
+    # Keep cleanup ownership before detaching any serving state. Failed
+    # backends must remain retryable without becoming usable for inference.
+    setattr(runner, "_gr_constraint_backends_pending_cleanup", tuple(pending))
     setattr(runner, "constraint_backend", None)
     projection = getattr(runner, "_gr_npu_stage_projection", None)
     if projection is not None:
@@ -48,8 +53,10 @@ def close_constraint_backend(runner: object) -> None:
     for processor in getattr(runner, "_gr_vocab_slice_processors", ()):
         processor._gr_vocab_slice = None
     setattr(runner, "_gr_vocab_slice_processors", ())
-    if backend is not None:
-        backend.close()
+    while pending:
+        pending[0].close()
+        pending.pop(0)
+        setattr(runner, "_gr_constraint_backends_pending_cleanup", tuple(pending))
 
 
 def _remove_model_bytecode_hooks(runner: object) -> None:
@@ -213,13 +220,14 @@ def make_load_model_with_constraint_backend(
             )
             return result
         except BaseException:
-            projection = getattr(self, "_gr_npu_stage_projection", None)
-            if projection is not None:
-                self._gr_npu_stage_projection = None
-                projection.close()
-            if backend is not None:
-                backend.close()
-            self.constraint_backend = None
+            # A returned Backend can fail before publication. Give it the same
+            # retained cleanup ownership as a published raw Backend or wrapper.
+            close_constraint_backend(
+                self,
+                unpublished_backend=(
+                    backend if getattr(self, "constraint_backend", None) is None else None
+                ),
+            )
             raise
 
     setattr(load_model_with_constraint_backend, _CONSTRAINT_LOAD_PATCH_MARKER, True)

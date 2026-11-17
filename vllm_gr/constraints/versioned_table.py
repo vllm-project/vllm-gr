@@ -86,17 +86,29 @@ class VersionedConstraintTable:
             for version, retired in self._retired_at.items()
             if version != self.current and now - retired >= self.retention_seconds
         ]
-        if expired and self._before_release is not None:
+        self._release_versions(expired)
+
+    def _release_versions(self, versions: list[str]) -> None:
+        """Release every selected version, retaining failed entries for retry."""
+
+        if not versions:
+            return
+        if self._before_release is not None:
             self._before_release()
-        for version in expired:
-            self.tables.pop(version).close()
-            del self._retired_at[version]
+        failures: list[Exception] = []
+        for version in versions:
+            try:
+                self.tables[version].close()
+            except Exception as exc:
+                # Keep failed entries available for a later cleanup attempt.
+                failures.append(exc)
+            else:
+                del self.tables[version]
+                self._retired_at.pop(version, None)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise ExceptionGroup("Failed to close constraint table versions", failures)
 
     def close(self) -> None:
-        values = list(self.tables.values())
-        if values and self._before_release is not None:
-            self._before_release()
-        for table in values:
-            table.close()
-        self.tables.clear()
-        self._retired_at.clear()
+        self._release_versions(list(self.tables))

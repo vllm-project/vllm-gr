@@ -144,6 +144,22 @@ Old tables remain for `VLLM_GR_TRIE_RETENTION_SECONDS` (default 60 seconds), the
 are released on a subsequent wrapper API call. There is no timer thread or
 per-request version pinning/reference counting. Lookups default to the latest
 version; this does not promise one fixed Trie version for a whole request.
+
+Cleanup synchronizes before releasing any selected table. If synchronization
+fails, all tables remain registered. If a table close fails, that version stays
+registered for a later cleanup attempt; other selected versions are still
+released. Cleanup reports the failure after those attempts, grouping multiple
+close errors rather than discarding them. Successfully released versions are
+not closed again on retry.
+
+Runner shutdown and full model replacement detach the serving Backend before
+cleanup. A failed cleanup stays owned by a separate pending-cleanup reference;
+it is never restored to `constraint_backend`. The next shutdown or full load
+retries cleanup, and replacement weights are not loaded until it succeeds.
+Failed load preparation uses the same cleanup ownership, including a Backend
+that has not yet been published. These are caller-driven retries, not a timer
+or an automatic recovery of a failed model service.
+
 Online Trie reload currently supports the CUDA asynchronous `beam_search_v1`
 path, preserving Trie count and vocabulary projection.
 
