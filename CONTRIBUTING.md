@@ -59,12 +59,27 @@ cancels its previous PR runs and skips new validation. Remove and re-add
 `ready` to request a fresh run. Unrelated labels do not start full validation;
 manual dispatches have their own job conditions.
 
-For PRs that only change Markdown files under `docs/` or the root files
-`README.md`, `CONTRIBUTING.md`, `AGENTS.md`, and `CLAUDE.md`, the workflow runs
-documentation checks instead of full validation. It runs the Markdown,
-character, spelling, whitespace, and line-ending hooks on changed files and
-checks tracked filenames. Deleted documents count toward classification but
-are not passed to the hooks. The `ready` and non-draft requirements still apply.
+For PRs whose entire diff contains only the following documentation files,
+the workflow runs documentation checks instead of full validation:
+
+- `.md`, `.markdown`, `.mdx`, and `.rst` files anywhere in the repository,
+  including `.github` templates and guides. Extensions are case-insensitive.
+- `.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp`, `.ico`, and `.avif` images
+  under `docs/assets/` or `docs/images/`, including their subdirectories.
+  Images elsewhere may be runtime inputs or test fixtures and require full CI.
+
+Workflow YAML, Actions scripts, dependencies, and runtime configuration still
+require full validation, even when placed in a documentation directory.
+Both the old and new paths of a rename must qualify as documentation.
+Deleted documents count toward classification but are not passed to checks.
+The `ready` and non-draft requirements still apply.
+
+Documentation checks run the character, spelling, whitespace, and line-ending
+hooks on changed text files, Markdown lint on `.md`/`.markdown`, and the PNG
+export hook for PNG changes. They also check tracked filenames and compile
+changed MDX with a pinned compiler without executing its JavaScript or imports.
+MDX compilation checks syntax, not component availability or rendered output;
+this repository does not currently have a documentation site build.
 
 A mixed PR, an unverified file list, or a file list too large for the
 documentation route falls back to full validation or the explicit A/B path.

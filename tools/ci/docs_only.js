@@ -11,17 +11,24 @@ const PAGE_SIZE = 100;
 // Keep it well below Linux's per-string execve limit and GitHub output limits.
 const MAX_FILES_JSON_BYTES = 32 * 1024;
 const shaPattern = /^[0-9a-f]{40}$/i;
-const rootDocs = new Set(['AGENTS.md', 'CLAUDE.md', 'README.md', 'CONTRIBUTING.md']);
 const statuses = new Set(['added', 'modified', 'removed', 'renamed']);
+const textExtensions = new Set(['md', 'markdown', 'mdx', 'rst']);
+const imageExtensions = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'avif']);
 
 function isDocumentation(path) {
-  if (typeof path !== 'string' || !path.endsWith('.md') ||
+  if (typeof path !== 'string' ||
       /[\x00-\x1f\x7f\\\\]/.test(path)) return false;
   const parts = path.split('/');
-  if (parts.some(part => !part || part === '.' || part === '..' || part === '.github')) {
+  if (parts.some(part => !part || part === '.' || part === '..')) {
     return false;
   }
-  return rootDocs.has(path) || (parts.length >= 2 && parts[0] === 'docs');
+  const extension = parts[parts.length - 1].match(/\.([^.]+)$/)?.[1].toLowerCase();
+  if (textExtensions.has(extension)) return true;
+  // Images elsewhere may be runtime inputs or test fixtures. Only these
+  // documentation asset directories can take the lightweight route.
+  return parts.length >= 3 && parts[0] === 'docs' &&
+    (parts[1] === 'assets' || parts[1] === 'images') &&
+    imageExtensions.has(extension);
 }
 
 // The ephemeral test merge commit is deliberately not compared here. GitHub

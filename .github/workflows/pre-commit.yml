@@ -163,6 +163,7 @@ jobs:
           import json
           import os
           import subprocess
+          from pathlib import Path
 
           files = json.loads(os.environ["DOC_FILES_JSON"])
           if not isinstance(files, list) or not all(isinstance(p, str) for p in files):
@@ -181,17 +182,51 @@ jobs:
           if not files:
               print("Documentation-only deletion: no remaining files to lint.")
           else:
-              for hook in (
+              text_files = [path for path in files if Path(path).suffix.lower() in
+                            {".md", ".markdown", ".mdx", ".rst"}]
+              png_files = [path for path in files if Path(path).suffix.lower() == ".png"]
+              hooks = [(hook, text_files) for hook in (
                   "markdownlint", "check-characters", "typos",
                   "end-of-file-fixer", "trailing-whitespace", "mixed-line-ending",
-              ):
+              )] + [("png-lint", png_files)]
+              for hook, paths in hooks:
+                  if not paths:
+                      continue
                   # Prefix names with ./ so even a leading dash is a filename.
                   subprocess.run(
                       ["pre-commit", "run", hook, "--show-diff-on-failure",
-                       "--files", *["./" + path for path in files]],
+                       "--files", *["./" + path for path in paths]],
                       check=True,
                   )
           PY
+      - name: Compile changed MDX documents
+        env:
+          DOC_FILES_JSON: ${{ needs.docs-scope.outputs.files }}
+        run: |
+          node --input-type=module <<'JS'
+          import fs from 'node:fs/promises';
+          import path from 'node:path';
+          import {execFileSync} from 'node:child_process';
+          import {pathToFileURL} from 'node:url';
+
+          const files = JSON.parse(process.env.DOC_FILES_JSON).filter(file => /\.mdx$/i.test(file));
+          if (files.length) {
+            const dir = await fs.mkdtemp(path.join(process.env.RUNNER_TEMP, 'docs-mdx-'));
+            try {
+              execFileSync('npm', ['install', '--prefix', dir, '--ignore-scripts',
+                '--no-package-lock', '--no-audit', '--no-fund', '@mdx-js/mdx@3.1.1'],
+              {stdio: 'inherit'});
+              const {compile} = await import(pathToFileURL(path.join(dir, 'node_modules/@mdx-js/mdx/index.js')));
+              for (const file of files) {
+                // Compile syntax without executing document JavaScript or imports.
+                await compile({path: file, value: await fs.readFile(file, 'utf8')}, {format: 'mdx'});
+                console.log(`Compiled ${file}`);
+              }
+            } finally {
+              await fs.rm(dir, {recursive: true, force: true});
+            }
+          }
+          JS
 
   resolve-ab-freshness:
     name: Resolve Beam V1 A/B freshness

@@ -56,6 +56,25 @@ Markdown linting does not establish that a link or test target exists. New
 untracked files must be included explicitly in the hook commands; `git diff`
 alone does not review their contents.
 
+The PR documentation route also accepts `.markdown`, `.mdx`, and `.rst` with
+case-insensitive extensions, including documentation under `.github/`.
+The text hooks above apply to these formats; `markdownlint` applies only to
+`.md` and `.markdown`. CI additionally compiles changed MDX with
+`@mdx-js/mdx@3.1.1` to check syntax without executing document JavaScript.
+It does not resolve imported components or build a documentation site.
+
+Images qualify only under `docs/assets/` and `docs/images/`; see the supported
+formats in [Pull request CI](../CONTRIBUTING.md#pull-request-ci).
+Do not pass binary images to text hooks. For PNG changes also run:
+
+```bash
+pre-commit run png-lint --files docs/assets/vLLM-GR.png
+```
+
+The filename check remains required for image-only and deletion-only changes.
+Changing workflow YAML, scripts, runtime configuration, or test images still
+requires the normal validation route.
+
 ## Repository checks
 
 Inspect `.pre-commit-config.yaml` for hook IDs, file filters, fix behavior, and

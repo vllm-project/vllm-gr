@@ -26,6 +26,98 @@ async function classifyFiles(files, {labels = ['ready'], action = 'synchronize',
   return classify({github, context, core: {warning: () => {}}});
 }
 
+test('classifies documentation formats across the repository', async () => {
+  const paths = [
+    'examples/online_serving/catalog/README.md',
+    'benchmarks/tools/notes.md', 'other.md', 'README.MD',
+    'docs/guide.rst', 'guide.RST', 'docs/tutorial.mdx', 'guide.MDX',
+    'guide.markdown', 'guide.MarkDown',
+    '.github/PULL_REQUEST_TEMPLATE.md', '.github/ISSUE_TEMPLATE/bug.md',
+    '.github/workflows/README.md', 'docs/.github/README.md',
+  ];
+  const files = paths.map(filename => ({status: 'modified', filename}));
+  assert.deepEqual(await classifyFiles(files), {docsOnly: true, files: paths});
+});
+
+test('allows images only in documentation asset directories', async () => {
+  const paths = ['docs/assets/architecture.PNG', 'docs/images/nested/flow.svg'];
+  for (const extension of ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'avif']) {
+    paths.push(`docs/assets/example.${extension}`);
+  }
+  const files = paths.map(filename => ({status: 'added', filename}));
+  assert.deepEqual(await classifyFiles(files), {docsOnly: true, files: paths});
+  assert.equal((await classifyFiles([
+    {status: 'modified', filename: 'README.md'}, ...files,
+  ])).docsOnly, true);
+});
+
+test('rejects mixed code, configuration, unsafe paths and non-documentation assets', async () => {
+  for (const filename of [
+    'examples/client.py', 'docs/conf.py', 'docs/patch_inventory.yaml',
+    '.github/workflows/ci.yml', '.github/actions/build/action.yaml',
+    '.github/scripts/check.sh', '.github/CODEOWNERS',
+    'tests/fixtures/input.png', 'examples/image.jpg', 'assets/logo.svg',
+    'docs/fixtures/input.png', 'docs/assets/run.py', 'docs/assets/data.json',
+    'docs/assets/model.bin', 'docs/assets/file.svg.js',
+    'docs/assets-old/image.png', 'docs/assetsimage.png',
+    'md', 'docs/rst', 'docs/assets/png', 'README.md.bak',
+    '../README.md', '/README.md', 'docs//README.md', 'docs/./README.md',
+    'docs\\README.md', 'docs/line\nbreak.md', 'docs/../assets/image.png',
+  ]) {
+    const files = [
+      {status: 'modified', filename: 'examples/README.md'},
+      {status: 'modified', filename},
+    ];
+    assert.deepEqual(await classifyFiles(files), {docsOnly: false, files: []}, filename);
+  }
+});
+
+test('requires both paths of a rename to qualify as documentation', async () => {
+  const renamed = (previous_filename, filename) => [{status: 'renamed', previous_filename, filename}];
+  for (const [previous, next] of [
+    ['examples/old.md', 'benchmarks/new.md'],
+    ['.github/README.md', 'examples/README.MD'],
+    ['docs/old.rst', 'docs/new.mdx'],
+    ['docs/assets/old.png', 'docs/images/new.PNG'],
+  ]) {
+    assert.deepEqual(await classifyFiles(renamed(previous, next)),
+      {docsOnly: true, files: [next]});
+  }
+  for (const [previous, next] of [
+    ['examples/client.py', 'examples/client.md'],
+    ['examples/README.md', 'examples/client.py'],
+    ['.github/workflows/ci.yml', '.github/workflows/ci.md'],
+    ['tests/fixtures/input.png', 'docs/assets/input.png'],
+    ['docs/assets/input.png', 'tests/fixtures/input.png'],
+  ]) {
+    assert.deepEqual(await classifyFiles(renamed(previous, next)), {docsOnly: false, files: []});
+  }
+});
+
+test('classifies deletions but only returns surviving documents and images', async () => {
+  const files = [
+    {status: 'removed', filename: '.github/old.MD'},
+    {status: 'removed', filename: 'docs/assets/old.png'},
+    {status: 'added', filename: 'docs/new.rst'},
+    {status: 'added', filename: 'docs/assets/new.png'},
+  ];
+  assert.deepEqual(await classifyFiles(files),
+    {docsOnly: true, files: ['docs/new.rst', 'docs/assets/new.png']});
+  assert.equal((await classifyFiles([
+    ...files, {status: 'removed', filename: 'src/model.py'},
+  ])).docsOnly, false);
+});
+
+test('examines files beyond the first API page before skipping full validation', async () => {
+  const files = Array.from({length: 100}, (_, i) => ({status: 'modified', filename: `docs/${i}.md`}));
+  assert.equal((await classifyFiles([
+    ...files, {status: 'modified', filename: '.github/README.MD'},
+  ])).docsOnly, true);
+  assert.deepEqual(await classifyFiles([
+    ...files, {status: 'modified', filename: '.github/workflows/ci.yml'},
+  ]), {docsOnly: false, files: []});
+});
+
 // Construct legal-length components whose JSON output is exactly the limit.
 function boundaryFiles() {
   return Array.from({length: 150}, (_, i) => {
