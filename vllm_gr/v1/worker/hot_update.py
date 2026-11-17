@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +12,7 @@ from typing import Any
 
 import torch
 
+from vllm_gr.config.models import deployment_for
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 
 
@@ -62,10 +62,11 @@ def versioned_constraint_table(
             raise
         return candidate
 
+    settings = deployment_for(getattr(runner, "vllm_config", None))
     return VersionedConstraintTable(
         backend,
         loader=load,
-        retention_seconds=float(os.environ.get("VLLM_GR_TRIE_RETENTION_SECONDS", "60")),
+        retention_seconds=settings.trie_retention_seconds,
         before_release=lambda: _sync(runner),
     )
 

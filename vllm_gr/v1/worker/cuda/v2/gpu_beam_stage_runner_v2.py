@@ -127,7 +127,7 @@ class CudaStageHooksV2(CudaStageHooks):
         enabled = (
             not worker.model_config.enforce_eager
             and cfg.beam_graph_enabled
-            and batch_size in cfg.beam_online_batch_sizes
+            and batch_size in cfg.deployment.beam_batch_sizes
             and not runtime.capture_failed
             and batch_size not in (runtime.startup_failures or {})
         )
@@ -317,7 +317,7 @@ def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -
 
     cfg = _get_gr_config(worker)
     requested = not worker.model_config.enforce_eager and cfg.beam_graph_enabled
-    if requested and batch_size not in cfg.beam_online_batch_sizes:
+    if requested and batch_size not in cfg.deployment.beam_batch_sizes:
         if graph is not None:
             raise RuntimeError("Unconfigured Decode shape has a published graph")
         return False

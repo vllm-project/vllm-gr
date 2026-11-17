@@ -14,7 +14,6 @@ import pytest
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 
 import vllm_gr.entrypoints.openai.completion_batch_patch as patch_module
-from vllm_gr.config import BeamExecutionMode
 from vllm_gr.entrypoints.openai.completion_batch_patch import (
     _batch_size,
     _create_completion_batched,
@@ -28,10 +27,10 @@ _EQUAL_LENGTHS = dict.fromkeys(range(4), 10)
 
 
 class _ModeStub:
-    """Stand-in for ``GRConfig`` that reports whatever mode a test sets."""
+    """Stand-in for ``GRConfig`` that reports whether a test configures Beam."""
 
-    beam_execution_mode = BeamExecutionMode.V1
-    beam_online_batch_sizes = (1, 2, 4)
+    beam_max_width = 128
+    deployment = SimpleNamespace(beam_batch_sizes=(1, 2, 4))
 
     @classmethod
     def from_vllm_config(cls, vllm_config: object) -> _ModeStub:
@@ -42,7 +41,7 @@ class _ModeStub:
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def _mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(patch_module, "GRConfig", _ModeStub)
-    monkeypatch.setattr(_ModeStub, "beam_execution_mode", BeamExecutionMode.V1)
+    monkeypatch.setattr(_ModeStub, "beam_max_width", 128)
 
 
 class _BatchSelf:
@@ -234,15 +233,15 @@ def test_an_engine_without_gr_beam_is_left_alone(
     serving: _BatchSelf, make_request: Callable[..., Any]
 ) -> None:
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(_ModeStub, "beam_execution_mode", None)
+        monkeypatch.setattr(_ModeStub, "beam_max_width", None)
         assert _batch_size(serving, make_request()) is None
 
 
 _DECLINE_CASES = [
-    ("count 3", {}, {"prompt": ["a"] * 3}, 0, "not one of the supported fixed batch sizes"),
-    ("count 5", {}, {"prompt": ["a"] * 5}, 0, "not one of the supported fixed batch sizes"),
-    ("count 6", {}, {"prompt": ["a"] * 6}, 0, "not one of the supported fixed batch sizes"),
-    ("count 9", {}, {"prompt": ["a"] * 9}, 0, "not one of the supported fixed batch sizes"),
+    ("count 3", {}, {"prompt": ["a"] * 3}, 0, "not one of the configured Beam batch sizes"),
+    ("count 5", {}, {"prompt": ["a"] * 5}, 0, "not one of the configured Beam batch sizes"),
+    ("count 6", {}, {"prompt": ["a"] * 6}, 0, "not one of the configured Beam batch sizes"),
+    ("count 9", {}, {"prompt": ["a"] * 9}, 0, "not one of the configured Beam batch sizes"),
     ("capacity 2", {"max_num_seqs": 2}, {}, 1, "exceeds the sequence capacity 2"),
     (
         "unequal budgets",
@@ -317,7 +316,11 @@ def test_a_batch_renders_and_submits_once_at_capacity(
     )
 
 
-@pytest.mark.parametrize("sizes", [None, [1, 3, 7]], ids=["default", "custom"])  # type: ignore[misc]
+@pytest.mark.parametrize(
+    "sizes",
+    [None, [1, 3, 7], [4], [1, 2], [1, 2, 8]],
+    ids=["default", "custom", "only-four", "without-four", "with-eight"],
+)  # type: ignore[misc]
 @pytest.mark.parametrize("count", [2, 3, 4, 7, 8])  # type: ignore[misc]
 def test_batch_policy_selects_fixed_http_sizes(
     make_serving: Callable[..., _BatchSelf],
@@ -333,13 +336,11 @@ def test_batch_policy_selects_fixed_http_sizes(
     serving = make_serving(
         engine_inputs=list(range(count)), prompt_lengths=dict.fromkeys(range(count), 10)
     )
-    serving.engine_client.vllm_config.additional_config = {
-        "vllm_gr_beam_execution_mode": "v1",
-    }
-    if sizes is not None:
-        serving.engine_client.vllm_config.additional_config["vllm_gr_beam_online_batch_sizes"] = (
-            sizes
-        )
+    from vllm_gr.config import gr_config_to_mapping
+    from vllm_gr.config.parser import load_engine_gr_config
+
+    config = load_engine_gr_config(None, {}, {"beam_batch_sizes": sizes or [1, 2, 4]})
+    serving.engine_client.vllm_config.additional_config = {"vllm_gr": gr_config_to_mapping(config)}
     request = make_request(prompt=["a"] * count)
     result = asyncio.run(create_completion_batch_dispatch(serving, request))
     if count in (sizes if sizes is not None else [1, 2, 4]):

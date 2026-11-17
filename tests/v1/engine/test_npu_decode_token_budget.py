@@ -46,13 +46,18 @@ core = _core_fixture
 scheduler = _scheduler_fixture
 
 
+@pytest.fixture(autouse=True)
+def npu_runner_policy(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+
+
 def _config(*, device="npu", budget=512, width=128, constrained=True):
     canonical = _canonical_gr_config(enabled=constrained, backend=device)
-    if not constrained:
-        canonical["constrained_generation"] = False
-        canonical["constraint_table"] = {"enabled": False, "backend": device}
-    canonical["beam"]["max_width"] = width
-    canonical["constraint_table"]["max_top_k"] = width
+    gr = canonical["gr"]
+    gr["beam_width"] = [width] * 3
+    gr["candidate_width"] = [width] * 3
+    if constrained:
+        gr["constraint_table"]["max_top_k"] = width
     engine = _make_engine(additional_config={"vllm_gr": canonical})
     engine.vllm_config.device_config = SimpleNamespace(device=device)
     engine.vllm_config.model_config.max_model_len = 512

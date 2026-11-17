@@ -960,10 +960,9 @@ class NPUEagerBeamStageRunner:
 def get_npu_stage_runner(worker: Any, scheduler_output: Any) -> NPUEagerBeamStageRunner:
     """Return the exclusive local NPU persistent execution owner."""
 
-    from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.config.execution import require_beam_execution_mode
+    from vllm_gr.config.execution import require_beam_config
 
-    require_beam_execution_mode(worker.vllm_config, BeamExecutionMode.V1)
+    require_beam_config(worker.vllm_config)
     existing = getattr(worker, "_gr_npu_stage_runner", None)
     if existing is not None and not existing.closed:
         return existing

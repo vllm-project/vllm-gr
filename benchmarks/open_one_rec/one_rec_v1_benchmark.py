@@ -35,7 +35,9 @@ def run_v1_benchmark(args, tokenizer, requests):
     lengths = [len(tokenizer.encode(prompt, add_special_tokens=False)) + 1 for prompt in prompts]
     if args.custom_input_len and any(length != args.custom_input_len + 1 for length in lengths):
         raise ValueError("text round-trip changed the requested input length")
-    model_len = args.max_model_len or 8192
+    from vllm_gr.config.parser import common_engine_defaults
+
+    model_len = args.max_model_len or common_engine_defaults()["max_model_len"]
     if max(lengths) + steps + 1 > model_len:
         raise ValueError("input plus output exceeds max_model_len")
     params = BeamSearchParams(
@@ -50,8 +52,6 @@ def run_v1_benchmark(args, tokenizer, requests):
     )
     engine_config = dict(
         async_scheduling=True,
-        enable_prefix_caching=True,
-        enable_chunked_prefill=False,
         max_model_len=model_len,
         max_num_batched_tokens=args.max_num_batched_tokens or model_len,
         max_num_seqs=args.n,
@@ -67,27 +67,25 @@ def run_v1_benchmark(args, tokenizer, requests):
             Path(args.model).resolve(), Path(args.constraint_triples).resolve(), artifact
         )
         config = {
-            "schema_version": 1,
-            "attention_backend": "CUSTOM",
-            "beam": {
-                "execution_mode": "v1",
-                "graph_enabled": True,
-                "worker_decision": True,
-                "max_width": args.n,
-                "max_decode_steps": steps,
-            },
+            "worker_decision": True,
+            "beam_width": [args.n] * steps,
+            "max_decode_steps": steps,
+            "constraint_mode": "table",
             "constraint_table": {
-                "enabled": True,
                 "backend": "cuda",
                 "max_top_k": args.n,
-                "path": str(artifact),
+                "path": str(artifact.resolve()),
                 "format": "constraint_table_v1",
-                "artifact_digest": artifact_digest,
-                "tokenizer_digest": tokenizer_digest,
+                "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
             },
+            "candidate_width": [args.n] * steps,
         }
         with GRLLM(
-            model=args.model, trust_remote_code=True, vllm_gr_config=config, **engine_config
+            model=args.model,
+            trust_remote_code=True,
+            attention_config={"backend": "CUSTOM"},
+            gr=config,
+            **engine_config,
         ) as llm:
             for index in range(args.warmup_requests + args.num_prompts):
                 measured = index >= args.warmup_requests

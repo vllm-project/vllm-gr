@@ -792,16 +792,11 @@ def test_head_logits_buffers_are_allocated_lazily_per_mode() -> None:
 
 
 @pytest.mark.parametrize("runner_version", ["v1", "v2"])
-@pytest.mark.parametrize("slice_setting", [None, "0", "off", "auto", "16384"])
+@pytest.mark.parametrize("slice_setting", [0, "auto", 16384])
 def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version, slice_setting):
     from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stage_runner
     from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
-    monkeypatch.setenv("VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT", "transposed")
-    if slice_setting is None:
-        monkeypatch.delenv("VLLM_GR_HEAD_SLICE", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_GR_HEAD_SLICE", slice_setting)
     # Isolate the head-allocation boundary from V2's native input storage.
     monkeypatch.setattr(
         CudaStageHooksV2,
@@ -813,9 +808,10 @@ def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version
     monkeypatch.setattr(stage_runner, "_get_unconstrained_head_layout", get_layout)
     owner = runtime(
         unconstrained=True,
+        gr_options={"unconstrained_head_layout": "transposed", "head_slice": slice_setting},
         hooks_cls=CudaStageHooksV2 if runner_version == "v2" else CudaStageHooksV1,
     )
-    if slice_setting in (None, "0", "off"):
+    if slice_setting == 0:
         get_layout.assert_not_called()
         assert owner._head_layout is None
         assert owner._head_slice_request == 0

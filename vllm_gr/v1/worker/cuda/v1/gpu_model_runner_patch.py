@@ -9,9 +9,6 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.attention.backends.beam_dense_prefill import (
-    requires_fresh_prefill_replay,
-)
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
@@ -21,6 +18,7 @@ from vllm_gr.v1.worker.gr_context import (
     _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
     _create_beam_context,
+    _get_gr_config,
 )
 
 # Shared context helpers and installation contracts have independent owners.
@@ -405,7 +403,11 @@ def capture_beam_decode_graph(runner) -> bool:
     )
 
     gr_cfg = _get_gr_config(runner)
-    if not gr_cfg.beam_graph_active or runner.model_config.enforce_eager:
+    if (
+        not gr_cfg.beam_graph_active
+        or runner.model_config.enforce_eager
+        or 1 not in gr_cfg.deployment.beam_batch_sizes
+    ):
         return False
 
     # ── TP / DP ubatching guard ─────────────────────────────────
@@ -548,18 +550,18 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                 return _orig_model_forward(
                     self, input_ids=input_ids, positions=positions, *args, **kwargs
                 )
-            if is_prefill_graph_enabled() and not hasattr(self, "_prefill_graph_runner"):
+            if is_prefill_graph_enabled(self) and not hasattr(self, "_prefill_graph_runner"):
                 logger.debug("Prefill CUDA graph fallback: runner_not_initialized")
                 return _orig_model_forward(
                     self, input_ids=input_ids, positions=positions, *args, **kwargs
                 )
         if scheduler_output is not None:
             if (
-                is_prefill_graph_enabled()
+                is_prefill_graph_enabled(self)
                 and is_prefill_phase_batch(self, scheduler_output)
                 # Dense-Prefill graphs replay only for fresh prompts.
                 and (
-                    not requires_fresh_prefill_replay()
+                    _get_gr_config(self).deployment.dense_prefill == "off"
                     or scheduled_requests_are_fresh(self, scheduler_output)
                 )
             ):
@@ -678,7 +680,7 @@ def capture_prefill_graphs(runner) -> None:
     only when the prefill graph env gate is enabled. Only explicitly
     recoverable capture failures fall back to eager prefill.
     """
-    if not is_prefill_graph_enabled():
+    if not is_prefill_graph_enabled(runner):
         return
     if getattr(runner, "_prefill_graphs_captured", False):
         return

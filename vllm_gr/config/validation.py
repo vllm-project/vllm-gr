@@ -11,15 +11,15 @@ import regex as re
 
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_FORMAT,
-    GR_CONFIG_SCHEMA_VERSION,
     MAX_BEAM_WIDTH,
     MAX_CANDIDATE_WIDTH,
     MULTI_TRIE_CONSTRAINT_TABLE_FORMAT,
-    SUPPORTED_BEAM_BATCH_SIZES,
-    BeamExecutionMode,
-    ConstraintBackend,
+    ConstraintBackendKind,
+    ConstraintConfig,
+    ConstraintMode,
     ConstraintTableBackendEnum,
-    ConstraintTableConfig,
+    ConstraintTableSpec,
+    DeploymentOptions,
     GRAttentionBackend,
     GRConfig,
     NPUDecodeExecution,
@@ -38,9 +38,19 @@ def validate_config_fields(config: object) -> None:
         object.__setattr__(config, item.name, validator(getattr(config, item.name)))
 
 
-def validate_constraint_table(value: object) -> ConstraintTableConfig | None:
-    if value is not None and not isinstance(value, ConstraintTableConfig):
-        raise ValueError("vllm-gr constraint_table must be a ConstraintTableConfig or None")
+def validate_deployment(value: object) -> DeploymentOptions:
+    if not isinstance(value, DeploymentOptions):
+        raise ValueError("vllm-gr deployment must be DeploymentOptions")
+    return value
+
+
+def validate_optional_max_top_k(value: object) -> int | None:
+    return None if value is None else validate_constraint_table_max_top_k(value)
+
+
+def validate_constraint_table(value: object) -> ConstraintTableSpec | None:
+    if value is not None and not isinstance(value, ConstraintTableSpec):
+        raise ValueError("vllm-gr constraint_table must be a ConstraintTableSpec or None")
     return value
 
 
@@ -50,45 +60,74 @@ def validate_beam_adapter_cache_enabled(value: object) -> bool:
     return value
 
 
-def validate_beam_execution_mode(value: object) -> BeamExecutionMode | None:
+def validate_constraint_mode(value: object) -> ConstraintMode:
+    if isinstance(value, ConstraintMode):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("vllm-gr constraint.mode must be a string")
+    try:
+        return ConstraintMode(value.lower())
+    except ValueError as exc:
+        raise ValueError("vllm-gr constraint.mode must be 'none' or 'table'") from exc
+
+
+def validate_constraint_backend_kind(value: object) -> ConstraintBackendKind:
+    if isinstance(value, ConstraintBackendKind):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("vllm-gr constraint.table.backend must be a string")
+    try:
+        return ConstraintBackendKind(value.lower())
+    except ValueError as exc:
+        supported = ", ".join(kind.value for kind in ConstraintBackendKind)
+        raise ValueError(
+            f"unsupported vllm-gr constraint.table.backend {value!r}; supported: {supported}"
+        ) from exc
+
+
+def validate_constraint_config(value: object) -> ConstraintConfig | None:
+    """Validate the schema-v2 constraint block.
+
+    Digests remain required in this transition step because the legacy
+    ConstraintTableSpec still validates them; artifact-metadata defaults are a
+    follow-up.
+    """
     if value is None:
         return None
-    if value == "legacy":
-        raise ValueError(
-            "Legacy GR beam_search() has been removed. Configure "
-            "beam.execution_mode='v1' and a canonical constraint artifact."
-        )
-    if isinstance(value, str):
-        try:
-            return BeamExecutionMode(value)
-        except ValueError:
-            pass
-    raise ValueError("vllm-gr beam.execution_mode must be 'v1' or unset")
-
-
-def validate_beam_online_batch_sizes(value: object) -> tuple[int, ...]:
-    """Require explicit engine-supported sizes and singleton fallback."""
-    if (
-        not isinstance(value, (list, tuple))
-        or not value
-        or any(type(size) is not int or size not in SUPPORTED_BEAM_BATCH_SIZES for size in value)
-    ):
-        raise ValueError(
-            "vllm-gr beam.online_batch_sizes must be a nonempty list of integers "
-            f"from {SUPPORTED_BEAM_BATCH_SIZES}"
-        )
-    if 1 not in value or len(set(value)) != len(value):
-        raise ValueError("vllm-gr beam.online_batch_sizes must include 1 and contain no duplicates")
-    return tuple(sorted(value))
-
-
-def validate_schema_version(value: object) -> int:
-    if type(value) is not int or value != GR_CONFIG_SCHEMA_VERSION:
-        raise ValueError(
-            f"unsupported vllm-gr schema_version {value!r}; "
-            f"expected integer {GR_CONFIG_SCHEMA_VERSION}"
-        )
-    return GR_CONFIG_SCHEMA_VERSION
+    if not isinstance(value, ConstraintConfig):
+        raise ValueError("vllm-gr constraint must be a ConstraintConfig or null")
+    mode = validate_constraint_mode(value.mode)
+    if mode is ConstraintMode.NONE:
+        if value.table is not None:
+            raise ValueError("vllm-gr constraint.mode='none' forbids constraint.table")
+        return ConstraintConfig(mode=mode)
+    if value.table is None:
+        raise ValueError("vllm-gr constraint.mode='table' requires constraint.table")
+    table = value.table
+    if not isinstance(table, ConstraintTableSpec):
+        raise ValueError("vllm-gr constraint.table must be a ConstraintTableSpec")
+    path = validate_constraint_table_path(table.path)
+    if path is None:
+        raise ValueError("vllm-gr constraint.mode='table' requires constraint.table.path")
+    artifact_digest = validate_artifact_digest(table.artifact_digest)
+    tokenizer_digest = validate_tokenizer_digest(table.tokenizer_digest)
+    if artifact_digest is None or tokenizer_digest is None:
+        raise ValueError("vllm-gr constraint.mode='table' requires artifact and tokenizer digests")
+    return ConstraintConfig(
+        mode=mode,
+        table=ConstraintTableSpec(
+            path=path,
+            backend=validate_constraint_backend_kind(table.backend),
+            max_top_k=(
+                None
+                if table.max_top_k is None
+                else validate_constraint_table_max_top_k(table.max_top_k)
+            ),
+            format=validate_constraint_table_format(table.format),
+            artifact_digest=artifact_digest,
+            tokenizer_digest=tokenizer_digest,
+        ),
+    )
 
 
 def validate_constraint_table_enabled(value: object) -> bool:
@@ -187,18 +226,15 @@ def validate_catalog_path(value: object) -> str | None:
     return value
 
 
-def validate_constraint_backend(value: object) -> ConstraintBackend:
-    if isinstance(value, ConstraintBackend):
-        return value
+def validate_legacy_constraint_backend(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("vllm-gr constraint_backend must be a string")
-    try:
-        return ConstraintBackend(value.lower())
-    except ValueError as exc:
-        supported = ", ".join(backend.value for backend in ConstraintBackend)
+    normalized = value.lower()
+    if normalized not in ("trie", "constraint_table"):
         raise ValueError(
-            f"unsupported vllm-gr constraint_backend {value!r}; supported: {supported}"
-        ) from exc
+            f"unsupported vllm-gr constraint_backend {value!r}; supported: trie, constraint_table"
+        )
+    return normalized
 
 
 def validate_attention_backend(value: object) -> GRAttentionBackend | None:

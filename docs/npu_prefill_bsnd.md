@@ -9,9 +9,10 @@ the normal vllm-gr modules. No import overlay or `sitecustomize` is required.
 Enable the existing Prefill graph facility and select explicit total-token /
 request-count pairs before starting the engine:
 
-```bash
-export VLLM_ENABLE_PREFILL_CUDAGRAPH=1
-export VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS='512,4;1024,4'
+```yaml
+gr:
+  prefill_graph_enabled: true
+  npu_bsnd_capture_specs: "512,4;1024,4"
 ```
 
 Each entry is `T,B`, where `P=T/B` is the capacity of each request. The example

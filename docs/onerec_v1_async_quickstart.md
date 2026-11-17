@@ -127,9 +127,9 @@ Use these settings for the initial request.
 | Constraint | CUDA Constraint Table | Produces catalog-valid SIDs. |
 | Parallelism and requests | TP/PP/DP/DCP/PCP are 1; one request | One execution owner holds the physical dispatch slots. |
 
-The example script sets `execution_mode: v1`, `worker_decision: true`,
+The example script sets `worker_decision: true`,
 `graph_enabled: true`, Prefix Cache, and `max_num_seqs == beam_width`.
-When changing the Beam width, also update the request, `beam.max_width`,
+When changing the Beam width, also update the request, `max(gr.beam_width)`,
 Constraint Table `max_top_k`, and engine capacity. Do not change only the
 client `beam_width`.
 
@@ -151,36 +151,15 @@ curl -X POST http://localhost:8000/v1/completions   -H "Content-Type: applicatio
   }'
 ```
 
-The engine admission contract supports logical B=1 through B=8. The default
-`beam.online_batch_sizes` policy is `[1, 2, 4]`; engine capability does not
-automatically enable every size for HTTP batching or CUDA graph capture.
-Arbitrary-length partitioning remains a separate follow-up feature.
+Set `gr.beam_batch_sizes` to the prompt counts a single non-streaming Beam
+completion may submit as one session. CUDA ModelRunner V1 and V2 use the same
+list for Prefill and Decode capture. The default is `[1, 2, 4]`. For example,
+with `--gr.beam_batch_sizes '[1,4]'`, a two-prompt completion takes the
+original per-prompt route. Separate HTTP requests are never collected here.
 
-To enable other exact HTTP batch sizes, add this field to the existing
-`--vllm-gr-config` YAML and restart the service:
-
-```yaml
-beam:
-  execution_mode: v1
-  online_batch_sizes: [1, 3, 7]
-```
-
-Keep the existing model/constraint-table settings. Use `--max-num-seqs 7` or
-higher for this example. The list must contain unique integers in 1..8 and
-include 1; order is normalized. A non-default policy exceeding `max_num_seqs`
-is rejected during engine configuration, not repaired by increasing capacity.
-The default policy is limited by the configured capacity, preserving B=1-only
-deployments. Prefill token and NPU Decode B*beam_width limits still apply.
-
-CUDA V1/V2 Prefill capture follows this policy by default. The existing
-`VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS` environment variable can override
-Prefill capture independently (for example `1,2,4` to avoid larger captures).
-It accepts increasing sizes in 1..8; uncaptured Prefill shapes retain fallback.
-CUDA ModelRunner V2 Decode capture follows the policy too: unselected sizes use
-eager execution, while a missing graph for a selected, successfully captured
-size remains an error. V1's single Decode startup shape is unchanged and uses
-`VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE` (default 1). NPU's exact Decode graph
-shape remains controlled by `beam.graph_batch_size`.
+Use strictly increasing integers from 1 to 8. To serve a listed batch, set
+`max_num_seqs` at least that high and allow enough tokens for its prompts.
+NPU Decode retains its separate exact-batch graph setting.
 
 These settings take effect at startup, not per HTTP request. Wider capture
 sets increase startup cost and graph memory. Persistent workspace capacity
@@ -271,7 +250,7 @@ when comparing runs.
 | CUDA graph or out-of-memory error | Start with width 128 and the default `--gpu-memory-utilization 0.5`; check for competing GPU processes. |
 | Online V1 validation is needed | The system test calls `OpenAIServing.beam_search_v1()` with a real asynchronous multiprocess engine. Legacy HTTP gates remain separate. |
 | EOS or Prefill admission error | Set `ignore_eos=True`, disable Chunked Prefill and allow the complete prompt in `max_num_batched_tokens`. |
-| A prompt list did not batch | Check `Beam batch declined`: the count must be in `beam.online_batch_sizes`, and sequence capacity, the token budget and equal generation budgets must all allow it. |
+| A prompt list did not batch | Check `Beam batch declined`: the count must be in `gr.beam_batch_sizes`, and sequence capacity, the token budget and equal generation budgets must all allow it. |
 
 ## Further reading
 

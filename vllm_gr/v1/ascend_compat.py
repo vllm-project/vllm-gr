@@ -69,9 +69,7 @@ def patch_npu_worker_init_device() -> int:
         # The penalties warmup guard must be installed before
         # compile_or_warm_up_model runs in this child process.
         apply_penalties_warmup_oom_guard()
-        # Mount set_gr_constraint_resources so the driver can inject constraint
-        # tables via EngineCore.collective_rpc after init_device returns.
-        from vllm_gr.constraints.worker_inject import load_constraint_tables_on_worker
+        # Mount the V1 worker utilities before native initialization.
         from vllm_gr.ops.npu_stage_logits import install_npu_stage_weight_update_hooks
         from vllm_gr.v1.worker.model_runner_patch import (
             install_worker_utility_hooks,
@@ -80,9 +78,6 @@ def patch_npu_worker_init_device() -> int:
         install_worker_utility_hooks(type(self))
         install_npu_stage_weight_update_hooks(type(self))
         result = original_init_device(self)
-        # Preload constraint tables onto the device at weight-load time so the
-        # runtime never does a lazy build/H2D on the first constrained step.
-        load_constraint_tables_on_worker(self)
         return result
 
     setattr(_patched_init_device, _NPU_WORKER_ORIGINAL_ATTR, original_init_device)
@@ -158,7 +153,7 @@ def _install_init_ascend_config_sanitizer() -> None:
 
     import vllm_ascend.ascend_config as ascend_config_mod
 
-    from vllm_gr.config.parser import GR_CONFIG_KEY, GR_CONFIG_KEY_PREFIX
+    from vllm_gr.config.parser import GR_CONFIG_KEY
 
     current = ascend_config_mod.init_ascend_config
     if getattr(current, "_vllm_gr_sanitized", False) is True:
@@ -172,12 +167,7 @@ def _install_init_ascend_config_sanitizer() -> None:
             additional = getattr(vllm_config, "additional_config", None)
             if not isinstance(additional, dict):
                 return original(vllm_config)
-            filtered = {
-                key: value
-                for key, value in additional.items()
-                if key != GR_CONFIG_KEY
-                and not (isinstance(key, str) and key.startswith(GR_CONFIG_KEY_PREFIX))
-            }
+            filtered = {key: value for key, value in additional.items() if key != GR_CONFIG_KEY}
             if len(filtered) == len(additional):
                 return original(vllm_config)
             vllm_config.additional_config = filtered

@@ -11,9 +11,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.helpers.gr_config import engine_args_from_file, make_gr_config
 from vllm_gr.config import (
     ConstraintTableBackendEnum,
-    ConstraintTableConfig,
+    ConstraintTableSpec,
     GRConfig,
     gr_config_to_mapping,
     write_canonical_gr_config,
@@ -25,21 +26,20 @@ _V1_REQUIRED = "NPU unconstrained.*ModelRunner V1.*VLLM_USE_V2_MODEL_RUNNER=0"
 
 def _gr_config(mode: str, *, canonical: bool = False, device: str = "npu") -> GRConfig:
     if mode == "ordinary":
-        return GRConfig()
+        return make_gr_config()
     if mode == "ordinary_unconstrained":
-        return GRConfig(constrained_generation=False)
+        return make_gr_config(constrained_generation=False)
     common: dict[str, Any] = {
         "beam_max_width": 4,
         "beam_max_decode_steps": 3,
         "beam_worker_decision": True,
-        "beam_execution_mode": "v1",
     }
     if canonical:
-        common["constraint_table"] = ConstraintTableConfig(
+        common["constraint_table"] = ConstraintTableSpec(
             max_top_k=4, backend=ConstraintTableBackendEnum(device)
         )
     if mode == "catalog":
-        common["constraint_table"] = ConstraintTableConfig(
+        common["constraint_table"] = ConstraintTableSpec(
             max_top_k=4,
             enabled=True,
             backend=ConstraintTableBackendEnum.NPU,
@@ -47,12 +47,14 @@ def _gr_config(mode: str, *, canonical: bool = False, device: str = "npu") -> GR
             artifact_digest="sha256:" + "a" * 64,
             tokenizer_digest="sha256:" + "b" * 64,
         )
-        return GRConfig(
+        return make_gr_config(
             **common,
             constrained_generation=True,
         )
     assert mode in ("generic", "sid")
-    return GRConfig(**common, constrained_generation=False, beam_sid_stage_vocab=mode == "sid")
+    return make_gr_config(
+        **common, constrained_generation=False, beam_sid_stage_vocab=mode == "sid"
+    )
 
 
 def _host(device: str, use_v2: bool) -> SimpleNamespace:
@@ -65,26 +67,52 @@ def _host(device: str, use_v2: bool) -> SimpleNamespace:
 
 
 def _write_config(host: SimpleNamespace, gr_config: GRConfig) -> None:
-    if gr_config.constraint_table is None:
+    if gr_config.constraint is None:
         gr_config.write_to_vllm_config(host)
     else:
         write_canonical_gr_config(host, gr_config)
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_npu_admission_rejects_v2_unconstrained_candidate_width_mismatch() -> None:
+    config = _host("npu", False)
+    gr_config = make_gr_config(
+        beam_max_width=4,
+        beam_max_decode_steps=3,
+        beam_worker_decision=True,
+        constrained_generation=False,
+        constraint_table=ConstraintTableSpec(
+            max_top_k=4,
+            candidate_width=8,
+            enabled=False,
+        ),
+    )
+    _write_config(config, gr_config)
+
+    with pytest.raises(ValueError, match="candidate_width.*beam width"):
+        validate_gr_device_config(config)
+
+
 @pytest.mark.parametrize("mode", ["generic", "sid"])  # type: ignore[misc]
-@pytest.mark.parametrize("encoding", ["canonical", "legacy"])  # type: ignore[misc]
+@pytest.mark.parametrize("encoding", ["file", "python"])  # type: ignore[misc]
 def test_npu_v2_rejected_during_engine_config_before_runtime_hooks(
-    monkeypatch: pytest.MonkeyPatch, mode: str, encoding: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, encoding: str
 ) -> None:
     from vllm_gr.engine import arg_utils_gr
     from vllm_gr.v1.engine import beam_search_v1
 
     config = _host("npu", True)
-    gr_config = _gr_config(mode, canonical=encoding == "canonical")
-    if encoding == "legacy":
-        gr_config.write_to_vllm_config(config)
-    args = SimpleNamespace(
-        _vllm_gr_config_input=gr_config_to_mapping(gr_config) if encoding == "canonical" else None
+    options = {
+        "beam_width": [4] * 3,
+        "constraint_mode": "none",
+        "sid_stage_vocab": mode == "sid",
+        "worker_decision": True,
+        "candidate_width": [4] * 3,
+    }
+    args = (
+        engine_args_from_file(tmp_path, {"gr": options})
+        if encoding == "file"
+        else SimpleNamespace(gr=options)
     )
     original_additional = config.additional_config.copy()
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
@@ -232,20 +260,14 @@ def test_device_admission_preserves_supported_and_existing_paths(
     ],
 )
 def test_engine_config_preserves_supported_and_existing_paths(
-    monkeypatch: pytest.MonkeyPatch, device: str, use_v2: bool, mode: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str, use_v2: bool, mode: str
 ) -> None:
     from vllm_gr.engine import arg_utils_gr
     from vllm_gr.v1 import ascend_compat
 
     config = _host(device, use_v2)
     gr_config = _gr_config(mode, canonical=True, device=device)
-    if gr_config.constraint_table is None:
-        # Ordinary engines keep their legacy/no-table form. Canonical Beam
-        # inputs explicitly carry a disabled or enabled table configuration.
-        _write_config(config, gr_config)
-        args = SimpleNamespace(_vllm_gr_config_input=None)
-    else:
-        args = SimpleNamespace(_vllm_gr_config_input=gr_config_to_mapping(gr_config))
+    args = engine_args_from_file(tmp_path, gr_config_to_mapping(gr_config))
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
     monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: device == "npu")
     monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: device == "cuda")
@@ -253,9 +275,8 @@ def test_engine_config_preserves_supported_and_existing_paths(
 
     assert arg_utils_gr.create_engine_config(args) is config
     effective = GRConfig.from_vllm_config(config)
-    assert effective.constrained_generation == gr_config.constrained_generation
+    assert effective.constraint_config.mode is gr_config.constraint_config.mode
     assert effective.beam_sid_stage_vocab == gr_config.beam_sid_stage_vocab
-    assert effective.beam_execution_mode is gr_config.beam_execution_mode
     assert config.use_v2_model_runner is use_v2
 
 

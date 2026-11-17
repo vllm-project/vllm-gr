@@ -538,8 +538,6 @@ def prefix_attention(
         and attn_metadata.max_num_splits == 0
         and getattr(attn_metadata, "prefix_length_bucket", 0)
     ):
-        from vllm.config import get_current_vllm_config_or_none
-
         from vllm_gr.v1.attention.backends.beam_prefix_policy import (
             PrefixShape,
             resolve_prefix_plan,
@@ -547,8 +545,6 @@ def prefix_attention(
 
         widths = attn_metadata.prefix_seqlens_q_cpu
         if widths and all(w == attn_metadata.prefix_max_q_len for w in widths):
-            config = get_current_vllm_config_or_none()
-            explicit = config.attention_config.flash_attn_version if config else None
             shape = PrefixShape(
                 batch=len(widths),
                 width=widths[0],
@@ -565,7 +561,10 @@ def prefix_attention(
                 fingerprint=device_fingerprint(query.device.index),
                 supported_versions=available_prefix_versions(query.device.index),
                 sm_count=multi_processor_count(query.device.index),
-                explicit_version=explicit,
+                explicit_version=attn_metadata.explicit_fa_version,
+                policy=attn_metadata.prefix_policy,
+                min_chain_us=attn_metadata.prefix_min_chain_us,
+                calibrations=attn_metadata.prefix_calibrations,
                 batch_invariant=envs.VLLM_BATCH_INVARIANT,
             )
             if plan is not None and plan.segments > 1:

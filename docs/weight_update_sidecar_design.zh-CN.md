@@ -122,7 +122,7 @@ checksum 或模型特定语义检查需要自定义 checker，默认检查不提
 已有 `constraint_backend` 持有 `VersionedConstraintTable`：
 reload 创建新的 backend，成功后将默认访问切换到最新表；准备失败时继续使用当前表。
 
-旧表保留 `VLLM_GR_TRIE_RETENTION_SECONDS` 指定的时间，默认 60 秒，
+旧表保留 `gr.trie_retention_seconds` 指定的时间，默认 60 秒，
 到期后在下一次 wrapper API 调用时释放。
 没有计时线程，也不按请求固定版本或做引用计数。
 访问默认指向最新版本，因此不保证一个请求全过程使用同一个 Trie 版本。
@@ -227,7 +227,7 @@ config = SidecarConfig(
 
 ### 启动 gRPC 实例
 
-保留现有 gRPC 入口和推理参数，新增必需的启动环境变量 **`VLLM_GR_ADMIN_PORT`**，
+保留现有 gRPC 入口和推理参数，通过 **`gr.admin_port`** 设置管理端口，
 每个实例使用不同端口。它在 gRPC 服务进程中启用独立的 HTTP 管控监听器，
 不是推理端口，也不替换 gRPC server。不设置该变量就不启动热更管控监听器。
 
@@ -235,10 +235,9 @@ config = SidecarConfig(
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-VLLM_GR_ADMIN_PORT=9100 \
 vllm serve /updates/bootstrap/ckpt_1700000000 --gr \
   --grpc \
-  --vllm-gr-config /etc/vllm-gr/gr-config.json \
+  --config /etc/vllm-gr/gr-config.yaml --gr.admin_port 9100 \
   --host 127.0.0.1 --port 9000 \
   --async-scheduling --no-enable-chunked-prefill
 ```
@@ -249,8 +248,8 @@ vllm serve /updates/bootstrap/ckpt_1700000000 --gr \
 示例配置包含八个实例，实际使用时按启动数量调整。
 
 管控地址默认绑定 `127.0.0.1`，适用于同一 Pod 共享网络的容器；
-可通过 `VLLM_GR_ADMIN_HOST` 覆盖。
-每个服务可用 `VLLM_GR_TRIE_RETENTION_SECONDS` 覆盖旧表默认 60 秒的保留时间。
+可通过 `gr.admin_host` 覆盖。
+每个服务可用 `gr.trie_retention_seconds` 覆盖旧表默认 60 秒的保留时间。
 HTTP 推理入口不启用这些热更接口，当前使用 gRPC 服务路径。
 
 ### 启动 Sidecar

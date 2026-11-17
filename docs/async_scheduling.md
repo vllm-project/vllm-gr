@@ -147,14 +147,13 @@ can still finish before the next dispatch's CPU preparation starts.
 
 ## Independent-engine reduction policy
 
-Both canonical configuration entry points, `vllm_gr_config` and
-`additional_config["vllm_gr"]`, write the complete normalized GR mapping into
-`VllmConfig.additional_config`. Equivalent settings with omitted defaults must
-have the same compilation cache identity. Otherwise, independent offline and
+All public startup paths write the complete normalized GR snapshot into
+`VllmConfig.additional_config["vllm_gr"]`. Equivalent settings with omitted
+defaults must have the same compilation cache identity. Otherwise, independent offline and
 online engines can tune different reduction kernels and produce different BF16
 Beam candidates and scores, despite having the same effective configuration.
 
-CUDA ModelRunner V1 engines using `beam.execution_mode=v1` and Inductor now
+CUDA ModelRunner V1 engines using the common Beam configuration and Inductor now
 default `compilation_config.inductor_compile_config.dynamic_scale_rblock` to
 `false`. The native compilation configuration includes this choice in its cache
 identity. Existing explicit values take precedence; ModelRunner V2, NPU and

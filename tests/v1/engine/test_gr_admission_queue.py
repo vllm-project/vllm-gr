@@ -163,7 +163,11 @@ def test_engine_startup_publishes_live_trie_count(counts):
     engine = SimpleNamespace()
 
     def original(self):
-        self.vllm_config = SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"})
+        self.vllm_config = SimpleNamespace(
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [4] * 3, "candidate_width": [4] * 3}}
+            }
+        )
         self.scheduler = SimpleNamespace()
         self.model_executor = SimpleNamespace(collective_rpc=Mock(return_value=counts))
 

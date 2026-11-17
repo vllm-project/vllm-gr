@@ -611,7 +611,9 @@ def test_backend_configuration_error_uses_request_error_channel() -> None:
     errors: list[object] = []
     engine = SimpleNamespace(
         vllm_config=SimpleNamespace(
-            additional_config={"vllm_gr_beam_execution_mode": "v1"},
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+            },
             scheduler_config=SimpleNamespace(async_scheduling=False),
         ),
         batch_queue=object(),
@@ -640,7 +642,9 @@ def test_gr_submission_disables_native_stop_ownership() -> None:
 
     engine = SimpleNamespace(
         vllm_config=SimpleNamespace(
-            additional_config={"vllm_gr_beam_execution_mode": "v1"},
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+            },
             scheduler_config=SimpleNamespace(async_scheduling=True),
         ),
         batch_queue=object(),

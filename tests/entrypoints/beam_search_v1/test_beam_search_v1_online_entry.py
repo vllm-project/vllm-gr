@@ -70,9 +70,8 @@ def _run(
             pass
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        # The mode guard needs a real engine config; the selection it performs
-        # is covered where the interface is chosen.
-        monkeypatch.setattr(execution, "require_beam_execution_mode", lambda *a, **k: None)
+        # Startup validation is covered by the dispatch tests.
+        monkeypatch.setattr(execution, "require_beam_config", lambda *a, **k: None)
         monkeypatch.setattr(serving_engine, "_next_data_parallel_rank", _rank)
         monkeypatch.setattr(
             serving_engine, "create_online_beam_search_v1_client", lambda self: object()

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -13,7 +12,6 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.batch_contracts import (
-    SUPPORTED_BEAM_BATCH_SIZES,
     BeamBatchParams,
     BeamOutputOptions,
 )
@@ -31,23 +29,6 @@ if TYPE_CHECKING:
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
 
 logger = init_logger(__name__)
-ENV_V1_STARTUP_CAPTURE_BATCH_SIZE = "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"
-
-
-def _startup_capture_batch_size() -> int:
-    raw = os.getenv(ENV_V1_STARTUP_CAPTURE_BATCH_SIZE)
-    if raw is None:
-        return 1
-    message = (
-        f"{ENV_V1_STARTUP_CAPTURE_BATCH_SIZE} must be one of {list(SUPPORTED_BEAM_BATCH_SIZES)}"
-    )
-    try:
-        batch_size = int(raw)
-    except ValueError as exc:
-        raise ValueError(message) from exc
-    if batch_size not in SUPPORTED_BEAM_BATCH_SIZES:
-        raise ValueError(message)
-    return batch_size
 
 
 def capture_async_forward(
@@ -61,90 +42,100 @@ def capture_async_forward(
             return False
         device_type = str(worker.device).split(":")[0]
         if device_type == "npu":
+            from vllm.config import set_current_vllm_config
+
             from vllm_gr.v1.worker.npu.npu_model_runner_patch import (
                 capture_beam_decode_graph,
             )
 
-            captured: bool = capture_beam_decode_graph(worker)
+            # Ascend's native capture can restore its config context before
+            # GR starts capturing. Bind this worker's config for mode selection
+            # and the dummy forwards so they use the same Decode backend.
+            with set_current_vllm_config(worker.vllm_config):
+                captured: bool = capture_beam_decode_graph(worker)
             return captured
         if device_type != "cuda":
             return False
         if hooks_type is None:
             raise ValueError("CUDA GR startup capture requires explicit stage hooks")
+        from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
+        from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+
+        if hooks_type is CudaStageHooksV2:
+            from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+                capture_multibatch_forward,
+            )
+
+            return capture_multibatch_forward(worker, allow_eager_fallback=allow_eager_fallback)
         # Measure (or load) the device-local prefix cost model before any Beam graph
         # is captured: the cache write is a YAML file and the probe needs the GPU to
         # itself. Failures degrade to "no calibration", never to a failed start-up.
         from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
             ensure_prefix_calibration,
         )
-        from vllm_gr.v1.attention.backends.beam_prefix_policy import (
-            remember_worker_flash_attn_version,
-        )
+        from vllm_gr.v1.worker.gr_context import _get_gr_config
 
-        # The request path may run without a vLLM config context, so persist the
-        # operator's explicit FlashAttention choice while it is still available.
-        remember_worker_flash_attn_version(worker)
-        ensure_prefix_calibration(worker)
-        from vllm_gr.v1.worker.gr_context import (
-            _get_gr_config,
-        )
-
-        if getattr(_get_gr_config(worker), "beam_graph_widths", None) is not None:
+        cfg = _get_gr_config(worker)
+        if getattr(cfg, "beam_graph_widths", None) is not None:
             logger.warning(
                 "beam.graph_widths is NPU-only startup pre-capture; CUDA captures "
                 "dynamic Decode (batch, width) shapes lazily on first use."
             )
 
-        from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
-
-        existing = getattr(worker, "_gr_gpu_stage_runner", None)
-        if existing is not None:
-            validate_stage_hooks_type(existing.hooks, hooks_type)
-            if (
-                existing.graph is None
-                or not existing.graph.ready
-                or not existing.closed
-                or getattr(worker, "_gr_async_decode_graph_capture_failed", False)
-            ):
+        max_reqs = worker.vllm_config.scheduler_config.max_num_seqs
+        batches = tuple(b for b in cfg.deployment.beam_batch_sizes if b <= max_reqs)
+        if not batches:
+            return False
+        if hasattr(worker, "_gr_decode_capture_failures"):
+            owner = getattr(worker, "_gr_gpu_stage_runner", None)
+            if owner is None or not owner.closed:
                 raise RuntimeError(
                     "Asynchronous scheduling startup encountered an incomplete capture state"
                 )
-            return True
-        error = _capture_batch(
-            worker,
-            _startup_capture_batch_size(),
-            hooks_type=hooks_type,
-            allow_eager_fallback=allow_eager_fallback,
-        )
-        if error is not None:
-            worker._gr_async_decode_graph_capture_failed = True
-            worker._gr_async_decode_graph_capture_error = error
-            return False
-        return True
+            validate_stage_hooks_type(owner.hooks, hooks_type)
+            graph = getattr(worker, "_beam_decode_graph", None)
+            for batch in batches:
+                if batch not in worker._gr_decode_capture_failures and (
+                    graph is None or not graph.select(batch, cfg.beam_max_width).ready
+                ):
+                    raise RuntimeError("Published Decode graph is not ready")
+            return len(worker._gr_decode_capture_failures) < len(batches)
+        if getattr(worker, "_gr_gpu_stage_runner", None) is not None:
+            raise RuntimeError(
+                "Asynchronous scheduling startup encountered an incomplete capture state"
+            )
+        ensure_prefix_calibration(worker)
+        failures = {}
+        for batch in batches:
+            error = _capture_batch(
+                worker,
+                batch,
+                hooks_type=hooks_type,
+                allow_eager_fallback=allow_eager_fallback,
+            )
+            if error is not None:
+                failures[batch] = error
+        worker._gr_decode_capture_failures = failures
+        worker._gr_async_decode_graph_capture_failed = len(failures) == len(batches)
+        worker._gr_async_decode_graph_capture_error = next(iter(failures.values()), None)
+        return len(failures) < len(batches)
 
 
 def _capture_enabled(worker: Any) -> bool:
-    from vllm_gr.v1.worker.gr_context import (
-        _get_gr_config,
-    )
+    from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
+    from vllm_gr.v1.worker.gr_context import _get_gr_config
 
     cfg = _get_gr_config(worker)
     validate_gr_execution_runtime(worker.vllm_config)
-    unconstrained = getattr(cfg, "constrained_generation", None) is False
-    if (
-        not cfg.beam_worker_decision
-        or cfg.beam_max_width is None
-        or (
-            not unconstrained and (cfg.constraint_table is None or not cfg.constraint_table.enabled)
-        )
-    ):
+    mode = configured_constraint_mode(cfg)
+    if not cfg.beam_worker_decision or cfg.beam_max_width is None or mode is None:
         raise ValueError(
             "Beam V1 requires worker decisions, fixed width and either an enabled "
             "canonical table or constrained_generation=False"
         )
-    if unconstrained and str(worker.device).split(":")[0] not in ("cuda", "npu"):
+    if mode is ConstraintMode.NONE and str(worker.device).split(":")[0] not in ("cuda", "npu"):
         raise ValueError("unconstrained Beam V1 requires CUDA or NPU")
-    if unconstrained and str(worker.device).split(":")[0] == "npu":
+    if mode is ConstraintMode.NONE and str(worker.device).split(":")[0] == "npu":
         validate_gr_device_config(worker.vllm_config)
     # A one-token session completes in Prefill and never replays a Decode graph.
     return (

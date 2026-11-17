@@ -143,11 +143,9 @@ class ModelRunnerPatchHooks(Protocol):
 ```
 
 Other factories are optional capabilities discovered by
-`model_runner_patch.apply_worker_patches()`. In particular,
-`make_patched_bookkeeping_sync(original)` is optional: CUDA retains the native
-method and records its identity, while NPU installs its six-item bookkeeping
-wrapper. A module without this factory still satisfies `ModelRunnerPatchHooks`.
-Optional sample, sample-tokens, state-update, reload, and graph hooks remain
+`model_runner_patch.apply_worker_patches()`. CUDA and NPU retain native sampling
+and bookkeeping for ordinary inference. V1 stage runners own Beam decisions
+and terminal results. Optional sample-tokens, state-update, reload, and graph hooks remain
 owned by the corresponding platform module.
 
 `make_patched_execute_model()` is intentionally absent. It is shared GPU/NPU

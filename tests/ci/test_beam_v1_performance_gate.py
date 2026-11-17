@@ -84,7 +84,7 @@ def test_offline_releases_consumed_outputs_before_next_call(
         def __enter__(self) -> "LLM":
             return self
 
-        def __exit__(self, *args: Any) -> None:
+        def __exit__(self, *args: object) -> None:
             assert all(ref() is None for ref in previous)
 
         def get_tokenizer(self) -> Tokenizer:
@@ -135,7 +135,7 @@ def test_offline_releases_consumed_outputs_before_next_call(
     monkeypatch.setattr(gr, "GRLLM", LLM)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
     monkeypatch.setattr(gate.time, "perf_counter_ns", clock)
-    (tmp_path / "vllm_gr_config.yaml").write_text("{}", encoding="utf-8")
+    (tmp_path / "setup.json").write_text('{"gr": {}}', encoding="utf-8")
     args = argparse.Namespace(
         output_dir=tmp_path,
         model="unused",
@@ -148,6 +148,7 @@ def test_offline_releases_consumed_outputs_before_next_call(
         batch_sizes=[1, 2],
         warmup_runs=2,
         measured_runs=3,
+        ab_legacy_config=False,
     )
     result: dict[str, Any] = {"cases": []}
     gc_policy = gc.isenabled(), gc.get_threshold()
@@ -271,3 +272,95 @@ def test_shared_driver_imports_each_selected_runtime(
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("legacy_config", [False, True])  # type: ignore[misc]
+def test_ab_driver_prepares_equivalent_startup_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_config: bool
+) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.entrypoints import gr
+
+    class EngineReached(Exception):
+        pass
+
+    engine_args: dict[str, Any] = {}
+
+    def record_engine_args(**kwargs: Any) -> None:
+        engine_args.update(kwargs)
+        raise EngineReached
+
+    monkeypatch.setattr(gr, "GRLLM", record_engine_args)
+    monkeypatch.delenv("V1_PERF_REPO_ROOT", raising=False)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.build_constraint_table",
+        SimpleNamespace(
+            build_constraint_table=lambda **kwargs: (
+                "sha256:" + "a" * 64,
+                "sha256:" + "b" * 64,
+                None,
+            )
+        ),
+    )
+    args = argparse.Namespace(
+        output_dir=tmp_path,
+        triples=tmp_path / "triples",
+        model="model",
+        revision=None,
+        prompt=tmp_path / "prompt",
+        input_len=128,
+        beam_width=128,
+        generated_steps=3,
+        batch_sizes=[1, 2, 4],
+        warmup_runs=1,
+        measured_runs=2,
+        max_model_len=8192,
+        gpu_memory_utilization=0.9,
+        request_timeout=60,
+        ab_prefill_grid=True,
+        ab_legacy_config=legacy_config,
+    )
+    gate.prepare(args)
+    setup = json.loads((tmp_path / "setup.json").read_text())
+    assert setup["beam_width"] == 128
+    settings = setup["gr"]
+    worker = load_engine_gr_config(None, {}, settings)
+    assert worker.beam_max_width == 128
+    assert worker.beam_max_decode_steps == 3
+    assert worker.deployment.beam_batch_sizes == (1, 2, 4)
+    assert worker.deployment.prefill_token_buckets == (1024, 2048, 4096)
+    assert worker.constraint.table.artifact_digest == "sha256:" + "a" * 64
+    assert worker.constraint.table.tokenizer_digest == "sha256:" + "b" * 64
+    assert worker.constraint.table.path == settings["constraint_table"]["path"]
+    with pytest.raises(EngineReached):
+        gate.run_offline(args, "prompt", {"cases": []})
+    if legacy_config:
+        assert "gr" not in engine_args
+        assert "attention_config" not in engine_args
+        config = engine_args["vllm_gr_config"]
+        assert config["schema_version"] == 1
+        assert config["attention_backend"] == "CUSTOM"
+        assert config["beam"] == {
+            "execution_mode": "v1",
+            "graph_enabled": True,
+            "worker_decision": True,
+            "max_width": 128,
+            "max_decode_steps": 3,
+            "online_batch_sizes": [1, 2, 4],
+        }
+        table = config["constraint_table"]
+        assert table["enabled"]
+        assert table["candidate_width"] == table["max_top_k"] == 128
+        assert table["path"] == worker.constraint.table.path
+        assert table["artifact_digest"] == worker.constraint.table.artifact_digest
+        assert table["tokenizer_digest"] == worker.constraint.table.tokenizer_digest
+    else:
+        assert "vllm_gr_config" not in engine_args
+        assert engine_args["gr"] == settings
+        assert engine_args["attention_config"] == {"backend": "CUSTOM"}

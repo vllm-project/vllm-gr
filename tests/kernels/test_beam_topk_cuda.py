@@ -37,13 +37,15 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unav
 
 
 def _run_both(
-    logits: torch.Tensor, temperatures: torch.Tensor, top_k: int
+    logits: torch.Tensor, temperatures: torch.Tensor, top_k: int, *, select: str = "i64"
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     rows = logits.shape[0]
     legacy_scratch = allocate_unconstrained_topk_scratch(
         rows, logits.shape[1], top_k, logits.device
     )
-    new_scratch = allocate_mcap_topk_scratch(rows, logits.shape[1], top_k, logits.device)
+    new_scratch = allocate_mcap_topk_scratch(
+        rows, logits.shape[1], top_k, logits.device, select=select
+    )
     outputs = []
     for launch, scratch in (
         (unconstrained_topk_out, legacy_scratch),
@@ -258,7 +260,6 @@ def test_mcap_matches_legacy_on_onerec_shape() -> None:
 def test_mcap_i32_surrogate_stays_bit_exact(monkeypatch: pytest.MonkeyPatch) -> None:
     """The optional 32-bit surrogate must not change any emitted value."""
 
-    monkeypatch.setenv("VLLM_GR_TOPK_SELECT", "i32")
     generator = torch.Generator().manual_seed(4242)
     vocab_size, top_k = 8192, 128
     base = torch.randn((2, vocab_size), generator=generator).cuda()
@@ -275,7 +276,7 @@ def test_mcap_i32_surrogate_stays_bit_exact(monkeypatch: pytest.MonkeyPatch) -> 
                 new_valid,
                 new_counts,
             ),
-        ) = _run_both(logits, torch.ones(2, device="cuda"), top_k)
+        ) = _run_both(logits, torch.ones(2, device="cuda"), top_k, select="i32")
         assert torch.equal(new_ids, ref_ids)
         assert torch.equal(new_lp, ref_lp)
         assert torch.equal(new_valid, ref_valid)
@@ -288,7 +289,6 @@ def test_mcap_i32_small_k_repairs_collision_at_cutoff(
 ) -> None:
     """An i32 prefix collision must still return the exact Top-K when keep == top_k."""
 
-    monkeypatch.setenv("VLLM_GR_TOPK_SELECT", "i32")
     # 1.0 and the next float share one truncated surrogate prefix, and the third
     # value is the larger of the three, so the surrogate alone would rank the tie
     # by lane and drop the true winner.
@@ -300,7 +300,7 @@ def test_mcap_i32_small_k_repairs_collision_at_cutoff(
     temperatures = torch.ones(rows, dtype=torch.float32, device="cuda")
 
     (ref_ids, ref_lp, ref_valid, ref_counts), (new_ids, new_lp, new_valid, new_counts) = _run_both(
-        logits, temperatures, top_k
+        logits, temperatures, top_k, select="i32"
     )
 
     assert new_ids.cpu().tolist() == [[2, 0][:top_k]] * rows
@@ -468,7 +468,6 @@ def test_mcap_streaming_slices_repair_before_buffer_reuse(
 ) -> None:
     """Repair hot/tied tiles without a host read, even in a captured graph."""
 
-    monkeypatch.setenv("VLLM_GR_TOPK_SELECT", mode)
     rows, vocab_size, slice_cols = 4, 8205, 2048
     logits = torch.randn((rows, vocab_size), device="cuda")
     logits[0].fill_(-10)
@@ -487,8 +486,10 @@ def test_mcap_streaming_slices_repair_before_buffer_reuse(
             torch.empty(rows, dtype=torch.int32, device="cuda"),
         )
 
-    scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
-    reference_scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device)
+    scratch = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device, select=mode)
+    reference_scratch = allocate_mcap_topk_scratch(
+        rows, vocab_size, top_k, logits.device, select=mode
+    )
     result, expected = buffers(), buffers()
     buffer = torch.empty((rows, slice_cols), device="cuda")
 

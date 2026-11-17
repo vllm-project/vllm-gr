@@ -4,8 +4,6 @@
 
 """Beam attention over a shared paged prefix and persistent per-beam suffix KV."""
 
-import functools
-import os
 from types import ModuleType
 from typing import Any, ClassVar
 
@@ -35,12 +33,6 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
 from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import (
     _get_fp8_dtype_for_flashattn,
 )
-from vllm_gr.v1.attention.backends.beam_dense_prefill import (
-    DENSE_PREFILL_MODES as _DENSE_PREFILL_MODES,
-)
-from vllm_gr.v1.attention.backends.beam_dense_prefill import (
-    ENV_DENSE_PREFILL,
-)
 
 __all__ = [
     "BeamAttentionBackend",
@@ -53,9 +45,7 @@ logger = init_logger(__name__)
 NPU_DEVICE = is_npu_available()
 CUDA_DEVICE = is_cuda_available()
 
-# In-process cache for the resolved vllm_gr_npu_decode_execution mode.  The
-# vLLM config is process-global and set once before model load, so the first
-# non-None read settles the mode for the lifetime of the process.
+# Worker calls outside a vLLM context reuse the most recently bound engine mode.
 _NPU_DECODE_EXECUTION_MODE: str | None = None
 
 
@@ -68,25 +58,25 @@ def _get_npu_decode_execution() -> str:
     Explicit ``cascade`` / ``xllm`` values always win.
     """
     global _NPU_DECODE_EXECUTION_MODE
-    if _NPU_DECODE_EXECUTION_MODE is not None:
-        return _NPU_DECODE_EXECUTION_MODE
     from vllm.config import get_current_vllm_config_or_none
 
     from vllm_gr.config import GRConfig
 
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
-        # Config not installed yet in this process; default without caching.
-        return "cascade"
+        return _NPU_DECODE_EXECUTION_MODE or "cascade"
+    bound = getattr(vllm_config, "_gr_npu_decode_execution", None)
+    if bound is not None:
+        _NPU_DECODE_EXECUTION_MODE = bound
+        return bound
     configured = GRConfig.from_vllm_config(vllm_config).npu_decode_execution
     if configured is not None:
-        _NPU_DECODE_EXECUTION_MODE = configured.value
-        return _NPU_DECODE_EXECUTION_MODE
-    if NPU_DEVICE and not CUDA_DEVICE:
+        mode = configured.value
+    elif NPU_DEVICE and not CUDA_DEVICE:
         from vllm_gr.ops.npu import beam_ops
 
-        _NPU_DECODE_EXECUTION_MODE = "xllm" if beam_ops.is_available() else "cascade"
-        if _NPU_DECODE_EXECUTION_MODE == "cascade":
+        mode = "xllm" if beam_ops.is_available() else "cascade"
+        if mode == "cascade":
             logger.info(
                 "vllm_gr_npu_decode_execution is unset and the xllm-ops library "
                 "is unavailable (%s); defaulting to the cascade decode path. "
@@ -95,8 +85,10 @@ def _get_npu_decode_execution() -> str:
                 beam_ops.unavailable_reason(),
             )
     else:
-        _NPU_DECODE_EXECUTION_MODE = "cascade"
-    return _NPU_DECODE_EXECUTION_MODE
+        mode = "cascade"
+    object.__setattr__(vllm_config, "_gr_npu_decode_execution", mode)
+    _NPU_DECODE_EXECUTION_MODE = mode
+    return mode
 
 
 def _get_platform_execution_module() -> ModuleType:
@@ -133,17 +125,13 @@ def _resolve_dense_prefill_mode() -> str | None:
     still checks its CPU lengths (eager batches and non-Beam decode rows also
     reach the Prefill entry).
     """
-    raw = os.environ.get(ENV_DENSE_PREFILL, "off").strip().lower()
-    if not CUDA_DEVICE or raw in ("", "off"):
-        return None
-    if raw not in _DENSE_PREFILL_MODES:
-        _warn_invalid_dense_prefill_mode(raw)
-        return None
-    if envs.VLLM_BATCH_INVARIANT:
+    if not CUDA_DEVICE or envs.VLLM_BATCH_INVARIANT:
         # The paged path pins num_splits=1; cuDNN-vs-FA2 selection by request
         # count would make results depend on batch composition.
         return None
     from vllm.config import get_current_vllm_config_or_none
+
+    from vllm_gr.config.models import deployment_for
 
     config = get_current_vllm_config_or_none()
     if (
@@ -154,13 +142,8 @@ def _resolve_dense_prefill_mode() -> str | None:
         or getattr(config, "kv_transfer_config", None) is not None
     ):
         return None
-    return raw
-
-
-@functools.lru_cache(maxsize=8)
-def _warn_invalid_dense_prefill_mode(raw: str) -> None:
-    # Resolved once per attention layer; warn once per process.
-    logger.warning("vllm_gr: ignoring %s=%s (expected off, fa2 or cudnn)", ENV_DENSE_PREFILL, raw)
+    mode = deployment_for(config).dense_prefill
+    return mode if mode != "off" else None
 
 
 def _dense_prefill_kwargs(

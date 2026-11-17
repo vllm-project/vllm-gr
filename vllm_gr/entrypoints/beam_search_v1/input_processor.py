@@ -15,11 +15,14 @@ from vllm.utils import random_uuid
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import GRConfig, resolve_candidate_width
-from vllm_gr.config.models import ConstraintTableBackendEnum
+from vllm_gr.config.models import ConstraintTableBackendEnum, configured_candidate_width
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
+)
+from vllm_gr.entrypoints.beam_search_v1.request_params import (
+    apply_beam_request_defaults,
 )
 from vllm_gr.entrypoints.beam_search_v1.token_utils import boundary_token_id
 from vllm_gr.v1.beam.batch_contracts import (
@@ -72,8 +75,17 @@ def _resolve_candidate_width(vllm_config: Any, params: Any) -> int:
 def _configured_candidate_width(vllm_config: Any) -> int | None:
     """Return the explicitly configured K, or ``None`` when K follows W."""
 
-    table = GRConfig.from_vllm_config(vllm_config).constraint_table
-    return None if table is None else table.candidate_width
+    config = GRConfig.from_vllm_config(vllm_config)
+    device = getattr(getattr(vllm_config, "device_config", None), "device", None)
+    if (
+        str(device).split(":")[0] == "npu"
+        and config.deployment.candidate_width is not None
+        and config.deployment.candidate_width == config.deployment.beam_width
+    ):
+        # NPU derives K from each stage's retained width. Do not serialize
+        # the workspace capacity as a fixed request override for dynamic W.
+        return None
+    return configured_candidate_width(config)
 
 
 def _effective_max_logprobs(vllm_config: Any) -> int | None:
@@ -170,9 +182,11 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
         raise BeamSearchRequestError(str(error)) from error
     # Shared validation above owns request/config semantics. Only frontend
     # limits and the configured Constraint Table remain to check here.
+    from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
+
     gr_config = GRConfig.from_vllm_config(vllm_config)
     table = gr_config.constraint_table
-    unconstrained = gr_config.constrained_generation is False
+    unconstrained = configured_constraint_mode(gr_config) is ConstraintMode.NONE
     device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
     device_type = str(device).split(":")[0]
     if unconstrained and device_type not in ("cuda", "npu"):
@@ -350,8 +364,9 @@ class BeamSearchInputProcessor:
         if call.concurrency_limit is not None and call.concurrency_limit <= 0:
             raise BeamSearchRequestError("concurrency_limit must be positive or None")
         tokenizer = llm.get_tokenizer()
+        params = apply_beam_request_defaults(self.engine.vllm_config, call.params)
         sampling_params, begin_token_id, end_token_id = _create_request_params(
-            call.params, tokenizer, vllm_config=self.engine.vllm_config
+            params, tokenizer, vllm_config=self.engine.vllm_config
         )
         engine_inputs = llm._preprocess_cmpl(call.prompts)
         lora_requests = llm._lora_request_to_seq(call.lora_request, len(engine_inputs))
@@ -377,7 +392,7 @@ class BeamSearchInputProcessor:
         request = _create_batch_request(
             session_id=session_id,
             engine_requests=tuple(engine_requests),
-            params=call.params,
+            params=params,
             vllm_config=self.engine.vllm_config,
             trie_ids=call.trie_ids,
         )
@@ -399,8 +414,9 @@ class BeamSearchInputProcessor:
             )
         if not call.prompts:
             raise VLLMValidationError("beam_search_v1 requires at least one prompt")
+        params = apply_beam_request_defaults(self.engine.vllm_config, call.params)
         sampling_params, begin_token_id, end_token_id = _create_request_params(
-            call.params, tokenizer, vllm_config=self.engine.vllm_config
+            params, tokenizer, vllm_config=self.engine.vllm_config
         )
         # One arrival time and one task set describe the batch, not its
         # members; asking per prompt would spread a single submission over the
@@ -431,7 +447,7 @@ class BeamSearchInputProcessor:
         request = _create_batch_request(
             session_id=session_id,
             engine_requests=tuple(engine_requests),
-            params=call.params,
+            params=params,
             vllm_config=self.engine.vllm_config,
             trie_ids=call.trie_ids,
         )

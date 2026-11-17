@@ -431,7 +431,7 @@ class ForwardRouting(unittest.TestCase):
         env: dict[str, Any] = {
             "wraps": wraps,
             "_WORKER_MODEL_FORWARD_PATCH_MARKER": "_test_patched",
-            "is_prefill_graph_enabled": lambda: True,
+            "is_prefill_graph_enabled": lambda runner: True,
             "is_prefill_phase_batch": lambda *args: True,
             "get_prefill_graph_runner": lambda runner: graph,
             "SUPPORTED_NUM_REQS": (1, 2, 4, 8),

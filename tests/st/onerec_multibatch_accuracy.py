@@ -42,11 +42,7 @@ def run(args: argparse.Namespace) -> int:
         VLLM_USE_V2_MODEL_RUNNER=str(int(args.runner == "v2")),
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
-        VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
-        VLLM_GR_PREFILL_GRAPH_KV_BOUND="8192",
     )
-    os.environ.pop("VLLM_GR_PREFILL_GRAPH_BUCKET_STEP", None)
-    os.environ.pop("VLLM_GR_PREFILL_GRAPH_MAX_BUCKET", None)
 
     from transformers import AutoTokenizer
 
@@ -136,8 +132,6 @@ def run(args: argparse.Namespace) -> int:
             "VLLM_USE_V2_MODEL_RUNNER",
             "VLLM_ENABLE_V1_MULTIPROCESSING",
             "VLLM_WORKER_MULTIPROC_METHOD",
-            "VLLM_ENABLE_PREFILL_CUDAGRAPH",
-            "VLLM_GR_PREFILL_GRAPH_KV_BOUND",
         )
     }
     result["packages"] = {
@@ -186,24 +180,23 @@ def run(args: argparse.Namespace) -> int:
     legal = {tuple(tokenizer.convert_tokens_to_ids(row)) for row in load_triples(triples)}
     result["catalog_legal_triples"] = len(legal)
     config = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": True,
-            "worker_decision": True,
-            "max_width": 128,
-            "max_decode_steps": 3,
-        },
+        "prefill_kv_bound": 8192,
+        "beam_graph_enabled": True,
+        "worker_decision": True,
+        "beam_width": [128] * 3,
+        "max_decode_steps": 3,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "max_top_k": 128,
             "path": str(artifact),
             "format": "constraint_table_v1",
-            "artifact_digest": artifact_info["artifact_digest"],
-            "tokenizer_digest": artifact_info["tokenizer_digest"],
+            "digests": {
+                "artifact": artifact_info["artifact_digest"],
+                "tokenizer": artifact_info["tokenizer_digest"],
+            },
         },
+        "candidate_width": [128] * 3,
     }
     kwargs: dict[str, Any] = {
         "model": str(model),
@@ -268,7 +261,7 @@ def run(args: argparse.Namespace) -> int:
     result["thresholds"] = thresholds
     persist()
     engine_start = time.perf_counter()
-    llm = GRLLM(**kwargs, vllm_gr_config=config)
+    llm = GRLLM(**kwargs, attention_config={"backend": "CUSTOM"}, gr=config)
     result["startup_seconds"] = time.perf_counter() - engine_start
     begin, end = tokenizer.convert_tokens_to_ids(["<|sid_begin|>", "<|sid_end|>"])
     addresses = None

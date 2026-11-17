@@ -39,7 +39,7 @@ def free_port() -> int:
 
 def prepare(
     output: Path, head_cache: str = "none", tied_weights: bool = False
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, dict[str, Any]]:
     from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
     from vllm.utils.torch_utils import set_random_seed
 
@@ -88,15 +88,15 @@ def prepare(
         table = compiler.compile(compile_relations_json(relations))
         path = output / "table.safetensors"
         artifact_digest = save_constraint_table_artifact(table, path)
-        data = json.loads(config.read_text())
-        data["constrained_generation"] = True
-        data["constraint_table"].update(
-            enabled=True,
-            path=str(path),
-            artifact_digest=artifact_digest,
-            tokenizer_digest=digest,
+        config.update(
+            constraint_mode="table",
+            constraint_table={
+                "backend": "cuda",
+                "max_top_k": max(config["candidate_width"]),
+                "path": str(path),
+                "digests": {"artifact": artifact_digest, "tokenizer": digest},
+            },
         )
-        config.write_text(json.dumps(data))
     import shutil
 
     second = output / "b/model"
@@ -137,40 +137,33 @@ def outputs(reply: Any) -> list[dict[str, list[int]]]:
 def server(
     output: Path,
     model: Path,
-    config: Path,
+    config: dict[str, Any],
     label: str,
     launcher: Path | None = None,
     *,
     graph: bool = False,
+    retention_seconds: float | None = None,
     head_cache: str = "none",
 ) -> Iterator[tuple[Any, httpx.Client]]:
     port, admin = free_port(), free_port()
     env = os.environ.copy()
     env.update(
         PYTHONPATH=str(ROOT),
-        VLLM_GR_ADMIN_PORT=str(admin),
         VLLM_USE_V2_MODEL_RUNNER="0",
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         HF_HUB_OFFLINE="1",
     )
-    env.pop("VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT", None)
-    env.pop("VLLM_GR_HEAD_SLICE", None)
+    overrides = {**config, "admin_port": admin}
+    if retention_seconds is not None:
+        overrides["trie_retention_seconds"] = retention_seconds
     if head_cache == "transposed":
-        # The transposed cache is created only when head slicing is enabled.
-        env.update(
-            VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT="transposed",
-            VLLM_GR_HEAD_SLICE="16384",
-        )
+        overrides.update(unconstrained_head_layout="transposed", head_slice=16384)
     if graph:
-        data = json.loads(config.read_text())
-        data["beam"]["graph_enabled"] = True
-        config = output / f"{label}-graph-config.json"
-        config.write_text(json.dumps(data, indent=2))
-        env.update(
-            VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
-            VLLM_GR_PREFILL_GRAPH_KV_BOUND="128",
-            VLLM_GR_PREFILL_GRAPH_BUCKETS="64,128,256",
-            VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS="1,2,4",
+        overrides.update(
+            beam_graph_enabled=True,
+            prefill_kv_bound=128,
+            prefill_token_buckets=[64, 128, 256],
+            beam_batch_sizes=[1, 2, 4],
         )
     command = [
         sys.executable,
@@ -179,8 +172,10 @@ def server(
         "serve",
         "--gr",
         str(model),
-        "--vllm-gr-config",
-        str(config),
+        "--attention-config",
+        '{"backend":"CUSTOM"}',
+        "--gr-config",
+        json.dumps(overrides),
         "--grpc",
         "--host",
         "127.0.0.1",

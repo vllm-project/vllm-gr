@@ -282,7 +282,9 @@ def test_explicit_cascade_overrides_platform_default(
     monkeypatch.setattr(
         vllm_config_mod,
         "get_current_vllm_config_or_none",
-        lambda: SimpleNamespace(additional_config={"vllm_gr_npu_decode_execution": "cascade"}),
+        lambda: SimpleNamespace(
+            additional_config={"vllm_gr": {"gr": {"npu_decode_execution": "cascade"}}}
+        ),
         raising=False,
     )
     monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", None)
@@ -300,7 +302,9 @@ def test_npu_decode_execution_reads_and_caches_gr_config(
 
     from vllm_gr.config import NPUDecodeExecution
 
-    vllm_config = SimpleNamespace(additional_config={"vllm_gr_npu_decode_execution": "xllm"})
+    vllm_config = SimpleNamespace(
+        additional_config={"vllm_gr": {"gr": {"npu_decode_execution": "xllm"}}}
+    )
     monkeypatch.setattr(
         vllm_config_mod,
         "get_current_vllm_config_or_none",

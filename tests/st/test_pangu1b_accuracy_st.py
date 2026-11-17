@@ -150,6 +150,15 @@ class TestPangu1bAccuracyUnitHooks(unittest.TestCase):
 
         self.assertEqual(kwargs["block_size"], 64)
 
+    @pytest.mark.l1
+    def test_offline_configuration_keeps_native_generation(self) -> None:
+        from vllm_gr.config import load_gr_config
+
+        config = load_gr_config(pangu_generate._pangu_engine_kwargs()["config"])
+        self.assertIsNone(config.beam_max_width)
+        self.assertFalse(config.beam_graph_enabled)
+        self.assertFalse(config.deployment.prefill_graph_enabled)
+
     def test_default_dataset_exists(self) -> None:
         self.assertEqual(pangu_generate._DEFAULT_DATASET, DEFAULT_DATASET)
         self.assertTrue(DEFAULT_DATASET.is_file())

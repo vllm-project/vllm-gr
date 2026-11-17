@@ -19,6 +19,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
+from tests.helpers.gr_config import set_deployment
 from vllm_gr.ops.npu_stage_logits import (
     NPUStageProjection,
     can_install_npu_stage_projection,
@@ -27,6 +28,18 @@ from vllm_gr.ops.npu_stage_logits import (
     install_npu_stage_weight_update_hooks,
     make_npu_stage_reload_weights,
 )
+
+
+@pytest.fixture(autouse=True)
+def cpu_embedding_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These CPU model doubles never run the native weight-loading hook that
+    # initializes cpu_linear. Keep the real projection/processor logic and
+    # replace only the device GEMM boundary.
+    monkeypatch.setattr(
+        UnquantizedEmbeddingMethod,
+        "apply",
+        lambda self, layer, x, bias=None: F.linear(x, layer.weight, bias),
+    )
 
 
 def _make_logits_processor(vocab_size: int) -> LogitsProcessor:
@@ -87,7 +100,6 @@ def context(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         hidden=torch.arange(16, dtype=torch.float32).reshape(2, 8) / 20,
         ids=ids,
     )
-    monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
     yield ctx
     installed = getattr(processor._get_logits, "__self__", None)
     if isinstance(installed, NPUStageProjection):
@@ -320,7 +332,6 @@ def test_inactive_or_unsupported_dispatch_uses_original_full_projection(
     "case",
     [
         "disabled",
-        "invalid",
         "no_stage_vocab",
         "tensor_parallel",
         "pipeline_parallel",
@@ -345,9 +356,7 @@ def test_install_rejects_unsupported_configs_without_changing_processor(
     original = ctx.processor._get_logits
     ctx.processor._gr_vocab_slice = (17, 12)
     if case == "disabled":
-        monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "0")
-    elif case == "invalid":
-        monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "true")
+        set_deployment(ctx.runner.vllm_config, npu_stage_lm_head=False)
     elif case == "no_stage_vocab":
         ctx.backend.stage_vocab = None
     elif case == "tensor_parallel":
@@ -448,17 +457,13 @@ def test_close_then_install_new_owner_uses_reloaded_weights(context: Any) -> Non
     )
 
 
-@pytest.mark.parametrize(
-    "value,enabled", [(None, True), ("1", True), ("0", False), ("", False), ("true", False)]
-)
+@pytest.mark.parametrize("value,enabled", [(None, True), (True, True), (False, False)])
 def test_automatic_stage_projection_can_be_explicitly_disabled(
-    context: Any, monkeypatch: pytest.MonkeyPatch, value: str | None, enabled: bool
+    context: Any, monkeypatch: pytest.MonkeyPatch, value: bool | None, enabled: bool
 ) -> None:
     ctx = context
-    if value is None:
-        monkeypatch.delenv("VLLM_GR_NPU_STAGE_LM_HEAD")
-    else:
-        monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", value)
+    if value is not None:
+        set_deployment(ctx.runner.vllm_config, npu_stage_lm_head=value)
     original = ctx.processor._get_logits
     assert can_install_npu_stage_projection(ctx.runner) is enabled
     owner = install_npu_stage_projection(ctx.runner, ctx.backend)
@@ -884,7 +889,7 @@ def test_sid_projection_remains_optional_for_ineligible_or_disabled_models(
     vocab = NPUSIDStageVocab(384, 4, ctx.ids)
     original = ctx.processor._get_logits
     if reason == "disabled":
-        monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "0")
+        set_deployment(ctx.runner.vllm_config, npu_stage_lm_head=False)
     elif reason == "lora":
         ctx.runner.lora_config = SimpleNamespace()
     else:

@@ -160,33 +160,34 @@ beam_width=128
 config_dir="${VLLM_GR_BENCHMARK_CONFIG_DIR:-$SCRIPT_DIR/../../generated_data/benchmark_v1}"
 mkdir -p "$config_dir" || exit 1
 config_dir="$(cd "$config_dir" && pwd)"
-config_path="$config_dir/vllm_gr_config.json"
-python - "$MODEL_PATH" "${triples_path:?Beam V1 requires CUDA or NPU constraint triples}" \
-    "$config_path" "$constraint_device" "$beam_width" <<'PY_CONFIG' || exit 1
+gr_overrides=$(python - "$MODEL_PATH" "${triples_path:?Beam V1 requires CUDA or NPU constraint triples}" \
+    "$config_dir/constraint_table.safetensors" "$constraint_device" "$beam_width" <<'PY_CONFIG'
 import json
 import sys
 from pathlib import Path
-from examples.offline_inference.beam_search.offline_beam_search_v1 import build_artifact
+from contextlib import redirect_stdout
 
-model, triples, config_path, backend, width = sys.argv[1:]
-path = Path(config_path)
-artifact = path.with_suffix(".safetensors")
-digest, tokenizer_digest = build_artifact(Path(model), Path(triples), artifact)
-config = {
-    "schema_version": 1,
-    "attention_backend": "CUSTOM",
-    "beam": {"execution_mode": "v1", "max_width": int(width), "max_decode_steps": 3,
-             "graph_enabled": backend == "cuda", "worker_decision": True},
+model, triples, artifact_path, backend, width = sys.argv[1:]
+artifact = Path(artifact_path)
+with redirect_stdout(sys.stderr):
+    from examples.offline_inference.beam_search.offline_beam_search_v1 import build_artifact
+
+    digest, tokenizer_digest = build_artifact(Path(model), Path(triples), artifact)
+print(json.dumps({
+    "beam_width": [int(width)] * 3,
+    "beam_graph_enabled": backend == "cuda",
+    "worker_decision": True,
     "constraint_table": {
-        "enabled": True, "backend": backend, "max_top_k": int(width),
-        "path": str(artifact), "format": "constraint_table_v1",
-        "artifact_digest": digest, "tokenizer_digest": tokenizer_digest,
+        "backend": backend,
+        "max_top_k": int(width),
+        "path": str(artifact.resolve()),
+        "digests": {"artifact": digest, "tokenizer": tokenizer_digest},
     },
-}
-path.write_text(json.dumps(config, indent=2) + "\n")
+    "candidate_width": [int(width)] * 3,
+}))
 PY_CONFIG
+) || exit 1
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
-  --gr \
   --model "$MODEL_PATH" \
   --dataset-path "$DATASET_PATH" \
   --dataset-name onerec \
@@ -194,7 +195,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --batch-size 1 \
   --use-beam-search \
   --task-type video \
-  --vllm-gr-config "$config_path" \
+  --gr "$gr_overrides" \
   --n "$beam_width")
 offline_status=$?
 printf '%s\n' "$output"
@@ -248,8 +249,9 @@ wait_for_server() {
 }
 
 echo "Starting OneRec online server"
-python -m vllm_gr.entrypoints.cli.main serve --gr \
-  --vllm-gr-config "$config_path" \
+python -m vllm_gr.entrypoints.cli.main serve --gr "$MODEL_PATH" \
+  --attention-config '{"backend":"CUSTOM"}' \
+  --gr-config "$gr_overrides" \
   --async-scheduling \
   --no-enable-chunked-prefill \
   --port "$run_port" \
@@ -258,8 +260,7 @@ python -m vllm_gr.entrypoints.cli.main serve --gr \
   --max-logprobs 512 \
   --max_num_seqs 2048 \
   --max_num_batched_tokens 16384 \
-  --scheduling-policy priority \
-  "$MODEL_PATH" &
+  --scheduling-policy priority &
 SERVER_PID=$!
 
 wait_for_server || exit 1

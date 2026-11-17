@@ -13,7 +13,7 @@ import torch
 from vllm_gr.config.models import (
     MULTI_TRIE_CONSTRAINT_TABLE_FORMAT,
     ConstraintTableBackendEnum,
-    ConstraintTableConfig,
+    ConstraintTableSpec,
 )
 from vllm_gr.constraints.artifact import (
     load_constraint_table_artifact,
@@ -97,7 +97,7 @@ def test_v2_artifact_roundtrip_and_cpu_query(tmp_path: Path, count: int, step: i
         with pytest.raises(ValueError):
             getattr(loaded, name).setflags(write=True)
     backend = load_constraint_backend(
-        ConstraintTableConfig(
+        ConstraintTableSpec(
             max_top_k=3,
             enabled=True,
             backend="cpu",
@@ -272,7 +272,7 @@ def test_cuda_loader_readiness_and_all_stages_match_scalar_reference(
     path = tmp_path / "roots.safetensors"
     digest = save_constraint_table_artifact(table, path)
     backend = load_constraint_backend(
-        ConstraintTableConfig(
+        ConstraintTableSpec(
             max_top_k=4,
             enabled=True,
             path=str(path),

@@ -6,8 +6,12 @@ import argparse
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
+
+import regex as re
+
+from vllm_gr.config.models import DeploymentOptions
+from vllm_gr.v1.attention.backends.beam_prefix_policy import calibration_path
 
 
 def token_digest(tokens):
@@ -34,29 +38,17 @@ def model_file_manifest(model):
     return result
 
 
-def prefix_environment():
+def prefix_environment(settings: DeploymentOptions) -> dict[str, str | None]:
     keys = (
         "CUDA_VISIBLE_DEVICES",
         "VLLM_BATCH_INVARIANT",
-        "VLLM_GR_PREFIX_POLICY",
-        "VLLM_GR_PREFIX_CALIBRATION",
-        "VLLM_GR_PREFIX_CALIBRATION_PATH",
         "XDG_CACHE_HOME",
-        "VLLM_ENABLE_PREFILL_CUDAGRAPH",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_USE_V2_MODEL_RUNNER",
         "VLLM_GR_TARGET_DEVICE",
-        "VLLM_GR_PREFILL_GRAPH_BUCKETS",
-        "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS",
-        "VLLM_GR_PREFILL_GRAPH_KV_BOUND",
-        "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE",
     )
     values = {key: os.environ.get(key) for key in keys}
-    override = values["VLLM_GR_PREFIX_CALIBRATION_PATH"]
-    base = values["XDG_CACHE_HOME"] or str(Path.home() / ".cache")
-    path = (
-        Path(override).expanduser() if override else Path(base) / "vllm_gr/prefix_calibration.yaml"
-    )
+    path = calibration_path(settings)
     if path.is_file():
         values["prefix_calibration_file_sha256_at_observation"] = hashlib.sha256(
             path.read_bytes()

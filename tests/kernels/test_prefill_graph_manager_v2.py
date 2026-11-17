@@ -25,13 +25,14 @@ from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 from vllm.v1.worker.gpu import cudagraph_utils as native
 
+from vllm_gr.config import GRConfig
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import close_v2_runtime
 from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
     PrefillCapturePlan,
     install_prefill_graph_manager_v2,
 )
 from vllm_gr.v1.worker.model_runner_patch import make_load_model_with_constraint_backend
-from vllm_gr.v1.worker.prefill_graph_common import PrefillGraphEnv
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")  # type: ignore[misc]
@@ -45,15 +46,14 @@ def test_native_capture_replay_fixed_output_and_piecewise_recovery(
     # The production runner opens this window before calling the manager.
     # Other graph tests may have closed it earlier in the same process.
     monkeypatch.setattr(monitor, "cudagraph_capturing_enabled", True)
-    monkeypatch.setattr(PrefillGraphEnv, "enabled", True)
-    monkeypatch.delenv("VLLM_GR_PREFILL_GRAPH_BUCKET_STEP", raising=False)
-    monkeypatch.delenv("VLLM_GR_PREFILL_GRAPH_MAX_BUCKET", raising=False)
     config = VllmConfig(
         compilation_config=CompilationConfig(cudagraph_mode=Mode.FULL_AND_PIECEWISE)
     )
     config.scheduler_config.max_num_seqs = 1
     config.scheduler_config.max_num_batched_tokens = 256
     config.compilation_config.cudagraph_capture_sizes = [1, 16, 128, 256]
+    # This test exercises the native capture budget, including 1 and 16.
+    GRConfig(deployment=DeploymentOptions(prefill_token_buckets=None)).write_to_vllm_config(config)
     device = torch.device("cuda:0")
     monkeypatch.setattr(
         native, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True)

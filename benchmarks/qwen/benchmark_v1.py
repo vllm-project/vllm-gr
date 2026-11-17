@@ -319,23 +319,21 @@ def build_constraint_artifact(
 
 def canonical_gr_config(args: argparse.Namespace, artifact: ConstraintArtifact) -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": not args.disable_beam_graph,
-            "max_width": args.beam_width,
-            "max_decode_steps": args.beam_steps,
-        },
+        "beam_graph_enabled": not args.disable_beam_graph,
+        "beam_width": [args.beam_width] * args.beam_steps,
+        "max_decode_steps": args.beam_steps,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "path": str(artifact.path),
             "format": "constraint_table_v1",
-            "artifact_digest": artifact.artifact_digest,
-            "tokenizer_digest": artifact.tokenizer_digest,
             "max_top_k": args.beam_width,
+            "digests": {
+                "artifact": artifact.artifact_digest,
+                "tokenizer": artifact.tokenizer_digest,
+            },
         },
-        "attention_backend": args.attention_backend or None,
+        "candidate_width": [args.beam_width] * args.beam_steps,
     }
 
 
@@ -587,10 +585,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     )
     timeline_trace_dir = Path(timeline_temp.name) if timeline_temp is not None else None
     engine_kwargs: dict[str, Any] = {
+        **(
+            {"attention_config": {"backend": args.attention_backend}}
+            if args.attention_backend
+            else {}
+        ),
         "model": args.model,
         "trust_remote_code": args.trust_remote_code,
         "max_logprobs": args.beam_width,
-        "vllm_gr_config": gr_config,
         "async_scheduling": True,
         "enable_prefix_caching": args.enable_prefix_caching,
         "max_num_seqs": 1,
@@ -606,7 +608,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     timeline_run = None
     try:
-        with GRLLM(**engine_kwargs) as llm:
+        with GRLLM(gr=gr_config, **engine_kwargs) as llm:
             for _ in range(args.warmup_runs):
                 _run_once(
                     llm,
@@ -668,21 +670,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "requests": len(workload),
         "warmup_runs": args.warmup_runs,
         "repeat": args.repeat,
-        "timeline": (
-            {
-                "output": str(timeline_target),
-                "requests": args.timeline_requests,
-                "repeat": args.timeline_repeat,
-                "profile_run_excluded_from_metrics": True,
-                "wall_ms_samples": timeline_run["wall_ms_samples"],
-                "phase_semantics": (
-                    "stage 0 is Prefill and emits the first Beam result; "
-                    f"stages 1..{args.beam_steps - 1} are Decode"
-                ),
-            }
-            if timeline_target is not None and timeline_run is not None
-            else None
-        ),
+        "timeline": {
+            "output": str(timeline_target),
+            "requests": args.timeline_requests,
+            "repeat": args.timeline_repeat,
+            "profile_run_excluded_from_metrics": True,
+            "wall_ms_samples": timeline_run["wall_ms_samples"],
+            "phase_semantics": f"stage 0 is Prefill and emits the first Beam result; stages 1..{args.beam_steps - 1} are Decode",
+        }
+        if timeline_target is not None and timeline_run is not None
+        else None,
         "sampling_params": {
             "beam_width": args.beam_width,
             "max_tokens": args.beam_steps,

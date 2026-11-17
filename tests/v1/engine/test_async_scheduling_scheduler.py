@@ -96,8 +96,13 @@ def scheduler(tmp_path, request):
             async_scheduling=True,
             enable_chunked_prefill=False,
         ),
-        additional_config={"vllm_gr_beam_execution_mode": "v1", "vllm_gr_beam_max_width": 4},
+        additional_config={"vllm_gr": {"gr": {"beam_width": [4] * 3, "candidate_width": [4] * 3}}},
     )
+    # CPU platform setup disables asynchronous model execution. These tests
+    # instantiate AsyncScheduler directly and exercise its host-only state machine.
+    config.scheduler_config.async_scheduling = True
+    # The model executor is simulated; admission still needs its CUDA identity.
+    config.device_config.device = torch.device("cuda")
     kv = KVCacheConfig(
         num_blocks=8,
         kv_cache_tensors=[],

@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.helpers.gr_config import engine_config
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_RETIRE_OUTPUT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
@@ -59,10 +60,12 @@ def test_execute_entry_binds_hooks_independently_of_environment(
     worker = SimpleNamespace(device="cuda")
     if not use_v2:
         worker.vllm_config = SimpleNamespace(
-            additional_config={"vllm_gr_beam_execution_mode": "v1"}
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+            }
         )
     # V2 deliberately has no vllm_config: the execution entry must not read
-    # execution_mode again after Engine admission.
+    # startup configuration again after Engine admission.
     output = _scheduled_frame(**{GR_STAGE_OUTPUT_ATTR: {"session": object()}})
     owner = SimpleNamespace(execute=Mock(return_value="stage"))
     get_owner = Mock(return_value=owner)
@@ -103,13 +106,15 @@ def test_cuda_dispatch_requires_explicit_hooks(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.l1  # type: ignore[misc]
 def test_v1_installer_binds_execution_and_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.worker import gr_startup, model_runner_patch
 
     class Runner:
         device = "cuda"
-        vllm_config = SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"})
-        _vllm_gr_config = SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1)
+        vllm_config = SimpleNamespace(
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+            }
+        )
         execute_model = _unexpected_native
         _prepare_inputs = _unexpected_native
         _bookkeeping_sync = _unexpected_native
@@ -147,7 +152,7 @@ def test_v1_installer_binds_execution_and_capture(monkeypatch: pytest.MonkeyPatc
     assert get_owner.call_args.kwargs["hooks_type"] is CudaStageHooksV1
 
 
-def test_v2_retirement_does_not_read_execution_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_v2_retirement_does_not_read_startup_config(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = SimpleNamespace(device="cuda")
     output = _scheduled_frame(**{GR_RETIRE_OUTPUT_ATTR: object()})
     retire = Mock(return_value="retired")
@@ -171,7 +176,7 @@ def test_v1_rejects_persistent_frames_without_v1_before_dispatch(
     retire = Mock(side_effect=AssertionError("invalid protocol retired an owner"))
     monkeypatch.setattr(stages, "get_stage_runner", get_owner)
     monkeypatch.setattr(stages, "execute_gr_retirement", retire)
-    with pytest.raises(ValueError, match="execution_mode='v1'"):
+    with pytest.raises(ValueError, match="gr.beam_width"):
         model_runner_common.make_patched_execute_model(_unexpected_native)(worker, output)
     get_owner.assert_not_called()
     retire.assert_not_called()
@@ -237,9 +242,7 @@ def test_stage_none_result_never_falls_through_to_native(
 ) -> None:
     worker = SimpleNamespace(device="cuda")
     if not use_v2:
-        worker.vllm_config = SimpleNamespace(
-            additional_config={"vllm_gr_beam_execution_mode": "v1"}
-        )
+        worker.vllm_config = engine_config()
     scheduled = _scheduled_frame(**{GR_STAGE_OUTPUT_ATTR: {"session": object()}})
     owner = SimpleNamespace(execute=Mock(return_value=None))
     monkeypatch.setattr(stages, "get_stage_runner", Mock(return_value=owner))

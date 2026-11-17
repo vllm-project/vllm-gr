@@ -24,7 +24,7 @@ def prefill_case_helpers() -> dict[str, Any]:
     tree = ast.parse(source.read_text(encoding="utf-8"))
     names = {
         "_padded_prefill_requested",
-        "_graph_test_environment",
+        "_graph_test_settings",
         "_comparison_prompts",
         "_assert_exact_prefill",
     }
@@ -44,23 +44,11 @@ def test_exact_prefill_inputs_and_opt_in_padding(prefill_case_helpers: dict[str,
     assert prompts[0] != prompts[1]
     legacy = helpers["_comparison_prompts"](None, exact_prefill=False)
     assert [len(prompt) + 1 for prompt in legacy] == [129, 161]
-    inherited = {
-        "VLLM_ENABLE_PREFILL_CUDAGRAPH": "0",
-        "VLLM_GR_PREFILL_GRAPH_BUCKET_STEP": "384",
-        "VLLM_GR_PREFILL_GRAPH_MAX_BUCKET": "384",
-        "unrelated": "keep",
+    settings = helpers["_graph_test_settings"]
+    assert settings({}) == {"prefill_token_buckets": [128, 256]}
+    assert settings({"VLLM_GR_TEST_PADDED_PREFILL": "1"}) == {
+        "prefill_token_buckets": [384],
     }
-    configured = helpers["_graph_test_environment"](inherited)
-    assert configured == dict(
-        inherited,
-        VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
-        VLLM_GR_PREFILL_GRAPH_BUCKET_STEP="128",
-        VLLM_GR_PREFILL_GRAPH_MAX_BUCKET="256",
-    )
-    assert inherited["VLLM_ENABLE_PREFILL_CUDAGRAPH"] == "0"
-    for flag in ("VLLM_GR_TEST_PADDED_PREFILL",):
-        diagnostic = dict(inherited, **{flag: "1"})
-        assert helpers["_graph_test_environment"](diagnostic) == diagnostic
 
 
 @pytest.mark.parametrize(

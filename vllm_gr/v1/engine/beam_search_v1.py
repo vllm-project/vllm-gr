@@ -17,7 +17,10 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_gr.config import MAX_BEAM_WIDTH, GRConfig
-from vllm_gr.config.models import CONSTRAINT_TABLE_MAX_DECODE_STEPS
+from vllm_gr.config.models import (
+    CONSTRAINT_TABLE_MAX_DECODE_STEPS,
+    configured_candidate_width,
+)
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
@@ -122,10 +125,9 @@ class GRRetireResult:
 
 def validate_gr_execution_config(config: Any) -> None:
     """Reject unsupported Asynchronous scheduling runtimes before native/Worker request allocation."""
-    from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.config.execution import require_beam_execution_mode
+    from vllm_gr.config.execution import require_beam_config
 
-    require_beam_execution_mode(config, BeamExecutionMode.V1)
+    require_beam_config(config)
     validate_gr_execution_runtime(config)
 
 
@@ -225,8 +227,7 @@ def _reject_candidate_width_below_dynamic_schedule(
     widths = params.dynamic_beam_widths
     if widths is None:
         return
-    table = getattr(gr_config, "constraint_table", None)
-    configured = getattr(table, "candidate_width", None)
+    configured = configured_candidate_width(gr_config)
     if configured is None:
         return
     for index, width in enumerate(widths):

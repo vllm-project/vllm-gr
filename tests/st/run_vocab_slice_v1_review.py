@@ -69,24 +69,19 @@ def main() -> None:
         model, Path(args.constraint_triples).resolve(), artifact
     )
     cfg = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": args.mode == "graph",
-            "worker_decision": True,
-            "max_width": 128,
-            "max_decode_steps": 3,
-        },
+        "beam_graph_enabled": args.mode == "graph",
+        "worker_decision": True,
+        "beam_width": [128] * 3,
+        "max_decode_steps": 3,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "path": str(artifact),
             "format": "constraint_table_v1",
-            "artifact_digest": digest,
-            "tokenizer_digest": tokenizer_digest,
             "max_top_k": 128,
+            "digests": {"artifact": digest, "tokenizer": tokenizer_digest},
         },
+        "candidate_width": [128] * 3,
     }
     last: dict[str, Any] = {}
     original = BeamSearchOutputProcessor.process_outputs
@@ -131,22 +126,25 @@ def main() -> None:
             ],
         }
 
-    with GRLLM(
-        model=str(model),
-        trust_remote_code=True,
-        vllm_gr_config=cfg,
-        async_scheduling=True,
-        enable_prefix_caching=True,
-        enable_chunked_prefill=False,
-        max_model_len=8192,
-        max_num_batched_tokens=8192,
-        max_num_seqs=128,
-        max_logprobs=128,
-        gpu_memory_utilization=0.9,
-        enforce_eager=args.mode == "eager",
-        seed=0,
-        worker_cls="vocab_slice_review_worker.ReviewWorker",
-    ) as llm:
+    with (
+        GRLLM(
+            model=str(model),
+            trust_remote_code=True,
+            attention_config={"backend": "CUSTOM"},
+            gr=cfg,
+            async_scheduling=True,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=False,
+            max_model_len=8192,
+            max_num_batched_tokens=8192,
+            max_num_seqs=128,
+            max_logprobs=128,
+            gpu_memory_utilization=0.9,
+            enforce_eager=args.mode == "eager",
+            seed=0,
+            worker_cls="vocab_slice_review_worker.ReviewWorker",
+        ) as llm,
+    ):
         for i in range(args.warmup):
             request(llm, i)
         llm.collective_rpc("review_control", args=("measure",))

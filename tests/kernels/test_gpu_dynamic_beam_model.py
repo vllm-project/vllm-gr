@@ -87,29 +87,24 @@ def build_tiny_engine(tmp_path, *, capacity=4, dense_catalog=False, graph=True):
     artifact = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(table, artifact)
     config = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": graph,
-            "worker_decision": True,
-            "max_width": capacity,
-            "max_decode_steps": 3,
-        },
+        "beam_graph_enabled": graph,
+        "worker_decision": True,
+        "beam_width": [capacity] * 3,
+        "max_decode_steps": 3,
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "max_top_k": capacity,
             "path": str(artifact),
             "format": "constraint_table_v1",
-            "artifact_digest": digest,
-            "tokenizer_digest": table.metadata.tokenizer_digest,
+            "digests": {"artifact": digest, "tokenizer": table.metadata.tokenizer_digest},
         },
+        "candidate_width": [capacity] * 3,
     }
     llm = GRLLM(
         model=str(model_path),
         dtype="float16",
-        vllm_gr_config=config,
+        gr=config,
+        attention_config={"backend": "CUSTOM"},
         async_scheduling=True,
         enable_chunked_prefill=False,
         enable_prefix_caching=False,

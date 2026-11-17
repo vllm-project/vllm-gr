@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -160,6 +162,7 @@ def test_incremental_metadata_builder_uses_active_session_contract() -> None:
 
     # Create a minimal builder instance
     builder = object.__new__(BeamAttentionMetadataBuilder)
+    builder.vllm_config = SimpleNamespace(speculative_config=None)
     builder.device = torch.device("cpu")
     builder.block_size = block_size
     builder.aot_schedule = False

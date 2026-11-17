@@ -36,6 +36,7 @@ if [[ ! -d "$model" ]]; then
   revision_args=(--revision "${V1_PERF_MODEL_REVISION:-cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b}")
 fi
 args=(
+  "$@"
   --model "$model"
   "${revision_args[@]}"
   --triples "$triples"
@@ -111,7 +112,7 @@ server_args=(
   --port "$port"
   --served-model-name "$server_identity"
   --seed 0
-  --vllm-gr-config "$output_dir/vllm_gr_config.yaml"
+  --config "$output_dir/gr-config.yaml"
   --async-scheduling
   --max-logprobs "$beam_width"
   --max-num-seqs "$max_batch_size"

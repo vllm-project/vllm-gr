@@ -12,6 +12,7 @@ from vllm.config.compilation import CUDAGraphMode as Mode
 from vllm.v1.worker.gpu import cudagraph_utils as native
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
+from tests.helpers.gr_config import set_deployment
 from vllm_gr.v1.worker import prefill_graph_common as common
 from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as pg2
 from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import close_v2_runtime
@@ -19,18 +20,10 @@ from vllm_gr.v1.worker.model_runner_patch import (
     make_load_model_with_constraint_backend,
     make_shutdown_with_constraint_backend,
 )
-from vllm_gr.v1.worker.prefill_graph_common import PrefillGraphEnv
 
 
 @pytest.fixture  # type: ignore[misc]
 def runner(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    monkeypatch.setattr(PrefillGraphEnv, "enabled", True)
-    for name in (
-        common.ENV_PREFILL_GRAPH_BUCKET_STEP,
-        common.ENV_PREFILL_GRAPH_MAX_BUCKET,
-        common.ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS,
-    ):
-        monkeypatch.delenv(name, raising=False)
     parallel = SimpleNamespace(
         tensor_parallel_size=1,
         data_parallel_size=1,
@@ -43,6 +36,7 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         adjust_cudagraph_sizes_for_spec_decode=lambda *args: None,
     )
     config = SimpleNamespace(
+        additional_config={"vllm_gr": {"gr": {"prefill_token_buckets": None}}},
         parallel_config=parallel,
         compilation_config=compilation,
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=512),
@@ -129,19 +123,22 @@ def test_capture_policy_is_not_engine_capacity(
     runner.scheduler_config.max_num_seqs = max_seqs
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = [128]
     if sizes is not None:
-        runner.vllm_config.additional_config = {"vllm_gr_beam_online_batch_sizes": list(sizes)}
+        runner.vllm_config.additional_config = {
+            "vllm_gr": {
+                "gr": {"beam_batch_sizes": list(sizes)},
+            }
+        }
     plan = pg2.PrefillCapturePlan.for_runner(runner)
     assert set(plan.batch_sizes) == expected
     assert {d.num_reqs for d in plan.descriptors()[Mode.FULL]} == expected
 
 
 @pytest.mark.parametrize("override", ["1,2,4", "3,7", "8"])  # type: ignore[misc]
-def test_prefill_capture_override_is_independent_of_online_policy(
+def test_prefill_capture_respects_configured_prompt_counts(
     runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, override: str
 ) -> None:
-    runner.vllm_config.additional_config = {"vllm_gr_beam_online_batch_sizes": [1, 3, 7]}
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = [128]
-    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS, override)
+    set_deployment(runner.vllm_config, beam_batch_sizes=list(map(int, override.split(","))))
     plan = pg2.PrefillCapturePlan.for_runner(runner)
     expected = {int(b) for b in override.split(",") if int(b) <= 4}
     assert {d.num_reqs for d in plan.descriptors()[Mode.FULL]} == expected
@@ -152,8 +149,8 @@ def test_prefill_capture_override_is_independent_of_online_policy(
 def test_plan_preserves_native_capture_budget(
     runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(common, "get_default_buckets", lambda: [128, 256, 1024])
-    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_KV_BOUND, "2048")
+    monkeypatch.setattr(common, "get_default_buckets", lambda config=None: [128, 256, 1024])
+    set_deployment(runner.vllm_config, prefill_kv_bound=2048)
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = [1, 2, 384, 2048]
     plan = pg2.PrefillCapturePlan.for_runner(runner)
     assert plan.buckets == (1, 2, 384)
@@ -216,20 +213,21 @@ def test_full_capture_admits_native_dummy_lengths_and_preserves_fallback(
 def test_v2_native_capture_sizes_do_not_change_v1_grid(
     runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, sizes: list[int]
 ) -> None:
-    from vllm_gr.config import BeamExecutionMode, GRConfig
+    from vllm_gr.config import GRConfig
+    from vllm_gr.config.models import DeploymentOptions
     from vllm_gr.v1.worker.prefill_graph_runner import get_prefill_graph_runner
 
     monkeypatch.setattr(
         GRConfig,
         "from_vllm_config",
         lambda _: SimpleNamespace(
-            beam_execution_mode=BeamExecutionMode.V1, beam_online_batch_sizes=(1, 2, 4)
+            beam_max_width=128,
+            deployment=DeploymentOptions(prefill_token_buckets=None),
         ),
     )
     runner.device = torch.device("cpu")
     runner.model_config.max_model_len = 1000
     runner.scheduler_config.max_num_batched_tokens = 4096
-    monkeypatch.delenv(common.ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = sizes
     v1 = get_prefill_graph_runner(runner)
     v2 = pg2.PrefillCapturePlan.for_runner(runner)
@@ -244,12 +242,11 @@ def test_v2_native_capture_sizes_do_not_change_v1_grid(
     assert ((4, 2048) in shapes) == (2048 in sizes)
 
 
-def test_legacy_grid_overrides_native_without_adding_capacity_endpoints(
+@pytest.mark.l1  # type: ignore[misc]
+def test_explicit_token_buckets_override_native_capture_sizes(
     runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_BUCKET_STEP, "128")
-    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_MAX_BUCKET, "256")
-    monkeypatch.delenv(common.ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
+    set_deployment(runner.vllm_config, prefill_token_buckets=[128, 256])
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = [1, 2, 512]
     assert pg2.PrefillCapturePlan.for_runner(runner).buckets == (128, 256)
 
@@ -289,7 +286,7 @@ def test_install_keeps_native_for_disabled_or_unsupported(
 ) -> None:
     before = runner.cudagraph_manager
     if gate == "env":
-        monkeypatch.setattr(PrefillGraphEnv, "enabled", False)
+        set_deployment(runner.vllm_config, prefill_graph_enabled=False)
     elif gate == "eager":
         runner.model_config.enforce_eager = True
     elif gate == "none":
@@ -583,9 +580,11 @@ def test_dense_prefill_capture_scope_and_fresh_replay(
     assert not dense.in_fresh_prefill_capture()
     with manager.prefill_scope(scheduled()):
         runner.req_states.num_computed_tokens_np[0] = 512  # cached Prefill suffix
-        monkeypatch.delenv(dense.ENV_DENSE_PREFILL, raising=False)
         assert manager.dispatch(1, 127, None).cg_mode == Mode.FULL
-        monkeypatch.setenv(dense.ENV_DENSE_PREFILL, "fa2")
+    set_deployment(runner.vllm_config, dense_prefill="fa2")
+    manager = make_manager(runner)
+    manager.capture()
+    with manager.prefill_scope(scheduled()):
         assert manager.dispatch(1, 127, None).cg_mode == Mode.PIECEWISE
         runner.req_states.num_computed_tokens_np[0] = 0
         assert manager.dispatch(1, 127, None).cg_mode == Mode.FULL

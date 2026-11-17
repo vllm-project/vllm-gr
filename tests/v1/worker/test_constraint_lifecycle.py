@@ -11,7 +11,13 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_gr.config import ConstraintTableConfig, GRConfig
+from vllm_gr.config import (
+    ConstraintBackendKind,
+    ConstraintConfig,
+    ConstraintMode,
+    ConstraintTableSpec,
+    GRConfig,
+)
 from vllm_gr.config.parser import gr_config_to_mapping
 from vllm_gr.v1.worker.model_runner_patch import (
     _runner_vocab_size,
@@ -39,16 +45,24 @@ def _vllm_config(
     beam_max_width: int | None = 4,
     max_top_k: int = 4,
 ) -> SimpleNamespace:
+    constraint = (
+        ConstraintConfig(
+            mode=ConstraintMode.TABLE,
+            table=ConstraintTableSpec(
+                max_top_k=max_top_k,
+                backend=ConstraintBackendKind.CUDA,
+                path="/models/constraint-table.safetensors",
+                artifact_digest=_ARTIFACT_DIGEST,
+                tokenizer_digest=_TOKENIZER_DIGEST,
+            ),
+        )
+        if enabled
+        else ConstraintConfig(mode=ConstraintMode.NONE)
+    )
     config = GRConfig(
         beam_max_width=beam_max_width,
         beam_max_decode_steps=3,
-        constraint_table=ConstraintTableConfig(
-            max_top_k=max_top_k,
-            enabled=enabled,
-            path="/models/constraint-table.safetensors" if enabled else None,
-            artifact_digest=_ARTIFACT_DIGEST if enabled else None,
-            tokenizer_digest=_TOKENIZER_DIGEST if enabled else None,
-        ),
+        constraint=constraint,
     )
     return SimpleNamespace(
         additional_config={"vllm_gr": gr_config_to_mapping(config)},
@@ -366,7 +380,7 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
 
     apply_sliced_logits_patch()
     runner = _runner()
-    runner.vllm_config.additional_config["vllm_gr"]["constraint_table"]["backend"] = "cuda"
+    runner.vllm_config.additional_config["vllm_gr"]["gr"]["constraint_table"]["backend"] = "cuda"
     runner.vllm_config.parallel_config = SimpleNamespace(tensor_parallel_size=2)
     backend = _Backend()
     backend.info.backend = ConstraintTableBackendEnum.CUDA

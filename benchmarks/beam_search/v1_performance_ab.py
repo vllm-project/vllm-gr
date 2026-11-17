@@ -31,7 +31,6 @@ SETUP_KEYS = (
     "gpu_memory_utilization",
     "artifact_digest",
     "tokenizer_digest",
-    "execution_mode",
     "graph_enabled",
     "prefix_caching",
     "chunked_prefill",

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from collections import Counter
 from collections.abc import Callable
 from functools import wraps
@@ -13,6 +12,7 @@ from typing import Any, cast
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.config.models import deployment_for
 from vllm_gr.ops.sliced_logits import (
     SlicedLMHeadProxy,
     is_supported_unquantized_lm_head,
@@ -26,7 +26,8 @@ _UPDATE_PATCH = "_vllm_gr_npu_stage_weight_update"
 
 def _supported_projection_parts(runner: Any) -> tuple[Any, Any] | None:
     """Check model eligibility before allocating optional device tables."""
-    if os.environ.get("VLLM_GR_NPU_STAGE_LM_HEAD", "1") != "1":
+    settings = deployment_for(getattr(runner, "vllm_config", None))
+    if not settings.npu_stage_lm_head:
         return None
     config = getattr(runner, "vllm_config", None)
     parallel = getattr(config, "parallel_config", None)
@@ -332,7 +333,7 @@ def install_npu_stage_projection(runner: Any, backend: Any) -> NPUStageProjectio
 def install_npu_sid_stage_projection(runner: Any, stage_vocab: Any) -> NPUStageProjection | None:
     """Optionally project tokenizer SID families without a catalog Backend.
 
-    Disabling the projection through VLLM_GR_NPU_STAGE_LM_HEAD=0 retains
+    Disabling the projection through gr.npu_stage_lm_head=false retains
     the stage-format semantics: candidate selection then masks full logits.
     The same owner handles ordinary/dummy fallback and native weight updates.
     """

@@ -217,6 +217,7 @@ def _build_incremental_metadata(
     token = BEAM_DATA_VAR.set(beam_info)
     try:
         builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
+        builder.vllm_config = SimpleNamespace(speculative_config=None)
         builder.device = DEVICE
         builder.block_size = BLOCK_SIZE
         builder.aot_schedule = False

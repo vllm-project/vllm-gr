@@ -12,8 +12,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 
-from vllm_gr.config import ConstraintTableBackendEnum
+from vllm_gr.config import ConstraintMode, ConstraintTableBackendEnum
 from vllm_gr.v1.worker.gr_context import (
+    _get_gr_config,
     get_beam_graph_runtime_stats,
 )
 from vllm_gr.v1.worker.gr_gc import (
@@ -103,7 +104,7 @@ def make_load_model_with_constraint_backend(
 
     @wraps(original)
     def load_model_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
-        from vllm_gr.config import BeamExecutionMode, GRConfig
+        from vllm_gr.config import GRConfig
 
         # A complete load replaces the model runtime. Release the previous
         # Backend before loading weights so a failed reload cannot leave stale
@@ -122,7 +123,7 @@ def make_load_model_with_constraint_backend(
         backend = None
         try:
             gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
-            if gr_config.constrained_generation is False:
+            if gr_config.constraint_config.mode is ConstraintMode.NONE:
                 return result
             table_config = gr_config.constraint_table
             if table_config is None or not table_config.enabled:
@@ -152,7 +153,7 @@ def make_load_model_with_constraint_backend(
             stage_options = {}
             if (
                 table_config.backend is ConstraintTableBackendEnum.NPU
-                and gr_config.beam_execution_mode is BeamExecutionMode.V1
+                and gr_config.beam_max_width is not None
                 and gr_config.beam_max_decode_steps <= 3
             ):
                 from vllm_gr.ops.npu_stage_logits import (
@@ -162,6 +163,7 @@ def make_load_model_with_constraint_backend(
                 # Check the loaded model before allocating compact tables.
                 if can_install_npu_stage_projection(self):
                     stage_options["enable_npu_stage_vocab"] = True
+                    stage_options["stage_lm_head"] = gr_config.deployment.npu_stage_lm_head
             backend = load_constraint_backend(
                 config=table_config,
                 device=getattr(self, "device", None),
@@ -305,10 +307,8 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
 
 def install_worker_utility_hooks(worker_cls: type) -> None:
     """Install named utility RPCs shared by CUDA and NPU Worker classes."""
-    from vllm_gr.constraints.worker_inject import install_worker_resource_hook
     from vllm_gr.v1.worker.hot_update import install_worker_hot_update_hooks
 
-    install_worker_resource_hook(worker_cls)
     install_worker_hot_update_hooks(worker_cls)
     if not getattr(worker_cls, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
         # Utility RPC dispatch resolves named Worker methods. Keep these
@@ -441,23 +441,14 @@ def apply_worker_patches() -> None:
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )
-        bookkeeping_patch = getattr(platform_module, "make_patched_bookkeeping_sync", None)
-        if bookkeeping_patch is not None:
-            runner_class._bookkeeping_sync = bookkeeping_patch(runner_class._bookkeeping_sync)
-        else:
-            # CUDA V1 stages produce their own final output. Keep native
-            # bookkeeping intact for ordinary inference and verify its identity.
-            runner_class._vllm_gr_native_bookkeeping = runner_class._bookkeeping_sync
+        # V1 stages own their results; ordinary inference retains native bookkeeping.
+        runner_class._vllm_gr_native_bookkeeping = runner_class._bookkeeping_sync
         # Pure-prefill graph interception: replays captured prefill graphs for
         # prompt batches inside _model_forward (installed on both platforms;
         # the vLLM 0.30 runner classes expose this method).
         model_forward_patch = getattr(platform_module, "make_patched_model_forward", None)
         if model_forward_patch is not None and hasattr(runner_class, "_model_forward"):
             runner_class._model_forward = model_forward_patch(runner_class._model_forward)
-        sample_patch = getattr(platform_module, "make_patched_sample", None)
-        if sample_patch is not None and hasattr(runner_class, "_sample"):
-            runner_class._sample = sample_patch(runner_class._sample)
-
         # Async V1 stages own sampling after execute_model returns.
         sample_tokens_patch = getattr(platform_module, "make_patched_sample_tokens", None)
         if sample_tokens_patch is not None and hasattr(runner_class, "sample_tokens"):
@@ -484,13 +475,9 @@ def apply_worker_patches() -> None:
                 @wraps(_orig)
                 def patched_capture_model(self: Any, *args: Any, **kwargs: Any) -> Any:
                     res = _orig(self, *args, **kwargs)
-                    from vllm_gr.config import BeamExecutionMode
-                    from vllm_gr.v1.worker.gr_context import (
-                        _get_gr_config,
-                    )
                     from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
-                    if _get_gr_config(self).beam_execution_mode is BeamExecutionMode.V1:
+                    if _get_gr_config(self).beam_max_width is not None:
                         capture_async_forward(self, hooks_type=hooks_type)
                     elif _beam_capture is not None:
                         try:

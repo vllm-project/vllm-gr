@@ -14,6 +14,7 @@ import atexit
 import functools
 import json
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -355,23 +356,17 @@ def install() -> None:
     except (ImportError, AttributeError):
         pass
 
-    # vLLM-gr worker decision is outside upstream _sample's original body.
-    # Patch the semantic function and refresh the copied module alias when the
-    # patch module has already been imported.
+    # V1 stage decisions receive candidate tensors directly. Refresh the copied
+    # NPU alias if its stage module was imported before instrumentation.
     try:
         from vllm_gr.v1.beam import beam_decision
 
-        original_decision = beam_decision.maybe_run_worker_beam_decision
-        wrapped_decision = _timed(
-            "beam_worker_decision", original_decision, require_scope="beam_sample"
-        )
-        beam_decision.maybe_run_worker_beam_decision = wrapped_decision
-        try:
-            import vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch as gpu_patch
-
-            gpu_patch.maybe_run_worker_beam_decision = wrapped_decision
-        except ImportError:
-            pass
+        original_decision = beam_decision.run_beam_decision_candidates
+        wrapped_decision = _timed("beam_worker_decision", original_decision)
+        beam_decision.run_beam_decision_candidates = wrapped_decision
+        stage_module = sys.modules.get("vllm_gr.v1.worker.npu.npu_beam_stage_runner")
+        if stage_module is not None:
+            setattr(stage_module, "run_beam_decision_candidates", wrapped_decision)
     except (ImportError, AttributeError):
         pass
 

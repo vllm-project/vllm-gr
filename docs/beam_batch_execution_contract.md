@@ -296,9 +296,9 @@ kernels move as one. Widths above 256 take the hierarchical path; the fused
 
 On CUDA the serving path consumes `K` end to end: the sampler is asked for `K`
 logprobs per row, the postprocess workspace is keyed by `(W, K)`, and every
-stage's selection takes `K` candidates per parent. A `beam_max_width` above 256
-therefore needs an explicit `candidate_width`; left unset, `K` follows `W` and
-exceeds the 256 candidate ceiling, which is rejected at parse time. With a
+stage's selection takes `K` candidates per parent. Unconstrained generation
+supports K up to 1024. Constraint-table generation still requires K <= 256;
+its backend loader checks that independent operator limit. With a
 dynamic schedule, a configured `K` must be at least every stage width and is the
 top-k of every stage. An unset `K` is not written onto the request: each stage
 keeps taking its own output width as top-k, exactly as before `K` existed, and
@@ -348,8 +348,9 @@ Bootstrap uses `P=1`. Decode uses `P=num_active_beams`, with
 with `1 <= K <= MAX_CANDIDATE_WIDTH`. Without `per_parent_beam_widths`,
 candidate generation uses the configured `K`, or `K=W_out` when it is unset.
 CUDA and NPU requests may configure a per-stage candidate schedule: bootstrap requires
-`K_1=W_1`, and later stages require `W_i <= W_(i-1)*K_i`. Every `K_i` is
-limited to 256, so a request schedule needs `W_1 <= 256`.
+`K_1=W_1`, and later stages require `W_i <= W_(i-1)*K_i`. Unconstrained CUDA
+supports `K_i <= 1024`; current constraint-table operators require `K_i <= 256`,
+so a table request schedule needs `W_1 <= 256`.
 An explicit request schedule uses dynamic selection, which flattens the
 `P*K` candidate pool and selects W winners.
 

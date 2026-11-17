@@ -67,6 +67,8 @@ def _build_serve_cmd(model_path: str, port: int) -> list[str]:
         "serve",
         "--gr",
         model_path,
+        "--config",
+        str(pangu_generate._PANGU_CONFIG),
         "--host",
         "127.0.0.1",
         "--port",
@@ -308,11 +310,16 @@ class TestPangu1bOnlineUnitHooks(unittest.TestCase):
     """Lightweight checks that do not load the full model or start a server."""
 
     def test_serve_command_builder(self) -> None:
+        from vllm_gr.config import load_gr_config
+
         cmd = _build_serve_cmd("/tmp/pangu", 18080)
         self.assertIn("serve", cmd)
         self.assertNotIn("--model-family", cmd)
         self.assertIn("--served-model-name", cmd)
         self.assertEqual(cmd[cmd.index("--served-model-name") + 1], SERVED_MODEL_NAME)
+        config = load_gr_config(cmd[cmd.index("--config") + 1])
+        self.assertIsNone(config.beam_max_width)
+        self.assertFalse(config.deployment.prefill_graph_enabled)
 
     def test_min_accuracy_environment_value_is_float(self) -> None:
         with mock.patch.dict(

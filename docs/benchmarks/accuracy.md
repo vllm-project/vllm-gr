@@ -19,7 +19,7 @@ This guide explains how to run the accuracy benchmark using the [`one_rec_acc_te
 Prepare the matching model snapshot and a canonical V1 configuration with a
 compiled Constraint Table. Follow the [artifact and engine setup](../../examples/offline_inference/beam_search/README.md#constraint-table-artifact).
 Use the same model and tokenizer snapshot for evaluation and artifact
-compilation. Set `--n` to match `beam.max_width` in the config. An enabled
+compilation. Set `--n` to match the first entry of `gr.beam_width` in the config. An enabled
 Constraint Table fixes generation to exactly three generated SID tokens,
 including the token sampled during Prefill; with both OneRec boundary tokens
 configured that is public `max_tokens=5`. The video task below uses three. The
@@ -32,7 +32,7 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
   --model "$ONEREC_MODEL" \
   --dataset-path ./data \
   --task-type video \
-  --vllm-gr-config ./vllm_gr_config.yaml \
+  --config ./vllm_gr_config.yaml \
   --n 128 \
   --num-prompts 1000 \
   --result-dir results/acc_test_results
@@ -107,7 +107,7 @@ the reported mean can be fractional.
 | `--task-type`      | str   | -                | Task to run (ad, product, label_cond, video, interactive)                 |
 | `--result-dir`     | str   | -                | Directory to save debug evaluation files                                  |
 | `--debug`          | -     | -                | Enable debug mode for evaluators                                          |
-| `--vllm-gr-config` | path  | -                | Required offline. Path to the canonical V1 config                         |
+| `--config`         | path  | -                | Offline engine YAML. Use `--gr` for JSON overrides.                       |
 | `--batch-size`     | int   | 1                | Offline V1 batch size (1, 2 or 4)                                         |
 | `--n`              | int   | dataset-specific | Override the dataset default beam width (number of beams) for beam search |
 | `--temperature`    | float | dataset-specific | Override the dataset default temperature                                  |

@@ -9,7 +9,6 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -286,7 +285,7 @@ def main() -> int:
         "--use-beam-search", action="store_true", help="Whether to use beam search for generation."
     )
     parser.add_argument("--n", type=int, help="Beam width to use if beam search is enabled.")
-    parser.add_argument("--vllm-gr-config", help="Canonical V1 config JSON; required offline")
+    parser.add_argument("--config", help="Optional explicit GR configuration file")
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
@@ -304,7 +303,9 @@ def main() -> int:
         default=1,
         help="Offline V1 logical batch size; partial tails split into 4/2/1",
     )
-    parser.add_argument("--gr", action="store_true", help="Whether to use vllm-gr.")
+    parser.add_argument(
+        "--gr", nargs="?", const={}, type=json.loads, help="Explicit GR settings as a JSON object"
+    )
 
     parser.add_argument(
         "--result-dir",
@@ -366,7 +367,9 @@ def main() -> int:
             parser.error("--chat-template-kwargs applies only to online requests")
 
     # 1. Load Configuration
-    if args.gr:
+    if args.gr is not None and not isinstance(args.gr, dict):
+        parser.error("--gr must be a JSON object")
+    if args.gr is not None:
         logger.info("Detected --gr flag, enabling vllm-gr mode for accuracy test.")
 
     if args.task_type not in TASK_REGISTRY:
@@ -409,39 +412,32 @@ def main() -> int:
         logger.info(f"\nUsing OpenAI-compatible API at: {args.endpoint}")
         logger.info(f"Model: {args.model}")
     else:
-        from vllm_gr.config import BeamExecutionMode
-        from vllm_gr.config.parser import load_gr_config
-
-        if not args.vllm_gr_config:
-            parser.error("Offline accuracy testing requires --vllm-gr-config with a V1 artifact")
-        config = load_gr_config(args.vllm_gr_config)
+        if not args.config and not args.gr:
+            parser.error(
+                "Offline accuracy testing requires a V1 constraint artifact in --gr or --config"
+            )
         width = gen_config.get("num_beams", 1)
         steps = gen_config.get("max_new_tokens", 5) - 2
-        if config.beam_execution_mode is not BeamExecutionMode.V1:
-            parser.error("Offline accuracy testing requires beam.execution_mode='v1'")
         if steps not in (1, 2, 3):
             parser.error(
                 "V1 supports only 1/2/3 generated SID tokens; long reasoning is unsupported"
             )
-        if width != config.beam_max_width or args.beam_max_width not in (None, width):
+        if args.beam_max_width not in (None, width):
             parser.error("Request beam width must equal the canonical V1 max_width")
         if args.catalog_path or args.constraint_backend:
-            parser.error(
-                "Use the canonical artifact in --vllm-gr-config instead of legacy catalog options"
-            )
+            parser.error("Supply the compiled artifact in gr.constraint_table")
         if args.backend not in (None, "CUSTOM"):
-            parser.error("Offline attention backend is selected by --vllm-gr-config")
+            parser.error("The offline Beam benchmark uses the CUSTOM attention backend")
         if args.max_concurrency is not None:
             parser.error("Use --batch-size 1/2/4 for offline V1 batching")
         if args.no_constrained_generation:
-            try:
-                config = replace(config, constrained_generation=False)
-            except ValueError as exc:
-                parser.error(f"--no-constrained-generation conflicts with V1 config: {exc}")
+            parser.error("Select constraint_mode in --gr")
         engine_kwargs = {
             "model": args.model,
             "trust_remote_code": True,
-            "vllm_gr_config": config,
+            "config": args.config,
+            "gr": args.gr,
+            **({"attention_config": {"backend": "CUSTOM"}} if args.gr and not args.config else {}),
             "async_scheduling": True,
             "enforce_eager": args.enforce_eager,
             "enable_chunked_prefill": False,
@@ -511,8 +507,15 @@ def main() -> int:
             end_token="<|sid_end|>",
             include_stop_str_in_output=True,
         )
+        from vllm_gr.config import GRConfig
+
         try:
             with GRLLM(**engine_kwargs) as llm:
+                config = GRConfig.from_vllm_config(llm.llm_engine.vllm_config)
+                if config.beam_max_width is None or width != config.beam_max_width:
+                    parser.error(
+                        "Offline accuracy testing requires V1 and the configured beam width"
+                    )
                 gen_start = time.perf_counter()
                 outputs = run_offline_v1_inference(
                     llm, prompts, params, args.batch_size, sample_ids=sample_ids

@@ -251,7 +251,9 @@ def test_npu_startup_publishes_the_loaded_backend_count_not_a_config_guess(count
     def initialize(owner: Any) -> None:
         owner.vllm_config = SimpleNamespace(
             device_config=SimpleNamespace(device="npu"),
-            additional_config={"vllm_gr_beam_execution_mode": "v1"},
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+            },
         )
         owner.scheduler = SimpleNamespace()
         owner.model_executor = SimpleNamespace(

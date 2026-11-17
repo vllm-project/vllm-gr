@@ -16,9 +16,9 @@ if TYPE_CHECKING:
 class ModelRunnerPatchHooks(Protocol):
     """Required hooks for the V1 ModelRunner patch dispatcher.
 
-    Additional factories, including ``make_patched_bookkeeping_sync``, are
-    optional capabilities discovered by the dispatcher. CUDA keeps native
-    bookkeeping; NPU supplies its six-item bookkeeping wrapper.
+    Additional stage sampling and model-forward factories are optional
+    capabilities discovered by the dispatcher. Both platforms retain native
+    sampling and bookkeeping for ordinary inference.
     """
 
     def discover_worker_runners(self) -> tuple[tuple[str, type[Any]], ...]: ...

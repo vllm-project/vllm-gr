@@ -33,6 +33,7 @@ import regex as re
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_PANGU_CONFIG = _REPO_ROOT / "configs" / "pangu1b.yaml"
 _DEFAULT_DATASET = _REPO_ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
 _ANSWER_RE = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
@@ -49,6 +50,7 @@ def _is_npu_platform() -> bool:
 def _pangu_engine_kwargs(block_size: int | None = None) -> dict[str, Any]:
     """Recommended vLLM engine flags for openPangu Embedded 1B."""
     kwargs: dict[str, Any] = {
+        "config": _PANGU_CONFIG,
         "trust_remote_code": True,
         "dtype": "bfloat16",
         "max_model_len": int(os.environ.get("PANGU1B_MAX_MODEL_LEN", "32768")),

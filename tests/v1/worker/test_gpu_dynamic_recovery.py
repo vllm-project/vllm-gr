@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.cuda.gpu_dynamic_beam import uses_dynamic_beam
 from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
@@ -104,7 +105,9 @@ assert ref() is None
 
 @pytest.mark.parametrize("failure", ["refused", "fatal", "unhealthy", "capturing"])
 def test_runtime_capture_recovery(monkeypatch, failure):
-    cfg = SimpleNamespace(beam_graph_enabled=True, beam_online_batch_sizes=(1,))
+    cfg = SimpleNamespace(
+        beam_graph_enabled=True, deployment=DeploymentOptions(beam_batch_sizes=(1,))
+    )
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
         _vllm_gr_config=cfg,

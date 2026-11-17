@@ -13,7 +13,9 @@ import torch
 
 from tests.constraints.test_table import make_table
 from tests.helpers.beam_requests import make_batch_request
-from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
+from tests.helpers.gr_config import engine_config
+from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
+from vllm_gr.config.models import DEFAULT_DEPLOYMENT
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
@@ -83,6 +85,7 @@ def runtime(
     candidate_width=None,
     *,
     unconstrained=False,
+    gr_options=None,
     hooks_cls=CudaStageHooksV1,
 ):
     context = BeamAttentionContext(3, 4, 1, 5, 8, 2, torch.device("cuda"), dtype)
@@ -117,6 +120,7 @@ def runtime(
     )
     backend._mark_ready()
     worker = SimpleNamespace(
+        vllm_config=engine_config(**(gr_options or {})),
         _beam_sessions={"session-0": session},
         model_config=SimpleNamespace(max_model_len=64),
         kv_cache_config=SimpleNamespace(
@@ -197,6 +201,7 @@ def admission_worker(
             max_model_len=64,
             is_encoder_decoder=False,
             is_hybrid=False,
+            hf_config=SimpleNamespace(architectures=[]),
             get_vocab_size=lambda: backend.info.table_metadata.vocab_size,
             get_head_size=lambda: 32,
             get_num_kv_heads=lambda _: 1,
@@ -205,14 +210,16 @@ def admission_worker(
         ),
         supports_mm_inputs=False,
         vllm_config=SimpleNamespace(
-            additional_config={"vllm_gr_beam_execution_mode": "v1"},
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+            },
             scheduler_config=SimpleNamespace(async_scheduling=True),
         ),
         cache_config=SimpleNamespace(cache_dtype="auto", sliding_window=None),
         _vllm_gr_config=SimpleNamespace(
+            deployment=DEFAULT_DEPLOYMENT,
             beam_max_width=4,
             beam_max_decode_steps=3,
-            beam_execution_mode=BeamExecutionMode.V1,
             enable_short_suffix_attention=False,
             # resolve_candidate_width reads this; None keeps K == W for the
             # fixture's W=4 workspace.

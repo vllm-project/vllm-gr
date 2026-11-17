@@ -1,26 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-import json
 from enum import Enum, auto
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from vllm_gr.ops.sliced_logits import (
     SlicedLMHeadProxy,
     compute_sliced_logits,
     get_rank_vocab_bounds,
-    get_vocab_slice_config,
-    is_vocab_slice_enabled,
     set_vocab_slice_config,
 )
-from vllm_gr.utils.catalog import Catalog
 from vllm_gr.utils.npu_adapter import is_cuda_available
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def cpu_embedding_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+
+    original = UnquantizedEmbeddingMethod.apply
+
+    def apply(self: Any, layer: Any, x: torch.Tensor, bias: Any = None) -> torch.Tensor:
+        # Mock heads bypass native model loading and its cpu_linear setup.
+        if x.device.type == "cpu":
+            return F.linear(x, layer.weight, bias)
+        return original(self, layer, x, bias)
+
+    monkeypatch.setattr(UnquantizedEmbeddingMethod, "apply", apply)
 
 
 @pytest.mark.l1  # type: ignore[misc]
@@ -112,68 +125,6 @@ def test_quantization_group_alignment() -> None:
     assert sliced_logits is not None
     assert sliced_logits.shape == (batch_size, slice_size)
     assert torch.allclose(sliced_logits, expected_slice_logits, atol=1e-5, rtol=1e-5)
-
-
-def test_catalog_slice_config(tmp_path: Any) -> None:
-    set_vocab_slice_config(None, None)
-    assert not is_vocab_slice_enabled()
-
-    class DummyTokenizer:
-        def convert_tokens_to_ids(self, tokens: Any) -> Any:
-            mapping = {
-                "<|sid_begin|>": 1,
-                "<s_a_100>": 1000,
-                "<s_b_200>": 1200,
-                "<s_c_500>": 2499,
-                "<|sid_end|>": 2,
-            }
-            if isinstance(tokens, list):
-                return [mapping.get(t, None) for t in tokens]
-            return mapping.get(tokens, None)
-
-    catalog_data = [["<|sid_begin|>", "<s_a_100>", "<s_b_200>", "<s_c_500>", "<|sid_end|>"]]
-    catalog_file = tmp_path / "test_catalog.json"
-    catalog_file.write_text(json.dumps(catalog_data))
-
-    cat = Catalog(DummyTokenizer())
-    cat.load(str(catalog_file))
-
-    assert is_vocab_slice_enabled()
-    assert cat.vocab_offset == 1000
-    assert cat.vocab_slice_size == 1500  # 2499 - 1000 + 1
-    offset, slice_size, _ = get_vocab_slice_config()
-    assert offset == 1000
-    assert slice_size == 1500
-
-    set_vocab_slice_config(None, None)
-    assert not is_vocab_slice_enabled()
-
-
-def test_constraint_triples_slice_config(tmp_path: Any) -> None:
-    from vllm_gr.utils.catalog import compute_catalog_slice_config
-
-    class DummyTokenizer:
-        def convert_tokens_to_ids(self, tokens: Any) -> Any:
-            mapping = {
-                "<s_a_100>": 1000,
-                "<s_b_200>": 1200,
-                "<s_c_500>": 2499,
-            }
-            return [mapping.get(token) for token in tokens]
-
-    triples_file = tmp_path / "constraint_triples.json"
-    triples_file.write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "triples": [{"a": "<s_a_100>", "b": "<s_b_200>", "c": "<s_c_500>"}],
-                "sentinels": {"begin": "<|sid_begin|>", "end": "<|sid_end|>"},
-                "relations": {},
-            }
-        )
-    )
-
-    assert compute_catalog_slice_config(str(triples_file), DummyTokenizer()) == (1000, 1500)
 
 
 class MockTPHead(nn.Module):  # type: ignore[misc]
@@ -313,42 +264,6 @@ def test_quantized_lm_head_fallback() -> None:
     assert torch.allclose(sliced_logits, ref_sliced, atol=1e-5, rtol=1e-5)
     # Ensure pre-sliced weight proxy was NOT created for quantized head
     assert not hasattr(quant_head, "_sliced_weight")
-
-
-def test_validation_vocab_offset_and_slice_size() -> None:
-    import pytest
-
-    from vllm_gr.config.validation import (
-        validate_vocab_offset,
-        validate_vocab_slice_size,
-    )
-
-    # Valid values
-    assert validate_vocab_offset(0) == 0
-    assert validate_vocab_offset("1000") == 1000
-    assert validate_vocab_offset(None) is None
-
-    assert validate_vocab_slice_size(1500) == 1500
-    assert validate_vocab_slice_size("24000") == 24000
-    assert validate_vocab_slice_size(None) is None
-
-    # Invalid negative offset
-    with pytest.raises(ValueError, match="vocab_offset"):
-        validate_vocab_offset(-10)
-
-    # Invalid non-positive slice size
-    with pytest.raises(ValueError, match="vocab_slice_size"):
-        validate_vocab_slice_size(0)
-
-    with pytest.raises(ValueError, match="vocab_slice_size"):
-        validate_vocab_slice_size(-100)
-
-    # Invalid types
-    with pytest.raises(ValueError, match="vocab_offset"):
-        validate_vocab_offset("abc")
-
-    with pytest.raises(ValueError, match="vocab_slice_size"):
-        validate_vocab_slice_size(True)
 
 
 def _native_processor(vocab_size: int, head_dtype: torch.dtype | None = None) -> Any:
@@ -507,7 +422,6 @@ def test_native_logits_non_receiver_preserves_none(quantized: bool) -> None:
 
     def gather(local: torch.Tensor) -> None:
         calls.append(local.shape[-1])
-        return None
 
     processor._gather_logits = gather
     assert processor(head, torch.randn(2, 32)) is None

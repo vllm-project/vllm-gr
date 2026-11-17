@@ -361,7 +361,9 @@ def test_worker_installs_config_filter_before_constructor(
 ) -> None:
     from vllm_gr.config.parser import parse_gr_config
 
-    config = SimpleNamespace(additional_config={"vllm_gr_beam_max_width": 8})
+    config = SimpleNamespace(
+        additional_config={"vllm_gr": {"gr": {"beam_width": [8], "candidate_width": [8]}}}
+    )
     seen: list[Any] = []
 
     def initialize(received: Any) -> None:
@@ -392,7 +394,7 @@ def test_worker_installs_config_filter_before_constructor(
 def test_worker_rechecks_config_bindings_without_rewrapping_device_hook(
     monkeypatch: pytest.MonkeyPatch, caller: str
 ) -> None:
-    additional = {"vllm_gr_beam_max_width": 8, "refresh": True}
+    additional = {"vllm_gr": {"gr": {"beam_width": [8], "candidate_width": [8]}}, "refresh": True}
     config = SimpleNamespace(additional_config=additional)
     seen: list[Any] = []
 
@@ -429,7 +431,10 @@ def test_worker_rechecks_config_bindings_without_rewrapping_device_hook(
     entry.init_ascend_config(config)
     assert seen == [config, config]
     assert config.additional_config is additional
-    assert additional == {"vllm_gr_beam_max_width": 8, "refresh": True}
+    assert additional == {
+        "vllm_gr": {"gr": {"beam_width": [8], "candidate_width": [8]}},
+        "refresh": True,
+    }
 
     assert ascend_compat.patch_npu_worker_init_device() == 0
     assert NPUWorker.init_device is device_wrapper
@@ -453,9 +458,8 @@ def test_config_binding_recheck_preserves_unrelated_overrides(
     assert sys.modules["vllm_ascend.ascend_config"].init_ascend_config is sanitizer
 
 
-@pytest.mark.parametrize("canonical", [False, True])  # type: ignore[misc]
 def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
-    monkeypatch: pytest.MonkeyPatch, canonical: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from copy import deepcopy
 
@@ -472,14 +476,7 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
     configs = []
     for width in (4, 8):
         additional: dict[str, Any] = {"refresh": True}
-        if canonical:
-            additional["vllm_gr"] = {
-                "schema_version": 1,
-                "beam": {"execution_mode": "v1", "max_width": width},
-                "constraint_table": {"max_top_k": width},
-            }
-        else:
-            additional.update(vllm_gr_beam_execution_mode="v1", vllm_gr_beam_max_width=width)
+        additional["vllm_gr"] = {"gr": {"beam_width": [width] * 3, "candidate_width": [width] * 3}}
         config = SimpleNamespace(additional_config=additional)
         before = deepcopy(additional)
         expected = parse_gr_config(config)
@@ -500,7 +497,10 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
 def test_ascend_config_filter_restores_mapping_on_native_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    additional = {"vllm_gr_beam_max_width": 4, "unknown_vendor_key": True}
+    additional = {
+        "vllm_gr": {"gr": {"beam_width": [4], "candidate_width": [4]}},
+        "unknown_vendor_key": True,
+    }
     config = SimpleNamespace(additional_config=additional)
 
     def initialize(received: Any) -> None:
@@ -513,7 +513,7 @@ def test_ascend_config_filter_restores_mapping_on_native_failure(
     with pytest.raises(ValueError, match="native validation failed"):
         initialize_filtered(config)
     assert config.additional_config is additional
-    assert additional["vllm_gr_beam_max_width"] == 4
+    assert additional["vllm_gr"] == {"gr": {"beam_width": [4], "candidate_width": [4]}}
 
 
 @pytest.mark.parametrize("additional", [None, {}, {"refresh": True}])  # type: ignore[misc]
@@ -536,7 +536,9 @@ def test_ascend_entry_installs_filter_before_delegating(
 ) -> None:
     import vllm_gr.patch as runtime_patch
 
-    config = SimpleNamespace(additional_config={"vllm_gr_beam_max_width": 4})
+    config = SimpleNamespace(
+        additional_config={"vllm_gr": {"gr": {"beam_width": [4], "candidate_width": [4]}}}
+    )
     initialize_child = mock.Mock()
     monkeypatch.setattr(runtime_patch, "initialize_engine_core_beam_patches", initialize_child)
 
@@ -551,7 +553,9 @@ def test_ascend_entry_installs_filter_before_delegating(
         assert args == ("socket-address",)
         assert kwargs == {"vllm_config": config, "dp_rank": 2, "local_dp_rank": 1}
         entry.init_ascend_config(config)
-        assert config.additional_config == {"vllm_gr_beam_max_width": 4}
+        assert config.additional_config == {
+            "vllm_gr": {"gr": {"beam_width": [4], "candidate_width": [4]}}
+        }
         return "ready"
 
     setattr(entry, "_run_engine_core_patch_func", native_entry)
@@ -584,7 +588,11 @@ def test_ascend_child_activates_live_trie_capacity_before_first_core_initializat
 
     config = SimpleNamespace(
         device_config=SimpleNamespace(device="npu"),
-        additional_config={"vllm_gr_beam_execution_mode": "v1"} if beam else {},
+        additional_config={
+            "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+        }
+        if beam
+        else {},
     )
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(

@@ -32,55 +32,23 @@ def beam_search_dispatch(
     *,
     trie_ids: list[int] | tuple[int, ...] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
-    """Adapt upstream OpenAI Beam calls to GR V1 or native non-GR inference.
+    """Route upstream OpenAI Beam calls exclusively to GR V1.
 
-    Upstream Chat/Completion still call ``self.beam_search``. Only that name
-    remains: the GR frontend token loop has been retired. Calling the native
-    mixin directly keeps repeated patch installation from capturing this
-    dispatcher as its own fallback.
-
-    ``prompt`` may be a sequence when a caller submits one fixed V1 batch.
+    Chat/Completion still call ``self.beam_search``; that upstream name is
+    only an adapter to ``beam_search_v1``, never a separate token loop.
+    ``prompt`` may be a sequence for one fixed V1 batch.
     """
     # Capture at generator creation, not iteration: upstream may consume the
     # per-prompt generators concurrently or after returning a streaming response.
     selectors = _COMPLETION_TRIE_IDS.get()
     if trie_ids is None and selectors is not None:
         trie_ids = [next(selectors)]
-    from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
-
-    from vllm_gr.config import BeamExecutionMode, GRConfig
+    from vllm_gr.config.execution import require_beam_config
     from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
 
-    config = getattr(self.engine_client, "vllm_config", None)
-    gr_config = GRConfig.from_vllm_config(config)
-    if gr_config.beam_execution_mode is BeamExecutionMode.V1:
-        impl = beam_search_v1
-    else:
-        additional = getattr(config, "additional_config", None) or {}
-        if (
-            gr_config.enabled
-            or gr_config.beam_max_width is not None
-            or "vllm_gr_beam_execution_mode" in additional
-            or "vllm_gr" in additional
-        ):
-            raise ValueError(
-                "Legacy GR beam_search() has been removed. Configure "
-                "beam.execution_mode='v1' and a canonical constraint artifact."
-            )
-        if getattr(params, "per_parent_beam_widths", None) is not None:
-            from vllm.exceptions import VLLMValidationError
-
-            raise VLLMValidationError(
-                "per_parent_beam_widths requires GR beam_search_v1",
-                parameter="per_parent_beam_widths",
-            )
-        impl = BeamSearchOnlineMixin.beam_search
-    trie_kwargs = {}
-    if trie_ids is not None:
-        if gr_config.beam_execution_mode is not BeamExecutionMode.V1:
-            raise ValueError("trie_ids require GR beam_search_v1")
-        trie_kwargs["trie_ids"] = trie_ids
-    return impl(
+    require_beam_config(getattr(self.engine_client, "vllm_config", None))
+    trie_kwargs = {} if trie_ids is None else {"trie_ids": trie_ids}
+    return beam_search_v1(
         self,
         prompt=prompt,
         request_id=request_id,

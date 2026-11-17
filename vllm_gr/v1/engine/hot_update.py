@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from vllm_gr.config import BeamExecutionMode, GRConfig
+from vllm_gr.config import GRConfig
 from vllm_gr.constraints.versioned_table import INITIAL_CONSTRAINT_VERSION
 from vllm_gr.update_status import ServiceState, ServiceStatus
 
@@ -84,7 +84,7 @@ def resume(core: Any) -> Any:
 def _reload_trie(core: Any, path: str, version: str) -> dict[str, Any]:
     _validate_target(path, version)
     config = GRConfig.from_vllm_config(core.vllm_config)
-    if config.beam_execution_mode is not BeamExecutionMode.V1:
+    if config.beam_max_width is None:
         raise ValueError("Online Trie reload requires beam_search_v1 execution")
     table = config.constraint_table
     if table is None or not table.enabled:

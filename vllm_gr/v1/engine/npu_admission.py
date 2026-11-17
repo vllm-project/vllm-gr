@@ -9,6 +9,11 @@ import math
 import struct
 from typing import TYPE_CHECKING, Any
 
+from vllm_gr.config.models import (
+    ConstraintMode,
+    configured_candidate_width,
+    configured_constraint_mode,
+)
 from vllm_gr.v1.engine.beam_search_v1 import GRDeviceRequestError
 
 if TYPE_CHECKING:
@@ -63,7 +68,15 @@ def validate_npu_device_config(
     config: Any, gr_config: GRConfig, request: BeamBatchRequest | None = None
 ) -> None:
     """Validate NPU deployment and request capabilities before allocation."""
-    if gr_config.constrained_generation is False:
+    parent_widths = gr_config.deployment.candidate_width
+    unconstrained = configured_constraint_mode(gr_config) is ConstraintMode.NONE
+    if (
+        unconstrained
+        and parent_widths is not None
+        and parent_widths != gr_config.deployment.beam_width
+    ):
+        raise ValueError("independent per-step candidate_width schedules require CUDA")
+    if unconstrained:
         validate_npu_unconstrained_runner(config)
         # Keep admission bounded to the validated decision/KV/graph horizon;
         # this does not admit CUDA's arbitrary generation horizons.
@@ -77,8 +90,11 @@ def validate_npu_device_config(
             )
         if gr_config.beam_max_decode_steps > 3:
             _validate_extended_unconstrained_kv_capacity(config, gr_config.beam_max_decode_steps)
-        table = gr_config.constraint_table
-        configured_k = None if table is None else table.candidate_width
+        # Public matching schedules describe K == W at each stage. Their
+        # maximum is workspace capacity, not a fixed K for dynamic requests.
+        # Keep the fixed-width check for internal scalar configurations and
+        # explicit request overrides below.
+        configured_k = configured_candidate_width(gr_config) if parent_widths is None else None
         candidate_width_error = (
             "NPU unconstrained beam_search_v1 requires candidate_width "
             "to match each stage's beam width"

@@ -8,8 +8,9 @@ import pytest
 from vllm_gr.v1.attention.backends import beam_attn
 
 
-def _config(prefix_caching=False, chunked=False, kv_transfer=None):
+def _config(prefix_caching=False, chunked=False, kv_transfer=None, *, mode=None):
     return SimpleNamespace(
+        additional_config={"vllm_gr": {"gr": {"dense_prefill": mode}}} if mode is not None else {},
         cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
         scheduler_config=SimpleNamespace(enable_chunked_prefill=chunked),
         kv_transfer_config=kv_transfer,
@@ -22,8 +23,7 @@ def _config(prefix_caching=False, chunked=False, kv_transfer=None):
         (None, True, _config(), None),
         ("off", True, _config(), None),
         ("fa2", True, _config(), "fa2"),
-        (" CUDNN ", True, _config(), "cudnn"),
-        ("flash", True, _config(), None),
+        ("cudnn", True, _config(), "cudnn"),
         ("cudnn", False, _config(), None),
         # Cached context lives only in the paged cache.
         ("cudnn", True, _config(prefix_caching=True), None),
@@ -37,10 +37,8 @@ def test_dense_prefill_mode_requires_fresh_prompts(monkeypatch, raw, cuda, confi
 
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", False)
 
-    if raw is None:
-        monkeypatch.delenv(beam_attn.ENV_DENSE_PREFILL, raising=False)
-    else:
-        monkeypatch.setenv(beam_attn.ENV_DENSE_PREFILL, raw)
+    if config is not None:
+        config.additional_config = _config(mode=raw).additional_config
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", cuda)
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
     assert beam_attn._resolve_dense_prefill_mode() == expected
@@ -49,9 +47,9 @@ def test_dense_prefill_mode_requires_fresh_prompts(monkeypatch, raw, cuda, confi
 def test_dense_prefill_mode_off_when_batch_invariant(monkeypatch):
     import vllm.config
 
-    monkeypatch.setenv(beam_attn.ENV_DENSE_PREFILL, "cudnn")
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", _config)
+    config = _config(mode="cudnn")
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", True)
     assert beam_attn._resolve_dense_prefill_mode() is None
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", False)
@@ -83,7 +81,7 @@ def test_dense_prefill_kwargs_forward_fresh_kv_only(changes, forwards):
     assert beam_attn._dense_prefill_kwargs(impl, None, value) == {}
 
 
-def test_fresh_prefill_capture_scope_and_replay_requirement(monkeypatch):
+def test_fresh_prefill_capture_scope():
     from vllm_gr.v1.attention.backends import beam_dense_prefill as dense
 
     assert not dense.in_fresh_prefill_capture()
@@ -93,18 +91,6 @@ def test_fresh_prefill_capture_scope_and_replay_requirement(monkeypatch):
             raise RuntimeError
         assert dense.in_fresh_prefill_capture()
     assert not dense.in_fresh_prefill_capture()
-    for raw, expected in (
-        (None, False),
-        ("off", False),
-        ("bogus", False),
-        ("FA2", True),
-        ("cudnn", True),
-    ):
-        if raw is None:
-            monkeypatch.delenv(dense.ENV_DENSE_PREFILL, raising=False)
-        else:
-            monkeypatch.setenv(dense.ENV_DENSE_PREFILL, raw)
-        assert dense.requires_fresh_prefill_replay() is expected
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

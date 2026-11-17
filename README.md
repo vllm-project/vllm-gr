@@ -87,8 +87,11 @@ for loading checks and guidance maintenance.
 The following is the serving configuration contract for the validated NPU
 stack (vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2).
 
-Use a canonical `--vllm-gr-config` file with `beam.execution_mode: v1` and
-`constraint_table.backend: npu`. Build the `.safetensors` artifact with the
+The driver loads [default_config.yaml](vllm_gr/config/default_config.yaml) automatically. Set
+`constraint_table.backend="npu"` in the Python `gr`
+dictionary or its `--gr-config` JSON equivalent. The separate `--gr` flag
+selects GR mode; for example, `vllm serve MODEL --gr --gr-config '{"result_width":2}'`.
+Build the `.safetensors` artifact with the
 same model/tokenizer snapshot used by the server and include the printed
 artifact and tokenizer digests in the configuration.
 
@@ -105,6 +108,31 @@ catalog paths plus a resolved benchmark policy; see
 For catalog-free Beam selection over the full vocabulary or opt-in SA/SB/SC
 token families on this stack, see
 [unconstrained Beam Search V1 on NPU](docs/npu_unconstrained_beam.md).
+
+## Engine configuration
+
+Each driver process loads the [common defaults](vllm_gr/config/default_config.yaml)
+once. Each engine receives its own resolved settings, including its workers.
+Pass native vLLM options by their usual names and plugin options under `gr`.
+Only specify the values that differ for this launch.
+
+```python
+from vllm_gr import GRLLM
+
+llm = GRLLM(
+    model="/models/my-model",
+    gr={"beam_width": [8, 8, 4], "candidate_width": [8, 4, 2]},
+)
+```
+
+Serving defaults to unconstrained Beam search (`gr.constraint_mode: none`).
+For table constraints, follow the build command in the common defaults, then set
+`gr.constraint_mode: table` and supply the generated artifact and digests.
+Explicit flags override `--config` YAML settings, which override the packaged
+defaults. A user-supplied YAML file can import a base file with
+`import: ./base.yaml`. Mappings merge by key and lists replace the inherited
+list. Relative table paths in YAML resolve against the declaring file.
+See [Configuration](docs/configuration.md) for the shared file format and startup examples.
 
 ## Uninstall
 

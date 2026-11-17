@@ -186,18 +186,18 @@ of installed package metadata are separate questions.
 - To [run OneRec offline on Ascend](../examples/README.md#run-onerec-offline),
   prepare the model first, then run the Ascend command on the examples page.
 - Follow the [online V1 serving example](../examples/online_serving/beam_search/README.md)
-  with `constraint_table.backend: npu` and the NPU execution settings below.
+  with `gr.constraint_table.backend: npu` and the NPU execution settings below.
 
 ## NPU decode execution options
 
-Beam Search V1 uses a fixed request width equal to `beam.max_width`
-(`vllm_gr_beam_max_width` in the legacy configuration encoding). A smaller
+Beam Search V1 uses a fixed request width equal to the first entry of
+`gr.beam_width`. A smaller
 request width is rejected before submission; the NPU batch pool is not a
 variable-width view. Native request state advances by one token per request
 at Decode, while the NPU model executes `batch_size * beam_width` tokens.
 
 The incremental beam decode branch on Ascend NPU has two execution modes,
-selected through the engine's `additional_config`:
+selected through `gr.npu_decode_execution`:
 
 Both modes require an active Beam session and persistent suffix KV pool.
 The old paged-suffix recompute path has been removed: missing session state
@@ -215,20 +215,15 @@ segments retain their paged-cache execution.
   and the merge operator chain. This is the default on NPU when xllm-ops is
   missing (a log line explains why) and always the default on CUDA.
 
-These `additional_config` examples select the attention adapter and the NPU
-decode execution mode only. They are not a complete canonical V1 serving
-configuration. Do not combine them with `--vllm-gr-config`; use the canonical
-online example for the V1 service.
+Use the [OneRec serving configuration](../examples/online_serving/catalog/README.md#write-the-server-configuration)
+as the base YAML. Omit `gr.npu_decode_execution` to use automatic selection.
 
 ```bash
-# default (xllm on NPU with xllm-ops installed; cascade otherwise)
-vllm serve <model> --additional-config '{"vllm_gr_attention_backend": "CUSTOM"}'
-
 # explicit xllm fused decode (fails fast at startup when xllm-ops is missing)
-vllm serve <model> --additional-config '{"vllm_gr_attention_backend": "CUSTOM", "vllm_gr_npu_decode_execution": "xllm"}'
+vllm serve /path/to/model --gr --config /path/to/config.yaml --gr.npu_decode_execution xllm
 
 # explicit cascade (opt out of the fused path)
-vllm serve <model> --additional-config '{"vllm_gr_attention_backend": "CUSTOM", "vllm_gr_npu_decode_execution": "cascade"}'
+vllm serve /path/to/model --gr --config /path/to/config.yaml --gr.npu_decode_execution cascade
 ```
 
 Notes:

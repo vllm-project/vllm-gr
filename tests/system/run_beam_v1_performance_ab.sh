@@ -5,14 +5,6 @@
 set -euo pipefail
 export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
 export V1_PERF_BEAM_WIDTH=128
-# This workload prefills 1024 tokens per request at B=1,2,4. Keep its graph
-# captures local to the A/B job instead of changing the runtime defaults.
-export VLLM_GR_PREFILL_GRAPH_BUCKETS=1024,2048,4096
-export VLLM_GR_PREFILL_GRAPH_BUCKET_STEP=1024
-export VLLM_GR_PREFILL_GRAPH_MAX_BUCKET=4096
-export VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS=1,2,4
-unset VLLM_GR_PREFILL_GRAPH_KV_BOUND
-
 candidate_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 event_base_sha="${V1_PERF_BASE_SHA:?V1_PERF_BASE_SHA is required}"
 candidate_sha="${V1_PERF_CANDIDATE_SHA:?V1_PERF_CANDIDATE_SHA is required}"
@@ -112,18 +104,32 @@ for path in \
   fi
 done
 
-run_pass() {
+run_pass() (
   local repo_root="$1"
   local result_dir="$2"
   local runtime_venv="$3"
+  local driver_args=(--ab-prefill-grid)
   cd "$repo_root"
+  # Keep the legacy Prefill overrides local to this pass.
+  unset VLLM_ENABLE_PREFILL_CUDAGRAPH VLLM_GR_PREFILL_GRAPH_BUCKETS \
+    VLLM_GR_PREFILL_GRAPH_BUCKET_STEP VLLM_GR_PREFILL_GRAPH_MAX_BUCKET \
+    VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS VLLM_GR_PREFILL_GRAPH_KV_BOUND
+  if [[ ! -f "$repo_root/vllm_gr/config/default_config.yaml" ]]; then
+    driver_args+=(--ab-legacy-config)
+    export VLLM_ENABLE_PREFILL_CUDAGRAPH=1
+    export VLLM_GR_PREFILL_GRAPH_BUCKETS=1024,2048,4096
+    # V2 uses the step/max variables to opt out of its native bucket list.
+    export VLLM_GR_PREFILL_GRAPH_BUCKET_STEP=1024
+    export VLLM_GR_PREFILL_GRAPH_MAX_BUCKET=4096
+    export VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS=1,2,4
+  fi
   PATH="$runtime_venv/bin:$PATH" VIRTUAL_ENV="$runtime_venv" \
     V1_PERF_REPO_ROOT="$repo_root" V1_PERF_OUTPUT_DIR="$result_dir" \
     V1_PERF_DRIVER="$candidate_root/benchmarks/beam_search/v1_performance_gate.py" \
     V1_PERF_MEASURE_ONLY=1 V1_PERF_OFFLINE_ONLY=1 \
     V1_PERF_WARMUP_RUNS=10 V1_PERF_MEASURED_RUNS=20 \
-    bash "$candidate_root/tests/system/run_beam_v1_performance.sh"
-}
+    bash "$candidate_root/tests/system/run_beam_v1_performance.sh" "${driver_args[@]}"
+)
 
 run_abba() {
   local results="$1"

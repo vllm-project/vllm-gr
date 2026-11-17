@@ -5,13 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.helpers.gr_config import engine_config
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.v1.attention.backends import beam_prefix_policy as policy
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
-
-
-@pytest.fixture(autouse=True)
-def isolate_calibration_state(monkeypatch):
-    monkeypatch.setattr(policy, "_runtime_calibrations", {})
 
 
 @pytest.mark.parametrize(
@@ -63,7 +60,9 @@ def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
 
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
-        _vllm_gr_config=SimpleNamespace(beam_graph_enabled=True, beam_online_batch_sizes=(1,)),
+        _vllm_gr_config=SimpleNamespace(
+            beam_graph_enabled=True, deployment=DeploymentOptions(beam_batch_sizes=(1,))
+        ),
         model=SimpleNamespace(compute_logits=Mock(return_value="logits")),
     )
     graph = Mock(ready=False)
@@ -99,7 +98,6 @@ def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
         build_async_batch_layout,
     )
 
-    monkeypatch.setattr(policy, "policy_mode", lambda: "auto")
     monkeypatch.setattr(policy, "available_prefix_versions", lambda device: (2,))
     monkeypatch.setattr(policy, "device_fingerprint", lambda device: {"capability": [8, 9]})
     monkeypatch.setattr(policy, "multi_processor_count", lambda device: 92)
@@ -120,6 +118,7 @@ def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
         )
         views = {name: torch.tensor(values, dtype=torch.int32) for name, values in layout.items()}
         return build_async(
+            prefix_policy="auto",
             layout=layout,
             views=views,
             session=SimpleNamespace(is_active=True, context=context),
@@ -186,20 +185,20 @@ def test_segment_search_only_uses_exact_splits():
 
 def test_calibration_roundtrip_and_lookup(monkeypatch, tmp_path):
     path = tmp_path / "calib.yaml"
-    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(path))
+    settings = DeploymentOptions(prefix_calibration_path=str(path))
     fingerprint = {"name": "NVIDIA L20", "capability": [8, 9], "sm_count": 92}
     geometry = {"heads": 16, "kv_heads": 8, "dim": 128, "dtype": "torch.bfloat16", "block_size": 16}
     calibration = policy.PrefixCalibration(
         u_ns_per_token=31.6, c_comp_us=9.3e-5, c_mem_us=6.8e-3, m_us=4.0
     )
-    assert policy.load_calibration(fingerprint, geometry) is None
-    policy.store_calibration(fingerprint, geometry, calibration)
+    assert policy.load_calibration(fingerprint, geometry, settings=settings) is None
+    policy.store_calibration(fingerprint, geometry, calibration, settings=settings)
     text = path.read_text(encoding="utf-8")
     assert "Cost model" in text and "u_ns_per_token" in text
-    loaded = policy.load_calibration(fingerprint, geometry)
+    loaded = policy.load_calibration(fingerprint, geometry, settings=settings)
     assert loaded == calibration
     # A different geometry must not reuse the entry.
-    assert policy.load_calibration(fingerprint, geometry | {"dim": 64}) is None
+    assert policy.load_calibration(fingerprint, geometry | {"dim": 64}, settings=settings) is None
 
 
 @pytest.mark.parametrize("source", ["persisted", "measured", "disabled", "failed"])
@@ -210,9 +209,7 @@ def test_startup_calibration_is_a_fixed_memory_snapshot(monkeypatch, tmp_path, s
     from vllm_gr.v1.attention.backends import beam_prefix_calibrate as calibrate
 
     path = tmp_path / "calib.yaml"
-    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(path))
-    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
-    monkeypatch.delenv(policy.ENV_CALIBRATION, raising=False)
+    settings = DeploymentOptions(prefix_calibration_path=str(path))
     fingerprint = {"name": "NVIDIA L20", "capability": [8, 9], "sm_count": 92}
     geometry = {"heads": 16, "kv_heads": 8, "dim": 128, "dtype": "torch.bfloat16", "block_size": 16}
     calibration = policy.PrefixCalibration(31.6, 9.3e-5, 6.8e-3, 4.0)
@@ -227,19 +224,23 @@ def test_startup_calibration_is_a_fixed_memory_snapshot(monkeypatch, tmp_path, s
         ),
         cache_config=SimpleNamespace(block_size=16),
     )
+    worker.vllm_config = engine_config(
+        prefix_calibration_path=str(path), prefix_calibration=source != "disabled"
+    )
     measure = Mock(return_value=calibration)
     monkeypatch.setattr(calibrate, "device_fingerprint", lambda index: fingerprint)
     monkeypatch.setattr(calibrate, "calibrate_prefix_device", measure)
     if source == "persisted":
-        policy.store_calibration(fingerprint, geometry, calibration)
-    elif source == "disabled":
-        monkeypatch.setenv(policy.ENV_CALIBRATION, "off")
+        policy.store_calibration(fingerprint, geometry, calibration, settings=settings)
     elif source == "failed":
         measure.side_effect = RuntimeError("calibration unavailable")
 
     result = calibrate.ensure_prefix_calibration(worker)
     assert result == (None if source in ("disabled", "failed") else calibration)
-    assert policy.get_calibration(dict(fingerprint), dict(geometry)) is result
+    assert (
+        policy.get_calibration(worker._gr_prefix_calibrations, dict(fingerprint), dict(geometry))
+        is result
+    )
     if source in ("persisted", "disabled"):
         measure.assert_not_called()
     else:
@@ -248,7 +249,6 @@ def test_startup_calibration_is_a_fixed_memory_snapshot(monkeypatch, tmp_path, s
     # File edits, deletion and path overrides cannot change a running worker.
     path.write_text("entries: [", encoding="utf-8")
     path.unlink()
-    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(tmp_path / "other.yaml"))
 
     def unexpected_io(*args, **kwargs):
         pytest.fail("calibration I/O after startup")
@@ -257,9 +257,12 @@ def test_startup_calibration_is_a_fixed_memory_snapshot(monkeypatch, tmp_path, s
     monkeypatch.setattr(calibrate, "load_calibration", unexpected_io)
     monkeypatch.setattr(calibrate, "calibrate_prefix_device", unexpected_io)
     assert calibrate.ensure_prefix_calibration(worker) is result
+    calibrations = worker._gr_prefix_calibrations
     shape = policy.PrefixShape(batch=1, width=32, length=10240, **geometry)
     args = {
         "default_version": 2,
+        "policy": "auto",
+        "calibrations": calibrations,
         "fingerprint": fingerprint,
         "supported_versions": (2,),
         "sm_count": 92,
@@ -271,14 +274,21 @@ def test_startup_calibration_is_a_fixed_memory_snapshot(monkeypatch, tmp_path, s
     # Request shapes vary while the same startup coefficients remain installed.
     assert policy.resolve_prefix_plan(replace(shape, length=1024, width=128), **args) is None
     assert policy.resolve_prefix_plan(replace(shape, batch=4, width=256), **args) is None
-    assert policy.get_calibration(fingerprint, geometry | {"dim": 64}) is None
-    assert policy.get_calibration(fingerprint | {"capability": [9, 0]}, geometry) is None
+    assert (
+        policy.get_calibration(worker._gr_prefix_calibrations, fingerprint, geometry | {"dim": 64})
+        is None
+    )
+    assert (
+        policy.get_calibration(
+            worker._gr_prefix_calibrations, fingerprint | {"capability": [9, 0]}, geometry
+        )
+        is None
+    )
 
 
 def test_explicit_fa_version_is_remembered_and_wins(monkeypatch, tmp_path):
     """Request path has no vLLM config context; the start-up choice must win."""
-    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(tmp_path / "calib.yaml"))
-    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
+    settings = DeploymentOptions(prefix_calibration_path=str(tmp_path / "calib.yaml"))
     shape = policy.PrefixShape(
         batch=1,
         width=32,
@@ -295,27 +305,31 @@ def test_explicit_fa_version_is_remembered_and_wins(monkeypatch, tmp_path):
         fingerprint,
         geometry,
         policy.PrefixCalibration(u_ns_per_token=31.6, c_comp_us=9.3e-5, c_mem_us=6.8e-3, m_us=4.0),
+        settings=settings,
     )
+    calibrations: dict[tuple[str, str], policy.PrefixCalibration] = {}
     policy.remember_calibration(
-        fingerprint, geometry, policy.load_calibration(fingerprint, geometry)
+        calibrations,
+        fingerprint,
+        geometry,
+        policy.load_calibration(fingerprint, geometry, settings=settings),
     )
     args = {
         "default_version": 2,
+        "policy": "auto",
+        "calibrations": calibrations,
         "fingerprint": fingerprint,
         "supported_versions": (2, 3),
         "sm_count": 92,
     }
-    policy.remember_explicit_fa_version(2)
-    try:
-        assert policy.resolve_prefix_plan(shape, **args) == policy.PrefixPlan(2, 1, 5)
-    finally:
-        policy.reset_explicit_fa_version()
-    # An explicit FA3/FA4 keeps the backend's own split-K heuristic.
-    policy.remember_explicit_fa_version(3)
-    try:
-        assert policy.resolve_prefix_plan(shape, **args) is None
-    finally:
-        policy.reset_explicit_fa_version()
+    for version, expected in [(2, policy.PrefixPlan(2, 1, 5)), (3, None)]:
+        host = SimpleNamespace(attention_config=SimpleNamespace(flash_attn_version=version))
+        assert (
+            policy.resolve_prefix_plan(
+                shape, explicit_version=policy.configured_fa_version(host), **args
+            )
+            == expected
+        )
 
 
 def test_broken_optional_backend_is_treated_as_unavailable(monkeypatch):
@@ -348,8 +362,7 @@ def test_broken_optional_backend_is_treated_as_unavailable(monkeypatch):
 
 
 def test_default_on_needs_a_measured_win_and_never_overrides_fa3(monkeypatch, tmp_path):
-    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(tmp_path / "calib.yaml"))
-    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
+    settings = DeploymentOptions(prefix_calibration_path=str(tmp_path / "calib.yaml"))
     shape = policy.PrefixShape(
         batch=1,
         width=32,
@@ -362,8 +375,11 @@ def test_default_on_needs_a_measured_win_and_never_overrides_fa3(monkeypatch, tm
     )
     fingerprint = {"name": "NVIDIA L20", "capability": [8, 9], "sm_count": 92}
     geometry = {"heads": 16, "kv_heads": 8, "dim": 128, "dtype": "torch.bfloat16", "block_size": 16}
+    calibrations: dict[tuple[str, str], policy.PrefixCalibration] = {}
     args = {
         "default_version": 2,
+        "policy": "auto",
+        "calibrations": calibrations,
         "fingerprint": fingerprint,
         "supported_versions": (2,),
         "sm_count": 92,
@@ -374,9 +390,13 @@ def test_default_on_needs_a_measured_win_and_never_overrides_fa3(monkeypatch, tm
         fingerprint,
         geometry,
         policy.PrefixCalibration(u_ns_per_token=31.6, c_comp_us=9.3e-5, c_mem_us=6.8e-3, m_us=4.0),
+        settings=settings,
     )
     policy.remember_calibration(
-        fingerprint, geometry, policy.load_calibration(fingerprint, geometry)
+        calibrations,
+        fingerprint,
+        geometry,
+        policy.load_calibration(fingerprint, geometry, settings=settings),
     )
     # 10240 / B1 / W32 on 92 SMs: five segments, a measured 3.6x on L20.
     assert policy.resolve_prefix_plan(shape, **args) == policy.PrefixPlan(2, 1, 5)
@@ -413,7 +433,7 @@ def test_default_on_needs_a_measured_win_and_never_overrides_fa3(monkeypatch, tm
     )
     assert policy.resolve_prefix_plan(narrow_wide, **args) is None
     # The kill switch always wins.
-    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "off")
+    args["policy"] = "off"
     assert policy.resolve_prefix_plan(shape, **args) is None
 
 
@@ -423,20 +443,26 @@ def test_short_prefix_stays_native(monkeypatch, tmp_path):
     Measured on L20 with the calibration below: the model predicts a 1.5x prefix
     win at 1024/B1/W128 and the end-to-end request came out 5% slower.
     """
-    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(tmp_path / "calib.yaml"))
-    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
+    settings = DeploymentOptions(prefix_calibration_path=str(tmp_path / "calib.yaml"))
     fingerprint = {"name": "NVIDIA L20", "capability": [8, 9], "sm_count": 92}
     geometry = {"heads": 16, "kv_heads": 8, "dim": 128, "dtype": "torch.bfloat16", "block_size": 16}
     policy.store_calibration(
         fingerprint,
         geometry,
         policy.PrefixCalibration(u_ns_per_token=31.6, c_comp_us=9.3e-5, c_mem_us=6.8e-3, m_us=4.0),
+        settings=settings,
     )
+    calibrations: dict[tuple[str, str], policy.PrefixCalibration] = {}
     policy.remember_calibration(
-        fingerprint, geometry, policy.load_calibration(fingerprint, geometry)
+        calibrations,
+        fingerprint,
+        geometry,
+        policy.load_calibration(fingerprint, geometry, settings=settings),
     )
     args = {
         "default_version": 2,
+        "policy": "auto",
+        "calibrations": calibrations,
         "fingerprint": fingerprint,
         "supported_versions": (2,),
         "sm_count": 92,
@@ -465,12 +491,12 @@ def test_short_prefix_stays_native(monkeypatch, tmp_path):
     assert policy.resolve_prefix_plan(long, **args) is not None
 
 
-def _short_prefix_args(monkeypatch, tmp_path):
-    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(tmp_path / "calib.yaml"))
-    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
+def _short_prefix_args():
     fingerprint = {"name": "NVIDIA L20", "capability": [8, 9], "sm_count": 92}
     geometry = {"heads": 16, "kv_heads": 8, "dim": 128, "dtype": "torch.bfloat16", "block_size": 16}
+    calibrations: dict[tuple[str, str], policy.PrefixCalibration] = {}
     policy.remember_calibration(
+        calibrations,
         fingerprint,
         geometry,
         policy.PrefixCalibration(u_ns_per_token=31.6, c_comp_us=9.3e-5, c_mem_us=6.8e-3, m_us=4.0),
@@ -487,6 +513,8 @@ def _short_prefix_args(monkeypatch, tmp_path):
     )
     args = {
         "default_version": 2,
+        "policy": "auto",
+        "calibrations": calibrations,
         "fingerprint": fingerprint,
         "supported_versions": (2,),
         "sm_count": 92,
@@ -495,18 +523,11 @@ def _short_prefix_args(monkeypatch, tmp_path):
 
 
 @pytest.mark.l1
-def test_min_chain_override_admits_short_prefix(monkeypatch, tmp_path):
-    shape, args = _short_prefix_args(monkeypatch, tmp_path)
-    monkeypatch.delenv(policy.ENV_MIN_CHAIN_US, raising=False)
+def test_min_chain_override_admits_short_prefix():
+    shape, args = _short_prefix_args()
     assert policy.resolve_prefix_plan(shape, **args) is None
-    monkeypatch.setenv(policy.ENV_MIN_CHAIN_US, "8")
-    plan = policy.resolve_prefix_plan(shape, **args)
+    plan = policy.resolve_prefix_plan(shape, min_chain_us=8, **args)
     assert plan is not None and plan.fa_version == 2 and plan.segments > 1
-    # Unparsable, non-finite or negative overrides keep the conservative default.
-    for invalid in ("fast", "nan", "inf", "-1"):
-        monkeypatch.setenv(policy.ENV_MIN_CHAIN_US, invalid)
-        assert policy._min_chain_us() == policy.MIN_CHAIN_US
-        assert policy.resolve_prefix_plan(shape, **args) is None
 
 
 @pytest.mark.l1
@@ -515,23 +536,23 @@ def test_calibration_from_older_schema_is_remeasured(monkeypatch, tmp_path):
     import yaml
 
     path = tmp_path / "calib.yaml"
-    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(path))
+    settings = DeploymentOptions(prefix_calibration_path=str(path))
     fingerprint = {"name": "NVIDIA L20", "capability": [8, 9], "sm_count": 92}
     other = {"name": "NVIDIA H20", "capability": [9, 0], "sm_count": 78}
     geometry = {"heads": 16, "kv_heads": 8, "dim": 128, "dtype": "torch.bfloat16", "block_size": 16}
     calibration = policy.PrefixCalibration(31.6, 9.3e-5, 6.8e-3, 4.0)
-    policy.store_calibration(fingerprint, geometry, calibration)
-    policy.store_calibration(other, geometry, calibration)
-    assert policy.load_calibration(fingerprint, geometry) == calibration
+    policy.store_calibration(fingerprint, geometry, calibration, settings=settings)
+    policy.store_calibration(other, geometry, calibration, settings=settings)
+    assert policy.load_calibration(fingerprint, geometry, settings=settings) == calibration
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert data["schema"] == policy.CALIBRATION_SCHEMA
     data["schema"] = 1
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    assert policy.load_calibration(fingerprint, geometry) is None
+    assert policy.load_calibration(fingerprint, geometry, settings=settings) is None
     # Re-measuring one device must not carry stale entries of other devices forward.
-    policy.store_calibration(fingerprint, geometry, calibration)
-    assert policy.load_calibration(fingerprint, geometry) == calibration
-    assert policy.load_calibration(other, geometry) is None
+    policy.store_calibration(fingerprint, geometry, calibration, settings=settings)
+    assert policy.load_calibration(fingerprint, geometry, settings=settings) == calibration
+    assert policy.load_calibration(other, geometry, settings=settings) is None
 
 
 @pytest.mark.l1
@@ -601,17 +622,16 @@ def test_calibration_rejects_model_shorter_than_split_probe(monkeypatch):
 
 
 @pytest.mark.l1
-def test_segmented_plan_requires_explicit_policy_opt_in(monkeypatch, tmp_path):
-    shape, args = _short_prefix_args(monkeypatch, tmp_path)
-    monkeypatch.setenv(policy.ENV_MIN_CHAIN_US, "8")
+def test_segmented_plan_requires_explicit_policy_opt_in():
+    shape, args = _short_prefix_args()
+    args["min_chain_us"] = 8
     # A measured speedup is insufficient to change the default execution path.
-    for value in (None, "", "off", "invalid"):
-        if value is None:
-            monkeypatch.delenv(policy.ENV_PREFIX_POLICY, raising=False)
-        else:
-            monkeypatch.setenv(policy.ENV_PREFIX_POLICY, value)
-        assert policy.resolve_prefix_plan(shape, **args) is None
-    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
+    assert DeploymentOptions().prefix_policy == "off"
+    assert (
+        policy.resolve_prefix_plan(shape, **{k: v for k, v in args.items() if k != "policy"})
+        is None
+    )
+    assert policy.resolve_prefix_plan(shape, **(args | {"policy": "off"})) is None
     plan = policy.resolve_prefix_plan(shape, **args)
     assert plan is not None and plan.segments > 1
 

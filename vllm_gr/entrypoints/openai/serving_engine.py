@@ -59,12 +59,9 @@ async def beam_search_v1(
     doing it at this boundary rather than in the shared parser is also what
     keeps it off an engine that is not running V1.
     """
-    from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.config.execution import require_beam_execution_mode
+    from vllm_gr.config.execution import require_beam_config
 
-    require_beam_execution_mode(
-        getattr(self.engine_client, "vllm_config", None), BeamExecutionMode.V1
-    )
+    require_beam_config(getattr(self.engine_client, "vllm_config", None))
     prompts = tuple(prompt_to_seq(prompt))
     if not prompts:
         raise VLLMValidationError("beam_search_v1 requires at least one prompt")

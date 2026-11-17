@@ -7,9 +7,8 @@ Scan ``tokenizer.get_added_vocab()`` for the three contiguous special
 token groups ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>``, then build the six CSR
 tables consumed by ``rec_constrained_topk`` without requiring a catalog JSON
 document.  The result is a :class:`~vllm_gr.constraints.compiler.ConstraintTableResource`
-(plain NumPy arrays + content digest), so it flows through the existing worker
-injection pipeline unchanged (``prepare_constraint_table`` /
-``install_constraint_table`` / ``inject_constraint_resources``).
+(plain NumPy arrays + content digest). Serialize it as a constraint-table
+artifact for the V1 worker startup loader.
 
 Two candidate modes (matching the constraint operators):
 

@@ -11,6 +11,7 @@ from unittest.mock import Mock, call
 
 import pytest
 
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.v1.worker import gr_gc as _gc_runtime
 from vllm_gr.v1.worker import model_runner_contracts as _patch_contracts
 from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
@@ -240,7 +241,9 @@ def test_repeated_capture_preserves_published_decode_failure(
 
     worker = SimpleNamespace(
         device="cuda",
-        _vllm_gr_config=SimpleNamespace(beam_max_width=4, beam_online_batch_sizes=(1,)),
+        _vllm_gr_config=SimpleNamespace(
+            beam_max_width=4, deployment=DeploymentOptions(beam_batch_sizes=(1,))
+        ),
         vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1)),
         cudagraph_manager=object(),
     )

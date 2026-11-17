@@ -165,6 +165,10 @@ installers run or their ordering.
 
 - Scope: `core`; backend ID: `null`
 
+Upstream `beam_search` calls route exclusively to `beam_search_v1`; startup
+requires `gr.beam_width`. There is no native Beam fallback. Ordinary sampling
+requests continue through their existing non-Beam entry points.
+
 - Targets:
     - `GenerateBaseServing.beam_search` and `beam_search_v1`
     - `ChatCompletionRequest.to_beam_search_params` and `CompletionRequest.to_beam_search_params`
@@ -192,6 +196,9 @@ installers run or their ordering.
 - Risk: High
 - Behavior:
     - registers active GR CLI options;
+    - distinguishes the `--gr` mode switch from `--gr-config` JSON settings;
+    - applies GR defaults and Beam validation only to explicitly selected GR engines;
+    - resolves native startup settings once, preserving explicit Python/CLI fields;
     - writes GR values into `VllmConfig.additional_config`;
     - applies active NPU compatibility defaults.
 - Descriptor assumptions:
@@ -439,7 +446,7 @@ and Decode capture policy remain active when this cache is disabled.
 - Targets:
     - `NPUModelRunner.execute_model`
     - `NPUModelRunner._prepare_inputs`
-    - `NPUModelRunner._bookkeeping_sync`
+    - `NPUModelRunner.sample_tokens` (V1 stage dispatch only)
     - `vllm_ascend.worker.worker.NPUWorker.reload_trie`
 - Utility activation: `ascend_compat.patch_npu_worker_init_device` installs a
   delayed wrapper; it calls `install_worker_utility_hooks(type(self))` before
@@ -454,7 +461,6 @@ and Decode capture policy remain active when this cache is disabled.
 - Dependencies:
     - NPU-specific private method signatures;
     - the 3-item `_prepare_inputs` result (`logits_indices`, speculative-decode metadata, total scheduled tokens);
-    - the 8-item `_bookkeeping_sync` result, including async NaN counts and request-index snapshots;
     - speculative decoding and token-compression state.
 - Hot-update coverage: `tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`
   checks delayed installation on a simulated NPU Worker;
@@ -465,7 +471,7 @@ and Decode capture policy remain active when this cache is disabled.
   Worker utility and constraint-backend lifecycle hooks.
 
 - Optional BSND Prefill: `_model_forward` selects fixed `(T,B)` captures only for
-  complete prompts without history when `VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS`
+  complete prompts without history when `gr.npu_bsnd_capture_specs`
   is configured. Other requests retain TND/native fallback. Graph metadata owns
   scratch buffers; device capture errors propagate when this mode is enabled.
 - Validation: `tests/v1/worker/test_npu_prefill_bsnd.py` and the explicitly scoped BSND
@@ -673,7 +679,7 @@ were re-verified during the 0.30 upgrade.
 
 ```text
 EngineArgs.catalog_path
-EngineArgs._vllm_gr_config_input
+EngineArgs._config_input
 SchedulerOutput.beam_data
 SchedulerOutput._gr_request_row_configs
 SchedulerOutput.gr_stage_metadata
@@ -682,7 +688,7 @@ Runner._current_beam_data
 Runner._current_beam_info
 Runner._beam_logprobs_cache
 Runner._gr_gpu_stage_runner
-Runner._vllm_gr_config
+Runner._config
 EngineCoreOutput.kv_transfer_params["gr_batch_result"]
 ```
 
@@ -693,8 +699,8 @@ part of the current frontend contract.
 ### Configuration keys
 
 ```text
-additional_config["vllm_gr_catalog_path"]
-additional_config["vllm_gr_attention_backend"]
+additional_config["vllm_gr"]["gr"]
+attention_config.backend
 VLLM_USE_V2_MODEL_RUNNER
 ```
 
@@ -734,3 +740,8 @@ lifecycle contract remains covered by
 `tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`.
 The ID is retained in the YAML `retired_patches` section and must not be
 counted as an active installer.
+
+The V1 stage runners own Beam sampling and results on both CUDA and NPU.
+Native `_sample` and `_bookkeeping_sync` remain unchanged for ordinary inference;
+the old Beam remap, sampler override, and driver-to-worker resource injection
+hooks have been removed. V1 loads constraint artifacts during worker startup.

@@ -31,7 +31,7 @@ def initialize_beam_postprocess_workspaces(
     if device.type != "cuda":
         return None
 
-    from vllm_gr.config import BeamExecutionMode, resolve_candidate_width
+    from vllm_gr.config import resolve_candidate_width
     from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
@@ -51,9 +51,7 @@ def initialize_beam_postprocess_workspaces(
     # The Beam context is created later, on the first admitted batch, with
     # max_batch=max(SUPPORTED_BEAM_BATCH_SIZES); the workspace built here must
     # match it or the stage runner rejects the session as incompatible.
-    default_max_batch = (
-        max(SUPPORTED_BEAM_BATCH_SIZES) if gr_cfg.beam_execution_mode is BeamExecutionMode.V1 else 1
-    )
+    default_max_batch = max(SUPPORTED_BEAM_BATCH_SIZES)
     resolved_max_batch = (
         int(max_batch)
         if max_batch is not None

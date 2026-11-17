@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -100,7 +101,7 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
 ) -> None:
     from unittest.mock import Mock
 
-    from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode, GRConfig
+    from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, GRConfig
     from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
@@ -121,7 +122,6 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
         device=torch.device("cuda"),
         model_config=SimpleNamespace(dtype=torch.float16),
         _vllm_gr_config=GRConfig(
-            beam_execution_mode=BeamExecutionMode.V1,
             beam_worker_decision=True,
             beam_max_width=4,
             beam_max_decode_steps=3,
@@ -147,3 +147,26 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
     with pytest.raises(RuntimeError, match="geometry changed"):
         workspace_support.initialize_beam_postprocess_workspaces(runner)
     assert allocate.call_count == 1
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_cuda_admission_fixture_supports_unconstrained_head_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from tests.kernels import beam_stage_test_utils as builders
+    from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
+    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+        _get_unconstrained_head_layout,
+    )
+
+    # Keep the real worker/model metadata while replacing device allocations.
+    backend = Mock()
+    backend.info.table_metadata.vocab_size = 32
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(builders, "_upload_cuda_backend", lambda *args, **kwargs: (backend, None))
+    monkeypatch.setattr(BeamPostprocessWorkspace, "allocate", Mock())
+    worker = builders.admission_worker(sliding_windows=())
+    worker.model = SimpleNamespace()
+    assert _get_unconstrained_head_layout(worker) is None

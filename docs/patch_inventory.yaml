@@ -98,7 +98,7 @@ patches:
     process_roles: [api_server]
     target: GenerateBaseServing.beam_search/beam_search_v1 and ChatCompletionRequest/CompletionRequest.to_beam_search_params
     risk: high
-    contract: null
+    contract: beam_search adapts upstream callers exclusively to beam_search_v1
     removal_condition: upstream exposes grouped-Beam serving and sampling extension points
 
   - id: GR-PATCH-005
@@ -106,10 +106,11 @@ patches:
     backend_id: null
     owner: vllm_gr/engine/arg_utils_gr.py
     installer: vllm_gr.engine.arg_utils_gr.patch_add_cli_args
-    activation: the required frontend patch plan detects GR EngineArgs methods are not installed
+    activation: the required frontend patch plan detects GR EngineArgs methods are not installed; GR defaults and Beam validation activate only for explicit GR engines
     validator_or_test:
       - vllm_gr.patch._validate_engine_args_patch
       - tests/v1/attention/test_attention_backend_custom.py
+      - tests/engine/test_gr_config_v1.py
     process_roles: [main, api_server]
     target: vllm.engine.arg_utils.EngineArgs
     risk: high
@@ -239,7 +240,7 @@ patches:
       - tests/sidecar/test_management.py::test_trie_rejects_unsupported_execution_before_worker_rpc
       - tests/sidecar/test_worker_update.py
     process_roles: [npu_worker]
-    target: vllm_ascend.worker.model_runner_v1.NPUModelRunner and vllm_ascend.worker.worker.NPUWorker.reload_trie
+    target: NPUModelRunner execute_model, _prepare_inputs, sample_tokens and graph/lifecycle hooks; NPUWorker.reload_trie (native _sample and _bookkeeping_sync unchanged)
     risk: critical
     contract: docs/npu_prefill_bsnd.md
     removal_condition: vLLM-Ascend exposes stable grouped input/output, Worker utility, and constraint-backend lifecycle hooks
@@ -388,3 +389,6 @@ retired_patches:
     reason: Removal condition met by the 0.30 upgrade; vllm-ascend 0.30.0rc2 replaced profile_memory with log_memory_stats, which reads the two allocator counters directly, and the installer found no native method to wrap on that runtime
     replacement_coverage:
       - tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+
+# Retired: Beam _sample/_bookkeeping_sync and set_gr_constraint_resources RPC.
+# V1 stage runners own sampling; constraint artifacts load during worker startup.

@@ -103,7 +103,11 @@ def test_gr_dispatch_selects_mode_without_mutating_process_argv(
 def test_mode_option_retains_typed_config_action() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--gr", type=json.loads, action="append", default=[{"worker_decision": True}]
+        "--gr-config",
+        dest="gr",
+        type=json.loads,
+        action="append",
+        default=[{"worker_decision": True}],
     )
     cli._add_mode_option(parser)
     args = parser.parse_args(["--gr", "--gr-config", '{"max_decode_steps":3}'])

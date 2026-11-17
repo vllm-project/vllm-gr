@@ -14,6 +14,7 @@ from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     install_decode_model,
 )
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
 from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
@@ -38,7 +39,7 @@ def test_recapture_after_last_graph_retired_with_live_output(
     worker.model_config.enforce_eager = False
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.beam_online_batch_sizes = (1,)
+    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
@@ -92,7 +93,7 @@ def test_recapture_preserves_other_live_geometry(
     worker.model_config.enforce_eager = False
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.beam_online_batch_sizes = (1, 2)
+    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1, 2))
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))

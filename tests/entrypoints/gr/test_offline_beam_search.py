@@ -14,6 +14,7 @@ import psutil
 import pytest
 import torch
 
+from vllm_gr.config.parser import gr_config_from_mapping
 from vllm_gr.entrypoints.gr import GRLLM
 from vllm_gr.sampling_params import BeamSearchParams
 
@@ -31,7 +32,8 @@ def _run_offline_beam_search_v1(
     evidence: Path | None = None,
     full_prefill: bool = False,
 ) -> None:
-    beam_width = config["beam"]["max_width"]
+    beam_width = gr_config_from_mapping({"gr": config}).beam_max_width
+    assert beam_width is not None
     params = BeamSearchParams(
         beam_width=beam_width,
         max_tokens=5,
@@ -53,23 +55,26 @@ def _run_offline_beam_search_v1(
         # padding to 4224. V2 consumes this native grid; V1 uses its GR grid.
         probe["compilation_config"] = {"cudagraph_capture_sizes": [1, 4, 128, 512, 1024, 4224]}
     rows = []
-    with GRLLM(
-        vllm_gr_config=config,
-        model=model,
-        trust_remote_code=True,
-        dtype=os.getenv("VLLM_GR_TEST_DTYPE", "bfloat16"),
-        async_scheduling=True,
-        enable_chunked_prefill=False,
-        enable_prefix_caching=False,
-        max_model_len=2048,
-        max_num_batched_tokens=8192,
-        max_num_seqs=4,
-        max_logprobs=beam_width,
-        gpu_memory_utilization=0.5,
-        enforce_eager=os.getenv("VLLM_GR_TEST_EAGER", "0") == "1",
-        shutdown_timeout=10,
-        **probe,
-    ) as llm:
+    with (
+        GRLLM(
+            attention_config={"backend": "CUSTOM"},
+            gr=config,
+            model=model,
+            trust_remote_code=True,
+            dtype=os.getenv("VLLM_GR_TEST_DTYPE", "bfloat16"),
+            async_scheduling=True,
+            enable_chunked_prefill=False,
+            enable_prefix_caching=False,
+            max_model_len=2048,
+            max_num_batched_tokens=8192,
+            max_num_seqs=4,
+            max_logprobs=beam_width,
+            gpu_memory_utilization=0.5,
+            enforce_eager=os.getenv("VLLM_GR_TEST_EAGER", "0") == "1",
+            shutdown_timeout=10,
+            **probe,
+        ) as llm,
+    ):
         if evidence is not None:
             from tests.st.test_onerec_v1_scheduler_st import (
                 _check_completion_prefill,
@@ -150,8 +155,8 @@ def _run_offline_beam_search_v1(
         end = time.perf_counter()
         if evidence is not None:
             events = llm.collective_rpc("onerec_v1_st_events")[0]
-            assert any(e["method"] == "replay" for e in events) is config["beam"]["graph_enabled"]
-            decode = "replay" if config["beam"]["graph_enabled"] else "_forward"
+            assert any(e["method"] == "replay" for e in events) is config["beam_graph_enabled"]
+            decode = "replay" if config["beam_graph_enabled"] else "_forward"
             assert sum(e["method"] == decode for e in events) == 4 * max(1, loops)
             assert not any(
                 e["method"] == ("_forward" if decode == "replay" else "replay") for e in events
@@ -236,8 +241,10 @@ def _run_unconstrained_target(work_dir: Path, full_prefill: bool = False) -> Non
     from tests.st.test_onerec_v1_scheduler_st import _inputs
 
     model, _, config, source, newline, _ = _inputs(work_dir)
-    config["constraint_table"] = {"enabled": False, "max_top_k": config["beam"]["max_width"]}
-    config["constrained_generation"] = False
+    config.pop("constraint_table")
+    config["constraint_mode"] = "none"
+    if full_prefill and os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "0":
+        config["prefill_token_buckets"] = [1024, 4224]
     _run_offline_beam_search_v1(
         1,
         model,
@@ -263,17 +270,6 @@ def test_offline_unconstrained_beam_search_v1(
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(runner == "v2")))
     monkeypatch.setenv("VLLM_GR_TEST_EAGER", str(int(eager)))
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
-    monkeypatch.setenv("VLLM_ENABLE_PREFILL_CUDAGRAPH", "1")
-    for name in (
-        "VLLM_GR_PREFILL_GRAPH_BUCKETS",
-        "VLLM_GR_PREFILL_GRAPH_BUCKET_STEP",
-        "VLLM_GR_PREFILL_GRAPH_MAX_BUCKET",
-        "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS",
-        "VLLM_GR_PREFILL_GRAPH_KV_BOUND",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    if full_prefill and runner == "v1":
-        monkeypatch.setenv("VLLM_GR_PREFILL_GRAPH_BUCKETS", "1024,4224")
     process = multiprocessing.get_context("spawn").Process(
         target=_run_unconstrained_target, args=(tmp_path, full_prefill)
     )

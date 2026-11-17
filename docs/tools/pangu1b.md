@@ -42,6 +42,7 @@ Start a local OpenAI-compatible server:
 
 ```bash
 vllm serve "$PANGU1B_MODEL_PATH" --gr \
+    --config configs/pangu1b.yaml \
     --trust-remote-code \
     --dtype bfloat16 \
     --max-model-len 32768 \
@@ -50,6 +51,7 @@ vllm serve "$PANGU1B_MODEL_PATH" --gr \
     --no-enable-prefix-caching
 ```
 
+Both entrypoints use `gr_config.yaml` to select native sampling and attention.
 Add `--block-size 128` to the serving command when running on Ascend NPU.
 
 Then send a chat completion request:

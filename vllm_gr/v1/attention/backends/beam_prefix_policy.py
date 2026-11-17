@@ -10,12 +10,13 @@ a serving request and no GPU product name is dispatched on.
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from vllm_gr.config.models import DEFAULT_DEPLOYMENT
 
 # Length buckets are aligned to 1024 tokens (see ``prefix_bucket``).
 _LENGTH_BUCKET_STEP = 1024
@@ -29,36 +30,6 @@ MIN_SPEEDUP = 1.05
 # its extra query copies and merges (measured: 10240/B1/W256 predicted a 1.3x
 # win but actually lost 12%).
 MIN_HEADROOM = 1.5
-# ... and only when the unsplit chain is long enough in absolute terms to pay
-# for two extra kernel launches per call. Below this the prefix call is launch
-# bound, so the relative win is unreal: 1024/B1/W128 predicted 1.5x and measured
-# 5% slower.
-MIN_CHAIN_US = 150.0
-ENV_MIN_CHAIN_US = "VLLM_GR_PREFIX_MIN_CHAIN_US"
-
-
-def _min_chain_us() -> float:
-    """Chain bound in microseconds; invalid overrides keep MIN_CHAIN_US."""
-    raw = os.environ.get(ENV_MIN_CHAIN_US)
-    if raw is None:
-        return MIN_CHAIN_US
-    return _parse_min_chain_us(raw)
-
-
-@lru_cache(maxsize=8)
-def _parse_min_chain_us(raw: str) -> float:
-    try:
-        value = float(raw)
-    except ValueError:
-        value = float("nan")
-    if math.isfinite(value) and value >= 0:
-        return value
-    from vllm.logger import init_logger
-
-    init_logger(__name__).warning(
-        "vllm_gr: ignoring %s=%r (expected a finite value >= 0)", ENV_MIN_CHAIN_US, raw
-    )
-    return MIN_CHAIN_US
 
 
 @dataclass(frozen=True)
@@ -154,63 +125,9 @@ def available_prefix_versions(device_index: int | None) -> tuple[int, ...]:
     return tuple(versions)
 
 
-# The request path cannot rely on a vLLM config context (it can be absent while
-# a request is being executed), so the operator's explicit version choice is
-# captured once at initialization and reused here.
-_explicit_fa_version: int | None = None
-_explicit_fa_probed = False
-
-
-def remember_explicit_fa_version(version: Any) -> None:
-    """Persist an explicit FlashAttention version chosen by the operator."""
-    global _explicit_fa_version, _explicit_fa_probed
-    _explicit_fa_version = int(version) if version is not None else None
-    _explicit_fa_probed = True
-
-
-def reset_explicit_fa_version() -> None:
-    """Test helper: forget both the remembered value and the probe flag."""
-    global _explicit_fa_version, _explicit_fa_probed
-    _explicit_fa_version = None
-    _explicit_fa_probed = False
-
-
-def explicit_fa_version() -> int | None:
-    """Explicit FA version, falling back to a best-effort one-time config read."""
-    global _explicit_fa_probed
-    if not _explicit_fa_probed:
-        _explicit_fa_probed = True
-        try:
-            from vllm.config import get_current_vllm_config_or_none
-
-            config = get_current_vllm_config_or_none()
-        except Exception:  # noqa: BLE001 - config context is optional here
-            config = None
-        attention = getattr(config, "attention_config", None)
-        if attention is not None:
-            remember_explicit_fa_version(getattr(attention, "flash_attn_version", None))
-    return _explicit_fa_version
-
-
-def remember_worker_flash_attn_version(worker: Any) -> None:
-    """Capture the explicit FA version from the worker at initialization.
-
-    ``worker.vllm_config`` is authoritative and always present in the worker; the
-    context-based fallback only covers callers that pass a bare model runner.
-    """
-    config = getattr(worker, "vllm_config", None)
-    if config is None:
-        try:
-            from vllm.config import get_current_vllm_config_or_none
-
-            config = get_current_vllm_config_or_none()
-        except Exception:  # noqa: BLE001
-            config = None
-    if config is None:
-        return
-    attention = getattr(config, "attention_config", None)
-    if attention is not None:
-        remember_explicit_fa_version(getattr(attention, "flash_attn_version", None))
+def configured_fa_version(host: Any) -> int | None:
+    attention = getattr(host, "attention_config", None)
+    return getattr(attention, "flash_attn_version", None)
 
 
 # ---------------------------------------------------------------------------
@@ -223,9 +140,6 @@ def remember_worker_flash_attn_version(worker: Any) -> None:
 # ---------------------------------------------------------------------------
 
 SEGMENT_CANDIDATES = (1, 2, 4, 5, 8)
-ENV_PREFIX_POLICY = "VLLM_GR_PREFIX_POLICY"
-ENV_CALIBRATION = "VLLM_GR_PREFIX_CALIBRATION"
-ENV_CALIBRATION_PATH = "VLLM_GR_PREFIX_CALIBRATION_PATH"
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,7 +240,7 @@ _CALIBRATION_HEADER = """\
 #
 # Measured once per (device, model geometry) when the engine starts and reused by
 # later starts. Delete this file to force a re-measurement; start the engine with
-# VLLM_GR_PREFIX_CALIBRATION=off to skip calibration and the segmented path.
+# gr.prefix_calibration=false to skip calibration and the segmented path.
 #
 # Cost model for one prefix attention call (length = graph length bucket):
 #   chain(S) = ceil(B * heads * ceil(W/128) * S / sm_count) * (length/S) * u
@@ -342,8 +256,8 @@ _CALIBRATION_HEADER = """\
 """
 
 
-def calibration_path() -> Path:
-    override = os.environ.get(ENV_CALIBRATION_PATH)
+def calibration_path(settings=DEFAULT_DEPLOYMENT) -> Path:
+    override = settings.prefix_calibration_path
     if override:
         return Path(override).expanduser()
     base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
@@ -360,11 +274,6 @@ def _device_key(device: dict[str, Any]) -> str:
     return f"{device.get('name')}-{device.get('sm_count')}-{device.get('cuda')}"
 
 
-# Populated only during worker startup. Requests neither insert entries nor
-# consult the filesystem; immutable coefficients live for the worker process.
-_runtime_calibrations: dict[tuple[str, str], PrefixCalibration] = {}
-
-
 def _calibration_key(device: dict[str, Any], geometry: dict[str, Any]) -> tuple[str, str]:
     return (
         json.dumps(device, sort_keys=True, default=str),
@@ -373,6 +282,7 @@ def _calibration_key(device: dict[str, Any], geometry: dict[str, Any]) -> tuple[
 
 
 def remember_calibration(
+    calibrations: dict,
     device: dict[str, Any],
     geometry: dict[str, Any],
     calibration: PrefixCalibration | None,
@@ -380,22 +290,26 @@ def remember_calibration(
     """Publish a startup result for this device and geometry in the worker."""
     key = _calibration_key(device, geometry)
     if calibration is None:
-        _runtime_calibrations.pop(key, None)
+        calibrations.pop(key, None)
     else:
-        _runtime_calibrations[key] = calibration
+        calibrations[key] = calibration
 
 
-def get_calibration(device: dict[str, Any], geometry: dict[str, Any]) -> PrefixCalibration | None:
+def get_calibration(
+    calibrations: dict, device: dict[str, Any], geometry: dict[str, Any]
+) -> PrefixCalibration | None:
     """Look up startup coefficients in memory; a miss keeps native attention."""
-    return _runtime_calibrations.get(_calibration_key(device, geometry))
+    return calibrations.get(_calibration_key(device, geometry))
 
 
-def load_calibration(device: dict[str, Any], geometry: dict[str, Any]) -> PrefixCalibration | None:
+def load_calibration(
+    device: dict[str, Any], geometry: dict[str, Any], *, settings=DEFAULT_DEPLOYMENT
+) -> PrefixCalibration | None:
     """Read persisted calibration during startup, never on a serving request."""
     import yaml
 
     try:
-        data = yaml.safe_load(calibration_path().read_text(encoding="utf-8"))
+        data = yaml.safe_load(calibration_path(settings).read_text(encoding="utf-8"))
         if data.get("schema") != CALIBRATION_SCHEMA:
             return None  # measured by an older merge kernel; re-measure
         entry = data["entries"][_device_key(device)]
@@ -420,6 +334,8 @@ def store_calibration(
     device: dict[str, Any],
     geometry: dict[str, Any],
     calibration: PrefixCalibration,
+    *,
+    settings=DEFAULT_DEPLOYMENT,
 ) -> None:
     """Write this device's calibration.
 
@@ -428,7 +344,7 @@ def store_calibration(
     """
     import yaml
 
-    path = calibration_path()
+    path = calibration_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     entries: dict[str, Any] = {}
     try:
@@ -452,12 +368,6 @@ def store_calibration(
     path.write_text(body, encoding="utf-8")
 
 
-def policy_mode() -> str:
-    """Enable measured segmentation only with an explicit ``auto`` policy."""
-    raw = os.environ.get(ENV_PREFIX_POLICY)
-    return "auto" if raw is not None and raw.strip().lower() == "auto" else "off"
-
-
 def resolve_prefix_plan(
     shape: PrefixShape,
     *,
@@ -467,18 +377,17 @@ def resolve_prefix_plan(
     sm_count: int,
     explicit_version: int | None = None,
     batch_invariant: bool = False,
+    policy: str = DEFAULT_DEPLOYMENT.prefix_policy,
+    min_chain_us: float = DEFAULT_DEPLOYMENT.prefix_min_chain_us,
+    calibrations: dict | None = None,
 ) -> PrefixPlan | None:
     """Decide the prefix plan; ``None`` keeps the backend's native behaviour.
 
     ``None`` is the safe answer: it preserves FA3/FA4 auto splitting, keeps any
     pre-computed scheduler metadata, and costs no extra CUDA graph.
     """
-    if batch_invariant or policy_mode() == "off":
+    if batch_invariant or policy == "off" or not calibrations:
         return None
-    if explicit_version is None:
-        # The request path may run without a vLLM config context; use the value
-        # captured at initialization so an explicit FA2/FA3 choice always wins.
-        explicit_version = explicit_fa_version()
     if explicit_version is not None and explicit_version >= 3:
         return None
     if default_version >= 3 and explicit_version is None:
@@ -488,6 +397,7 @@ def resolve_prefix_plan(
     if 2 not in supported_versions:
         return None
     calibration = get_calibration(
+        calibrations,
         fingerprint,
         {
             "heads": shape.heads,
@@ -509,7 +419,7 @@ def resolve_prefix_plan(
     # The 150us default was fitted on L20 while the merge kernel ran serially
     # (~40us/call); on RTX PRO 6000 with the parallel merge it blocks 1.3-3.8x
     # wins at 512-4096 tokens. Overridable until re-measured per device.
-    if calibration.terms_us(shape, 1, sm_count)[0] < _min_chain_us():
+    if calibration.terms_us(shape, 1, sm_count)[0] < min_chain_us:
         # Short prefix: the call is launch bound, so a relative win does not pay
         # for the extra launches and merges.
         return None

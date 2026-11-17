@@ -40,11 +40,11 @@ def make_patched_engine_init(original):
     @wraps(original)
     def initialize(self, *args, **kwargs):
         original(self, *args, **kwargs)
-        from vllm_gr.config import BeamExecutionMode, GRConfig
+        from vllm_gr.config import GRConfig
         from vllm_gr.v1.engine.core import loaded_constraint_trie_count
 
         config = GRConfig.from_vllm_config(self.vllm_config)
-        if config.beam_execution_mode is not BeamExecutionMode.V1:
+        if config.beam_max_width is None:
             return
         counts = self.model_executor.collective_rpc(loaded_constraint_trie_count)
         if not counts or any(type(n) is not int or n < 1 or n != counts[0] for n in counts):

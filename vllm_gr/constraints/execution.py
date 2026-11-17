@@ -32,7 +32,7 @@ import torch
 
 # Single source of truth for the operator's legacy padding payload. Structural
 # validity is carried separately and never inferred from this numeric value.
-from vllm_gr.config.models import MAX_CANDIDATE_WIDTH
+from vllm_gr.config.models import MAX_CONSTRAINT_CANDIDATE_WIDTH
 from vllm_gr.constraints.compiler import validate_resource_tables
 from vllm_gr.constraints.scoring import INVALID_LOGIT as _INVALID_LOGIT
 from vllm_gr.constraints.validity import (
@@ -614,8 +614,8 @@ def _validate_runtime_inputs(
         raise ValueError(f"unsupported current_step={current_step}; expected 0, 1, or 2")
     if not isinstance(top_k, int) or isinstance(top_k, bool):
         raise ValueError(f"top_k must be an int, got {type(top_k).__name__}")
-    if not (1 <= top_k <= MAX_CANDIDATE_WIDTH):
-        raise ValueError(f"top_k must be in [1, {MAX_CANDIDATE_WIDTH}], got {top_k}")
+    if not (1 <= top_k <= MAX_CONSTRAINT_CANDIDATE_WIDTH):
+        raise ValueError(f"top_k must be in [1, {MAX_CONSTRAINT_CANDIDATE_WIDTH}], got {top_k}")
     _validate_input_dtypes(logits, sequence_group, temperatures, tables)
     _validate_shapes(logits, sequence_group, current_step, vocab_size)
     _validate_same_device(logits, sequence_group, temperatures)

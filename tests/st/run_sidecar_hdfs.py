@@ -15,6 +15,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from vllm_gr.config.models import deployment_for
+
 
 def install_control_trace() -> None:
     from fastapi.responses import JSONResponse
@@ -26,7 +28,7 @@ def install_control_trace() -> None:
     def control_app(engine: Any) -> Any:
         app = original(engine)
         root = Path(os.environ["GR_SIDECAR_TEST_OUTPUT"])
-        port = int(os.environ["VLLM_GR_ADMIN_PORT"])
+        port = deployment_for(engine.vllm_config).admin_port
 
         @app.middleware("http")  # type: ignore[misc]
         async def trace(request: Any, call_next: Any) -> Any:
@@ -79,7 +81,7 @@ def main() -> None:
     stamp = int(time.time())
     remote = args.hdfs_root.rstrip("/") + f"/sidecar_e2e_{stamp}_{os.getpid()}"
     (root / "remote.json").write_text(json.dumps({"remote": remote, "binary": fs.binary}))
-    os.environ.update(GR_SIDECAR_TEST_OUTPUT=str(root), VLLM_GR_TRIE_RETENTION_SECONDS="1")
+    os.environ["GR_SIDECAR_TEST_OUTPUT"] = str(root)
     (root / "control.jsonl").write_text("")
     first, second, _ = prepare(root / "weights")
     _, config, trie_a, trie_b = prepare_trie(root / "trie")
@@ -142,7 +144,15 @@ def main() -> None:
         )
 
     contexts = [
-        server(root, model, config, f"node-{i}", Path(__file__).resolve(), graph=True)
+        server(
+            root,
+            model,
+            config,
+            f"node-{i}",
+            Path(__file__).resolve(),
+            graph=True,
+            retention_seconds=1,
+        )
         for i, model in enumerate((first, second))
     ]
     with contextlib.ExitStack() as stack:

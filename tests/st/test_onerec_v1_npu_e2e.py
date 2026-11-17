@@ -67,17 +67,10 @@ def _padded_prefill_requested(env: Mapping[str, str]) -> bool:
     return env.get("VLLM_GR_TEST_PADDED_PREFILL") == "1"
 
 
-def _graph_test_environment(env: Mapping[str, str]) -> dict[str, str]:
-    result = dict(env)
-    if not _padded_prefill_requested(env):
-        # A bounded exact-bucket regression, not a change to product defaults.
-        # Override stale shell settings so passing cannot mean Prefill was off.
-        result.update(
-            VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
-            VLLM_GR_PREFILL_GRAPH_BUCKET_STEP="128",
-            VLLM_GR_PREFILL_GRAPH_MAX_BUCKET="256",
-        )
-    return result
+def _graph_test_settings(env: Mapping[str, str]) -> dict[str, list[int]]:
+    if _padded_prefill_requested(env):
+        return {"prefill_token_buckets": [384]}
+    return {"prefill_token_buckets": [128, 256]}
 
 
 def _comparison_prompts(tokenizer: Any, *, exact_prefill: bool) -> list[list[int]]:
@@ -379,32 +372,29 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
         work_dir / "onerec_v1_npu_constraints.safetensors",
     )
     config: dict[str, Any] = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": False,
-            "worker_decision": True,
-            "max_width": _BEAM_WIDTH,
-            "max_decode_steps": 3,
-        },
+        "beam_graph_enabled": False,
+        "worker_decision": True,
+        "beam_width": [_BEAM_WIDTH] * 3,
+        "max_decode_steps": 3,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "npu",
             "max_top_k": _BEAM_WIDTH,
             "path": str(work_dir / "onerec_v1_npu_constraints.safetensors"),
             "format": "constraint_table_v1",
-            "artifact_digest": digest,
-            "tokenizer_digest": tokenizer_digest,
+            "digests": {"artifact": digest, "tokenizer": tokenizer_digest},
         },
+        "candidate_width": [_BEAM_WIDTH] * 3,
     }
+
+    if graph:
+        config.update(_graph_test_settings(os.environ))
 
     engine_kwargs: dict[str, Any] = {
         "model": model,
         "trust_remote_code": True,
         "dtype": "float16",
         "seed": 0,
-        "vllm_gr_config": config,
         "async_scheduling": True,
         "enable_prefix_caching": True,
         "enable_chunked_prefill": False,
@@ -428,7 +418,11 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
             "padding precision issue remains open (NPU-PREFILL-PADDING-001)",
             flush=True,
         )
-    with GRLLM(**engine_kwargs, enforce_eager=True) as llm:
+    with (
+        GRLLM(
+            attention_config={"backend": "CUSTOM"}, gr=config, **engine_kwargs, enforce_eager=True
+        ) as llm,
+    ):
         staged_prompt = comparison_prompts[0]
         isolated = _run_case(
             llm,
@@ -504,8 +498,12 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
         return
     # Keep native compilation/graph defaults enabled, disabling only Beam
     # FULL. This is NOT an enforce_eager reference: Decode may be PIECEWISE.
-    config["beam"].update(graph_enabled=False, graph_batch_size=2)
-    with GRLLM(**engine_kwargs, enforce_eager=False) as llm:
+    config.update(beam_graph_enabled=False, decode_graph_batch_size=2)
+    with (
+        GRLLM(
+            attention_config={"backend": "CUSTOM"}, gr=config, **engine_kwargs, enforce_eager=False
+        ) as llm,
+    ):
         native_before = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
         native_outputs, native_trace = _run_traced_case(
             llm, tokenizer, comparison_prompts, legal, "native-no-beam-full-n3"
@@ -534,8 +532,12 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
             if event["stage"]:
                 assert forward["runtime_mode"] in ("NONE", "PIECEWISE")
 
-    config["beam"].update(graph_enabled=True, graph_batch_size=2)
-    with GRLLM(**engine_kwargs, enforce_eager=False) as llm:
+    config.update(beam_graph_enabled=True, decode_graph_batch_size=2)
+    with (
+        GRLLM(
+            attention_config={"backend": "CUSTOM"}, gr=config, **engine_kwargs, enforce_eager=False
+        ) as llm,
+    ):
         stats = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
         assert [2, _BEAM_WIDTH] in [list(shape) for shape in stats["captured_shapes"]]
         signature = llm.collective_rpc("onerec_npu_graph_context_signature")[0]
@@ -637,7 +639,7 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
 
 
 def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
-    env = _graph_test_environment(os.environ) if graph else dict(os.environ)
+    env = dict(os.environ)
     env.update(
         USE_TF="0",
         VLLM_USE_V2_MODEL_RUNNER="0",

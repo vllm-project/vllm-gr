@@ -55,7 +55,7 @@ to restrict the output to known items.
 
 Copy the [configuration template](sidecar/config.py). Set each task's HDFS
 address and a cache directory that its target instances can read. Set each
-gRPC instance's management address to use its `VLLM_GR_ADMIN_PORT`. Run
+gRPC instance's management address to use its `gr.admin_port`. Run
 `vllm-gr-sidecar --config /path/to/config.py`. See the
 [deployment guide](../docs/weight_update_sidecar_design.md#user-startup-and-publication-guide)
 for checkpoint rolling updates and online Trie switching.
@@ -75,7 +75,7 @@ setting. The Ascend examples and gRPC tiny-model smoke test use V1. The
 library, general CLI, and offline thinking modes default to V1 when the
 variable is unset.
 
-`beam.execution_mode: v1` selects the same Beam Search API for both runners.
+Both runners use the same Beam Search API and `gr` configuration.
 CUDA Prefill and Decode capture policies differ by runner. See the
 [V2 integration guide](../docs/modelrunner_v2_multibatch.md) and
 [Prefill capture guide](../docs/prefill_graph_capture.md).

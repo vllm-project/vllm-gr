@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
+from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.v1.worker import model_runner_patch
 from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
 
@@ -88,10 +88,8 @@ def test_dispatcher_selects_one_platform_module(
     assert imported == [model_runner_patch._NPU_PATCH_MODULE]
 
 
-@pytest.mark.parametrize("with_bookkeeping", [False, True])  # type: ignore[misc]
 def test_dispatcher_installs_required_and_optional_hooks_once(
     monkeypatch: pytest.MonkeyPatch,
-    with_bookkeeping: bool,
 ) -> None:
     # V1-platform install test: pin the V2 flag off (see
     # test_dispatcher_selects_one_platform_module).
@@ -121,12 +119,6 @@ def test_dispatcher_installs_required_and_optional_hooks_once(
         discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
     )
-    if with_bookkeeping:
-        from vllm_gr.v1.worker.npu import npu_model_runner_patch
-
-        platform_module.make_patched_bookkeeping_sync = (
-            npu_model_runner_patch.make_patched_bookkeeping_sync
-        )
     monkeypatch.setattr(
         model_runner_patch,
         "_get_active_platform_module",
@@ -136,21 +128,13 @@ def test_dispatcher_installs_required_and_optional_hooks_once(
     bookkeeping = Runner._bookkeeping_sync
     model_runner_patch.apply_worker_patches()
     first = (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync)
-    if with_bookkeeping:
-        assert Runner._bookkeeping_sync is not bookkeeping
-        assert getattr(Runner._bookkeeping_sync, "__wrapped__") is bookkeeping
-    else:
-        assert Runner._bookkeeping_sync is bookkeeping
+    assert Runner._bookkeeping_sync is bookkeeping
     # Ordinary inference still delegates to the native method on either path.
     assert Runner()._bookkeeping_sync(SimpleNamespace()) is native_result
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert getattr(Runner, "_patched_for_beam_pos_ids") is True
-    # No _sample on this Runner -> the Constraint Tables hook must not be added.
-    from vllm_gr.v1.worker.model_runner_contracts import (
-        _WORKER_SAMPLE_PATCH_MARKER,
-    )
-
-    assert not hasattr(getattr(Runner, "_sample", None), _WORKER_SAMPLE_PATCH_MARKER)
+    # Beam stages do not install a native sampler override.
+    assert not hasattr(getattr(Runner, "_sample", None), "_vllm_gr_beam_sample_patch")
 
     model_runner_patch.apply_worker_patches()
     assert (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync) == first
@@ -173,9 +157,6 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
     monkeypatch.setattr(
         model_runner_patch, "_active_platform_module_name", lambda: platform_module_name
-    )
-    from vllm_gr.v1.worker.model_runner_contracts import (
-        _WORKER_SAMPLE_PATCH_MARKER,
     )
     from vllm_gr.v1.worker.model_runner_patch import (
         _CONSTRAINT_LOAD_PATCH_MARKER,
@@ -252,7 +233,7 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
 
     assert Runner._sample is sample
     assert Runner._bookkeeping_sync is bookkeeping
-    assert not getattr(Runner._sample, _WORKER_SAMPLE_PATCH_MARKER, False)
+    assert not getattr(Runner._sample, "_vllm_gr_beam_sample_patch", False)
     assert getattr(Runner.load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False)
     assert max_batches == [expected_max_batch]
     assert getattr(Runner.shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
@@ -439,9 +420,9 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
     assert called == ["staging", "v2"]
 
 
-@pytest.mark.parametrize("mode", [None, BeamExecutionMode.V1])  # type: ignore[misc]
+@pytest.mark.parametrize("mode", [None, 4])  # type: ignore[misc]
 def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
-    monkeypatch: pytest.MonkeyPatch, mode: BeamExecutionMode | None
+    monkeypatch: pytest.MonkeyPatch, mode: int | None
 ) -> None:
     import builtins
 
@@ -457,7 +438,7 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     events: list[str] = []
 
     class Runner:
-        _vllm_gr_config = SimpleNamespace(beam_execution_mode=mode)
+        _vllm_gr_config = SimpleNamespace(beam_max_width=mode)
 
         def execute_model(self, *args: Any) -> None:
             pass
@@ -500,7 +481,7 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     model_runner_patch.apply_worker_patches()
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert Runner().capture_model() == 17
-    assert events == ["native", "stages" if mode is BeamExecutionMode.V1 else "legacy"]
+    assert events == ["native", "stages" if mode is not None else "legacy"]
 
 
 pytestmark = pytest.mark.cpu_test

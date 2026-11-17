@@ -14,16 +14,15 @@ to set the model and data paths, compile a CUDA table, and write the server YAML
 
 ## Beam configuration parameters
 
-The server loads the shared YAML through `--vllm-gr-config`.
+The server loads the shared YAML through `--config`.
 The values below apply to that configuration. Library defaults can differ.
 
 | Parameter | Example value | Server YAML and client CLI |
 | --- | --- | --- |
-| `beam.execution_mode` | `v1` | Set in YAML to select Beam Search V1. |
-| `beam.graph_enabled` | `true` | Set in YAML to enable Beam graphs. |
-| `beam.worker_decision` | `true` | Set in YAML to enable Beam selection on the Worker. |
-| `beam.max_width` | `128` | Set the width in YAML and match it with the client flag `--width 128`. |
-| `beam.max_decode_steps` | `3` | Set the effective token capacity in YAML. Use `--max-new-tokens 3` for the three-layer Constraint Table. The client handles the boundary markers separately. |
+| `gr.beam_graph_enabled` | `true` | Set in YAML to enable Beam graphs. |
+| `gr.worker_decision` | `true` | Set in YAML to enable Beam selection on the Worker. |
+| `gr.beam_width` | `[128, 128, 128]` | Match the first width with the client flag `--width 128`. |
+| `gr.max_decode_steps` | `3` | Set the effective token capacity in YAML. Use `--max-new-tokens 3` for the three-layer Constraint Table. The client handles the boundary markers separately. |
 
 ## Start the server
 
@@ -35,7 +34,7 @@ export ONEREC_SERVED_MODEL_NAME=onerec
 VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}" vllm serve "$ONEREC_MODEL" --gr \
   --grpc --host 127.0.0.1 --port 50051 \
   --served-model-name "$ONEREC_SERVED_MODEL_NAME" \
-  --vllm-gr-config "$ONEREC_WORKDIR/vllm_gr_config.yaml" \
+  --config "$ONEREC_WORKDIR/vllm_gr_config.yaml" \
   --trust-remote-code \
   --max-logprobs 128 --max-num-seqs 128 \
   --max-model-len 2048 --max-num-batched-tokens 2048 \

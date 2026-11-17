@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disallow-untyped-decorators=False
-
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
@@ -9,8 +8,11 @@ from typing import Any, cast
 import pytest
 import torch
 
+from tests.helpers.gr_config import make_gr_config
 from vllm_gr.config import (
-    ConstraintTableConfig,
+    ConstraintConfig,
+    ConstraintMode,
+    ConstraintTableSpec,
     GRConfig,
     gr_config_from_mapping,
     gr_config_to_mapping,
@@ -33,33 +35,30 @@ def flash_backend(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
 @pytest.mark.parametrize("version", [None, "auto", 2, 3])
 @pytest.mark.parametrize("short_suffix", [False, True])
 def test_prefill_config_roundtrip(version: Any, short_suffix: bool) -> None:
-    config = GRConfig(
-        prefill_flash_attn_version=version, enable_short_suffix_attention=short_suffix
+    config = make_gr_config(
+        prefill_flash_attn_version=version,
+        enable_short_suffix_attention=short_suffix,
+        constraint=ConstraintConfig(mode=ConstraintMode.NONE),
     )
     worker = SimpleNamespace(additional_config={})
     config.write_to_vllm_config(worker)
     assert GRConfig.from_vllm_config(worker) == config
-    canonical = GRConfig(
+    canonical = make_gr_config(
         prefill_flash_attn_version=version,
         enable_short_suffix_attention=short_suffix,
-        constraint_table=ConstraintTableConfig(max_top_k=256),
+        constraint_table=ConstraintTableSpec(max_top_k=256),
+        constraint_backend="constraint_table",
     )
     mapping = gr_config_to_mapping(canonical)
     assert gr_config_from_mapping(mapping) == canonical
-    if short_suffix:
-        assert "enable_short_suffix_attention" not in mapping["beam"]
-    else:
-        assert mapping["beam"]["enable_short_suffix_attention"] is False
-    if version == "auto":
-        assert "prefill_flash_attn_version" not in mapping["beam"]
-    elif version is None:
-        assert mapping["beam"]["prefill_flash_attn_version"] is None
+    assert mapping["gr"]["enable_short_suffix_attention"] is short_suffix
+    assert mapping["gr"]["prefill_flash_attn_version"] == version
 
 
 @pytest.mark.parametrize("version", [True, False, 0, 4, 3.0, "3", "fast", [], {}])
 def test_prefill_config_rejects_invalid_version(version: Any) -> None:
     with pytest.raises(ValueError, match="prefill_flash_attn_version"):
-        GRConfig(prefill_flash_attn_version=version)
+        make_gr_config(prefill_flash_attn_version=version)
 
 
 def _resolve(requested: Any, decode: int = 2, **changes: Any) -> int:
@@ -223,7 +222,7 @@ def test_mixed_cascade_keeps_prefix_suffix_on_fa2(
     assert versions == ([2, 2, 2] if q_len == 1 else [3, 2, 2])
 
 
-@pytest.mark.parametrize("policy", [{}, {"vllm_gr_prefill_flash_attn_version": 3}])
+@pytest.mark.parametrize("policy", [{}, {"prefill_flash_attn_version": 3}])
 @pytest.mark.parametrize("decode_version", [2, 3, 4])
 @pytest.mark.parametrize("short_suffix", [False, True])
 def test_initialization_preserves_global_decode_config(
@@ -237,10 +236,17 @@ def test_initialization_preserves_global_decode_config(
 
     config = SimpleNamespace(
         attention_config=SimpleNamespace(flash_attn_version=decode_version),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
         additional_config={
-            "vllm_gr_beam_max_width": 128,
-            "vllm_gr_enable_short_suffix_attention": short_suffix,
-            **policy,
+            "vllm_gr": {
+                "gr": {
+                    "beam_width": [128] * 3,
+                    "candidate_width": [128] * 3,
+                    "enable_short_suffix_attention": short_suffix,
+                    **policy,
+                }
+            },
         },
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
@@ -259,14 +265,14 @@ def test_initialization_preserves_global_decode_config(
 
 
 def test_omitted_prefill_policy_defaults_to_auto() -> None:
-    assert GRConfig().prefill_flash_attn_version == "auto"
+    assert make_gr_config().prefill_flash_attn_version == "auto"
     assert (
         GRConfig.from_vllm_config(SimpleNamespace(additional_config={})).prefill_flash_attn_version
         == "auto"
     )
-    canonical = GRConfig(constraint_table=ConstraintTableConfig(max_top_k=256))
+    canonical = make_gr_config(constraint_table=ConstraintTableSpec(max_top_k=256))
     mapping = gr_config_to_mapping(canonical)
-    assert "prefill_flash_attn_version" not in mapping["beam"]
+    assert mapping["gr"]["prefill_flash_attn_version"] == "auto"
     assert gr_config_from_mapping(mapping).prefill_flash_attn_version == "auto"
 
 
@@ -276,7 +282,9 @@ def test_npu_prefill_default_and_inherit_are_noops(
 ) -> None:
     import vllm.config
 
-    config = SimpleNamespace(additional_config={"vllm_gr_prefill_flash_attn_version": policy})
+    config = SimpleNamespace(
+        additional_config={"vllm_gr": {"gr": {"prefill_flash_attn_version": policy}}}
+    )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
     monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)

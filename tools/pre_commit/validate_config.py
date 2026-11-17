@@ -70,7 +70,7 @@ class ConfigValidator(ast.NodeVisitor):
             )
         ]
 
-        if self.gr_config and node.name in {"GRConfig", "ConstraintTableConfig"}:
+        if self.gr_config and node.name in {"GRConfig", "ConstraintTableSpec"}:
             if "dataclass" not in decorators:
                 fail(f"Class {node.name} must be a dataclass.", node)
             validate_class(node, require_metadata=True)
@@ -150,18 +150,8 @@ def validate_class(class_node: ast.ClassDef, *, require_metadata: bool = False) 
                         and kw.value.value is True
                         for kw in spec.keywords
                     )
-                    if (class_node.name, field_name) == (
-                        "ConstraintTableConfig",
-                        "max_top_k",
-                    ) and not required:
-                        fail("Field 'max_top_k' must explicitly declare required=True.", stmt)
-                    if required and (class_node.name, field_name) != (
-                        "ConstraintTableConfig",
-                        "max_top_k",
-                    ):
+                    if required:
                         fail(f"Unexpected required config field '{field_name}'.", stmt)
-                    if required and _has_default(stmt.value):
-                        fail(f"Required field '{field_name}' must not have a default.", stmt)
                 if not _has_default(stmt.value) and not required:
                     fail(
                         f"Field '{field_name}' in {class_node.name} must have a default value.",

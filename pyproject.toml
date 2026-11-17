@@ -92,6 +92,7 @@ include = ["vllm_gr*"]
 
 [tool.setuptools.package-data]
 "vllm_gr" = ["_version.py", "*.json"]
+"vllm_gr.config" = ["default_config.yaml"]
 "vllm_gr.entrypoints.grpc" = ["proto/*.proto"]
 "vllm_gr.entrypoints.grpc.generated" = ["README.md"]
 

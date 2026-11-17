@@ -72,31 +72,34 @@ def prepare(args: argparse.Namespace) -> None:
         trust_remote_code=True,
     )
     config = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": True,
-            "worker_decision": True,
-            "max_width": args.beam_width,
-            "max_decode_steps": args.generated_steps,
-        },
+        "beam_graph_enabled": True,
+        "worker_decision": True,
+        "beam_width": [args.beam_width] * args.generated_steps,
+        "max_decode_steps": args.generated_steps,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "max_top_k": args.beam_width,
             "path": str(artifact.resolve()),
             "format": "constraint_table_v1",
-            "artifact_digest": artifact_digest,
-            "tokenizer_digest": tokenizer_digest,
+            "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
         },
+        "candidate_width": [args.beam_width] * args.generated_steps,
     }
-    (args.output_dir / "vllm_gr_config.yaml").write_text(
-        yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+    if args.ab_prefill_grid:
+        config.update(
+            prefill_graph_enabled=True,
+            prefill_token_buckets=[1024, 2048, 4096],
+            beam_batch_sizes=[1, 2, 4],
+        )
+    (args.output_dir / "gr-config.yaml").write_text(
+        yaml.safe_dump({"attention-config": {"backend": "CUSTOM"}, "gr": config}, sort_keys=False),
+        encoding="utf-8",
     )
     write_json(
         args.output_dir / "setup.json",
         {
+            "gr": config,
             "benchmark_driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "model": args.model,
             "revision": args.revision,
@@ -118,12 +121,12 @@ def prepare(args: argparse.Namespace) -> None:
             "max_tokens_including_sid_boundaries": args.generated_steps + 2,
             "artifact_digest": artifact_digest,
             "tokenizer_digest": tokenizer_digest,
-            "execution_mode": "v1",
             "graph_enabled": True,
             "prefix_caching": False,
             "chunked_prefill": False,
             "timing": "end-to-end caller time; warmup excluded; generated beam IDs/scores/text materialized offline (full/compact normalized)",
             "online_streaming": False,
+            "candidate_width": [args.beam_width] * 3,
         },
     )
 
@@ -243,9 +246,38 @@ def _measure_offline_batch(
     return elapsed
 
 
-def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -> None:
-    import yaml
+def _legacy_ab_config(gr: dict[str, Any]) -> dict[str, Any]:
+    """Translate the fixed A/B workload to the base revision's schema."""
+    widths = gr["beam_width"]
+    steps = gr["max_decode_steps"]
+    if not widths or widths != [widths[0]] * steps or gr["candidate_width"] != widths:
+        raise ValueError("Legacy A/B requires one shared candidate and beam width")
+    table = gr["constraint_table"]
+    return {
+        "schema_version": 1,
+        "attention_backend": "CUSTOM",
+        "beam": {
+            "execution_mode": "v1",
+            "graph_enabled": gr["beam_graph_enabled"],
+            "worker_decision": gr["worker_decision"],
+            "max_width": widths[0],
+            "max_decode_steps": steps,
+            "online_batch_sizes": gr["beam_batch_sizes"],
+        },
+        "constraint_table": {
+            "enabled": True,
+            "backend": table["backend"],
+            "max_top_k": table["max_top_k"],
+            "path": table["path"],
+            "format": table["format"],
+            "artifact_digest": table["digests"]["artifact"],
+            "tokenizer_digest": table["digests"]["tokenizer"],
+            "candidate_width": widths[0],
+        },
+    }
 
+
+def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -> None:
     from vllm_gr.entrypoints import gr
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
@@ -255,11 +287,10 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
         if not runtime_source.is_relative_to(Path(root).resolve() / "vllm_gr"):
             raise RuntimeError(f"benchmark imported the wrong runtime: {runtime_source}")
     result["runtime_source"] = str(runtime_source)
-    config = yaml.safe_load((args.output_dir / "vllm_gr_config.yaml").read_text())
+    gr = json.loads((args.output_dir / "setup.json").read_text(encoding="utf-8"))["gr"]
     engine_args = {
         "model": args.model,
         "trust_remote_code": True,
-        "vllm_gr_config": config,
         "async_scheduling": True,
         "enable_prefix_caching": False,
         "enable_chunked_prefill": False,
@@ -271,6 +302,10 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
         "enforce_eager": False,
         "seed": 0,
     }
+    if args.ab_legacy_config:
+        engine_args["vllm_gr_config"] = _legacy_ab_config(gr)
+    else:
+        engine_args.update(gr=gr, attention_config={"backend": "CUSTOM"})
     if args.revision:
         engine_args["revision"] = args.revision
     params = BeamSearchParams(
@@ -414,7 +449,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--port", type=int, default=7001)
+    parser.add_argument(
+        "--ab-prefill-grid", action="store_true", help="Capture the B=1,2,4 performance workload"
+    )
+    parser.add_argument(
+        "--ab-legacy-config",
+        action="store_true",
+        help="Use schema-v1 startup for an offline A/B pass",
+    )
     args = parser.parse_args()
+    if args.ab_legacy_config and (not args.ab_prefill_grid or args.mode == "online"):
+        parser.error("--ab-legacy-config requires an offline A/B pass")
     if (
         args.beam_width <= 0
         or args.generated_steps != 3
@@ -439,8 +484,8 @@ def main() -> None:
     if args.mode == "prepare":
         prepare(args)
         return
-    if not (args.output_dir / "vllm_gr_config.yaml").is_file():
-        raise FileNotFoundError("V1 config missing; run prepare first")
+    if not (args.output_dir / "setup.json").is_file():
+        raise FileNotFoundError("Benchmark setup missing; run prepare first")
     prompt = args.prompt.read_text(encoding="utf-8").strip()
     if not prompt:
         raise ValueError("empty benchmark prompt")

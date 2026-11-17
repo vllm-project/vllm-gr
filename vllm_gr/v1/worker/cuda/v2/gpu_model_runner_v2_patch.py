@@ -6,7 +6,7 @@ The V2 runner (``vllm.v1.worker.gpu.model_runner.GPUModelRunner``) replaces the
 V1 ``_prepare_inputs``/``_bookkeeping_sync``/``_sample`` trio with
 ``prepare_inputs``/``sample``/``sample_tokens`` and a mutable ``InputBatch``
 dataclass.  Under V2 the beam surface is the beam_search_v1 persistent GR
-stage path (``execution_mode=v1``); the LEGACY ``beam_data`` frame stack has
+stage path; the LEGACY ``beam_data`` frame stack has
 been removed, so this module installs only the slim hook set:
 
 - ``execute_model``: the local slim wrapper (retirement/stage dispatch and
@@ -111,7 +111,7 @@ def make_patched_execute_model_v2(
     - FAILS FAST on a ``beam_data`` frame — the historical alternative was a
       silent wrong-beam-results mode when the V1/V2 flag resolved differently
       than the patch layer assumed (ISSUES §1.1); a loud error names both
-      remediations (execution_mode=v1, or unset the V2 flag);
+      remediations (configure gr.beam_width, or unset the V2 flag);
 
     Everything else is the untouched native ``execute_model``.
     """
@@ -142,7 +142,7 @@ def make_patched_execute_model_v2(
         if getattr(scheduler_output, "beam_data", {}):
             raise ValueError(
                 "legacy beam_data frames are not supported under ModelRunnerV2; "
-                "use beam.execution_mode='v1' or unset VLLM_USE_V2_MODEL_RUNNER"
+                "configure gr.beam_width or unset VLLM_USE_V2_MODEL_RUNNER"
             )
 
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)

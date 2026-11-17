@@ -183,8 +183,8 @@ def test_constrained_length_is_checked_before_grpc_token_decoding(
     )
 
     config = _canonical_gr_config(backend=backend)
-    config["constraint_table"]["format"] = table_format
-    config["beam"]["max_decode_steps"] = 7
+    config["gr"]["constraint_table"]["format"] = table_format
+    config["gr"]["max_decode_steps"] = 7
     runtime = engine()
     runtime.vllm_config = SimpleNamespace(
         additional_config={"vllm_gr": config}, device_config=SimpleNamespace(device=backend)
@@ -230,6 +230,40 @@ def test_npu_trie_selector_matches_http_validation(trie_id: int) -> None:
     servicer = BeamVllmEngineServicer(backend, 0.0)
     batch, _ = servicer.build_batch([request])
     assert batch.items[0].trie_id == trie_id
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("override_schedule", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("override_result", [False, True])  # type: ignore[misc]
+def test_grpc_beam_deployment_defaults(override_schedule: bool, override_result: bool) -> None:
+    from tests.entrypoints.beam_search_v1.test_beam_search_v1_input_processor import (
+        _canonical_gr_config,
+    )
+
+    config = _canonical_gr_config(enabled=False)
+    config["gr"]["beam_width"] = [4, 4, 4]
+    config["gr"].update(
+        {
+            "beam_width": [4, 2, 2],
+            "candidate_width": [4, 2, 1],
+            "result_width": 1,
+        }
+    )
+    runtime = engine()
+    runtime.vllm_config = SimpleNamespace(
+        additional_config={"vllm_gr": config}, device_config=SimpleNamespace(device="cuda")
+    )
+    request = message()
+    request.sampling_params.n = request.beam_search.beam_width = 4
+    if override_schedule:
+        request.beam_search.dynamic_beam_widths.extend([4, 3, 3])
+    if override_result:
+        request.beam_search.result_width = 2
+
+    batch, _ = BeamVllmEngineServicer(runtime, 0.0).build_batch([request])
+    assert batch.beam_params.dynamic_beam_widths == ((4, 3, 3) if override_schedule else (4, 2, 2))
+    assert batch.beam_params.per_parent_beam_widths == (4, 2, 1)
+    assert batch.output_options.num_return_sequences == (2 if override_result else 1)
 
 
 @pytest.mark.parametrize("result_width", [None, 1, 2])  # type: ignore[misc]
@@ -686,6 +720,11 @@ def test_mixed_batch_queue_rejection_is_atomic_and_service_recovers(
     )
 
     core = grpc_admission_core
+    import torch
+
+    core.vllm_config.device_config.device = torch.device("cuda")
+    core.vllm_config.scheduler_config.async_scheduling = True
+    core.vllm_config.scheduler_config.enable_chunked_prefill = False
     core._gr_trie_count = core.scheduler._gr_trie_count = 2
     core.add_request = Mock(wraps=core.add_request)
     core.preprocess_add_request = Mock(wraps=core.preprocess_add_request)

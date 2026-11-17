@@ -85,33 +85,26 @@ def create_v1_llm(args: argparse.Namespace, max_tokens: int) -> Iterator[Any]:
             Path(args.model), args.catalog.resolve(), artifact
         )
         config = {
-            "schema_version": 1,
-            "attention_backend": "CUSTOM",
-            "beam": {
-                "execution_mode": "v1",
-                "graph_enabled": True,
-                "worker_decision": True,
-                "max_width": args.beam_width,
-                "max_decode_steps": steps,
-            },
+            "worker_decision": True,
+            "beam_width": [args.beam_width] * steps,
+            "max_decode_steps": steps,
+            "constraint_mode": "table",
             "constraint_table": {
-                "enabled": True,
                 "backend": "cuda",
                 "max_top_k": args.beam_width,
-                "path": str(artifact),
+                "path": str(artifact.resolve()),
                 "format": "constraint_table_v1",
-                "artifact_digest": digest,
-                "tokenizer_digest": tokenizer_digest,
+                "digests": {"artifact": digest, "tokenizer": tokenizer_digest},
             },
+            "candidate_width": [args.beam_width] * steps,
         }
         model_len = max(8192, args.input_length + max_tokens)
         with GRLLM(
             model=args.model,
             trust_remote_code=True,
-            vllm_gr_config=config,
+            attention_config={"backend": "CUSTOM"},
+            gr=config,
             async_scheduling=True,
-            enable_chunked_prefill=False,
-            enable_prefix_caching=True,
             max_num_seqs=args.beam_width,
             max_logprobs=args.beam_width,
             max_num_batched_tokens=max(16384, model_len),
@@ -207,6 +200,9 @@ def main() -> int:
     miss_samples: list[dict[str, Any]] = []
     hit_samples: list[dict[str, Any]] = []
     with create_v1_llm(args, max_tokens) as llm:
+        effective = llm.llm_engine.vllm_config
+        prefix_caching = effective.cache_config.enable_prefix_caching
+        chunked_prefill = effective.scheduler_config.enable_chunked_prefill
         for prompt_token_ids in prompt_token_ids_list[: args.warmup_requests]:
             if not llm.reset_prefix_cache():
                 raise RuntimeError("prefix cache reset failed during warmup")
@@ -298,10 +294,9 @@ def main() -> int:
             "catalog_path": str(args.catalog),
             "constraint_backend": "canonical_cuda",
             "single_request": True,
-            "beam_execution_mode": "v1",
             "async_scheduling": True,
-            "enable_chunked_prefill": False,
-            "enable_prefix_caching": True,
+            "enable_prefix_caching": prefix_caching,
+            "enable_chunked_prefill": chunked_prefill,
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

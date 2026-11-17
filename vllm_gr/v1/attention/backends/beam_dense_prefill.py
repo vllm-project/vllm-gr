@@ -15,33 +15,18 @@ The contract therefore has two halves:
   open. Native decode, mixed and other captures keep the paged path.
 * Replay: when dense Prefill is requested, those runners replay a Prefill graph
   only if every scheduled request has ``num_computed_tokens == 0``
-  (:func:`requires_fresh_prefill_replay`).
+  (checked by the graph runners using the same GR configuration).
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-ENV_DENSE_PREFILL = "VLLM_GR_DENSE_PREFILL"
-DENSE_PREFILL_MODES = ("fa2", "cudnn")
-
 _fresh_prefill_capture: ContextVar[bool] = ContextVar(
     "vllm_gr_fresh_prefill_capture", default=False
 )
-
-
-def requested_dense_prefill_mode() -> str | None:
-    """The env-selected mode before config gating, or None when off or invalid."""
-    raw = os.environ.get(ENV_DENSE_PREFILL, "off").strip().lower()
-    return raw if raw in DENSE_PREFILL_MODES else None
-
-
-def requires_fresh_prefill_replay() -> bool:
-    """Whether Prefill graph replay must be limited to requests without context."""
-    return requested_dense_prefill_mode() is not None
 
 
 @contextmanager

@@ -90,7 +90,6 @@ def write_pass(root: Path, sha: str, offline_ms: list[float | list[float]]) -> N
                 "gpu_memory_utilization": 0.7,
                 "artifact_digest": artifact_digest,
                 "tokenizer_digest": tokenizer_digest,
-                "execution_mode": "v1",
                 "graph_enabled": True,
                 "prefix_caching": False,
                 "chunked_prefill": False,

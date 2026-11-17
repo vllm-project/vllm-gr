@@ -221,12 +221,9 @@ def test_canonical_config_enables_cuda_artifact(tmp_path: Path) -> None:
 
     config = benchmark.canonical_gr_config(args, artifact)
 
-    assert config["beam"] == {
-        "execution_mode": "v1",
-        "graph_enabled": True,
-        "max_width": 128,
-        "max_decode_steps": 3,
-    }
+    assert config["beam_graph_enabled"] is True
+    assert config["beam_width"] == [128, 128, 128]
+    assert config["max_decode_steps"] == 3
     assert config["constraint_table"]["backend"] == "cuda"
     assert config["constraint_table"]["path"] == str(artifact.path)
 

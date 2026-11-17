@@ -91,7 +91,7 @@ scripts use the configurations below.
 
 ### Public entrypoint
 
-Set `beam.execution_mode: v1` and call `GRLLM.beam_search_v1()`.
+Set the `gr` Beam configuration and call `GRLLM.beam_search_v1()`.
 `GRLLM.beam_search()` raises a migration error. EngineCore now owns scheduling
 for the V1 session.
 
@@ -121,14 +121,14 @@ Both modes require:
 - Logical B=1..8 with shared generation parameters; online batch/capture policy
   defaults to `[1, 2, 4]` and must fit engine capacity.
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
-- Request `beam_width == beam.max_width`.
+- Match the request `beam_width` to the first entry in `gr.beam_width`.
 - Token/text prompts rather than embedding prompts.
 - No speculative decoding, LoRA, quantization, hybrid model, encoder-decoder
   model, or multimodal model.
 
 For catalog-constrained generation, pass `--catalog`, set
 `catalog_strategy=None`, and generate exactly three tokens. Without a catalog,
-the engine supports 1 through `beam.max_decode_steps` effective tokens. The
+the engine supports 1 through `gr.max_decode_steps` effective tokens. The
 example CLI accepts 1 to 3.
 
 ### Constraint Table artifact
@@ -145,27 +145,26 @@ different constraint data or a different tokenizer.
 
 With `--catalog`, the script builds the CUDA configuration below in memory.
 Save the same mapping as YAML for other applications. For NPU, set
-`constraint_table.backend: npu`.
+`gr.constraint_table.backend: npu`.
 
 ```yaml
-schema_version: 1
-attention_backend: CUSTOM
-
-beam:
-  execution_mode: v1
-  graph_enabled: true
+attention-config:
+  backend: CUSTOM
+gr:
+  beam_graph_enabled: true
   worker_decision: true
-  max_width: 128
+  beam_width: [128, 128, 128]
+  candidate_width: [128, 128, 128]
   max_decode_steps: 3
-
-constraint_table:
-  enabled: true
-  backend: cuda
-  max_top_k: 128
-  path: /absolute/path/to/video_constraint_table.safetensors
-  format: constraint_table_v1
-  artifact_digest: sha256:REPLACE_WITH_ARTIFACT_DIGEST
-  tokenizer_digest: sha256:REPLACE_WITH_TOKENIZER_DIGEST
+  constraint_mode: table
+  constraint_table:
+    backend: cuda
+    max_top_k: 128
+    path: /absolute/path/to/video_constraint_table.safetensors
+    format: constraint_table_v1
+    digests:
+      artifact: sha256:REPLACE_WITH_ARTIFACT_DIGEST
+      tokenizer: sha256:REPLACE_WITH_TOKENIZER_DIGEST
 ```
 
 #### Beam configuration parameters
@@ -175,16 +174,14 @@ belong to `offline_beam_search_v1.py`. Library defaults can differ.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `execution_mode` | `v1` | The script selects Beam Search V1. |
-| `graph_enabled` | `true` on CUDA | On Ascend, `--execution graph` enables Beam graphs and `--execution eager` disables them. CUDA ignores this flag. |
+| `beam_graph_enabled` | `true` on CUDA | On Ascend, `--execution graph` enables Beam graphs and `--execution eager` disables them. CUDA ignores this flag. |
 | `worker_decision` | `true` | The script enables Beam selection on the Worker. |
-| `max_width` | `128` | `--beam-width` sets both the engine capacity and the request width. |
+| `beam_width` | `[128, 128, 128]` | `--beam-width` sets both the engine capacity and the request width. |
 | `max_decode_steps` | `3` | `--generated-steps` sets the effective token count. The three-layer Constraint Table requires `3`. |
 
-On CUDA, with `constrained_generation: false` and
-`constraint_table.enabled: false`, one engine can accept per-request effective
-lengths from `1` through its configured `beam.max_decode_steps` (for example,
-`7`). Existing NPU startup limits still apply (`max_decode_steps <= 3`).
+With `gr.constraint_mode: none` and `gr.constraint_table: null`, one engine can
+accept per-request effective lengths from `1` through its configured
+`gr.max_decode_steps`, up to the supported platform limit.
 Increasing capacity does not change the depth of an enabled
 `constraint_table_v1`: constrained requests still require exactly three
 effective tokens.
@@ -196,7 +193,7 @@ compiles a temporary artifact and fills in its path and digests.
 
 | Parameter | Example value | How to set it |
 | --- | --- | --- |
-| `enabled` | `true` | The script enables the table when you pass `--catalog`. It uses full-vocabulary Beam Search otherwise. |
+| `gr.constraint_mode` | `table` | The script enables the table when you pass `--catalog`. It selects `none` for full-vocabulary Beam Search. |
 | `backend` | `cuda` | Use `--constraint-backend npu` on Ascend. |
 | `max_top_k` | `128` | The script sets this capacity to the candidate width. In YAML, set it to at least that width. |
 | `candidate_width` | Omitted, resolves to `128` | Use `--candidate-width` to set the candidates per Beam row independently of `--beam-width`. The accepted range is 1 through 256. Set it explicitly when the Beam width exceeds 256. |
@@ -242,7 +239,7 @@ these values for the fixed-width example.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `beam_width` | `128` | Taken from `--beam-width`. It must equal `beam.max_width`. |
+| `beam_width` | `128` | Taken from `--beam-width`. Match the first entry in `gr.beam_width`. |
 | `max_tokens` | `5` | The script adds two boundary positions to `--generated-steps`. |
 | `temperature` | `0.0` | Fixed by the script for Beam Search. |
 | `ignore_eos` | `True` | Ignores stop and EOS tokens during the fixed-length search. |
@@ -467,13 +464,12 @@ Run the opt-in strict comparison in a prepared Ascend environment:
 
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
-VLLM_GR_TEST_PADDED_PREFILL=1 VLLM_ENABLE_PREFILL_CUDAGRAPH=1 \
-VLLM_GR_PREFILL_GRAPH_BUCKET_STEP=384 VLLM_GR_PREFILL_GRAPH_MAX_BUCKET=384 \
+VLLM_GR_TEST_PADDED_PREFILL=1 \
   python -m pytest --run-slow -s -v --tb=short \
   tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
 ```
 
-For the same-input exact-bucket control, set both bucket values to `290`.
+The padded test sets `gr.prefill_token_buckets: [384]`.
 The default regression exercises a different, exact 256-token batch.
 
 ### Measure latency without profiling
@@ -565,8 +561,8 @@ params = BeamSearchParams(
 ```
 
 The first stage requires `K_1=W_1`. Each later stage must satisfy
-`W_i <= W_(i-1) * K_i`. Both W and K remain limited to 256 in this
-implementation.
+`W_i <= W_(i-1) * K_i`. W supports up to 1024. Unconstrained CUDA supports K
+up to 1024; current constraint-table operators cap K at 256.
 
 An explicit `per_parent_beam_widths` overrides the startup
 `constraint_table.candidate_width`, subject to backend `max_top_k` capacity.
@@ -585,10 +581,10 @@ HTTP clients can pass the schedule in `vllm_xargs` through Completion or Chat;
 native non-GR Beam rejects an explicit schedule.
 
 `beam_width` remains the engine capacity in `[1, 256]` and must equal
-`beam.max_width`.
+the first entry of `gr.beam_width`.
 The schedule has exactly one integer in `[1, beam_width]` per effective generated
 step N, which must equal 3 when the constraint table is enabled. Without
-constraints, N can range from 1 through `beam.max_decode_steps`, subject to the
+constraints, N can range from 1 through `gr.max_decode_steps`, subject to the
 backend's existing capacity limits. Begin/end boundary positions are excluded
 from the schedule. With both boundary tokens above, `max_tokens=5` means N=3:
 retain 128 SA candidates, then 64 SB candidates, then 32 SC candidates.
@@ -628,32 +624,32 @@ normalization preserves score order. Variable-length early stopping is not
 supported by this dynamic-width implementation.
 
 For graph execution, construct `GRLLM` with the canonical engine configuration
-above, selecting `constraint_table.backend: npu`, and set these Beam fields
+above, selecting `gr.constraint_table.backend: npu`, and set these Beam fields
 before engine initialization:
 
 ```yaml
-beam:
-  execution_mode: v1
-  graph_enabled: true
-  graph_batch_size: 4
-  graph_widths: [64, 128]
+gr:
+  beam_graph_enabled: true
+  decode_graph_batch_size: 4
+  decode_graph_widths: [64, 128]
   worker_decision: true
-  max_width: 128
+  beam_width: [128, 64, 32]
+  candidate_width: [128, 64, 32]
   max_decode_steps: 3
 ```
 
-Retain the existing schema version, attention backend, Constraint Table artifact
-path/digests and `constraint_table.max_top_k: 128`. `graph_widths` lists Decode
+Retain the attention backend, Constraint Table artifact path/digests and
+`gr.constraint_table.max_top_k: 128`. `gr.decode_graph_widths` lists Decode
 **input** widths, so this schedule needs 128 and 64, not its final output width
 32. Use `GRLLM(..., async_scheduling=True, enable_chunked_prefill=False,
-enforce_eager=False, vllm_gr_config=config)` with enough sequence and token
-capacity for the batch. The engine also captures `max_width`; omitting
-`graph_widths` keeps the previous startup capture of that width alone.
+enforce_eager=False, config="/path/to/config.yaml")` with enough sequence and
+token capacity for the batch. The engine always captures the maximum configured
+beam width. Omit `gr.decode_graph_widths` to capture only that width.
 
 When Beam graphs are enabled, at most **8 distinct widths** may be captured,
-including the implicitly added `max_width`. For example, 8 explicit widths
-that omit `max_width` would require 9 captures and are rejected before engine
-startup. Listing `max_width` explicitly counts it once. This conservative
+including the implicitly added maximum beam width. Eight explicit widths
+that omit the maximum would require nine captures and are rejected before engine
+startup. Listing the maximum explicitly counts it once. This conservative
 resource policy bounds the number of retained banks and graphs; it does not
 guarantee a configuration fits device memory. Disabling Beam graphs does not
 apply this capture-count limit.
@@ -669,7 +665,7 @@ and activations require additional memory. Capture only the Decode input
 widths needed by the schedules you intend to serve; uncaptured widths retain
 the native fallback path described above. The
 existing padded-Prefill precision limitation remains independent of Decode
-widths; set `VLLM_ENABLE_PREFILL_CUDAGRAPH=0` when isolating Decode parity for
+widths. Set `gr.prefill_graph_enabled: false` when isolating Decode parity for
 padded or mixed prompt lengths.
 
 Narrower intermediate widths intentionally prune the search; later expansion
@@ -751,7 +747,6 @@ prompt.
 set -o pipefail
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export ASCEND_RT_VISIBLE_DEVICES=0
-export VLLM_ENABLE_PREFILL_CUDAGRAPH=0
 MODEL=/absolute/path/to/Qwen3-0.6B-OneRecVocab
 PROMPT=tests/resources/single_one_rec_prompt.txt
 DYNAMIC_RUN="$PWD/test-results/npu_dynamic_beam_$(date +%Y%m%d_%H%M%S)"
@@ -780,7 +775,7 @@ python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution graph \
   --batch-size 1 --beam-width 128 --input-len 128 --generated-steps 3 \
-  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 \
+  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 --no-prefill-graph \
   --warmup-runs 3 --repeat 20 \
   --output-json "$DYNAMIC_RUN/json/b1_narrow.json" \
   2>&1 | tee "$DYNAMIC_RUN/logs/b1_narrow.log"
@@ -793,7 +788,7 @@ python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution graph \
   --batch-size 4 --beam-width 128 --input-len 128 --generated-steps 3 \
-  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 \
+  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 --no-prefill-graph \
   --warmup-runs 3 --repeat 20 \
   --output-json "$DYNAMIC_RUN/json/b4_narrow.json" \
   2>&1 | tee "$DYNAMIC_RUN/logs/b4_narrow.log"
@@ -821,7 +816,7 @@ python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution graph \
   --batch-size 1 --beam-width 128 --input-len 128 --generated-steps 3 \
-  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 \
+  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 --no-prefill-graph \
   --profile-dir "$DYNAMIC_RUN/profile/b1_narrow" \
   --profile-warmup-runs 1 --profile-runs 5 \
   2>&1 | tee "$DYNAMIC_RUN/logs/b1_narrow_profile.log"
@@ -834,7 +829,7 @@ python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution graph \
   --batch-size 4 --beam-width 128 --input-len 128 --generated-steps 3 \
-  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 \
+  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 --no-prefill-graph \
   --profile-dir "$DYNAMIC_RUN/profile/b4_narrow" \
   --profile-warmup-runs 1 --profile-runs 5 \
   2>&1 | tee "$DYNAMIC_RUN/logs/b4_narrow_profile.log"

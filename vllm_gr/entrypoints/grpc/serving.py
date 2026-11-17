@@ -15,7 +15,12 @@ from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_gr.config import GRConfig
+from vllm_gr.config.models import configured_candidate_width
 from vllm_gr.entrypoints.beam_search_v1.client import AsyncBeamSearchClient
+from vllm_gr.entrypoints.beam_search_v1.input_processor import (
+    apply_beam_request_defaults,
+)
+from vllm_gr.sampling_params import BeamSearchParams
 from vllm_gr.v1.beam.batch_contracts import (
     ADMISSION_REJECTED_CODE,
     BEAM_BATCH_PROTOCOL_VERSION,
@@ -99,8 +104,16 @@ class BeamVllmEngineServicer(VllmEngineServicer):
             width = options.beam_width or source.n or 1
             if source.n and source.n != width:
                 raise ValueError("sampling_params.n must match beam_search.beam_width")
-            final_width = options.dynamic_beam_widths[-1] if options.dynamic_beam_widths else width
-            result_width = options.result_width if options.HasField("result_width") else final_width
+            params = apply_beam_request_defaults(
+                config,
+                BeamSearchParams(
+                    beam_width=width,
+                    max_tokens=source.max_tokens,
+                    dynamic_beam_widths=list(options.dynamic_beam_widths) or None,
+                    result_width=options.result_width if options.HasField("result_width") else None,
+                ),
+            )
+            final_width = params.dynamic_beam_widths[-1] if params.dynamic_beam_widths else width
             beam = BeamBatchParams(
                 beam_width=width,
                 max_tokens=source.max_tokens,
@@ -111,10 +124,20 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                 length_penalty=options.length_penalty
                 if options.HasField("length_penalty")
                 else 1.0,
-                dynamic_beam_widths=tuple(options.dynamic_beam_widths) or None,
+                dynamic_beam_widths=tuple(params.dynamic_beam_widths)
+                if params.dynamic_beam_widths is not None
+                else None,
+                per_parent_beam_widths=tuple(params.per_parent_beam_widths)
+                if params.per_parent_beam_widths is not None
+                else None,
+                candidate_width=configured_candidate_width(gr_config)
+                if gr_config is not None
+                else None,
             )
             output = BeamOutputOptions(
-                num_return_sequences=result_width,
+                num_return_sequences=final_width
+                if params.result_width is None
+                else params.result_width,
                 include_stop_token=False,
                 include_cumulative_logprob=True,
                 include_parent_beam_indices=options.include_parent_beam_indices,
@@ -283,7 +306,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
             request, identities = self.build_batch(messages)
             if any(identity in self._beam_tasks for identity in identities):
                 raise ValueError("request_id already has an active beam session")
-        except (ValueError, TypeError) as exc:
+        except (VLLMValidationError, ValueError, TypeError) as exc:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
             raise
         task = asyncio.current_task()

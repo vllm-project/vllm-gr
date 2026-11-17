@@ -38,7 +38,7 @@ def test_gpu_model_forward_intercepts_pure_prefill(
             replay["token_counts"] = num_scheduled_tokens
             return output_buf
 
-    monkeypatch.setattr(gpu_patch_mod, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(gpu_patch_mod, "is_prefill_graph_enabled", lambda runner=None: True)
     monkeypatch.setattr(
         gpu_patch_mod,
         "is_prefill_phase_batch",
@@ -110,8 +110,6 @@ def test_gpu_model_forward_intercepts_pure_prefill(
 def test_gpu_model_forward_dense_prefill_replays_only_fresh_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr.v1.attention.backends.beam_dense_prefill import ENV_DENSE_PREFILL
-
     output_buf = torch.zeros(4, 16)
 
     class FakePrefillRunner:
@@ -124,7 +122,7 @@ def test_gpu_model_forward_dense_prefill_replays_only_fresh_batches(
         def execute_model_prefill(self: Any, *args: Any, **kwargs: Any) -> Any:
             return output_buf
 
-    monkeypatch.setattr(gpu_patch_mod, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(gpu_patch_mod, "is_prefill_graph_enabled", lambda *_: True)
     monkeypatch.setattr(gpu_patch_mod, "is_prefill_phase_batch", lambda self, so: True)
     monkeypatch.setattr(gpu_patch_mod, "scheduled_requests_are_fresh", lambda self, so: so.fresh)
     monkeypatch.setattr(
@@ -137,9 +135,12 @@ def test_gpu_model_forward_dense_prefill_replays_only_fresh_batches(
     )
     wrapped = gpu_patch_mod.make_patched_model_forward_gpu(lambda self, *args, **kwargs: "orig_out")
 
-    def run(fresh: bool) -> Any:
+    def run(fresh: bool, mode: str) -> Any:
         scheduler_output = SimpleNamespace(fresh=fresh, num_scheduled_tokens={"r1": 30})
         runner = SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                additional_config={"vllm_gr": {"gr": {"dense_prefill": mode}}}
+            ),
             _current_scheduler_output=scheduler_output,
             input_batch=SimpleNamespace(
                 block_table=[
@@ -152,12 +153,10 @@ def test_gpu_model_forward_dense_prefill_replays_only_fresh_batches(
         return wrapped(runner, input_ids="ids", positions="pos")
 
     # Without dense Prefill, a cached-Prefill suffix may replay the graph.
-    monkeypatch.delenv(ENV_DENSE_PREFILL, raising=False)
-    assert run(fresh=False) is output_buf
+    assert run(fresh=False, mode="off") is output_buf
     # With dense Prefill, only fresh prompts replay; others run the original forward.
-    monkeypatch.setenv(ENV_DENSE_PREFILL, "cudnn")
-    assert run(fresh=False) == "orig_out"
-    assert run(fresh=True) is output_buf
+    assert run(fresh=False, mode="cudnn") == "orig_out"
+    assert run(fresh=True, mode="cudnn") is output_buf
 
 
 pytestmark = pytest.mark.cpu_test

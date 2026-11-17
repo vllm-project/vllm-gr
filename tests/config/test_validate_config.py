@@ -77,19 +77,19 @@ def test_model_field_contract(tmp_path: Path, declaration: str, doc: str, messag
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("default", "required", "message"),
     [
-        ("", ", required=True", ""),
-        ("default=32, ", ", required=True", "must not have a default"),
-        ("default=32, ", "", "must explicitly declare required=True"),
-        ("", "", "must explicitly declare required=True"),
+        ("", ", required=True", "Unexpected required"),
+        ("default=32, ", ", required=True", "Unexpected required"),
+        ("default=None, ", "", ""),
+        ("", "", "default value"),
     ],
 )
-def test_required_capacity_is_a_narrow_exception(
+def test_table_capacity_has_a_constructor_default(
     tmp_path: Path, default: str, required: str, message: str
 ) -> None:
     source = (
-        "@dataclass(frozen=True, slots=True)\nclass ConstraintTableConfig:\n"
+        "@dataclass(frozen=True, slots=True)\nclass ConstraintTableSpec:\n"
         f'    max_top_k: int = field({default}metadata={{"gr": ConfigFieldSpec("check"{required})}})\n'
-        '    """Required table capacity."""\n'
+        '    """Candidate capacity for table-mode deployment."""\n'
     )
     output = _check(tmp_path, source)
     if message:

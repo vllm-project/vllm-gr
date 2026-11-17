@@ -45,7 +45,7 @@ if not beam_ops.is_available():
         "vllm_gr_npu_decode_execution='xllm' requires the xllm-ops library "
         f"({beam_ops.unavailable_reason()}); install it with "
         "tools/install_xllm_ops.sh or select 'cascade' explicitly via "
-        "additional_config['vllm_gr_npu_decode_execution']='cascade'"
+        "gr.npu_decode_execution=cascade"
     )
 
 # Forwarded primitives: std requests, prefill and cache writes behave

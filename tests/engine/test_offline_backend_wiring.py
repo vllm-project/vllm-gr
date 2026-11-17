@@ -15,16 +15,19 @@ vLLM modules are shadowed for the duration of these tests only.
 
 from __future__ import annotations
 
+import argparse
+import importlib
 import sys
+from collections.abc import Iterator
+from contextlib import ExitStack
 from enum import Enum
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Iterator
+from typing import Any, cast
 from unittest import mock
 
 import msgspec
 import pytest
-
-from vllm_gr.config import ConstraintBackend, GRConfig
 
 # ``arg_utils_gr`` / ``gr`` are cached in sys.modules once a process imports
 # them (possibly against the real vLLM in CI).  Each test re-imports them
@@ -33,25 +36,6 @@ _VLLM_GR_REIMPORT = (
     "vllm_gr.engine.arg_utils_gr",
     "vllm_gr.entrypoints.gr",
 )
-
-
-def _drop_reimported_modules() -> None:
-    for name in list(sys.modules):
-        if name in _VLLM_GR_REIMPORT:
-            del sys.modules[name]
-    # ``from vllm_gr.engine import arg_utils_gr`` resolves through the cached
-    # parent package's ``__dict__`` before falling back to sys.modules, so
-    # dropping the sys.modules entry alone leaves the stale submodule attribute
-    # on the package.  The next test would then import the previous test's
-    # module (whose ``EngineArgs`` / ``origin_*`` globals point at the old fake
-    # class) instead of re-executing against its own fakes.
-    for parent_name, submodule_name in (
-        ("vllm_gr.engine", "arg_utils_gr"),
-        ("vllm_gr.entrypoints", "gr"),
-    ):
-        parent = sys.modules.get(parent_name)
-        if parent is not None and hasattr(parent, submodule_name):
-            delattr(parent, submodule_name)
 
 
 def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -76,6 +60,9 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
         @classmethod
         def from_cli_args(cls, args: Any) -> Any:  # replaced by the patch
             raise NotImplementedError
+
+    class AsyncEngineArgs(EngineArgs):
+        pass
 
     class LLM:
         """Stand-in for vLLM's LLM base; records the super().__init__ kwargs.
@@ -160,7 +147,9 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
 
     modules: dict[str, ModuleType] = {
         "vllm.engine": ModuleType("vllm.engine"),
-        "vllm.engine.arg_utils": _module("vllm.engine.arg_utils", EngineArgs=EngineArgs),
+        "vllm.engine.arg_utils": _module(
+            "vllm.engine.arg_utils", EngineArgs=EngineArgs, AsyncEngineArgs=AsyncEngineArgs
+        ),
         "vllm.utils": ModuleType("vllm.utils"),
         # ``GRLLM.__init__`` calls ``vllm_gr.plugin.initialize_runtime()`` →
         # ``check_environment()`` → ``from vllm.platforms import
@@ -172,7 +161,7 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
             "vllm.platforms",
             current_platform=SimpleNamespace(device_type="cpu"),
         ),
-        # ``vllm_gr.utils.catalog`` imports ``TokenizerLike`` at runtime; the
+        # The entrypoint imports tokenizer types at runtime; the
         # real ``vllm.tokenizers`` package pulls in ``vllm.utils.import_utils``,
         # which the fake ``vllm.utils`` above shadows.  Faking it here keeps
         # this file self-contained when run in isolation.
@@ -224,15 +213,33 @@ def _isolated_vllm_imports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     imported against the real vLLM).  Re-importing them per test keeps the
     patch state deterministic without mutating the real vLLM classes.
     """
-    _install_fake_vllm_modules(monkeypatch)
-    _drop_reimported_modules()
-    yield
-    _drop_reimported_modules()
+    from vllm_gr.engine import startup
+
+    # These fakes exercise typed argument forwarding. Native CLI conversion is
+    # covered in tests/config; do not rely on a parser cached by another test.
+    parser = argparse.ArgumentParser(add_help=False)
+    with ExitStack() as restore:
+        # Preserve the original module and parent bindings. A later re-import
+        # could otherwise capture live, already-patched EngineArgs methods.
+        for name in _VLLM_GR_REIMPORT:
+            parent_name, _, child_name = name.rpartition(".")
+            parent = importlib.import_module(parent_name)
+            for namespace, key in ((sys.modules, name), (vars(parent), child_name)):
+                if key in namespace:
+                    restore.callback(namespace.__setitem__, key, namespace.pop(key))
+                else:
+                    restore.callback(namespace.pop, key, None)
+        with monkeypatch.context() as isolated:
+            isolated.setattr(startup, "_native_parser", lambda: parser)
+            _install_fake_vllm_modules(isolated)
+            yield
 
 
 def _fake_config() -> SimpleNamespace:
     """VllmConfig stand-in: additional_config is a plain mapping."""
-    return SimpleNamespace(additional_config={})
+    return SimpleNamespace(
+        additional_config={}, scheduler_config=SimpleNamespace(async_scheduling=True)
+    )
 
 
 class TestEngineArgsGrInitPatch:
@@ -247,11 +254,11 @@ class TestEngineArgsGrInitPatch:
 
         engine_args = EngineArgs(
             model="Qwen/Qwen3-1.7B",
-            catalog_path="/models/triples.json",
-            constraint_backend="constraint_table",
+            gr={"beam_width": 8},
         )
-        assert engine_args.catalog_path == "/models/triples.json"
-        assert engine_args.constraint_backend == "constraint_table"
+        assert engine_args.gr == {"beam_width": 8}
+        # Native LLM.from_engine_args forwards vars(engine_args) to its constructor.
+        assert EngineArgs(**vars(engine_args)).gr == engine_args.gr
 
     def test_patch_applies_engine_defaults_and_preserves_overrides(self) -> None:
         from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
@@ -260,7 +267,12 @@ class TestEngineArgsGrInitPatch:
 
         from vllm.engine.arg_utils import EngineArgs
 
-        defaults = EngineArgs(model="Qwen/Qwen3-1.7B")
+        native = EngineArgs(model="Qwen/Qwen3-1.7B")
+        assert native._gr_selected is False
+        assert not hasattr(native, "max_model_len")
+
+        defaults = EngineArgs(model="Qwen/Qwen3-1.7B", gr={})
+        assert defaults._gr_selected is True
         assert defaults.max_model_len == 8192
         assert defaults.max_num_batched_tokens == 8192
         assert defaults.enable_chunked_prefill is False
@@ -268,6 +280,7 @@ class TestEngineArgsGrInitPatch:
 
         overridden = EngineArgs(
             model="Qwen/Qwen3-1.7B",
+            gr={},
             max_model_len=4096,
             max_num_batched_tokens=4096,
             enable_chunked_prefill=True,
@@ -280,6 +293,7 @@ class TestEngineArgsGrInitPatch:
 
         long_context = EngineArgs(
             model="Qwen/Qwen3-1.7B",
+            gr={},
             max_model_len=32768,
         )
         assert long_context.max_model_len == 32768
@@ -287,6 +301,7 @@ class TestEngineArgsGrInitPatch:
 
         chunked_long_context = EngineArgs(
             model="Qwen/Qwen3-1.7B",
+            gr={},
             max_model_len=32768,
             enable_chunked_prefill=True,
         )
@@ -294,39 +309,15 @@ class TestEngineArgsGrInitPatch:
 
         explicit_batched_limit = EngineArgs(
             model="Qwen/Qwen3-1.7B",
+            gr={},
             max_model_len=32768,
             max_num_batched_tokens=16384,
         )
         assert explicit_batched_limit.max_num_batched_tokens == 16384
 
-    def test_create_engine_config_writes_constraint_backend(self) -> None:
-        """The threaded values reach VllmConfig via the patched factory."""
-        from vllm_gr.engine import arg_utils_gr
-        from vllm_gr.engine.arg_utils_gr import create_engine_config, patch_add_cli_args
-
-        patch_add_cli_args()
-
-        from vllm.engine.arg_utils import EngineArgs
-
-        engine_args = EngineArgs(
-            model=None,  # model=None skips the vocab-slice resolution block
-            catalog_path="/models/triples.json",
-            constraint_backend="constraint_table",
-        )
-        vllm_config = _fake_config()
-        with mock.patch.object(
-            arg_utils_gr,
-            "origin_create_engine_config",
-            return_value=vllm_config,
-        ):
-            result = create_engine_config(engine_args)
-
-        parsed = GRConfig.from_vllm_config(result)
-        assert parsed.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
-        assert parsed.catalog_path == "/models/triples.json"
-
-    def test_plain_construction_writes_nothing(self) -> None:
-        """A plain EngineArgs must not change the (default) GR config."""
+    @pytest.mark.l1  # type: ignore[misc]
+    def test_unconstrained_default_needs_no_artifact(self) -> None:
+        """The default Beam engine must bind a model-specific constraint table."""
         from vllm_gr.engine import arg_utils_gr
         from vllm_gr.engine.arg_utils_gr import create_engine_config, patch_add_cli_args
 
@@ -342,18 +333,31 @@ class TestEngineArgsGrInitPatch:
             return_value=vllm_config,
         ):
             result = create_engine_config(engine_args)
+        from vllm_gr.config import GRConfig
 
-        assert GRConfig.from_vllm_config(result) == GRConfig()
+        assert GRConfig.from_vllm_config(result).constraint_table is None
 
 
 class TestGrllmCanonicalConstruction:
     def _import_gr(self, monkeypatch: pytest.MonkeyPatch) -> Any:
-        import vllm_gr.entrypoints.gr as gr
-        import vllm_gr.entrypoints.openai.beam_search_patch as beam_search_patch
-        import vllm_gr.plugin as plugin
+        import logging
 
-        monkeypatch.setattr(plugin, "initialize_runtime", lambda: {"patch_count": 0})
-        monkeypatch.setattr(beam_search_patch, "patch_engine_core_process_entrypoint", lambda: None)
+        # These setup hooks touch native libraries. The constructor tests
+        # exercise argument forwarding using the lightweight LLM above.
+        for name, symbols in {
+            "vllm.logger": {"init_logger": logging.getLogger},
+            "vllm_gr.utils.npu_adapter": {"release_accelerator_memory": mock.Mock()},
+            "vllm_gr.plugin": {"initialize_runtime": mock.Mock()},
+            "vllm_gr.entrypoints.openai.beam_search_patch": {
+                "patch_engine_core_process_entrypoint": mock.Mock()
+            },
+        }.items():
+            module = ModuleType(name)
+            vars(module).update(cast(dict[str, Any], symbols))
+            monkeypatch.setitem(sys.modules, name, module)
+
+        from vllm_gr.entrypoints import gr
+
         monkeypatch.setattr(gr, "_install_renderer_eos_token_id_cache", lambda: None)
         return gr
 
@@ -361,23 +365,20 @@ class TestGrllmCanonicalConstruction:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         gr = self._import_gr(monkeypatch)
-        llm = gr.GRLLM(model="model")
-        assert llm._last_kwargs == {}
+        native = {"max_model_len": 4096, "dtype": "float16"}
+        llm = gr.GRLLM(model="model", **native)
+        assert {
+            key: value for key, value in llm._last_kwargs.items() if not key.startswith("_gr_")
+        } == native
+        assert llm._last_kwargs["_gr_mode"] is True
+        assert set(native) <= llm._last_kwargs["_gr_explicit_native_fields"]
         assert not hasattr(llm, "constraint_strategy")
-
-    @pytest.mark.parametrize("constrained_generation", [False, True])  # type: ignore[misc]
-    def test_explicit_constrained_generation_reaches_native_constructor(
-        self, monkeypatch: pytest.MonkeyPatch, constrained_generation: bool
-    ) -> None:
-        gr = self._import_gr(monkeypatch)
-        llm = gr.GRLLM(model="model", constrained_generation=constrained_generation)
-
-        assert llm._last_kwargs == {"constrained_generation": constrained_generation}
 
     @pytest.mark.parametrize(
         "kwargs",
         [  # type: ignore[misc]
             {"catalog_path": "/missing/catalog.json"},
+            {"constrained_generation": False},
             {"constraint_backend": "trie"},
             {"constraint_backend": "constraint_table"},
         ],
@@ -387,19 +388,24 @@ class TestGrllmCanonicalConstruction:
     ) -> None:
         gr = self._import_gr(monkeypatch)
         initialize = mock.Mock(side_effect=AssertionError("must reject before runtime startup"))
-        monkeypatch.setattr("vllm_gr.plugin.initialize_runtime", initialize)
-        with pytest.raises(ValueError, match="removed.*vllm_gr_config"):
+        monkeypatch.setattr(sys.modules["vllm_gr.plugin"], "initialize_runtime", initialize)
+        with pytest.raises(ValueError, match="Removed.*config"):
             gr.GRLLM(model="model", **kwargs)
         initialize.assert_not_called()
 
     def test_canonical_config_passed_without_legacy_injection(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         gr = self._import_gr(monkeypatch)
-        config = {"schema_version": 1, "beam": {"execution_mode": "v1"}}
-        llm = gr.GRLLM(model="model", vllm_gr_config=config, async_scheduling=True)
-        assert llm._last_kwargs == {"vllm_gr_config": config, "async_scheduling": True}
-        assert llm._last_kwargs["vllm_gr_config"] is config
+        config = tmp_path / "scenario.yaml"
+        config.write_text("max-model-len: 4096\ngr: {}\n")
+        llm = gr.GRLLM(model="model", config=config, async_scheduling=True)
+        assert llm._last_kwargs["config"] == config
+        assert "max_model_len" not in llm._last_kwargs
+        assert llm._last_kwargs["async_scheduling"] is True
+        assert llm._last_kwargs["_gr_startup_document"]["max-model-len"] == 4096
+        assert "async_scheduling" in llm._last_kwargs["_gr_explicit_native_fields"]
+        assert "max_model_len" not in llm._last_kwargs["_gr_explicit_native_fields"]
         assert not hasattr(llm, "constraint_coordinator")
 
 

@@ -4,6 +4,8 @@
 """Offline vLLM entry point with persistent GR Beam Search V1 execution."""
 
 import gc
+from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, Union, cast, overload
 
 from vllm.entrypoints.generate.beam_search.utils import (
@@ -12,8 +14,7 @@ from vllm.entrypoints.generate.beam_search.utils import (
 from vllm.entrypoints.llm import LLM
 from vllm.inputs import TokensPrompt
 
-from vllm_gr.config import BeamExecutionMode, ConstraintBackend, GRConfig
-from vllm_gr.config.validation import validate_beam_max_width
+from vllm_gr.config import GRConfig
 from vllm_gr.logger import init_logger
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 
@@ -74,21 +75,14 @@ class GRLLM(LLM):
         self,
         model: str = "",
         *,
-        catalog_path: str | None = None,
-        constraint_backend: ConstraintBackend | str | None = None,
-        constrained_generation: bool | None = None,
-        beam_graph_enabled: bool | None = None,
-        beam_max_width: int | None = None,
-        beam_max_decode_steps: int | None = None,
+        config: str | Path | None = None,
+        gr: Mapping[str, Any] | None = None,
         **kwargs,
     ):
-        if catalog_path is not None or constraint_backend is not None:
-            raise ValueError(
-                "Legacy catalog_path/constraint_backend arguments have been removed. "
-                "Use vllm_gr_config with beam.execution_mode='v1' and a canonical "
-                "constraint_table artifact."
-            )
-        beam_max_width = validate_beam_max_width(beam_max_width)
+        removed = {"catalog_path", "constraint_backend", "constrained_generation"} & kwargs.keys()
+        if removed:
+            raise ValueError(f"Removed GR options {sorted(removed)}; use gr or config")
+
         # Apply the vllm-gr ModelRunner policy before LLM.__init__ constructs
         # VllmConfig. This keeps V1 as the default and preserves an explicit
         # V2 opt-in for the adapted beam_search_v1 path.
@@ -117,33 +111,23 @@ class GRLLM(LLM):
         self._shutdown_complete = False
         self._frontend_gc_registered = False
 
-        if constrained_generation is not None:
-            kwargs["constrained_generation"] = constrained_generation
+        kwargs["_gr_mode"] = True
+        kwargs["_gr_explicit_native_fields"] = set(kwargs) | ({"model"} if model else set())
+        if gr is not None:
+            kwargs["gr"] = gr
+        if config is not None:
+            from vllm_gr.config.parser import read_settings
 
-        # Beam-graph settings ride vLLM's native additional_config so they
-        # survive into the spawned engine-core process (same channel as the
-        # serve CLI flags; see vllm_gr/engine/arg_utils_gr.py).
-        beam_updates: dict[str, object] = {}
-        if beam_graph_enabled is not None:
-            beam_updates["vllm_gr_beam_graph_enabled"] = beam_graph_enabled
-        if beam_max_width is not None:
-            beam_updates["vllm_gr_beam_max_width"] = beam_max_width
-        if beam_max_decode_steps is not None:
-            beam_updates["vllm_gr_beam_max_decode_steps"] = beam_max_decode_steps
-        if beam_updates:
-            additional_config = dict(kwargs.pop("additional_config", None) or {})
-            additional_config.update(beam_updates)
-            kwargs["additional_config"] = additional_config
-
-        super().__init__(
-            model=model,
-            **kwargs,
-        )
+            document = read_settings(config)
+            model = model or document.get("model", "")
+            kwargs["config"] = config
+            kwargs["_gr_startup_document"] = document
+        super().__init__(model=model, **kwargs)
 
         _install_renderer_eos_token_id_cache()
 
         resolved_gr = GRConfig.from_vllm_config(getattr(self.llm_engine, "vllm_config", None))
-        if resolved_gr.beam_execution_mode is BeamExecutionMode.V1:
+        if resolved_gr.beam_max_width is not None:
             from vllm_gr.utils.engine_lifecycle import acquire_frontend_startup_heap
 
             try:
@@ -198,12 +182,9 @@ class GRLLM(LLM):
         full prompt-plus-tail tokens or text; callers decode the tail if needed.
         Search, ranking and configured begin/end/stop boundaries are identical.
         """
-        from vllm_gr.config import BeamExecutionMode
-        from vllm_gr.config.execution import require_beam_execution_mode
+        from vllm_gr.config.execution import require_beam_config
 
-        require_beam_execution_mode(
-            getattr(self.llm_engine, "vllm_config", None), BeamExecutionMode.V1
-        )
+        require_beam_config(getattr(self.llm_engine, "vllm_config", None))
         from vllm_gr.entrypoints.beam_search_v1 import run_beam_search_v1
         from vllm_gr.entrypoints.beam_search_v1.protocol import OfflineBeamSearchRequest
 
@@ -233,7 +214,7 @@ class GRLLM(LLM):
         """Reject the retired API instead of inheriting vLLM's implementation."""
         raise NotImplementedError(
             "GRLLM.beam_search() has been removed. Use beam_search_v1() with "
-            "beam.execution_mode='v1' and a canonical constraint artifact. "
+            "gr.beam_width and gr.constraint_table. "
             "Legacy arguments and stopping rules are not translated automatically."
         )
 

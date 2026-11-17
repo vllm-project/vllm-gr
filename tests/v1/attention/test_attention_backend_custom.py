@@ -40,8 +40,15 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
             attention_config.backend = None
 
         config = VllmConfig(attention_config=attention_config)
+        # Model execution is mocked; retain the GR runtime contract on CPU hosts.
+        config.scheduler_config.async_scheduling = True
+        config.scheduler_config.enable_chunked_prefill = False
+        config.scheduler_config.long_prefill_token_threshold = 0
         if marker is not None:
-            config.additional_config["vllm_gr_attention_backend"] = marker
+            config.additional_config["vllm_gr"] = {
+                "gr": {},
+                "attention_backend": marker,
+            }
         return config
 
     @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
@@ -51,44 +58,51 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
 
         from vllm_gr.engine.arg_utils_gr import create_engine_config
 
-        # Simulate: platform reset backend to None inside original create_engine_config
-        fake_config = self._make_fake_config(backend=None)
+        # Ascend clears the native backend during VllmConfig creation.
+        fake_config = self._make_fake_config()
         mock_origin_create.return_value = fake_config
 
         class FakeSelf:
+            _gr_selected = True
             attention_backend = "CUSTOM"
             attention_config = None
 
         result = create_engine_config(FakeSelf())
 
-        assert result.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
+        from vllm_gr.config import GRAttentionBackend, GRConfig
+
+        assert GRConfig.from_vllm_config(result).attention_backend is GRAttentionBackend.CUSTOM
         assert result.attention_config.backend == AttentionBackendEnum.CUSTOM
 
     @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
     def test_attention_config_backend_custom_persists_marker(self, mock_origin_create):
-        """--attention-config backend=CUSTOM sets marker and restores backend."""
+        """Restore the explicit CUSTOM backend after Ascend clears it."""
         from vllm.config import AttentionConfig
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         from vllm_gr.engine.arg_utils_gr import create_engine_config
 
-        fake_config = self._make_fake_config(backend=None)
+        fake_config = self._make_fake_config()
         mock_origin_create.return_value = fake_config
 
         class FakeSelf:
+            _gr_selected = True
             attention_backend = None
             attention_config = AttentionConfig(backend=AttentionBackendEnum.CUSTOM)
 
         result = create_engine_config(FakeSelf())
 
-        assert result.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
+        from vllm_gr.config import GRAttentionBackend, GRConfig
+
+        assert GRConfig.from_vllm_config(result).attention_backend is GRAttentionBackend.CUSTOM
         assert result.attention_config.backend == AttentionBackendEnum.CUSTOM
 
     @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
     def test_non_custom_backend_does_not_set_marker(self, mock_origin_create):
-        """Non-CUSTOM backend leaves additional_config untouched."""
+        """Non-CUSTOM backend leaves the GR attention marker unset."""
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        from vllm_gr.config import GRConfig
         from vllm_gr.engine.arg_utils_gr import create_engine_config
 
         fake_config = self._make_fake_config(backend=AttentionBackendEnum.FLASH_ATTN)
@@ -100,25 +114,8 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
 
         result = create_engine_config(FakeSelf())
 
-        assert "vllm_gr_attention_backend" not in result.additional_config
-        assert result.attention_config.backend is not AttentionBackendEnum.CUSTOM
-
-    @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
-    def test_catalog_path_persists_in_additional_config(self, mock_origin_create):
-        """GR-only model options must not be injected into ModelConfig."""
-        from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-        fake_config = self._make_fake_config()
-        mock_origin_create.return_value = fake_config
-
-        class FakeSelf:
-            attention_backend = None
-            attention_config = None
-            catalog_path = "/tmp/catalog.json"
-
-        result = create_engine_config(FakeSelf())
-
-        assert result.additional_config["vllm_gr_catalog_path"] == "/tmp/catalog.json"
+        assert GRConfig.from_vllm_config(result).attention_backend is None
+        assert result.attention_config.backend is AttentionBackendEnum.FLASH_ATTN
 
 
 class TestCustomBackendMarkerSerialization(unittest.TestCase):
@@ -129,16 +126,19 @@ class TestCustomBackendMarkerSerialization(unittest.TestCase):
         from vllm.config import AttentionConfig, VllmConfig
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        from vllm_gr.config import GRAttentionBackend, GRConfig
+        from vllm_gr.config.parser import parse_gr_config
+
         config = VllmConfig(attention_config=AttentionConfig())
         config.attention_config.backend = AttentionBackendEnum.CUSTOM
-        config.additional_config["vllm_gr_attention_backend"] = "CUSTOM"
+        GRConfig(attention_backend=GRAttentionBackend.CUSTOM).write_to_vllm_config(config)
 
         _pickle = importlib.import_module("pickle")
         serialized = _pickle.dumps(config)
         restored = _pickle.loads(serialized)
 
         assert restored.attention_config.backend == AttentionBackendEnum.CUSTOM
-        assert restored.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
+        assert parse_gr_config(restored).attention_backend is GRAttentionBackend.CUSTOM
 
 
 class TestNpuDefaultBlockSize(unittest.TestCase):

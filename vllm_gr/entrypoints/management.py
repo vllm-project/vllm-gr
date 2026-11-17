@@ -3,7 +3,7 @@
 # mypy: disable-error-code="misc"
 """Hot-update endpoints backed by the authoritative Engine Core.
 
-gRPC only: set VLLM_GR_ADMIN_PORT for a separate loopback HTTP control listener.
+gRPC only: set gr.admin_port for a separate loopback HTTP control listener.
 Sidecar owns update sequencing. Weight loading uses the upstream collective RPC.
 """
 
@@ -140,7 +140,7 @@ class AdminServer:
         import uvicorn
 
         if not 1 <= port <= 65535:
-            raise ValueError("VLLM_GR_ADMIN_PORT must be in [1, 65535]")
+            raise ValueError("gr.admin_port must be in [1, 65535]")
 
         class Server(uvicorn.Server):
             @contextmanager

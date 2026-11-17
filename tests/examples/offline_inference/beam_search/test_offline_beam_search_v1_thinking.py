@@ -258,12 +258,10 @@ def test_thinking_uses_unconstrained_generate_and_exports_utf8_results(
     assert example.run_thinking(args) is None
     assert len(state.engine_calls) == 1
     kwargs = state.engine_calls[0]
-    config = kwargs["vllm_gr_config"]
-    assert config["attention_backend"] == "CUSTOM"
-    assert config["constrained_generation"] is False
-    assert config["constraint_table"]["enabled"] is False
-    assert config["constraint_table"]["max_top_k"] == 1
-    assert "beam" not in config
+    config = kwargs["gr"]
+    assert kwargs["attention_config"] == {"backend": "CUSTOM"}
+    assert config["constraint_mode"] == "none"
+    assert config["beam_width"] is config["candidate_width"] is None
     assert kwargs["enable_prefix_caching"] is False
     assert kwargs["enforce_eager"] is (execution == "eager")
     assert kwargs["max_num_seqs"] == max(4, batch_size)

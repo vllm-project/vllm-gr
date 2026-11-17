@@ -31,17 +31,16 @@ _parametrize = cast(_Parametrize, pytest.mark.parametrize)
 
 def _runner() -> SimpleNamespace:
     config = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "constrained_generation": False,
-        "beam": {
-            "execution_mode": "v1",
+        "gr": {
             "worker_decision": True,
-            "max_width": 4,
+            "beam_width": [4] * 3,
             "max_decode_steps": 3,
             "sid_stage_vocab": True,
+            "constraint_mode": "none",
+            "constraint_table": None,
+            "candidate_width": [4] * 3,
         },
-        "constraint_table": {"enabled": False, "backend": "npu", "max_top_k": 4},
+        "attention-config": {"backend": "CUSTOM"},
     }
     return SimpleNamespace(
         model=torch.nn.Module(),
@@ -144,7 +143,7 @@ def test_generic_unconstrained_load_does_not_initialize_sid_tokenizer(
     import vllm.tokenizers
 
     runner = _runner()
-    runner.vllm_config.additional_config["vllm_gr"]["beam"]["sid_stage_vocab"] = False
+    runner.vllm_config.additional_config["vllm_gr"]["gr"]["sid_stage_vocab"] = False
 
     def forbidden(*args: Any) -> NoReturn:
         raise AssertionError("generic generation must not load SID tokenizer")
@@ -165,7 +164,7 @@ def test_shared_cuda_loader_does_not_create_npu_sid_state(
 
     runner = _runner()
     runner.device = "cuda:0"
-    runner.vllm_config.additional_config["vllm_gr"]["beam"]["sid_stage_vocab"] = False
+    runner.vllm_config.additional_config["vllm_gr"]["gr"]["sid_stage_vocab"] = False
 
     def forbidden(*args: Any) -> NoReturn:
         raise AssertionError("CUDA loading must not initialize NPU SID state")

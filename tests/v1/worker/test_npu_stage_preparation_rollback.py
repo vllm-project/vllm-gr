@@ -323,7 +323,11 @@ def test_retirement_allows_a_fresh_owner_to_start_prefill(
     worker.device = "npu"
     worker.use_async_scheduling = True
     worker.model_config = SimpleNamespace(dtype=torch.float16)
-    worker.vllm_config = SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"})
+    worker.vllm_config = SimpleNamespace(
+        additional_config={
+            "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+        }
+    )
     prefill = _scheduled(prefill=True)
     replacement = stage_module.get_npu_stage_runner(worker, prefill)
     assert replacement is not stage

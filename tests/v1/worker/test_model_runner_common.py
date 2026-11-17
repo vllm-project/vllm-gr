@@ -28,14 +28,12 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     should_raise = False
 
     def execute_model(self: Any, output: Any) -> str:
-        assert self._beam_result_host_ready is False
         assert BEAM_DATA_VAR.get() is self._current_beam_info
         assert self._current_beam_info == {
             "beam_data": output.beam_data,
             "req_ids": [],
         }
-        # The Constraint Tables _sample hook reads the scheduler output to find
-        # _gr_request_row_configs; it must be published for the whole run.
+        # Prefill graph interception needs the current scheduler output.
         assert self._current_scheduler_output is output
         if should_raise:
             raise ExpectedError
@@ -58,12 +56,9 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     finally:
         BEAM_DATA_VAR.reset(token)
 
-    # The beam context deliberately OUTLIVES execute_model: with async
-    # scheduling, sample_tokens (constraint hook + worker beam decision)
-    # runs AFTER execute_model returns and still needs the published
-    # context — including on the exception path (only the ContextVar is
-    # reset in the finally block).
-    assert runner._current_beam_data is scheduler_output.beam_data
+    # Ordinary execution retains its scheduler output, with no stale Beam data,
+    # including after an exception. The outer ContextVar has been restored.
+    assert runner._current_beam_data == {}
     assert runner._current_scheduler_output is scheduler_output
     assert runner._current_beam_info == {
         "beam_data": scheduler_output.beam_data,

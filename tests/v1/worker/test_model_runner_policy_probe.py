@@ -13,18 +13,18 @@ from tests.st.test_modelrunner_v2_stage_parity_st import _SESSIONS
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "runner,sizes,max_seqs,enabled,eager,startup,expected",
+    "runner,sizes,max_seqs,enabled,eager,expected",
     [
-        pytest.param("v2", None, 8, True, False, "4", [1, 2, 4], id="default"),
-        pytest.param("v2", None, 1, True, False, "4", [1], id="single-capacity"),
-        pytest.param("v2", None, 3, True, False, "4", [1, 2], id="bounded-capacity"),
-        pytest.param("v2", [7, 1, 3], 7, True, False, "4", [1, 3, 7], id="custom"),
-        pytest.param("v2", None, 8, False, False, "4", [], id="graph-disabled"),
-        pytest.param("v2", None, 8, True, True, "4", [], id="eager"),
-        pytest.param("v1", [1, 3, 7], 8, True, False, None, [1], id="v1-default"),
-        pytest.param("v1", [1, 3, 7], 8, True, False, "4", [4], id="v1-startup"),
-        pytest.param("v1", None, 8, False, False, "4", [], id="v1-graph-disabled"),
-        pytest.param("v1", None, 8, True, True, "4", [], id="v1-eager"),
+        pytest.param("v2", None, 8, True, False, [1, 2, 4], id="default"),
+        pytest.param("v2", None, 1, True, False, [1], id="single-capacity"),
+        pytest.param("v2", None, 3, True, False, [1, 2], id="bounded-capacity"),
+        pytest.param("v2", [1, 6, 8], 7, True, False, [1, 6], id="custom"),
+        pytest.param("v2", None, 8, False, False, [], id="graph-disabled"),
+        pytest.param("v2", None, 8, True, True, [], id="eager"),
+        pytest.param("v1", [1, 6, 8], 8, True, False, [1, 6, 8], id="v1-default"),
+        pytest.param("v1", [1, 6, 8], 7, True, False, [1, 6], id="v1-startup"),
+        pytest.param("v1", None, 8, False, False, [], id="v1-graph-disabled"),
+        pytest.param("v1", None, 8, True, True, [], id="v1-eager"),
     ],
 )
 def test_probe_separates_capture_policy_from_backend_capacity(
@@ -34,19 +34,18 @@ def test_probe_separates_capture_policy_from_backend_capacity(
     max_seqs: int,
     enabled: bool,
     eager: bool,
-    startup: str | None,
     expected: list[int],
 ) -> None:
-    monkeypatch.delenv("VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE", raising=False)
-    if startup is not None:
-        monkeypatch.setenv("VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE", startup)
-    monkeypatch.setenv("VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS", "1,6,8")
-    beam: dict[str, Any] = {"max_width": 128, "graph_enabled": enabled}
-    if sizes is not None:
-        beam["online_batch_sizes"] = sizes
+    deployment = {"beam_batch_sizes": sizes if sizes is not None else [1, 2, 4]}
+    beam: dict[str, Any] = {
+        "constraint_mode": "none",
+        "beam_width": [128] * 3,
+        "beam_graph_enabled": enabled,
+        "candidate_width": [128] * 3,
+    }
     assert startup_expectations(
         runner=runner,
-        config={"schema_version": 1, "beam": beam, "constraint_table": {"max_top_k": 128}},
+        config={**beam, **deployment},
         max_num_seqs=max_seqs,
         enforce_eager=eager,
     ) == (1024 if runner == "v2" else 128, expected)

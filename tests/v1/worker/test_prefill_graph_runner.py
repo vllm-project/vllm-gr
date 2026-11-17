@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.gr_config import engine_config
 from vllm_gr.v1.worker import prefill_graph_common
 from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 
@@ -16,8 +17,6 @@ from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 def _force_non_npu(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
 
-    # Isolate unit-test bucket grids from deployment BSND capture specs.
-    monkeypatch.delenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", raising=False)
     monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: False)
 
     class MockCUDAProvider:
@@ -27,9 +26,9 @@ def _force_non_npu(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class MockModelRunner:
-    def __init__(self) -> None:
+    def __init__(self, **options: Any) -> None:
         self.device = torch.device("cpu")
-        self.vllm_config: Any = None
+        self.vllm_config: Any = engine_config(**options)
 
 
 def test_match_bucket_standard() -> None:
@@ -59,10 +58,7 @@ def test_match_bucket_dense_default_range() -> None:
 
 
 def test_match_bucket_small_buckets_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_KV_BOUND
-
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_KV_BOUND, "1024")
-    graph_runner = BeamPrefillGraphRunner(MockModelRunner())
+    graph_runner = BeamPrefillGraphRunner(MockModelRunner(prefill_kv_bound=1024))
 
     # With the override set, an exact small bucket serves the cache-hit tails:
     # tail 1 (a separate gemv shape) gets bucket 1, tails 2..16 get bucket 16,
@@ -86,20 +82,16 @@ def test_small_buckets_never_shrink_replay_coverage(
     bound the step grid baked for the same request. That is the regression the
     small buckets introduced when they were added to the default grid.
     """
-    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_common import (
-        ENV_PREFILL_GRAPH_KV_BOUND,
         SMALL_PREFILL_BUCKETS,
     )
 
     # The grid the env leaves untouched, captured with the env unset.
-    monkeypatch.delenv(ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
     default_buckets = list(BeamPrefillGraphRunner(MockModelRunner()).buckets)
 
     # The opt-in grid under the bound the feature requires, compared against
     # the default grid under the *same* environment.
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_KV_BOUND, "1024")
-    opt_in_runner = BeamPrefillGraphRunner(MockModelRunner())
+    opt_in_runner = BeamPrefillGraphRunner(MockModelRunner(prefill_kv_bound=1024))
     assert set(opt_in_runner.buckets) - set(default_buckets) == set(SMALL_PREFILL_BUCKETS)
     assert set(default_buckets) - set(opt_in_runner.buckets) == set()
 
@@ -107,7 +99,7 @@ def test_small_buckets_never_shrink_replay_coverage(
         """KV extent a step landing in ``bucket`` is admitted for."""
         if bucket is None:
             return 0
-        return int(GPUPrefillGraphRunner._kv_capture_bound(bucket))
+        return int(opt_in_runner._kv_capture_bound(bucket))
 
     for total in range(1, max(default_buckets) + 1):
         step_bucket = next((b for b in default_buckets if b >= total), None)
@@ -220,35 +212,11 @@ def test_is_prefill_phase_batch() -> None:
     assert is_prefill_phase_batch(SimpleNamespace(input_batch=None), output) is False
 
 
-def test_is_prefill_graph_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.worker.prefill_graph_common import (
-        PrefillGraphEnv,
-        _read_env_flag,
-    )
-    from vllm_gr.v1.worker.prefill_graph_runner import (
-        ENV_ENABLE_PREFILL_GRAPH,
-        is_prefill_graph_enabled,
-    )
+def test_is_prefill_graph_enabled() -> None:
+    from vllm_gr.v1.worker.prefill_graph_runner import is_prefill_graph_enabled
 
-    # Parse the environment values independently; production caches the result
-    # once when PrefillGraphEnv is initialized.
-    monkeypatch.delenv(ENV_ENABLE_PREFILL_GRAPH, raising=False)
-    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is True
-    assert _read_env_flag("VLLM_GR_OTHER_FLAG", default=False) is False
-
-    monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "0")
-    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is False
-    monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "false")
-    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is False
-    monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "1")
-    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is True
-    monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "true")
-    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is True
-
-    monkeypatch.setattr(PrefillGraphEnv, "enabled", True)
-    assert is_prefill_graph_enabled() is True
-    monkeypatch.setattr(PrefillGraphEnv, "enabled", False)
-    assert is_prefill_graph_enabled() is False
+    assert is_prefill_graph_enabled(MockModelRunner())
+    assert not is_prefill_graph_enabled(MockModelRunner(prefill_graph_enabled=False))
 
 
 def test_npu_gates_allow_prefill_graph(
@@ -262,11 +230,8 @@ def test_npu_gates_allow_prefill_graph(
         is_prefill_phase_batch,
     )
 
-    # NPU prefill graphs follow the process-cached environment flag.
-    monkeypatch.setattr(prefill_graph_common.PrefillGraphEnv, "enabled", True)
-    assert is_prefill_graph_enabled() is True
-    monkeypatch.setattr(prefill_graph_common.PrefillGraphEnv, "enabled", False)
-    assert is_prefill_graph_enabled() is False
+    assert is_prefill_graph_enabled(MockModelRunner())
+    assert not is_prefill_graph_enabled(MockModelRunner(prefill_graph_enabled=False))
 
     # Prefill-phase batches classify as prefill-phase on NPU.
     import numpy as np
@@ -552,151 +517,93 @@ def test_bucket_clamp_to_max_num_batched_tokens() -> None:
     assert graph_runner.buckets == [256, 1024]
 
 
-def test_platform_bucket_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm_gr.v1.worker.prefill_graph_runner import (
+def test_platform_bucket_config() -> None:
+    from vllm_gr.v1.worker.prefill_graph_common import (
         DEFAULT_PREFILL_BUCKETS,
-        ENV_PREFILL_GRAPH_BUCKET_STEP,
-        ENV_PREFILL_GRAPH_KV_BOUND,
-        ENV_PREFILL_GRAPH_MAX_BUCKET,
-        NPU_DEFAULT_PREFILL_BUCKETS,
-        PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
-        PREFILL_GRAPH_MAX_BUCKET_DEFAULT,
         get_default_buckets,
     )
 
-    # Both platforms use the configured dense bucket geometry. The exact small
-    # buckets are opt-in via the KV-bound override, so with the environment
-    # untouched the grid is the plain step range.
-    expected_default_buckets = list(
-        range(
-            PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
-            PREFILL_GRAPH_MAX_BUCKET_DEFAULT + 1,
-            PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
-        )
-    )
     assert get_default_buckets() == DEFAULT_PREFILL_BUCKETS
-    assert get_default_buckets() == expected_default_buckets
-
-    monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: True)
-    assert get_default_buckets() == NPU_DEFAULT_PREFILL_BUCKETS
-    assert get_default_buckets() == expected_default_buckets
-
-    # Opting in adds the small buckets on either platform.
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_KV_BOUND, "1024")
-    assert get_default_buckets() == sorted(
-        set(expected_default_buckets) | set(prefill_graph_common.SMALL_PREFILL_BUCKETS)
-    )
-    monkeypatch.delenv(ENV_PREFILL_GRAPH_KV_BOUND)
-    monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: False)
-
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKET_STEP, "256")
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_MAX_BUCKET, "1024")
-    assert get_default_buckets() == [256, 512, 768, 1024]
-
-    # A deliberately tiny configured maximum still wins over the opt-in.
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_KV_BOUND, "1024")
-    assert get_default_buckets() == [1, 16, 256, 512, 768, 1024]
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_MAX_BUCKET, "8")
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKET_STEP, "8")
-    assert get_default_buckets() == [1, 8]
+    for buckets, bound, expected in (
+        ([256, 512, 768, 1024], None, [256, 512, 768, 1024]),
+        ([256, 512, 768, 1024], 1024, [1, 16, 256, 512, 768, 1024]),
+        ([8], 1024, [1, 8]),
+    ):
+        config = engine_config(prefill_token_buckets=buckets, prefill_kv_bound=bound)
+        assert get_default_buckets(config) == expected
 
 
-def test_prefill_bucket_config_validation(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.worker.prefill_graph_runner import (
-        ENV_PREFILL_GRAPH_BUCKET_STEP,
-        ENV_PREFILL_GRAPH_MAX_BUCKET,
-        get_default_buckets,
-    )
-
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKET_STEP, "0")
-    with pytest.raises(ValueError, match="positive integer"):
-        get_default_buckets()
-
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKET_STEP, "128")
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_MAX_BUCKET, "1000")
-    with pytest.raises(ValueError, match="must be divisible"):
-        get_default_buckets()
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "options,match",
+    [
+        ({"prefill_token_buckets": [0]}, "positive integer"),
+        ({"prefill_token_buckets": []}, "nonempty"),
+        ({"prefill_token_buckets": [256, 1024, 512]}, "strictly increasing"),
+        ({"beam_batch_sizes": [9]}, "1..8"),
+    ],
+)
+def test_prefill_bucket_config_validation(options: Any, match: Any) -> None:
+    with pytest.raises(ValueError, match=match):
+        engine_config(**options)
 
 
-def test_opt_in_graded_b4_prefill_graph_config(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_opt_in_graded_b4_prefill_graph_config() -> None:
     from vllm_gr.v1.worker.prefill_graph_common import (
-        ENV_PREFILL_GRAPH_BUCKETS,
-        ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS,
         get_default_buckets,
         get_prefill_graph_capture_num_reqs,
     )
 
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKETS, "256,512,1024,2048,4096,8192,12288,24576")
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS, "4")
-    assert get_default_buckets() == [256, 512, 1024, 2048, 4096, 8192, 12288, 24576]
-    assert get_prefill_graph_capture_num_reqs() == (4,)
-
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKETS, "256,1024,512")
-    with pytest.raises(ValueError, match="strictly increasing"):
-        get_default_buckets()
-    # All supported sizes can be selected explicitly, not just the defaults.
-    monkeypatch.setenv(
-        ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS,
-        "9",
-    )
-    with pytest.raises(ValueError, match="must contain only"):
-        get_prefill_graph_capture_num_reqs()
+    buckets = [256, 512, 1024, 2048, 4096, 8192, 12288, 24576]
+    config = engine_config(prefill_token_buckets=buckets, beam_batch_sizes=[4])
+    assert get_default_buckets(config) == buckets
+    assert get_prefill_graph_capture_num_reqs(config) == (4,)
 
 
-def test_prefill_capture_policy_and_explicit_wider_sizes(monkeypatch: pytest.MonkeyPatch) -> None:
-    from types import SimpleNamespace
-
+@pytest.mark.parametrize("sizes", [[1, 2, 4], [3, 5, 6, 7, 8]])  # type: ignore[misc]
+def test_prefill_capture_policy_and_explicit_wider_sizes(sizes: Any) -> None:
     from vllm_gr.v1.worker.prefill_graph_common import (
-        ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS,
         get_prefill_graph_capture_num_reqs,
     )
 
-    monkeypatch.delenv(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS, raising=False)
     assert get_prefill_graph_capture_num_reqs() == (1, 2, 4)
-    host = SimpleNamespace(additional_config={"vllm_gr_beam_online_batch_sizes": [1, 3, 7]})
-    assert get_prefill_graph_capture_num_reqs(host) == (1, 3, 7)
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS, "1,2,4")
-    assert get_prefill_graph_capture_num_reqs(host) == (1, 2, 4)
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS, "3,5,6,7,8")
-    assert get_prefill_graph_capture_num_reqs(host) == (3, 5, 6, 7, 8)
+    assert get_prefill_graph_capture_num_reqs(engine_config(beam_batch_sizes=sizes)) == tuple(sizes)
 
 
 def test_custom_b4_bucket_limit_uses_total_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     from types import SimpleNamespace
 
-    from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
-    from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_BUCKETS
 
     runner = MockModelRunner()
-    runner.vllm_config = SimpleNamespace(
-        _vllm_gr_parsed_config=SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1)
-    )
+    from dataclasses import replace
+
+    from tests.helpers.gr_config import make_gr_config
+    from vllm_gr.config.models import DeploymentOptions
+
+    config = make_gr_config(beam_max_width=4)
+    config.write_to_vllm_config(runner.vllm_config)
     setattr(runner, "scheduler_config", SimpleNamespace(max_num_batched_tokens=24))
     setattr(runner, "model_config", SimpleNamespace(max_model_len=8))
 
-    monkeypatch.delenv(ENV_PREFILL_GRAPH_BUCKETS, raising=False)
-    monkeypatch.delenv("VLLM_GR_PREFILL_GRAPH_KV_BOUND", raising=False)
-    assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8]
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKETS, "4,8,12,24")
+    assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8, 12, 24]
+    replace(
+        config, deployment=DeploymentOptions(prefill_token_buckets=(4, 8, 12, 24))
+    ).write_to_vllm_config(runner.vllm_config)
     assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8, 12, 24]
     assert NPUPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8]
 
 
-def test_prefill_capture_without_v1_keeps_b1_when_only_b4_configured() -> None:
-    from vllm_gr.config import BeamExecutionMode
+@pytest.mark.l1  # type: ignore[misc]
+def test_prefill_uses_configured_batch_sizes() -> None:
     from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import (
         _capture_request_counts,
     )
 
-    assert _capture_request_counts((4,), 4, None) == (1,)
-    assert _capture_request_counts((4,), 4, BeamExecutionMode.V1) == (4,)
+    assert _capture_request_counts((4,), 3) == ()
+    assert _capture_request_counts((4,), 4) == (4,)
 
 
 def test_b4_capture_geometry_respects_per_request_model_limit() -> None:
-    from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import (
         _capture_dummy_positions,
         _capture_eligible_request_counts,
@@ -706,7 +613,7 @@ def test_b4_capture_geometry_respects_per_request_model_limit() -> None:
     )
     from vllm_gr.v1.worker.prefill_graph_common import PREFILL_GRAPH_CAPTURE_NUM_REQS
 
-    counts = _capture_request_counts(PREFILL_GRAPH_CAPTURE_NUM_REQS, 4, BeamExecutionMode.V1)
+    counts = _capture_request_counts(PREFILL_GRAPH_CAPTURE_NUM_REQS, 4)
     assert counts == (1, 2, 4)
     assert _capture_eligible_request_counts(32768, counts, 8192, True) == (4,)
     assert _capture_eligible_request_counts(8192, counts, 8192, True) == counts
@@ -953,21 +860,20 @@ def test_gpu_kv_capture_bound_matches_replay_gate(
     not in the grid at all), and the override only ever widens.
     """
     from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
-    from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_KV_BOUND
 
-    monkeypatch.delenv(ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
-    assert GPUPrefillGraphRunner._kv_capture_bound(1) == 2
-    assert GPUPrefillGraphRunner._kv_capture_bound(16) == 32
-    assert GPUPrefillGraphRunner._kv_capture_bound(128) == 256
-    assert GPUPrefillGraphRunner._kv_capture_bound(1024) == 2048
+    graph = GPUPrefillGraphRunner(MockModelRunner(), buckets=[16])
+    assert graph._kv_capture_bound(1) == 2
+    assert graph._kv_capture_bound(16) == 32
+    assert graph._kv_capture_bound(128) == 256
+    assert graph._kv_capture_bound(1024) == 2048
 
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_KV_BOUND, "1024")
+    graph = GPUPrefillGraphRunner(MockModelRunner(prefill_kv_bound=1024), buckets=[16])
     # Small buckets: the override is what makes them usable for cache hits.
-    assert GPUPrefillGraphRunner._kv_capture_bound(1) == 1024
-    assert GPUPrefillGraphRunner._kv_capture_bound(16) == 1024
+    assert graph._kv_capture_bound(1) == 1024
+    assert graph._kv_capture_bound(16) == 1024
     # Buckets whose default already covers their contexts keep it.
-    assert GPUPrefillGraphRunner._kv_capture_bound(1024) == 2048
-    assert GPUPrefillGraphRunner._kv_capture_bound(2048) == 4096
+    assert graph._kv_capture_bound(1024) == 2048
+    assert graph._kv_capture_bound(2048) == 4096
 
 
 def test_gpu_bucket16_gate_uses_capture_bound(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -981,16 +887,14 @@ def test_gpu_bucket16_gate_uses_capture_bound(monkeypatch: pytest.MonkeyPatch) -
     import numpy as np
 
     from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
-    from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_KV_BOUND
 
-    monkeypatch.setenv(ENV_PREFILL_GRAPH_KV_BOUND, "1024")
-    gpu_runner = GPUPrefillGraphRunner(MockModelRunner(), buckets=[16])
+    gpu_runner = GPUPrefillGraphRunner(MockModelRunner(prefill_kv_bound=1024), buckets=[16])
     buf = gpu_runner.buffers[16]
     buf.captured_graphs[1] = SimpleNamespace(replay=lambda: None)
     buf.output_bufs[1] = torch.zeros(16, 8)
     # What capture_graphs records for the gate; must be the same value it bakes
     # into the graph (asserted by the sibling test above).
-    buf.max_seq_len_bounds[1] = GPUPrefillGraphRunner._kv_capture_bound(16)
+    buf.max_seq_len_bounds[1] = gpu_runner._kv_capture_bound(16)
     assert buf.max_seq_len_bounds[1] == 1024
 
     def runner_for(computed: int) -> Any:
@@ -1120,7 +1024,7 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
     )
     graph_runner = GPUPrefillGraphRunner(runner, buckets=[1024, 1152])
     runner._prefill_graph_runner = graph_runner
-    monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda runner=None: True)
     monkeypatch.setattr(patch, "get_prefill_graph_runner", lambda _: graph_runner)
     replays: list[int] = []
 
@@ -1227,13 +1131,12 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.worker import gr_async_output, gr_startup, model_runner_patch
     from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
     from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     stream = SimpleNamespace(wait_stream=lambda _other: None)
-    monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda runner=None: True)
     monkeypatch.setattr(patch.torch.cuda, "Stream", lambda: stream)
     monkeypatch.setattr(patch.torch.cuda, "stream", lambda _side: nullcontext())
     monkeypatch.setattr(patch.torch.accelerator, "current_stream", lambda: stream)
@@ -1255,7 +1158,7 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     events: list[str] = []
 
     class Runner:
-        _vllm_gr_config = SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1)
+        _vllm_gr_config = SimpleNamespace(beam_max_width=128)
 
         def execute_model(self) -> None:
             pass
@@ -1272,7 +1175,6 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     platform = SimpleNamespace(
         discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
         make_patched_prepare_inputs=lambda original: original,
-        make_patched_bookkeeping_sync=lambda original: original,
         capture_prefill_graphs=patch.capture_prefill_graphs,
     )
     monkeypatch.setattr(gr_async_output, "install_async_output_guard", lambda: None)
@@ -1315,13 +1217,9 @@ def test_npu_bsnd_config_defaults_off() -> None:
     assert runner._BSND_CAPTURE_SPECS == ()
 
 
-@pytest.mark.parametrize("specs", ["", "512,4;1024,4"])  # type: ignore[misc]
-def test_bsnd_metadata_resources_are_instance_owned(
-    monkeypatch: pytest.MonkeyPatch, specs: str
-) -> None:
+def test_bsnd_metadata_resources_are_instance_owned() -> None:
     from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
 
-    monkeypatch.setenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", specs)
     tensor = torch.empty(0)
     first = BeamAttentionMetadata(0, 0, tensor, 0, tensor, tensor, tensor)
     second = BeamAttentionMetadata(0, 0, tensor, 0, tensor, tensor, tensor)
@@ -1334,11 +1232,12 @@ def test_bsnd_metadata_resources_are_instance_owned(
 def test_npu_bsnd_config_validates_runner_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
-    monkeypatch.setenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", "1024,4;512,4")
-    runner = NPUPrefillGraphRunner(MockModelRunner(), buckets=[512, 1024])
+    runner = NPUPrefillGraphRunner(
+        MockModelRunner(npu_bsnd_capture_specs="1024,4;512,4"), buckets=[512, 1024]
+    )
     assert runner._BSND_CAPTURE_SPECS == ((512, 4), (1024, 4))
     with pytest.raises(ValueError, match="1024 is not in configured prefill buckets"):
-        NPUPrefillGraphRunner(MockModelRunner(), buckets=[512])
+        NPUPrefillGraphRunner(MockModelRunner(npu_bsnd_capture_specs="1024,4;512,4"), buckets=[512])
 
 
 def test_npu_prefill_capture_skips_native_attention() -> None:
@@ -1409,3 +1308,54 @@ def test_scheduled_requests_are_fresh() -> None:
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_prefill_allocates_only_shapes_in_capture_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr.v1.worker import prefill_graph_common as common
+    from vllm_gr.v1.worker.prefill_capture_plan import plan_prefill_capture
+
+    allocated: list[int] = []
+    monkeypatch.setattr(
+        common, "PrefillBucketBuffers", lambda b, *args, **kwargs: allocated.append(b)
+    )
+    monkeypatch.setattr(common, "_get_block_table_cols", lambda runner: None)
+    monkeypatch.setattr(common, "get_max_context_len", lambda runner: 512)
+    monkeypatch.setattr(common.BasePrefillGraphRunner, "supports_multi_request_total_buckets", True)
+    scheduler = SimpleNamespace(max_num_batched_tokens=8192, max_num_seqs=4)
+    config = SimpleNamespace(
+        additional_config={
+            "vllm_gr": {
+                "gr": {
+                    "beam_width": [8, 4, 2],
+                    "candidate_width": [8, 4, 2],
+                    "max_decode_steps": 5,
+                    "beam_batch_sizes": [1, 2, 4],
+                }
+            }
+        }
+    )
+    config.scheduler_config = scheduler
+    runner = SimpleNamespace(vllm_config=config, scheduler_config=scheduler, device="cpu")
+    graph = common.BasePrefillGraphRunner(runner, list(range(128, 8193, 128)))
+    assert allocated == list(graph.capture_plan) == list(range(128, 2049, 128))
+    assert graph.capture_plan[512] == (1, 2, 4)
+    assert graph.capture_plan[2048] == (4,)
+    limited = plan_prefill_capture(
+        [512, 1024, 2048],
+        [1, 2, 4],
+        max_num_seqs=2,
+        max_num_batched_tokens=8192,
+        max_model_len=512,
+        total_token_buckets=True,
+    )
+    assert limited == {512: (1, 2), 1024: (2,)}
+    per_context = plan_prefill_capture(
+        [512, 1024],
+        [1, 2],
+        max_num_seqs=4,
+        max_num_batched_tokens=8192,
+        max_model_len=512,
+        total_token_buckets=False,
+    )
+    assert per_context == {512: (1, 2)}

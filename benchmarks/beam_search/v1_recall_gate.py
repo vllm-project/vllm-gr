@@ -13,6 +13,7 @@ import platform
 import subprocess
 import tempfile
 import time
+from bisect import bisect_left
 from collections import Counter
 from contextlib import nullcontext
 from importlib.metadata import version
@@ -28,6 +29,52 @@ from benchmarks.beam_search.v1_sid_validation import validate_sid_tokens
 os.environ.setdefault("USE_TF", "0")
 logger = logging.getLogger(__name__)
 TASKS = ("video", "ad", "product", "label_cond", "interactive")
+
+# Preserve the calibrated grid for the summed B=4 tokens, including long prompts.
+RECALL_PREFILL_BUCKETS = (
+    *range(16, 257, 16),
+    *range(320, 1025, 64),
+    *range(1152, 4097, 128),
+    *range(4352, 16385, 256),
+    *range(16896, 32769, 512),
+)
+RECALL_PREFILL_KV_BOUND = 8192
+
+
+def recall_prefill_buckets(token_budget: int) -> list[int]:
+    end = bisect_left(RECALL_PREFILL_BUCKETS, token_budget)
+    if end == len(RECALL_PREFILL_BUCKETS):
+        raise ValueError(f"prefill graph buckets do not cover {token_budget} tokens")
+    return list(RECALL_PREFILL_BUCKETS[: end + 1])
+
+
+def recall_gr_config(
+    *,
+    beam_width: int,
+    batch_size: int,
+    buckets: list[int],
+    artifact: Path,
+    artifact_digest: str,
+    tokenizer_digest: str,
+) -> dict[str, object]:
+    return {
+        "beam_width": [beam_width] * 3,
+        "candidate_width": [beam_width] * 3,
+        "max_decode_steps": 3,
+        "beam_graph_enabled": True,
+        "worker_decision": True,
+        "beam_batch_sizes": [batch_size],
+        "prefill_token_buckets": buckets,
+        "prefill_kv_bound": RECALL_PREFILL_KV_BOUND,
+        "constraint_mode": "table",
+        "constraint_table": {
+            "backend": "cuda",
+            "max_top_k": beam_width,
+            "path": str(artifact.resolve()),
+            "format": "constraint_table_v1",
+            "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
+        },
+    }
 
 
 def sha256_file(path):
@@ -327,16 +374,15 @@ def main():
             prefill_budget,
         )
     max_prefill_budget = max(item["prefill_budget"] for item in prepared)
-    custom_buckets = os.getenv("VLLM_GR_PREFILL_GRAPH_BUCKETS")
-    if custom_buckets:
-        configured = [int(value) for value in custom_buckets.split(",")]
-        used = [bucket for bucket in configured if bucket < max_prefill_budget]
-        covering = next((bucket for bucket in configured if bucket >= max_prefill_budget), None)
-        if covering is None:
-            raise ValueError(f"prefill graph buckets do not cover {max_prefill_budget} tokens")
-        used.append(covering)
-        os.environ["VLLM_GR_PREFILL_GRAPH_BUCKETS"] = ",".join(map(str, used))
-        logger.info("CI prefill graph buckets: %s", used)
+    buckets = recall_prefill_buckets(max_prefill_budget)
+    logger.info("Recall prefill graph buckets: %s", buckets)
+    # Keep report fields and value types compatible with the calibrated baseline.
+    graph_profile = {
+        "prefill_bucket_grid": ",".join(map(str, RECALL_PREFILL_BUCKETS)),
+        "prefill_capture_num_reqs": str(args.batch_size),
+        "prefill_kv_bound": str(RECALL_PREFILL_KV_BOUND),
+        "v1_startup_capture_batch_size": str(args.batch_size),
+    }
     engine_config = {
         "async_scheduling": True,
         "enable_prefix_caching": True,
@@ -394,32 +440,24 @@ def main():
             args.model.resolve(), args.catalog_path.resolve(), artifact
         )
         logger.info("constraint_artifact=%s digest=%s", artifact, artifact_digest)
-        config = {
-            "schema_version": 1,
-            "attention_backend": "CUSTOM",
-            "beam": {
-                "execution_mode": "v1",
-                "graph_enabled": True,
-                "worker_decision": True,
-                "max_width": args.n,
-                "max_decode_steps": 3,
-            },
-            "constraint_table": {
-                "enabled": True,
-                "backend": "cuda",
-                "max_top_k": args.n,
-                "path": str(artifact),
-                "format": "constraint_table_v1",
-                "artifact_digest": artifact_digest,
-                "tokenizer_digest": tokenizer_digest,
-            },
-        }
+        config = recall_gr_config(
+            beam_width=args.n,
+            batch_size=args.batch_size,
+            buckets=buckets,
+            artifact=artifact,
+            artifact_digest=artifact_digest,
+            tokenizer_digest=tokenizer_digest,
+        )
         engine_config["gpu_memory_utilization"] = resolve_memory_utilization(
             args.gpu_memory_utilization
         )
         init_start = time.perf_counter()
         with GRLLM(
-            model=str(args.model), trust_remote_code=True, vllm_gr_config=config, **engine_config
+            model=str(args.model),
+            trust_remote_code=True,
+            attention_config={"backend": "CUSTOM"},
+            gr=config,
+            **engine_config,
         ) as llm:
             logger.info(
                 "Initialized one GRLLM for %s in %.1f s", tasks, time.perf_counter() - init_start
@@ -506,24 +544,10 @@ def main():
                         "python": platform.python_version(),
                     },
                     graph_runtime=graph_runtime,
-                    graph_profile={
-                        # The effective per-group buckets are recorded in graph_runtime.
-                        "prefill_bucket_grid": custom_buckets,
-                        "prefill_capture_num_reqs": os.getenv(
-                            "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS"
-                        ),
-                        "prefill_kv_bound": os.getenv("VLLM_GR_PREFILL_GRAPH_KV_BOUND"),
-                        "v1_startup_capture_batch_size": os.getenv(
-                            "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"
-                        ),
-                    },
-                    prefill_graph_buckets=os.getenv("VLLM_GR_PREFILL_GRAPH_BUCKETS"),
-                    prefill_graph_capture_num_reqs=os.getenv(
-                        "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS"
-                    ),
-                    v1_startup_capture_batch_size=os.getenv(
-                        "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"
-                    ),
+                    graph_profile=graph_profile,
+                    prefill_graph_buckets=",".join(map(str, buckets)),
+                    prefill_graph_capture_num_reqs=graph_profile["prefill_capture_num_reqs"],
+                    v1_startup_capture_batch_size=graph_profile["v1_startup_capture_batch_size"],
                     elapsed_time=elapsed,
                     time_per_sample=elapsed / len(samples),
                     artifact_digest=artifact_digest,
@@ -534,6 +558,9 @@ def main():
                 )
                 output.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n")
                 if diagnostic_samples is not None:
+                    from vllm_gr.config import GRConfig, gr_config_to_mapping
+
+                    resolved = GRConfig.from_vllm_config(llm.llm_engine.vllm_config)
                     diagnostic = {
                         "schema_version": 1,
                         "task": task,
@@ -546,8 +573,8 @@ def main():
                         "tokenizer_digest": tokenizer_digest,
                         "runtime_provenance": metrics["runtime_provenance"],
                         "engine_config": engine_config,
-                        "gr_config": config,
-                        "prefix_environment": prefix_environment(),
+                        "gr_config": gr_config_to_mapping(resolved)["gr"],
+                        "prefix_environment": prefix_environment(resolved.deployment),
                         "graph_runtime": graph_runtime,
                         "samples": diagnostic_samples,
                     }

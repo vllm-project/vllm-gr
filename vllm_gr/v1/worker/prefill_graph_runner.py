@@ -11,13 +11,7 @@ from vllm.platforms import current_platform
 
 from vllm_gr.v1.worker.prefill_graph_common import (
     DEFAULT_PREFILL_BUCKETS,
-    ENV_ENABLE_PREFILL_GRAPH,
-    ENV_PREFILL_GRAPH_BUCKET_STEP,
-    ENV_PREFILL_GRAPH_KV_BOUND,
-    ENV_PREFILL_GRAPH_MAX_BUCKET,
     NPU_DEFAULT_PREFILL_BUCKETS,
-    PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
-    PREFILL_GRAPH_MAX_BUCKET_DEFAULT,
     SUPPORTED_NUM_REQS,
     BasePrefillGraphRunner,
     PrefillBucketBuffers,
@@ -30,13 +24,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "DEFAULT_PREFILL_BUCKETS",
-    "ENV_ENABLE_PREFILL_GRAPH",
-    "ENV_PREFILL_GRAPH_BUCKET_STEP",
-    "ENV_PREFILL_GRAPH_KV_BOUND",
-    "ENV_PREFILL_GRAPH_MAX_BUCKET",
     "NPU_DEFAULT_PREFILL_BUCKETS",
-    "PREFILL_GRAPH_BUCKET_STEP_DEFAULT",
-    "PREFILL_GRAPH_MAX_BUCKET_DEFAULT",
     "SUPPORTED_NUM_REQS",
     "BasePrefillGraphRunner",
     "BeamPrefillGraphRunner",
@@ -81,5 +69,5 @@ def BeamPrefillGraphRunner(
 def get_prefill_graph_runner(runner: Any) -> BasePrefillGraphRunner:
     """Retrieves or lazily initializes the active prefill graph runner on a ModelRunner."""
     if not hasattr(runner, "_prefill_graph_runner"):
-        runner._prefill_graph_runner = BeamPrefillGraphRunner(runner, buckets=get_default_buckets())
+        runner._prefill_graph_runner = BeamPrefillGraphRunner(runner)
     return runner._prefill_graph_runner  # type: ignore[no-any-return]

@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from vllm import envs
 
+from vllm_gr.config.models import DEFAULT_DEPLOYMENT
 from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
 
 
@@ -105,6 +106,10 @@ def build_async(
     max_model_len: int,
     num_heads: int,
     num_kv_heads: int,
+    prefix_policy: str = DEFAULT_DEPLOYMENT.prefix_policy,
+    prefix_min_chain_us: float = DEFAULT_DEPLOYMENT.prefix_min_chain_us,
+    prefix_calibrations: dict | None = None,
+    explicit_fa_version: int | None = None,
 ) -> BeamAttentionMetadata:
     """Build a fresh metadata description over stable device storage each step.
 
@@ -121,18 +126,16 @@ def build_async(
         PrefixShape,
         available_prefix_versions,
         device_fingerprint,
-        explicit_fa_version,
         multi_processor_count,
-        policy_mode,
         prefix_bucket,
         resolve_prefix_plan,
     )
 
     bucket = 0
-    if not envs.VLLM_BATCH_INVARIANT and policy_mode() != "off":
+    if not envs.VLLM_BATCH_INVARIANT and prefix_policy != "off":
         candidate = prefix_bucket(max(layout["prefix_lengths"]), block_size, max_model_len)
         versions = available_prefix_versions(blocks.device.index)
-        explicit = explicit_fa_version()
+        explicit = explicit_fa_version
         plan = None
         if versions:
             plan = resolve_prefix_plan(
@@ -154,6 +157,9 @@ def build_async(
                 supported_versions=versions,
                 sm_count=multi_processor_count(blocks.device.index),
                 explicit_version=explicit,
+                policy=prefix_policy,
+                min_chain_us=prefix_min_chain_us,
+                calibrations=prefix_calibrations,
             )
         if plan is not None and plan.segments > 1:
             pages = (candidate + block_size - 1) // block_size
@@ -162,6 +168,10 @@ def build_async(
                 bucket = candidate
     return BeamAttentionMetadata(
         num_actual_tokens=rows,
+        prefix_policy=prefix_policy,
+        prefix_min_chain_us=prefix_min_chain_us,
+        explicit_fa_version=explicit_fa_version,
+        prefix_calibrations=prefix_calibrations,
         num_reqs=batch,
         max_query_len=width,
         query_start_loc=views["query"],

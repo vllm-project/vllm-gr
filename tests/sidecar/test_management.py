@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
-from vllm_gr.config import BeamExecutionMode
 from vllm_gr.constraints.versioned_table import (
     INITIAL_CONSTRAINT_VERSION,
     VersionedConstraintTable,
@@ -31,7 +30,7 @@ class Core:
     def __init__(self) -> None:
         self.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model="/models/v1"))
         self.vllm_config._vllm_gr_parsed_config = SimpleNamespace(
-            beam_execution_mode=BeamExecutionMode.V1,
+            beam_max_width=128,
             constraint_table=SimpleNamespace(
                 enabled=True, path="/tries/v1/table", backend=SimpleNamespace(value="cuda")
             ),
@@ -121,7 +120,8 @@ def test_failed_native_load_does_not_record_success() -> None:
 @pytest.mark.l1
 def test_trie_has_only_one_worker_reload_operation() -> None:
     core = Core()
-    assert reload_trie(core, "/trie/v2", "v2")["ok"]
+    result = reload_trie(core, "/trie/v2", "v2")
+    assert result["ok"], result
     assert core.calls == [("reload_trie", ("/trie/v2", "v2"))]
     assert not core.paused
     assert service_status(core).trie_path == "/trie/v2"

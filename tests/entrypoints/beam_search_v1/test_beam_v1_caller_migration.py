@@ -68,13 +68,12 @@ def test_accuracy_rejects_mismatched_output_counts() -> None:
 
 
 @pytest.mark.parametrize("eager", [False, True])  # type: ignore[misc]
-def test_accuracy_cli_selects_engine_execution_mode(
+def test_accuracy_cli_configures_beam_capacity(
     monkeypatch: pytest.MonkeyPatch, eager: bool
 ) -> None:
     import transformers
 
     import benchmarks.open_one_rec.one_rec_acc_test as benchmark
-    from vllm_gr.config import BeamExecutionMode
 
     class EngineReached(Exception):
         pass
@@ -86,7 +85,7 @@ def test_accuracy_cli_selects_engine_execution_mode(
 
     monkeypatch.setattr(
         "vllm_gr.config.parser.load_gr_config",
-        lambda _: SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1, beam_max_width=128),
+        lambda _: SimpleNamespace(beam_max_width=128),
     )
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **kw: object())
     monkeypatch.setattr(
@@ -100,7 +99,7 @@ def test_accuracy_cli_selects_engine_execution_mode(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["accuracy", "--task-type", "video", "--vllm-gr-config", "config.json"]
+        ["accuracy", "--task-type", "video", "--config", "config.json"]
         + (["--enforce-eager"] if eager else []),
     )
     with pytest.raises(EngineReached):
@@ -202,14 +201,14 @@ def test_benchmark_keeps_artifact_until_engine_shutdown(monkeypatch: Any) -> Non
 
     class Engine:
         def __init__(self, **kwargs: Any) -> None:
-            config = kwargs["vllm_gr_config"]
-            assert config["beam"]["execution_mode"] == "v1"
-            assert config["beam"]["max_width"] == 128
-            assert config["beam"]["max_decode_steps"] == 3
-            assert config["constraint_table"]["artifact_digest"] == "artifact-digest"
+            config = kwargs["gr"]
+            assert "execution_mode" not in config
+            assert config["beam_width"] == [128, 128, 128]
+            assert config["max_decode_steps"] == 3
+            assert config["constraint_table"]["digests"]["artifact"] == "artifact-digest"
             assert kwargs["async_scheduling"] is True
-            assert kwargs["enable_chunked_prefill"] is False
-            assert kwargs["enable_prefix_caching"] is True
+            assert "enable_chunked_prefill" not in kwargs
+            assert "enable_prefix_caching" not in kwargs
             assert artifacts[-1].exists()
 
         def __enter__(self) -> Self:
@@ -259,7 +258,7 @@ def test_onerec_benchmark_closes_engine_before_deleting_artifact(
 
     class Engine:
         def __init__(self, **kwargs: Any) -> None:
-            path = Path(kwargs["vllm_gr_config"]["constraint_table"]["path"])
+            path = Path(kwargs["gr"]["constraint_table"]["path"])
             assert path == artifacts[0] and path.is_file()
 
         def __enter__(self) -> Self:

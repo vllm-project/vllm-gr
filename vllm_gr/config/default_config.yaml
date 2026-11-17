@@ -1,0 +1,103 @@
+# vllm-gr startup configuration. Common, GPU, and NPU options share the gr namespace.
+# Precedence: common defaults < imported YAML < scenario YAML < explicit startup arguments.
+# Nested mappings merge; lists replace the inherited list in full.
+# Python: GRLLM(model=model, gr={"beam_width": [8, 8, 4], "candidate_width": [8, 4, 2]})
+# CLI: vllm serve /models/my-model --gr --gr.beam_batch_sizes '[1, 4]'
+# A scenario YAML can inherit another file with one line: import: ./base.yaml
+
+# Native vLLM options
+max-model-len: 8192                        # Maximum tokens per sequence, including input and output.
+max-num-batched-tokens: 8192               # Total token budget across requests in one scheduler iteration.
+max-logprobs: 128                          # Must cover the largest per-parent candidate_width.
+enable-chunked-prefill: false              # Beam processes the complete prompt in one Prefill step.
+enable-prefix-caching: true                # Reuse KV cache for shared prompt prefixes.
+async-scheduling: true                     # The scheduler advances GR Beam generation asynchronously.
+
+gr:
+  # Common: Beam search
+  beam_width: [128, 128, 128]              # Retained beams per step, each in 1..1024; capacity is max(list).
+                                           # Three entries mean three steps. [128, 64, 32] returns 32 by default.
+  candidate_width: [128, 128, 128]         # Candidates per parent per step, each in 1..1024; same length as beam_width.
+                                           # The first entries must match: the first step has only one parent.
+                                           # CUDA supports independent lists, e.g. W=[128,64,32], K=[128,8,4].
+                                           # NPU unconstrained requires candidate_width equal to beam_width.
+                                           # NPU table mode also supports independent per-step candidate widths.
+  max_decode_steps: 3                      # Maximum supported steps; positive and at least len(beam_width).
+                                           # NPU unconstrained fixed-width generation: at most 6 steps; default remains 3.
+                                           # Steps 4..6 also require the model's KV reorder buffer to fit; checked at startup.
+                                           # Dynamic width schedules: at most 3 steps. Table/SID paths: at most 3 steps.
+                                           # CUDA unconstrained fixed-width generation has no separate 6-step ceiling.
+  worker_decision: null                    # true: worker selects beams; false: disable; null: choose by platform.
+  result_width: null                       # Returned sequences; 1..last beam_width; null: use the last beam_width.
+  constraint_mode: none                    # none: unconstrained; table: use a table built for the inference model.
+  constraint_table: null                   # Required in table mode. Paths resolve relative to the declaring YAML.
+
+  # Build a table from the repository root; replace --model with the inference model directory.
+  # The example contains OneRec video SID triples; replace --triples for other applications.
+  # python tools/build_constraint_table.py \
+  #   --model /absolute/path/to/OneRec-1.7B \
+  #   --triples tools/AB_Tests/constraints/video_constraint_triples.json \
+  #   --output "$PWD/video_constraint_table.safetensors"
+  # Remote model IDs require --revision; custom model code requires --trust-remote-code.
+  # To enable, set constraint_mode: table and replace constraint_table: null with this mapping.
+  # constraint_table:                       # Deployment-specific artifact metadata.
+  #   path: /absolute/path/to/video_constraint_table.safetensors  # The actual --output path.
+  #   backend: auto                         # auto, cpu, cuda, or npu.
+  #   format: constraint_table_v1           # constraint_table_v1: single table; constraint_table_v2: multiple tries.
+  #   max_top_k: 128                        # Per-parent candidate capacity; current CUDA/NPU table operators cap this at 256.
+  #   digests:                              # sha256: followed by 64 lowercase hexadecimal characters.
+  #     artifact: "sha256:<artifact-digest>" # Use artifact_digest printed by the builder, including sha256:.
+  #     tokenizer: "sha256:<tokenizer-digest>" # Use tokenizer_digest printed by the builder, including sha256:.
+
+  # Common: scheduling and graph capture
+  beam_batch_sizes: [1, 2, 4]              # Shared policy: HTTP atomic Beam batches and CUDA V1/V2 Prefill/Decode capture.
+                                           # Strictly increasing integers in 1..8; maximum atomic Beam batch is 8.
+                                           # Defaults enable 1, 2, 4; add 8 explicitly to enable that HTTP batch size.
+                                           # Requests are not combined into batches.
+                                           # Removing B also routes B-prompt HTTP completions to the original handler.
+  beam_graph_enabled: true                 # Allow Beam Decode graph replay.
+  prefill_graph_enabled: true              # Allow Prefill graph capture and replay.
+  dense_prefill: "off"                      # CUDA fresh-prompt Prefill: off, fa2 or cudnn.
+  prefill_token_buckets: [                 # Buckets T for total input tokens across requests; strictly increasing.
+    128, 256, 384, 512, 640, 768, 896, 1024,
+    1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048,
+    2176, 2304, 2432, 2560, 2688, 2816, 2944, 3072,
+    3200, 3328, 3456, 3584, 3712, 3840, 3968, 4096,
+    4224, 4352, 4480, 4608, 4736, 4864, 4992, 5120,
+    5248, 5376, 5504, 5632, 5760, 5888, 6016, 6144,
+    6272, 6400, 6528, 6656, 6784, 6912, 7040, 7168,
+    7296, 7424, 7552, 7680, 7808, 7936, 8064, 8192
+  ]                                        # Replace the whole list. null: native V2 buckets or the V1 default range.
+  prefill_kv_bound: null                   # Positive lower bound for captured Attention KV length; null: infer from buckets.
+                                           # An explicit bound also adds short buckets 1 and 16, up to the largest bucket.
+  enable_short_suffix_attention: true      # Allow short-suffix Attention optimization for Beam.
+  trie_retention_seconds: 60               # Retain old tries for this many seconds after hot update; nonnegative.
+  admin_host: 127.0.0.1                    # Bind address for the gRPC management service.
+  admin_port: null                         # null: disable the management service; otherwise a port in 1..65535.
+
+  # GPU: CUDA graphs and vocabulary projection
+  adapter_cache_enabled: false             # Cache execution adapters by B; V1 retains buffers for multiple captured B values.
+  prefill_flash_attn_version: auto         # auto: upgrade eligible FA2 to FA3; 2 or 3: explicit version; null: follow Decode.
+  unconstrained_head_layout: transposed    # Cache a transposed LM head using extra weight memory; null: original layout.
+                                           # Unconstrained, unquantized FP16/BF16 Qwen3 only; TP=PP=1 and no LoRA.
+  head_slice: auto                         # auto: choose by row count; 0: disable; positive: vocabulary columns per slice.
+                                           # Explicit slice sizes must align to the kernel granularity.
+  head_slice_min_rows: 1024                # Minimum logits rows for automatic slicing; nonnegative.
+  head_slice_max_mb: 128                   # Temporary logits budget per slice in MiB; 0: disable budget-based shrinking.
+  topk_keep: 8                             # Local candidates per vocabulary block in CUDA unconstrained Top-K; 1..256.
+                                           # Smaller values reduce merging; exact repair preserves the requested result count.
+  topk_select: i64                         # i64: full 64-bit sort keys; i32: short-key preselection with exact boundary repair.
+  prefix_policy: "off"                      # auto: select shared-prefix segments using calibration and shape; off: disable.
+  prefix_min_chain_us: 150.0                 # Minimum predicted unsplit prefix latency for segmentation, in microseconds.
+  prefix_calibration: true                 # Reuse calibration cache or measure and save on a miss; false: skip calibration.
+  prefix_calibration_path: null            # Custom YAML cache path. Default: $XDG_CACHE_HOME/vllm_gr/prefix_calibration.yaml,
+                                           # or ~/.cache/vllm_gr/prefix_calibration.yaml if XDG_CACHE_HOME is unset.
+
+  # NPU: Ascend graphs and execution backend
+  sid_stage_vocab: false                   # Stage-specific SID vocabulary without tables; worker decision and at most 3 steps.
+  decode_graph_batch_size: 1               # Exact Decode request count, 1..128, also bounded by platform capacity.
+  decode_graph_widths: null                # Extra Decode widths to warm up; null: engine width only; at most 8 widths in total.
+  npu_bsnd_capture_specs: ""               # Empty: TND only. Example "256,2;512,4": total tokens and request count per shape.
+                                           # B must be 1, 2, or 4; T must be a token bucket divisible by B.
+  npu_decode_execution: null               # null: xllm when xllm-ops is available, else cascade; explicit xllm/cascade allowed.
+  npu_stage_lm_head: true                  # Allow stage-specific SID LM heads on NPU.

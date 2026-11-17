@@ -16,11 +16,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc
 
+from tests.helpers.gr_config import make_gr_config
 from vllm_gr.config import (
-    BeamExecutionMode,
     ConstraintTableBackendEnum,
-    ConstraintTableConfig,
-    GRConfig,
+    ConstraintTableSpec,
     write_canonical_gr_config,
 )
 from vllm_gr.v1.beam.batch_contracts import (
@@ -66,7 +65,7 @@ def _config(
         scheduler_config=SimpleNamespace(async_scheduling=True),
         use_v2_model_runner=False,
     )
-    table = ConstraintTableConfig(
+    table = ConstraintTableSpec(
         max_top_k=capacity,
         candidate_width=configured_width,
         backend=ConstraintTableBackendEnum(device),
@@ -77,8 +76,7 @@ def _config(
     )
     write_canonical_gr_config(
         config,
-        GRConfig(
-            beam_execution_mode=BeamExecutionMode.V1,
+        make_gr_config(
             beam_max_width=4,
             beam_max_decode_steps=3,
             beam_worker_decision=True,

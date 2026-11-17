@@ -306,25 +306,15 @@ def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() 
         validate_beam_batch_request(_request(output_options=_options(num_return_sequences=3)))
 
 
-def test_request_beam_width_above_the_candidate_ceiling_requires_an_explicit_k() -> None:
-    """A wide Beam needs an explicit K, because K follows W when unset.
+def test_unconstrained_request_accepts_wide_beam_and_candidates() -> None:
+    """Wide unconstrained requests accept both implicit and explicit K."""
+    for width in (257, 512, MAX_BEAM_WIDTH):
+        for candidate_width in (None, width):
+            validate_beam_batch_request(
+                _request(beam_params=_params(beam_width=width, candidate_width=candidate_width))
+            )
 
-    ``MAX_BEAM_WIDTH`` (1024) is higher than ``MAX_CANDIDATE_WIDTH`` (256).  An
-    unset K implies the candidate count at the Beam width, which the operators
-    cannot take, so the request is rejected here rather than at the first
-    workspace lookup.  Stating K independently makes the wide Beam valid.
-    """
-    assert MAX_BEAM_WIDTH > MAX_CANDIDATE_WIDTH
-
-    validate_beam_batch_request(_request(beam_params=_params(beam_width=MAX_CANDIDATE_WIDTH)))
-    with pytest.raises(BeamContractError, match="candidate_width is unset"):
-        validate_beam_batch_request(
-            _request(beam_params=_params(beam_width=MAX_CANDIDATE_WIDTH + 1))
-        )
-    with pytest.raises(BeamContractError, match="candidate_width is unset"):
-        validate_beam_batch_request(_request(beam_params=_params(beam_width=512)))
-
-    # Stating K lifts the restriction: a wide Beam with a legal K is admitted.
+    # Independent K remains supported.
     validate_beam_batch_request(
         _request(
             beam_params=_params(beam_width=512, candidate_width=MAX_CANDIDATE_WIDTH),
@@ -346,7 +336,7 @@ def test_explicit_candidate_width_may_differ_from_the_beam_width() -> None:
     # K still has its own operator ceiling.
     with pytest.raises(BeamContractError, match="candidate_width must be <="):
         validate_beam_batch_request(
-            _request(beam_params=_params(beam_width=512, candidate_width=1024))
+            _request(beam_params=_params(beam_width=512, candidate_width=MAX_CANDIDATE_WIDTH + 1))
         )
 
 

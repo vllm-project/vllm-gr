@@ -44,17 +44,11 @@ def dispatch_main() -> None:
 
 
 def _add_mode_option(parser: argparse.ArgumentParser) -> None:
-    # The public configuration resolver uses dest="gr" for its JSON mapping.
-    # Keep that action and its conversion/defaults, giving it an unambiguous
-    # spelling when the standalone --gr token selects the command mode.
-    action = parser._option_string_actions.pop("--gr", None)
-    if action is not None:
-        action.option_strings = [
-            "--gr-config" if name == "--gr" else name for name in action.option_strings
-        ]
-        parser._option_string_actions["--gr-config"] = action
+    from vllm_gr.config.parser import common_engine_defaults
+
+    parser.set_defaults(**common_engine_defaults())
     parser.add_argument(
-        "--gr", action="store_true", dest="_gr_mode", help="Use the vLLM-GR command."
+        "--gr", action="store_true", dest="_gr_mode", default=True, help="Use the vLLM-GR command."
     )
 
 

@@ -111,6 +111,11 @@ def parse_args(*, quickstart: bool = False) -> argparse.Namespace:
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument(
+        "--no-prefill-graph",
+        action="store_true",
+        help="Disable GR Prefill graph capture and replay",
+    )
     parser.add_argument("--print-beams", type=int, default=5)
     parser.add_argument("--repeat", type=int, help="Benchmark this many batches without a profiler")
     parser.add_argument(
@@ -612,10 +617,9 @@ def run_thinking(args: argparse.Namespace) -> None:
     params = SamplingParams(**sampling)
     prompts = [tokens_input(list(prompt_ids)) for _ in range(args.batch_size)]
     config = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "constrained_generation": False,
-        "constraint_table": {"enabled": False, "backend": args.constraint_backend, "max_top_k": 1},
+        "beam_width": None,
+        "candidate_width": None,
+        "constraint_mode": "none",
     }
     device_kwargs = {"block_size": 128} if args.constraint_backend == "npu" else {}
     print(
@@ -626,7 +630,8 @@ def run_thinking(args: argparse.Namespace) -> None:
         model=str(args.model.resolve()),
         trust_remote_code=True,
         seed=args.seed,
-        vllm_gr_config=config,
+        gr=config,
+        attention_config={"backend": "CUSTOM"},
         enable_prefix_caching=False,
         enable_chunked_prefill=False,
         max_model_len=args.max_model_len,
@@ -766,46 +771,41 @@ def run(args: argparse.Namespace, artifact_path: Path | None = None) -> None:
     else:
         prefill_capacity = args.batch_size * (args.input_len + 1)
 
-    table_config: dict[str, Any] = {
-        "enabled": args.catalog is not None,
-        "backend": args.constraint_backend,
-        "max_top_k": candidate_width,
-    }
+    candidate_widths = [args.beam_width] + [candidate_width] * (args.generated_steps - 1)
+    max_candidates = max(candidate_widths)
+    table_config = None
     if args.catalog is not None:
         if artifact_path is None:
             raise ValueError("artifact_path is required with --catalog")
         artifact_digest, tokenizer_digest = build_artifact(
             args.model.resolve(), args.catalog.resolve(), artifact_path
         )
-        table_config.update(
-            path=str(artifact_path),
-            format="constraint_table_v1",
-            artifact_digest=artifact_digest,
-            tokenizer_digest=tokenizer_digest,
-        )
+        table_config = {
+            "path": str(artifact_path.resolve()),
+            "format": "constraint_table_v1",
+            "backend": args.constraint_backend,
+            "max_top_k": max_candidates,
+            "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
+        }
     beam_config: dict[str, object] = {
-        "execution_mode": "v1",
-        "graph_enabled": not is_npu or args.execution == "graph",
-        "graph_batch_size": args.batch_size,
+        "beam_graph_enabled": not is_npu or args.execution == "graph",
         "worker_decision": True,
-        "max_width": args.beam_width,
+        "beam_width": [args.beam_width] * args.generated_steps,
+        "candidate_width": candidate_widths,
         "max_decode_steps": args.generated_steps,
-    }
-    vllm_gr_config: dict[str, Any] = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": beam_config,
+        "constraint_mode": "table" if table_config is not None else "none",
         "constraint_table": table_config,
     }
-    if args.catalog is None:
-        vllm_gr_config["constrained_generation"] = False
+    if getattr(args, "no_prefill_graph", False):
+        beam_config["prefill_graph_enabled"] = False
     dynamic_widths = getattr(args, "dynamic_beam_widths", None)
     result_width = getattr(args, "result_width", None)
-    if dynamic_widths is not None and len(dynamic_widths) > 1:
-        beam_config["graph_widths"] = sorted(set(dynamic_widths[:-1]))
-    if args.candidate_width is not None:
-        # Omitted means K == beam_width; state it explicitly when decoupled.
-        table_config["candidate_width"] = args.candidate_width
+    if is_npu:
+        beam_config["decode_graph_batch_size"] = args.batch_size
+        if dynamic_widths is not None and len(dynamic_widths) > 1:
+            beam_config["decode_graph_widths"] = sorted(set(dynamic_widths[:-1]))
+    else:
+        beam_config["beam_batch_sizes"] = sorted({1, args.batch_size})
     params = BeamSearchParams(
         beam_width=args.beam_width,
         dynamic_beam_widths=dynamic_widths,
@@ -823,7 +823,8 @@ def run(args: argparse.Namespace, artifact_path: Path | None = None) -> None:
     with GRLLM(
         model=str(args.model.resolve()),
         trust_remote_code=True,
-        vllm_gr_config=vllm_gr_config,
+        gr=beam_config,
+        attention_config={"backend": "CUSTOM"},
         async_scheduling=True,
         enable_prefix_caching=True,
         enable_chunked_prefill=False,
@@ -832,7 +833,7 @@ def run(args: argparse.Namespace, artifact_path: Path | None = None) -> None:
         # B-wide Prefill schedules B * (input_len + 1) tokens, not B * input_len.
         max_num_batched_tokens=max(args.max_model_len, prefill_capacity),
         max_num_seqs=max(args.beam_width, args.batch_size),
-        max_logprobs=candidate_width,
+        max_logprobs=max_candidates,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=is_npu and args.execution == "eager",
         **profiler_engine_kwargs(args),

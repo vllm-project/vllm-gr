@@ -79,23 +79,23 @@ def _worker() -> Any:
         vllm_config=SimpleNamespace(
             additional_config={
                 "vllm_gr": {
-                    "schema_version": 1,
-                    "beam": {
-                        "execution_mode": "v1",
-                        "graph_enabled": False,
-                        "max_width": 4,
+                    "gr": {
+                        "beam_graph_enabled": False,
+                        "beam_width": [4, 4, 4],
+                        "candidate_width": [4, 4, 4],
                         "max_decode_steps": 3,
+                        "constraint_mode": "table",
+                        "constraint_table": {
+                            "backend": "npu",
+                            "path": "/tmp/independent-k.safetensors",
+                            "format": "constraint_table_v1",
+                            "digests": {
+                                "artifact": "sha256:" + "a" * 64,
+                                "tokenizer": "sha256:" + "b" * 64,
+                            },
+                            "max_top_k": 8,
+                        },
                     },
-                    "constraint_table": {
-                        "enabled": True,
-                        "backend": "npu",
-                        "path": "/tmp/independent-k.safetensors",
-                        "format": "constraint_table_v1",
-                        "artifact_digest": "sha256:" + "a" * 64,
-                        "tokenizer_digest": "sha256:" + "b" * 64,
-                        "max_top_k": 8,
-                    },
-                    "attention_backend": None,
                 }
             }
         )

@@ -57,26 +57,6 @@ if [[ -n "${V1_RECALL_BASELINE_FILE:-}" && "$repeat_count" -eq 2 ]]; then
   echo "A configured Recall gate requires one screening run or at least three runs" >&2
   exit 1
 fi
-# These overrides are exclusive to this accuracy gate. The runtime defaults
-# remain unchanged for serving and other benchmarks. The graded buckets cover
-# the summed B=4 prefill token count, including long interactive prompts.
-# 132 total-token buckets: increasingly wider steps for longer B=4 inputs.
-VLLM_GR_PREFILL_GRAPH_BUCKETS="$(python - <<'PY'
-buckets = (
-    list(range(16, 257, 16))
-    + list(range(320, 1025, 64))
-    + list(range(1152, 4097, 128))
-    + list(range(4352, 16385, 256))
-    + list(range(16896, 32769, 512))
-)
-print(",".join(map(str, buckets)))
-PY
-)"
-export VLLM_GR_PREFILL_GRAPH_BUCKETS
-export VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS=4
-export VLLM_GR_PREFILL_GRAPH_KV_BOUND=8192
-export VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE=4
-
 run_group() {
   local run_dir="$1"
   local group="$2"

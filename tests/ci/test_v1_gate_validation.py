@@ -14,8 +14,15 @@ from benchmarks.beam_search.v1_recall_diagnostics import (
     prefix_environment,
     token_digest,
 )
-from benchmarks.beam_search.v1_recall_gate import graph_delta, infer_batch
+from benchmarks.beam_search.v1_recall_gate import (
+    RECALL_PREFILL_BUCKETS,
+    graph_delta,
+    infer_batch,
+    recall_gr_config,
+    recall_prefill_buckets,
+)
 from benchmarks.open_one_rec.tools.convert_catalog import process_json
+from tests.helpers.paths import REPO_ROOT
 
 VALID = ["<|sid_begin|>", "<s_a_1>", "<s_b_2>", "<s_c_3>", "<|sid_end|>"]
 
@@ -83,8 +90,10 @@ def test_recall_diagnostics_record_scores_without_changing_predictions() -> None
 
 @pytest.mark.l1  # type: ignore[misc]
 def test_recall_diagnostics_hash_snapshot_and_calibration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
+    from vllm_gr.config.models import DeploymentOptions
+
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     (tmp_path / "model.safetensors").write_bytes(b"weights")
     before = model_file_manifest(tmp_path)
@@ -93,10 +102,10 @@ def test_recall_diagnostics_hash_snapshot_and_calibration(
     assert before["config.json"] == after["config.json"]
     assert before["model.safetensors"]["sha256"] != after["model.safetensors"]["sha256"]
     calibration = tmp_path / "prefix.yaml"
-    monkeypatch.setenv("VLLM_GR_PREFIX_CALIBRATION_PATH", str(calibration))
-    assert prefix_environment()["prefix_calibration_file_sha256_at_observation"] is None
+    settings = DeploymentOptions(prefix_calibration_path=str(calibration))
+    assert prefix_environment(settings)["prefix_calibration_file_sha256_at_observation"] is None
     calibration.write_text("calibration", encoding="utf-8")
-    assert prefix_environment()["prefix_calibration_file_sha256_at_observation"] is not None
+    assert prefix_environment(settings)["prefix_calibration_file_sha256_at_observation"] is not None
 
 
 @pytest.mark.l1  # type: ignore[misc]
@@ -139,6 +148,49 @@ def test_recall_graph_gate_requires_every_b4_batch_to_replay() -> None:
     after[0]["gr_prefill_dispatches"] = {"replay:4": 1, "fallback:4:no_graph": 1}
     with pytest.raises(RuntimeError, match="expected 2 replays"):
         graph_delta(before, after, 2)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_recall_gr_config_preserves_calibrated_b4_capture(tmp_path: Path) -> None:
+    from vllm_gr.config import gr_config_from_mapping
+    from vllm_gr.v1.worker.prefill_capture_plan import plan_prefill_capture
+    from vllm_gr.v1.worker.prefill_graph_common import (
+        get_default_buckets,
+        get_prefill_graph_capture_num_reqs,
+    )
+
+    baseline_path = REPO_ROOT / "benchmarks/beam_search/v1_recall_b4_baseline.json"
+    profile = json.loads(baseline_path.read_text(encoding="utf-8"))["graph_profile"]
+    assert ",".join(map(str, RECALL_PREFILL_BUCKETS)) == profile["prefill_bucket_grid"]
+    token_budget = 22808
+    buckets = recall_prefill_buckets(token_budget)
+    assert buckets[-2:] == [22528, 23040]
+    artifact = tmp_path / "catalog.safetensors"
+    options = recall_gr_config(
+        beam_width=128,
+        batch_size=4,
+        buckets=buckets,
+        artifact=artifact,
+        artifact_digest="sha256:" + "a" * 64,
+        tokenizer_digest="sha256:" + "b" * 64,
+    )
+    config = gr_config_from_mapping({"gr": options, "attention-config": {"backend": "CUSTOM"}})
+    assert config.deployment.candidate_width == config.deployment.beam_width == (128, 128, 128)
+    assert str(config.deployment.prefill_kv_bound) == profile["prefill_kv_bound"]
+    assert config.constraint_table is not None
+    assert config.constraint_table.path == str(artifact)
+    assert config.constraint_table.max_top_k == 128
+    host = SimpleNamespace(additional_config={"vllm_gr": {"gr": options}})
+    captures = plan_prefill_capture(
+        get_default_buckets(host),
+        get_prefill_graph_capture_num_reqs(host),
+        max_num_seqs=128,
+        max_num_batched_tokens=token_budget,
+        max_model_len=8192,
+        total_token_buckets=True,
+    )
+    assert captures[token_budget] == (4,)
+    assert set(captures.values()) == {(4,)}
 
 
 pytestmark = pytest.mark.cpu_test

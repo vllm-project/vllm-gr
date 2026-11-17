@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -12,7 +11,6 @@ from vllm.logger import init_logger
 
 from vllm_gr.utils.npu_adapter import is_npu_available
 from vllm_gr.v1.worker.prefill_graph_common import (
-    ENV_ENABLE_PREFILL_GRAPH,
     SUPPORTED_NUM_REQS,
     BasePrefillGraphRunner,
     PrefillBucketBuffers,
@@ -114,7 +112,8 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         self.entries: dict[int, Any] = {}
         # Opt-in configuration is read once per runner; empty means TND only.
         self._BSND_CAPTURE_SPECS = parse_bsnd_capture_specs(
-            os.getenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", ""), self.buckets
+            self.gr_settings.npu_bsnd_capture_specs,
+            self.buckets,
         )
         self.bsnd_entries: dict[tuple[int, int], Any] = {}
         self._replays_by_bucket: dict[int, int] = {}
@@ -332,10 +331,9 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         A single graph per bucket covers all supported batch sizes because
         the task-group update rewrites the per-request host lists at replay.
         """
-        if not is_prefill_graph_enabled():
+        if not is_prefill_graph_enabled(runner):
             logger.info(
-                "Prefill NPU Graph capture is disabled via environment variable (%s=0).",
-                ENV_ENABLE_PREFILL_GRAPH,
+                "Prefill NPU Graph capture is disabled by gr.prefill_graph_enabled.",
             )
             return
 
@@ -662,7 +660,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         shape-bound, so replay needs no per-layer host update.
         """
         # No allocation/capture when disabled; resources are graph-owned.
-        if not self._BSND_CAPTURE_SPECS or not is_prefill_graph_enabled():
+        if not self._BSND_CAPTURE_SPECS or not is_prefill_graph_enabled(runner):
             return
         if not is_npu_available():
             logger.info("NPU not available; skipping BSND prefill graph capture.")

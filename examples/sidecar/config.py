@@ -3,7 +3,7 @@
 """Composition example for servers implementing the sidecar control contract.
 
 Run: python -m vllm_gr.sidecar --config examples/sidecar/config.py
-gRPC servers: set VLLM_GR_ADMIN_PORT to the configured control port.
+gRPC servers: set gr.admin_port to the configured control port.
 Hot updates are not exposed by the HTTP inference server.
 Online Trie switching currently requires CUDA asynchronous beam_search_v1.
 Checkpoint history defaults to two local copies, oldest downloads removed first.

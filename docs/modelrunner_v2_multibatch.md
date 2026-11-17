@@ -232,7 +232,7 @@ Set `beam.adapter_cache_enabled: true` in the canonical service configuration
 to opt into cross-batch adapter caching. It defaults to false, preserving the
 previous latest-adapter reuse and lazy capture policy. Disabling this cache
 does not disable Decode CUDA Graphs or same-batch adapter reuse. The legacy
-configuration key is `vllm_gr_beam_adapter_cache_enabled`.
+configuration key is `gr.adapter_cache_enabled`.
 
 When this option and Decode graphs are enabled, the shared runner retains one drained
 adapter per logical batch size while the context, workspace and search geometry
@@ -368,20 +368,16 @@ code zero; inference success alone does not establish clean shutdown.
 Use the Beam configuration and Constraint Table artifact described in the
 [asynchronous quickstart](onerec_v1_async_quickstart.md). Set
 `VLLM_USE_V2_MODEL_RUNNER=1` before importing vLLM, and submit the complete
-batch through `GRLLM.beam_search_v1()`. `beam.execution_mode="v1"` selects the
+batch through `GRLLM.beam_search_v1()`. `beam_search_v1` uses the
 Beam protocol; it does not select ModelRunner V1.
 
-`beam.online_batch_sizes` defaults to `[1, 2, 4]`. For example, `[1, 3, 7]`
-enables fixed HTTP batches of 3 and 7 and selects those startup Decode capture
-sizes. It also selects Prefill request counts unless the Prefill-specific
-environment override is set. Increase `max_num_seqs` explicitly to at least 7;
-the policy never enlarges engine capacity automatically.
+The default `gr.beam_batch_sizes` is `[1, 2, 4]`. With `[1, 3, 7]`, a single Beam completion can submit 3 or 7 prompts together, and CUDA plans Prefill and Decode graphs for the same sizes. Set `max_num_seqs` to at least 7 to use B=7.
 
 For B=4, set `max_num_seqs` to at least 4 and make
 `max_num_batched_tokens` large enough for the sum of all remaining prompt
 tokens. `max_model_len` remains a per-member limit. The native request capacity
 does not need to equal B * W; GR allocates the expanded Decode rows separately.
-Keep request beam width equal to `beam.max_width`, with sufficient Constraint
+Keep request beam width equal to `max(gr.beam_width)`, with sufficient Constraint
 Table top-k capacity.
 
 The implemented scope is CUDA, one executing logical batch, fixed beam width,

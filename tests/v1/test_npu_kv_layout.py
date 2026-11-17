@@ -20,10 +20,6 @@ class _AttentionBackend(Enum):
     OTHER = "other"
 
 
-class _Execution(Enum):
-    V1 = "v1"
-
-
 class _Decode(Enum):
     XLLM = "xllm"
     CASCADE = "cascade"
@@ -66,7 +62,6 @@ def policy(monkeypatch: pytest.MonkeyPatch) -> Any:
         "vllm_gr.config": SimpleNamespace(
             GRConfig=SimpleNamespace(from_vllm_config=lambda config: config.gr),
             GRAttentionBackend=_AttentionBackend,
-            BeamExecutionMode=_Execution,
             NPUDecodeExecution=_Decode,
         ),
         "vllm_gr.v1.attention.backends.beam_attn": beam,
@@ -106,7 +101,6 @@ def _case() -> tuple[Any, Any, Any]:
         use_v2_model_runner=False,
         gr=SimpleNamespace(
             attention_backend=_AttentionBackend.CUSTOM,
-            beam_execution_mode=_Execution.V1,
             beam_max_width=128,
             npu_decode_execution=_Decode.XLLM,
         ),
@@ -233,7 +227,7 @@ def test_supported_dtype_and_explicit_token_major_layout(
     [
         ("use_v2_model_runner", True),
         ("gr.attention_backend", _AttentionBackend.OTHER),
-        ("gr.beam_execution_mode", None),
+        ("gr.beam_max_width", None),
         ("gr.beam_max_width", None),
         ("gr.beam_max_width", 0),
         ("gr.npu_decode_execution", _Decode.CASCADE),
@@ -377,7 +371,7 @@ def test_native_result_and_exception_are_not_replaced(policy: Any) -> None:
 
 def test_ordinary_config_never_imports_beam_backend(policy: Any) -> None:
     case = _case()
-    case[1].gr.beam_execution_mode = None
+    case[1].gr.beam_max_width = None
     assert _installed(policy)(*case) is False
     assert "vllm_gr.v1.attention.backends.beam_attn" not in policy.imports
 

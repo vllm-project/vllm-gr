@@ -207,9 +207,10 @@ def _validate_chat_sampling_patch() -> str | None:
 
 
 def _validate_engine_args_patch() -> str | None:
-    from vllm.engine.arg_utils import EngineArgs
+    from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 
     from vllm_gr.engine.arg_utils_gr import (
+        _init_async_engine_args,
         _init_engine_args,
         add_cli_args,
         create_engine_config,
@@ -220,7 +221,8 @@ def _validate_engine_args_patch() -> str | None:
         EngineArgs.add_cli_args is add_cli_args
         and EngineArgs.create_engine_config is create_engine_config
         and EngineArgs.from_cli_args.__func__ is from_cli_args
-        and EngineArgs.__init__ is _init_engine_args,
+        and EngineArgs.__init__ is _init_engine_args
+        and AsyncEngineArgs.__init__ is _init_async_engine_args,
         "EngineArgs GR integration is incomplete",
     )
 

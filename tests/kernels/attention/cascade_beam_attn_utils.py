@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -186,6 +187,7 @@ def build_beam_attn_metadata(
     )
     try:
         builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
+        builder.vllm_config = SimpleNamespace(speculative_config=None)
         builder.device = torch.device(device)
         builder.block_size = inputs.block_size
         builder.aot_schedule = False

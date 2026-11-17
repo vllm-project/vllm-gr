@@ -17,16 +17,15 @@ to set the model and data paths, compile the table, and write the server YAML.
 
 ### Beam configuration parameters
 
-The values come from the example YAML passed to `--vllm-gr-config`. The HTTP
+The values come from the example YAML passed to `--config`. The HTTP
 client flags configure the request. Library defaults can differ.
 
 | Parameter | Example value | Server YAML and client CLI |
 | --- | --- | --- |
-| `beam.execution_mode` | `v1` | Set in YAML to select Beam Search V1. |
-| `beam.graph_enabled` | `true` | Set in YAML to enable Beam graphs. |
-| `beam.worker_decision` | `true` | Set in YAML to enable Beam selection on the Worker. |
-| `beam.max_width` | `128` | Set the width in YAML and match it with the client flag `-b`. |
-| `beam.max_decode_steps` | `3` | Set the effective token capacity in YAML. The client sends `max_tokens: 5`, which includes two SID markers and three generated tokens. |
+| `gr.beam_graph_enabled` | `true` | Set in YAML to enable Beam graphs. |
+| `gr.worker_decision` | `true` | Set in YAML to enable Beam selection on the Worker. |
+| `gr.beam_width` | `[128, 128, 128]` | Match the first width with the client flag `-b`. |
+| `gr.max_decode_steps` | `3` | Set the effective token capacity in YAML. The client sends `max_tokens: 5`, which includes two SID markers and three generated tokens. |
 
 ## Start the server
 
@@ -43,7 +42,7 @@ fi
 VLLM_USE_V2_MODEL_RUNNER="$onerec_runner" vllm serve "$ONEREC_MODEL" --gr \
   --host 127.0.0.1 --port 8000 \
   --served-model-name "$ONEREC_SERVED_MODEL_NAME" \
-  --vllm-gr-config "$ONEREC_WORKDIR/vllm_gr_config.yaml" \
+  --config "$ONEREC_WORKDIR/vllm_gr_config.yaml" \
   --trust-remote-code \
   --max-logprobs 128 \
   --max-num-seqs 128 \
@@ -66,8 +65,8 @@ export ONEREC_WORKDIR="${ONEREC_WORKDIR:-$PWD/results/onerec-serving}"
 curl --fail --silent --show-error --output /dev/null http://127.0.0.1:8000/health
 ```
 
-GR patches load through the vLLM plugin. Use only `--vllm-gr-config` for the
-GR settings in this example. For authentication and deployment guidance, see
+GR patches load through the vLLM plugin. Use `--gr` to enable GR serving
+and `--config` to load the YAML. For authentication and deployment guidance, see
 the [security policy](../../../SECURITY.md). If the server uses `--api-key`
 or `VLLM_API_KEY`, set `VLLM_API_KEY` in the client terminal too.
 
@@ -109,6 +108,6 @@ Press Ctrl+C in the server terminal to stop the service.
   filesystem, set `VLLM_RPC_BASE_PATH` to a short, writable directory on the
   serving node that supports Unix sockets.
 - If the request returns a model or width error, check the served model name
-  and match the request width to `beam.max_width`.
+  and match the request width to the first entry of `gr.beam_width`.
 - If startup runs out of device memory, use a device with enough free memory
   for the model and Beam workspace.

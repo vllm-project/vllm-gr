@@ -181,21 +181,19 @@ def test_dynamic_beam_example_wires_graphs_and_benchmark(
     assert params_kwargs["beam_width"] == 8
     assert params_kwargs["dynamic_beam_widths"] == widths
     assert params_kwargs["result_width"] == 2
-    config = engine_kwargs["vllm_gr_config"]
-    beam_config = config["beam"]
-    assert beam_config["max_width"] == 8
-    assert beam_config["graph_widths"] == graph_widths
-    assert beam_config["graph_batch_size"] == 2
+    config = engine_kwargs["gr"]
+    assert config["beam_width"] == config["candidate_width"] == [8, 8, 8]
+    assert config["decode_graph_widths"] == graph_widths
+    assert config["decode_graph_batch_size"] == 2
     report = json.loads(output_path.read_text())
-    assert config["constraint_table"]["enabled"] is with_catalog
+    assert config["constraint_mode"] == ("table" if with_catalog else "none")
     if with_catalog:
         assert artifact_builds == [(tmp_path, tmp_path / "catalog.json", artifact_path)]
         assert report["catalog"] == str(tmp_path / "catalog.json")
         assert report["prompt"] == str(tmp_path / "prompt.txt")
     else:
         assert not artifact_builds
-        assert config["constrained_generation"] is False
-        assert "path" not in config["constraint_table"]
+        assert config["constraint_table"] is None
         assert report["catalog"] is None
         assert report["prompt"] is None
     assert report["dynamic_beam_widths"] == widths and report["result_width"] == 2

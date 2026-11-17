@@ -7,6 +7,7 @@ import asyncio
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
@@ -97,7 +98,11 @@ def test_grllm_v1_entry_uses_new_frontend(
     frontend = _Frontend()
     fake_llm = object.__new__(GRLLM)
     fake_llm.llm_engine = SimpleNamespace(
-        vllm_config=SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"})
+        vllm_config=SimpleNamespace(
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+            }
+        )
     )
     monkeypatch.setattr(
         GRLLM,
@@ -140,9 +145,11 @@ def test_v1_heap_is_prepared_before_serving_and_released_on_close(
             raise RuntimeError("engine shutdown failed")
 
     def initialize(llm: Any, **kwargs: Any) -> None:
-        additional_config: dict[str, object] = {"vllm_gr_beam_execution_mode": "v1"}
+        additional_config: dict[str, Any] = {
+            "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+        }
         if unconstrained:
-            additional_config["vllm_gr_constrained_generation"] = False
+            additional_config["vllm_gr"]["gr"]["constraint_mode"] = "none"
         llm.llm_engine = SimpleNamespace(
             vllm_config=SimpleNamespace(additional_config=additional_config),
             shutdown=shutdown,
@@ -266,6 +273,32 @@ def test_v1_async_flow_closes_only_after_session_is_returned(failure_stage: str)
         frontend.close.assert_not_awaited()
     else:
         frontend.close.assert_awaited_once_with(session)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "widths,candidates",
+    [([128, 128, 128], [128, 128, 128]), ([128, 256, 64], [128, 64, 32])],
+)
+def test_serving_engine_logprob_capacity_is_an_integer_for_width_schedules(
+    tmp_path: Path, widths: list[int], candidates: list[int]
+) -> None:
+    from pydantic import TypeAdapter
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    from tests.helpers.gr_config import serving_beam_engine_args
+    from vllm_gr.engine.arg_utils_gr import _init_async_engine_args
+
+    config = {"beam_width": widths, "candidate_width": candidates, "beam_graph_enabled": False}
+    # EngineArgs resolves the model path; an existing local directory avoids
+    # treating this unit-test placeholder as a Hugging Face repository.
+    kwargs = serving_beam_engine_args(str(tmp_path), config, 0.7)
+    args = AsyncEngineArgs.__new__(AsyncEngineArgs)
+    _init_async_engine_args(args, **kwargs)
+    assert args.model == str(tmp_path)
+    assert TypeAdapter(int).validate_python(args.max_logprobs, strict=True) == 2 * max(candidates)
+    assert args.max_num_seqs == 1 and args.enforce_eager
+    assert args.gr is config
 
 
 pytestmark = pytest.mark.cpu_test

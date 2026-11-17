@@ -124,8 +124,8 @@ Use the table builder's actual digests. Use `backend: npu` for an Ascend table.
 ```bash
 vllm serve --gr --config engine.yaml
 vllm serve --gr --config engine.yaml --port 9000
-vllm serve --gr --config engine.yaml --gr.capture_batch_sizes '[1,2,4]'
-vllm serve --gr --config engine.yaml --gr-config '{"capture_batch_sizes":[1,2,4]}'
+vllm serve --gr --config engine.yaml --gr.beam_batch_sizes '[1,2,4]'
+vllm serve --gr --config engine.yaml --gr-config '{"beam_batch_sizes":[1,2,4]}'
 ```
 
 `--gr-config` is a JSON mapping, not a file path. It retains the resolver's `gr`
@@ -316,7 +316,7 @@ Start the server in a separate terminal with the generated configuration:
 
 ```bash
 vllm serve /models/OneRec --gr --port 7001 \
-  --vllm-gr-config /results/beam-performance/vllm_gr_config.yaml \
+  --config /results/beam-performance/gr-config.yaml \
   --seed 0 --async-scheduling --max-logprobs 32 --max-num-seqs 4 \
   --max-num-batched-tokens 8192 --max-model-len 8192 \
   --gpu-memory-utilization 0.7 --no-enable-prefix-caching --no-enable-chunked-prefill

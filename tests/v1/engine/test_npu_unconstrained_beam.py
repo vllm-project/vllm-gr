@@ -15,6 +15,8 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
+from tests.helpers.gr_config import make_gr_config
+from vllm_gr.config import ConstraintConfig, ConstraintMode
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
 from vllm_gr.v1.beam.batch_contracts import (
@@ -90,7 +92,9 @@ def _assert_matches_reference(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("vocab_size,top_k", [(17, 1), (17, 17), (17, 32), (1031, 3)])
+@pytest.mark.parametrize(
+    "vocab_size,top_k", [(17, 1), (17, 17), (17, 32), (1031, 3), (1031, 512), (1031, 1024)]
+)
 @pytest.mark.parametrize("broadcast_temperature", [False, True])
 def test_full_vocab_scores_match_scalar_enumeration(
     dtype: torch.dtype, vocab_size: int, top_k: int, broadcast_temperature: bool
@@ -313,12 +317,11 @@ def test_unconstrained_startup_selects_the_existing_npu_graph_adapter(
         model_config=SimpleNamespace(enforce_eager=eager),
         vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=True)),
         _vllm_gr_config=SimpleNamespace(
-            constrained_generation=False,
+            constraint=ConstraintConfig(mode=ConstraintMode.NONE),
             beam_worker_decision=True,
             beam_max_width=2,
             beam_max_decode_steps=steps,
             beam_graph_enabled=True,
-            constraint_table=None,
         ),
     )
     assert _capture_enabled(worker) is expected
@@ -328,8 +331,6 @@ def test_unconstrained_startup_selects_the_existing_npu_graph_adapter(
 def test_npu_generation_capacity_is_checked_before_worker_state_is_allocated(
     capacity: int,
 ) -> None:
-    from vllm_gr.config import GRConfig
-
     config = SimpleNamespace(
         additional_config={},
         device_config=SimpleNamespace(device="npu"),
@@ -337,7 +338,7 @@ def test_npu_generation_capacity_is_checked_before_worker_state_is_allocated(
             get_num_kv_heads=lambda parallel: 8, get_head_size=lambda: 128
         ),
     )
-    GRConfig(
+    make_gr_config(
         constrained_generation=False, beam_max_width=2, beam_max_decode_steps=capacity
     ).write_to_vllm_config(config)
     worker = SimpleNamespace(
@@ -559,7 +560,6 @@ def test_bounded_generic_support_preserves_sid_stage_capacity(steps: int) -> Non
     with pytest.raises(ValueError, match=r"beam\.max_decode_steps <= 3"):
         GRConfig(
             constrained_generation=False,
-            beam_execution_mode="v1",
             beam_worker_decision=True,
             beam_max_width=2,
             beam_max_decode_steps=steps,
@@ -568,7 +568,6 @@ def test_bounded_generic_support_preserves_sid_stage_capacity(steps: int) -> Non
     config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device="npu"))
     GRConfig(
         constrained_generation=False,
-        beam_execution_mode="v1",
         beam_worker_decision=True,
         beam_max_width=2,
         beam_max_decode_steps=3,
@@ -585,7 +584,7 @@ def test_bounded_generic_support_preserves_sid_stage_capacity(steps: int) -> Non
 def test_bounded_generic_support_preserves_catalog_depth(steps: int) -> None:
     from vllm_gr.config import (
         ConstraintTableBackendEnum,
-        ConstraintTableConfig,
+        ConstraintTableSpec,
         GRConfig,
         write_canonical_gr_config,
     )
@@ -593,17 +592,19 @@ def test_bounded_generic_support_preserves_catalog_depth(steps: int) -> None:
 
     config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device="npu"))
     gr_config = GRConfig(
-        constrained_generation=True,
         beam_max_width=2,
         beam_max_decode_steps=6,
-        constraint_table=ConstraintTableConfig(
-            enabled=True,
-            backend=ConstraintTableBackendEnum.NPU,
-            path="/tmp/test-constraint-table.safetensors",
-            format="constraint_table_v1",
-            artifact_digest="sha256:" + "a" * 64,
-            tokenizer_digest="sha256:" + "b" * 64,
-            max_top_k=2,
+        constraint=ConstraintConfig(
+            mode=ConstraintMode.TABLE,
+            table=ConstraintTableSpec(
+                enabled=True,
+                backend=ConstraintTableBackendEnum.NPU,
+                path="/tmp/test-constraint-table.safetensors",
+                format="constraint_table_v1",
+                artifact_digest="sha256:" + "a" * 64,
+                tokenizer_digest="sha256:" + "b" * 64,
+                max_top_k=2,
+            ),
         ),
     )
     write_canonical_gr_config(config, gr_config)
@@ -642,14 +643,13 @@ def test_bounded_generic_support_preserves_dynamic_schedule_contract(
 def test_native_request_candidate_width_is_checked_at_device_admission(
     device: str, candidate_width: int | None, widths: tuple[int, ...] | None
 ) -> None:
-    from vllm_gr.config import GRConfig
     from vllm_gr.v1.engine.beam_search_v1 import (
         validate_gr_device_config,
         validate_gr_request,
     )
 
     config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device=device))
-    GRConfig(
+    make_gr_config(
         constrained_generation=False, beam_max_width=2, beam_max_decode_steps=3
     ).write_to_vllm_config(config)
     native = EngineCoreRequest(

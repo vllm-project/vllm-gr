@@ -25,7 +25,6 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export ASCEND_RT_VISIBLE_DEVICES=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_USE_V2_MODEL_RUNNER=0
-export VLLM_ENABLE_PREFILL_CUDAGRAPH=1
 ```
 
 Save the following as `npu_beam.py`, replace the model path, and run it as a
@@ -40,27 +39,18 @@ from vllm_gr.sampling_params import BeamSearchParams
 def main() -> None:
     batch_size = 4  # Use 1 for a single request.
     config = {
-        "schema_version": 1,
-        "constrained_generation": False,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "worker_decision": True,
-            "graph_enabled": True,
-            "graph_batch_size": batch_size,
-            "max_width": 128,
-            "max_decode_steps": 3,
-        },
-        "constraint_table": {
-            "enabled": False,
-            "backend": "npu",
-            "max_top_k": 128,
-        },
+        "constraint_mode": "none",
+        "worker_decision": True,
+        "beam_graph_enabled": True,
+        "decode_graph_batch_size": batch_size,
+        "beam_width": [128] * 3,
+        "max_decode_steps": 3,
+        "candidate_width": [128] * 3,
     }
 
     with GRLLM(
         model="/absolute/path/to/model",
-        vllm_gr_config=config,
+        gr=config,
         async_scheduling=True,
         enforce_eager=False,
         enable_chunked_prefill=False,
@@ -109,7 +99,7 @@ For SID generation that permits every SA/SB/SC combination, enable the stage
 domain inside `main()`, after building `config` and before constructing `GRLLM`:
 
 ```python
-config["beam"]["sid_stage_vocab"] = True
+config["sid_stage_vocab"] = True
 ```
 
 Use the checkpoint's SID prompt, including its SID-begin marker when required.
@@ -127,21 +117,13 @@ startup dummy paths retain the full LM head. This option requires NPU Beam V1,
 worker decisions, `constrained_generation=False`, and at most three generated
 tokens. It is disabled by default; CUDA and catalog-based behavior are unchanged.
 
-`VLLM_GR_NPU_STAGE_LM_HEAD=0` disables only the projection optimization. The SID
+`gr.npu_stage_lm_head: false` disables only the projection optimization. The SID
 stage domains, token-ID mapping, and score semantics remain enabled, providing
 a full-head reference for the optimized projection. Supported models use the
-stage projection by default when the environment variable is unset or `1`.
+stage projection by default. To run the reference case, set
+`config["npu_stage_lm_head"] = False` before constructing the engine.
 
-Set this environment variable before starting Python; changing it does not
-reconfigure an existing engine. With `sid_stage_vocab=True` in the saved script,
-run each reference or optimized case in a new process:
-
-```bash
-VLLM_GR_NPU_STAGE_LM_HEAD=0 python -u npu_beam.py
-VLLM_GR_NPU_STAGE_LM_HEAD=1 python -u npu_beam.py
-```
-
-Setting `VLLM_GR_NPU_STAGE_LM_HEAD=1` alone does not select the SID stage domain
+Setting `gr.npu_stage_lm_head: true` alone does not select the SID stage domain
 or override model eligibility checks. With `sid_stage_vocab=False`, catalog-free
 Beam selection still uses the full model vocabulary.
 
@@ -161,8 +143,8 @@ domain when checking correctness. Catalog membership is not guaranteed.
   generation horizons or support for all model geometries: native history
   layouts and scratch-buffer capacity still bound further generalization.
   Use this path with
-  `ignore_eos=True` and `beam.sid_stage_vocab=False`. Configure
-  `beam.max_decode_steps=6` to reserve capacity for requests through six tokens.
+  `ignore_eos=True` and `gr.sid_stage_vocab: false`. Configure
+  `gr.max_decode_steps=6` to reserve capacity for requests through six tokens.
   Each request selects its own `max_tokens` within that capacity; the configured
   maximum does not force shorter requests to generate six tokens. Six-token
   generation executes one output-producing Prefill followed by five Decode
@@ -173,7 +155,7 @@ domain when checking correctness. Catalog membership is not guaranteed.
   Admission checks the full configured capacity before allocation, even for a
   shorter request. For example, 64 KV heads with head dimension 128 fit five
   tokens but exceed this buffer at six; eight KV heads at that dimension fit
-  six. Reduce `beam.max_decode_steps` when this guard rejects a configuration.
+  six. Reduce `gr.max_decode_steps` when this guard rejects a configuration.
 - SID stage projection and Constraint Table generation retain their existing
   three-stage boundary. Dynamic width schedules also retain their one-, two-,
   or three-token contract; longer generation uses a fixed Beam width.
@@ -181,17 +163,16 @@ domain when checking correctness. Catalog membership is not guaranteed.
   V1, asynchronous scheduling, and TP/PP/DP/DCP/PCP all equal to one.
 - Logical batch sizes follow the existing NPU Beam contract (1 through 8). The
   configured maximum width must equal the request's `beam_width`.
-- The configured `graph_batch_size` and Decode input width identify exact graph
-  shapes. Configure `graph_widths` for additional dynamic input widths, or use the
+- The configured `gr.decode_graph_batch_size` and Decode input width identify exact graph
+  shapes. Configure `gr.decode_graph_widths` for additional dynamic input widths, or use the
   existing eager fallback when a matching graph is unavailable. A one-token
   session ends in Prefill and needs no Decode graph.
 - Dynamic shrinking and expanding widths use the existing parent/KV ownership
   path. For example, with capacity 128, `dynamic_beam_widths=[128, 64, 32]` and
   `result_width=32` are valid. To capture both Decode input widths, add
-  `"graph_widths": [64, 128]` to `beam`; the final 32 has no following Decode.
-- Leave `constraint_table.candidate_width` unset for dynamic schedules. Independent
-  per-parent candidate widths remain CUDA-only. An explicitly configured scalar
-  candidate width must match every retained stage width on this NPU path.
+  `"decode_graph_widths": [64, 128]` to `gr`; the final 32 has no following Decode.
+- Set `gr.candidate_width` to the same per-step list as `gr.beam_width` for
+  dynamic NPU schedules. Independent per-parent candidate widths remain CUDA-only.
 
 Prefill and Decode reuse the existing model graph machinery. Candidate selection
 and Beam decisions retain their existing scheduling boundary outside the captured

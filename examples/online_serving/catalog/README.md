@@ -82,48 +82,49 @@ Generate the server YAML using the printed digest values.
 ARTIFACT_DIGEST=$(awk '$1 == "artifact_digest:" {print $2}' "$ONEREC_WORKDIR/digests.txt")
 TOKENIZER_DIGEST=$(awk '$1 == "tokenizer_digest:" {print $2}' "$ONEREC_WORKDIR/digests.txt")
 cat > "$ONEREC_WORKDIR/vllm_gr_config.yaml" <<EOF
-schema_version: 1
-attention_backend: CUSTOM
-beam:
-  execution_mode: v1
-  graph_enabled: true
+attention-config:
+  backend: CUSTOM
+gr:
+  beam_graph_enabled: true
   worker_decision: true
-  max_width: 128
+  beam_width: [128, 128, 128]
+  candidate_width: [128, 128, 128]
   max_decode_steps: 3
-constraint_table:
-  enabled: true
-  backend: $ONEREC_BACKEND
-  max_top_k: 128
-  path: "$ONEREC_WORKDIR/constraint_table.safetensors"
-  format: constraint_table_v1
-  artifact_digest: "${ARTIFACT_DIGEST:?Build the Constraint Table first}"
-  tokenizer_digest: "${TOKENIZER_DIGEST:?Build the Constraint Table first}"
+  constraint_mode: table
+  constraint_table:
+    backend: $ONEREC_BACKEND
+    max_top_k: 128
+    path: "$ONEREC_WORKDIR/constraint_table.safetensors"
+    format: constraint_table_v1
+    digests:
+      artifact: "${ARTIFACT_DIGEST:?Build the Constraint Table first}"
+      tokenizer: "${TOKENIZER_DIGEST:?Build the Constraint Table first}"
 EOF
 ```
 
 ## Change the beam width
 
-Set the request width to match `beam.max_width`. For the example width of
-128, omitting `constraint_table.candidate_width` makes it resolve to 128.
-For widths up to 256 on CUDA, the candidate width can follow the beam width.
-Set `constraint_table.max_top_k` to cover the candidate width. Set
+Set the request width to match the first entry of `gr.beam_width`. The first
+candidate width also matches the request width because Prefill expands one
+prompt into that many beams. Set `gr.constraint_table.max_top_k` to cover
+the largest configured candidate count. Set
 `--max-logprobs` to at least the candidate width and `--max-num-seqs` to at
 least the beam width for these server examples.
 
-For a CUDA beam width of 512, change these fields in the generated YAML.
-The per-beam candidate limit is 256.
+For a CUDA beam width of 256, change these fields in the generated YAML.
+CUDA Constraint Table sampling supports up to 256 candidates.
 
 ```yaml
-beam:
-  max_width: 512
-constraint_table:
-  candidate_width: 256
-  max_top_k: 256
+gr:
+  beam_width: [256, 256, 256]
+  candidate_width: [256, 256, 256]
+  constraint_table:
+    max_top_k: 256
 ```
 
 With this configuration, use `--max-logprobs 256` or higher and
-`--max-num-seqs 512` or higher in the example server command. Restart the
-server, then request width 512 with HTTP `-b 512` or gRPC `--width 512`.
+`--max-num-seqs 256` or higher in the example server command. Restart the
+server, then request width 256 with HTTP `-b 256` or gRPC `--width 256`.
 
 A constrained request can return fewer beams if the catalog has too few
 reachable SIDs.

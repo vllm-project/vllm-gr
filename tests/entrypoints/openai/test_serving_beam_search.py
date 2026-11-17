@@ -7,9 +7,11 @@ try:
 except ImportError:
     from vllm.sampling_params import BeamSearchParams
 
+import asyncio
 import multiprocessing
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -52,27 +54,15 @@ async def beam_search_test(loops: int) -> None:
 
 
 async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
+    from tests.helpers.gr_config import serving_beam_engine_args
     from vllm_gr.plugin import initialize_runtime
 
     initialize_runtime()
-    beam_width = config["beam"]["max_width"]
+    beam_width = max(config["beam_width"])
     max_tokens = 5
 
     engine_args = AsyncEngineArgs(
-        model=model_name,
-        trust_remote_code=True,
-        async_scheduling=True,
-        enable_chunked_prefill=False,
-        max_model_len=2048,
-        max_num_batched_tokens=8192,
-        # V1 owns one logical request; beam rows are managed by the worker.
-        max_num_seqs=1,
-        enforce_eager=not config["beam"]["graph_enabled"],
-        enable_log_requests=False,
-        shutdown_timeout=10,
-        max_logprobs=2 * beam_width,
-        gpu_memory_utilization=gpu_memory_utilization,
-        additional_config={"vllm_gr": config},
+        **serving_beam_engine_args(model_name, config, gpu_memory_utilization)
     )
 
     async with build_async_engine_client_from_engine_args(engine_args) as engine_client:
@@ -125,16 +115,35 @@ async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
         assert len(final_output.outputs) == beam_width
 
 
+def _run_in_spawned_process(
+    target: Callable[[int], None], loops: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = multiprocessing.get_context("spawn").Process(target=target, args=(loops,))
+    # Set the EngineCore start method before the child imports vLLM and can
+    # cache it. The pytest parent may already have touched the CUDA runtime.
+    try:
+        with monkeypatch.context() as launch_env:
+            launch_env.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+            process.start()
+        process.join()
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+
+def _run_beam_search_target(loops: int) -> None:
+    asyncio.run(beam_search_test(loops))
+
+
 @pytest.mark.slow  # type: ignore
-@pytest.mark.timeout(1200)  # three model/engine builds can exceed 600 s on L20
-@pytest.mark.asyncio  # type: ignore
-async def test_serving_beam_search(loops: int) -> None:
-    await beam_search_test(loops)
+@pytest.mark.timeout(1200)
+def test_serving_beam_search(loops: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    _run_in_spawned_process(_run_beam_search_target, loops, monkeypatch)
 
 
 def _run_gr_beam_search_target(loops: int) -> None:
-    import asyncio
-
     from vllm_gr.patch import re_apply_patches
 
     re_apply_patches()
@@ -173,12 +182,8 @@ def _run_gr_beam_search_target(loops: int) -> None:
 
 @pytest.mark.slow  # type: ignore
 @pytest.mark.timeout(1200)  # three model/engine builds can exceed 600 s on L20
-def test_serving_gr_beam_search(loops: int) -> None:
-    ctx = multiprocessing.get_context("spawn")
-    p = ctx.Process(target=_run_gr_beam_search_target, args=(loops,))
-    p.start()
-    p.join()
-    assert p.exitcode == 0
+def test_serving_gr_beam_search(loops: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    _run_in_spawned_process(_run_gr_beam_search_target, loops, monkeypatch)
 
 
 pytestmark = pytest.mark.gpu_test

@@ -30,7 +30,6 @@ class _ForwardCase:
         )
         runner_module = importlib.import_module("vllm_gr.v1.worker.npu.npu_prefill_graph_runner")
         self.patch = importlib.import_module("vllm_gr.v1.worker.npu.npu_model_runner_patch")
-        monkeypatch.delenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", raising=False)
         self.owner = SimpleNamespace(
             device=torch.device("cpu"),
             vllm_config=None,
@@ -76,7 +75,7 @@ class _ForwardCase:
             "get_forward_context",
             lambda: SimpleNamespace(attn_metadata={"layer": self.metadata}),
         )
-        monkeypatch.setattr(self.patch, "is_prefill_graph_enabled", lambda: True)
+        monkeypatch.setattr(self.patch, "is_prefill_graph_enabled", lambda runner=None: True)
         self.native = Mock(return_value=object())
 
         def native(*args: Any, **kwargs: Any) -> Any:
@@ -106,7 +105,7 @@ class _ForwardCase:
 
 @pytest.fixture
 def backend(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    return load_backend(monkeypatch)
+    return cast(ModuleType, load_backend(monkeypatch))
 
 
 @pytest.fixture
@@ -199,7 +198,7 @@ def test_latched_failure_blocks_every_later_forward_route(
     if route == "decode":
         case.owner.input_batch.num_computed_tokens_cpu = [2, 2]
     elif route == "disabled":
-        monkeypatch.setattr(case.patch, "is_prefill_graph_enabled", lambda: False)
+        monkeypatch.setattr(case.patch, "is_prefill_graph_enabled", lambda runner=None: False)
     elif route == "missing_bucket":
         case.owner._current_scheduler_output.num_scheduled_tokens = {"a": 99}
         case.owner._current_scheduler_output.total_num_scheduled_tokens = 99

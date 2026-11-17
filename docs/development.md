@@ -89,16 +89,15 @@ constraints in the model. Input-specific path handling stays in `parser.py`.
 
 Preserve the distinction between missing, null, and explicit false inputs.
 Canonical inputs require `schema_version` even though direct construction has a
-default. `ConstraintTableConfig.max_top_k` remains a required constructor
-argument with no default and an explicit `required=True` declaration. The
-`validate-config` hook checks defaults and docstrings for both configuration
-classes, with that one required-field exception. See the
+default. Table mode requires `gr.constraint_table.max_top_k` when constructing
+a deployment. The standalone `ConstraintTableSpec` can omit this value.
+The `validate-config` hook checks both configuration classes. See the
 [standalone configuration tests](tools/README.md#targeted-tests-and-dependencies)
 and extend the existing configuration round-trip tests for behavior changes.
 
 ## ModelRunner and graph boundaries
 
-`beam.execution_mode="v1"` names the Beam protocol, independently of native
+`beam_search_v1` is the only Beam protocol, independently of native
 ModelRunner V1/V2. The selection policy lives in `vllm_gr/_env_check.py`.
 
 CUDA V1, CUDA V2, and NPU have different capture and storage lifecycles. Read

@@ -19,11 +19,17 @@ def attention_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     import vllm.config
 
     config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
         additional_config={
-            "vllm_gr_npu_decode_execution": "cascade",
-            "vllm_gr_enable_short_suffix_attention": False,
-            "vllm_gr_prefill_flash_attn_version": None,
-        }
+            "vllm_gr": {
+                "gr": {
+                    "npu_decode_execution": "cascade",
+                    "enable_short_suffix_attention": False,
+                    "prefill_flash_attn_version": None,
+                }
+            },
+        },
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
     monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
@@ -113,7 +119,7 @@ def test_npu_rejection_does_not_require_loading_selected_execution_module(
     attention_config: SimpleNamespace,
     mode: str,
 ) -> None:
-    attention_config.additional_config["vllm_gr_npu_decode_execution"] = mode
+    attention_config.additional_config["vllm_gr"]["gr"]["npu_decode_execution"] = mode
     # The resolver would import xllm when requested. Rejecting before it is
     # called also works on hosts where that optional extension is unavailable.
     _assert_rejected_before_initialization(monkeypatch, {"sliding_window": 128})

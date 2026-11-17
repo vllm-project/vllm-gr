@@ -19,6 +19,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_gr.config import GRConfig
+from vllm_gr.config.models import DEFAULT_DEPLOYMENT
 from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
     _build_beam_mappings,
     _build_std_mappings,
@@ -33,6 +35,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import (
     create_beam_tensors,
     create_std_tensors,
 )
+from vllm_gr.v1.attention.backends.beam_prefix_policy import configured_fa_version
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 
 logger = init_logger(__name__)
@@ -142,6 +145,10 @@ class BeamAttentionMetadata:
     # Host proof that the current NPU batch routes every row in order. Graph
     # dispatch must preserve this layout: replay does not re-run Python guards.
     npu_prefix_rows_are_identity: bool = False
+    prefix_policy: str = DEFAULT_DEPLOYMENT.prefix_policy
+    prefix_min_chain_us: float = DEFAULT_DEPLOYMENT.prefix_min_chain_us
+    prefix_calibrations: dict | None = None
+    explicit_fa_version: int | None = None
 
 
 def require_beam_decode_session(metadata: BeamAttentionMetadata) -> Any:
@@ -190,7 +197,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
-        from vllm_gr.config import GRConfig
 
         self._v2_gr_prefill_capture = (
             self._is_cuda
@@ -238,8 +244,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self._fixed_buffers = self._is_cuda or self._is_npu
         self._tensor_buffers = BeamTensorBuffers()
         if self._fixed_buffers:
-            from vllm_gr.config import GRConfig
-
             max_beams = GRConfig.from_vllm_config(vllm_config).beam_max_width
             if max_beams is None:
                 self._fixed_buffers = False
@@ -621,7 +625,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             and all(index == row for row, index in enumerate(prefix_indices))
         )
 
+        deployment = GRConfig.from_vllm_config(self.vllm_config).deployment
         meta = BeamAttentionMetadata(
+            explicit_fa_version=configured_fa_version(self.vllm_config),
+            prefix_policy=deployment.prefix_policy,
+            prefix_min_chain_us=deployment.prefix_min_chain_us,
+            prefix_calibrations=getattr(self.vllm_config, "_gr_prefix_calibrations", None),
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,

@@ -163,14 +163,17 @@ def _run_arm(work_dir: Path, arm: str) -> None:
     from vllm_gr.entrypoints.gr import GRLLM
 
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
-    config["beam"]["graph_enabled"] = arm != "eager"
+    config["beam_graph_enabled"] = arm != "eager"
     kwargs = _engine_kwargs(model, config)
     kwargs["shutdown_timeout"] = 10
     kwargs["worker_extension_cls"] = _EXTENSIONS[arm]
     decode_graph = arm in ("graph", "prefill_fallback")
     results: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
-    with GRLLM(vllm_gr_config=config, **kwargs) as llm, _decode_path_probe(llm):
+    with (
+        GRLLM(attention_config={"backend": "CUSTOM"}, gr=config, **kwargs) as llm,
+        _decode_path_probe(llm),
+    ):
         processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
         previous = {"replay": 0, "eager": 0, "full": 0, "piecewise": 0}
         state_address = None
@@ -273,7 +276,6 @@ def test_modelrunner_v2_stage_parity(tmp_path: Path) -> None:
         VLLM_USE_V2_MODEL_RUNNER="1",
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
-        VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
         VLLM_GR_TEST_WIDTH="128",
         VLLM_GR_TEST_EAGER="0",
         VLLM_GR_TEST_DTYPE="bfloat16",

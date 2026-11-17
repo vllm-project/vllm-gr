@@ -140,7 +140,7 @@ target instances. The existing `constraint_backend` holds a
 `VersionedConstraintTable`: reload creates a new backend and switches its default
 access to the latest table. Preparation failure leaves the current table active.
 
-Old tables remain for `VLLM_GR_TRIE_RETENTION_SECONDS` (default 60 seconds), then
+Old tables remain for `gr.trie_retention_seconds` (default 60 seconds), then
 are released on a subsequent wrapper API call. There is no timer thread or
 per-request version pinning/reference counting. Lookups default to the latest
 version; this does not promise one fixed Trie version for a whole request.
@@ -257,7 +257,7 @@ or omitting that marker on only one side causes rejection.
 ### Start the gRPC instances
 
 Keep the existing gRPC entrypoint and inference arguments. The required startup
-addition is **`VLLM_GR_ADMIN_PORT`**, unique per instance. It enables a separate HTTP
+addition is **`gr.admin_port`**, unique per instance. It enables a separate HTTP
 control listener in that gRPC service process; it is not the inference port and
 does not replace the gRPC server. Without it, no update listener is started.
 
@@ -265,10 +265,9 @@ For instance 0, a minimal example is:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-VLLM_GR_ADMIN_PORT=9100 \
 vllm serve /updates/bootstrap/ckpt_1700000000 --gr \
   --grpc \
-  --vllm-gr-config /etc/vllm-gr/gr-config.json \
+  --config /etc/vllm-gr/gr-config.yaml --gr.admin_port 9100 \
   --host 127.0.0.1 --port 9000 \
   --async-scheduling --no-enable-chunked-prefill
 ```
@@ -280,8 +279,8 @@ inference flags. For instance `i`, use its GPU assignment, inference port
 change the list to the number actually started.
 
 The control host defaults to `127.0.0.1`, suitable for containers sharing a Pod
-network. `VLLM_GR_ADMIN_HOST` overrides it. Set
-`VLLM_GR_TRIE_RETENTION_SECONDS` on each service to override the 60-second old-table
+network. `gr.admin_host` overrides it. Set
+`gr.trie_retention_seconds` on each service to override the 60-second old-table
 retention period. The HTTP inference entrypoint does not enable these hot-update
 endpoints; use the gRPC serving path.
 

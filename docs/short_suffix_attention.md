@@ -33,11 +33,11 @@ to the FP16/BF16 activation types used by the model runner.
 
 The fused implementation is enabled by default for CUDA CUSTOM attention with
 an active Beam pool. To opt out, set the field explicitly in the engine's
-existing `vllm_gr_config` mapping before startup:
+existing `config` mapping before startup:
 
 ```python
-vllm_gr_config["beam"]["enable_short_suffix_attention"] = False
-# Pass the mapping to GRLLM(..., vllm_gr_config=vllm_gr_config).
+config["beam"]["enable_short_suffix_attention"] = False
+# Pass the mapping to GRLLM(..., config=config).
 ```
 
 Setting the field to `False` restores packed suffix KV and separate merging.

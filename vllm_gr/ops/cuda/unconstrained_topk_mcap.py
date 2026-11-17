@@ -13,12 +13,13 @@ its flagged tiles.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
+
+from vllm_gr.config.models import DEFAULT_DEPLOYMENT
 
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
@@ -29,9 +30,7 @@ LOCAL_TILE_SIZE = 1024
 # write-back and the merge traffic proportional to the read instead of to
 # ``tiles * top_k``.  Lowering it trades local ``tl.topk`` work for a higher
 # chance of the (exact) repair pass, so it stays tunable per deployment.
-LOCAL_KEEP_MAX = int(os.environ.get("VLLM_GR_TOPK_KEEP", "8"))
-if not 1 <= LOCAL_KEEP_MAX <= 256:
-    raise ValueError(f"VLLM_GR_TOPK_KEEP must be in [1, 256], got {LOCAL_KEEP_MAX}")
+LOCAL_KEEP_MAX = DEFAULT_DEPLOYMENT.topk_keep
 # Width of one chunk in the first merge stage.  The stage is a plain
 # "sort this chunk, keep its best top_k" pass, so the chunk count (not the tile
 # count) bounds the second stage.
@@ -56,6 +55,8 @@ class MCarryTopKScratch:
     vocab_size: int
     top_k: int
     keep: int
+    keep_limit: int = LOCAL_KEEP_MAX
+    select: str = DEFAULT_DEPLOYMENT.topk_select
 
 
 @triton.jit
@@ -675,7 +676,9 @@ def _repair_emit_kernel(
         tl.store(output_counts + row, tl.sum(valid.to(tl.int32), axis=0))
 
 
-def mcap_topk_tiling(vocab_size: int, top_k: int) -> tuple[int, int, int, int]:
+def mcap_topk_tiling(
+    vocab_size: int, top_k: int, keep_limit: int = LOCAL_KEEP_MAX
+) -> tuple[int, int, int, int]:
     """Return ``(tiles, keep, candidates, chunk_count)``; one shared definition."""
 
     if vocab_size <= 0 or top_k <= 0:
@@ -684,7 +687,7 @@ def mcap_topk_tiling(vocab_size: int, top_k: int) -> tuple[int, int, int, int]:
     # A row must be able to retain at least ``top_k`` candidates in total, so a
     # vocabulary with only a few tiles widens the per-tile cap instead of
     # silently dropping winners.
-    keep = min(top_k, max(LOCAL_KEEP_MAX, -(-top_k // tiles)))
+    keep = min(top_k, max(keep_limit, -(-top_k // tiles)))
     candidates = tiles * keep
     chunk_count = (candidates + MERGE_CHUNK - 1) // MERGE_CHUNK
     return tiles, keep, candidates, chunk_count
@@ -705,10 +708,13 @@ def allocate_mcap_topk_scratch(
     vocab_size: int,
     top_k: int,
     device: torch.device,
+    *,
+    keep_limit: int = LOCAL_KEEP_MAX,
+    select: str = DEFAULT_DEPLOYMENT.topk_select,
 ) -> MCarryTopKScratch:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k)
+    tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k, keep_limit)
     return MCarryTopKScratch(
         local_keys=torch.empty((batch_size, candidates), dtype=torch.int64, device=device),
         local_marginal=torch.empty((batch_size, tiles), dtype=torch.int64, device=device),
@@ -728,6 +734,8 @@ def allocate_mcap_topk_scratch(
         vocab_size=vocab_size,
         top_k=top_k,
         keep=keep,
+        keep_limit=keep_limit,
+        select=select,
     )
 
 
@@ -809,11 +817,11 @@ def unconstrained_topk_mcap_out(
 def _local_slice_plan(
     vocab_size: int, top_k: int, scratch: MCarryTopKScratch
 ) -> tuple[int, int, int, int, bool, bool, int]:
-    tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k)
+    tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k, scratch.keep_limit)
     if keep != scratch.keep:
         raise ValueError("bounded Top-K scratch retention width does not match its tiling")
     need_marginal = keep < top_k
-    i32_select = os.environ.get("VLLM_GR_TOPK_SELECT", "i64").strip().lower() == "i32"
+    i32_select = scratch.select == "i32"
     # The i32 surrogate ranks a truncated key, so it must also retain the value
     # just below the cutoff to notice a collision there.  That extra slot is
     # needed even when ``keep == top_k``, where exact i64 selection is already
@@ -845,7 +853,7 @@ def _launch_local_slice(
     tiles, keep, candidates, _, need_marginal, _, keep_block = _local_slice_plan(
         scratch.vocab_size, top_k, scratch
     )
-    mode = os.environ.get("VLLM_GR_TOPK_SELECT", "i64").strip().lower()
+    mode = scratch.select
     slice_tiles = -(-slice_size // LOCAL_TILE_SIZE)
     _local_keys_kernel[(rows, slice_tiles)](
         logits,
