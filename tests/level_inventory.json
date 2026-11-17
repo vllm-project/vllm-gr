@@ -365,7 +365,6 @@
     "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_cascade_execution_batch_matches_individual_requests": "l2",
     "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_gather_shared_blocks_bounds_fixed_width_table": "l2",
     "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_xllm_cache_unshared_kv_matches_reference": "l2",
-    "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_xllm_cascade_fallback_reason": "l2",
     "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_xllm_incremental_matches_cascade": "l2",
     "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_xllm_mixed_std_beam_batch_falls_back_to_cascade": "l2",
     "tests/kernels/test_beam_attn_npu_xllm_parity.py::test_xllm_submax_width_matches_cascade": "l2",
