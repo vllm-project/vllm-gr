@@ -305,8 +305,6 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
                 manager._capture_mem_samples = None
             res = _orig_capture_model(self, *args, **kwargs)
 
-            self._gr_async_decode_graph_capture_failed = False
-            self._gr_async_decode_graph_capture_error = None
             before_decode = torch.accelerator.get_memory_info()[0]
             from vllm.compilation import monitor
 

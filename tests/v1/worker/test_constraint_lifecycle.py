@@ -508,20 +508,32 @@ assert 'vllm_gr.ops.cuda.rec_constrained_topk' not in sys.modules
 def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
     v2: bool, operation: str
 ) -> None:
+    from threading import Lock
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+    from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+        V2RuntimeState,
+        close_v2_runtime,
+    )
 
     runner = _runner()
     backend = runner.constraint_backend = _Backend()
     graph = runner._beam_decode_graph = SimpleNamespace(uninstall=Mock(), clear=Mock())
     runtime = {
-        "_gr_input_buffers": object(),
-        "_gr_gpu_stage_runner": object(),
-        "_gr_decode_capture_failures": {2: "refused"},
-        "_gr_runtime_decode_capture_failures": {(1, 4): "refused"},
-        "_gr_async_decode_graph_capture_failed": True,
-        "_gr_async_decode_graph_capture_error": "refused",
+        "_gr_v2_runtime": V2RuntimeState(
+            inputs=object(),
+            startup_failures={2: "refused"},
+            runtime_failures={(1, 4): "refused"},
+            capture_failed=True,
+            capture_error="refused",
+        ),
+        "_gr_gpu_stage_runner": SimpleNamespace(
+            closed=True,
+            pending=None,
+            control_busy=[],
+            control_lock=Lock(),
+            terminal_cleanup_pending=False,
+        ),
     }
     for name, value in runtime.items():
         setattr(runner, name, value)

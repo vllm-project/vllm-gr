@@ -91,13 +91,14 @@ class PolicyWorkerExtension:
         runner = self.model_runner
         owner = getattr(runner, "_gr_gpu_stage_runner", None)
         graph = getattr(runner, "_beam_decode_graph", None)
-        inputs = getattr(runner, "_gr_input_buffers", None)
+        runtime = getattr(runner, "_gr_v2_runtime", None)
+        inputs = runtime.inputs if runtime is not None else None
         states = getattr(runner, "req_states", None)
         return {
             "source": str(Path(model_runner_patch.__file__).resolve()),
             "runner_class": f"{type(runner).__module__}.{type(runner).__name__}",
             "decode_batches": sorted(s.batch_size for s in graph._bindings) if graph else [],
-            "decode_failures": getattr(runner, "_gr_decode_capture_failures", {}),
+            "decode_failures": (runtime.startup_failures or {}) if runtime is not None else {},
             "addresses": {
                 name: getattr(inputs, name).data_ptr()
                 for name in ("device", "input_ids", "positions", "slots", "execution_mask")

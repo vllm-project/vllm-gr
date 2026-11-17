@@ -224,7 +224,9 @@ def admission_worker(
             ]
         ),
         compilation_config=SimpleNamespace(static_forward_context=layers),
-        _beam_postprocess_workspaces=SimpleNamespace(require=Mock(return_value=workspace)),
+        _beam_postprocess_workspaces=SimpleNamespace(
+            keys=(workspace.key,), require=Mock(return_value=workspace)
+        ),
         _update_states=Mock(),
     )
 

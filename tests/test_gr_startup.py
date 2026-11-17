@@ -16,8 +16,30 @@ from vllm_gr.v1.worker import gr_startup as startup
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import capture_multibatch_forward
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+    capture_multibatch_forward,
+    get_v2_runtime,
+)
 from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
+
+
+def _capture_failed(worker: SimpleNamespace) -> bool:
+    runtime = getattr(worker, "_gr_v2_runtime", None)
+    return bool(
+        runtime.capture_failed
+        if runtime is not None
+        else getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+    )
+
+
+def _capture_error(worker: SimpleNamespace) -> str | None:
+    runtime = getattr(worker, "_gr_v2_runtime", None)
+    return (
+        runtime.capture_error
+        if runtime is not None
+        else getattr(worker, "_gr_async_decode_graph_capture_error", None)
+    )
+
 
 CaptureRuntime = tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace, Mock, Mock]
 
@@ -60,7 +82,7 @@ def capture_runtime(monkeypatch: pytest.MonkeyPatch) -> CaptureRuntime:
 
     def release(*args: Any, **kwargs: Any) -> None:
         assert owner.graph is None, "graph published before release"
-        assert not worker._gr_async_decode_graph_capture_failed
+        assert not _capture_failed(worker)
         owner.closed = True
 
     owner.release = Mock(side_effect=release)
@@ -69,7 +91,7 @@ def capture_runtime(monkeypatch: pytest.MonkeyPatch) -> CaptureRuntime:
     def synchronize() -> None:
         assert owner.closed
         assert owner.graph is None, "graph published before synchronization"
-        assert not worker._gr_async_decode_graph_capture_failed
+        assert not _capture_failed(worker)
 
     stream.synchronize.side_effect = synchronize
     monkeypatch.setattr(stages, "get_stage_runner", Mock(return_value=owner))
@@ -210,7 +232,7 @@ def test_single_step_skips_decode_capture(capture_runtime: CaptureRuntime, v2: b
     owner.capture_forward.assert_not_called()
     owner.release.assert_not_called()
     assert not hasattr(worker, "_gr_gpu_stage_runner")
-    assert not hasattr(worker, "_gr_decode_capture_failures")
+    assert getattr(getattr(worker, "_gr_v2_runtime", None), "startup_failures", None) is None
 
 
 def test_recoverable_failure_records_reason_only_after_cleanup(
@@ -219,13 +241,15 @@ def test_recoverable_failure_records_reason_only_after_cleanup(
     worker, owner, _graph, stream, health = capture_runtime
     owner.capture_forward.side_effect = BeamDecodeCaptureUnsupported("capture unsupported")
     assert not _capture(worker)
-    assert worker._gr_async_decode_graph_capture_failed
-    assert worker._gr_async_decode_graph_capture_error == "capture unsupported"
+    assert _capture_failed(worker)
+    assert _capture_error(worker) == "capture unsupported"
     assert owner.graph is None and owner.closed
     owner.release.assert_called_once()
     health.assert_called_once_with(worker.device)
     stream.synchronize.assert_called_once()
-    assert not stages.should_replay_decode_graph(worker, owner.graph)
+    assert not stages.should_replay_decode_graph(
+        worker, owner.graph, capture_failed=get_v2_runtime(worker).capture_failed
+    )
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -243,7 +267,7 @@ def test_unclassified_failure_cannot_enable_fallback(
     with pytest.raises(type(error)) as raised:
         _capture(worker)
     assert raised.value is error
-    assert not worker._gr_async_decode_graph_capture_failed
+    assert not _capture_failed(worker)
     assert owner.graph is None
     owner.release.assert_called_once()
     health.assert_not_called()
@@ -262,8 +286,8 @@ def test_cleanup_failure_never_publishes_graph_or_fallback(
     with pytest.raises(RuntimeError) as raised:
         _capture(worker)
     assert raised.value is error
-    assert not worker._gr_async_decode_graph_capture_failed
-    assert worker._gr_async_decode_graph_capture_error is None
+    assert not _capture_failed(worker)
+    assert _capture_error(worker) is None
     assert owner.graph is None
     assert graph.clear.call_count == int(not recoverable)
 
@@ -274,7 +298,7 @@ def test_failed_device_health_check_cannot_enable_fallback(capture_runtime: Capt
     health.side_effect = RuntimeError("CUDA illegal memory access")
     with pytest.raises(RuntimeError, match="illegal memory"):
         _capture(worker)
-    assert not worker._gr_async_decode_graph_capture_failed
+    assert not _capture_failed(worker)
     assert owner.graph is None
     owner.release.assert_called_once()
 
@@ -287,7 +311,7 @@ def test_capture_mode_must_have_ended(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="did not leave capture mode"):
         _capture(worker)
-    assert not worker._gr_async_decode_graph_capture_failed
+    assert not _capture_failed(worker)
     health.assert_not_called()
 
 
@@ -296,7 +320,7 @@ def test_v1_does_not_opt_into_optional_fallback(capture_runtime: CaptureRuntime)
     owner.capture_forward.side_effect = BeamDecodeCaptureUnsupported("capture unsupported")
     with pytest.raises(BeamDecodeCaptureUnsupported):
         startup.capture_async_forward(worker, hooks_type=CudaStageHooksV1)
-    assert not worker._gr_async_decode_graph_capture_failed
+    assert not _capture_failed(worker)
 
 
 def test_successful_release_must_close_owner(capture_runtime: CaptureRuntime) -> None:
@@ -315,7 +339,7 @@ def test_repeated_startup_accepts_only_completed_capture(
 ) -> None:
     worker, owner, graph, _stream, _health = capture_runtime
     worker._gr_gpu_stage_runner = owner
-    worker._gr_decode_capture_failures = {}
+    get_v2_runtime(worker).startup_failures = {}
     worker._beam_decode_graph = graph
     graph.select = Mock(return_value=graph)
     owner.hooks = CudaStageHooksV2(worker) if use_v2 else CudaStageHooksV1(worker)
@@ -340,7 +364,7 @@ def test_repeated_startup_rejects_different_hooks_without_recapture(
 ) -> None:
     worker, owner, graph, _stream, _health = capture_runtime
     worker._gr_gpu_stage_runner = owner
-    worker._gr_decode_capture_failures = {}
+    get_v2_runtime(worker).startup_failures = {}
     worker._beam_decode_graph = graph
     graph.select = Mock(return_value=graph)
     hooks = CudaStageHooksV1(worker) if use_v2 else CudaStageHooksV2(worker)
@@ -355,7 +379,7 @@ def test_repeated_startup_rejects_different_hooks_without_recapture(
     assert owner.hooks is hooks
     assert owner.graph is graph
     assert owner.closed
-    assert worker._gr_decode_capture_failures == {}
+    assert get_v2_runtime(worker).startup_failures == {}
     graph.select.assert_not_called()
     owner.capture_forward.assert_not_called()
     cast(Mock, stages.get_stage_runner).assert_not_called()
@@ -400,7 +424,9 @@ def test_startup_batch_plan_is_selected_by_entry_not_environment(
     )
     assert entry(worker)
     assert [call.args[1] for call in capture.call_args_list] == ([1, 2, 4] if v2 else [4])
-    assert hasattr(worker, "_gr_decode_capture_failures") is v2
+    assert (
+        getattr(getattr(worker, "_gr_v2_runtime", None), "startup_failures", None) is not None
+    ) is v2
 
 
 @pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
@@ -600,8 +626,8 @@ def test_startup_failure_is_local_to_batch(
     monkeypatch.setattr(startup, "_capture_batch", capture)
     assert capture_multibatch_forward(worker)
     assert captured == [1, 2, 4]
-    assert worker._gr_decode_capture_failures == {2: "capture unsupported"}
-    assert not worker._gr_async_decode_graph_capture_failed
+    assert get_v2_runtime(worker).startup_failures == {2: "capture unsupported"}
+    assert not _capture_failed(worker)
     assert not should_replay_decode_graph(worker, None, batch_size=2)
     assert should_replay_decode_graph(worker, SimpleNamespace(ready=True), batch_size=4)
     with pytest.raises(RuntimeError, match="not ready"):

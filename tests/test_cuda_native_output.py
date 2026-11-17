@@ -24,7 +24,7 @@ def test_finish_native_output_preserves_resources_and_bookkeeping(
     hooks_type: CudaStageHooksType, has_native_output: bool
 ) -> None:
     resources = {
-        "_gr_input_buffers": object(),
+        "_gr_v2_runtime": object(),
         "_beam_decode_graph": object(),
         "_gr_gpu_stage_runner_cache": {1: object()},
         "_beam_sessions": {"request": object()},

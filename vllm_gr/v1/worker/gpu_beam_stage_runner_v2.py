@@ -41,6 +41,7 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     _hidden_logits,
     should_replay_decode_graph,
 )
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import get_v2_runtime
 from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
 
 logger = init_logger(__name__)
@@ -59,7 +60,8 @@ class CudaStageHooksV2(CudaStageHooks):
 
         worker, beam = self.worker, owner.beam
         block_size = worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
-        inputs = getattr(worker, "_gr_input_buffers", None)
+        runtime = get_v2_runtime(worker)
+        inputs = runtime.inputs
         if inputs is None:
             inputs = V2InputBuffers(
                 beam.state.beam_width,
@@ -68,7 +70,7 @@ class CudaStageHooksV2(CudaStageHooks):
                 beam.state.device,
                 max_batch=beam.workspace.max_batch,
             )
-            worker._gr_input_buffers = inputs
+            runtime.inputs = inputs
         if (
             inputs.width != beam.state.beam_width
             or inputs.max_batch != beam.workspace.max_batch
@@ -108,21 +110,22 @@ class CudaStageHooksV2(CudaStageHooks):
         )
 
         worker = self.worker
+        runtime = get_v2_runtime(worker)
         batch_size = len(owner.bindings)
         cfg = _get_gr_config(worker)
         bucket = getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0)
         geometry = (
             (batch_size, owner.inputs.width, bucket) if bucket else (batch_size, owner.inputs.width)
         )
-        if geometry in getattr(worker, "_gr_runtime_decode_capture_failures", {}):
+        if geometry in runtime.runtime_failures:
             owner.graph = None
             return owner._forward()
         enabled = (
             not worker.model_config.enforce_eager
             and cfg.beam_graph_enabled
             and batch_size in cfg.beam_online_batch_sizes
-            and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
-            and batch_size not in getattr(worker, "_gr_decode_capture_failures", {})
+            and not runtime.capture_failed
+            and batch_size not in (runtime.startup_failures or {})
         )
         owner.graph = self.decode_graph(batch_size, owner.inputs.width) if enabled else None
         if owner.graph is not None and bucket:
@@ -132,11 +135,7 @@ class CudaStageHooksV2(CudaStageHooks):
         if (
             owner.graph is not None
             and not owner.graph.ready
-            and (
-                bucket
-                or owner.dynamic is not None
-                or getattr(worker, "_gr_dynamic_graphs_discarded", False)
-            )
+            and (bucket or owner.dynamic is not None or runtime.graphs_discarded)
         ):
             try:
                 owner.graph.capture(owner._forward_hidden, persistent_install=False)
@@ -147,10 +146,7 @@ class CudaStageHooksV2(CudaStageHooks):
                     raise RuntimeError("Decode capture did not leave capture mode") from error
                 torch.accelerator.synchronize(worker.device)
                 owner.graph.discard_selected()
-                failures = getattr(worker, "_gr_runtime_decode_capture_failures", None)
-                if failures is None:
-                    failures = worker._gr_runtime_decode_capture_failures = {}
-                failures[geometry] = str(error)
+                runtime.runtime_failures[geometry] = str(error)
                 owner.graph = None
                 logger.warning(
                     "GR runtime Decode capture unsupported; using eager for B=%d W=%d: %s",
@@ -321,8 +317,9 @@ def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -
         if graph is not None:
             raise RuntimeError("Unconfigured Decode shape has a published graph")
         return False
-    if requested and batch_size in getattr(worker, "_gr_decode_capture_failures", {}):
+    runtime = get_v2_runtime(worker)
+    if requested and batch_size in (runtime.startup_failures or {}):
         if graph is not None:
             raise RuntimeError("Decode capture failed but a graph is still published")
         return False
-    return should_replay_decode_graph(worker, graph)
+    return should_replay_decode_graph(worker, graph, capture_failed=runtime.capture_failed)

@@ -14,9 +14,11 @@ from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     install_decode_model,
 )
-from vllm_gr.v1.worker.gpu_beam_stage_runner import should_replay_decode_graph
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-from vllm_gr.v1.worker.gr_startup import capture_async_forward
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import should_replay_decode_graph_v2
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+    capture_multibatch_forward,
+    get_v2_runtime,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -28,6 +30,7 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
     worker.model_config.enforce_eager = False
     worker.model_config.max_model_len = 64
     worker._vllm_gr_config.beam_graph_enabled = True
+    worker._vllm_gr_config.beam_online_batch_sizes = (1,)
     worker._vllm_gr_config.beam_worker_decision = True
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=1)
@@ -50,7 +53,7 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
     original = worker.model
     if failure == "invalidated":
         with pytest.raises(RuntimeError) as raised:
-            capture_async_forward(worker, hooks_type=CudaStageHooksV2, allow_eager_fallback=True)
+            capture_multibatch_forward(worker, allow_eager_fallback=True)
         assert invalidations == [True]
         errors = []
         error: BaseException | None = raised.value
@@ -58,20 +61,20 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
             errors.append(str(error))
             error = error.__cause__ or error.__context__
         assert any("previous error during capture" in message for message in errors), errors
-        assert not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+        assert not get_v2_runtime(worker).capture_failed
         assert worker._gr_gpu_stage_runner.graph is None
         return
 
-    captured = capture_async_forward(worker, hooks_type=CudaStageHooksV2, allow_eager_fallback=True)
+    captured = capture_multibatch_forward(worker, allow_eager_fallback=True)
     owner = worker._gr_gpu_stage_runner
     assert owner.closed and not worker._beam_sessions
     assert worker.model is original
     assert not worker._beam_decode_graph.installed
     assert captured is (failure is None)
-    assert should_replay_decode_graph(worker, owner.graph) is captured
+    assert should_replay_decode_graph_v2(worker, owner.graph, batch_size=1) is captured
     if failure:
-        assert worker._gr_async_decode_graph_capture_failed
-        assert "not supported" in worker._gr_async_decode_graph_capture_error
+        assert get_v2_runtime(worker).capture_failed
+        assert "not supported" in get_v2_runtime(worker).capture_error
         assert not worker._beam_decode_graph.ready
         assert not worker._beam_graph_keys
     for token, position in [(3, 7), (2, 19)]:

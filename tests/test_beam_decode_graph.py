@@ -10,6 +10,10 @@ import pytest
 from vllm.config import CUDAGraphMode
 
 from vllm_gr.v1.worker import beam_decode_graph as shared
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+    V2RuntimeState,
+    get_v2_runtime,
+)
 
 
 def test_equal_token_counts_do_not_alias_different_beam_geometries() -> None:
@@ -64,7 +68,8 @@ def test_context_replacement_fails_before_graph_launch() -> None:
     [
         (False, None, None),
         (True, None, None),
-        (False, "_gr_input_buffers", "input storage changed"),
+        (False, "inputs", "input storage changed"),
+        (False, "_gr_v2_runtime", "runtime generation changed"),
         (False, "model", "model changed"),
     ],
 )
@@ -82,11 +87,12 @@ def test_replay_checks_captured_storage_and_model_before_launch(
     graph.wrapper = SimpleNamespace(concrete_cudagraph_entries={graph.descriptor: entry})
     graph.worker = SimpleNamespace(
         _beam_context=graph.context,
-        _gr_input_buffers=graph.input_buffers,
+        _gr_v2_runtime=V2RuntimeState(inputs=graph.input_buffers),
         model=graph.wrapper if installed else graph.original_model,
     )
+    graph.runtime = get_v2_runtime(graph.worker)
     if replacement is not None:
-        setattr(graph.worker, replacement, object())
+        setattr(graph.runtime if replacement == "inputs" else graph.worker, replacement, object())
         with pytest.raises(RuntimeError, match=message):
             graph.replay()
         entry.cudagraph.replay.assert_not_called()

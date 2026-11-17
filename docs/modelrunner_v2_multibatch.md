@@ -142,6 +142,80 @@ are unchanged. Frontend request guards and startup-heap leases retain their
 separate owner in `utils/engine_lifecycle.py`; these guard a different request
 lifetime, including when engines run in process.
 
+### V2 runtime generations and teardown prerequisites
+
+`gpu_model_runner_v2_resources.py` owns `V2RuntimeState`, reached through the
+Worker's single `_gr_v2_runtime` reference. Its object identity is the runtime
+generation. Fixed input tensors remain lazily allocated at the same capacities
+and addresses; graph bindings borrow the generation and its input storage.
+Replay and capture of another shape reject a different generation, changed
+storage or a replaced model; selecting an uncaptured shape cannot overwrite
+the binding used by previously captured shapes.
+Startup refusals, runtime shape refusals, capture diagnostics and dynamic-graph
+discard state belong to that generation. Repeated startup capture retains published failures and their diagnostics until
+the generation ends. A new runtime starts without its
+predecessor's refusal records. Dynamic adapter invalidation clears runtime
+refusals while retaining the existing startup-shape policy.
+
+| Resource | Owner and release rule |
+| --- | --- |
+| V2 fixed model inputs | Worker runtime; stage owners borrow views, stable until runtime cleanup |
+| Decode graphs and captured output | Shared Worker graph registry; replay overwrites output; stage hidden staging preserves values required by later sampling |
+| Startup/runtime capture records | V2 runtime generation; no independent Worker copies |
+| Dispatch metadata, control slots and hidden staging | Stage owner; retained through dispatch and output consumption |
+| Async output/retirement receipts | Output consumer retains the owner; a cached retirement receipt is removed only after consumption and release |
+| Context, sessions and postprocess workspace | Existing resource-specific owners; runtime cleanup requires released leases but retains these allocations |
+| Head layout cache | Model's LM head; weight-only load hooks refresh its existing storage |
+
+```mermaid
+flowchart LR
+    R["Worker V2 runtime generation"] --> I["Fixed input storage"]
+    R --> F["Capture and failure state"]
+    G["Decode graph registry"] -.->|"borrows generation and addresses"| R
+    S["Stage and async receipt"] -.->|"borrows inputs until released"| I
+    S -->|"existing event waits and end_session synchronization"| D["Released stage and consumed output"]
+    D -->|"checked before invalidation"| C["close_v2_runtime"]
+    C -->|"clears graph and runtime references"| R
+```
+
+`close_v2_runtime()` is a lifecycle operation, not a drain implementation.
+The serialized Worker/control caller must stop admitting work and consume its
+outputs first. Before changing references, cleanup checks the current and cached
+stage owners, any cached retirement output, and context/workspace leases. A
+stage must be closed, with no pending dispatch or busy output slot. A retirement
+receipt must already contain its output. Fused terminal release also requires
+successful native request cleanup. The output consumer sets a pending flag
+before releasing the GPU owner and clears it under the control lock after native
+cleanup succeeds. A live borrower raises before Prefill manager, graph, backend
+or model-hook teardown. Shared stage `release()` calls Beam `end_session()`,
+which waits for the final consumer event and synchronizes before marking the
+owner closed. Cleanup reuses that proof without adding GPU synchronization,
+polling or cancellation.
+
+| Lifecycle caller | Required boundary and ordering |
+| --- | --- |
+| Startup memory profiling | The V2 profile wrapper rejects a bound serving runtime; startup capture releases its dummy stage and checks GPU health. Native temporary KV teardown precedes GR cleanup. Partial capture must release its owner or cleanup rejects it. |
+| Full model load/replacement | The serialized Worker load/control caller must drain old GR dispatches and consumers. The load wrapper validates and clears the old runtime before backend teardown and native model loading. |
+| Load failure | Old runtime invalidation has completed before native load starts. Backend publication failures retain the existing rollback; partially created graph state cannot bypass the next cleanup check. |
+| Shutdown | The Worker shutdown/control caller must drain GR work and outputs. The wrapper checks runtime release before removing model hooks/backend or invoking native shutdown; a later native synchronization is not used as proof for earlier GR cleanup. |
+
+The installed vLLM V2 control paths are `GPUWorker.load_model()` to the patched
+runner load method, and `WorkerProc.shutdown()` to `GPUWorker.shutdown()` and
+the patched runner shutdown method. EngineCore shutdown normally processes
+remaining work before executor teardown. None of these names alone proves GR
+release: the guard observes the release established by the output consumer's
+`AsyncGPUBeamOutput.get_output()` or `AsyncGRRetireOutput.get_output()` and the
+shared stage's `release()`/Beam `end_session()` chain. A forced or out-of-order
+lifecycle call with a live GR borrower is rejected rather than assuming native
+shutdown will synchronize later.
+
+These are GR release checks, not a global admission lock or a substitute for
+the caller's native-request shutdown protocol. Repeated cleanup is harmless.
+Externally retained consumed receipts keep their cached results valid. V1 keeps
+stage-owned inputs and its own graph policy. Weight-only reload keeps the
+runtime and uses the model-owned head-cache refresh path. Directory placement
+and allocation/capture policy are unchanged.
+
 ### V1 compatibility boundary
 
 ModelRunner V1 uses the GR Prefill grid, clamps capture to the per-request

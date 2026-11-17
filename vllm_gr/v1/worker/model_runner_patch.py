@@ -241,18 +241,18 @@ def make_shutdown_with_constraint_backend(
 
         def shutdown_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
             del args, kwargs
-            _remove_model_bytecode_hooks(self)
             if close_runtime is not None:
                 close_runtime(self)
+            _remove_model_bytecode_hooks(self)
             close_constraint_backend(self)
 
     else:
 
         @wraps(original)
         def shutdown_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
-            _remove_model_bytecode_hooks(self)
             if close_runtime is not None:
                 close_runtime(self)
+            _remove_model_bytecode_hooks(self)
             close_constraint_backend(self)
             return original(self, *args, **kwargs)
 

@@ -95,6 +95,7 @@ def test_failed_hooks_construction_preserves_admission(failure, stale_cache):
     worker = admission_worker()
     cache = {1: object()} if stale_cache else {}
     worker._gr_gpu_stage_runner_cache = cache
+    graph = worker._beam_decode_graph = Mock()
     before_cache = dict(cache)
     hooks_type = Incomplete if failure == "abstract" else BrokenConstructor
     error = TypeError if failure == "abstract" else RuntimeError
@@ -108,7 +109,7 @@ def test_failed_hooks_construction_preserves_admission(failure, stale_cache):
     assert not getattr(worker, "_beam_sessions", {})
     assert getattr(worker, "_gr_gpu_stage_runner", None) is None
     assert cache == before_cache
-    assert not getattr(worker, "_gr_dynamic_graphs_discarded", False)
+    graph.clear.assert_not_called()
 
     owner = get_stage_runner(worker, dispatch(metadata()), hooks_type=CudaStageHooksV1)
     assert context.registry.num_active_sessions == 1

@@ -24,6 +24,8 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import get_v2_runtime
+
 _SESSIONS = ((1024, 3), (900, 3), (900, 3), (1024, 3))
 _EXTENSIONS = {
     "graph": "tests.st.test_modelrunner_v2_stage_parity_st.OneRecV2ParityWorkerExtension",
@@ -130,10 +132,8 @@ class OneRecV2ParityWorkerExtension:
             graph = runner._gr_gpu_stage_runner.graph
             snapshot.update(
                 decode_graph_ready=graph is not None and graph.ready,
-                decode_capture_failed=bool(
-                    getattr(runner, "_gr_async_decode_graph_capture_failed", False)
-                ),
-                decode_capture_error=getattr(runner, "_gr_async_decode_graph_capture_error", None),
+                decode_capture_failed=bool(get_v2_runtime(runner).capture_failed),
+                decode_capture_error=get_v2_runtime(runner).capture_error,
                 counts=dict(self._v2_parity_counts),
                 prefill_tokens=self._v2_prefill_tokens,
                 prefill_stats=get_beam_graph_runtime_stats(self),

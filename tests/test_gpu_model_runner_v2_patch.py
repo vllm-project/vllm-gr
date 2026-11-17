@@ -15,6 +15,7 @@ from vllm_gr.v1.worker import gpu_model_runner_v2_patch as v2
 from vllm_gr.v1.worker import gpu_model_runner_v2_resources as resources
 from vllm_gr.v1.worker import gr_gc as _gc_runtime
 from vllm_gr.v1.worker import model_runner_contracts as _patch_contracts
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import get_v2_runtime
 
 
 def test_discover_worker_runners_returns_v2_class() -> None:
@@ -225,7 +226,53 @@ def test_capture_order_and_failure_propagation(
         expected.append(call.freeze(worker))
     assert events.mock_calls == expected
     if beam_enabled:
-        assert not worker._gr_async_decode_graph_capture_failed
+        assert not get_v2_runtime(worker).capture_failed
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_repeated_capture_preserves_published_decode_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.attention.backends import beam_prefix_calibrate
+    from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as prefill
+    from vllm_gr.v1.worker import gr_startup
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+
+    worker = SimpleNamespace(
+        device="cuda",
+        _vllm_gr_config=SimpleNamespace(beam_max_width=4, beam_online_batch_sizes=(1,)),
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1)),
+        cudagraph_manager=object(),
+    )
+    reason = "Decode capture refused"
+
+    def refuse(runner: Any, batch: int, **kwargs: Any) -> str:
+        assert runner is worker
+        runner._gr_gpu_stage_runner = SimpleNamespace(closed=True, hooks=CudaStageHooksV2(worker))
+        return reason
+
+    capture = Mock(side_effect=refuse)
+    monkeypatch.setattr(gr_startup, "_capture_enabled", Mock(return_value=True))
+    monkeypatch.setattr(gr_startup, "_capture_batch", capture)
+    monkeypatch.setattr(beam_prefix_calibrate, "ensure_prefix_calibration", Mock())
+    monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", Mock())
+    monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", Mock())
+    monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (8192, 16384))
+
+    def native(runner: Any) -> int:
+        return 17
+
+    wrapped = v2.make_patched_capture_model_v2(native)
+    for _ in range(2):
+        assert wrapped(worker) == 17
+        runtime = get_v2_runtime(worker)
+        assert runtime.startup_failures == {1: reason}
+        assert runtime.capture_failed
+        assert runtime.capture_error == reason
+
+    capture.assert_called_once_with(
+        worker, 1, hooks_type=CudaStageHooksV2, allow_eager_fallback=True
+    )
 
 
 def test_stage_hooks_require_native_prefill_output_and_scheduler_kv() -> None:
@@ -364,8 +411,16 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
         assert manager.pool == native.current_platform.get_global_graph_pool()
         manager._capture_mem_samples.extend([10 * mib, 2 * mib])
         worker._beam_decode_graph = graph
-        worker._gr_gpu_stage_runner = object()
-        worker._gr_input_buffers = object()
+        from threading import Lock
+
+        worker._gr_gpu_stage_runner = SimpleNamespace(
+            closed=True,
+            pending=None,
+            control_busy=[],
+            control_lock=Lock(),
+            terminal_cleanup_pending=False,
+        )
+        get_v2_runtime(worker).inputs = object()
         worker._beam_context = object()
         events.append("capture")
         if failure:
@@ -402,7 +457,7 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
         hasattr(worker, n)
         for n in (
             "_gr_gpu_stage_runner",
-            "_gr_input_buffers",
+            "_gr_v2_runtime",
             "_beam_context",
         )
     )

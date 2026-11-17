@@ -12,6 +12,10 @@ import torch
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 from vllm_gr.v1.worker.gpu_dynamic_beam import uses_dynamic_beam
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+    V2RuntimeState,
+    get_v2_runtime,
+)
 
 
 @pytest.mark.parametrize(
@@ -53,13 +57,13 @@ def test_discard_dynamic_graphs_drops_runtime_capture_refusals():
     graph = Mock()
     worker = SimpleNamespace(
         _beam_decode_graph=graph,
-        _gr_runtime_decode_capture_failures={(1, 4): "capture refused"},
+        _gr_v2_runtime=V2RuntimeState(runtime_failures={(1, 4): "capture refused"}),
     )
     context = SimpleNamespace(registry=SimpleNamespace(num_active_sessions=0))
     discard_dynamic_graphs(worker, context)
     graph.clear.assert_called_once()
-    assert worker._gr_dynamic_graphs_discarded
-    assert not hasattr(worker, "_gr_runtime_decode_capture_failures")
+    assert get_v2_runtime(worker).graphs_discarded
+    assert not get_v2_runtime(worker).runtime_failures
 
 
 def test_dynamic_owner_released_while_gc_frozen():
@@ -129,7 +133,7 @@ def test_runtime_capture_recovery(monkeypatch, failure):
         with pytest.raises(RuntimeError):
             hooks.decode_logits(owner)
         owner._forward.assert_not_called()
-        assert not getattr(worker, "_gr_runtime_decode_capture_failures", {})
+        assert not get_v2_runtime(worker).runtime_failures
         return
     assert hooks.decode_logits(owner) == "eager"
     assert owner.graph is None
@@ -141,7 +145,7 @@ def test_runtime_capture_recovery(monkeypatch, failure):
     owner.inputs.width = 2
     assert hooks.decode_logits(owner) == "eager"
     assert graph.capture.call_count == 2
-    assert set(worker._gr_runtime_decode_capture_failures) == {(1, 4), (1, 2)}
+    assert set(get_v2_runtime(worker).runtime_failures) == {(1, 4), (1, 2)}
 
 
 pytestmark = pytest.mark.cpu_test

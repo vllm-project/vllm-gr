@@ -198,6 +198,8 @@ patches:
       - tests/platforms/test_import_isolation.py
       - tests/kernels/test_beam_batch_switch_reuse.py
       - tests/test_gpu_model_runner_v2_patch.py
+      - tests/v1/worker/test_v2_runtime_resources.py
+      - tests/kernels/test_gpu_beam_stage_lifecycle.py
       - tests/kernels/test_gr_prefill_v2.py
       - tests/kernels/test_v2_multibatch_graphs.py
       - tests/kernels/test_beam_pool_recapture.py

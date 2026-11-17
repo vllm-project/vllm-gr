@@ -331,6 +331,17 @@ and Decode capture policy remain active when this cache is disabled.
   Coverage: `tests/test_model_runner_common.py`,
   `tests/test_model_runner_stage_binding.py`, `tests/test_model_runner_patch.py`,
   `tests/platforms/test_import_isolation.py`, and the existing CUDA lifecycle cases.
+- V2 runtime ownership: `gpu_model_runner_v2_resources.py` owns one
+  `V2RuntimeState` per Worker generation, containing fixed inputs and capture
+  records. Graphs validate their borrowed generation before replay. Shared
+  stage/cache and model/head ownership remain separate. Lifecycle cleanup checks
+  released stages, fused terminal native cleanup, consumed retirement receipts
+  and context/workspace leases before any teardown. Existing `end_session` event synchronization supplies the
+  GPU release proof; no new GPU fence or dispatch wait is added. Successful
+  cleanup removes the retired receipt cache together with runtime references.
+  Coverage: `tests/v1/worker/test_v2_runtime_resources.py`,
+  `tests/kernels/test_gpu_beam_stage_lifecycle.py`,
+  `tests/kernels/test_v2_multibatch_graphs.py`, and existing profiling cases.
 - Native output completion: the shared CUDA stage calls
   `CudaStageHooksV1/V2.finish_native_output()` after device output submission and
   before clearing its pending dispatch. The hooks own the native result field

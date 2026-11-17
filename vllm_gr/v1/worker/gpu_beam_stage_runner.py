@@ -256,7 +256,9 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         return out
 
 
-def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
+def should_replay_decode_graph(
+    worker: Any, graph: Any, *, capture_failed: bool | None = None
+) -> bool:
     """Resolve decode graph replay, preserving unexpected-missing invariants."""
     from vllm_gr.v1.worker.gr_context import (
         _get_gr_config,
@@ -265,7 +267,9 @@ def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
     requested = not worker.model_config.enforce_eager and _get_gr_config(worker).beam_graph_enabled
     if not requested:
         return False
-    if getattr(worker, "_gr_async_decode_graph_capture_failed", False):
+    if capture_failed is None:
+        capture_failed = getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+    if capture_failed:
         if graph is not None:
             raise RuntimeError("Decode capture failed but a graph is still published")
         return False
@@ -569,7 +573,7 @@ class GPUBeamStageRunner:
         self.closed = False
         self.cancelled = False
         self.terminal_release_requested = False
-        self.terminal_release_claimed = False
+        self.terminal_cleanup_pending = False
         self.execution_error: Exception | None = None
         self.dynamic: Any = None
         self.unconstrained_topk_scratch: UnconstrainedTopKScratch | None = None
@@ -1111,13 +1115,13 @@ class GPUBeamStageRunner:
         with self.control_lock:
             ready = (
                 self.terminal_release_requested
-                and not self.terminal_release_claimed
+                and not self.terminal_cleanup_pending
                 and not self.closed
                 and self.pending is None
                 and not any(self.control_busy)
             )
             if ready:
-                self.terminal_release_claimed = True
+                self.terminal_cleanup_pending = True
         if not ready:
             return False
         self.release(
@@ -1131,6 +1135,10 @@ class GPUBeamStageRunner:
         cleanup = SchedulerOutput.make_empty()
         cleanup.finished_req_ids.update(binding.native_request_id for binding in self.bindings)
         self.hooks.consume_native_state(cleanup)
+        # release() closes the GPU owner before this native bookkeeping.
+        # Publish the consumer's completion only after native cleanup succeeds.
+        with self.control_lock:
+            self.terminal_cleanup_pending = False
         return True
 
     @torch.inference_mode()  # type: ignore[misc]
@@ -1545,7 +1553,7 @@ def get_stage_runner(
         adapter._dispatch_session, adapter._validated_dispatch = None, None
         adapter.closed, adapter.cancelled = False, False
         adapter.terminal_release_requested = False
-        adapter.terminal_release_claimed = False
+        adapter.terminal_cleanup_pending = False
         adapter.execution_error = None
         adapter.prepared = None
         adapter.constraint_steps = beam.state.num_generated_tokens[: view.batch_size]

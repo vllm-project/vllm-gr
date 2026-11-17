@@ -32,6 +32,7 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import (
 from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
     capture_multibatch_forward,
     close_v2_runtime,
+    get_v2_runtime,
 )
 from vllm_gr.v1.worker.model_runner_patch import make_load_model_with_constraint_backend
 
@@ -53,7 +54,7 @@ def test_runtime_recapture_refusal_preserves_live_request(monkeypatch):
     graph = worker._beam_decode_graph
     assert graph.ready
     graph.clear()
-    worker._gr_dynamic_graphs_discarded = True
+    get_v2_runtime(worker).graphs_discarded = True
     m = metadata()
     scheduled = dispatch(m)
     owner = get_stage_runner(worker, scheduled, hooks_type=CudaStageHooksV2)
@@ -139,9 +140,9 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     # The runtime capture is refused: eager serves the shape and records the one
     # geometry whose graph could not be built.
     worker._beam_decode_graph.clear()
-    worker._gr_dynamic_graphs_discarded = True
+    get_v2_runtime(worker).graphs_discarded = True
     assert serve_decode().graph is None
-    assert list(worker._gr_runtime_decode_capture_failures) == [(1, 4)]
+    assert list(get_v2_runtime(worker).runtime_failures) == [(1, 4)]
 
     # A complete load replaces this runtime; the record describes graphs that
     # only the retired runtime owned and must not outlive it.  Drive the real
@@ -164,7 +165,7 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     make_load_model_with_constraint_backend(native_load, close_runtime=close_v2_runtime)(worker)
     assert loaded == [worker]
     assert isinstance(worker.constraint_backend.get(), CUDAConstraintBackend)
-    assert not hasattr(worker, "_gr_runtime_decode_capture_failures")
+    assert getattr(worker, "_gr_v2_runtime", None) is None
 
     # The replacement recaptures the same geometry and really replays it.
     refuse[0] = False
@@ -216,7 +217,7 @@ def test_all_batches_capture_at_startup_and_reuse_storage(
     assert {s.batch_size for s in graph._bindings} == (
         set(sizes) - {sizes[1]} if fail_shape else set(sizes)
     )
-    buffers = worker._gr_input_buffers
+    buffers = get_v2_runtime(worker).inputs
     addresses = (
         buffers.device.data_ptr(),
         buffers.input_ids.data_ptr(),
