@@ -34,19 +34,21 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
+    GRAdmissionError,
 )
-from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, GRSessionStatus
+from vllm_gr.v1.beam.dispatch import (
+    GR_BATCH_RESULT_ATTR,
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_STAGE_OUTPUT_ATTR,
+)
+from vllm_gr.v1.core.sched.gr_async_scheduler import (
+    consume_gr_retirement,
+)
+from vllm_gr.v1.core.sched.session import GRResourceStatus, GRSessionStatus
 from vllm_gr.v1.engine.core import _handle_submit_gr_session
 from vllm_gr.v1.engine.engine_core_patch import (
     apply_engine_core_request_patches,
     make_patched_engine_init,
-)
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GR_BATCH_RESULT_ATTR,
-    GR_RETIRE_OUTPUT_ATTR,
-    GR_STAGE_OUTPUT_ATTR,
-    GRAdmissionError,
-    consume_gr_retirement,
 )
 
 scheduler = _scheduler_fixture

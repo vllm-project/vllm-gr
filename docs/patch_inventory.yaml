@@ -173,17 +173,35 @@ patches:
   - id: GR-PATCH-010
     scope: core
     backend_id: null
-    owner: vllm_gr/v1/engine/engine_core_patch.py and gr_async_scheduler.py
-    installer: vllm_gr.v1.engine.engine_core_patch.apply_scheduler_patch
-    activation: the EngineCore patch plan detects scheduler metadata propagation is absent
+    owner: vllm_gr/v1/core/sched/scheduler_patch.py and gr_async_scheduler.py
+    shared_helpers: vllm_gr/v1/core/sched/session.py, vllm_gr/v1/beam/dispatch.py
+    installer: vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch
+    activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper
     validator_or_test:
       - vllm_gr.patch._validate_scheduler_patch
       - tests/contract/test_engine_core_protocol_contracts.py
     process_roles: [engine_core]
-    target: vllm.v1.core.sched.scheduler.Scheduler.schedule
+    target: Scheduler.schedule and Scheduler.update_from_output in vllm.v1.core.sched.scheduler
     risk: critical
     contract: scheduler-contract
     removal_condition: explicit upstream scheduler metadata hooks carry grouped Beam state
+
+  - id: GR-PATCH-022
+    scope: core
+    backend_id: null
+    owner: vllm_gr/v1/core/kv_cache_utils.py
+    installer: vllm_gr.v1.core.kv_cache_utils.apply_kv_hash_memo_patch
+    activation: the EngineCore plan detects a missing block or chain hash wrapper or a stale EngineCore factory binding
+    validator_or_test:
+      - vllm_gr.patch._validate_kv_hash_memo_patch
+      - tests/v1/core/test_gr_plain_hash_chain.py
+      - tests/test_patch_initialization.py::test_kv_hash_memo_patch_equivalence_and_hits
+      - tests/test_patch_initialization.py::test_kv_hash_memo_plan_repairs_partial_install
+    process_roles: [engine_core]
+    target: vllm.v1.core.kv_cache_utils.hash_block_tokens and get_request_block_hasher, plus vllm.v1.engine.core.get_request_block_hasher
+    risk: high
+    contract: prefix-cache-hash-equivalence
+    removal_condition: upstream provides equivalent prefix hashing for repeated prompts
 
   - id: GR-PATCH-011
     scope: backend

@@ -31,6 +31,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchRequest,
     BeamBatchResult,
+    GRAdmissionError,
 )
 
 logger = init_logger(__name__)
@@ -120,8 +121,6 @@ def _submission_failure(exc: Exception) -> BeamBatchFailure:
     anything, which makes the exception a description of the request rather
     than of the engine. Anything else here is the transport failing.
     """
-    from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
-
     code = ADMISSION_REJECTED_CODE if isinstance(exc, GRAdmissionError) else "submit_failed"
     return BeamBatchFailure(code=code, message=str(exc), item_index=None)
 

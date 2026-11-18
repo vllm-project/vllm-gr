@@ -48,9 +48,11 @@ from vllm_gr.v1.beam.batch_contracts import (
 )
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
-from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspaceKey
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.beam.dispatch import (
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_RETIRE_RESULT_ATTR,
+    GR_STAGE_OUTPUT_ATTR,
+    GR_WORKER_RESULT_ATTR,
     GRDispatchSession,
     GRExecutionCapacity,
     GRRetireMetadata,
@@ -61,12 +63,8 @@ from vllm_gr.v1.engine.beam_search_v1 import (
     validate_dispatch,
     validate_dispatch_session,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GR_RETIRE_OUTPUT_ATTR,
-    GR_RETIRE_RESULT_ATTR,
-    GR_STAGE_OUTPUT_ATTR,
-    GR_WORKER_RESULT_ATTR,
-)
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.worker.cuda.beam_final_output import GPUBeamFinalOutput
 from vllm_gr.v1.worker.cuda.beam_search_runner import (
     BeamBatchSearchRunner,

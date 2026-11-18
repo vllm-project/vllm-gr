@@ -23,7 +23,7 @@ from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
-from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
+from vllm_gr.v1.beam.dispatch import GRStageKind
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     get_stage_runner,
 )

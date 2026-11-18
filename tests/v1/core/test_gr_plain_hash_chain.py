@@ -11,7 +11,7 @@ import pytest
 from vllm.utils.hashing import sha256 as _hash
 from vllm.v1.core import kv_cache_utils
 
-from vllm_gr.v1.engine import engine_core_patch
+from vllm_gr.v1.core import kv_cache_utils as gr_kv_cache_utils
 
 
 def _request(length: int) -> Any:
@@ -30,13 +30,13 @@ def _direct_block_hash(tokens: Any, parent: bytes, extra_keys: Any) -> bytes:
     """Same encoding the memo computes, without going through the wrapper."""
     return cast(
         bytes,
-        engine_core_patch._hash_block_bytes(
-            engine_core_patch._token_bytes(tokens), parent, extra_keys
+        gr_kv_cache_utils._hash_block_bytes(
+            gr_kv_cache_utils._token_bytes(tokens), parent, extra_keys
         ),
     )
 
 
-def _factory(monkeypatch: Any, block_size: int, hash_fn: Any = _hash) -> Any:
+def _factory(block_size: int, hash_fn: Any = _hash) -> Any:
     if getattr(kv_cache_utils, "NONE_HASH", None) is None:
         kv_cache_utils.init_none_hash(_hash)
     fallback = Mock(return_value=[])
@@ -45,20 +45,14 @@ def _factory(monkeypatch: Any, block_size: int, hash_fn: Any = _hash) -> Any:
         BlockHash=kv_cache_utils.BlockHash,
         NONE_HASH=kv_cache_utils.NONE_HASH,
     )
-    # Installation also updates core's from-import alias; restore it after the test.
-    from vllm.v1.engine import core
-
-    monkeypatch.setattr(core, "get_request_block_hasher", core.get_request_block_hasher)
-    engine_core_patch._apply_block_hash_chain_memo_patch(proxy)
+    gr_kv_cache_utils._apply_block_hash_chain_memo_patch(proxy)
     return proxy.get_request_block_hasher(block_size, hash_fn), fallback, proxy
 
 
 @pytest.mark.parametrize("block_size", [4, 16, 32])  # type: ignore[misc]
 @pytest.mark.parametrize("length", [0, 3, 4, 15, 16, 17, 1023, 1024, 1025])  # type: ignore[misc]
-def test_gr_chain_matches_direct_buffer_encoding(
-    monkeypatch: Any, block_size: int, length: int
-) -> None:
-    hasher, fallback, _ = _factory(monkeypatch, block_size)
+def test_gr_chain_matches_direct_buffer_encoding(block_size: int, length: int) -> None:
+    hasher, fallback, _ = _factory(block_size)
     request = _request(length)
     expected: list[bytes] = []
     parent = None
@@ -88,10 +82,8 @@ def test_gr_chain_matches_direct_buffer_encoding(
         ("prompt_embeds", object()),
     ],
 )  # type: ignore[misc]
-def test_extra_keys_and_incremental_requests_fall_back(
-    monkeypatch: Any, field: str, value: Any
-) -> None:
-    hasher, fallback, _ = _factory(monkeypatch, 16)
+def test_extra_keys_and_incremental_requests_fall_back(field: str, value: Any) -> None:
+    hasher, fallback, _ = _factory(16)
     request = _request(64)
     setattr(request, field, value)
     hasher(request)
@@ -101,7 +93,7 @@ def test_extra_keys_and_incremental_requests_fall_back(
 def test_failed_hash_does_not_publish_partial_chain(monkeypatch: Any) -> None:
     calls = 0
 
-    original = engine_core_patch._hash_block_bytes
+    original = gr_kv_cache_utils._hash_block_bytes
 
     def fail_second(*args: Any) -> bytes:
         nonlocal calls
@@ -110,11 +102,11 @@ def test_failed_hash_does_not_publish_partial_chain(monkeypatch: Any) -> None:
             raise ValueError("hash failed")
         return cast(bytes, original(*args))
 
-    monkeypatch.setattr(engine_core_patch, "_hash_block_bytes", fail_second)
-    hasher, _, proxy = _factory(monkeypatch, 16)
+    monkeypatch.setattr(gr_kv_cache_utils, "_hash_block_bytes", fail_second)
+    hasher, _, proxy = _factory(16)
     with pytest.raises(ValueError, match="hash failed"):
         hasher(_request(64))
-    assert engine_core_patch._CHAIN_FALLBACK_ACTIVE is False
+    assert gr_kv_cache_utils._CHAIN_FALLBACK_ACTIVE is False
     assert not proxy.get_request_block_hasher._gr_chain_memo_entries
     assert len(hasher(_request(64))) == 4
 
@@ -130,8 +122,8 @@ class _NoTokenCopy(np.ndarray):  # type: ignore[misc]
         raise AssertionError("token list copy")
 
 
-def test_chain_reads_views_without_token_copies(monkeypatch: pytest.MonkeyPatch) -> None:
-    hasher, _, _ = _factory(monkeypatch, 16)
+def test_chain_reads_views_without_token_copies() -> None:
+    hasher, _, _ = _factory(16)
     request = _request(64)
     request.all_token_ids = request.all_token_ids.view(_NoTokenCopy)
     first = hasher(request)
@@ -158,8 +150,8 @@ def test_block_memo_reads_views_without_token_copies(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(core, "get_request_block_hasher", core.get_request_block_hasher)
     monkeypatch.setattr(kv_cache_utils, "get_request_block_hasher", lambda *_: Mock())
     monkeypatch.setattr(kv_cache_utils, "hash_block_tokens", lambda *_: None)
-    monkeypatch.setattr(engine_core_patch, "_CHAIN_FALLBACK_ACTIVE", False)
-    engine_core_patch.apply_kv_hash_memo_patch()
+    monkeypatch.setattr(gr_kv_cache_utils, "_CHAIN_FALLBACK_ACTIVE", False)
+    gr_kv_cache_utils.apply_kv_hash_memo_patch()
     tokens = _request(16).all_token_ids.view(_NoTokenCopy)
     fn = kv_cache_utils.hash_block_tokens
     first = fn(_hash, b"parent", tokens, ("salt",))
@@ -170,9 +162,9 @@ def test_block_memo_reads_views_without_token_copies(monkeypatch: pytest.MonkeyP
     assert fn(_hash, b"parent", tokens, ("salt",)) != first
 
 
-def test_python_list_tokens_use_the_same_chain_encoding(monkeypatch: Any) -> None:
+def test_python_list_tokens_use_the_same_chain_encoding() -> None:
     """Native list token storage normalizes instead of raising in hashlib."""
-    hasher, _, _ = _factory(monkeypatch, 16)
+    hasher, _, _ = _factory(16)
     array_request = _request(64)
     list_request = SimpleNamespace(
         all_token_ids=list(range(100000, 100064)),
@@ -187,11 +179,11 @@ def test_python_list_tokens_use_the_same_chain_encoding(monkeypatch: Any) -> Non
     assert hasher(list_request) == expected
 
 
-def test_non_default_hash_function_falls_back(monkeypatch: Any) -> None:
+def test_non_default_hash_function_falls_back() -> None:
     """A configured non-sha256 algorithm keeps the native implementation."""
     from vllm.utils.hashing import sha256_cbor
 
-    hasher, fallback, _ = _factory(monkeypatch, 16, sha256_cbor)
+    hasher, fallback, _ = _factory(16, sha256_cbor)
     request = _request(64)
     hasher(request)
     fallback.assert_called_once_with(request)
@@ -212,10 +204,10 @@ def test_non_default_hash_serializers_match_python_tokens(
         kv_cache_utils, "get_request_block_hasher", kv_cache_utils.get_request_block_hasher
     )
     monkeypatch.setattr(kv_cache_utils, "hash_block_tokens", kv_cache_utils.hash_block_tokens)
-    monkeypatch.setattr(engine_core_patch, "_CHAIN_FALLBACK_ACTIVE", False)
+    monkeypatch.setattr(gr_kv_cache_utils, "_CHAIN_FALLBACK_ACTIVE", False)
     if getattr(kv_cache_utils, "NONE_HASH", None) is None:
         kv_cache_utils.init_none_hash(_hash)
-    engine_core_patch.apply_kv_hash_memo_patch()
+    gr_kv_cache_utils.apply_kv_hash_memo_patch()
     hasher = kv_cache_utils.get_request_block_hasher(4, getattr(hashing, algorithm))
     array_request = _request(9)
     list_request = _request(9)

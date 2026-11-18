@@ -22,14 +22,14 @@ from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
-from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.beam.dispatch import (
+    GR_STAGE_OUTPUT_ATTR,
     GRDeviceStateRef,
     GRStageKind,
     GRStageMetadata,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.worker.cuda.beam_search_runner import (
     BeamBatchSearchRunner,
     BeamSearchRunner,

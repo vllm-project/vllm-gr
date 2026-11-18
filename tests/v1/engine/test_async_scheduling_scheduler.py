@@ -4,6 +4,8 @@
 """Asynchronous scheduling admission/retirement against the installed native AsyncScheduler."""
 
 import json
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from typing import Any
@@ -15,6 +17,7 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -25,18 +28,22 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tests.helpers.beam_requests import make_batch_request
-from vllm_gr.v1.engine.beam_search_v1 import (
-    GRResourceStatus,
-    GRRetireResult,
-    GRWorkerResult,
+from vllm_gr.v1.beam.batch_contracts import (
+    BeamBatchOutput,
+    BeamBatchResult,
+    BeamOutputSequence,
+    BeamRequestOutput,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import (
+from vllm_gr.v1.beam.dispatch import (
     GR_RETIRE_OUTPUT_ATTR,
     GR_RETIRE_RESULT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
-    consume_gr_retirement,
+    GRRetireResult,
+    GRWorkerResult,
 )
+from vllm_gr.v1.core.sched.gr_async_scheduler import consume_gr_retirement
+from vllm_gr.v1.core.sched.session import GRResourceStatus
 
 pytestmark = [
     pytest.mark.cpu_test,
@@ -52,7 +59,7 @@ def scheduler(tmp_path, request):
     if current_platform.device_type == "npu":
         pytest.skip("V1 async scheduler tests are temporarily disabled on NPU")
 
-    from vllm_gr.v1.engine.engine_core_patch import apply_scheduler_patch
+    from vllm_gr.v1.core.sched.scheduler_patch import apply_scheduler_patch
 
     apply_scheduler_patch()
     from vllm_gr.v1.beam.token_buffer import (
@@ -478,6 +485,55 @@ def test_native_progress_retains_request_and_suppresses_placeholders(scheduler, 
     assert not session._kv_dispatch_leases
 
 
+def _successful_stage_receipt(scheduled):
+    (stage,) = getattr(scheduled, GR_STAGE_OUTPUT_ATTR).values()
+    request = stage.session_init
+    sequences = tuple(
+        BeamOutputSequence((4 + rank,), -float(rank), (0,), "length", None)
+        for rank in range(request.output_options.num_return_sequences)
+    )
+    terminal = BeamBatchResult(
+        request.protocol_version,
+        request.batch_id,
+        BeamBatchOutput((BeamRequestOutput(0, stage.session_id, sequences),)),
+        failure=None,
+    )
+    output = receipt(scheduled, released=False)
+    results = getattr(output, GR_WORKER_RESULT_ATTR)
+    results[stage.session_id] = replace(results[stage.session_id], terminal_result=terminal)
+    return output
+
+
+@pytest.mark.l2
+def test_spawned_worker_round_trips_dispatch_and_retirement(scheduler):
+    session = add(scheduler, "A", n=1)
+    stage = scheduler.schedule()
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        output = pool.submit(_successful_stage_receipt, stage).result(timeout=120)
+        pending = scheduler.update_from_output(stage, output)
+        assert not any(out.finished for group in pending.values() for out in group.outputs)
+        assert not session._terminal_emitted
+        retirement = scheduler.schedule()
+        release = pool.submit(release_receipt, retirement).result(timeout=120)
+        published = scheduler.update_from_output(retirement, release)
+    (out,) = [out for group in published.values() for out in group.outputs]
+    assert out.finish_reason == FinishReason.LENGTH and out.request_id == "A"
+    result = out.kv_transfer_params["gr_batch_result"]
+    assert result.batch_id == "A" and result.failure is None
+    (item,) = result.output.items
+    assert (item.item_index, item.request_id) == (0, "A")
+    assert [(seq.token_ids, seq.cumulative_logprob) for seq in item.sequences] == [
+        ((4,), 0.0),
+        ((5,), -1.0),
+        ((6,), -2.0),
+        ((7,), -3.0),
+    ]
+    assert session._terminal_emitted
+    assert session.resource_status is GRResourceStatus.CLOSED
+
+
 def test_duplicate_and_old_generation_do_not_consume_new_placeholders(scheduler):
     first_owner = add(scheduler, "A", n=1)
     old = scheduler.schedule()
@@ -510,7 +566,7 @@ def test_duplicate_and_old_generation_do_not_consume_new_placeholders(scheduler)
 def test_active_receipt_failure_requires_retirement_and_preserves_cancel(
     scheduler, fault, cancelled
 ):
-    from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
+    from vllm_gr.v1.core.sched.session import GRSessionStatus
 
     session = add(scheduler, "A", n=1)
     scheduled = scheduler.schedule()

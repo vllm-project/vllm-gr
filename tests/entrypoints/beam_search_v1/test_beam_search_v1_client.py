@@ -9,7 +9,7 @@ import threading
 import weakref
 from types import SimpleNamespace
 from typing import Any, NoReturn, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from vllm.exceptions import VLLMValidationError
@@ -34,6 +34,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchRequest,
     BeamBatchResult,
+    GRAdmissionError,
 )
 
 
@@ -440,6 +441,34 @@ def test_terminal_failure_precedes_tokenizer_access(online: bool) -> None:
             call = OfflineBeamSearchRequest([[1, 2]], object())
         client.build_output(call, _request(), result)
     assert caught.value.failure is failure
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("admission", [False, True])  # type: ignore[misc]
+def test_submission_failure_classification(online: bool, admission: bool) -> None:
+    from tests.helpers.beam_requests import make_batch_request
+
+    error = GRAdmissionError("capacity exceeded") if admission else RuntimeError("transport failed")
+    engine = SimpleNamespace(
+        submit_gr_session=AsyncMock(side_effect=error) if online else Mock(side_effect=error),
+        abort_gr_session=AsyncMock() if online else Mock(),
+        release_gr_session=AsyncMock() if online else Mock(),
+    )
+    request = make_batch_request()
+    with pytest.raises(VLLMValidationError if admission else BeamSearchEngineError) as caught:
+        if online:
+            asyncio.run(
+                AsyncBeamSearchClient(SimpleNamespace(engine_client=engine)).submit_once(request)
+            )
+        else:
+            BeamSearchClient(SimpleNamespace(llm_engine=engine)).submit_once(request)
+
+    assert caught.value.__cause__ is error
+    assert str(caught.value) == str(error)
+    if isinstance(caught.value, BeamSearchEngineError):
+        assert caught.value.failure.code == "submit_failed"
+    engine.abort_gr_session.assert_called_once_with(request.batch_id)
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]

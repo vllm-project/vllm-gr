@@ -2796,7 +2796,7 @@ def test_npu_constraint_candidates_chunk_multi_batch_rows(
 @pytest.mark.parametrize("ignore_stop_tokens", [False, True])  # type: ignore[misc]
 def test_npu_dynamic_beam_admission_requires_fixed_horizon(ignore_stop_tokens: bool) -> None:
     from vllm_gr.v1.beam.batch_contracts import BeamBatchParams
-    from vllm_gr.v1.engine.beam_search_v1 import _validate_gr_generation_params
+    from vllm_gr.v1.beam.dispatch import _validate_gr_generation_params
 
     params = BeamBatchParams(
         beam_width=4,

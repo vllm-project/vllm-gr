@@ -38,10 +38,7 @@ def make_patched_execute_model(
         self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
     ) -> Any:
         from vllm_gr.config.execution import require_beam_config
-        from vllm_gr.v1.engine.gr_async_scheduler import (
-            GR_RETIRE_OUTPUT_ATTR,
-            GR_STAGE_OUTPUT_ATTR,
-        )
+        from vllm_gr.v1.beam.dispatch import GR_RETIRE_OUTPUT_ATTR, GR_STAGE_OUTPUT_ATTR
 
         # Shared stage and retirement code receives an admitted V1 frame.
         if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is not None or getattr(

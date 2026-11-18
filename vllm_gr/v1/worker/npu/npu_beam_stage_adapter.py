@@ -14,12 +14,11 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
 )
-
-GR_STAGE_OUTPUT_ATTR = "gr_stage_metadata"
 
 
 @dataclass(frozen=True, slots=True)

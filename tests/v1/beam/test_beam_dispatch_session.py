@@ -13,9 +13,9 @@ import msgspec
 import pytest
 
 from tests.helpers.beam_requests import make_batch_request
-from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.engine import beam_search_v1
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.beam import dispatch as beam_dispatch
+from vllm_gr.v1.beam.dispatch import (
+    GR_STAGE_OUTPUT_ATTR,
     SESSION_FIELDS,
     STAGE_FIELDS,
     GRDeviceStateRef,
@@ -27,7 +27,7 @@ from vllm_gr.v1.engine.beam_search_v1 import (
     validate_dispatch_session,
     validate_dispatch_step,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
@@ -310,6 +310,6 @@ def test_step_never_rebuilds_the_session_record(monkeypatch: pytest.MonkeyPatch)
     def explode(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("step validation rebuilt the session record")
 
-    monkeypatch.setattr(beam_search_v1, "validate_dispatch_session", explode)
+    monkeypatch.setattr(beam_dispatch, "validate_dispatch_session", explode)
     decode = metadata(1)
     assert validate_dispatch_step(dispatch(decode), session, previous=first) == (decode,)

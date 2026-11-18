@@ -713,7 +713,7 @@ def test_mixed_batch_queue_rejection_is_atomic_and_service_recovers(
     from vllm.v1.engine.output_processor import OutputProcessor
 
     from tests.v1.engine.test_gr_admission_queue import worker_receipt
-    from vllm_gr.v1.engine.gr_async_scheduler import GR_BATCH_RESULT_ATTR
+    from vllm_gr.v1.beam.dispatch import GR_BATCH_RESULT_ATTR
     from vllm_gr.v1.engine.gr_session_client import (
         submit_gr_session_async,
         wait_gr_session_async,
@@ -1015,7 +1015,7 @@ def test_terminal_failure_status_and_subsequent_valid_request(width: int, code: 
 def test_submission_failure_status_cleanup_and_recovery(method: str, fault: str) -> None:
     from vllm.v1.engine.exceptions import EngineDeadError
 
-    from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
+    from vllm_gr.v1.beam.batch_contracts import GRAdmissionError
 
     async def run() -> None:
         async with connection() as (stub, backend, submitted, servicer):

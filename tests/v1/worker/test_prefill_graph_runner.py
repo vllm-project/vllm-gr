@@ -999,7 +999,7 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
 
     import numpy as np
 
-    from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
+    from vllm_gr.v1.beam.dispatch import GRStageKind
     from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
     from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 

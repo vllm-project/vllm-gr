@@ -21,10 +21,7 @@ from tests.kernels.beam_stage_test_utils import (
 from tests.kernels.v2_input_test_utils import make_native_v2_worker
 from vllm_gr.config import GRConfig
 from vllm_gr.config.models import DeploymentOptions
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GR_STAGE_OUTPUT_ATTR,
-    GR_WORKER_RESULT_ATTR,
-)
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR, GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import AsyncGPUBeamOutput
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2

@@ -98,7 +98,7 @@ def test_capture_attention_bounds_are_local_to_v2_pure_prefill() -> None:
 def test_retirement_preserves_runner_policy_and_scheduler_output(v2: bool) -> None:
     from vllm.v1.core.sched.output import SchedulerOutput
 
-    from vllm_gr.v1.engine.beam_search_v1 import GRRetireMetadata
+    from vllm_gr.v1.beam.dispatch import GRRetireMetadata
     from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import execute_gr_retirement
 
     scheduled = SchedulerOutput.make_empty()

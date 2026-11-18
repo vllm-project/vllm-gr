@@ -13,12 +13,12 @@ import torch
 
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.npu_dynamic_beam import (
     NPUDynamicBeamState,
     get_npu_stage_pools,
     initialize_npu_packed_stage_pools,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.worker.npu import npu_beam_stage_runner as npu_runner
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

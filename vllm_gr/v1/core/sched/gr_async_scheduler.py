@@ -12,30 +12,35 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchRequest,
     BeamBatchResult,
+    GRAdmissionError,
 )
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.beam.dispatch import (
+    GR_BATCH_RESULT_ATTR,
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_RETIRE_RESULT_ATTR,
+    GR_STAGE_OUTPUT_ATTR,
+    GR_WORKER_RESULT_ATTR,
     GRDeviceStateRef,
     GRExecutionCapacity,
-    GRResourceStatus,
     GRRetireMetadata,
     GRRetireResult,
-    GRSessionState,
-    GRSessionStatus,
-    GRStageCompletion,
     GRStageKind,
     GRStageMetadata,
     GRWorkerResult,
+)
+from vllm_gr.v1.core.sched.session import (
+    GRResourceStatus,
+    GRSessionState,
+    GRSessionStatus,
+    GRStageCompletion,
+)
+from vllm_gr.v1.engine.beam_search_v1 import (
     validate_gr_device_config,
     validate_gr_execution_config,
     validate_gr_request,
 )
 
-GR_STAGE_OUTPUT_ATTR = "gr_stage_metadata"
-GR_WORKER_RESULT_ATTR = "gr_worker_results"
-GR_BATCH_RESULT_ATTR = "gr_batch_results"
 GR_LOOKAHEAD_DEPTH = 2
-GR_RETIRE_OUTPUT_ATTR = "gr_retire_metadata"
-GR_RETIRE_RESULT_ATTR = "gr_retire_result"
 _DRAINING_STATUSES = frozenset(
     {
         GRSessionStatus.FINISHING,
@@ -47,10 +52,6 @@ _DRAINING_STATUSES = frozenset(
 
 class _GRWorkerProtocolError(ValueError):
     """A malformed per-request Worker result; never escapes EngineCore."""
-
-
-class GRAdmissionError(ValueError):
-    """An expected request rejection before Scheduler/Worker registration."""
 
 
 def _sessions(scheduler: Any) -> dict[str, GRSessionState]:
@@ -650,10 +651,7 @@ def update_gr_from_output(
 
     finished = worker_finished or terminal_result is not None
     if finished or metadata.is_last_stage:
-        session.status = GRSessionStatus.FINISHING
-        session.terminal_result_pending = True
-        session._pending_terminal_result = terminal_result
-        session.resource_status = GRResourceStatus.DRAINING
+        _begin_terminal_drain(session, terminal_result)
     return _stage_completion(
         session,
         metadata.stage_index,
@@ -661,6 +659,25 @@ def update_gr_from_output(
         finished=finished,
         device_state=worker_result.device_state,
     )
+
+
+def _begin_terminal_drain(session: GRSessionState, result: BeamBatchResult | None) -> None:
+    session.status = GRSessionStatus.FINISHING
+    session.terminal_result_pending = True
+    session._pending_terminal_result = result
+    session.resource_status = GRResourceStatus.DRAINING
+
+
+def finish_after_native_termination(session: GRSessionState, member_id: str) -> None:
+    """Drain outstanding work, preserving any terminal result already buffered."""
+    result = session._pending_terminal_result
+    if result is None:
+        result = _make_failure_result(
+            session,
+            "native_termination_without_gr_result",
+            f"Native batch member {member_id} terminated before GR produced a terminal result",
+        )
+    _begin_terminal_drain(session, result)
 
 
 def _make_failure_result(session: GRSessionState, code: str, message: str) -> BeamBatchResult:

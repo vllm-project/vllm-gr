@@ -34,20 +34,18 @@ from vllm_gr.v1.beam.batch_contracts import (
 )
 from vllm_gr.v1.beam.beam_decision import run_beam_decision_candidates
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
-from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
-from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.beam.dispatch import (
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_RETIRE_RESULT_ATTR,
+    GR_STAGE_OUTPUT_ATTR,
+    GR_WORKER_RESULT_ATTR,
     GRRetireMetadata,
     GRRetireResult,
     GRStageMetadata,
     GRWorkerResult,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GR_RETIRE_OUTPUT_ATTR,
-    GR_RETIRE_RESULT_ATTR,
-    GR_STAGE_OUTPUT_ATTR,
-    GR_WORKER_RESULT_ATTR,
-)
+from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
+from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,

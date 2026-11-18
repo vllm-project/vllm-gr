@@ -74,7 +74,8 @@ installers run or their ordering.
 | GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds V1 client/lifecycle methods incomplete | `_validate_batch_and_fork_patch`; V1 request, admission, rejection, and online lifecycle tests | API server |
 | GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
 | GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py`, `hot_update.py` | `apply_engine_core_request_patches` | Shared EngineCore plan, including NPU child entry, finds request dispatch or Trie-capacity initialization incomplete; utilities do not depend on the management listener | request validators; V1 admission, NPU multi-Trie routing, hot-update utility contracts and management tests | EngineCore |
-| GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `gr_async_scheduler.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
+| GR-PATCH-010 | `v1/core/sched/scheduler_patch.py`, `gr_async_scheduler.py` | `apply_scheduler_patch` | EngineCore plan finds either scheduler wrapper missing | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
+| GR-PATCH-022 | `v1/core/kv_cache_utils.py` | `apply_kv_hash_memo_patch` | EngineCore plan installs the prefix hash memos | `_validate_kv_hash_memo_patch`; block and chain equivalence tests | EngineCore |
 | GR-PATCH-011 | GPU V1/V2 runner patches; `worker/hot_update.py` | `model_runner_patch.apply_worker_patches` | selected CUDA runner hooks are incomplete; common installer mounts Worker utilities | runner validator; GPU, utility contract, reload and lifecycle tests | GPU worker |
 | GR-PATCH-012 | NPU runner patch; `worker/hot_update.py`, `ascend_compat.py` | `model_runner_patch.apply_worker_patches`; delayed `NPUWorker.init_device` | active NPU runner hooks are incomplete; delayed initialization mounts Worker utilities | NPU runner, delayed-install and unsupported-reload guard tests | NPU worker |
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
@@ -289,19 +290,29 @@ requests continue through their existing non-Beam entry points.
 
 - Scope: `core`; backend ID: `null`
 
-- Target: `Scheduler.schedule`
-- Mutation: scheduling hot-path wrapper or replacement
+- Target: `Scheduler.schedule` and `Scheduler.update_from_output`
+- Mutation: independently installed wrappers for dispatch and completion
 - Risk: Critical
 - Behavior:
     - adapts KV cache lookup for grouped Beam requests;
     - builds Beam scheduling metadata;
-    - attaches GR metadata to the scheduler result.
+    - attaches GR metadata to the scheduler result;
+    - consumes Worker receipts and publishes the terminal result after dispatches drain.
 - Dependencies:
     - `Scheduler.requests`;
     - `Scheduler.kv_cache_manager`;
     - `num_scheduled_tokens`;
     - the ability to attach metadata to `SchedulerOutput`.
 - Removal condition: Beam metadata can be carried through an explicit upstream scheduler extension or wrapper without replacing `schedule()` or adding undeclared attributes.
+
+### GR-PATCH-022 — Prefix-cache hash memoization
+
+- Scope: `core`; backend ID: `null`
+- Source: `vllm_gr/v1/core/kv_cache_utils.py`
+- Targets: upstream `hash_block_tokens` and `get_request_block_hasher`, including the EngineCore binding.
+- Behavior: cache repeated block and prompt hashes in bounded process-local memos. On repeat installation, verify both wrappers and restore the EngineCore factory binding while reusing installed wrappers.
+- Coverage: `tests/v1/core/test_gr_plain_hash_chain.py` and `tests/test_patch_initialization.py`.
+- Removal condition: upstream provides equivalent prefix hashing for repeated prompts.
 
 ### GR-PATCH-011 — GPU ModelRunner V1/V2 Overrides
 

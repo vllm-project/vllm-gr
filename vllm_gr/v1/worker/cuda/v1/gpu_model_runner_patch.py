@@ -9,6 +9,7 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
@@ -522,7 +523,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
     @wraps(_orig_model_forward)
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
         scheduler_output = getattr(self, "_current_scheduler_output", None)
-        gr_stages = getattr(scheduler_output, "gr_stage_metadata", None)
+        gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
         batch_view = None
         if gr_stages:
             # Decode uses its independent startup graph. A Batch Session has

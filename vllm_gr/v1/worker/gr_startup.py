@@ -15,15 +15,17 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchParams,
     BeamOutputOptions,
 )
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.beam.dispatch import (
+    GR_STAGE_OUTPUT_ATTR,
     GRDeviceStateRef,
     GRExecutionCapacity,
     GRStageKind,
     GRStageMetadata,
+)
+from vllm_gr.v1.engine.beam_search_v1 import (
     validate_gr_device_config,
     validate_gr_execution_runtime,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
 
 if TYPE_CHECKING:
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType

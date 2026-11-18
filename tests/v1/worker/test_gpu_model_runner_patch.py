@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tests.helpers.gr_config import make_gr_config
-from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
+from vllm_gr.v1.beam.dispatch import GRStageKind
 from vllm_gr.v1.worker import gr_context as _gr_context
 from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as gpu_patch
 

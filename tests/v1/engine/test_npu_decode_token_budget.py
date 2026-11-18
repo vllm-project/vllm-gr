@@ -34,13 +34,12 @@ from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OnlineBeamSearchRequest,
 )
 from vllm_gr.sampling_params import BeamSearchParams
-from vllm_gr.v1.beam.batch_contracts import BeamBatchItem
-from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
-from vllm_gr.v1.engine.core import _handle_submit_gr_session
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GRAdmissionError,
+from vllm_gr.v1.beam.batch_contracts import BeamBatchItem, GRAdmissionError
+from vllm_gr.v1.core.sched.gr_async_scheduler import (
     _prepare_gr_session,
 )
+from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+from vllm_gr.v1.engine.core import _handle_submit_gr_session
 
 core = _core_fixture
 scheduler = _scheduler_fixture

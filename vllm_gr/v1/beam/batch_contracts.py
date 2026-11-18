@@ -38,6 +38,10 @@ ADMISSION_REJECTED_CODE = "admission_rejected"
 GR_BATCH_RESULT_PARAM = "gr_batch_result"
 
 
+class GRAdmissionError(ValueError):
+    """An expected request rejection before Scheduler/Worker registration."""
+
+
 class BeamContractError(ValueError):
     """Raised when a Beam batch value violates the contract."""
 
@@ -694,6 +698,7 @@ def validate_beam_batch_result(
 
 
 __all__ = [
+    "ADMISSION_REJECTED_CODE",
     "BEAM_BATCH_PROTOCOL_VERSION",
     "DEFAULT_CONSTRAINT_RESOURCE_ID",
     "SUPPORTED_BEAM_BATCH_SIZES",
@@ -710,6 +715,7 @@ __all__ = [
     "BeamOutputOptions",
     "BeamOutputSequence",
     "BeamRequestOutput",
+    "GRAdmissionError",
     "to_int64_tokens",
     "validate_beam_batch_limits",
     "validate_beam_batch_request",

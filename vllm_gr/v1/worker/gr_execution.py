@@ -149,7 +149,7 @@ def _dispatch_retirement_frame(self: Any, scheduler_output: Any) -> Any:
     Returns None when ``scheduler_output`` is not a retirement frame (the
     caller continues with the normal dispatch).
     """
-    from vllm_gr.v1.engine.gr_async_scheduler import GR_RETIRE_OUTPUT_ATTR
+    from vllm_gr.v1.beam.dispatch import GR_RETIRE_OUTPUT_ATTR
 
     if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is None:
         return None
@@ -173,7 +173,7 @@ def _dispatch_stage_frame(
     sampling must also fail or valid-looking stale logits could hide a
     failed execute Future from that native path.
     """
-    from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+    from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 
     if not getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
         return _NOT_A_STAGE_FRAME

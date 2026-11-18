@@ -161,7 +161,7 @@ def test_numpy_hashes_match_full_recompute_for_cold_warm_and_incremental(salt):
     from vllm.utils.hashing import sha256
     from vllm.v1.core import kv_cache_utils as kv
 
-    from vllm_gr.v1.engine.engine_core_patch import apply_kv_hash_memo_patch
+    from vllm_gr.v1.core.kv_cache_utils import apply_kv_hash_memo_patch
 
     if getattr(kv, "NONE_HASH", None) is None:
         kv.init_none_hash(sha256)
@@ -189,7 +189,7 @@ def test_numpy_block_hash_uses_bytes_without_python_iteration():
     from vllm.utils.hashing import sha256
     from vllm.v1.core import kv_cache_utils as kv
 
-    from vllm_gr.v1.engine.engine_core_patch import apply_kv_hash_memo_patch
+    from vllm_gr.v1.core.kv_cache_utils import apply_kv_hash_memo_patch
 
     class NoIteration(np.ndarray):
         def __iter__(self):

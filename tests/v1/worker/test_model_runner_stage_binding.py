@@ -8,10 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from tests.helpers.gr_config import engine_config
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GR_RETIRE_OUTPUT_ATTR,
-    GR_STAGE_OUTPUT_ATTR,
-)
+from vllm_gr.v1.beam.dispatch import GR_RETIRE_OUTPUT_ATTR, GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.worker import model_runner_common
 from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks

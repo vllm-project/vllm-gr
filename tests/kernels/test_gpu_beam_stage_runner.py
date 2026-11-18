@@ -32,12 +32,10 @@ from vllm_gr.v1.attention.backends.beam_graph_kernels import (
     cache_unshared_kv_graph,
     copy_suffix_kv_graph,
 )
-from vllm_gr.v1.engine.beam_search_v1 import (
-    GRDeviceStateRef,
-)
-from vllm_gr.v1.engine.gr_async_scheduler import (
+from vllm_gr.v1.beam.dispatch import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
+    GRDeviceStateRef,
 )
 from vllm_gr.v1.worker import gr_context as _gr_context
 from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner

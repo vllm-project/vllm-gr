@@ -37,6 +37,7 @@ CORE_PATCH_IDS = (
     "GR-PATCH-013",
     "GR-PATCH-015",
     "GR-PATCH-020",
+    "GR-PATCH-022",
 )
 
 
@@ -328,11 +329,17 @@ def _validate_engine_core_request_patch() -> str | None:
 def _validate_scheduler_patch() -> str | None:
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    from vllm_gr.v1.engine.engine_core_patch import _SCHEDULER_PATCH_MARKER
+    from vllm_gr.v1.core.sched.scheduler_patch import (
+        _SCHEDULER_PATCH_MARKER,
+        _SCHEDULER_UPDATE_PATCH_MARKER,
+    )
 
     return _verified(
-        bool(getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False)),
-        "Scheduler beam metadata propagation is not installed",
+        bool(
+            getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False)
+            and getattr(Scheduler.update_from_output, _SCHEDULER_UPDATE_PATCH_MARKER, False)
+        ),
+        "Scheduler Beam dispatch or completion hook is missing",
     )
 
 
@@ -355,11 +362,17 @@ def _validate_model_runner_patch() -> str | None:
 
 
 def _validate_kv_hash_memo_patch() -> str | None:
-    """Verify the bounded memo wrapper on hash_block_tokens."""
+    """Verify both prefix-hash wrappers and the factory used by EngineCore."""
     from vllm.v1.core import kv_cache_utils
+    from vllm.v1.engine import core
 
     if not getattr(kv_cache_utils.hash_block_tokens, "_gr_hash_memo", False):
         return "hash_block_tokens memo wrapper not installed"
+    factory = kv_cache_utils.get_request_block_hasher
+    if not getattr(factory, "_gr_chain_memo", False):
+        return "get_request_block_hasher chain memo wrapper not installed"
+    if core.get_request_block_hasher is not factory:
+        return "EngineCore get_request_block_hasher is not bound to the chain memo wrapper"
     return None
 
 
@@ -467,13 +480,13 @@ def _engine_core_beam_patches() -> tuple[BeamPatch, ...]:
         ),
         patch(
             "kv_hash_memo",
-            "vllm_gr.v1.engine.engine_core_patch",
+            "vllm_gr.v1.core.kv_cache_utils",
             "apply_kv_hash_memo_patch",
             _validate_kv_hash_memo_patch,
         ),
         patch(
             "scheduler",
-            "vllm_gr.v1.engine.engine_core_patch",
+            "vllm_gr.v1.core.sched.scheduler_patch",
             "apply_scheduler_patch",
             _validate_scheduler_patch,
         ),

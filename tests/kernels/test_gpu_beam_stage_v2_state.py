@@ -18,12 +18,12 @@ from tests.kernels.beam_stage_test_utils import (
     runtime,
 )
 from tests.kernels.v2_input_test_utils import make_native_v2_worker
-from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
-from vllm_gr.v1.engine.beam_search_v1 import validate_dispatch_session
-from vllm_gr.v1.engine.gr_async_scheduler import (
+from vllm_gr.v1.beam.dispatch import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
+    validate_dispatch_session,
 )
+from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
 from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 

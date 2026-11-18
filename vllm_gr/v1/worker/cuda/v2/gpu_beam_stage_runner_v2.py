@@ -33,6 +33,7 @@ from typing import Any, ClassVar
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
@@ -238,7 +239,7 @@ class CudaStageHooksV2(CudaStageHooks):
         # force a device->host sync right after the Prefill forward — the
         # sampler's own indexing is the authoritative contract and needs none.
         batch = state.input_batch
-        stages = getattr(scheduler_output, "gr_stage_metadata", None)
+        stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
         if not stages or len(stages) != 1:
             raise ValueError("GR Prefill requires one logical batch's metadata")
         request_ids = next(iter(stages.values())).request_ids
