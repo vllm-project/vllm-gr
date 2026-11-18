@@ -19,6 +19,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
+from tools.hardware_marks import hardware_test
 from vllm_gr.ops.npu_stage_logits import (
     NPUStageProjection,
     can_install_npu_stage_projection,
@@ -134,7 +135,7 @@ def test_three_stage_projection_preserves_original_processor_semantics(
     assert snapshot["fallback_counts"] == {}
 
 
-@pytest.mark.npu_test
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("sid_domain", [False, True])
 def test_stage_projection_routes_replicated_mode_under_ascend_dispatch(
     context: Any, monkeypatch: pytest.MonkeyPatch, sid_domain: bool
@@ -759,7 +760,7 @@ def test_weight_update_hooks_preserve_native_behavior_without_active_projection(
     assert worker.finish_weight_update() == "finished"
 
 
-@pytest.mark.npu_test
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("update_api", ["runner", "worker"])
 def test_npu_hot_update_refreshes_inference_buffers_at_native_boundary(
     context: Any, update_api: str

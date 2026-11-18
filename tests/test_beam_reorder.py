@@ -23,11 +23,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_test
 from vllm_gr.ops.onerec_decode import _parent_beams_from_prefix
 from vllm_gr.v1.beam.reorder import (
     _group_token_num_from_parents,
     reorder_unshared_kv,
 )
+
 
 # ---------------------------------------------------------------------------
 # group_token_num round trip (device-agnostic)
@@ -162,7 +164,7 @@ except (ImportError, RuntimeError):
 _NPU_AVAILABLE = _NPU_IMPORTABLE and hasattr(torch, "npu") and torch.npu.is_available()
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is not available")  # type: ignore[misc]
 @pytest.mark.parametrize(
     "parent",
@@ -196,7 +198,7 @@ def test_reorder_xllm_mode_fused_matches_references_on_npu(
         torch.testing.assert_close(pool.unshared_value.cpu(), ref.unshared_value, rtol=0, atol=0)
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is not available")  # type: ignore[misc]
 @pytest.mark.parametrize(
     "parent",
@@ -230,7 +232,7 @@ def test_reorder_xllm_mode_falls_back_for_unsorted_or_shrunk(
         torch.testing.assert_close(pool.unshared_value.cpu(), ref.unshared_value, rtol=0, atol=0)
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is not available")  # type: ignore[misc]
 def test_reorder_xllm_fused_agrees_with_onerec_golden_on_npu(
     monkeypatch: pytest.MonkeyPatch,

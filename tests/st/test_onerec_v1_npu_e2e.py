@@ -27,6 +27,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks, hardware_test
 from tests.st.npu_beam_diagnostics import NPUForwardTrace
 
 try:
@@ -39,13 +40,14 @@ if not hasattr(torch, "npu") or not torch.npu.is_available():
 
 from vllm_gr.ops.npu import beam_ops
 
+
 if not beam_ops.is_available():
     pytest.skip(
         f"xllm Beam operators are unavailable: {beam_ops.unavailable_reason()}",
         allow_module_level=True,
     )
 
-pytestmark = pytest.mark.npu_test
+pytestmark = hardware_marks(res={"npu": "A3"}, num_cards=1)
 
 _BEAM_WIDTH = 8
 _BEGIN_TOKEN = "<|sid_begin|>"
@@ -665,7 +667,7 @@ def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
                 process.wait()
 
 
-@pytest.mark.npu_test
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.model_test
 @pytest.mark.slow
 @pytest.mark.timeout(660)
@@ -673,7 +675,7 @@ def test_onerec_v1_npu_public_api_end_to_end(tmp_path: Path) -> None:
     _run_subprocess(tmp_path)
 
 
-@pytest.mark.npu_test
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.model_test
 @pytest.mark.slow
 @pytest.mark.timeout(660)

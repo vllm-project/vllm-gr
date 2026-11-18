@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks, hardware_test
 from vllm_gr.config.models import (
     MULTI_TRIE_CONSTRAINT_TABLE_FORMAT,
     ConstraintTableBackendEnum,
@@ -30,6 +31,7 @@ from vllm_gr.constraints.json_compiler import compile_relations_json
 from vllm_gr.constraints.loader import _upload_cuda_backend, load_constraint_backend
 from vllm_gr.constraints.table import ConstraintTable, validate_constraint_table
 from vllm_gr.ops.cuda.rec_constrained_topk import rec_constrained_topk_cuda
+
 
 SIDS = (
     ((1, 2, 0), (1, 2, 1), (1, 4, 3), (3, 5, 1), (3, 5, 4)),
@@ -136,9 +138,9 @@ def test_v2_artifact_roundtrip_and_cpu_query(tmp_path: Path, count: int, step: i
     "mode",
     [
         "cpu",
-        pytest.param("cuda", marks=pytest.mark.gpu_test),
-        pytest.param("cuda_out", marks=pytest.mark.gpu_test),
-        pytest.param("cuda_raw", marks=pytest.mark.gpu_test),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "A100"}, num_cards=1)),
+        pytest.param("cuda_out", marks=hardware_marks(res={"cuda": "A100"}, num_cards=1)),
+        pytest.param("cuda_raw", marks=hardware_marks(res={"cuda": "A100"}, num_cards=1)),
     ],
 )
 def test_checked_backends_share_root_defaults_and_range_errors(count: int, mode: str) -> None:
@@ -210,7 +212,7 @@ def test_checked_backends_share_root_defaults_and_range_errors(count: int, mode:
         backend.close()
 
 
-@pytest.mark.gpu_test  # type: ignore[misc]
+@hardware_test(res={"cuda": "A100"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")  # type: ignore[misc]
 def test_worker_unchecked_selection_skips_public_validation(
     monkeypatch: pytest.MonkeyPatch,
@@ -261,7 +263,7 @@ def test_rejects_cross_root_key_and_boundary_corruption() -> None:
         )
 
 
-@pytest.mark.gpu_test  # type: ignore[misc]
+@hardware_test(res={"cuda": "A100"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")  # type: ignore[misc]
 @pytest.mark.parametrize("count", [1, 2])  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]

@@ -11,6 +11,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from tools.hardware_marks import hardware_marks
 from vllm_gr.ops.lm_head_cache import install_lm_head_cache_reload_hooks
 from vllm_gr.ops.sliced_logits import compute_sliced_logits
 
@@ -241,7 +242,9 @@ def test_sliced_reload_hook_tracks_window_changes_without_rewrapping(bias: bool)
 
 @pytest.mark.l2
 @pytest.mark.parametrize("loaded_owner", ["embed_tokens", "lm_head"])
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu_test)])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=hardware_marks(res={"cuda": "A100"}, num_cards=1))]
+)
 def test_tied_head_caches_follow_native_layerwise_reload(loaded_owner: str, device: str) -> None:
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,

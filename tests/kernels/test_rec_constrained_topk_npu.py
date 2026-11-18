@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from vllm_gr.ops.npu.rec_constrained_topk import (
     is_available as rec_constrained_topk_npu_available,
 )
@@ -25,12 +26,13 @@ from vllm_gr.ops.npu.rec_constrained_topk import (
 )
 from vllm_gr.ops.rec_constrained_topk import rec_constrained_topk_torch
 
+
 # pytest parametrization decorators are untyped in the strict mypy environment.
 # Keep this exception local to the NPU-only test module.
 # mypy: disable-error-code="misc"
 
 
-pytestmark = pytest.mark.npu_test
+pytestmark = hardware_marks(res={"npu": "A3"}, num_cards=1)
 
 
 try:

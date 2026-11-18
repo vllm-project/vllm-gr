@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tools.hardware_marks import hardware_marks, hardware_test
 from vllm_gr.ops.sliced_logits import (
     SlicedLMHeadProxy,
     compute_sliced_logits,
@@ -368,8 +369,12 @@ def _native_processor(vocab_size: int, head_dtype: torch.dtype | None = None) ->
     "device,dtype",
     [
         ("cpu", torch.float32),
-        pytest.param("cuda", torch.float16, marks=pytest.mark.gpu_test),
-        pytest.param("cuda", torch.bfloat16, marks=pytest.mark.gpu_test),
+        pytest.param(
+            "cuda", torch.float16, marks=hardware_marks(res={"cuda": "A100"}, num_cards=1)
+        ),
+        pytest.param(
+            "cuda", torch.bfloat16, marks=hardware_marks(res={"cuda": "A100"}, num_cards=1)
+        ),
     ],
 )
 @pytest.mark.parametrize("head_dtype", [None, torch.float32])  # type: ignore[misc]
@@ -546,7 +551,7 @@ def test_v2_topk_clamp_reuses_an_already_wrapped_import() -> None:
     assert calls == [(3, True)]
 
 
-@pytest.mark.gpu_test  # type: ignore[misc]
+@hardware_test(res={"cuda": "A100"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("logits_mode", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("width", [1, 7])  # type: ignore[misc]
 @pytest.mark.parametrize("num_logprobs", [0, 1, 5])  # type: ignore[misc]

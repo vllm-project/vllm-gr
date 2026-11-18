@@ -15,6 +15,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_test
+
 
 class _MockNPUTensor(torch.Tensor):  # type: ignore[misc]
     @property
@@ -610,7 +612,7 @@ def _native_modules() -> tuple[Any, Any]:
     return torch_npu, module
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
 @pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
 def test_npu_row_view_cache_attention_and_graph_replay_are_exact(
@@ -696,7 +698,7 @@ def test_npu_row_view_cache_attention_and_graph_replay_are_exact(
                 torch.testing.assert_close(reference, actual, rtol=0, atol=0)
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
 @pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
 def test_npu_packed_qkv_views_still_materialize_gather(dtype: torch.dtype, batch_size: int) -> None:
@@ -715,7 +717,7 @@ def test_npu_packed_qkv_views_still_materialize_gather(dtype: torch.dtype, batch
         torch.testing.assert_close(selected, tensor[metadata.prefix_indices], rtol=0, atol=0)
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     "batch_size,beam_width,heads,kv_heads",
     [(1, 128, 16, 8), (4, 128, 16, 8), (1, 32, 8, 8), (4, 32, 8, 8)],
@@ -838,7 +840,7 @@ def test_npu_shared_gather_attention_and_graph_replay_are_exact(
                 torch.testing.assert_close(expected, actual, rtol=0, atol=0)
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     "batch_size,beam_width,heads,kv_heads",

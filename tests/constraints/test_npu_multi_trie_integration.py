@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from tests.constraints.test_npu_multi_trie import TRIPLES, make_npu_tries
 from vllm_gr.config import ConstraintTableConfig
 from vllm_gr.config.models import MULTI_TRIE_CONSTRAINT_TABLE_FORMAT
@@ -20,7 +21,8 @@ from vllm_gr.constraints.loader import load_constraint_backend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
 from vllm_gr.ops.npu.rec_constrained_topk import is_available
 
-pytestmark = [pytest.mark.npu_test, pytest.mark.l2]
+
+pytestmark = [*hardware_marks(res={"npu": "A3"}, num_cards=1), pytest.mark.l2]
 
 try:
     import torch_npu  # noqa: F401

@@ -28,7 +28,9 @@ from typing import Any
 
 import pytest
 
-pytestmark = pytest.mark.gpu_test
+from tools.hardware_marks import hardware_marks
+
+pytestmark = hardware_marks(res={"cuda": "A100"}, num_cards=1)
 
 _MODULE_READY = time.monotonic()
 _MEASUREMENTS: dict[str, Any] = {"phases": {}, "rows": [], "events": []}

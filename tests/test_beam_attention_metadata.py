@@ -11,6 +11,7 @@ import pytest
 import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
+from tools.hardware_marks import hardware_test
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
@@ -469,7 +470,7 @@ def test_only_npu_incremental_geometry_uses_async_upload(
     assert transfers == [is_npu]
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
     """Queued uploads retain immutable payloads after their local source dies."""
     pytest.importorskip("torch_npu")

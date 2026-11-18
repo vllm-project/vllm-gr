@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from vllm_gr.ops import beam_search_group
 from vllm_gr.ops import select_unshared_kv as ops_select_unshared_kv
 from vllm_gr.v1.attention.backends.beam_kernels import (
@@ -24,7 +25,7 @@ def _devices() -> list[pytest.ParameterSet]:
             torch.device("cuda"),
             id="cuda",
             marks=[
-                pytest.mark.gpu_test,
+                *hardware_marks(res={"cuda": "A100"}, num_cards=1),
                 pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available"),
             ],
         ),

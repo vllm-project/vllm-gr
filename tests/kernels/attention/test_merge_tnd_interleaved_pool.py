@@ -20,14 +20,16 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     interleaved_pool_base,
 )
 
+
 DEVICES = ["cpu"]
 try:
     if torch.npu.is_available():
-        DEVICES.append(pytest.param("npu", marks=pytest.mark.npu_test))
+        DEVICES.append(pytest.param("npu", marks=hardware_marks(res={"npu": "A3"}, num_cards=1)))
 except AttributeError:
     pass
 

@@ -14,6 +14,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from tools.hardware_marks import hardware_test
 from vllm_gr.ops.onerec_decode import (
     _beam_search_group_torch,
     _beam_search_rec_final_select_torch,
@@ -346,7 +347,7 @@ def test_registered_final_select_is_visible_to_torch_compile() -> None:
         torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
 
 
-@pytest.mark.gpu_test  # type: ignore[misc]
+@hardware_test(res={"cuda": "A100"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.skipif(  # type: ignore[misc]
     not torch.cuda.is_available(), reason="CUDA is required"
 )

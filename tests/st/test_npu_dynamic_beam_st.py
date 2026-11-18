@@ -20,6 +20,8 @@ from typing import Any
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks, hardware_test
+
 try:
     import torch_npu  # noqa: F401
 except ImportError:
@@ -40,7 +42,8 @@ from tests.st.test_onerec_v1_npu_e2e import (  # noqa: E402
     _prompt_tokens,
 )
 
-pytestmark = pytest.mark.npu_test
+
+pytestmark = hardware_marks(res={"npu": "A3"}, num_cards=1)
 
 _WIDTH = 32
 _SCHEDULES = (None, (32, 32, 32), (32, 16, 8), (8, 16, 32))
@@ -386,7 +389,7 @@ def _run_regression(work_dir: Path) -> None:
                 ordinary_reference = ordinary_after
 
 
-@pytest.mark.npu_test
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.slow
 @pytest.mark.timeout(960)
 def test_npu_dynamic_beam_full_model_eager_graph(tmp_path: Path) -> None:

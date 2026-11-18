@@ -15,7 +15,9 @@ from typing import Any
 import pytest
 import torch
 
-pytestmark = [pytest.mark.npu_test, pytest.mark.l2]
+from tools.hardware_marks import hardware_marks
+
+pytestmark = [*hardware_marks(res={"npu": "A3"}, num_cards=1), pytest.mark.l2]
 
 
 def _unavailable(reason: str) -> None:
@@ -37,6 +39,7 @@ if not hasattr(torch, "npu") or not torch.npu.is_available():
     _unavailable("Ascend NPU unavailable")
 from vllm_gr.ops.npu import _xattention_out as optional_binding  # noqa: E402
 from vllm_gr.ops.npu import beam_ops  # noqa: E402
+
 
 if not optional_binding.x_attention_out_available():
     _unavailable("optional XAttention output binding unavailable or incompatible")
