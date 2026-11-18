@@ -13,20 +13,20 @@ The recorded pre-upgrade runtime baseline is:
 
 The upstream source revisions used for compatibility analysis are:
 
-- `vllm-project/vllm@releases/v0.22.1`
-    - commit: `dd72658e7db0c6a674f473f6f9f0f5c2ebe7e523`
-- `vllm-project/vllm-ascend@releases/v0.22.1rc`
-    - commit: `f528cdd561969730504bfe8b5e96b6b7e69d6c4f`
+- [vLLM 0.22.1 release snapshot](https://github.com/vllm-project/vllm/tree/dd72658e7db0c6a674f473f6f9f0f5c2ebe7e523)
+- [vLLM-Ascend 0.22.1 release candidate snapshot](https://github.com/vllm-project/vllm-ascend/tree/f528cdd561969730504bfe8b5e96b6b7e69d6c4f)
 
 The vLLM-Ascend release branch is movable, so compatibility conclusions must retain the exact source commit.
 
-The current CUDA release candidate targets vLLM 0.30.0 and has completed GPU
-functional, packaging, and performance validation. Its release-level precision
-decision remains open. The Ascend 0.30.0rc2 baseline at
-`43bc85f9b375281452d0af7005dc9fa752f43884` completed NPU validation
-(unit, integration, eager/graph end-to-end, dynamic beam, prefill graphs, and
-benchmark gates). The subsequent config-filter refactor has host regression
-coverage and still requires NPU startup and inference revalidation.
+The current runtime targets vLLM 0.30.0 on CUDA and vLLM-Ascend 0.30.0rc2
+on Ascend. See the [runtime version contract](../README.md#runtime-version-contract)
+for installation requirements. The [upgrade evidence](https://github.com/JiusiServe/vllm-gr/pull/553)
+records historical validation and its limits. At the time of the upgrade,
+CUDA functional, packaging and performance checks were complete and the
+release-level precision decision was pending. The
+[Ascend validation baseline](https://github.com/JiusiServe/vllm-gr/commit/43bc85f9b375281452d0af7005dc9fa752f43884)
+predated the config-filter refactor. The refactor had host regression coverage at the time of that inventory update.
+NPU startup and inference revalidation remained outstanding at that point.
 
 ## Risk Levels
 
@@ -307,10 +307,9 @@ and Decode capture policy remain active when this cache is disabled.
 - Sources:
     - `vllm_gr/v1/worker/gpu_model_runner_patch.py`
     - `vllm_gr/v1/worker/gpu_model_runner_v2_patch.py`
-    - `vllm_gr/v1/worker/gpu_model_runner_v2_graph.py`
     - `vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py` (`CudaStageHooksV1`)
     - `vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py` (`CudaStageHooksV2`)
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/gpu_postprocess_workspace.py`, `vllm_gr/v1/worker/gpu_prefill_inputs.py`, `vllm_gr/v1/worker/gpu_prefill_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/gpu_stage_hooks.py`, `vllm_gr/v1/worker/gpu_beam_stage_runner.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/model_runner_contracts.py`, `vllm_gr/v1/worker/gr_gc.py`, `vllm_gr/v1/worker/gr_context.py`, `vllm_gr/v1/worker/gr_execution.py`, `vllm_gr/v1/worker/gpu_postprocess_workspace.py`, `vllm_gr/v1/worker/gpu_model_runner_v2_resources.py`, `vllm_gr/v1/worker/gpu_prefill_inputs.py`, `vllm_gr/v1/worker/gpu_prefill_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/gpu_stage_hooks.py`, `vllm_gr/v1/worker/gpu_beam_stage_runner.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - CUDA stage binding: execution and startup entrypoints explicitly select the
   independent V1/V2 implementations of `CudaStageHooks`. The shared core has no
@@ -320,6 +319,18 @@ and Decode capture policy remain active when this cache is disabled.
   startup regressions live in `tests/test_model_runner_stage_binding.py` and
   `tests/test_gr_startup.py`; `tests/tools/test_cuda_stage_typing.py` pins the
   abstract method set and both subclasses.
+- Common support ownership: `model_runner_common.py` contains bounded V1
+  adaptation only. V2 owns its execute wrapper; `gr_execution.py` owns control
+  frame classification and dispatch, including its single not-a-frame sentinel.
+  `gr_gc.py` owns Worker-side process flags, locks, depth and freeze entrypoints.
+  `gr_context.py` owns config/context and graph diagnostics;
+  `model_runner_contracts.py` owns markers/checks without hardware imports.
+  The public installer selects V1 before importing its wrapper and installs
+  NumPy staging once for either CUDA version. Public RPC names, async sampling
+  context lifetime, freeze policy and cleanup ordering retain existing behavior.
+  Coverage: `tests/test_model_runner_common.py`,
+  `tests/test_model_runner_stage_binding.py`, `tests/test_model_runner_patch.py`,
+  `tests/platforms/test_import_isolation.py`, and the existing CUDA lifecycle cases.
 - Native output completion: the shared CUDA stage calls
   `CudaStageHooksV1/V2.finish_native_output()` after device output submission and
   before clearing its pending dispatch. The hooks own the native result field
@@ -358,6 +369,15 @@ and Decode capture policy remain active when this cache is disabled.
     - the 3-item `_prepare_inputs` result (`logits_indices`, speculative-decode metadata, maximum sampled-token count);
     - native execute/sample separation and asynchronous output consumption;
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
+- V2 graph integration: `gpu_model_runner_v2_patch.py` owns the KV,
+  profiling and capture patch factories and their installation markers.
+  `gpu_model_runner_v2_resources.py` owns multi-batch Decode capture with explicit
+  V2 hooks binding through `gr_startup.py`. The native Prefill manager remains
+  separate. Profiling teardown, capture-state restoration, shape-local fallback,
+  memory accounting and GC-freeze ordering retain their existing execution points.
+  Coverage: `tests/test_gpu_model_runner_v2_patch.py`, `tests/test_gr_startup.py`,
+  `tests/kernels/test_v2_multibatch_graphs.py`, and
+  `tests/kernels/test_beam_pool_recapture.py`.
 - ModelRunner V2 dependencies:
     - native `prepare_inputs`/`add_requests` request-state contracts;
     - admitted all-new GR Prefill batches skip unused native sampler registration;
@@ -403,7 +423,7 @@ and Decode capture policy remain active when this cache is disabled.
 - Scope: `backend`; backend ID: `npu`
 
 - Source: `vllm_gr/v1/worker/npu_model_runner_patch.py`
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/ascend_compat.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/npu_model_runner_inputs.py`, `vllm_gr/v1/worker/npu_model_runner_bookkeeping.py`, `vllm_gr/v1/worker/model_runner_contracts.py`, `vllm_gr/v1/worker/gr_gc.py`, `vllm_gr/v1/worker/gr_context.py`, `vllm_gr/v1/worker/gr_execution.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/ascend_compat.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
     - `NPUModelRunner.execute_model`

@@ -117,7 +117,9 @@ class CudaStageHooksV1(CudaStageHooks):
         """V1 can capture a missing graph against a new stage's buffers."""
         assert owner.inputs is not None
         worker = self.worker
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         graph_enabled = (
             not worker.model_config.enforce_eager

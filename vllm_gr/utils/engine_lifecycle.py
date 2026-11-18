@@ -17,7 +17,7 @@ from vllm_gr.logger import init_logger
 logger = init_logger(__name__)
 
 # GC threshold applied to ALL generations (0/1/2) while serving, matching the
-# worker-side freeze (model_runner_common._freeze_serving_gc).  Tracer
+# worker-side freeze (gr_gc._freeze_serving_gc).  Tracer
 # evidence: every collection during serving measured ``collected=0`` — the
 # old-gen scans were 17-36 ms pauses, and gen-0 scans (the in-flight
 # request's beam bookkeeping) 3.7-8 ms pauses landing inside the request

@@ -37,7 +37,9 @@ def initialize_beam_postprocess_workspaces(
         BeamPostprocessWorkspaceKey,
         BeamPostprocessWorkspacePool,
     )
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     gr_cfg = _get_gr_config(runner)
     width = gr_cfg.beam_max_width

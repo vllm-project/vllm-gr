@@ -146,9 +146,12 @@ allowing intermediate prefix-output and final-output rounding.
 
 ## Historical performance validation (2026-09-28)
 
-Measured on NVIDIA L20 with Qwen3-0.6B BF16, PyTorch 2.11.0+cu130 and
-vLLM 0.22.1. Both runs used this change on top of `decode_graph` commit
-`74c4a9e`, switching only `beam.enable_short_suffix_attention`.
+> Measured on NVIDIA L20 / 2026-09-28 / PyTorch 2.11.0+cu130, vLLM 0.22.1.
+> Not a performance guarantee.
+
+Both runs used Qwen3-0.6B BF16 and the same short-suffix implementation on
+a [decode_graph snapshot](https://github.com/JiusiServe/vllm-gr/commit/74c4a9e).
+Only `beam.enable_short_suffix_attention` changed between runs.
 The workload used context length 128, beam width 128, batch size 1,
 and three generated stages (one prefill and two decode stages).
 
@@ -156,9 +159,9 @@ Input IDs were sampled with seed 0 from `[1000, 2000)`. The synthetic
 three-stage constraint table used the same interval and one continuation
 per beam after the first stage. CUDA graphs were enabled and prefix caching
 was disabled. Each fresh engine ran 10 warmups, 100 unprofiled measurements,
-and five separate complete timeline runs. The Qwen benchmark runner from
-commit `435eb2a` was used with the configuration field inserted before engine
-startup; that benchmark is maintained separately from this kernel change.
+and five separate complete timeline runs. The
+[Qwen benchmark runner used in the experiment](https://github.com/JiusiServe/vllm-gr/commit/435eb2a)
+received the configuration field before engine startup.
 
 | Metric | Disabled | Enabled |
 | --- | ---: | ---: |
@@ -181,9 +184,10 @@ measured requests returned 128 three-token beams; this checks the execution
 contract, not bitwise BF16 equivalence. Numerical correctness is validated
 against the independent FP32 reference described above.
 
-## Integration validation on updated decode_graph
+## Historical ModelRunner integration validation
 
-The change was rebased onto `decode_graph` commit `9c71c9d` on 2026-10-08.
+The 2026-10-08 validation used the
+[ModelRunner V2 integration snapshot](https://github.com/JiusiServe/vllm-gr/commit/9c71c9d).
 The expanded attention, configuration, model-runner, startup and graph
 regression suite passed 467 tests, with three platform skips. This includes
 the independent FP32 kernel comparisons and the new ModelRunner V2 tests.
@@ -198,11 +202,12 @@ disabled traces contained no fused-kernel calls. These smoke runs establish
 integration and dispatch behavior, not a new latency distribution.
 
 The historical BF16 OneRec cache-miss A/B validation had reproducible
-Top-1 changes on 2 of 100 requests before upstream `9fc66d3` changed selected
-candidate scoring to normalization over the shared logits window. Updated
+Top-1 changes on 2 of 100 requests before the
+[shared-domain scoring change](https://github.com/JiusiServe/vllm-gr/commit/9fc66d3)
+normalized candidate scores over the shared logits window. Updated
 same-revision comparisons and independent references are described below.
 
-## Real-model numerical validation (2026-10-08)
+## Historical real-model numerical validation (2026-10-08)
 
 The final regression matrix passed 485 tests, with three platform skips.
 The attention/configuration subset passed 163 tests. An additional empty
@@ -264,7 +269,7 @@ within this new matrix are used for its reference agreement. Changing
 intermediate rounding can alter BF16 model trajectories. Enabling this
 optimization does not promise bitwise output or beam-order equivalence.
 
-## Suffix-length validation (2026-10-08)
+## Historical suffix-length validation (2026-10-08)
 
 The explicit toggle accepts any positive configured pool capacity; no
 three-token upper limit is imposed by the fused implementation. Pools of
@@ -281,8 +286,13 @@ Graph replay covers capacities 3/4/32/128 with changing step, mask and KV
 histories. Real FA2 prefix integration covers capacities 3/8/32. Production
 pool initialization is tested with FP16 and BF16.
 
-A separate CUDA-graph kernel microbenchmark on NVIDIA L20 used BF16,
-beam width 128, 16 query heads, eight KV heads and head dimension 128.
+### Historical CUDA Graph microbenchmark
+
+> Measured on NVIDIA L20 / 2026-10-08 / runtime versions not recorded.
+> Not a performance guarantee.
+
+The microbenchmark used BF16, beam width 128, 16 query heads, eight KV heads
+and head dimension 128.
 With capacity 3 and actual suffix length 3, median kernel execution time
 was 2.377 microseconds before and 2.378 microseconds after this extension.
 With capacity 128 and actual length 1, the extended kernel took 1.917

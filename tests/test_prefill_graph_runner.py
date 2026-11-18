@@ -1380,4 +1380,30 @@ def test_npu_prefill_capture_skips_mixed_attention_groups() -> None:
     assert NPUPrefillGraphRunner._supports_beam_prefill_capture(runner) is False
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_scheduled_requests_are_fresh() -> None:
+    """Dense-Prefill graphs replay only when no scheduled request has computed tokens."""
+    import numpy as np
+
+    def batch(computed: list[int], scheduled: Any) -> tuple[Any, Any]:
+        runner = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                num_computed_tokens_cpu=np.array(computed),
+                req_id_to_index={"rA": 2, "rB": 0},
+            )
+        )
+        return runner, SimpleNamespace(num_scheduled_tokens=scheduled)
+
+    fresh = prefill_graph_common.scheduled_requests_are_fresh
+    # Scattered rows: the unscheduled row 1 carries context and is ignored.
+    assert fresh(*batch([0, 300, 0], {"rA": 4, "rB": 4})) is True
+    # A cached-Prefill suffix is a prefill-phase row but not fresh.
+    assert fresh(*batch([0, 300, 32], {"rA": 4, "rB": 4})) is False
+    assert fresh(*batch([0, 0, 0], {"rA": 4, "missing": 4})) is False
+    assert fresh(*batch([0, 0, 0], {})) is False
+    # Legacy positional list form.
+    assert fresh(*batch([0, 0, 7], [4, 4])) is True
+    assert fresh(*batch([0, 5, 0], [4, 4])) is False
+
+
 pytestmark = pytest.mark.cpu_test

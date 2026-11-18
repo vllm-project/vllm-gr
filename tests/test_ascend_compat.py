@@ -284,9 +284,11 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     assert worker_class().init_device() == "ready"
     assert events == ["re_apply", "kv_layout", "original"]
 
-    from vllm_gr.v1.worker.model_runner_common import (
-        freeze_gc_after_warmup,
+    from vllm_gr.v1.worker.gr_context import (
         get_beam_graph_runtime_stats,
+    )
+    from vllm_gr.v1.worker.gr_gc import (
+        freeze_gc_after_warmup,
     )
 
     assert worker_class.__dict__["get_gr_beam_graph_runtime_stats"] is get_beam_graph_runtime_stats

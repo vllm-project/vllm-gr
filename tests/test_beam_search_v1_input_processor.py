@@ -1091,4 +1091,19 @@ def test_online_entrypoint_rejects_dp_before_submission(local_only: bool, local_
     engine.submit_gr_session.assert_not_called()
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_constraint_table_rejects_explicit_catalog_strategy() -> None:
+    engine = _make_engine()
+    engine.vllm_config.device_config = SimpleNamespace(device="cuda")
+    with pytest.raises(
+        BeamSearchRequestError, match="Constraint Table does not support catalog_strategy"
+    ):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True, catalog_strategy="fill"),
+            online=False,
+        )
+
+
 pytestmark = pytest.mark.cpu_test

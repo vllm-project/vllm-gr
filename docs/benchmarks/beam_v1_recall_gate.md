@@ -26,16 +26,10 @@ the stored JSON preserves their full precision.
 | label_cond | 2.443016% | 2.414683% |
 | interactive | 20.846230% | 21.032897% |
 
-Provenance recorded in the baseline:
-
-- PR head: `809028ade945e5935be0b92dde6291b797f41d32`.
-- Base: `33a1fdb2e39dea9e30f648405bd263eb62b15323`.
-- Tested merge: `b7eacec7466a85e50b31ff24dc51e475df3c0ae9`.
-- Artifact: `beam-v1-recall-41385992758-1`, ID `13119065345`.
-- ZIP SHA256: `7a2e0446724a628eb176916a68c6d0d9b81d83f43c1a4137001e4d60c1136286`.
-- Runtime: A100-PCIE-40GB, CUDA 13.0, PyTorch 2.13.0+cu130, vLLM 0.30.0,
-  Python 3.11.12.
-- Model revision: `cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b`.
+The calibration used an A100 PCIe 40 GB, CUDA 13.0, PyTorch 2.13.0+cu130,
+vLLM 0.30.0 and Python 3.11.12. The
+[baseline JSON](../../benchmarks/beam_search/v1_recall_b4_baseline.json)
+records the exact model snapshot, tested commit, CI artifact and checksum.
 
 The original run failed the previous `label_cond` floor. That historical result
 is retained; the accepted measurements now define the reference for future
@@ -64,9 +58,9 @@ The A100 calibration does not establish identical absolute metrics on L20 or
 NPU. The separate [Video-100 gate](parent_score_gate.md), Pangu offline/online
 accuracy thresholds, and performance thresholds keep their existing policies.
 The GPU workflow reads this Recall baseline from its checked-out candidate; the
-Video-100/Pangu YAML policy continues to come from the PR base. On `main` and
-`decode_graph`, NPU runs retain the Video-100 benchmark instead of this GPU-only
-Recall gate.
+Video-100/Pangu YAML policy and resolver come from the same tested commit,
+as described in the [CI policy guide](../ci/benchmark-policy-approvals.md).
+On `main` and `decode_graph`, NPU runs use the Video-100 benchmark.
 
 ## Local validation
 

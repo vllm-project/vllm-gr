@@ -9,6 +9,8 @@ import hashlib
 import json
 import tracemalloc
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, BinaryIO
 
 import numpy as np
 import pytest
@@ -254,6 +256,110 @@ def test_atomic_save_streams_without_materializing_the_whole_artifact(
     digest = save_constraint_table_artifact(make_table(), output)
 
     assert digest == _digest(output.read_bytes())
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    ("data", "match"),
+    [
+        (b"short", "too short for a safetensors header"),
+        ((0).to_bytes(8, "little"), "invalid safetensors header size 0"),
+        (
+            (artifact_module._MAX_SAFETENSORS_HEADER_BYTES + 1).to_bytes(8, "little")
+            + b"{}".ljust(artifact_module._MAX_SAFETENSORS_HEADER_BYTES + 1, b" "),
+            "invalid safetensors header size",
+        ),
+        (
+            (artifact_module._MAX_SAFETENSORS_HEADER_BYTES).to_bytes(8, "little"),
+            "invalid safetensors header size",
+        ),
+    ],
+)
+def test_rejects_truncated_or_invalid_header_size(data: bytes, match: str, tmp_path: Path) -> None:
+    path = tmp_path / "bad-header.safetensors"
+    path.write_bytes(data)
+
+    with pytest.raises(ValueError, match=match):
+        _load(path, _digest(data))
+
+
+@pytest.mark.l1
+def test_rejects_duplicate_header_keys(tmp_path: Path) -> None:
+    header = b'{"__metadata__": 1, "__metadata__": 2}'
+    data = len(header).to_bytes(8, "little") + header
+    path = tmp_path / "duplicate-header-key.safetensors"
+    path.write_bytes(data)
+
+    with pytest.raises(ValueError, match="invalid safetensors header: duplicate key"):
+        _load(path, _digest(data))
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    ("header", "match"),
+    [
+        (b'{"answer": "not metadata"', "invalid safetensors header"),
+        (b"\xff\xfe\xfd", "invalid safetensors header"),
+        (b"[1, 2, 3]", "safetensors header must be a JSON object"),
+        (b"42", "safetensors header must be a JSON object"),
+    ],
+)
+def test_rejects_invalid_header_json(header: bytes, match: str, tmp_path: Path) -> None:
+    data = len(header).to_bytes(8, "little") + header
+    path = tmp_path / "bad-header-json.safetensors"
+    path.write_bytes(data)
+
+    with pytest.raises(ValueError, match=match):
+        _load(path, _digest(data))
+
+
+@pytest.mark.l1
+def test_rejects_oversized_artifact_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "oversized.safetensors"
+    digest = save_constraint_table_artifact(make_table(), path)
+    monkeypatch.setattr(artifact_module, "_MAX_ARTIFACT_BYTES", path.stat().st_size - 1)
+
+    class FailingReadFile:
+        def __init__(self, file: BinaryIO) -> None:
+            self.file = file
+
+        def fileno(self) -> int:
+            return self.file.fileno()
+
+        def read(self, *_args: object) -> bytes:
+            raise AssertionError("oversized artifact must be rejected before read")
+
+        def __enter__(self) -> "FailingReadFile":
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self.file.close()
+
+    original_open = Path.open
+
+    def instrumented_open(file_self: Any, *args: Any, **kwargs: Any) -> FailingReadFile:
+        return FailingReadFile(original_open(file_self, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "open", instrumented_open)
+    with pytest.raises(ValueError, match=r"exceeds the \d+ byte limit"):
+        _load(path, digest)
+
+
+@pytest.mark.l1
+def test_reports_shrinking_artifact_race(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "shrinking.safetensors"
+    digest = save_constraint_table_artifact(make_table(), path)
+    data = path.read_bytes()
+
+    reported_size = len(data) + 1
+    monkeypatch.setattr("os.fstat", lambda _fd: SimpleNamespace(st_size=reported_size))
+    with pytest.raises(
+        ValueError,
+        match=rf"size changed while reading: expected {reported_size}, got {len(data)}",
+    ):
+        _load(path, digest)
 
 
 pytestmark = pytest.mark.cpu_test

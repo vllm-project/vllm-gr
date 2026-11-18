@@ -11,7 +11,7 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
     metadata,
@@ -144,9 +144,9 @@ def test_ordinary_prefill_chunks_keep_native_state_and_token_progress():
     from unittest.mock import Mock
 
     from vllm_gr.v1.worker.gpu_model_runner_v2_patch import (
+        make_patched_execute_model_v2,
         make_patched_sample_tokens_v2,
     )
-    from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model_v2
 
     prompt = list(range(10, 18))
     worker = make_native_v2_worker(prompt)

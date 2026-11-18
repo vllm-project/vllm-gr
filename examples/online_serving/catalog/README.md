@@ -82,7 +82,7 @@ The example uses `beam.max_width: 128`, `beam.max_decode_steps: 3`, and
 Start the server with the canonical configuration:
 
 ```bash
-vllm-gr serve OpenOneRec/OneRec-1.7B \
+vllm serve OpenOneRec/OneRec-1.7B --gr \
     --revision "$ONEREC_REVISION" \
     --vllm-gr-config ${MyFolder}/vllm_gr_config.yaml \
     --default-chat-template-kwargs '{"enable_thinking": false}' \

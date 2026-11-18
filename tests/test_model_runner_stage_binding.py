@@ -12,6 +12,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
 )
 from vllm_gr.v1.worker import gpu_beam_stage_runner as stages
+from vllm_gr.v1.worker import gpu_model_runner_v2_patch as _v2_integration
 from vllm_gr.v1.worker import model_runner_common
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
@@ -40,7 +41,7 @@ def test_old_beam_frames_rejected_before_native_execution(use_v2: bool, mixed: b
     if mixed:
         output.num_scheduled_tokens["ordinary"] = 1
     factory = (
-        model_runner_common.make_patched_execute_model_v2
+        _v2_integration.make_patched_execute_model_v2
         if use_v2
         else model_runner_common.make_patched_execute_model
     )
@@ -68,7 +69,7 @@ def test_execute_entry_binds_hooks_independently_of_environment(
     monkeypatch.setattr(stages, "get_stage_runner", get_owner)
     native = _unexpected_native
     factory = (
-        model_runner_common.make_patched_execute_model_v2
+        _v2_integration.make_patched_execute_model_v2
         if use_v2
         else model_runner_common.make_patched_execute_model
     )
@@ -152,7 +153,7 @@ def test_v2_retirement_does_not_read_execution_mode(monkeypatch: pytest.MonkeyPa
     retire = Mock(return_value="retired")
     monkeypatch.setattr(stages, "execute_gr_retirement", retire)
     native = _unexpected_native
-    assert model_runner_common.make_patched_execute_model_v2(native)(worker, output) == "retired"
+    assert _v2_integration.make_patched_execute_model_v2(native)(worker, output) == "retired"
     local = retire.call_args.args[1]
     assert local is not output
     retire.assert_called_once_with(worker, local)
@@ -227,3 +228,30 @@ def test_stage_capture_passes_bound_model_install_policy(
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("use_v2", [False, True])  # type: ignore[misc]
+def test_stage_none_result_never_falls_through_to_native(
+    monkeypatch: pytest.MonkeyPatch, use_v2: bool
+) -> None:
+    worker = SimpleNamespace(device="cuda")
+    if not use_v2:
+        worker.vllm_config = SimpleNamespace(
+            additional_config={"vllm_gr_beam_execution_mode": "v1"}
+        )
+    scheduled = _scheduled_frame(**{GR_STAGE_OUTPUT_ATTR: {"session": object()}})
+    owner = SimpleNamespace(execute=Mock(return_value=None))
+    monkeypatch.setattr(stages, "get_stage_runner", Mock(return_value=owner))
+    factory = (
+        _v2_integration.make_patched_execute_model_v2
+        if use_v2
+        else model_runner_common.make_patched_execute_model
+    )
+    wrapper = (
+        factory(_unexpected_native)
+        if use_v2
+        else factory(_unexpected_native, hooks_type=CudaStageHooksV1)
+    )
+    assert wrapper(worker, scheduled) is None
+    assert owner.execute.call_count == 1

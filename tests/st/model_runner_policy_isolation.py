@@ -84,7 +84,9 @@ class PolicyWorkerExtension:
         import torch
 
         from vllm_gr.v1.worker import model_runner_patch
-        from vllm_gr.v1.worker.model_runner_common import get_beam_graph_runtime_stats
+        from vllm_gr.v1.worker.gr_context import (
+            get_beam_graph_runtime_stats,
+        )
 
         runner = self.model_runner
         owner = getattr(runner, "_gr_gpu_stage_runner", None)

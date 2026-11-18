@@ -87,7 +87,9 @@ def capture_async_forward(
         # operator's explicit FlashAttention choice while it is still available.
         remember_worker_flash_attn_version(worker)
         ensure_prefix_calibration(worker)
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         if getattr(_get_gr_config(worker), "beam_graph_widths", None) is not None:
             logger.warning(
@@ -122,7 +124,9 @@ def capture_async_forward(
 
 
 def _capture_enabled(worker: Any) -> bool:
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     cfg = _get_gr_config(worker)
     validate_gr_execution_runtime(worker.vllm_config)
@@ -161,7 +165,9 @@ def _capture_batch(
     from vllm_gr.v1.worker.gpu_beam_stage_runner import (
         get_stage_runner,
     )
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     cfg = _get_gr_config(worker)
     width = cfg.beam_max_width

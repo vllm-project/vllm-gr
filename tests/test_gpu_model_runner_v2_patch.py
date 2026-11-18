@@ -12,7 +12,9 @@ from unittest.mock import Mock, call
 import pytest
 
 from vllm_gr.v1.worker import gpu_model_runner_v2_patch as v2
-from vllm_gr.v1.worker import model_runner_common as common
+from vllm_gr.v1.worker import gpu_model_runner_v2_resources as resources
+from vllm_gr.v1.worker import gr_gc as _gc_runtime
+from vllm_gr.v1.worker import model_runner_contracts as _patch_contracts
 
 
 def test_discover_worker_runners_returns_v2_class() -> None:
@@ -90,21 +92,24 @@ def test_apply_v2_runner_patches_stamps_markers(
 
     # Input preparation/registration have guarded GR specializations; native
     # sampling and request retirement remain unchanged.
-    assert getattr(Runner.execute_model, common._WORKER_EXECUTE_PATCH_MARKER, False)
+    assert getattr(Runner.execute_model, _patch_contracts._WORKER_EXECUTE_PATCH_MARKER, False)
     assert all(getattr(Runner, name) is method for name, method in native_methods.items())
-    assert getattr(Runner.sample_tokens, common._WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False)
-    assert getattr(Runner.load_model, common._CONSTRAINT_LOAD_PATCH_MARKER, False)
-    assert getattr(Runner.shutdown, common._CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
-    assert getattr(Runner.prepare_inputs, common._WORKER_V2_PREPARE_PATCH_MARKER, False)
-    assert getattr(Runner.add_requests, common._WORKER_V2_ADD_REQUESTS_PATCH_MARKER, False)
-    assert common.is_worker_runner_v2_patched(Runner)
-    assert common.is_worker_runner_patched(Runner)
-    from vllm_gr.v1.worker import gpu_model_runner_v2_graph as graphs
+    assert getattr(
+        Runner.sample_tokens, _patch_contracts._WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False
+    )
+    assert getattr(Runner.load_model, _patch_contracts._CONSTRAINT_LOAD_PATCH_MARKER, False)
+    assert getattr(Runner.shutdown, _patch_contracts._CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
+    assert getattr(Runner.prepare_inputs, _patch_contracts._WORKER_V2_PREPARE_PATCH_MARKER, False)
+    assert getattr(
+        Runner.add_requests, _patch_contracts._WORKER_V2_ADD_REQUESTS_PATCH_MARKER, False
+    )
+    assert _patch_contracts.is_worker_runner_v2_patched(Runner)
+    assert _patch_contracts.is_worker_runner_patched(Runner)
 
     graph_methods = {
-        "initialize_kv_cache": graphs._WORKER_V2_KV_PATCH_MARKER,
-        "profile_cudagraph_memory": graphs._WORKER_V2_PROFILE_PATCH_MARKER,
-        "capture_model": graphs._WORKER_V2_GRAPH_PATCH_MARKER,
+        "initialize_kv_cache": v2._WORKER_V2_KV_PATCH_MARKER,
+        "profile_cudagraph_memory": v2._WORKER_V2_PROFILE_PATCH_MARKER,
+        "capture_model": v2._WORKER_V2_GRAPH_PATCH_MARKER,
     }
     captured_methods = {name: getattr(Runner, name) for name in graph_methods}
     for name, marker in graph_methods.items():
@@ -143,7 +148,7 @@ def test_sample_tokens_v2_plain_fallback_is_pure_native() -> None:
         return out
 
     wrapped = v2.make_patched_sample_tokens_v2(native)
-    assert getattr(wrapped, common._WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False)
+    assert getattr(wrapped, _patch_contracts._WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False)
     assert v2.make_patched_sample_tokens_v2(wrapped) is wrapped
 
     runner = SimpleNamespace()  # no _gr_gpu_stage_runner
@@ -188,7 +193,6 @@ def test_configure_model_runner_default_normalizes_opt_in(
 def test_capture_order_and_failure_propagation(
     monkeypatch: pytest.MonkeyPatch, beam_enabled: bool, failure: str | None
 ) -> None:
-    from vllm_gr.v1.worker import gpu_model_runner_v2_graph as graphs
     from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as prefill
 
     worker = SimpleNamespace(
@@ -198,9 +202,9 @@ def test_capture_order_and_failure_propagation(
     events = Mock()
     events.native.return_value = 17
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", events.plan)
-    monkeypatch.setattr(graphs, "capture_multibatch_forward", events.decode)
-    monkeypatch.setattr(graphs.torch.accelerator, "get_memory_info", lambda: (4096, 8192))
-    monkeypatch.setattr(common, "freeze_gc_after_graph_capture", events.freeze)
+    monkeypatch.setattr(resources, "capture_multibatch_forward", events.decode)
+    monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (4096, 8192))
+    monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", events.freeze)
     expected = [call.native(worker)]
     if beam_enabled:
         expected.insert(0, call.plan(worker))
@@ -209,7 +213,7 @@ def test_capture_order_and_failure_propagation(
     def native(runner: Any) -> int:
         return cast(int, events.native(runner))
 
-    wrapped = graphs.make_patched_capture_model_v2(native)
+    wrapped = v2.make_patched_capture_model_v2(native)
     if failure:
         error = RuntimeError("operation not supported when stream is capturing")
         getattr(events, failure).side_effect = error
@@ -242,7 +246,6 @@ def test_profile_capture_includes_decode_without_freezing(
 ) -> None:
     from vllm.compilation import monitor
 
-    from vllm_gr.v1.worker import gpu_model_runner_v2_graph as graphs
     from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as prefill
 
     manager = (
@@ -258,18 +261,18 @@ def test_profile_capture_includes_decode_without_freezing(
         cudagraph_manager=manager,
     )
     native = Mock(return_value=4096)
-    setattr(native, graphs._WORKER_V2_GRAPH_PATCH_MARKER, False)
+    setattr(native, v2._WORKER_V2_GRAPH_PATCH_MARKER, False)
     install = Mock()
     decode = Mock()
     freeze = Mock()
     monkeypatch.setattr(monitor, "cudagraph_capturing_enabled", capturing_enabled)
     decode.side_effect = lambda worker: monitor.set_cudagraph_capturing_enabled(False)
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", install)
-    monkeypatch.setattr(graphs, "capture_multibatch_forward", decode)
-    monkeypatch.setattr(common, "freeze_gc_after_graph_capture", freeze)
+    monkeypatch.setattr(resources, "capture_multibatch_forward", decode)
+    monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", freeze)
     memory = iter((8192, 7168))
-    monkeypatch.setattr(graphs.torch.accelerator, "get_memory_info", lambda: (next(memory), 16384))
-    assert graphs.make_patched_capture_model_v2(native)(worker, profile_only=profile_only) == 5120
+    monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (next(memory), 16384))
+    assert v2.make_patched_capture_model_v2(native)(worker, profile_only=profile_only) == 5120
     native.assert_called_once_with(worker, profile_only=profile_only)
     install.assert_called_once_with(worker)
     decode.assert_called_once_with(worker)
@@ -284,6 +287,44 @@ def test_profile_capture_includes_decode_without_freezing(
     assert samples == []  # The native profiler must not extrapolate a full measurement.
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("capturing_enabled", [False, True])  # type: ignore[misc]
+def test_profile_decode_failure_restores_native_capture_state(
+    monkeypatch: pytest.MonkeyPatch, capturing_enabled: bool
+) -> None:
+    from vllm.compilation import monitor
+
+    from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as prefill
+
+    worker = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(beam_max_width=128),
+        cudagraph_manager=object(),
+    )
+    error = RuntimeError("Decode capture failed")
+    native = Mock(return_value=4096)
+    setattr(native, v2._WORKER_V2_GRAPH_PATCH_MARKER, False)
+    install, freeze = Mock(), Mock()
+
+    def capture(runner: Any) -> bool:
+        assert runner is worker
+        monitor.set_cudagraph_capturing_enabled(False)
+        raise error
+
+    monkeypatch.setattr(monitor, "cudagraph_capturing_enabled", capturing_enabled)
+    monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", install)
+    monkeypatch.setattr(resources, "capture_multibatch_forward", capture)
+    monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (8192, 16384))
+    monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", freeze)
+
+    with pytest.raises(RuntimeError) as caught:
+        v2.make_patched_capture_model_v2(native)(worker, profile_only=True)
+    assert caught.value is error
+    assert monitor.cudagraph_capturing_enabled is capturing_enabled
+    native.assert_called_once_with(worker, profile_only=True)
+    install.assert_called_once_with(worker)
+    freeze.assert_not_called()
+
+
 @pytest.mark.parametrize("failure", [False, True])  # type: ignore[misc]
 def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
     monkeypatch: pytest.MonkeyPatch, failure: bool
@@ -293,7 +334,6 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
     from vllm.config import CUDAGraphMode as Mode
     from vllm.v1.worker.gpu import cudagraph_utils as native
 
-    from vllm_gr.v1.worker import gpu_model_runner_v2_graph as graphs
     from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as prefill
 
     mib = 1 << 20
@@ -342,18 +382,18 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
     monkeypatch.setattr(
         native,
         "_init_minimal_kv_cache_for_profiling",
-        lambda r: graphs.make_patched_initialize_kv_cache_v2(init)(r, object(), is_profiling=True),
+        lambda r: v2.make_patched_initialize_kv_cache_v2(init)(r, object(), is_profiling=True),
     )
     monkeypatch.setattr(native, "_teardown_profiling_state", teardown)
     monkeypatch.setattr(native.current_platform, "graph_pool_handle", lambda: (123, 456))
-    monkeypatch.setattr(graphs.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(v2.torch.accelerator, "empty_cache", lambda: None)
     pool = type(native.current_platform)._global_graph_pool
-    profile = graphs.make_patched_profile_cudagraph_memory_v2(native.profile_cudagraph_memory)
+    profile = v2.make_patched_profile_cudagraph_memory_v2(native.profile_cudagraph_memory)
     if failure:
         with pytest.raises(RuntimeError, match="capture failure"):
             profile(worker)
     else:
-        # Extrapolation must use the GR plan's seven FULL graphs.
+        # Extrapolation must use the GR plan's seven FULL v2.
         assert profile(worker) == (20 + 10 + 6 * 2) * mib
     assert events == ["capture", "native teardown"]
     assert type(native.current_platform)._global_graph_pool == pool
@@ -373,15 +413,13 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
 def test_profile_rejects_bound_runtime_and_preserves_non_beam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr.v1.worker import gpu_model_runner_v2_graph as graphs
-
     worker = SimpleNamespace(
         _vllm_gr_config=SimpleNamespace(beam_max_width=128),
         _beam_decode_graph=object(),
     )
     original = Mock(return_value=42)
-    setattr(original, graphs._WORKER_V2_PROFILE_PATCH_MARKER, False)
-    profile = graphs.make_patched_profile_cudagraph_memory_v2(original)
+    setattr(original, v2._WORKER_V2_PROFILE_PATCH_MARKER, False)
+    profile = v2.make_patched_profile_cudagraph_memory_v2(original)
     with pytest.raises(RuntimeError, match="unbound GR runtime"):
         profile(worker)
     original.assert_not_called()

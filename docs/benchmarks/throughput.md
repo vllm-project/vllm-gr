@@ -16,47 +16,40 @@ This guide explains how to run the throughput benchmark using the [`one_rec_main
 
 ### 1. Offline Throughput Mode (Simple, Local)
 
+Prepare the model snapshot and [constraint triples](../../examples/offline_inference/beam_search/README.md#constraint-table-artifact).
+The offline Beam runner builds a CUDA artifact from the triples.
+
 ```bash
-# Single command — everything runs in one process
+export ONEREC_MODEL=/absolute/path/to/OneRec-1.7B
+export ONEREC_TRIPLES=/absolute/path/to/video_constraint_triples.json
 python -m benchmarks.open_one_rec.one_rec_main bench throughput \
-  --model OpenOneRec/OneRec-1.7B \
-  --max-logprobs 1024 \
+  --model "$ONEREC_MODEL" \
   --dataset-name onerec \
   --dataset-path ./data \
   --task-types video \
   --num-prompts 100 \
-  --output-json results/throughput.json  \
-  --use-beam-search \
+  --output-json results/throughput.json \
+  --constraint-triples "$ONEREC_TRIPLES" \
+  --output-len 5 --beam-search-v1 \
   --n 128
 ```
 
 ### 2. Online, API Server Mode (Production-like)
 
-Run the server and client separately for a production‑style setup.
-
-#### Terminal 1 — Start the vLLM API server
-
-```bash
-
-  vllm-gr serve OpenOneRec/OneRec-1.7B \
-  --max-logprobs 1024 \
-  --default-chat-template-kwargs '{"enable_thinking": false}' \
-  --max-num-seqs 1024 \
-  --max-num-batched-tokens 16384 \
-  --scheduling-policy priority
-```
+Start the server using the [online V1 guide](../../examples/online_serving/beam_search/README.md#start-the-server).
+The client uses a local tokenizer from the same model snapshot as the server.
 
 #### Terminal 2 — Run the throughput benchmark against the server
 
 ```bash
-
+export ONEREC_MODEL=/absolute/path/to/OneRec-1.7B
 python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --endpoint /v1/chat/completions \
-  --backend openai-chat  \
-  --model OpenOneRec/OneRec-1.7B  \
-  --dataset-name  onerec \
-  --dataset-path ./data  \
-  --task-types video  \
+  --backend openai-chat \
+  --model onerec --tokenizer "$ONEREC_MODEL" \
+  --dataset-name onerec \
+  --dataset-path ./data \
+  --task-types video \
   --num-prompts 100 \
   --use-beam-search \
   --n 128
@@ -92,10 +85,12 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 
 #### Beam Search Parameters (Optional)
 
-| Argument            | Type | Default | Description                          |
-|---------------------|------|---------|--------------------------------------|
-| `--use-beam-search` | flag | `False` | Enable beam search during generation |
-| `--n`               | int  | -       | Number of beams for beam search      |
+| Argument               | Type | Default | Description                          |
+| ---------------------- | ---- | ------- | ------------------------------------ |
+| `--beam-search-v1`     | flag | `False` | Select the offline V1 Beam benchmark |
+| `--constraint-triples` | path | -       | Required for offline Beam V1         |
+| `--use-beam-search`    | flag | `False` | Enable beam search during generation |
+| `--n`                  | int  | -       | Number of beams for beam search      |
 
 #### Arguments for Online benchmark
 
@@ -111,11 +106,13 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 On some CPUs, including older Intel Xeon generations, NumPy AVX-512 kernels
 can trigger frequency changes that also slow subsequent scalar CPU work.
 Small token-array reductions may therefore increase end-to-end Beam latency
-despite being fast themselves. Local tests on a Xeon Gold 6133 with NumPy
-2.2.6 showed lower offline latency when NumPy AVX-512 dispatch was disabled;
-CPU frequency changes were not measured directly. This is CPU- and
+despite being fast themselves. One historical comparison found lower offline latency with NumPy AVX-512
+dispatch disabled. CPU frequency was not measured directly. This is CPU- and
 workload-dependent, so keep the default unless an A/B test shows a benefit.
 See Intel's [power level and frequency transition explanation][intel-avx512].
+
+> Measured on Intel Xeon Gold 6133 / date not recorded / NumPy 2.2.6.
+> Not a performance guarantee.
 
 For diagnosis with NumPy 2.2.6, prefix the same benchmark command with the
 setting below. Use your actual dataset directory and constraint JSON path.
@@ -123,9 +120,9 @@ setting below. Use your actual dataset directory and constraint JSON path.
 ```bash
 NPY_DISABLE_CPU_FEATURES=AVX512F,AVX512CD,AVX512_KNL,AVX512_KNM,AVX512_SKX,AVX512_CLX,AVX512_CNL,AVX512_ICL \
   python -m benchmarks.open_one_rec.one_rec_main bench throughput \
-  --model OpenOneRec/OneRec-1.7B --dataset-name onerec --dataset-path ./data \
-  --task-types video --num-prompts 100 --use-beam-search --n 128 \
-  --constraint-triples /path/to/video_constraint_triples.json \
+  --model "$ONEREC_MODEL" --dataset-name onerec --dataset-path ./data \
+  --task-types video --num-prompts 100 --beam-search-v1 --n 128 \
+  --output-len 5 --constraint-triples "$ONEREC_TRIPLES" \
   --output-json results/throughput-no-avx512.json
 ```
 
@@ -144,9 +141,9 @@ recommendation.
 
 ## Expected Output
 
-The output will include throughput metrics that can be used to evaluate the model's performance under load conditions.
+Illustrative output from the HTTP benchmark. The values show the report format.
 
-```bash
+```text
 
 ============ Serving Benchmark Result ============
 Successful requests:                     100
