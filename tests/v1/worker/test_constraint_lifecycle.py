@@ -511,7 +511,7 @@ def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
     from threading import Lock
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+    from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
         V2RuntimeState,
         close_v2_runtime,
     )

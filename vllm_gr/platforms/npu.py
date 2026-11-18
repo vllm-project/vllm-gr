@@ -49,7 +49,7 @@ class NPUBackendProvider:
     def get_model_runner_hooks(self) -> ModelRunnerPatchHooks:
         return cast(
             ModelRunnerPatchHooks,
-            import_module("vllm_gr.v1.worker.npu_model_runner_patch"),
+            import_module("vllm_gr.v1.worker.npu.npu_model_runner_patch"),
         )
 
     def get_attention_execution(self) -> BeamAttentionExecution:

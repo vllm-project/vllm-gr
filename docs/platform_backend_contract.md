@@ -152,7 +152,7 @@ owned by the corresponding platform module.
 
 `make_patched_execute_model()` is intentionally absent. It is shared GPU/NPU
 V1 adaptation owned by `model_runner_common.py`, imported only after V1
-selection. V2 owns its execute wrapper in `gpu_model_runner_v2_patch.py`; both
+selection. V2 owns its execute wrapper in `cuda/v2/gpu_model_runner_v2_patch.py`; both
 use shared dispatch in `gr_execution.py`. Installation markers/checks live in
 the hardware-free `model_runner_contracts.py` rather than in V1 adaptation.
 
@@ -208,7 +208,7 @@ registered.
 | `device_type` | `cuda` | `npu` |
 | `check_environment()` | Validate current CUDA platform, then `check_runtime_versions()` | `check_ascend_environment(require_npu_platform=True)` |
 | `apply_runtime_patches()` | No early compatibility hooks | NPU spawn protection, then NPUWorker initialization hook; return the summed patch count |
-| `get_model_runner_hooks()` | `gpu_model_runner_patch` | `npu_model_runner_patch` |
+| `get_model_runner_hooks()` | `cuda/v1/gpu_model_runner_patch` | `npu/npu_model_runner_patch` |
 | `get_attention_execution()` | `beam_attn_gpu` | `beam_attn_npu` |
 | `create_constrained_topk_execution()` | Lazy-loads a fresh `CUDAConstrainedTopKExecution(device=device)` | Lazy-loads a fresh `NPUConstrainedTopKExecution(device=device)` |
 

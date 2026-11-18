@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
@@ -26,11 +26,9 @@ from vllm_gr.v1.engine.beam_search_v1 import (
     validate_gr_execution_runtime,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
-from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
-from vllm_gr.v1.worker.gpu_stage_hooks import (
-    CudaStageHooksType,
-    validate_stage_hooks_type,
-)
+
+if TYPE_CHECKING:
+    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
 
 logger = init_logger(__name__)
 ENV_V1_STARTUP_CAPTURE_BATCH_SIZE = "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"
@@ -63,7 +61,7 @@ def capture_async_forward(
             return False
         device_type = str(worker.device).split(":")[0]
         if device_type == "npu":
-            from vllm_gr.v1.worker.npu_model_runner_patch import (
+            from vllm_gr.v1.worker.npu.npu_model_runner_patch import (
                 capture_beam_decode_graph,
             )
 
@@ -96,6 +94,8 @@ def capture_async_forward(
                 "beam.graph_widths is NPU-only startup pre-capture; CUDA captures "
                 "dynamic Decode (batch, width) shapes lazily on first use."
             )
+
+        from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
 
         existing = getattr(worker, "_gr_gpu_stage_runner", None)
         if existing is not None:
@@ -162,7 +162,8 @@ def _capture_batch(
     allow_eager_fallback: bool,
 ) -> str | None:
     """Capture the explicit batch selected by the V1 or V2 entry point."""
-    from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+    from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
+    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
         get_stage_runner,
     )
     from vllm_gr.v1.worker.gr_context import (

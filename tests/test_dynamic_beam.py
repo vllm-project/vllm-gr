@@ -270,7 +270,7 @@ def test_select_ignores_non_finite_parent_scores_per_batch():
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 @pytest.mark.parametrize("returned", [1, 2])
 def test_gpu_single_step_packing_filters_before_return_limit(bad, returned):
-    from vllm_gr.v1.worker.gpu_dynamic_beam import GPUDynamicBeam
+    from vllm_gr.v1.worker.cuda.gpu_dynamic_beam import GPUDynamicBeam
 
     adapter = GPUDynamicBeam.__new__(GPUDynamicBeam)
     adapter.state = DynamicBeamState(context(1, "cpu"), 1, 1)

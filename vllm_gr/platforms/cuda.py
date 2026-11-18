@@ -41,7 +41,7 @@ class CUDABackendProvider:
     def get_model_runner_hooks(self) -> ModelRunnerPatchHooks:
         return cast(
             ModelRunnerPatchHooks,
-            import_module("vllm_gr.v1.worker.gpu_model_runner_patch"),
+            import_module("vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch"),
         )
 
     def get_attention_execution(self) -> BeamAttentionExecution:

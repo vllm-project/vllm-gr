@@ -15,9 +15,9 @@ from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.engine.beam_search_v1 import GRRetireMetadata
 from vllm_gr.v1.engine.gr_async_scheduler import GR_RETIRE_RESULT_ATTR
-from vllm_gr.v1.worker import npu_beam_stage_runner as stage_module
-from vllm_gr.v1.worker.npu_beam_stage_adapter import NPUEagerStagePlan
-from vllm_gr.v1.worker.npu_beam_stage_runner import (
+from vllm_gr.v1.worker.npu import npu_beam_stage_runner as stage_module
+from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import NPUEagerStagePlan
+from vllm_gr.v1.worker.npu.npu_beam_stage_runner import (
     NPUEagerBeamStageRunner,
     execute_npu_gr_retirement,
 )

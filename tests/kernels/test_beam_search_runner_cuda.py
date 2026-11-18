@@ -41,8 +41,8 @@ from vllm_gr.v1.beam.cpu_reference import (
     select_initial_beams,
     select_next_beams,
 )
-from vllm_gr.v1.worker.beam_final_output import _PayloadLayout
-from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
+from vllm_gr.v1.worker.cuda.beam_final_output import _PayloadLayout
+from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 # Test fixtures and Triton DSL functions intentionally use untyped values.

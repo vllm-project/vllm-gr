@@ -34,7 +34,7 @@ and Worker staging.
   session cleanup before engine shutdown.
 - `BeamEngineCoreRequest` carries NumPy prompts. Core token storage and
   scheduler adapters live in `v1/beam/token_buffer.py`; V2 GPU staging lives in
-  `v1/worker/numpy_staging.py`. Prefix hashes preserve baseline cache identity.
+  `v1/worker/cuda/numpy_staging.py`. Prefix hashes preserve baseline cache identity.
 
 ```text
 protobuf repeated / bytes -> NumPy -> BeamBatchRequest

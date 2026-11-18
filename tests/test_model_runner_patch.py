@@ -9,7 +9,8 @@ from typing import Any
 import pytest
 
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
-from vllm_gr.v1.worker import gpu_model_runner_patch, model_runner_patch
+from vllm_gr.v1.worker import model_runner_patch
+from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
 
 
 @pytest.mark.l1  # type: ignore[misc]
@@ -121,7 +122,7 @@ def test_dispatcher_installs_required_and_optional_hooks_once(
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
     )
     if with_bookkeeping:
-        from vllm_gr.v1.worker import npu_model_runner_patch
+        from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
         platform_module.make_patched_bookkeeping_sync = (
             npu_model_runner_patch.make_patched_bookkeeping_sync
@@ -273,7 +274,7 @@ def test_npu_module_exports_sample_tokens_alias() -> None:
     scheduling (regression: bw128_1k_t10 trace had 0 patched_sample_tokens
     frames while the frontend kept its per-step RPC loop).
     """
-    from vllm_gr.v1.worker import npu_model_runner_patch
+    from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
     assert npu_model_runner_patch.make_patched_sample_tokens is (
         npu_model_runner_patch.make_patched_sample_tokens_npu
@@ -390,7 +391,7 @@ def test_numpy_token_staging_installs_for_cuda_runners_only(
     expected: list[str],
 ) -> None:
     """V1 and V2 share StagedWriteTensor, so staging is runner-agnostic."""
-    from vllm_gr.v1.worker import numpy_staging
+    from vllm_gr.v1.worker.cuda import numpy_staging
 
     calls: list[str] = []
     monkeypatch.setattr(numpy_staging, "install_numpy_staging", lambda: calls.append("staging"))
@@ -414,7 +415,7 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
     unguarded _prepare_inputs access the V2 runner does not expose."""
     called: list[str] = []
 
-    import vllm_gr.v1.worker.gpu_model_runner_v2_patch as v2_patch_module
+    import vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch as v2_patch_module
 
     fake_platforms = ModuleType("vllm.platforms")
     monkeypatch.setattr(
@@ -492,7 +493,7 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     original_import = builtins.__import__
 
     def without_cuda_hooks(name: str, *args: Any, **kwargs: Any) -> Any:
-        assert not name.startswith("vllm_gr.v1.worker.gpu_beam_stage_runner")
+        assert name != "vllm_gr.v1.worker.cuda" and not name.startswith("vllm_gr.v1.worker.cuda.")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", without_cuda_hooks)
@@ -513,10 +514,10 @@ def test_public_installer_owns_numpy_staging_once(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import gpu_model_runner_v2_patch as v2
     from vllm_gr.v1.worker import gr_async_output
     from vllm_gr.v1.worker import model_runner_patch as installer
-    from vllm_gr.v1.worker import numpy_staging
+    from vllm_gr.v1.worker.cuda import numpy_staging
+    from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
 
     install = Mock()
     discover = Mock(return_value=())

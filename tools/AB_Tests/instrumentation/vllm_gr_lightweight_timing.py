@@ -367,7 +367,7 @@ def install() -> None:
         )
         beam_decision.maybe_run_worker_beam_decision = wrapped_decision
         try:
-            import vllm_gr.v1.worker.gpu_model_runner_patch as gpu_patch
+            import vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch as gpu_patch
 
             gpu_patch.maybe_run_worker_beam_decision = wrapped_decision
         except ImportError:

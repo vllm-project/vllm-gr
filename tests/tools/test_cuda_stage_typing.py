@@ -13,7 +13,10 @@ from typing import Any
 import pytest
 
 from tools.pre_commit import mypy as mypy_hook
-from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks, validate_stage_hooks_type
+from vllm_gr.v1.worker.cuda.gpu_stage_hooks import (
+    CudaStageHooks,
+    validate_stage_hooks_type,
+)
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
@@ -104,8 +107,8 @@ def test_validate_rejects_a_different_hooks_class() -> None:
 
 def test_implementations_subclass_the_contract() -> None:
     """Both CUDA runners must inherit the ABC, not merely match it structurally."""
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
     for implementation in (CudaStageHooksV1, CudaStageHooksV2):
         assert issubclass(implementation, CudaStageHooks)
@@ -122,8 +125,8 @@ def test_implementations_subclass_the_contract() -> None:
             "vllm_gr/v1/worker/model_runner_contracts.py",
             "vllm_gr/v1/worker/gr_gc.py",
             "vllm_gr/v1/worker/gr_context.py",
-            "vllm_gr/v1/worker/gpu_model_runner_v2_patch.py",
-            "vllm_gr/v1/worker/gpu_model_runner_v2_resources.py",
+            "vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py",
+            "vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py",
         }
     ),
 )

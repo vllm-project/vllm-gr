@@ -22,7 +22,7 @@ def install_probes() -> None:
     from vllm.v1.engine.core import EngineCoreProc
 
     from vllm_gr.v1.worker import model_runner_patch
-    from vllm_gr.v1.worker.gpu_beam_stage_runner import GPUBeamStageRunner
+    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import GPUBeamStageRunner
 
     if getattr(GPUBeamStageRunner.execute, "_pause_drain_probe", False):
         return

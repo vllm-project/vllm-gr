@@ -12,9 +12,9 @@ from vllm.config.compilation import CUDAGraphMode as Mode
 from vllm.v1.worker.gpu import cudagraph_utils as native
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
-from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as pg2
 from vllm_gr.v1.worker import prefill_graph_common as common
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as pg2
+from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import close_v2_runtime
 from vllm_gr.v1.worker.model_runner_patch import (
     make_load_model_with_constraint_backend,
     make_shutdown_with_constraint_backend,

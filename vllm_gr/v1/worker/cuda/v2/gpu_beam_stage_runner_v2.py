@@ -34,15 +34,15 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
-from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
+from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
     _hidden_logits,
     should_replay_decode_graph,
 )
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import get_v2_runtime
-from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runtime
 
 logger = init_logger(__name__)
 
@@ -56,7 +56,9 @@ class CudaStageHooksV2(CudaStageHooks):
     specialize_constraint_steps: ClassVar[bool] = True
 
     def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
-        from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2InputBuffers
+        from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+            V2InputBuffers,
+        )
 
         worker, beam = self.worker, owner.beam
         block_size = worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
@@ -93,8 +95,10 @@ class CudaStageHooksV2(CudaStageHooks):
         pass
 
     def decode_graph(self, batch_size: int, beam_width: int) -> Any:
-        from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
-        from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2BeamDecodeGraph
+        from vllm_gr.v1.worker.cuda.beam_decode_graph import get_beam_decode_graph
+        from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+            V2BeamDecodeGraph,
+        )
 
         return get_beam_decode_graph(
             self.worker,
@@ -208,7 +212,7 @@ class CudaStageHooksV2(CudaStageHooks):
         worker = self.worker
         from contextlib import nullcontext
 
-        from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
+        from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
             GRPrefillCudaGraphManager,
         )
 

@@ -25,11 +25,11 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputOptions,
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.worker.npu_beam_stage_adapter import (
+from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
-from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
+from vllm_gr.v1.worker.npu.npu_beam_stage_runner import NPUEagerBeamStageRunner
 
 
 def _scalar_reference(

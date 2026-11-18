@@ -10,13 +10,13 @@ from typing import Any, ClassVar
 import torch
 
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
     _hidden_logits,
     should_replay_decode_graph,
 )
-from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
 
 
 class CudaStageHooksV1(CudaStageHooks):
@@ -109,7 +109,7 @@ class CudaStageHooksV1(CudaStageHooks):
             graph.discard_geometry(view.batch_size, view.beam_width)
 
     def decode_graph(self, batch_size: int, beam_width: int) -> Any:
-        from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
+        from vllm_gr.v1.worker.cuda.beam_decode_graph import get_beam_decode_graph
 
         return get_beam_decode_graph(self.worker, batch_size=batch_size, beam_width=beam_width)
 

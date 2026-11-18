@@ -35,7 +35,7 @@ from vllm_gr.v1.beam.batch_contracts import (
 _CONTROL_WORDS = 3
 
 if TYPE_CHECKING:
-    from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
         BeamRequestBinding,
         GPUBeamStageRunner,
     )

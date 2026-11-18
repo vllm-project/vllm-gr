@@ -86,7 +86,7 @@ def test_small_buckets_never_shrink_replay_coverage(
     bound the step grid baked for the same request. That is the regression the
     small buckets introduced when they were added to the default grid.
     """
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_common import (
         ENV_PREFILL_GRAPH_KV_BOUND,
         SMALL_PREFILL_BUCKETS,
@@ -310,8 +310,8 @@ def test_multi_req_graph_buffers() -> None:
 
 def test_platform_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_runner import (
         BeamPrefillGraphRunner,
         get_active_prefill_graph_runner_class,
@@ -363,7 +363,7 @@ class MockNPUAttnBuilder:
 def test_npu_dummy_metadata_per_bucket(
     bucket: int, expected_reqs: int, expected_lens: list[int], expected_cols: int
 ) -> None:
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     npu_runner = NPUPrefillGraphRunner(MockModelRunner(), buckets=[bucket])
     builder = MockNPUAttnBuilder()
@@ -383,7 +383,7 @@ def test_npu_dummy_metadata_per_bucket(
 
 
 def test_build_update_lists_pad_absorption() -> None:
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import build_update_lists
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import build_update_lists
 
     # No padding: lists mirror the real per-request token counts.
     qlen_list, kvlen_list = build_update_lists([32, 32], 64)
@@ -407,7 +407,7 @@ def test_build_update_lists_pad_absorption() -> None:
 def test_npu_dummy_metadata_and_bucket_registry() -> None:
     from types import SimpleNamespace
 
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     runner = MockModelRunner()
     npu_runner = NPUPrefillGraphRunner(runner, buckets=[128])
@@ -453,7 +453,7 @@ def test_npu_dummy_metadata_and_bucket_registry() -> None:
 def test_build_update_lists_from_metadata() -> None:
     from types import SimpleNamespace
 
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import (
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import (
         build_update_lists_from_metadata,
     )
 
@@ -494,7 +494,7 @@ def test_build_update_lists_from_metadata() -> None:
 
 
 def test_npu_capture_buffers_int32_slot_mapping() -> None:
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     runner = MockModelRunner()
     npu_runner = NPUPrefillGraphRunner(runner, buckets=[128])
@@ -513,7 +513,7 @@ def test_npu_capture_buffers_int32_slot_mapping() -> None:
 def test_npu_shared_workspace_binding() -> None:
     from types import SimpleNamespace
 
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     runner = MockModelRunner()
     npu_runner = NPUPrefillGraphRunner(runner, buckets=[128, 512])
@@ -667,7 +667,7 @@ def test_custom_b4_bucket_limit_uses_total_tokens(monkeypatch: pytest.MonkeyPatc
     from types import SimpleNamespace
 
     from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_BUCKETS
 
     runner = MockModelRunner()
@@ -687,7 +687,9 @@ def test_custom_b4_bucket_limit_uses_total_tokens(monkeypatch: pytest.MonkeyPatc
 
 def test_prefill_capture_without_v1_keeps_b1_when_only_b4_configured() -> None:
     from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import _capture_request_counts
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import (
+        _capture_request_counts,
+    )
 
     assert _capture_request_counts((4,), 4, None) == (1,)
     assert _capture_request_counts((4,), 4, BeamExecutionMode.V1) == (4,)
@@ -695,7 +697,7 @@ def test_prefill_capture_without_v1_keeps_b1_when_only_b4_configured() -> None:
 
 def test_b4_capture_geometry_respects_per_request_model_limit() -> None:
     from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import (
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import (
         _capture_dummy_positions,
         _capture_eligible_request_counts,
         _capture_query_len,
@@ -722,7 +724,7 @@ def test_b4_capture_geometry_respects_per_request_model_limit() -> None:
 def test_npu_max_kvlen_from_model_config() -> None:
     from types import SimpleNamespace
 
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     # Direct model_config attribute.
     runner: Any = SimpleNamespace(
@@ -745,7 +747,7 @@ def test_npu_max_kvlen_from_model_config() -> None:
 
 
 def test_gpu_replay_falls_back_without_slot_mapping() -> None:
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
     runner = MockModelRunner()
     gpu_runner = GPUPrefillGraphRunner(runner, buckets=[512])
@@ -773,7 +775,7 @@ def test_gpu_multi_request_replay_refreshes_request_local_buffers() -> None:
 
     import numpy as np
 
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
     request_ids = ("r0", "r1", "r2", "r3")
     token_counts = {"r0": 3, "r1": 4, "r2": 2, "r3": 5}
@@ -894,7 +896,7 @@ def test_gpu_capture_preserves_only_valid_native_fa_schedules(
 ) -> None:
     from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
     schedule = object()
     ordinary = object.__new__(FlashAttentionMetadata)
@@ -920,7 +922,7 @@ def test_gpu_capture_preserves_only_valid_native_fa_schedules(
 def test_gpu_max_seq_len_bound() -> None:
     from types import SimpleNamespace
 
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
     # Per-layer dict: every layer's scalar is bound to the replay KV-length
     # bound (2x the bucket).
@@ -950,7 +952,7 @@ def test_gpu_kv_capture_bound_matches_replay_gate(
     With the override unset the small buckets keep ``2 * bucket`` (they are
     not in the grid at all), and the override only ever widens.
     """
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_KV_BOUND
 
     monkeypatch.delenv(ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
@@ -978,7 +980,7 @@ def test_gpu_bucket16_gate_uses_capture_bound(monkeypatch: pytest.MonkeyPatch) -
 
     import numpy as np
 
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_KV_BOUND
 
     monkeypatch.setenv(ENV_PREFILL_GRAPH_KV_BOUND, "1024")
@@ -1031,7 +1033,7 @@ def test_gpu_replay_falls_back_when_kvlen_exceeds_bound() -> None:
 
     import numpy as np
 
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
     runner = SimpleNamespace(
         device=torch.device("cpu"),
@@ -1094,8 +1096,8 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
     import numpy as np
 
     from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
-    from vllm_gr.v1.worker import gpu_model_runner_patch as patch
-    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
     live_slots = torch.arange(1152, dtype=torch.int64)
     live_table = torch.zeros((1, 72), dtype=torch.int32)
@@ -1226,9 +1228,9 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     from unittest.mock import Mock
 
     from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.v1.worker import gpu_model_runner_patch as patch
     from vllm_gr.v1.worker import gr_async_output, gr_startup, model_runner_patch
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+    from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
+    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     stream = SimpleNamespace(wait_stream=lambda _other: None)
     monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
@@ -1307,7 +1309,7 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
 
 
 def test_npu_bsnd_config_defaults_off() -> None:
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     runner = NPUPrefillGraphRunner(MockModelRunner(), buckets=[128])
     assert runner._BSND_CAPTURE_SPECS == ()
@@ -1330,7 +1332,7 @@ def test_bsnd_metadata_resources_are_instance_owned(
 
 
 def test_npu_bsnd_config_validates_runner_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     monkeypatch.setenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", "1024,4;512,4")
     runner = NPUPrefillGraphRunner(MockModelRunner(), buckets=[512, 1024])
@@ -1343,7 +1345,7 @@ def test_npu_prefill_capture_skips_native_attention() -> None:
     from vllm_gr.v1.attention.backends.beam_attn_metadata import (
         BeamAttentionMetadataBuilder,
     )
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     class NativeBuilder:
         pass
@@ -1366,7 +1368,7 @@ def test_npu_prefill_capture_skips_mixed_attention_groups() -> None:
     from vllm_gr.v1.attention.backends.beam_attn_metadata import (
         BeamAttentionMetadataBuilder,
     )
-    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+    from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
     class Group:
         def __init__(self, builder: object) -> None:

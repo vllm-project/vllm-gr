@@ -17,8 +17,10 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
-from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_prepare_inputs_gpu
-from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
+from vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch import (
+    make_patched_prepare_inputs_gpu,
+)
+from vllm_gr.v1.worker.cuda.v1.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 # pytest parametrization decorators are untyped under strict mypy.

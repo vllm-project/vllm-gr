@@ -16,8 +16,8 @@ from typing import Any, cast
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER = "vllm_gr/v1/worker/npu_prefill_graph_runner.py"
-PATCH = "vllm_gr/v1/worker/npu_model_runner_patch.py"
+RUNNER = "vllm_gr/v1/worker/npu/npu_prefill_graph_runner.py"
+PATCH = "vllm_gr/v1/worker/npu/npu_model_runner_patch.py"
 ATTENTION = "vllm_gr/v1/attention/backends/beam_attn_npu.py"
 BACKEND = "vllm_gr/v1/attention/backends/beam_attn.py"
 

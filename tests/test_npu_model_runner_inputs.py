@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_gr.v1.worker import npu_model_runner_inputs as inputs
+from vllm_gr.v1.worker.npu import npu_model_runner_inputs as inputs
 
 
 def test_position_helpers_support_buffer_forms() -> None:

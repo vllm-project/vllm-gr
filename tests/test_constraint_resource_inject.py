@@ -189,7 +189,9 @@ def test_inject_constraint_resources_requires_complete_cuda_v1_stage_hooks(
 ) -> None:
     """Real V1 wrappers permit injection/preload without patching native _sample."""
     from vllm_gr.constraints import worker_inject
-    from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_sample_tokens_gpu
+    from vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch import (
+        make_patched_sample_tokens_gpu,
+    )
     from vllm_gr.v1.worker.model_runner_common import (
         make_patched_execute_model,
     )

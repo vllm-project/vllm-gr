@@ -32,7 +32,7 @@ class ReviewWorker(Worker):  # type: ignore[misc]  # Upstream Worker is untyped.
             return self.review_timed("forward", original_forward, *args, **kwargs)
 
         runner._model_forward = forward
-        from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
+        from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
 
         original_replay = BeamDecodeGraph.replay
 
@@ -41,7 +41,7 @@ class ReviewWorker(Worker):  # type: ignore[misc]  # Upstream Worker is untyped.
             return self.review_timed("forward_graph", original_replay, graph)
 
         BeamDecodeGraph.replay = replay
-        from vllm_gr.v1.worker.gpu_beam_stage_runner import GPUBeamStageRunner
+        from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import GPUBeamStageRunner
 
         original_admit = GPUBeamStageRunner.admit
 

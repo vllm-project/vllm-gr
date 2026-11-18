@@ -40,8 +40,8 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_WORKER_RESULT_ATTR,
 )
 from vllm_gr.v1.worker import gr_context as _gr_context
-from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
-from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
+from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     LOCAL_TILE_SIZE,
     SLICE_AUTO,
     GPUBeamStageRunner,
@@ -51,8 +51,8 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     head_slice_plan,
     validate_dispatch,
 )
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.gr_inputs import GRInputBuffers, bind_device_inputs
+from vllm_gr.v1.worker.cuda.gr_inputs import GRInputBuffers, bind_device_inputs
+from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
@@ -794,8 +794,8 @@ def test_head_logits_buffers_are_allocated_lazily_per_mode() -> None:
 @pytest.mark.parametrize("runner_version", ["v1", "v2"])
 @pytest.mark.parametrize("slice_setting", [None, "0", "off", "auto", "16384"])
 def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version, slice_setting):
-    from vllm_gr.v1.worker import gpu_beam_stage_runner as stage_runner
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+    from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stage_runner
+    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
     monkeypatch.setenv("VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT", "transposed")
     if slice_setting is None:
@@ -827,7 +827,7 @@ def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version
 
 def _assert_sliced_head_non_divisible_vocab_peak_allocation():
     """Measure only allocations made by this projection in a fresh process."""
-    from vllm_gr.v1.worker import gpu_beam_stage_runner as stage_runner
+    from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stage_runner
 
     rows, hidden_size, vocab_size = 2048, 16, 176256
     budget = 128 * 2**20

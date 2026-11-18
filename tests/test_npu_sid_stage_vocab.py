@@ -19,7 +19,7 @@ from vllm_gr.ops.npu.sid_stage_vocab import (
     select_sid_stage_candidates,
 )
 from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
-from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
+from vllm_gr.v1.worker.npu.npu_beam_stage_runner import NPUEagerBeamStageRunner
 
 
 def _tokenizer(vocabulary: Any) -> Any:

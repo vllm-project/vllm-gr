@@ -44,7 +44,7 @@ def test_cuda_provider_lazily_returns_platform_modules(
     def import_module(name: str) -> object:
         imported.append(name)
         return {
-            "vllm_gr.v1.worker.gpu_model_runner_patch": gpu_runner,
+            "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch": gpu_runner,
             "vllm_gr.v1.attention.backends.beam_attn_gpu": gpu_attention,
         }[name]
 
@@ -53,7 +53,7 @@ def test_cuda_provider_lazily_returns_platform_modules(
     assert cuda.CUDA_BACKEND.get_model_runner_hooks() is gpu_runner
     assert cuda.CUDA_BACKEND.get_attention_execution() is gpu_attention
     assert imported == [
-        "vllm_gr.v1.worker.gpu_model_runner_patch",
+        "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
         "vllm_gr.v1.attention.backends.beam_attn_gpu",
     ]
 
@@ -68,7 +68,7 @@ def test_npu_provider_lazily_returns_platform_modules(
     def import_module(name: str) -> object:
         imported.append(name)
         return {
-            "vllm_gr.v1.worker.npu_model_runner_patch": npu_runner,
+            "vllm_gr.v1.worker.npu.npu_model_runner_patch": npu_runner,
             "vllm_gr.v1.attention.backends.beam_attn_npu": npu_attention,
         }[name]
 
@@ -77,7 +77,7 @@ def test_npu_provider_lazily_returns_platform_modules(
     assert npu.NPU_BACKEND.get_model_runner_hooks() is npu_runner
     assert npu.NPU_BACKEND.get_attention_execution() is npu_attention
     assert imported == [
-        "vllm_gr.v1.worker.npu_model_runner_patch",
+        "vllm_gr.v1.worker.npu.npu_model_runner_patch",
         "vllm_gr.v1.attention.backends.beam_attn_npu",
     ]
 

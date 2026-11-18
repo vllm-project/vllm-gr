@@ -52,11 +52,13 @@ __all__ = [
 def get_active_prefill_graph_runner_class() -> type[BasePrefillGraphRunner]:
     """Returns the platform-specific prefill graph runner class."""
     if f"{current_platform.device_type}".lower() == "npu":
-        from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+        from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
 
         return NPUPrefillGraphRunner
     else:
-        from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+        from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import (
+            GPUPrefillGraphRunner,
+        )
 
         return GPUPrefillGraphRunner
 

@@ -213,8 +213,8 @@ def test_production_routes_forward_arguments_and_map_errors() -> None:
 
 @pytest.mark.l1
 def test_runner_keeps_the_same_wrapper_across_reload() -> None:
-    from vllm_gr.v1.worker import gpu_beam_stage_runner as stages
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+    from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
+    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     old, new = _backend(), _backend()
     table = VersionedConstraintTable(old, loader=lambda _: new)

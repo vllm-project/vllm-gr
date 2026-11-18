@@ -38,6 +38,20 @@ replace the separate Worker and Attention dispatchers. The
 [platform contract](platform_backend_contract.md) explains these boundaries;
 the [patch inventory](runtime_patch_inventory.md) records installation ownership.
 
+### Worker packages
+
+The public installer is `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`.
+The worker root owns cross-device dispatch, context, startup coordination,
+diagnostics and the adapters shared by V1 and Ascend. Device implementations
+live under `worker/cuda/` and `worker/npu/`. CUDA V1 and V2 use the same CUDA
+stage, workspace, input and Decode support. Each version owns its native
+integration and Prefill code in `cuda/v1/` or `cuda/v2/`.
+
+Keep package initializers lightweight. Select backend implementations lazily
+from the installer or the active dispatch branch. CUDA V2 can depend on shared
+CUDA support and shared worker code. Its imports must stay independent of
+CUDA V1 and Ascend integration.
+
 ## Request flow and ownership
 
 ```mermaid

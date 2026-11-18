@@ -33,11 +33,11 @@ from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_SAMPLE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
 )
-from vllm_gr.v1.worker.npu_model_runner_bookkeeping import (
+from vllm_gr.v1.worker.npu.npu_model_runner_bookkeeping import (
     _attach_beam_search_result,
     _beam_collapse_bookkeeping,
 )
-from vllm_gr.v1.worker.npu_model_runner_inputs import (
+from vllm_gr.v1.worker.npu.npu_model_runner_inputs import (
     InputBatchProxy,
     _beam_remap_inputs,
     _materialize_logits_indices,
@@ -921,7 +921,7 @@ def _capture_beam_decode_graph_width(runner, width: int) -> bool:
     # PIECEWISE/NONE dispatch. Never pad inactive rows into Beam state/KV ownership.
     batch_size = int(getattr(gr_cfg, "beam_graph_batch_size", 1))
     num_tokens = batch_size * width
-    from vllm_gr.v1.worker.npu_beam_decode_graph import install_npu_beam_graph_model
+    from vllm_gr.v1.worker.npu.npu_beam_decode_graph import install_npu_beam_graph_model
 
     # The implicit capacity-width capture needs the same isolation as explicit
     # stage widths. Install before the cached-shape check and verify ownership.

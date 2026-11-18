@@ -48,7 +48,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
-from vllm_gr.v1.worker.npu_beam_stage_adapter import (
+from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
@@ -424,7 +424,7 @@ class NPUEagerBeamStageRunner:
                 f"B*W token count: {total} != {plan.model_token_count}"
             )
 
-        from vllm_gr.v1.worker.npu_model_runner_inputs import (
+        from vllm_gr.v1.worker.npu.npu_model_runner_inputs import (
             InputBatchProxy,
             _get_positions_buffers,
             _materialize_logits_indices,

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_gr.v1.worker import gpu_postprocess_workspace as workspace_support
+from vllm_gr.v1.worker.cuda import gpu_postprocess_workspace as workspace_support
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 

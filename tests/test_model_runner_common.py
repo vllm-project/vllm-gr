@@ -14,9 +14,9 @@ from typing import Any
 import pytest
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
-from vllm_gr.v1.worker import gpu_model_runner_v2_patch as _v2_integration
 from vllm_gr.v1.worker import gr_gc as _gc_runtime
 from vllm_gr.v1.worker import model_runner_common as common
+from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as _v2_integration
 
 
 def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:

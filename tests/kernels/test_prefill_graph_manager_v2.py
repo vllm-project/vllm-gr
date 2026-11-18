@@ -25,8 +25,8 @@ from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 from vllm.v1.worker.gpu import cudagraph_utils as native
 
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
-from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
+from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import close_v2_runtime
+from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
     PrefillCapturePlan,
     install_prefill_graph_manager_v2,
 )

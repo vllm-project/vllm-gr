@@ -9,8 +9,8 @@ from unittest.mock import Mock
 import pytest
 from vllm.config import CUDAGraphMode
 
-from vllm_gr.v1.worker import beam_decode_graph as shared
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+from vllm_gr.v1.worker.cuda import beam_decode_graph as shared
+from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
     V2RuntimeState,
     get_v2_runtime,
 )
@@ -76,7 +76,9 @@ def test_context_replacement_fails_before_graph_launch() -> None:
 def test_replay_checks_captured_storage_and_model_before_launch(
     installed: bool, replacement: str | None, message: str | None
 ) -> None:
-    from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2BeamDecodeGraph
+    from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+        V2BeamDecodeGraph,
+    )
 
     graph = object.__new__(V2BeamDecodeGraph)
     graph.context, graph.input_buffers, graph.original_model = object(), object(), object()

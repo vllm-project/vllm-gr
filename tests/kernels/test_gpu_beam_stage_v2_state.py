@@ -24,8 +24,8 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
-from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
+from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
@@ -65,7 +65,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(
         desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 8, 1)
         batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
         if specialized:
-            from vllm_gr.v1.worker.gpu_prefill_v2 import (
+            from vllm_gr.v1.worker.cuda.v2.gpu_prefill_v2 import (
                 try_prepare_gr_prefill_inputs_v2,
             )
 
@@ -143,7 +143,7 @@ def test_ordinary_prefill_chunks_keep_native_state_and_token_progress():
     """Use native input/count operations and stand-in forward/sampling callbacks."""
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker.gpu_model_runner_v2_patch import (
+    from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch import (
         make_patched_execute_model_v2,
         make_patched_sample_tokens_v2,
     )
@@ -260,7 +260,7 @@ def test_v2_hooked_admission_records_the_session_once():
 
 @pytest.mark.l2
 def test_v2_decode_does_not_revalidate_the_session_facts(monkeypatch):
-    from vllm_gr.v1.worker import gpu_beam_stage_runner as stage_runner_module
+    from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stage_runner_module
 
     worker = admission_worker()
     first = metadata(0)

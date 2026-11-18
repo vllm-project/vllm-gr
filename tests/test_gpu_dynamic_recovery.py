@@ -9,10 +9,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-from vllm_gr.v1.worker.gpu_dynamic_beam import uses_dynamic_beam
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
+from vllm_gr.v1.worker.cuda.gpu_dynamic_beam import uses_dynamic_beam
+from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
     V2RuntimeState,
     get_v2_runtime,
 )
@@ -52,7 +52,7 @@ def test_discard_dynamic_graphs_drops_runtime_capture_refusals():
     describes a graph that no longer exists, so keeping it would veto the
     replacement this session is about to capture.
     """
-    from vllm_gr.v1.worker.gpu_dynamic_beam import discard_dynamic_graphs
+    from vllm_gr.v1.worker.cuda.gpu_dynamic_beam import discard_dynamic_graphs
 
     graph = Mock()
     worker = SimpleNamespace(
@@ -77,7 +77,7 @@ import gc
 import weakref
 from types import SimpleNamespace
 import torch
-from vllm_gr.v1.worker.gpu_dynamic_beam import GPUDynamicBeam
+from vllm_gr.v1.worker.cuda.gpu_dynamic_beam import GPUDynamicBeam
 class Owner:
     pass
 owner = Owner()

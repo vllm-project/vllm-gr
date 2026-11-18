@@ -60,7 +60,8 @@ def test_v1_requires_native_async() -> None:
 def test_v1_npu_startup_routes_to_acl_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr.v1.worker import gr_startup, npu_model_runner_patch
+    from vllm_gr.v1.worker import gr_startup
+    from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
     capture = Mock(return_value=True)
     monkeypatch.setattr(

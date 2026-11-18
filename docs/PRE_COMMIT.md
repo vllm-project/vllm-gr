@@ -66,7 +66,7 @@ sign-off using the configured Git identity.
 
 ## CUDA stage hooks contract
 
-`CudaStageHooks` in `vllm_gr/v1/worker/gpu_stage_hooks.py` is an abstract base
+`CudaStageHooks` in `vllm_gr/v1/worker/cuda/gpu_stage_hooks.py` is an abstract base
 class. Both CUDA runners subclass it, so an implementation that leaves a
 required operation or policy abstract raises `TypeError` when the hooks object is
 constructed, before any dispatch, on any device, with no type checker involved.

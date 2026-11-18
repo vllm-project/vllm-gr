@@ -21,7 +21,7 @@ from vllm_gr.v1.beam.output_columns import (
     sequence_columns,
     validate_complete_sequences,
 )
-from vllm_gr.v1.worker.beam_final_output import _build_batch_result, _PayloadLayout
+from vllm_gr.v1.worker.cuda.beam_final_output import _build_batch_result, _PayloadLayout
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 

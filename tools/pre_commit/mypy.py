@@ -35,10 +35,10 @@ FILES = [
 # internals outside this boundary remain dynamically typed.
 CUDA_STAGE_GROUP = "cuda-stage"
 CUDA_STAGE_FILES = [
-    "vllm_gr/v1/worker/gpu_stage_hooks.py",
-    "vllm_gr/v1/worker/gpu_beam_stage_runner.py",
-    "vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py",
-    "vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py",
+    "vllm_gr/v1/worker/cuda/gpu_stage_hooks.py",
+    "vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py",
+    "vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py",
+    "vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py",
     "vllm_gr/v1/worker/gr_execution.py",
     "vllm_gr/v1/worker/gr_startup.py",
     "vllm_gr/v1/worker/model_runner_common.py",
@@ -46,10 +46,10 @@ CUDA_STAGE_FILES = [
     "vllm_gr/v1/worker/gr_gc.py",
     "vllm_gr/v1/worker/gr_context.py",
     "vllm_gr/v1/worker/model_runner_patch.py",
-    "vllm_gr/v1/worker/gpu_model_runner_v2_patch.py",
-    "vllm_gr/v1/worker/gpu_model_runner_v2_resources.py",
-    "vllm_gr/v1/worker/gr_inputs.py",
-    "vllm_gr/v1/worker/beam_decode_graph.py",
+    "vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py",
+    "vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py",
+    "vllm_gr/v1/worker/cuda/gr_inputs.py",
+    "vllm_gr/v1/worker/cuda/beam_decode_graph.py",
     "tests/tools/cuda_stage_typing_cases.py",
 ]
 
@@ -57,10 +57,10 @@ CUDA_STAGE_FILES = [
 # so a signature change cannot escape caller-side validation.
 NPU_WORKER_GROUP = "npu-worker"
 NPU_WORKER_FILES = [
-    "vllm_gr/v1/worker/npu_model_runner_patch.py",
-    "vllm_gr/v1/worker/npu_beam_stage_runner.py",
-    "vllm_gr/v1/worker/npu_model_runner_inputs.py",
-    "vllm_gr/v1/worker/npu_model_runner_bookkeeping.py",
+    "vllm_gr/v1/worker/npu/npu_model_runner_patch.py",
+    "vllm_gr/v1/worker/npu/npu_beam_stage_runner.py",
+    "vllm_gr/v1/worker/npu/npu_model_runner_inputs.py",
+    "vllm_gr/v1/worker/npu/npu_model_runner_bookkeeping.py",
 ]
 
 # After fixing errors resulting from changing follow_imports

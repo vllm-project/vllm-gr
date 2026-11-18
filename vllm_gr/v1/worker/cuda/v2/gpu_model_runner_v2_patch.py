@@ -37,13 +37,13 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
-from vllm_gr.v1.worker import gpu_model_runner_v2_resources as v2_resources
 from vllm_gr.v1.worker import gr_execution, gr_gc
-from vllm_gr.v1.worker.gpu_postprocess_workspace import (
+from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
     _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
     make_load_model_with_beam_postprocess_workspace,
 )
-from vllm_gr.v1.worker.gpu_prefill_v2 import (
+from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_resources as v2_resources
+from vllm_gr.v1.worker.cuda.v2.gpu_prefill_v2 import (
     try_add_gr_prefill_requests,
     try_prepare_gr_prefill_inputs_v2,
 )
@@ -118,7 +118,7 @@ def make_patched_execute_model_v2(
     if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
         return _orig_execute_model
 
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
     @wraps(_orig_execute_model)
     def _patched_execute_model_step_v2(
@@ -235,7 +235,7 @@ def make_patched_initialize_kv_cache_v2(original: Any) -> Any:
     def initialize_kv_cache(self: Any, *args: Any, **kwargs: Any) -> Any:
         result = original(self, *args, **kwargs)
         if _get_gr_config(self).beam_max_width is not None:
-            from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
+            from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
                 install_prefill_graph_manager_v2,
             )
 
@@ -289,7 +289,7 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
         # The Engine admits only beam_search_v1 for V2 Beam engines. The
         # execution layer checks whether Beam is enabled, not its protocol.
         if _get_gr_config(self).beam_max_width is not None:
-            from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
+            from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
                 GRPrefillCudaGraphManager,
                 install_prefill_graph_manager_v2,
             )

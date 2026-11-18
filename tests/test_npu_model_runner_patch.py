@@ -20,13 +20,13 @@ from vllm_gr.v1.beam.npu_execution_batch import (
 )
 from vllm_gr.v1.worker import gr_context as _gr_context
 from vllm_gr.v1.worker import gr_execution as _gr_dispatch
-from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
-from vllm_gr.v1.worker.npu_beam_stage_adapter import (
+from vllm_gr.v1.worker.npu import npu_model_runner_patch as npu_patch
+from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
-from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
-from vllm_gr.v1.worker.npu_model_runner_inputs import InputBatchProxy
+from vllm_gr.v1.worker.npu.npu_beam_stage_runner import NPUEagerBeamStageRunner
+from vllm_gr.v1.worker.npu.npu_model_runner_inputs import InputBatchProxy
 
 
 def _eager_stage_output(
@@ -1211,7 +1211,7 @@ def _stub_beam_graph_install(
     from types import ModuleType
 
     calls: list[Any] = []
-    module = ModuleType("vllm_gr.v1.worker.npu_beam_decode_graph")
+    module = ModuleType("vllm_gr.v1.worker.npu.npu_beam_decode_graph")
 
     def install(runner: Any) -> Any:
         calls.append(runner)
@@ -1371,7 +1371,7 @@ def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 
     from vllm_gr.v1.beam.context import BEAM_DATA_VAR
-    from vllm_gr.v1.worker.npu_beam_decode_graph import NPUBeamGraphModel
+    from vllm_gr.v1.worker.npu.npu_beam_decode_graph import NPUBeamGraphModel
 
     descriptor = BatchDescriptor(num_tokens=4, uniform=True)
 
@@ -1903,7 +1903,8 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler(
 def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import gpu_beam_stage_runner, npu_beam_stage_runner
+    from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner
+    from vllm_gr.v1.worker.npu import npu_beam_stage_runner
 
     output = object()
     stage = SimpleNamespace(execute=Mock(return_value=output))
@@ -1995,7 +1996,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     """Mirror the 0.30.0rc2 first-decode call order through the real GR hooks."""
     from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
-    from vllm_gr.v1.worker import npu_beam_stage_runner, npu_model_runner_inputs
+    from vllm_gr.v1.worker.npu import npu_beam_stage_runner, npu_model_runner_inputs
 
     logical = _eager_stage_output(kind="decode")
     metadata = next(iter(logical.gr_stage_metadata.values()))
@@ -2103,7 +2104,7 @@ def test_npu_failed_execute_reaches_sample_without_native_fallback(
 ) -> None:
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import npu_beam_stage_runner
+    from vllm_gr.v1.worker.npu import npu_beam_stage_runner
 
     failure = ValueError("injected execute failure")
     worker = SimpleNamespace(device="npu", execute_model_state=None)
@@ -2260,7 +2261,7 @@ def test_npu_prefill_sample_preserves_candidate_and_winner_shape_errors(
 def test_npu_decode_sample_accepts_candidate_width_distinct_from_winner_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr.v1.worker import npu_beam_stage_runner
+    from vllm_gr.v1.worker.npu import npu_beam_stage_runner
 
     scheduled = _eager_stage_output(kind="decode", batch_size=1, beam_width=2)
     metadata = next(iter(scheduled.gr_stage_metadata.values()))
@@ -3132,7 +3133,7 @@ def test_npu_dynamic_parent_history_is_not_advanced_twice(
     native = Mock(side_effect=AssertionError("dynamic lineage must not use the native decision"))
     advance = Mock(side_effect=AssertionError("dynamic lineage must not be advanced twice"))
     monkeypatch.setattr(
-        "vllm_gr.v1.worker.npu_beam_stage_runner.run_beam_decision_candidates", native
+        "vllm_gr.v1.worker.npu.npu_beam_stage_runner.run_beam_decision_candidates", native
     )
     monkeypatch.setattr(stage, "_advance_parent_history", advance)
     build_terminal = stage._build_terminal_result

@@ -23,7 +23,7 @@ from tests.kernels.v2_input_test_utils import (
     make_native_v2_worker,
     make_prefill_metadata,
 )
-from vllm_gr.v1.worker.gpu_prefill_v2 import (
+from vllm_gr.v1.worker.cuda.v2.gpu_prefill_v2 import (
     try_add_gr_prefill_requests,
     try_prepare_gr_prefill_inputs_v2,
 )
@@ -165,7 +165,7 @@ def _fresh_registration_worker():
 @pytest.mark.parametrize("batch", [1, 2, 4, 8])
 @pytest.mark.parametrize("numpy_tokens", [False, True])
 def test_fused_registration_matches_native_after_batch_reuse(batch, numpy_tokens):
-    from vllm_gr.v1.worker.numpy_staging import install_numpy_staging
+    from vllm_gr.v1.worker.cuda.numpy_staging import install_numpy_staging
 
     install_numpy_staging()
     native, fast = _fresh_registration_worker(), _fresh_registration_worker()

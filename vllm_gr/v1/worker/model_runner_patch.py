@@ -8,12 +8,11 @@ from collections.abc import Callable
 from functools import wraps
 from importlib import import_module
 from types import ModuleType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 
 from vllm_gr.config import ConstraintTableBackendEnum
-from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooksType
 from vllm_gr.v1.worker.gr_context import (
     get_beam_graph_runtime_stats,
 )
@@ -29,11 +28,14 @@ from vllm_gr.v1.worker.model_runner_contracts import (
     is_worker_runner_patched,
 )
 
+if TYPE_CHECKING:
+    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
+
 logger = init_logger(__name__)
 
-_GPU_PATCH_MODULE = "vllm_gr.v1.worker.gpu_model_runner_patch"
-_NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu_model_runner_patch"
-_V2_GPU_PATCH_MODULE = "vllm_gr.v1.worker.gpu_model_runner_v2_patch"
+_GPU_PATCH_MODULE = "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch"
+_NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu.npu_model_runner_patch"
+_V2_GPU_PATCH_MODULE = "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch"
 _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 
 
@@ -338,7 +340,7 @@ def _install_numpy_token_staging() -> None:
     """
     if _active_platform_module_name() != _GPU_PATCH_MODULE:
         return
-    from vllm_gr.v1.worker.numpy_staging import install_numpy_staging
+    from vllm_gr.v1.worker.cuda.numpy_staging import install_numpy_staging
 
     install_numpy_staging()
 
@@ -362,7 +364,7 @@ def apply_worker_patches() -> None:
         # no ``_prepare_inputs``/``_bookkeeping_sync``; the V1 body below does
         # unguarded attribute access that V2 lacks, so dispatch to the
         # V2-specific installer instead.
-        from vllm_gr.v1.worker import gpu_model_runner_v2_patch as v2
+        from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
 
         v2._apply_v2_runner_patches()
         return
@@ -376,10 +378,10 @@ def apply_worker_patches() -> None:
         platform_module, "make_load_model_with_beam_postprocess_workspace", None
     )
     if _active_platform_module_name() == _GPU_PATCH_MODULE:
-        from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-        from vllm_gr.v1.worker.gpu_postprocess_workspace import (
+        from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
             make_load_model_with_beam_postprocess_workspace,
         )
+        from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
         cuda_hooks_type = CudaStageHooksV1
         workspace_load_patcher = make_load_model_with_beam_postprocess_workspace

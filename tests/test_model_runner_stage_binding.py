@@ -11,12 +11,12 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_RETIRE_OUTPUT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
 )
-from vllm_gr.v1.worker import gpu_beam_stage_runner as stages
-from vllm_gr.v1.worker import gpu_model_runner_v2_patch as _v2_integration
 from vllm_gr.v1.worker import model_runner_common
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
+from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as _v2_integration
+from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
 
 def _unexpected_native(*args: object, **kwargs: object) -> None:
@@ -206,7 +206,7 @@ def test_stage_capture_passes_bound_model_install_policy(
     hooks_type: type[CudaStageHooks],
     input_width: int | None,
 ) -> None:
-    from vllm_gr.v1.worker import beam_decode_graph
+    from vllm_gr.v1.worker.cuda import beam_decode_graph
 
     worker = SimpleNamespace()
     owner = object.__new__(stages.GPUBeamStageRunner)

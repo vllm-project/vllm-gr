@@ -87,7 +87,7 @@ def _apply_fused_prefill_state_writes(worker: Any) -> None:
     block_table = worker.block_tables.block_tables[0]
     tokens = states.all_token_ids._staged_write_contents
     block_ids = block_table._staged_write_contents
-    from vllm_gr.v1.worker.numpy_staging import NumpyStagedContents, array_h2d
+    from vllm_gr.v1.worker.cuda.numpy_staging import NumpyStagedContents, array_h2d
 
     token_array = tokens.array() if isinstance(tokens, NumpyStagedContents) else np.asarray(tokens)
     count = len(states.total_len._staged_write_indices)
@@ -420,7 +420,7 @@ def _try_prepare_gr_prefill_batch_inputs_v2(
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
     from vllm_gr.ops.cuda.gr_prefill_inputs import prepare_gr_prefill_batch_inputs_v2
-    from vllm_gr.v1.worker.numpy_staging import array_h2d
+    from vllm_gr.v1.worker.cuda.numpy_staging import array_h2d
 
     # Pack only the small row descriptors; tokens stay in native GPU/UVA state.
     # Native gather_batch_req_state owns ordering, independently of slot IDs or

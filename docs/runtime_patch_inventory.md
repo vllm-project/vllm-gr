@@ -305,11 +305,11 @@ Cross-batch stage-adapter caching is opt-in through
 and Decode capture policy remain active when this cache is disabled.
 
 - Sources:
-    - `vllm_gr/v1/worker/gpu_model_runner_patch.py`
-    - `vllm_gr/v1/worker/gpu_model_runner_v2_patch.py`
-    - `vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py` (`CudaStageHooksV1`)
-    - `vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py` (`CudaStageHooksV2`)
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/model_runner_contracts.py`, `vllm_gr/v1/worker/gr_gc.py`, `vllm_gr/v1/worker/gr_context.py`, `vllm_gr/v1/worker/gr_execution.py`, `vllm_gr/v1/worker/gpu_postprocess_workspace.py`, `vllm_gr/v1/worker/gpu_model_runner_v2_resources.py`, `vllm_gr/v1/worker/gpu_prefill_inputs.py`, `vllm_gr/v1/worker/gpu_prefill_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/gpu_stage_hooks.py`, `vllm_gr/v1/worker/gpu_beam_stage_runner.py`
+    - `vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py`
+    - `vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py`
+    - `vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py` (`CudaStageHooksV1`)
+    - `vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py` (`CudaStageHooksV2`)
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/model_runner_contracts.py`, `vllm_gr/v1/worker/gr_gc.py`, `vllm_gr/v1/worker/gr_context.py`, `vllm_gr/v1/worker/gr_execution.py`, `vllm_gr/v1/worker/cuda/gpu_postprocess_workspace.py`, `vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py`, `vllm_gr/v1/worker/cuda/v1/gpu_prefill_inputs.py`, `vllm_gr/v1/worker/cuda/v2/gpu_prefill_v2.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/worker/cuda/gpu_stage_hooks.py`, `vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - CUDA stage binding: execution and startup entrypoints explicitly select the
   independent V1/V2 implementations of `CudaStageHooks`. The shared core has no
@@ -331,7 +331,7 @@ and Decode capture policy remain active when this cache is disabled.
   Coverage: `tests/test_model_runner_common.py`,
   `tests/test_model_runner_stage_binding.py`, `tests/test_model_runner_patch.py`,
   `tests/platforms/test_import_isolation.py`, and the existing CUDA lifecycle cases.
-- V2 runtime ownership: `gpu_model_runner_v2_resources.py` owns one
+- V2 runtime ownership: `cuda/v2/gpu_model_runner_v2_resources.py` owns one
   `V2RuntimeState` per Worker generation, containing fixed inputs and capture
   records. Graphs validate their borrowed generation before replay. Shared
   stage/cache and model/head ownership remain separate. Lifecycle cleanup checks
@@ -380,9 +380,9 @@ and Decode capture policy remain active when this cache is disabled.
     - the 3-item `_prepare_inputs` result (`logits_indices`, speculative-decode metadata, maximum sampled-token count);
     - native execute/sample separation and asynchronous output consumption;
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
-- V2 graph integration: `gpu_model_runner_v2_patch.py` owns the KV,
+- V2 graph integration: `cuda/v2/gpu_model_runner_v2_patch.py` owns the KV,
   profiling and capture patch factories and their installation markers.
-  `gpu_model_runner_v2_resources.py` owns multi-batch Decode capture with explicit
+  `cuda/v2/gpu_model_runner_v2_resources.py` owns multi-batch Decode capture with explicit
   V2 hooks binding through `gr_startup.py`. The native Prefill manager remains
   separate. Profiling teardown, capture-state restoration, shape-local fallback,
   memory accounting and GC-freeze ordering retain their existing execution points.
@@ -411,11 +411,11 @@ and Decode capture policy remain active when this cache is disabled.
 - V2 Prefill fast-path validation: `tests/kernels/test_gr_prefill_v2.py` compares
   registration and fused inputs with native CUDA state, including reused slots,
   cached/chunked inputs, padding, pending-write fallback and failed submission
-  without queue loss. `gpu_prefill_v2.py` owns registration, input preparation and the
+  without queue loss. `cuda/v2/gpu_prefill_v2.py` owns registration, input preparation and the
   packed native-state write contract, separate from stage execution hooks.
-  `gpu_postprocess_workspace.py` owns workspace initialization, the load-wrapper
+  `cuda/gpu_postprocess_workspace.py` owns workspace initialization, the load-wrapper
   marker and load-time device-memory accounting shared by CUDA V1/V2. V1 input
-  preparation remains in `gpu_prefill_inputs.py`; V2 does not import the V1
+  preparation remains in `cuda/v1/gpu_prefill_inputs.py`; V2 does not import the V1
   integration module.
 - Shared workspace coverage: `tests/test_gpu_postprocess_workspace.py` checks
   load ordering, failure propagation, fixed-storage reuse and memory accounting.
@@ -433,8 +433,8 @@ and Decode capture policy remain active when this cache is disabled.
 
 - Scope: `backend`; backend ID: `npu`
 
-- Source: `vllm_gr/v1/worker/npu_model_runner_patch.py`
-- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/npu_model_runner_inputs.py`, `vllm_gr/v1/worker/npu_model_runner_bookkeeping.py`, `vllm_gr/v1/worker/model_runner_contracts.py`, `vllm_gr/v1/worker/gr_gc.py`, `vllm_gr/v1/worker/gr_context.py`, `vllm_gr/v1/worker/gr_execution.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/ascend_compat.py`
+- Source: `vllm_gr/v1/worker/npu/npu_model_runner_patch.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`, `vllm_gr/v1/worker/npu/npu_model_runner_inputs.py`, `vllm_gr/v1/worker/npu/npu_model_runner_bookkeeping.py`, `vllm_gr/v1/worker/model_runner_contracts.py`, `vllm_gr/v1/worker/gr_gc.py`, `vllm_gr/v1/worker/gr_context.py`, `vllm_gr/v1/worker/gr_execution.py`, `vllm_gr/v1/worker/hot_update.py`, `vllm_gr/constraints/versioned_table.py`, `vllm_gr/v1/ascend_compat.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
     - `NPUModelRunner.execute_model`

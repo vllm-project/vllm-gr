@@ -23,8 +23,8 @@ for module_name in (
     "torch_npu",
     "vllm",
     "vllm_ascend",
-    "vllm_gr.v1.worker.gpu_model_runner_patch",
-    "vllm_gr.v1.worker.npu_model_runner_patch",
+    "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
+    "vllm_gr.v1.worker.npu.npu_model_runner_patch",
     "vllm_gr.v1.attention.backends.beam_attn_gpu",
     "vllm_gr.v1.attention.backends.beam_attn_npu",
     "vllm_gr.v1.ascend_compat",
@@ -40,8 +40,8 @@ for module_name in (
     "torch_npu",
     "vllm",
     "vllm_ascend",
-    "vllm_gr.v1.worker.gpu_model_runner_patch",
-    "vllm_gr.v1.worker.npu_model_runner_patch",
+    "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
+    "vllm_gr.v1.worker.npu.npu_model_runner_patch",
     "vllm_gr.v1.attention.backends.beam_attn_gpu",
     "vllm_gr.v1.attention.backends.beam_attn_npu",
     "vllm_gr.v1.ascend_compat",
@@ -113,8 +113,9 @@ assert not any(name in sys.modules for name in blocked)
 @pytest.mark.parametrize(  # type: ignore[misc]
     "module_name",
     [
-        "vllm_gr.v1.worker.gpu_postprocess_workspace",
-        "vllm_gr.v1.worker.gpu_model_runner_v2_patch",
+        "vllm_gr.v1.worker.cuda.gpu_postprocess_workspace",
+        "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch",
+        "vllm_gr.v1.worker.model_runner_patch",
     ],
 )
 def test_shared_workspace_and_v2_do_not_import_v1_integration(module_name: str) -> None:
@@ -122,23 +123,44 @@ def test_shared_workspace_and_v2_do_not_import_v1_integration(module_name: str) 
     code = """
 import importlib
 import importlib.abc
+import os
 import sys
+from unittest.mock import Mock
 
-forbidden = {
-    "vllm_gr.v1.worker.model_runner_common",
-    "vllm_gr.v1.worker.gpu_model_runner_patch",
-    "vllm_gr.v1.worker.gpu_prefill_inputs",
-    "vllm_gr.v1.worker.npu_model_runner_patch",
-}
+blocked_packages = ("vllm_gr.v1.worker.cuda.v1", "vllm_gr.v1.worker.npu")
+
+def forbidden(name):
+    return name == "vllm_gr.v1.worker.model_runner_common" or any(
+        name == package or name.startswith(package + ".") for package in blocked_packages
+    )
 
 class RejectInactiveIntegration(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname in forbidden:
+        if forbidden(fullname):
             raise AssertionError(f"unexpected integration dependency: {fullname}")
 
 sys.meta_path.insert(0, RejectInactiveIntegration())
-importlib.import_module(sys.argv[1])
-assert not forbidden.intersection(sys.modules)
+module_name = sys.argv[1]
+if module_name == "vllm_gr.v1.worker.model_runner_patch":
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    import vllm.platforms
+    from vllm.platforms.interface import Platform
+
+    platform = Platform()
+    platform.device_type = "cuda"
+    vllm.platforms.current_platform = platform
+
+    from vllm_gr.v1.worker import model_runner_patch
+    from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch
+
+    install_v2 = Mock()
+    gpu_model_runner_v2_patch._apply_v2_runner_patches = install_v2
+    model_runner_patch._install_active_worker_resource_hook = Mock()
+    model_runner_patch.apply_worker_patches()
+    install_v2.assert_called_once_with()
+else:
+    importlib.import_module(module_name)
+assert not any(forbidden(name) for name in sys.modules)
 """
     subprocess.run(
         [sys.executable, "-c", code, module_name],
@@ -157,12 +179,19 @@ pytestmark = pytest.mark.cpu_test
 def test_runner_contracts_import_stays_hardware_free() -> None:
     code = """
 import sys
-from vllm_gr.v1.worker import model_runner_contracts
+from vllm_gr.v1.worker import cuda, model_runner_contracts, npu
+from vllm_gr.v1.worker.cuda import v1, v2
 
+for package in (cuda, v1, v2, npu):
+    assert not any(
+        name.startswith(package.__name__ + ".")
+        and (package is not cuda or name not in (v1.__name__, v2.__name__))
+        for name in sys.modules
+    )
 assert callable(model_runner_contracts.is_worker_runner_patched)
 for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
              "vllm_gr.v1.worker.model_runner_common",
-             "vllm_gr.v1.worker.gpu_model_runner_v2_patch"):
+             "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch"):
     assert name not in sys.modules, name
 """
     subprocess.run(

@@ -73,6 +73,7 @@ import os
 import tarfile
 from email.parser import BytesParser, Parser
 from importlib import metadata
+from importlib.util import find_spec
 from pathlib import Path
 
 from packaging.requirements import Requirement
@@ -84,6 +85,20 @@ install_dir = Path(os.environ["INSTALL_DIR"]).resolve()
 origin = Path(vllm_gr.__file__).resolve()
 if not origin.is_relative_to(install_dir):
     raise SystemExit(f"vllm_gr imported outside wheel target: {origin}")
+
+# Probe installed module locations without importing hardware implementations.
+worker_package = "vllm_gr.v1.worker"
+for module in (
+    "model_runner_patch",
+    "cuda.gpu_stage_hooks",
+    "cuda.v1.gpu_model_runner_patch",
+    "cuda.v2.gpu_model_runner_v2_patch",
+    "cuda.v2.gpu_model_runner_v2_resources",
+    "npu.npu_model_runner_patch",
+):
+    spec = find_spec(f"{worker_package}.{module}")
+    if spec is None or not spec.origin or not Path(spec.origin).resolve().is_relative_to(install_dir):
+        raise SystemExit(f"worker module missing from installed wheel: {module}")
 
 version = metadata.version("vllm-gr")
 (sdist,) = (Path(os.environ["SOURCE_DIR"]) / "dist").glob("*.tar.gz")

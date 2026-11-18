@@ -13,10 +13,10 @@ skips unused native sampler initialization and refresh, while preserving
 request removal, model state, block IDs and per-slot prompt-logprob resets.
 Every member must pass admission before any slot changes. Ordinary, mixed,
 new-plus-cached and unsupported batches retain native registration.
-`gpu_prefill_v2` owns registration, the staged-write ABI and guarded V2
-input preparation. V1 preparation remains in `gpu_prefill_inputs`; the V2
+`cuda/v2/gpu_prefill_v2` owns registration, the staged-write ABI and guarded V2
+input preparation. V1 preparation remains in `cuda/v1/gpu_prefill_inputs`; the V2
 stage hooks own execution and lifecycle transitions. Both CUDA integrations
-use `gpu_postprocess_workspace` for workspace initialization and load-time
+use `cuda/gpu_postprocess_workspace` for workspace initialization and load-time
 device-memory accounting; V2 does not import V1 patch implementation code.
 
 Fresh batches on an empty native request set can flush token, total-length,
@@ -79,11 +79,11 @@ candidate backend before it can become active.
 
 ### Graph installation and startup ownership
 
-`gpu_model_runner_v2_patch.py` owns the marker-guarded factories for native
+`cuda/v2/gpu_model_runner_v2_patch.py` owns the marker-guarded factories for native
 KV initialization, graph-memory profiling and model capture. The existing
-`gpu_model_runner_v2_resources.py` owns multi-batch Decode capture together
+`cuda/v2/gpu_model_runner_v2_resources.py` owns multi-batch Decode capture together
 with fixed input storage, graph bindings and runtime invalidation.
-`gpu_prefill_graph_runner_v2.py` owns native FULL/PIECEWISE planning and replay.
+`cuda/v2/gpu_prefill_graph_runner_v2.py` owns native FULL/PIECEWISE planning and replay.
 
 ```mermaid
 flowchart LR
@@ -103,7 +103,7 @@ resource ownership, consumer-drain prerequisites or release timing.
 
 ### Execution and shared support ownership
 
-V2 owns `make_patched_execute_model_v2` in `gpu_model_runner_v2_patch.py`.
+V2 owns `make_patched_execute_model_v2` in `cuda/v2/gpu_model_runner_v2_patch.py`.
 `model_runner_common.py` is limited to native V1 execution adaptation and active
 input proxies/row/logprob bookkeeping used by NPU. The public installer imports
 that V1 wrapper only after selecting V1; V2 does not load this adaptation module.
@@ -144,7 +144,7 @@ lifetime, including when engines run in process.
 
 ### V2 runtime generations and teardown prerequisites
 
-`gpu_model_runner_v2_resources.py` owns `V2RuntimeState`, reached through the
+`cuda/v2/gpu_model_runner_v2_resources.py` owns `V2RuntimeState`, reached through the
 Worker's single `_gr_v2_runtime` reference. Its object identity is the runtime
 generation. Fixed input tensors remain lazily allocated at the same capacities
 and addresses; graph bindings borrow the generation and its input storage.
@@ -245,7 +245,7 @@ The switch is read from service configuration, not from individual requests;
 it does not add startup pre-capture or change schedule-miss behavior.
 
 `CudaStageHooksV1` and `CudaStageHooksV2` subclass the `CudaStageHooks` abstract
-base class in `gpu_stage_hooks.py`. The ABC rejects missing operations and policy
+base class in `cuda/gpu_stage_hooks.py`. The ABC rejects missing operations and policy
 flags at construction. The class-side `CudaStageHooksType` Protocol additionally
 checks constructor compatibility at binding sites; mypy checks operation signatures
 and policy types. Hooks are constructed before session admission or graph-cache

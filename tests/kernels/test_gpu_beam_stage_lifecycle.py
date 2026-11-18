@@ -23,10 +23,10 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
-from vllm_gr.v1.worker.gpu_beam_stage_runner import AsyncGPUBeamOutput
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import get_v2_runtime
+from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import AsyncGPUBeamOutput
+from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runtime
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
@@ -98,8 +98,10 @@ def test_native_output_completion_preserves_async_receipt(monkeypatch, hooks_cls
     # drained. Native work must consume its own fresh output, not old GR state.
     from vllm.v1.core.sched.output import SchedulerOutput
 
-    from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_sample_tokens_gpu
-    from vllm_gr.v1.worker.gpu_model_runner_v2_patch import (
+    from vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch import (
+        make_patched_sample_tokens_gpu,
+    )
+    from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch import (
         make_patched_execute_model_v2,
         make_patched_sample_tokens_v2,
     )
@@ -388,7 +390,7 @@ def test_running_cancel_drains_queued_stage_without_changing_beam_state(dtype, n
 @pytest.mark.parametrize("cancelled", [False, True])
 @torch.inference_mode()
 def test_v2_runtime_cleanup_preserves_unconsumed_receipt(cancelled):
-    from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+    from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import close_v2_runtime
 
     owner = runtime(n=3 if cancelled else 1, hooks_cls=CudaStageHooksV2)
     worker = make_native_v2_worker(list(range(7)))

@@ -31,7 +31,7 @@ from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     stream_slice,
     unconstrained_topk_mcap_out,
 )
-from vllm_gr.v1.worker.gpu_beam_stage_runner import head_slice_plan
+from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import head_slice_plan
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 

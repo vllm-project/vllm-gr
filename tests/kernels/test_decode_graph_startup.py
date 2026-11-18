@@ -14,8 +14,10 @@ from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     install_decode_model,
 )
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import should_replay_decode_graph_v2
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import (
+    should_replay_decode_graph_v2,
+)
+from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
     capture_multibatch_forward,
     get_v2_runtime,
 )

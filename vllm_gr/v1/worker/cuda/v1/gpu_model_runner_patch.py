@@ -16,7 +16,7 @@ from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
 )
-from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
+from vllm_gr.v1.worker.cuda.v1.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 from vllm_gr.v1.worker.gr_context import (
     _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
@@ -399,7 +399,7 @@ def capture_beam_decode_graph(runner) -> bool:
 
     Returns True if a graph was captured.
     """
-    from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
+    from vllm_gr.v1.worker.cuda.beam_decode_graph import get_beam_decode_graph
     from vllm_gr.v1.worker.gr_context import (
         _get_gr_config,
     )

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_gr.v1.worker import npu_model_runner_bookkeeping as bookkeeping
+from vllm_gr.v1.worker.npu import npu_model_runner_bookkeeping as bookkeeping
 
 
 def test_logprob_remux_preserves_flattening_and_placeholder_rows() -> None:

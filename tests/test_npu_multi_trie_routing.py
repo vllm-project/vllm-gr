@@ -15,8 +15,8 @@ import torch
 
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.worker.npu_beam_stage_adapter import NPUEagerStagePlan
-from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
+from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import NPUEagerStagePlan
+from vllm_gr.v1.worker.npu.npu_beam_stage_runner import NPUEagerBeamStageRunner
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 

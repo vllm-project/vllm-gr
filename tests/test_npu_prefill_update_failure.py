@@ -29,8 +29,8 @@ class _ForwardCase:
         monkeypatch.setitem(
             sys.modules, "vllm_gr.v1.attention.backends.beam_attn_npu", backend_module
         )
-        runner_module = importlib.import_module("vllm_gr.v1.worker.npu_prefill_graph_runner")
-        self.patch = importlib.import_module("vllm_gr.v1.worker.npu_model_runner_patch")
+        runner_module = importlib.import_module("vllm_gr.v1.worker.npu.npu_prefill_graph_runner")
+        self.patch = importlib.import_module("vllm_gr.v1.worker.npu.npu_model_runner_patch")
         monkeypatch.delenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", raising=False)
         self.owner = SimpleNamespace(
             device=torch.device("cpu"),
@@ -259,7 +259,7 @@ def test_safe_preflight_rejection_keeps_native_fallback(case: _ForwardCase, miss
 
 def test_failure_state_belongs_to_the_runner_instance(case: _ForwardCase) -> None:
     case.fail()
-    module = importlib.import_module("vllm_gr.v1.worker.npu_prefill_graph_runner")
+    module = importlib.import_module("vllm_gr.v1.worker.npu.npu_prefill_graph_runner")
     fresh = module.NPUPrefillGraphRunner(SimpleNamespace(device=torch.device("cpu")), buckets=[4])
     fresh.raise_if_failed()
     assert fresh._task_update_error is None

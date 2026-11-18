@@ -66,18 +66,18 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
-from vllm_gr.v1.worker.beam_final_output import GPUBeamFinalOutput
-from vllm_gr.v1.worker.beam_search_runner import (
+from vllm_gr.v1.worker.cuda.beam_final_output import GPUBeamFinalOutput
+from vllm_gr.v1.worker.cuda.beam_search_runner import (
     BeamBatchSearchRunner,
     BeamCandidateBatch,
     BeamSearchRunner,
 )
-from vllm_gr.v1.worker.gpu_stage_hooks import (
+from vllm_gr.v1.worker.cuda.gpu_stage_hooks import (
     CudaStageHooks,
     CudaStageHooksType,
     validate_stage_hooks_type,
 )
-from vllm_gr.v1.worker.gr_inputs import (
+from vllm_gr.v1.worker.cuda.gr_inputs import (
     GRInputBuffers,
     PreparedGRInputs,
     bind_device_inputs,
@@ -1414,7 +1414,7 @@ def get_stage_runner(
         raise ValueError("captured Beam resource addresses or layouts changed")
     # The graph captures the adapter's fixed Forward and attention buffers,
     # not the request-local Beam state or its effective token budget.
-    from vllm_gr.v1.worker.gpu_dynamic_beam import (
+    from vllm_gr.v1.worker.cuda.gpu_dynamic_beam import (
         GPUDynamicBeam,
         discard_dynamic_graphs,
         uses_dynamic_beam,

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch_mod
+from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as gpu_patch_mod
 
 
 def test_gpu_model_forward_intercepts_pure_prefill(

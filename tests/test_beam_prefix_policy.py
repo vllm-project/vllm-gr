@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_gr.v1.attention.backends import beam_prefix_policy as policy
-from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
+from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +59,7 @@ def test_length_graphs_do_not_alias_and_new_storage_invalidates_all_buckets():
 def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),

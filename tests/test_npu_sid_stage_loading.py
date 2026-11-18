@@ -14,7 +14,7 @@ from vllm_gr.v1.worker.model_runner_patch import (
     make_load_model_with_constraint_backend,
     make_shutdown_with_constraint_backend,
 )
-from vllm_gr.v1.worker.npu_model_runner_patch import (
+from vllm_gr.v1.worker.npu.npu_model_runner_patch import (
     make_patched_load_model,
     make_patched_shutdown,
 )
