@@ -435,17 +435,17 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
 
 def _npu_xllm_decode_mode_active() -> bool:
-    """True iff the NPU decode execution mode resolves to the fused xllm path.
+    """True iff the selected backend's fused decode path is active.
 
-    Only the xllm fused path is graph-safe: the cascade NPU path slices the
-    beam pool with host-int decode_step values (beam_attn_npu.py), which a
-    captured graph would freeze.  Resolved lazily through the same
-    per-process cache the attention backend uses (``_get_npu_decode_execution``).
+    Only the fused path is graph-safe: the cascade path slices the beam pool
+    with host-int decode_step values (beam_attn_npu.py), which a captured graph
+    would freeze. The selected backend answers which path it runs.
     """
     try:
-        from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
+        from vllm_gr.platforms.loader import active_backend_service
 
-        return _get_npu_decode_execution() == "xllm"
+        policy = active_backend_service("create_stage_execution_service")
+        return bool(policy.uses_fused_beam_decision())
     except Exception:
         return False
 

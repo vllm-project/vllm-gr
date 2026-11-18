@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
-    from .services import BeamAttentionService, StageExecutionService
+    from .services import BackendConfigService, BeamAttentionService, StageExecutionService
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,12 @@ class CUDABackendProvider:
         from .cuda_services import CudaBeamAttentionService
 
         return CudaBeamAttentionService()
+
+    def create_config_service(self) -> BackendConfigService:
+        """Return CUDA's configuration-time policy."""
+        from .cuda_services import CudaConfigService
+
+        return CudaConfigService()
 
     def create_stage_execution_service(self) -> StageExecutionService:
         """Return the CUDA stage execution service.

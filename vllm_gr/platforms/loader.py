@@ -104,17 +104,21 @@ def activate_current_backend() -> GRBackendProvider:
     matches providers against the identity of the platform vLLM already chose;
     an explicit ``VLLM_GR_BACKEND`` may pick among compatible matches but cannot
     make an incompatible platform match.
+
+    Once a backend is active, the answer cannot change in this process, so the
+    call returns it without repeating discovery. Execution entry points call this
+    per stage and per attention layer, and re-running registration there would
+    add registry walks to the token hot path.
     """
+    active = _already_active()
+    if active is not None:
+        return active
+
     from .builtins import register_builtin_backends
     from .compat import enforce_declared_ranges
 
     register_builtin_backends()
     load_backend_plugins()
-
-    active = _already_active()
-    if active is not None:
-        enforce_declared_ranges(active)
-        return active
 
     provider = activate_selected_backend(
         current_platform_identity(),
@@ -132,3 +136,36 @@ def _already_active() -> GRBackendProvider | None:
         return get_active_backend()
     except BackendNotActiveError:
         return None
+
+
+#: Bound services, keyed by factory, together with the provider that owns them.
+_SERVICES: dict[str, tuple[object, object]] = {}
+
+
+def active_backend_service(factory: str) -> object:
+    """Return one bound service of the active backend, created once per process.
+
+    RFC #706 requires execution to call services that are already bound: no
+    entry-point discovery, reflection, or backend probing per token. Activation
+    walks the registry and re-checks declared version ranges, so shared code that
+    runs per attention layer or per decode step must not repeat it.
+
+    The cached entry records the provider that produced the service and is
+    rebuilt when that provider changes, so a test that selects a different
+    backend never receives the previous backend's service. Holding the provider
+    reference also keeps its identity stable for the comparison.
+    """
+    provider = activate_current_backend()
+
+    entry = _SERVICES.get(factory)
+    if entry is not None and entry[0] is provider:
+        return entry[1]
+    service = getattr(provider, factory)()
+    _SERVICES[factory] = (provider, service)
+    return service
+
+
+def _reset_backend_services_for_tests() -> None:
+    """Drop cached services so an isolated test selects its own backend."""
+    _SERVICES.clear()
+

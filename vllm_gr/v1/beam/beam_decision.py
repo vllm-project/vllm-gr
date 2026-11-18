@@ -67,20 +67,29 @@ def _is_beam_decode_step(runner: Any) -> bool:
     return False
 
 
-def _xllm_decode_mode_active() -> bool:
-    """True iff the NPU decode execution mode resolves to the fused xllm path.
+def _stage_policy() -> Any:
+    """Return the selected backend's stage-execution policy.
 
-    The worker-side beam decision is the post-processing half of the xllm
+    Operator-path selection belongs to the runner adapter or stage service
+    (RFC #706), so shared Beam decision code asks the backend instead of
+    comparing a device name. The service is bound once per process: these calls
+    run per decode step, and activation re-walks the provider registry.
+    """
+    from vllm_gr.platforms.loader import active_backend_service
+
+    return active_backend_service("create_stage_execution_service")
+
+
+def _xllm_decode_mode_active() -> bool:
+    """True iff the selected backend's fused decision path is available.
+
+    The worker-side beam decision is the post-processing half of the fused
     pipeline: its same-step ``select_unshared_kv`` reorder assumes the fused
-    pool layout, and running it under ``cascade`` mode would mix the two
-    execution paths.  Resolved lazily through the same per-process cache the
-    attention backend uses (``_get_npu_decode_execution``; unset config
-    defaults to ``cascade``, NPU-with-library defaults to ``xllm``).
+    pool layout, and running it under the cascade path would mix the two
+    execution modes.
     """
     try:
-        from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
-
-        return _get_npu_decode_execution() == "xllm"
+        return bool(_stage_policy().uses_fused_beam_decision())
     except Exception:
         return False
 
@@ -89,10 +98,9 @@ def worker_decision_enabled(runner: Any) -> bool:
     """Return whether worker-side beam decision is active for this run.
 
     Requires the GRConfig opt-in, an active BeamSearchSession, an incremental
-    beam-decode step, an NPU device, and worker-side candidate filtering. It
-    additionally requires the fused xllm decode mode. CUDA V1 decisions are
-    handled by the stage runner and never enter this path. Trie filtering
-    remains frontend-side and therefore keeps the frontend NumPy decision path.
+    beam-decode step, and a backend that executes decisions worker-side. It
+    additionally requires that backend's fused decode mode. Shared code never
+    tests a device name here; the selected backend answers both questions.
     """
     from vllm_gr.config import ConstraintBackend
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
@@ -104,11 +112,9 @@ def worker_decision_enabled(runner: Any) -> bool:
         return False
     if _decision_buffers(runner) is None:
         return False
-    device = getattr(runner, "device", None)
-    device_type = str(getattr(device, "type", ""))
-    if device_type != "npu":
+    if not _stage_policy().supports_worker_beam_decision():
         return False
-    # NPU same-step KV selection is defined only for fused xllm mode.
+    # Same-step KV selection is defined only on the fused decode path.
     if not _xllm_decode_mode_active():
         return False
     # Trie-catalog filtering runs frontend-side; Constraint Table candidates
@@ -310,10 +316,10 @@ def _reorder_kv_same_step(
     step = state.decode_step  # 0-based; the reorder covers [0, step]
     pool_beam_width = pools[0].unshared_key.shape[1]
 
-    # The fused operator only executes on NPU tensors; CPU hosts (unit tests,
-    # GPU-debug parity runs) go straight to the dispatcher fallback instead of
-    # raising through the ACL layer first.
-    if beam_index.numel() == pool_beam_width and str(beam_index.device.type) == "npu":
+    # The fused operator only executes on the backend that provides it; other
+    # hosts (unit tests, GPU-debug parity runs) go straight to the dispatcher
+    # fallback instead of raising through the vendor layer first.
+    if beam_index.numel() == pool_beam_width and _stage_policy().uses_fused_beam_decision():
         try:
             from vllm_gr.ops.npu import beam_ops
 
@@ -370,7 +376,7 @@ def _reorder_kv_batch_same_step(
     if tuple(beam_index.shape) != expected or tuple(group_token_num.shape) != expected:
         raise RuntimeError("NPU Beam batch reorder tensors have an invalid shape")
 
-    if str(beam_index.device.type) == "npu":
+    if _stage_policy().uses_fused_beam_decision():
         try:
             from vllm_gr.ops.npu import beam_ops
 
@@ -456,9 +462,10 @@ def _finalize_decision(
     if len(sessions) != batch:
         raise RuntimeError("Beam decision batch does not match its request sessions")
     if not all(item._state.is_last_step for item in sessions):
-        # NPU B>1 keeps the complete request-major geometry in one operator call.
-        # Other devices and B=1 retain the established per-session path.
-        if batch > 1 and local_idx.device.type == "npu":
+        # A backend that reorders the whole request-major geometry in one
+        # operator call keeps B>1 in a single dispatch; other devices and B=1
+        # retain the established per-session path.
+        if batch > 1 and _stage_policy().batches_beam_kv_reorder():
             _reorder_kv_batch_same_step(session, sessions, local_idx, local_prefix)
         else:
             for row, item in enumerate(sessions):
@@ -548,9 +555,10 @@ def _run_torch_decision(
     seq = bufs.sequence[:batch, :beam_width, : step + 1].contiguous()
 
     prefix: torch.Tensor | None = None
-    if is_last_step and (
-        top_tokens.device.type == "cuda" or result_width % _FINAL_SELECT_ALIGNMENT == 0
-    ):
+    # A backend whose final-select kernel has no row-tiling constraint accepts
+    # any result width; one that tiles rows needs an aligned width.
+    aligned_width_required = _stage_policy().requires_aligned_final_select()
+    if is_last_step and (not aligned_width_required or result_width % _FINAL_SELECT_ALIGNMENT == 0):
         out_ids, out_idx, out_lp, out_seq = beam_search_rec_final_select(
             log_probs, top_tokens, top_probs, seq, step, result_width
         )
@@ -596,8 +604,7 @@ def run_beam_decision(
     cannot be decided worker-side (caller keeps the frontend path).
     """
     width = session.beam_width
-    run_device = getattr(runner, "device", None)
-    device_type = str(run_device.type) if run_device is not None else ""
+    policy = _stage_policy()
     # Candidate width K is independent of the beam width W; the sampler emits
     # one row per beam and K columns per row.
     candidate_width = _workspace_candidate_width(runner, width)
@@ -629,10 +636,10 @@ def run_beam_decision(
         # twice. Normal engine paths seed from request metadata at creation.
         return None
 
-    # The fused xllm decision operators hard-code K == W. Raise here, outside
-    # the defensive fallback below, so an unsupported geometry cannot be
-    # silently absorbed by the PyTorch reference.
-    if device_type.startswith("npu") and candidate_width != width:
+    # The fused decision operators hard-code K == W. Raise here, outside the
+    # defensive fallback below, so an unsupported geometry cannot be silently
+    # absorbed by the portable reference.
+    if policy.requires_beam_candidate_width_match() and candidate_width != width:
         raise NotImplementedError(
             "NPU beam decision requires candidate_width == beam_width, got "
             f"candidate_width={candidate_width}, beam_width={width}"
@@ -641,10 +648,10 @@ def run_beam_decision(
     try:
         from vllm_gr.ops.npu import beam_ops
 
-        # The fused xllm operators execute on NPU tensors; on CPU/CUDA hosts
-        # (unit-test / GPU-debug environments) always take the PyTorch
-        # reference so the decision logic stays verifiable off-device.
-        if beam_ops.is_available() and device_type.startswith("npu"):
+        # The fused operators execute only on the backend that provides them;
+        # other hosts (unit-test / GPU-debug environments) always take the
+        # portable reference so the decision logic stays verifiable off-device.
+        if beam_ops.is_available() and policy.uses_fused_beam_decision():
             decision = _run_npu_decision(session, top_tokens, top_probs, is_last_step, result_width)
             if decision is not None:
                 decision["probs"] = session.context.decision.beam_scores[:1, :width].clone()
@@ -692,13 +699,13 @@ def run_beam_decision_candidates(
     result_width = result_width or width
     if not 1 <= result_width <= width:
         raise ValueError("result_width must be in [1, beam_width]")
-    device_type = str(getattr(getattr(runner, "device", None), "type", ""))
-    if device_type.startswith("npu"):
+    policy = _stage_policy()
+    if policy.uses_fused_beam_decision():
         from vllm_gr.ops.npu import beam_ops
 
         if not beam_ops.is_available():
             raise RuntimeError("NPU Beam decision operators are unavailable")
-        if top_tokens.shape[1] != width:
+        if policy.requires_beam_candidate_width_match() and top_tokens.shape[1] != width:
             raise NotImplementedError(
                 "NPU beam decision requires candidate_width == beam_width, got "
                 f"candidate_width={top_tokens.shape[1]}, beam_width={width}"

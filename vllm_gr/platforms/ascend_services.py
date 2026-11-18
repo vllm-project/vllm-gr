@@ -71,6 +71,29 @@ class AscendStageExecutionService:
 
         validate_gr_device_config(worker.vllm_config)
 
+    def supports_worker_beam_decision(self) -> bool:
+        return True
+
+    def uses_fused_beam_decision(self) -> bool:
+        """The fused decision operators exist only on the fused decode path."""
+        if self.decode_mode() != _XLLM_DECODE_MODE:
+            return False
+        from vllm_gr.ops.npu import beam_ops
+
+        return bool(beam_ops.is_available())
+
+    def requires_beam_candidate_width_match(self) -> bool:
+        # The fused decision operators hard-code one survivor per Beam row.
+        return True
+
+    def batches_beam_kv_reorder(self) -> bool:
+        # One request-major call keeps the whole B>1 geometry in the operator.
+        return True
+
+    def requires_aligned_final_select(self) -> bool:
+        # The Ascend final-select kernel tiles rows in aligned blocks.
+        return True
+
 
 class AscendBeamAttentionService:
     """Own Ascend Beam attention selection and admissibility.
@@ -253,4 +276,80 @@ class AscendBeamAttentionService:
         return True
 
 
-__all__ = ["AscendBeamAttentionService", "AscendStageExecutionService"]
+class AscendConfigService:
+    """Ascend's configuration-time policy, kept out of shared configuration code."""
+
+    backend_id = "ascend"
+
+    def apply_config_defaults(self, config: Any) -> None:
+        """Pin the Ascend-compatible block size without overriding user intent.
+
+        vLLM-Ascend 0.30 sets the block size to 128 when prefix caching or
+        chunked prefill is enabled, but leaves the platform default in place
+        otherwise, while the Beam attention backends require the 128 kernel
+        geometry. This closes that gap.
+        """
+        cache_config = getattr(config, "cache_config", None)
+        model_config = getattr(config, "model_config", None)
+        if cache_config is None:
+            return
+        if getattr(cache_config, "user_specified_block_size", False):
+            return
+        # Hybrid attention/state models have model-specific cache sizing rules
+        # in vLLM-Ascend and must not be forced onto the dense default.
+        if model_config is not None and getattr(model_config, "is_hybrid", False):
+            return
+        if cache_config.block_size != 128:
+            import logging
+
+            logging.getLogger("vllm_gr.platforms.ascend_services").info(
+                "Using Ascend-compatible default KV cache block size 128 "
+                "(vLLM resolved the unspecified value to %s).",
+                cache_config.block_size,
+            )
+            cache_config.block_size = 128
+
+    def supports_worker_decision_by_default(self) -> bool:
+        return True
+
+    def promotes_constraint_tables(self) -> bool:
+        # Ascend Beam deployments default to Constraint Tables plus worker
+        # decisions when the user did not choose a backend explicitly.
+        return True
+
+    def supports_constraint_vocab_slicing(self) -> bool:
+        # Ascend keeps the original full-vocabulary ABI and rejects slicing.
+        return False
+
+    def validate_unconstrained_runner(self, config: Any) -> None:
+        from vllm_gr.v1.engine.beam_search_v1 import validate_npu_unconstrained_runner
+
+        validate_npu_unconstrained_runner(config)
+
+    def requires_persistent_v2_protocol(self) -> bool:
+        # Ascend may retain the V2 opt-in while constructing a V1 runner.
+        return False
+
+    def install_engine_core_config_sanitizer(self) -> None:
+        """Filter GR keys before vllm-ascend validates ``additional_config``.
+
+        vllm-ascend wraps ``EngineCoreProc.run_engine_core`` and validates the
+        config with pydantic ``extra="forbid"`` in the spawned EngineCore
+        process before the vLLM-GR plugin loads, so the filter must be the
+        outermost entrypoint.
+        """
+        from vllm.v1.engine.core import EngineCoreProc
+
+        from vllm_gr.v1.ascend_compat import apply_engine_core_config_sanitizer
+
+        apply_engine_core_config_sanitizer(EngineCoreProc)
+
+    def default_constraint_table_backend(self) -> str | None:
+        return "npu"
+
+
+__all__ = [
+    "AscendBeamAttentionService",
+    "AscendConfigService",
+    "AscendStageExecutionService",
+]

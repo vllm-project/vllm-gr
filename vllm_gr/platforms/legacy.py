@@ -123,6 +123,26 @@ class LegacyProviderAdapter:
 
         return CudaStageExecutionService()
 
+    def create_beam_attention_service(self) -> Any:
+        """Return the fixed Beam attention service of the version-1 identity."""
+        if self.device_type == "npu":
+            from .ascend_services import AscendBeamAttentionService
+
+            return AscendBeamAttentionService()
+        from .cuda_services import CudaBeamAttentionService
+
+        return CudaBeamAttentionService()
+
+    def create_config_service(self) -> Any:
+        """Return the fixed configuration policy of the version-1 identity."""
+        if self.device_type == "npu":
+            from .ascend_services import AscendConfigService
+
+            return AscendConfigService()
+        from .cuda_services import CudaConfigService
+
+        return CudaConfigService()
+
     def create_constrained_topk_execution(
         self,
         *,

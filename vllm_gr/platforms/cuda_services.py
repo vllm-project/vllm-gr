@@ -68,6 +68,25 @@ class CudaStageExecutionService:
         """CUDA serves every unconstrained Beam V1 configuration this release admits."""
         del worker
 
+    def supports_worker_beam_decision(self) -> bool:
+        # CUDA V1 decisions are made by its stage runner, never worker-side.
+        return False
+
+    def uses_fused_beam_decision(self) -> bool:
+        # The fused decision operators are Ascend-only; CUDA uses the reference.
+        return False
+
+    def requires_beam_candidate_width_match(self) -> bool:
+        return False
+
+    def batches_beam_kv_reorder(self) -> bool:
+        # CUDA reorders each request's pool separately.
+        return False
+
+    def requires_aligned_final_select(self) -> bool:
+        # CUDA final selection has no row-tiling constraint.
+        return False
+
 
 class CudaBeamAttentionService:
     """Own CUDA Beam attention selection and admissibility.
@@ -207,4 +226,42 @@ def _configured_decode_mode() -> str | None:
     return None if configured is None else str(configured.value)
 
 
-__all__ = ["CudaBeamAttentionService", "CudaStageExecutionService"]
+class CudaConfigService:
+    """CUDA's configuration-time policy, kept out of shared configuration code."""
+
+    backend_id = "cuda"
+
+    def apply_config_defaults(self, config: Any) -> None:
+        # CUDA pins no block size: the native default is the kernel geometry.
+        del config
+
+    def supports_worker_decision_by_default(self) -> bool:
+        return True
+
+    def promotes_constraint_tables(self) -> bool:
+        # Promotion is an Ascend deployment default; CUDA keeps the request.
+        return False
+
+    def supports_constraint_vocab_slicing(self) -> bool:
+        # CUDA carries full-vocabulary table ids with a sliced logits window.
+        return True
+
+    def validate_unconstrained_runner(self, config: Any) -> None:
+        del config
+
+    def requires_persistent_v2_protocol(self) -> bool:
+        return True
+
+    def install_engine_core_config_sanitizer(self) -> None:
+        # Only a vendor platform validates additional_config before GR loads.
+        return None
+
+    def default_constraint_table_backend(self) -> str | None:
+        return "cuda"
+
+
+__all__ = [
+    "CudaBeamAttentionService",
+    "CudaConfigService",
+    "CudaStageExecutionService",
+]

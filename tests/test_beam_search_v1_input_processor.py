@@ -38,6 +38,30 @@ from vllm_gr.v1.beam.batch_contracts import (
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 
 
+def _select_backend(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
+    """Select the backend that serves ``device`` for this request.
+
+    The frontend asks the selected backend for its Constraint Table placement;
+    a test therefore selects a backend rather than relying on a device name in
+    shared code.
+    """
+    from vllm_gr.platforms.cuda_services import CudaConfigService
+
+    import vllm_gr.platforms.loader as loader
+
+    # Bound services are cached per process; drop them before pointing
+    # selection at this test's backend.
+    loader._reset_backend_services_for_tests()
+    service = CudaConfigService()
+    placement = {"cuda": "cuda", "npu": "npu"}.get(device)
+    monkeypatch.setattr(service, "default_constraint_table_backend", lambda: placement)
+    provider = SimpleNamespace(
+        backend_id="cuda" if device == "cuda" else "ascend",
+        create_config_service=lambda: service,
+    )
+    monkeypatch.setattr("vllm_gr.platforms.loader.activate_current_backend", lambda: provider)
+
+
 def _canonical_gr_config(*, enabled: bool = True, backend: str = "cuda") -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -381,12 +405,16 @@ def test_offline_compact_output_preserves_accepted_prompt_snapshot(
     "trie_ids", [None, [0, 1], [1, 1], (1, 0), [True, 0], [-1, 0], [None, 1], [0]]
 )
 def test_per_prompt_trie_selection(
-    trie_ids: Any, online: bool, independent_k: bool, device: str
+    trie_ids: Any,
+    online: bool,
+    independent_k: bool,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     canonical = _canonical_gr_config(backend=device)
     canonical["constraint_table"]["format"] = "constraint_table_v2"
     engine = _make_engine(additional_config={"vllm_gr": canonical})
-    engine.vllm_config.device_config = SimpleNamespace(device=device)
+    _select_backend(monkeypatch, device)
     params = BeamSearchParams(
         beam_width=2,
         max_tokens=3,
@@ -629,11 +657,13 @@ def test_request_requires_enabled_canonical_cuda_constraint_table(
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
-def test_request_rejects_width_below_fixed_runtime_before_submission(device: str) -> None:
+def test_request_rejects_width_below_fixed_runtime_before_submission(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     canonical = _canonical_gr_config(backend=device)
     canonical["beam"]["max_width"] = 128
     engine = _make_engine(additional_config={"vllm_gr": canonical})
-    engine.vllm_config.device_config = SimpleNamespace(device=device)
+    _select_backend(monkeypatch, device)
     with pytest.raises(BeamSearchRequestError, match="fixed runtime width 128"):
         _prepare_request(
             engine,
@@ -644,9 +674,11 @@ def test_request_rejects_width_below_fixed_runtime_before_submission(device: str
     engine.submit_gr_session.assert_not_called()
 
 
-def test_npu_request_accepts_matching_width_and_canonical_backend() -> None:
+def test_npu_request_accepts_matching_width_and_canonical_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(backend="npu")})
-    engine.vllm_config.device_config = SimpleNamespace(device="npu")
+    _select_backend(monkeypatch, "npu")
     request = _prepare_request(
         engine, [1, 2], BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True), online=True
     )
@@ -656,10 +688,10 @@ def test_npu_request_accepts_matching_width_and_canonical_backend() -> None:
 @pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
 @pytest.mark.parametrize("widths", [None, [2, 2, 2], [2, 1, 2]])  # type: ignore[misc]
 def test_stage_widths_and_return_limit_reach_worker_contract(
-    device: str, widths: list[int] | None
+    device: str, widths: list[int] | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(backend=device)})
-    engine.vllm_config.device_config = SimpleNamespace(device=device)
+    _select_backend(monkeypatch, device)
     request = _prepare_request(
         engine,
         [1, 2],
@@ -769,13 +801,14 @@ def test_constrained_length_is_checked_before_native_input_processing(
     table_format: str,
     begin: str | None,
     end: str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _canonical_gr_config(backend=backend)
     config["constrained_generation"] = constrained
     config["constraint_table"]["format"] = table_format
     config["beam"]["max_decode_steps"] = 7
     engine = _make_engine(additional_config={"vllm_gr": config})
-    engine.vllm_config.device_config = SimpleNamespace(device=backend)
+    _select_backend(monkeypatch, backend)
     process_inputs = Mock(wraps=engine.input_processor.process_inputs)
     engine.input_processor.process_inputs = process_inputs
 

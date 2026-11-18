@@ -276,14 +276,23 @@ def _gate_runner(
 
 
 def _use_decode_mode(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
-    """Pin the backend's Decode mode; shared code carries no mode cache."""
-    context = SimpleNamespace(backend_id="ascend", decode_mode=lambda: mode)
+    """Pin the backend's operator-path policy; shared code carries no cache."""
+    policy = SimpleNamespace(
+        supports_worker_beam_decision=lambda: True,
+        uses_fused_beam_decision=lambda: mode == "xllm",
+        requires_beam_candidate_width_match=lambda: True,
+        batches_beam_kv_reorder=lambda: True,
+        requires_aligned_final_select=lambda: True,
+    )
     import vllm_gr.platforms.loader as loader
 
+    # The bound services are cached per process, so drop them before pointing
+    # selection at this test's policy.
+    loader._reset_backend_services_for_tests()
     monkeypatch.setattr(
         loader,
         "activate_current_backend",
-        lambda: SimpleNamespace(create_beam_attention_service=lambda: context),
+        lambda: SimpleNamespace(create_stage_execution_service=lambda: policy),
     )
 
 
@@ -308,10 +317,31 @@ def test_worker_decision_disabled_on_cuda() -> None:
     assert beam_decision.worker_decision_enabled(runner) is False
 
 
-def test_worker_decision_disabled_on_cpu_host(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_decision_disabled_when_backend_has_no_worker_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backend without worker-side decisions keeps the frontend path.
+
+    The gate asks the selected backend, not the runner's device name: a process
+    selects its backend from the native platform, so a runner labelled with a
+    different device is not what decides this.
+    """
+    policy = SimpleNamespace(
+        supports_worker_beam_decision=lambda: False,
+        uses_fused_beam_decision=lambda: True,
+        requires_beam_candidate_width_match=lambda: True,
+        batches_beam_kv_reorder=lambda: True,
+        requires_aligned_final_select=lambda: True,
+    )
+    import vllm_gr.platforms.loader as loader
+
+    monkeypatch.setattr(
+        loader,
+        "activate_current_backend",
+        lambda: SimpleNamespace(create_stage_execution_service=lambda: policy),
+    )
     context = _make_context()
-    runner = _gate_runner(context, device_type="cpu")
-    _use_decode_mode(monkeypatch, "xllm")
+    runner = _gate_runner(context)
     assert beam_decision.worker_decision_enabled(runner) is False
 
 

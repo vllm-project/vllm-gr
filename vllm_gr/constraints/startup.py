@@ -107,21 +107,22 @@ def create_constraint_execution(
 def validate_constraint_table_platform(
     gr_config: GRConfig,
     *,
-    device_type: str | None = None,
+    backend_id: str | None = None,
 ) -> None:
-    """Reject configurations Constraint Tables cannot support in this release.
+    """Reject configurations the selected Constraint Table backend cannot run.
 
-    CUDA carries full-vocabulary table ids alongside a sliced logits window
-    and translates ids to local logits columns inside the fused kernel. Other
-    platforms still use the original full-vocabulary ABI and reject slicing.
+    A backend that carries global table token ids alongside a sliced logits
+    window accepts vocabulary slicing; one that keeps the full-vocabulary ABI
+    rejects it. The answer is backend identity, so shared code never compares a
+    device name.
     """
     slicing_enabled = gr_config.vocab_offset is not None or gr_config.vocab_slice_size is not None
-    if slicing_enabled and device_type != "cuda":
+    if slicing_enabled and backend_id != "cuda":
         raise ValueError(
             "constraint_backend='constraint_table' cannot be combined with "
             f"vocab slicing (vocab_offset={gr_config.vocab_offset!r}, "
             f"vocab_slice_size={gr_config.vocab_slice_size!r}) on platform "
-            f"{device_type or 'unknown'!r}"
+            f"{backend_id or 'unknown'!r}"
         )
 
 
@@ -235,17 +236,13 @@ def prepare_constraint_table(
     constrained request runs, never at the first constrained step.
     """
     from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
-    from vllm_gr.platforms.identity import current_platform_identity
     from vllm_gr.platforms.loader import activate_current_backend
 
     # Activate the provider before validation so an unsupported platform fails
     # here rather than at the first constrained step.
-    activate_current_backend()
+    provider = activate_current_backend()
     if gr_config is not None:
-        validate_constraint_table_platform(
-            gr_config,
-            device_type=current_platform_identity().device_type,
-        )
+        validate_constraint_table_platform(gr_config, backend_id=provider.backend_id)
     # Startup-time fail-fast (issue #246 §7): the probe adapter is discarded;
     # the Worker lazily creates its own with the runner device (N3).
     create_constraint_execution()

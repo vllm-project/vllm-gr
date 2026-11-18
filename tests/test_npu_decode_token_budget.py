@@ -42,8 +42,39 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
 core = _core_fixture
 scheduler = _scheduler_fixture
 
+#: Backend the frontend resolves its Constraint Table placement from.
+_selected_backend = {"device": "npu"}
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _selected_backend_provider(monkeypatch):
+    """Select the backend that serves the device under test.
+
+    The frontend asks the selected backend for its Constraint Table placement,
+    so a test selects a backend instead of relying on a device name in shared
+    code.
+    """
+    from vllm_gr.platforms.cuda_services import CudaConfigService
+
+    import vllm_gr.platforms.loader as loader
+
+    loader._reset_backend_services_for_tests()
+    service = CudaConfigService()
+
+    def activate():
+        device = _selected_backend["device"]
+        placement = {"cuda": "cuda", "npu": "npu"}.get(device)
+        monkeypatch.setattr(service, "default_constraint_table_backend", lambda: placement)
+        return SimpleNamespace(
+            backend_id="cuda" if device == "cuda" else "ascend",
+            create_config_service=lambda: service,
+        )
+
+    monkeypatch.setattr("vllm_gr.platforms.loader.activate_current_backend", activate)
+
 
 def _config(*, device="npu", budget=512, width=128, constrained=True):
+    _selected_backend["device"] = device
     canonical = _canonical_gr_config(enabled=constrained, backend=device)
     if not constrained:
         canonical["constrained_generation"] = False

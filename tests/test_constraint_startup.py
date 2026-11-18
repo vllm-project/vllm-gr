@@ -75,6 +75,7 @@ def _fake_activate_provider(
 
     def fake_activate() -> Any:
         return SimpleNamespace(
+            backend_id="cuda" if device_type == "cuda" else "ascend",
             device_type=device_type,
             create_constrained_topk_execution=lambda device=None: adapter,
         )
@@ -140,14 +141,14 @@ class TestValidateConstraintTablePlatform:
     def test_cuda_accepts_complete_vocab_slice(self) -> None:
         validate_constraint_table_platform(
             GRConfig(vocab_offset=1000, vocab_slice_size=1024),
-            device_type="cuda",
+            backend_id="cuda",
         )
 
     def test_npu_still_rejects_vocab_slice(self) -> None:
-        with pytest.raises(ValueError, match="platform 'npu'"):
+        with pytest.raises(ValueError, match="platform 'ascend'"):
             validate_constraint_table_platform(
                 GRConfig(vocab_offset=1000, vocab_slice_size=1024),
-                device_type="npu",
+                backend_id="ascend",
             )
 
 

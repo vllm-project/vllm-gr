@@ -57,6 +57,12 @@ class FakeProvider:
     def create_stage_execution_service(self) -> Any:
         return object()
 
+    def create_beam_attention_service(self) -> Any:
+        return object()
+
+    def create_config_service(self) -> Any:
+        return object()
+
     def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:
         del prefer_v2
         return "tests.platforms.fakes.patch"
@@ -244,6 +250,12 @@ def test_provider_missing_only_constrained_topk_execution_is_rejected() -> None:
             return object()
 
         def create_stage_execution_service(self) -> Any:
+            return object()
+
+        def create_beam_attention_service(self) -> Any:
+            return object()
+
+        def create_config_service(self) -> Any:
             return object()
 
         def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:

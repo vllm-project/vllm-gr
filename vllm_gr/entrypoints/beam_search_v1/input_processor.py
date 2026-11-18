@@ -173,13 +173,16 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     gr_config = GRConfig.from_vllm_config(vllm_config)
     table = gr_config.constraint_table
     unconstrained = gr_config.constrained_generation is False
-    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
-    device_type = str(device).split(":")[0]
-    if unconstrained and device_type not in ("cuda", "npu"):
-        raise BeamSearchRequestError("unconstrained beam_search_v1 requires CUDA or NPU")
-    required_backend = (
-        ConstraintTableBackendEnum.NPU if device_type == "npu" else ConstraintTableBackendEnum.CUDA
+    # The selected backend names the Constraint Table placement it serves; the
+    # frontend never derives it from a device name.
+    from vllm_gr.platforms.loader import activate_current_backend
+
+    placement = (
+        activate_current_backend().create_config_service().default_constraint_table_backend()
     )
+    if unconstrained and placement is None:
+        raise BeamSearchRequestError("unconstrained beam_search_v1 requires CUDA or NPU")
+    required_backend = ConstraintTableBackendEnum(placement) if placement is not None else None
     if not unconstrained and (
         table is None or not table.enabled or table.backend is not required_backend
     ):
@@ -263,10 +266,13 @@ def _create_batch_request(
     dynamic_widths = getattr(params, "dynamic_beam_widths", None)
     per_parent_beam_widths = getattr(params, "per_parent_beam_widths", None)
     result_width = getattr(params, "result_width", None)
-    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
-    if str(device).split(":")[0] not in ("cuda", "npu") and (
-        dynamic_widths is not None or result_width is not None
-    ):
+    from vllm_gr.platforms.loader import activate_current_backend
+
+    dynamic_shape_supported = (
+        activate_current_backend().create_config_service().default_constraint_table_backend()
+        is not None
+    )
+    if not dynamic_shape_supported and (dynamic_widths is not None or result_width is not None):
         raise BeamSearchRequestError(
             "dynamic_beam_widths and result_width require CUDA or NPU beam_search_v1"
         )

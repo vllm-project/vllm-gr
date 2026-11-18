@@ -76,6 +76,10 @@ def _attention_service(
 
 
 def _use_attention_service(monkeypatch: pytest.MonkeyPatch, service: Any) -> Any:
+    import vllm_gr.platforms.loader as loader
+
+    # The bound service is cached per process; drop it before substituting.
+    loader._reset_backend_services_for_tests()
     monkeypatch.setattr(beam_attn, "_attention_service", lambda: service)
     return service
 

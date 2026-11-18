@@ -43,13 +43,16 @@ def _attention_service() -> Any:
     """Return the selected backend's Beam attention service.
 
     Resolution goes through the provider registry, never through a platform
-    constant, so this module carries no hardware identity of its own. The
-    backend answers execution-path selection, the cascade/xllm split and
-    configuration admissibility.
-    """
-    from vllm_gr.platforms.loader import activate_current_backend
+    constant, so this module carries no hardware identity of its own. The backend
+    answers execution-path selection, the cascade/xllm split and configuration
+    admissibility.
 
-    return activate_current_backend().create_beam_attention_service()
+    The service is bound once per process: this runs per attention layer per
+    forward pass, and activation re-walks the provider registry.
+    """
+    from vllm_gr.platforms.loader import active_backend_service
+
+    return active_backend_service("create_beam_attention_service")
 
 
 def _get_npu_decode_execution() -> str:

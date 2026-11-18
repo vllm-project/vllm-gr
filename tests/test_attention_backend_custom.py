@@ -153,27 +153,22 @@ class TestNpuDefaultBlockSize(unittest.TestCase):
             model_config=SimpleNamespace(is_hybrid=is_hybrid),
         )
 
-    def test_npu_uses_128_when_block_size_was_not_explicit(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
+    @staticmethod
+    def _ascend_defaults(config):
+        """Apply the shipped Ascend policy, as shared configuration does."""
+        from vllm_gr.platforms.ascend_services import AscendConfigService
 
+        AscendConfigService().apply_config_defaults(config)
+
+    def test_npu_uses_128_when_block_size_was_not_explicit(self):
         config = self._config()
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
+        self._ascend_defaults(config)
 
         assert config.cache_config.block_size == 128
 
     def test_npu_preserves_explicit_block_size(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
-
         config = self._config(user_specified=True)
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
+        self._ascend_defaults(config)
 
         assert config.cache_config.block_size == 16
 

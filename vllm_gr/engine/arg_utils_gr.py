@@ -6,7 +6,7 @@ import json
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Final
+from typing import Any, Final
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -339,57 +339,49 @@ def _explicit_gr_attention_backend(
     return False, None
 
 
-def _apply_npu_default_block_size(config) -> None:
-    """Use an Ascend-compatible default without overriding user intent.
+def _backend_config_service() -> Any | None:
+    """Return the selected backend's configuration policy, if any.
 
-    vLLM-Ascend 0.30 sets the block size to 128 itself when prefix caching or
-    chunked prefill is enabled, but leaves the platform default in place
-    otherwise, while the beam attention backends require the 128 kernel
-    geometry. This rule closes that gap; it was validated on the 0.30.0rc2
-    runtime.
+    Configuration code asks the backend rather than reading a device name, so a
+    new backend does not have to edit shared default pinning. A host without a
+    registered backend (pure configuration parsing in tests) has no policy and
+    keeps the neutral defaults.
     """
     try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return
-    if getattr(current_platform, "device_type", None) != "npu":
-        return
+        from vllm_gr.platforms.loader import activate_current_backend
 
-    cache_config = getattr(config, "cache_config", None)
-    model_config = getattr(config, "model_config", None)
-    if cache_config is None:
+        return activate_current_backend().create_config_service()
+    except Exception:
+        return None
+
+
+def _apply_npu_default_block_size(config) -> None:
+    """Apply the selected backend's configuration defaults.
+
+    A backend that needs a specific KV cache geometry pins it here; a backend
+    without such a requirement leaves the native default untouched.
+    """
+    service = _backend_config_service()
+    if service is None:
         return
-    if getattr(cache_config, "user_specified_block_size", False):
-        return
-    # Hybrid attention/state models have model-specific cache sizing rules in
-    # vLLM-Ascend and must not be forced onto the dense-attention default.
-    if model_config is not None and getattr(model_config, "is_hybrid", False):
-        return
-    if cache_config.block_size != 128:
-        logger.info(
-            "Using Ascend-compatible default KV cache block size 128 "
-            "(vLLM resolved the unspecified value to %s).",
-            cache_config.block_size,
-        )
-        cache_config.block_size = 128
+    service.apply_config_defaults(config)
 
 
 def _is_npu_platform() -> bool:
-    """Return whether the active platform is an Ascend NPU."""
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return False
-    return getattr(current_platform, "device_type", None) == "npu"
+    """Return whether the selected backend applies the Ascend policy.
+
+    This asks the selected backend's identity, never a device name: identity is
+    what names a configuration policy, and it is already decided by provider
+    matching before any of this runs.
+    """
+    service = _backend_config_service()
+    return service is not None and service.backend_id == "ascend"
 
 
 def _is_cuda_platform() -> bool:
-    """Return whether the active platform is CUDA."""
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return False
-    return getattr(current_platform, "device_type", None) == "cuda"
+    """Return whether the selected backend applies the native CUDA policy."""
+    service = _backend_config_service()
+    return service is not None and service.backend_id == "cuda"
 
 
 def _constraint_explicitly_configured(
@@ -551,11 +543,9 @@ def create_engine_config(self, usage_context=None, headless=False):
             worker_decision=effective_beam_worker_decision,
         )
         offset, slice_size = None, None
-        # CUDA Constraint Tables support sliced logits while keeping global
-        # table token ids (CUDAConstrainedTopKExecution._vocab_window).  The
-        # slice helper accepts both Trie lists and triples documents, so keep
-        # the old lm_head fast path on CUDA. NPU retains its full-vocabulary
-        # ABI and validate_constraint_table_platform rejects slicing there.
+        # Constraint Table slicing is a backend capability: an implementation
+        # that carries global table token ids alongside a sliced logits window
+        # accepts it, while one that keeps the full-vocabulary ABI does not.
         constraint_slice_supported = (
             effective_constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
             or _is_cuda_platform()
@@ -646,9 +636,9 @@ def create_engine_config(self, usage_context=None, headless=False):
             effective_gr_config, beam_execution_mode=validate_beam_execution_mode(execution_mode)
         )
 
-    # Ascend may retain the V2 opt-in while constructing a V1 runner. Only
-    # CUDA V2 Beam engines require the persistent protocol; ordinary V2
-    # engines and existing V1/NPU defaults remain unchanged.
+    # A backend may retain the V2 opt-in while constructing a V1 runner. Only a
+    # backend that requires the persistent V2 protocol rejects that
+    # combination; ordinary V2 and existing V1 defaults remain unchanged.
     if (
         _is_cuda_platform()
         and getattr(config, "use_v2_model_runner", False)
@@ -709,12 +699,8 @@ def create_engine_config(self, usage_context=None, headless=False):
             # so the AOT cache key includes it. Explicit overrides still win.
             compilation.inductor_compile_config.setdefault("dynamic_scale_rblock", False)
 
-    # On Ascend, vllm-ascend wraps EngineCoreProc.run_engine_core and validates
-    # additional_config (pydantic extra="forbid") in the spawned EngineCore
-    # process *before* the vllm-gr plugin loads. Install the GR-key sanitizer
-    # here -- after origin_create_engine_config and every general plugin, and
-    # before EngineCoreClient spawns the process -- so it is the outermost
-    # entrypoint and filters GR keys during vllm-ascend's init_ascend_config.
+    # A vendor backend may need its configuration filter installed before the
+    # native EngineCore process validates it.
     if _is_npu_platform():
         from vllm.v1.engine.core import EngineCoreProc
 

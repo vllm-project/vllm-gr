@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
     from .identity import PlatformIdentity
-    from .services import BeamAttentionService, StageExecutionService
+    from .services import BackendConfigService, BeamAttentionService, StageExecutionService
 
 #: Provider API implemented by built-in and external providers in this release.
 PROVIDER_API_VERSION = 2
@@ -139,6 +139,15 @@ class GRBackendProvider(Protocol):
         Shared Beam attention calls this instead of reading module-level device
         constants. The service owns execution-module selection (including the
         Ascend cascade/xllm split) and configuration admissibility.
+        """
+        ...
+
+    def create_config_service(self) -> "BackendConfigService":
+        """Return this backend's configuration-time policy.
+
+        Shared configuration code calls this instead of testing a platform
+        predicate, so adding a backend does not require edits to default
+        pinning or promotion rules.
         """
         ...
 

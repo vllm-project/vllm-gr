@@ -37,6 +37,11 @@ class StageExecutionService(Protocol):
     ``admit_unconstrained_beam`` carries the per-backend admission rules for an
     unconstrained session. A backend that cannot serve that configuration raises;
     a backend that can returns normally.
+
+    The ``*_beam_*`` methods carry the operator-path policy that RFC #706 places
+    with the runner adapter or stage service. Shared Beam decision code keeps one
+    implementation of the semantics and asks the backend which execution shape
+    applies, instead of comparing a device name.
     """
 
     def execute(
@@ -60,6 +65,29 @@ class StageExecutionService(Protocol):
     ) -> bool: ...
 
     def admit_unconstrained_beam(self, worker: Any) -> None: ...
+
+    def supports_worker_beam_decision(self) -> bool:
+        """Whether worker-side Beam decision is this backend's execution path."""
+
+    def uses_fused_beam_decision(self) -> bool:
+        """Whether the fused decision operators are this backend's choices.
+
+        A backend without them leaves shared code on the portable reference
+        path rather than failing at the first decoded step.
+        """
+
+    def requires_beam_candidate_width_match(self) -> bool:
+        """Whether this backend's decision operators require ``K == W``.
+
+        The fused operators hard-code one survivor per Beam row; the reference
+        path accepts a narrower candidate set.
+        """
+
+    def batches_beam_kv_reorder(self) -> bool:
+        """Whether this backend reorders every request's KV pool in one call."""
+
+    def requires_aligned_final_select(self) -> bool:
+        """Whether final selection needs an aligned result width on this backend."""
 
 
 @runtime_checkable
@@ -182,4 +210,44 @@ class BeamAttentionService(Protocol):
         """
 
 
-__all__ = ["BeamAttentionService", "StageExecutionService"]
+@runtime_checkable
+class BackendConfigService(Protocol):
+    """Answer the configuration-time policy that a backend owns.
+
+    These questions used to be platform predicates in shared configuration code.
+    RFC #706 requires that adding a backend does not need edits to shared default
+    pinning, so each answer moves behind the provider.
+    """
+
+    backend_id: str
+
+    def apply_config_defaults(self, config: Any) -> None:
+        """Pin backend-specific configuration defaults on a resolved config."""
+
+    def supports_worker_decision_by_default(self) -> bool:
+        """Whether an omitted Beam worker-decision default resolves to enabled."""
+
+    def promotes_constraint_tables(self) -> bool:
+        """Whether a triples catalog promotes an unset backend to Constraint Tables."""
+
+    def supports_constraint_vocab_slicing(self) -> bool:
+        """Whether this backend's Constraint Table ABI accepts a sliced logits window."""
+
+    def validate_unconstrained_runner(self, config: Any) -> None:
+        """Apply this backend's admission rules for an unconstrained Beam runner."""
+
+    def requires_persistent_v2_protocol(self) -> bool:
+        """Whether a V2 ModelRunner Beam engine requires the persistent protocol."""
+
+    def install_engine_core_config_sanitizer(self) -> None:
+        """Install any pre-native EngineCore configuration filter this backend needs."""
+
+    def default_constraint_table_backend(self) -> str | None:
+        """Return this backend's Constraint Table placement, or ``None``."""
+
+
+__all__ = [
+    "BackendConfigService",
+    "BeamAttentionService",
+    "StageExecutionService",
+]

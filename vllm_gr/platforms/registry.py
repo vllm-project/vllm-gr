@@ -26,6 +26,8 @@ _REQUIRED_PROVIDER_METHODS = (
     "get_model_runner_hooks",
     "get_attention_execution",
     "create_stage_execution_service",
+    "create_beam_attention_service",
+    "create_config_service",
     "select_runner_patch_module_name",
     "create_constrained_topk_execution",
 )
@@ -330,3 +332,7 @@ def _reset_backend_registry_for_tests() -> None:
 
     _BACKENDS.clear()
     _ACTIVE_BACKEND = None
+    # Cached services belong to the backend that produced them.
+    from .loader import _reset_backend_services_for_tests
+
+    _reset_backend_services_for_tests()
