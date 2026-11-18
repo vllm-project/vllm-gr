@@ -17,6 +17,8 @@ from vllm_gr.config import (
 )
 from vllm_gr.v1.attention.backends import beam_attn, beam_attn_gpu
 
+from .attention_service_utils import attention_service
+
 
 @pytest.fixture
 def flash_backend(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
@@ -133,9 +135,7 @@ def test_forward_routes_both_prefill_entries_without_changing_decode(
         cascade_attention=lambda **kwargs: calls.append(kwargs),
         prefill_attention=lambda **kwargs: calls.append(kwargs),
     )
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: attention_service(execution))
     impl = _impl()
     q = torch.zeros(4, 2, 8)
     key_cache = torch.zeros(2, 16, 2, 8)
@@ -231,10 +231,7 @@ def test_initialization_preserves_global_decode_config(
         },
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", False)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: beam_attn_gpu)
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: attention_service(beam_attn_gpu))
     monkeypatch.setattr(beam_attn_gpu, "get_flash_attn_version", lambda **kwargs: decode_version)
     impl = beam_attn.BeamAttentionImpl(16, 128, 128**-0.5, 8, None, None, "auto")
     assert impl.prefill_flash_attn_version == (
@@ -265,10 +262,19 @@ def test_npu_prefill_default_and_inherit_are_noops(
 
     config = SimpleNamespace(additional_config={"vllm_gr_prefill_flash_attn_version": policy})
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
     execution = SimpleNamespace(get_flash_attn_version=lambda **kw: None)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
+    monkeypatch.setattr(
+        beam_attn,
+        "_attention_service",
+        lambda: attention_service(
+            execution,
+            backend_id="ascend",
+            supports_batch_invariance=False,
+            supports_short_suffix=False,
+            requires_flash_attn_version=False,
+            requires_layer_kv_scale=False,
+        ),
+    )
     monkeypatch.setattr(
         beam_attn_gpu,
         "resolve_prefill_flash_attn_version",

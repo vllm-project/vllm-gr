@@ -255,9 +255,16 @@ The complete call signatures are defined by
 `beam_attn_gpu.py` and `beam_attn_npu.py` modules satisfy the contract directly;
 providers return those modules rather than copying or wrapping their kernels.
 
-Production attention dispatch also selects the NPU xllm or cascade execution
-path. Returning the base `beam_attn_npu` module from a provider must not bypass
-that selection. Getter unification is a separate migration.
+Production attention dispatch goes through `BeamAttentionService` rather than
+these module primitives. The service selects the Ascend xllm or cascade decode
+path, resolves Prefill separately from Decode, and answers configuration
+admissibility. `get_attention_execution()` remains the primitive surface; adding
+a backend means implementing the service, not editing a device branch in
+`beam_attn.py`.
+
+`beam_attn.py` carries no device constants and no process-global decode-mode
+cache. A backend that cannot serve a feature rejects the configuration itself,
+before shared code stores any per-instance state.
 
 Metadata construction, KV memory management, and the shared execute-model
 wrapper are deliberately outside this contract until their owning migration

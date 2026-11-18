@@ -212,10 +212,16 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         from vllm_gr.v1.attention.backends import beam_attn
 
         execution = SimpleNamespace(is_available=lambda: True)
+        service = SimpleNamespace(
+            execution_module=lambda: execution,
+            prefill_module=lambda: execution,
+            supports_fp8_kv_cache=lambda: False,
+            supports_sinks=lambda: False,
+            supports_batch_invariance=lambda: True,
+            supports_compute_capability=lambda capability: True,
+        )
         with (
-            mock.patch.object(beam_attn, "CUDA_DEVICE", True),
-            mock.patch.object(beam_attn, "NPU_DEVICE", False),
-            mock.patch.object(beam_attn, "_get_platform_execution_module", return_value=execution),
+            mock.patch.object(beam_attn, "_attention_service", return_value=service),
         ):
             reasons = beam_attn.BeamAttentionBackend.validate_configuration(
                 head_size=128,

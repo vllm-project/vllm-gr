@@ -144,14 +144,17 @@ class BSNDRegressions(unittest.TestCase):
     ) -> tuple[Callable[..., Any], tuple[Any, ...], list[tuple[str, Any]]]:
         calls: list[tuple[str, Any]] = []
         platform = SimpleNamespace(reshape_and_cache=lambda *args: calls.append(("cache", args)))
+        service = SimpleNamespace(
+            execution_module=lambda: platform,
+            prefill_module=lambda: platform,
+            uses_bsnd_prefill=lambda meta: meta.prefill_fia_layout == "BSND",
+            requires_layer_kv_scale=lambda: False,
+            has_standard_prefill_capture=lambda: False,
+        )
         fn = extract(
             BACKEND,
             "prefill_forward",
-            {
-                "NPU_DEVICE": True,
-                "CUDA_DEVICE": False,
-                "_get_platform_execution_module": lambda: platform,
-            },
+            {"_attention_service": lambda: service},
         )
         owner = SimpleNamespace(
             kv_sharing_target_layer_name=None,

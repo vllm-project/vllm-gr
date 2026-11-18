@@ -460,9 +460,9 @@ def test_cuda_forward_keeps_original_kv_gather(monkeypatch: pytest.MonkeyPatch) 
         cascade_attention=lambda **_kwargs: None,
         select_beam_rows=forbid_select,
     )
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
+    from .attention_service_utils import attention_service
+
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: attention_service(execution))
     pool = SimpleNamespace(unshared_key=torch.empty(1), unshared_value=torch.empty(1))
     session = SimpleNamespace(
         is_active=True,

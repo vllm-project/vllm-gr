@@ -554,6 +554,7 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
     """Exercise the actual facade without loading an NPU execution module."""
     from vllm.config import CUDAGraphMode
 
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
     from vllm_gr.v1.attention import backends
     from vllm_gr.v1.attention.backends import beam_attn
     from vllm_gr.v1.beam.context import BEAM_DATA_VAR
@@ -593,13 +594,22 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
         ),
     )
     monkeypatch.setattr(context_module, "get_forward_context", lambda: context)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
+    # The facade asks the selected backend. Keep the shipped Ascend answers
+    # (which own the native task-group capture) and let the fixture switch the
+    # backend answer for the CUDA guard.
+    service = AscendBeamAttentionService()
+    state = {"backend_id": "ascend", "has_standard_capture": True}
     monkeypatch.setattr(
-        beam_attn,
-        "_get_platform_execution_module",
+        service,
+        "execution_module",
         lambda: SimpleNamespace(reshape_and_cache=unexpected_cache_write),
     )
+    monkeypatch.setattr(
+        service,
+        "has_standard_prefill_capture",
+        lambda: state["has_standard_capture"],
+    )
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: service)
     implementation = SimpleNamespace(
         kv_sharing_target_layer_name="shared-cache",
         kv_cache_dtype="auto",
@@ -639,6 +649,7 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
         yield SimpleNamespace(
             invoke=invoke,
             facade=beam_attn,
+            state=state,
             npu=npu_module,
             capture_calls=capture_calls,
             fallback_calls=fallback_calls,
@@ -678,8 +689,10 @@ def test_prefill_capture_wiring_preserves_platform_and_private_graph_guards(
 ) -> None:
     wiring = prefill_wiring
     if guard == "gpu":
-        wiring.facade.NPU_DEVICE = False
-        wiring.facade.CUDA_DEVICE = True
+        # A backend without native task groups falls through to ordinary
+        # Prefill attention and never presents a capture.
+        wiring.state["backend_id"] = "cuda"
+        wiring.state["has_standard_capture"] = False
     else:
         wiring.npu._GRAPH_CAPTURE_STATE["capturing"] = True
     assert wiring.invoke() is wiring.output

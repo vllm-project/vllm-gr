@@ -275,22 +275,30 @@ def _gate_runner(
     )
 
 
+def _use_decode_mode(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """Pin the backend's Decode mode; shared code carries no mode cache."""
+    context = SimpleNamespace(backend_id="ascend", decode_mode=lambda: mode)
+    import vllm_gr.platforms.loader as loader
+
+    monkeypatch.setattr(
+        loader,
+        "activate_current_backend",
+        lambda: SimpleNamespace(create_beam_attention_service=lambda: context),
+    )
+
+
 def test_worker_decision_disabled_in_cascade_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cascade decode execution must keep the frontend decision path."""
-    from vllm_gr.v1.attention.backends import beam_attn
-
     context = _make_context()
     runner = _gate_runner(context)
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "cascade")
+    _use_decode_mode(monkeypatch, "cascade")
     assert beam_decision.worker_decision_enabled(runner) is False
 
 
 def test_worker_decision_enabled_in_xllm_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.attention.backends import beam_attn
-
     context = _make_context()
     runner = _gate_runner(context)
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "xllm")
+    _use_decode_mode(monkeypatch, "xllm")
     assert beam_decision.worker_decision_enabled(runner) is True
 
 
@@ -301,21 +309,17 @@ def test_worker_decision_disabled_on_cuda() -> None:
 
 
 def test_worker_decision_disabled_on_cpu_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.attention.backends import beam_attn
-
     context = _make_context()
     runner = _gate_runner(context, device_type="cpu")
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "xllm")
+    _use_decode_mode(monkeypatch, "xllm")
     assert beam_decision.worker_decision_enabled(runner) is False
 
 
 def test_worker_decision_disabled_without_option(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.attention.backends import beam_attn
-
     context = _make_context()
     runner = _gate_runner(context)
     runner._vllm_gr_config.beam_worker_decision = False
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "xllm")
+    _use_decode_mode(monkeypatch, "xllm")
     assert beam_decision.worker_decision_enabled(runner) is False
 
 

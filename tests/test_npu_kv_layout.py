@@ -50,8 +50,7 @@ def policy(monkeypatch: pytest.MonkeyPatch) -> Any:
         return getattr(vllm_config, "native_result", False)
 
     beam = SimpleNamespace(
-        NPU_DEVICE=True,
-        CUDA_DEVICE=False,
+        _attention_service=lambda: SimpleNamespace(backend_id="ascend"),
         BeamAttentionImpl=_BeamImpl,
         AttentionType=SimpleNamespace(DECODER="decoder"),
         _get_npu_decode_execution=lambda: "xllm",

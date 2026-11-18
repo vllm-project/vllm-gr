@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
 from vllm_gr.v1.attention.backends import beam_attn
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
@@ -26,8 +27,7 @@ def attention_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         }
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: AscendBeamAttentionService())
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", False)
     return config
 
@@ -128,7 +128,12 @@ def test_npu_default_features_keep_existing_normalization(
     flash_version = Mock(return_value=None)
     execution = SimpleNamespace(get_flash_attn_version=flash_version)
     resolve = Mock(return_value=execution)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", resolve)
+    # Substitute only the execution module: the shipped Ascend service carries
+    # the real admissibility answers, but resolving its module needs the vendor
+    # runtime, which this host does not have.
+    service = AscendBeamAttentionService()
+    monkeypatch.setattr(service, "execution_module", resolve)
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: service)
 
     impl = beam_attn.BeamAttentionImpl(**_options(logits_soft_cap=soft_cap))
 
@@ -154,11 +159,11 @@ def test_cuda_features_are_not_rejected_by_npu_capability_guard(
     attention_config: SimpleNamespace,
     features: dict[str, Any],
 ) -> None:
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
     flash_version = Mock(return_value=2)
     execution = SimpleNamespace(get_flash_attn_version=flash_version)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
+    from .attention_service_utils import attention_service
+
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: attention_service(execution))
 
     impl = beam_attn.BeamAttentionImpl(**_options(**features))
 

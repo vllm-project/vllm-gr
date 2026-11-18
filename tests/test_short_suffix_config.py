@@ -20,6 +20,8 @@ from vllm_gr.v1.attention.backends.beam_attn_gpu import (
 from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 
+from .attention_service_utils import attention_service
+
 
 @pytest.fixture
 def flash_backend(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
@@ -252,9 +254,7 @@ def test_fusion_preserves_platform_auto_selection(
     monkeypatch.setattr(
         flash_backend, "is_fa_version_supported", lambda version: version in (2, default_version)
     )
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: beam_attn_gpu)
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: attention_service(beam_attn_gpu))
     # Exercise the installed vLLM selector, including device fallbacks.
     if fa_version == 3 and capability == 8:
         pytest.skip("explicit FA3 is not supported on SM8x")
@@ -704,6 +704,7 @@ def test_layer_constructor_validates_before_execution(
 ) -> None:
     import vllm.config
 
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
     from vllm_gr.v1.attention.backends import beam_attn
 
     additional_config: dict[str, Any] = {"vllm_gr_beam_max_width": width}
@@ -711,13 +712,24 @@ def test_layer_constructor_validates_before_execution(
         additional_config["vllm_gr_enable_short_suffix_attention"] = enabled
     config = SimpleNamespace(additional_config=additional_config)
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", cuda)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", not cuda)
-    monkeypatch.setattr(
-        beam_attn,
-        "_get_platform_execution_module",
-        lambda: SimpleNamespace(get_flash_attn_version=lambda **kwargs: 2),
-    )
+    # ``cuda`` selects which backend answers. The CUDA path gets a stand-in
+    # execution module because the real one needs FlashAttention; the Ascend
+    # path uses the shipped service so its feature rejections stay covered.
+    if cuda:
+        execution = SimpleNamespace(get_flash_attn_version=lambda **kwargs: 2)
+        monkeypatch.setattr(
+            beam_attn,
+            "_attention_service",
+            lambda: attention_service(execution),
+        )
+    else:
+        # The shipped Ascend service carries the real feature rejections, but
+        # its execution module needs the vendor runtime. Substituting only the
+        # module keeps ``validate_impl_features`` under test.
+        service = AscendBeamAttentionService()
+        stub = SimpleNamespace(get_flash_attn_version=lambda **kwargs: 2)
+        monkeypatch.setattr(service, "execution_module", lambda: stub)
+        monkeypatch.setattr(beam_attn, "_attention_service", lambda: service)
     kwargs: dict[str, Any] = {
         "num_heads": 16,
         "head_size": 128,

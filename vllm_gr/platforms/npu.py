@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
 
-    from .services import StageExecutionService
+    from .services import BeamAttentionService, StageExecutionService
 
 #: Qualified name of the vendor platform class this provider supports. The
 #: check is a lineage lookup on the already-selected platform instance, so it
@@ -98,6 +98,16 @@ class NPUBackendProvider:
             BeamAttentionExecution,
             import_module("vllm_gr.v1.attention.backends.beam_attn_npu"),
         )
+
+    def create_beam_attention_service(self) -> BeamAttentionService:
+        """Return the Ascend Beam attention service.
+
+        The service defers its own imports, so building it loads no vendor
+        runtime and this provider keeps its import-light contract.
+        """
+        from .ascend_services import AscendBeamAttentionService
+
+        return AscendBeamAttentionService()
 
     def create_stage_execution_service(self) -> StageExecutionService:
         """Return the Ascend stage execution service.

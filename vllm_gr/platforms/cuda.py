@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
-    from .services import StageExecutionService
+    from .services import BeamAttentionService, StageExecutionService
 
 
 @dataclass(frozen=True)
@@ -85,6 +85,15 @@ class CUDABackendProvider:
             BeamAttentionExecution,
             import_module("vllm_gr.v1.attention.backends.beam_attn_gpu"),
         )
+
+    def create_beam_attention_service(self) -> BeamAttentionService:
+        """Return the CUDA Beam attention service.
+
+        The service defers its own imports, so building it loads no CUDA module.
+        """
+        from .cuda_services import CudaBeamAttentionService
+
+        return CudaBeamAttentionService()
 
     def create_stage_execution_service(self) -> StageExecutionService:
         """Return the CUDA stage execution service.

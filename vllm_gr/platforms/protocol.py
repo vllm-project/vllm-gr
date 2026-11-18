@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
     from .identity import PlatformIdentity
-    from .services import StageExecutionService
+    from .services import BeamAttentionService, StageExecutionService
 
 #: Provider API implemented by built-in and external providers in this release.
 PROVIDER_API_VERSION = 2
@@ -132,6 +132,15 @@ class GRBackendProvider(Protocol):
         ...
 
     def get_attention_execution(self) -> BeamAttentionExecution: ...
+
+    def create_beam_attention_service(self) -> "BeamAttentionService":
+        """Return the bound Beam attention service for this backend.
+
+        Shared Beam attention calls this instead of reading module-level device
+        constants. The service owns execution-module selection (including the
+        Ascend cascade/xllm split) and configuration admissibility.
+        """
+        ...
 
     def create_stage_execution_service(self) -> "StageExecutionService":
         """Return the bound GR stage execution service for this backend.

@@ -13,8 +13,9 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_gr.v1.attention import backends
 from vllm_gr.v1.attention.backends import beam_attn
+
+from .attention_service_utils import attention_service as build_attention_service
 
 try:
     import torch_npu  # noqa: F401
@@ -43,20 +44,57 @@ assert "vllm_gr.v1.attention.backends.beam_attn_npu" not in sys.modules
     )
 
 
+def _attention_service(
+    execution: Any,
+    *,
+    backend_id: str = "cuda",
+    prefill: Any = None,
+    decode_mode: str = "cascade",
+    supports_sinks: bool = False,
+    supports_fp8: bool = False,
+    supports_batch_invariance: bool = True,
+    supports_short_suffix: bool = True,
+    requires_flash_attn_version: bool = True,
+    requires_layer_kv_scale: bool = True,
+    returns_bsnd: bool = False,
+    prefill_version: Any = None,
+) -> Any:
+    return build_attention_service(
+        execution,
+        backend_id=backend_id,
+        prefill=prefill,
+        decode_mode=decode_mode,
+        supports_sinks=supports_sinks,
+        supports_fp8=supports_fp8,
+        supports_batch_invariance=supports_batch_invariance,
+        supports_short_suffix=supports_short_suffix,
+        requires_flash_attn_version=requires_flash_attn_version,
+        requires_layer_kv_scale=requires_layer_kv_scale,
+        returns_bsnd=returns_bsnd,
+        prefill_version=prefill_version,
+    )
+
+
+def _use_attention_service(monkeypatch: pytest.MonkeyPatch, service: Any) -> Any:
+    monkeypatch.setattr(beam_attn, "_attention_service", lambda: service)
+    return service
+
+
 def test_cuda_platform_rejects_xllm_execution_mode() -> None:
     """CUDA + xllm must fail loudly in a fresh process (no NPU stack)."""
     project_root = Path(__file__).resolve().parents[1]
     code = """
 from types import SimpleNamespace
 
-import vllm_gr.v1.attention.backends.beam_attn as beam_attn
+import vllm.config
+from vllm_gr.platforms.cuda_services import CudaBeamAttentionService
 
-beam_attn.CUDA_DEVICE = True
-beam_attn.NPU_DEVICE = False
-beam_attn._NPU_DECODE_EXECUTION_MODE = "xllm"
+vllm.config.get_current_vllm_config_or_none = lambda: SimpleNamespace(
+    additional_config={"vllm_gr_npu_decode_execution": "xllm"}
+)
 
 try:
-    beam_attn._get_platform_execution_module()
+    CudaBeamAttentionService().execution_module()
 except RuntimeError as exc:
     assert "requires an Ascend NPU" in str(exc), exc
 else:
@@ -119,37 +157,30 @@ assert "vllm_gr.v1.attention.backends.beam_attn_npu_xllm" not in sys.modules
     )
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
-    ("cuda_available", "npu_available", "expected"),
-    [
-        (True, False, "gpu"),
-        (False, True, "npu"),
-        (False, False, None),
-        (True, True, None),
-    ],
-)
-def test_platform_dispatch_selects_exactly_one_execution_module(
+def test_execution_module_comes_from_the_selected_backend(
     monkeypatch: pytest.MonkeyPatch,
-    cuda_available: bool,
-    npu_available: bool,
-    expected: str | None,
 ) -> None:
+    """Shared attention asks the backend instead of testing a platform constant."""
     gpu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_gpu")
     npu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_npu")
     monkeypatch.setitem(sys.modules, gpu_module.__name__, gpu_module)
     monkeypatch.setitem(sys.modules, npu_module.__name__, npu_module)
-    monkeypatch.setattr(backends, "beam_attn_gpu", gpu_module, raising=False)
-    monkeypatch.setattr(backends, "beam_attn_npu", npu_module, raising=False)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", cuda_available)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", npu_available)
 
-    if expected is None:
-        with pytest.raises(RuntimeError, match="exactly one active CUDA or NPU"):
-            beam_attn._get_platform_execution_module()
-        return
+    _use_attention_service(monkeypatch, _attention_service(gpu_module))
+    assert beam_attn._get_platform_execution_module() is gpu_module
 
-    selected = beam_attn._get_platform_execution_module()
-    assert selected is (gpu_module if expected == "gpu" else npu_module)
+    # A decode-only fused path must not be asked to serve Prefill.
+    _use_attention_service(
+        monkeypatch,
+        _attention_service(gpu_module, prefill=npu_module),
+    )
+    assert beam_attn._get_prefill_execution_module() is npu_module
+
+
+def test_shared_attention_carries_no_hardware_identity() -> None:
+    """The module holds no device constants for selection to read."""
+    for name in ("NPU_DEVICE", "CUDA_DEVICE", "_NPU_DECODE_EXECUTION_MODE"):
+        assert not hasattr(beam_attn, name), name
 
 
 @pytest.mark.npu_test  # type: ignore[misc]
@@ -163,51 +194,59 @@ def test_platform_dispatch_selects_exactly_one_execution_module(
         ("xllm", "vllm_gr.v1.attention.backends.beam_attn_npu_xllm"),
     ],
 )
-def test_npu_dispatch_selects_execution_mode_module(
+def test_ascend_dispatch_selects_execution_mode_module(
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
     expected_module_name: str,
 ) -> None:
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", mode)
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
 
-    selected = beam_attn._get_platform_execution_module()
-    assert selected.__name__ == expected_module_name
+    service = AscendBeamAttentionService()
+    monkeypatch.setattr(service, "decode_mode", lambda: mode)
+
+    assert service.execution_module().__name__ == expected_module_name
+    # Prefill never resolves through the decode-only fused module.
+    assert service.prefill_module().__name__ == "vllm_gr.v1.attention.backends.beam_attn_npu"
 
 
 def test_cuda_rejects_xllm_execution_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "xllm")
+    import vllm.config as vllm_config_mod
+
+    from vllm_gr.platforms.cuda_services import CudaBeamAttentionService
+
+    monkeypatch.setattr(
+        vllm_config_mod,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(additional_config={"vllm_gr_npu_decode_execution": "xllm"}),
+        raising=False,
+    )
 
     with pytest.raises(RuntimeError, match="requires an Ascend NPU"):
-        beam_attn._get_platform_execution_module()
+        CudaBeamAttentionService().execution_module()
 
 
-def test_npu_decode_execution_defaults_to_cascade_without_config(
+def test_ascend_decode_execution_defaults_to_cascade_without_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm.config as vllm_config_mod
 
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
+
     monkeypatch.setattr(
         vllm_config_mod, "get_current_vllm_config_or_none", lambda: None, raising=False
     )
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", None)
 
-    assert beam_attn._get_npu_decode_execution() == "cascade"
-    # The unset-config fallback must not poison the process-lifetime cache.
-    assert beam_attn._NPU_DECODE_EXECUTION_MODE is None
+    assert AscendBeamAttentionService().decode_mode() == "cascade"
 
 
 def test_unset_mode_defaults_to_xllm_on_npu_with_operator_library(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unset config + NPU + available xllm-ops resolves to xllm."""
+    """Unset config + Ascend + available xllm-ops resolves to xllm."""
     import vllm.config as vllm_config_mod
 
     from vllm_gr.ops.npu import beam_ops
-    from vllm_gr.v1.attention.backends import beam_attn as mod
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
 
     monkeypatch.setattr(
         vllm_config_mod,
@@ -215,23 +254,19 @@ def test_unset_mode_defaults_to_xllm_on_npu_with_operator_library(
         lambda: SimpleNamespace(additional_config={}),
         raising=False,
     )
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", None)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
     monkeypatch.setattr(beam_ops, "is_available", lambda: True)
 
-    assert mod._get_npu_decode_execution() == "xllm"
-    assert mod._NPU_DECODE_EXECUTION_MODE == "xllm"
+    assert AscendBeamAttentionService().decode_mode() == "xllm"
 
 
 def test_unset_mode_defaults_to_cascade_on_npu_without_operator_library(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unset config + NPU + missing xllm-ops falls back to cascade (logged)."""
+    """Unset config + Ascend + missing xllm-ops falls back to cascade."""
     import vllm.config as vllm_config_mod
 
     from vllm_gr.ops.npu import beam_ops
-    from vllm_gr.v1.attention.backends import beam_attn as mod
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
 
     monkeypatch.setattr(
         vllm_config_mod,
@@ -239,23 +274,18 @@ def test_unset_mode_defaults_to_cascade_on_npu_without_operator_library(
         lambda: SimpleNamespace(additional_config={}),
         raising=False,
     )
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", None)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
     monkeypatch.setattr(beam_ops, "is_available", lambda: False)
-    monkeypatch.setattr(beam_ops, "unavailable_reason", lambda: "stub reason")
 
-    assert mod._get_npu_decode_execution() == "cascade"
-    assert mod._NPU_DECODE_EXECUTION_MODE == "cascade"
+    assert AscendBeamAttentionService().decode_mode() == "cascade"
 
 
-def test_unset_mode_defaults_to_cascade_on_cuda(
+def test_cuda_decode_execution_is_always_cascade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Unset config never selects xllm on a CUDA host."""
     import vllm.config as vllm_config_mod
 
-    from vllm_gr.v1.attention.backends import beam_attn as mod
+    from vllm_gr.platforms.cuda_services import CudaBeamAttentionService
 
     monkeypatch.setattr(
         vllm_config_mod,
@@ -263,11 +293,60 @@ def test_unset_mode_defaults_to_cascade_on_cuda(
         lambda: SimpleNamespace(additional_config={}),
         raising=False,
     )
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", None)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
 
-    assert mod._get_npu_decode_execution() == "cascade"
+    assert CudaBeamAttentionService().decode_mode() == "cascade"
+    assert beam_attn._get_npu_decode_execution() == "cascade"
+
+
+def test_ascend_explicit_cascade_overrides_platform_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit cascade wins even on Ascend with the operator library present."""
+    import vllm.config as vllm_config_mod
+
+    from vllm_gr.ops.npu import beam_ops
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
+
+    monkeypatch.setattr(
+        vllm_config_mod,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(additional_config={"vllm_gr_npu_decode_execution": "cascade"}),
+        raising=False,
+    )
+    monkeypatch.setattr(beam_ops, "is_available", lambda: True)
+
+    assert AscendBeamAttentionService().decode_mode() == "cascade"
+
+
+def test_decode_execution_is_not_cached_in_shared_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second engine must be able to observe its own configured mode."""
+    import vllm.config as vllm_config_mod
+
+    from vllm_gr.config import NPUDecodeExecution
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
+
+    configured = {"vllm_gr_npu_decode_execution": "xllm"}
+    monkeypatch.setattr(
+        vllm_config_mod,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(additional_config=configured),
+        raising=False,
+    )
+    service = AscendBeamAttentionService()
+    assert service.decode_mode() == NPUDecodeExecution.XLLM.value
+
+    # The answer follows the live configuration; nothing is frozen in shared
+    # attention for the lifetime of the process.
+    configured["vllm_gr_npu_decode_execution"] = "cascade"
+    monkeypatch.setattr(
+        vllm_config_mod,
+        "get_current_vllm_config_or_none",
+        lambda: None,
+        raising=False,
+    )
+    assert service.decode_mode() == "cascade"
 
 
 def test_explicit_cascade_overrides_platform_default(
@@ -277,7 +356,7 @@ def test_explicit_cascade_overrides_platform_default(
     import vllm.config as vllm_config_mod
 
     from vllm_gr.ops.npu import beam_ops
-    from vllm_gr.v1.attention.backends import beam_attn as mod
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
 
     monkeypatch.setattr(
         vllm_config_mod,
@@ -285,20 +364,18 @@ def test_explicit_cascade_overrides_platform_default(
         lambda: SimpleNamespace(additional_config={"vllm_gr_npu_decode_execution": "cascade"}),
         raising=False,
     )
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", None)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
     monkeypatch.setattr(beam_ops, "is_available", lambda: True)
 
-    assert mod._get_npu_decode_execution() == "cascade"
+    assert AscendBeamAttentionService().decode_mode() == "cascade"
 
 
-def test_npu_decode_execution_reads_and_caches_gr_config(
+def test_decode_execution_reads_the_live_gr_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm.config as vllm_config_mod
 
     from vllm_gr.config import NPUDecodeExecution
+    from vllm_gr.platforms.ascend_services import AscendBeamAttentionService
 
     vllm_config = SimpleNamespace(additional_config={"vllm_gr_npu_decode_execution": "xllm"})
     monkeypatch.setattr(
@@ -307,16 +384,15 @@ def test_npu_decode_execution_reads_and_caches_gr_config(
         lambda: vllm_config,
         raising=False,
     )
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", None)
 
-    assert beam_attn._get_npu_decode_execution() == NPUDecodeExecution.XLLM.value
-    assert beam_attn._NPU_DECODE_EXECUTION_MODE == "xllm"
-    # Subsequent reads come from the cache: dropping the config must not
-    # change the resolved mode.
+    service = AscendBeamAttentionService()
+    assert service.decode_mode() == NPUDecodeExecution.XLLM.value
+    # A host without a config context still answers with a usable path; the
+    # mode is never frozen in shared code.
     monkeypatch.setattr(
         vllm_config_mod, "get_current_vllm_config_or_none", lambda: None, raising=False
     )
-    assert beam_attn._get_npu_decode_execution() == "xllm"
+    assert service.decode_mode() == "cascade"
 
 
 @pytest.mark.parametrize("tuple_cache", [False, True])  # type: ignore[misc]
@@ -336,13 +412,16 @@ def test_forward_preserves_cache_and_attention_arguments(
         reshape_and_cache=reshape_and_cache,
         cascade_attention=cascade_attention,
     )
-    monkeypatch.setattr(
-        beam_attn,
-        "_get_platform_execution_module",
-        lambda: execution,
+    # ``tuple_cache`` selects which backend answers the KV-scale question: an
+    # Ascend-style backend applies no layer scale, a CUDA-style one does.
+    _use_attention_service(
+        monkeypatch,
+        _attention_service(
+            execution,
+            backend_id="ascend" if tuple_cache else "cuda",
+            requires_layer_kv_scale=not tuple_cache,
+        ),
     )
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", tuple_cache)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", not tuple_cache)
 
     impl = object.__new__(beam_attn.BeamAttentionImpl)
     impl.kv_sharing_target_layer_name = None
@@ -441,9 +520,7 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
         cascade_attention=cascade_attention,
         cache_unshared_kv=cache_unshared_kv,
     )
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
+    _use_attention_service(monkeypatch, _attention_service(execution))
 
     # Create a session using our 3-layer architecture
     context = BeamAttentionContext(

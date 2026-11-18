@@ -69,4 +69,142 @@ class CudaStageExecutionService:
         del worker
 
 
-__all__ = ["CudaStageExecutionService"]
+class CudaBeamAttentionService:
+    """Own CUDA Beam attention selection and admissibility.
+
+    Shared Beam attention asks this service instead of reading platform
+    constants. FlashAttention availability still lives in the execution module;
+    this type only reports it to shared code under a backend-neutral contract.
+    """
+
+    backend_id = "cuda"
+
+    def execution_module(self) -> Any:
+        self._reject_npu_only_decode_mode()
+        from vllm_gr.v1.attention.backends import beam_attn_gpu
+
+        return beam_attn_gpu
+
+    def prefill_module(self) -> Any:
+        # CUDA serves Prefill and Decode from the same module.
+        return self.execution_module()
+
+    def decode_mode(self) -> str:
+        self._reject_npu_only_decode_mode()
+        return "cascade"
+
+    def _reject_npu_only_decode_mode(self) -> None:
+        """Fail when a fused Ascend-only Decode path was requested on CUDA."""
+        if _configured_decode_mode() == "xllm":
+            raise RuntimeError(
+                "vllm_gr_npu_decode_execution='xllm' requires an Ascend NPU; "
+                "unset the option or select 'cascade' on CUDA."
+            )
+
+    def supports_sinks(self) -> bool:
+        from vllm_gr.v1.attention.backends import beam_attn_gpu
+
+        return bool(beam_attn_gpu.is_available() and beam_attn_gpu.supports_sinks())
+
+    def supports_fp8_kv_cache(self) -> bool:
+        from vllm.platforms import current_platform
+
+        # FP8 KV cache needs an FA3 decode path on the 90-class devices; the
+        # capability test belongs to the backend, not to shared attention.
+        if self.execution_module().get_flash_attn_version() != 3:
+            return False
+        return bool(current_platform.is_device_capability_family(90))
+
+    def supports_batch_invariance(self) -> bool:
+        return True
+
+    def requires_flash_attn_version(self) -> bool:
+        return True
+
+    def supports_short_suffix_attention(self) -> bool:
+        return True
+
+    def supports_prefill_version_selection(self) -> bool:
+        return True
+
+    def supports_compute_capability(self, capability: Any) -> bool:
+        from vllm.platforms.interface import DeviceCapability
+
+        return bool(capability >= DeviceCapability(8, 0))
+
+    def requires_layer_kv_scale(self) -> bool:
+        return True
+
+    def uses_bsnd_prefill(self, attn_metadata: Any) -> bool:
+        del attn_metadata
+        return False
+
+    def beam_row_selector(self) -> Any:
+        # CUDA always gathers the Beam rows; there is no identity fast path.
+        return None
+
+    def validate_impl_features(
+        self,
+        *,
+        sliding_window: Any,
+        alibi_slopes: Any,
+        logits_soft_cap: Any,
+        has_sinks: bool,
+    ) -> None:
+        # CUDA's FlashAttention paths implement all of these settings.
+        del sliding_window, alibi_slopes, logits_soft_cap, has_sinks
+
+    def resolve_prefill_version(
+        self,
+        requested: Any,
+        decode_version: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if requested is None:
+            return decode_version
+        from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+            resolve_prefill_flash_attn_version,
+        )
+
+        return resolve_prefill_flash_attn_version(requested, decode_version, **kwargs)
+
+    def update_standard_graph_params(
+        self,
+        update_stream: Any,
+        forward_context: Any,
+        num_tokens: Any,
+    ) -> None:
+        # CUDA refreshes persistent Beam buffers; it has no standard task group.
+        del update_stream, forward_context, num_tokens
+
+    def capture_standard_prefill(
+        self,
+        output: Any,
+        query: Any,
+        key_cache: Any,
+        value_cache: Any,
+        attn_metadata: Any,
+        scale: float,
+        layer_name: str,
+        max_model_len: int,
+    ) -> bool:
+        del output, query, key_cache, value_cache, attn_metadata, scale
+        del layer_name, max_model_len
+        return False
+
+    def has_standard_prefill_capture(self) -> bool:
+        # CUDA captures no native Prefill task groups; Beam owns its own graph.
+        return False
+
+
+def _configured_decode_mode() -> str | None:
+    """Read the configured NPU decode mode without importing any vendor code."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    from vllm_gr.config import GRConfig
+
+    configured = GRConfig.from_vllm_config(get_current_vllm_config_or_none()).npu_decode_execution
+    return None if configured is None else str(configured.value)
+
+
+__all__ = ["CudaBeamAttentionService", "CudaStageExecutionService"]
