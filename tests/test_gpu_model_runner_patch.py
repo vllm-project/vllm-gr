@@ -12,7 +12,7 @@ import torch
 from vllm_gr.config import GRConfig
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
-from vllm_gr.v1.worker import model_runner_common as common
+from vllm_gr.v1.worker import gr_context as _gr_context
 
 
 def _prefill_stage(*request_ids: str) -> SimpleNamespace:
@@ -453,7 +453,7 @@ def test_beam_graph_runtime_stats_reports_capture_and_dispatch_state() -> None:
     )
     worker = SimpleNamespace(model_runner=runner)
 
-    stats = common.get_beam_graph_runtime_stats(worker)
+    stats = _gr_context.get_beam_graph_runtime_stats(worker)
 
     assert stats == {
         "runner": "SimpleNamespace",
@@ -488,7 +488,7 @@ def test_worker_graph_stats_hook_is_named_and_idempotent(
     first = getattr(FakeWorker, "get_gr_beam_graph_runtime_stats")
     dispatcher._install_active_worker_resource_hook()
 
-    assert first is common.get_beam_graph_runtime_stats
+    assert first is _gr_context.get_beam_graph_runtime_stats
     assert getattr(FakeWorker, "get_gr_beam_graph_runtime_stats") is first
 
 
@@ -599,14 +599,12 @@ def test_capture_beam_decode_graph_disabled_returns_false() -> None:
     """When beam_graph_active is False, capture returns False immediately."""
     gr_cfg = SimpleNamespace(beam_graph_active=False)
 
-    import vllm_gr.v1.worker.model_runner_common as common
-
-    original_fn = common._get_gr_config
+    original_fn = _gr_context._get_gr_config
 
     def _stub_config(r: Any) -> Any:
         return gr_cfg
 
-    common._get_gr_config = _stub_config
+    _gr_context._get_gr_config = _stub_config
     try:
         runner = SimpleNamespace(
             parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False)
@@ -614,7 +612,7 @@ def test_capture_beam_decode_graph_disabled_returns_false() -> None:
         result = gpu_patch.capture_beam_decode_graph(runner)
         assert result is False
     finally:
-        common._get_gr_config = original_fn
+        _gr_context._get_gr_config = original_fn
 
 
 def test_capture_beam_decode_graph_tp_gt1_returns_false() -> None:
@@ -625,14 +623,12 @@ def test_capture_beam_decode_graph_tp_gt1_returns_false() -> None:
         beam_max_decode_steps=3,
     )
 
-    import vllm_gr.v1.worker.model_runner_common as common
-
-    original_fn = common._get_gr_config
+    original_fn = _gr_context._get_gr_config
 
     def _stub_config(r: Any) -> Any:
         return gr_cfg
 
-    common._get_gr_config = _stub_config
+    _gr_context._get_gr_config = _stub_config
     try:
         runner = SimpleNamespace(
             model_config=SimpleNamespace(enforce_eager=False),
@@ -641,7 +637,7 @@ def test_capture_beam_decode_graph_tp_gt1_returns_false() -> None:
         result = gpu_patch.capture_beam_decode_graph(runner)
         assert result is False
     finally:
-        common._get_gr_config = original_fn
+        _gr_context._get_gr_config = original_fn
 
 
 def test_capture_beam_decode_graph_ubatching_returns_false() -> None:
@@ -652,14 +648,12 @@ def test_capture_beam_decode_graph_ubatching_returns_false() -> None:
         beam_max_decode_steps=3,
     )
 
-    import vllm_gr.v1.worker.model_runner_common as common
-
-    original_fn = common._get_gr_config
+    original_fn = _gr_context._get_gr_config
 
     def _stub_config(r: Any) -> Any:
         return gr_cfg
 
-    common._get_gr_config = _stub_config
+    _gr_context._get_gr_config = _stub_config
     try:
         runner = SimpleNamespace(
             model_config=SimpleNamespace(enforce_eager=False),
@@ -668,7 +662,7 @@ def test_capture_beam_decode_graph_ubatching_returns_false() -> None:
         result = gpu_patch.capture_beam_decode_graph(runner)
         assert result is False
     finally:
-        common._get_gr_config = original_fn
+        _gr_context._get_gr_config = original_fn
 
 
 def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
@@ -679,10 +673,9 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 
     from vllm_gr.v1.worker import beam_decode_graph as shared
-    from vllm_gr.v1.worker import model_runner_common as common
 
     monkeypatch.setattr(
-        common,
+        _gr_context,
         "_get_gr_config",
         lambda _: SimpleNamespace(
             beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3
@@ -868,10 +861,10 @@ def test_capture_create_dummy_context_creates_session_and_beam_info() -> None:
 def test_beam_full_graph_ready_uses_worker_registry() -> None:
     graph = SimpleNamespace(signature=SimpleNamespace(num_model_rows=8), ready=True)
     runner = SimpleNamespace(_beam_decode_graph=graph)
-    assert common._beam_full_graph_ready(runner, 8)
-    assert not common._beam_full_graph_ready(runner, 4)
+    assert _gr_context._beam_full_graph_ready(runner, 8)
+    assert not _gr_context._beam_full_graph_ready(runner, 4)
     runner._beam_decode_graph.ready = False
-    assert not common._beam_full_graph_ready(runner, 8)
+    assert not _gr_context._beam_full_graph_ready(runner, 8)
 
 
 def test_beam_full_graph_ready_ignores_other_native_graphs() -> None:
@@ -884,7 +877,7 @@ def test_beam_full_graph_ready_ignores_other_native_graphs() -> None:
         concrete_cudagraph_entries={BatchDescriptor(num_tokens=4, uniform=True): MagicMock()},
     )
     with patch("vllm.compilation.cuda_graph.CUDAGraphWrapper._all_instances", [wrapper]):
-        assert not common._beam_full_graph_ready(SimpleNamespace(), 4)
+        assert not _gr_context._beam_full_graph_ready(SimpleNamespace(), 4)
 
 
 pytestmark = pytest.mark.cpu_test

@@ -72,7 +72,9 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$container")" != true ]]; then
   echo "container $container is not running" >&2
   exit 2
 fi
-if docker exec "$container" pgrep -f "vllm-gr serve" >/dev/null; then
+# A service started before the CLI migration may still be running.
+gr_serve_pattern='(^|[ /])(vllm-gr serve([[:space:]]|$)|(vllm|vllm_gr[.]entrypoints[.]cli[.]main) serve (.* )?--gr([[:space:]]|$))'
+if docker exec "$container" pgrep -f "$gr_serve_pattern" >/dev/null; then
   echo "an existing vllm-gr service is running; skipping" >&2
   exit 75
 fi

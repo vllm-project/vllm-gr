@@ -125,6 +125,7 @@ import importlib.abc
 import sys
 
 forbidden = {
+    "vllm_gr.v1.worker.model_runner_common",
     "vllm_gr.v1.worker.gpu_model_runner_patch",
     "vllm_gr.v1.worker.gpu_prefill_inputs",
     "vllm_gr.v1.worker.npu_model_runner_patch",
@@ -150,3 +151,25 @@ assert not forbidden.intersection(sys.modules)
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_runner_contracts_import_stays_hardware_free() -> None:
+    code = """
+import sys
+from vllm_gr.v1.worker import model_runner_contracts
+
+assert callable(model_runner_contracts.is_worker_runner_patched)
+for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
+             "vllm_gr.v1.worker.model_runner_common",
+             "vllm_gr.v1.worker.gpu_model_runner_v2_patch"):
+    assert name not in sys.modules, name
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )

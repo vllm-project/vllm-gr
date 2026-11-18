@@ -2,7 +2,7 @@
 
 ModelRunner V1 and V2 have separate capture policies. Selecting V2 must not
 change V1's configuration or execution behavior. Both can capture B=1/2/4
-where admitted by `max_num_seqs`; V1 legacy Beam execution remains B=1.
+where admitted by `max_num_seqs`.
 
 Both runners default to the request-count policy `beam.online_batch_sizes`,
 whose default is `[1, 2, 4]`. An explicit policy such as `[1, 3, 7]` selects
@@ -14,7 +14,7 @@ or Decode capture. Capture counts are filtered by `max_num_seqs` in both runners
 
 ## ModelRunner V1: preserve the GR grid
 
-V1 retains the policy of `7ee1d95`. Its default GR grid runs from 128 to 8192
+The default V1 GR grid runs from 128 to 8192
 in steps of 128. `VLLM_GR_PREFILL_GRAPH_BUCKET_STEP` and
 `VLLM_GR_PREFILL_GRAPH_MAX_BUCKET` configure that grid. Native
 `cudagraph_capture_sizes` does not replace it. Explicit internal constructor
@@ -31,6 +31,33 @@ the original fallback path.
 opt-in behavior. V1 async GR Prefill also retains its original requirement
 that native input tensors have the actual scheduled token length. GR can
 pad its own static buffers after admission.
+
+## Dense CUDA Prefill (opt-in)
+
+Captured CUDA Prefill attention reads K/V from the paged cache, which selects
+FA2's split-KV kernel. `VLLM_GR_DENSE_PREFILL=fa2` instead attends over the
+layer's freshly projected contiguous K/V with the dense FA2 kernel;
+`VLLM_GR_DENSE_PREFILL=cudnn` uses cuDNN SDPA for single-request Prefill of at
+least 64 tokens and dense FA2 otherwise. The KV cache is still written. The
+default `off` keeps the paged path.
+
+The mode applies only when prefix caching, chunked Prefill and KV connectors
+are all disabled, because only then does every captured Prefill hold a fresh
+prompt whose K/V rows align with its query rows. Each call also checks the CPU
+lengths: the pure-Prefill entry also serves eager batches and non-Beam decode
+rows, and any request whose context is longer than its scheduled tokens keeps
+the whole batch on the paged path. `VLLM_BATCH_INVARIANT`, layers with sliding
+windows, ALiBi, softcap or sinks, quantized KV caches, KV sharing and NPU also
+keep the paged path. If cuDNN cannot serve the shape, dense FA2 is used.
+
+A CUDA graph freezes the choice made at capture, so the CPU check alone is not
+enough: native decode capture uses `seq_len == query_len == 1` dummies and then
+replays over cached context. While a stream is capturing, dense attention is
+selected only inside the fresh-Prefill scope that the GR Prefill runners (V1 and
+V2) open; all other captures keep the paged path. With dense Prefill requested,
+those runners replay a FULL Prefill graph only when every scheduled request has
+no computed tokens; otherwise V2 uses its PIECEWISE graph and V1 the native path,
+where attention runs eagerly with the CPU check.
 
 ## ModelRunner V2: use the native capture plan
 

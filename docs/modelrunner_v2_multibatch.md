@@ -77,14 +77,82 @@ current stage degrees and Trie count. A capacity change therefore compiles
 during table loading rather than the first request. Failed warmup releases the
 candidate backend before it can become active.
 
+### Graph installation and startup ownership
+
+`gpu_model_runner_v2_patch.py` owns the marker-guarded factories for native
+KV initialization, graph-memory profiling and model capture. The existing
+`gpu_model_runner_v2_resources.py` owns multi-batch Decode capture together
+with fixed input storage, graph bindings and runtime invalidation.
+`gpu_prefill_graph_runner_v2.py` owns native FULL/PIECEWISE planning and replay.
+
+```mermaid
+flowchart LR
+    I["V2 patch integration"] -->|"native plan and capture"| P["Prefill graph manager"]
+    I -->|"Decode capture and lifecycle callbacks"| R["V2 resource support"]
+    R -->|"explicit V2 hooks binding"| S["Shared startup capture"]
+```
+
+Startup installs the Prefill plan, runs native capture, then captures configured
+Decode batches. Profiling measures the complete GR plan in the native temporary
+pool and includes Decode/fixed-state memory. It restores the native capture flag
+after Decode capture, including failures, and never freezes GC for profiling.
+The native profiler tears down its temporary KV state before GR cleanup runs.
+Ordinary non-Beam capture retains native behavior; graph hooks remain optional
+capabilities of the native runner. Moving these operations does not change
+resource ownership, consumer-drain prerequisites or release timing.
+
+### Execution and shared support ownership
+
+V2 owns `make_patched_execute_model_v2` in `gpu_model_runner_v2_patch.py`.
+`model_runner_common.py` is limited to native V1 execution adaptation and active
+input proxies/row/logprob bookkeeping used by NPU. The public installer imports
+that V1 wrapper only after selecting V1; V2 does not load this adaptation module.
+
+Shared responsibilities have explicit owners:
+
+- `model_runner_contracts.py`: hardware-free patch markers and completeness checks.
+- `gr_execution.py`: frame classification, input isolation, stage/retirement
+  execution and failure propagation. Its one sentinel distinguishes an ordinary
+  frame from a handled stage whose legitimate result is `None`.
+- `gr_gc.py`: all Worker-side process-level GC state, locks, execute-depth accounting,
+  background freeze coordination and capture/warmup RPC functions.
+- `gr_context.py`: cached GR configuration, context construction and graph
+  diagnostics. Configuration remains cached on the native runner.
+
+```mermaid
+flowchart LR
+    V1["V1 integration and native adaptation"] --> D["GR dispatch and input isolation"]
+    V2["V2 integration"] --> D
+    V1 --> G["One process-level GC coordinator"]
+    V2 --> G
+    V1 --> C["GR configuration and context support"]
+    V2 --> C
+    I["Public patch installer"] --> K["Lightweight installation contracts"]
+```
+
+Both execute wrappers enter/leave the same GC coordination boundary, including
+exceptions. The existing freeze thresholds, timeout, retry and acknowledgement
+semantics are retained. Async sampling keeps V1 request context alive past
+`execute_model`; ordinary V2 frames continue to execute natively. Public Worker
+RPC names are unchanged and their functions remain importable in spawned workers.
+The public CUDA installer owns NumPy staging installation for both versions;
+version-specific sampling delegates retain their own installation markers and
+call the shared stage sampler. Resource invalidation and consumer-drain timing
+are unchanged. Frontend request guards and startup-heap leases retain their
+separate owner in `utils/engine_lifecycle.py`; these guard a different request
+lifetime, including when engines run in process.
+
 ### V1 compatibility boundary
 
-ModelRunner V1 retains the behavior of the rebased parent `7ee1d95`: the GR
-Prefill grid and per-request capacity clamp, exact native-input admission for
-async Prefill, B=1 startup Decode capture, and lazy capture against stage-owned
-buffers when a new batch needs a graph. Its Backend row bound, retirement and
-shutdown semantics remain unchanged. Upstream V1/NPU fixes in that parent,
-including B=2 Prefill capture, are retained.
+ModelRunner V1 uses the GR Prefill grid, clamps capture to the per-request
+capacity and requires exact native input extents for async Prefill admission.
+It captures B=1 Decode at startup and can lazily capture against stage-owned
+buffers when a new batch needs a graph.
+
+Beam attention uses incremental Decode with one query token per beam;
+full-suffix recomputation is not supported. NPU retains incremental row views
+and B=2 Prefill capture support. Backend row bounds, retirement and shutdown
+remain the responsibility of their existing implementations.
 
 Set `beam.adapter_cache_enabled: true` in the canonical service configuration
 to opt into cross-batch adapter caching. It defaults to false, preserving the
@@ -303,11 +371,10 @@ V2 FULL Prefill replay, fixed input addresses, absence of V2 request-time
 capture, candidate structure and resource release. Repeated matching
 shapes must produce identical outputs after batch switches.
 
-To verify V1 baseline behavior, copy this single probe into a checkout of
-`7ee1d95`, run `--runner v1 --mode graph`, then run the current checkout with
-`--reference /path/to/baseline/results.json`. This requires exact ordered
-candidates and scores for every matching case. `--expected-source` can
-additionally assert the Worker imports the intended checkout.
+To compare two revisions, run the same probe with matching inputs and runner
+settings. Pass the first run's JSON as `--reference` in the second run to
+require exact ordered candidates and scores for matching cases.
+`--expected-source` can check the Worker's import source.
 
 Cross-B or Graph/Eager equality is a separate numerical investigation; it is
 not a required identity in this probe. Different shapes can change BF16

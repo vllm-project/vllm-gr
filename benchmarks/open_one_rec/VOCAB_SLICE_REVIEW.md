@@ -1,17 +1,17 @@
-# TP=1 canonical vocabulary slicing: review validation
+# Historical CUDA vocabulary slicing validation
 
-## Implementation
-
-- For TP>1, disable canonical CUDA vocabulary slicing and use the original full-vocabulary projection and collective path. TP>1 slicing and multi-GPU E2E validation are outside this PR.
-- Remove the platform-neutral dispatcher's top-level CUDA backend import. GPU logits layers are imported only after selecting a CUDA backend.
-- Bind windows to each runner's LogitsProcessor instances. The backend interprets narrowed logits with its own window. Canonical load/close never modifies legacy global state.
-- Explicit local None overrides legacy global slicing. Disable full-vocabulary windows to avoid redundant weight cloning.
-- Tests cover two runner windows, projection after closing the other runner, full-window bypass, TP fallback, import isolation, offsets and three constraint stages.
+The [canonical vocabulary slicing PR](https://github.com/JiusiServe/vllm-gr/pull/405)
+investigated the numerical effects of changing projection shape. The CUDA
+implementation uses the original full-vocabulary projection and collective
+path for TP greater than one. The measured comparisons below use TP=1.
 
 ## Measurement
 
-NVIDIA L20 48 GB; TP=1; BF16 OneRec-1.7B revision
-cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b; torch 2.11+cu130; vLLM 0.22.1.
+> Measured on NVIDIA L20 (48 GB) / date not recorded / PyTorch 2.11+cu130,
+> vLLM 0.22.1. Not a performance guarantee.
+
+The run used the [OneRec-1.7B model snapshot](https://huggingface.co/OpenOneRec/OneRec-1.7B/tree/cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b)
+in BF16 with tensor parallelism set to 1.
 100 synthetic OneRec text prompts use the existing OneRecDataset and tokenizer.
 Real gated RecIF data was unavailable. Input=1024 tokens including SID begin;
 SID=3; beam=128; canonical CUDA tables; async_scheduling=True.
@@ -54,7 +54,6 @@ This setting also changes the full-projection baseline output. It is a separate
 numerical configuration, not preservation of default BF16 behavior. Production
 code does not silently change the global PyTorch flag. These observations apply
 to this GPU/model/workload, not a universal bitwise guarantee across hardware.
-Default enablement remains a merge decision until the numerical contract is agreed.
 
 ## Default BF16 reduction
 
@@ -139,23 +138,10 @@ Remove --strict-bf16 for default-precision cases. The strict flag affects only
 the isolated validation worker; it is not a production option. This manual
 integration harness reuses OneRecDataset and calls beam_search_v1 directly,
 adding worker events, memory snapshots and raw parent/token/score capture.
-The ordinary benchmark entry point remains one_rec_main.py (V1_BENCHMARK.md).
+For the regular CLI, see the [OneRec benchmark guide](V1_BENCHMARK.md).
 
 Check workload_sha256, artifact_digest and tokenizer_digest before comparison.
 Compare samples[i].beams exactly; diagnostic records retain stage timings/shapes.
-Raw remote artifacts: /tmp/vocab-slice-review/{eager,graph}-{full,slice}.{json,log}
-and strict-{eager,graph}-{full,slice}.{json,log}; summaries: summary.json and
-strict-summary.json. Artifacts are not checked in.
-
-CPU/NPU boundary smoke tests deny CUDA/Triton imports in a subprocess and
-supplement platform dispatch tests. They do not replace execution on NPU hardware.
-
-## Regression checks
-
-227 passed, 3 skipped (NPU hardware-dependent tests). Ruff check, Ruff format
-check and git diff --check pass. The repository manual harness also completed
-an eager/slice strict-precision smoke run with warmup=1,repeat=1; its timings
-are excluded from the reported 100-request results.
 
 ## Per-stage diagnostic means (ms)
 

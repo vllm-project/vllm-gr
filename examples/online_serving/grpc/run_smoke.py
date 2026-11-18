@@ -40,6 +40,7 @@ def main():
         "-m",
         "vllm_gr.entrypoints.cli.main",
         "serve",
+        "--gr",
         str(model),
         "--vllm-gr-config",
         str(config),

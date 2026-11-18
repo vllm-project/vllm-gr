@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """NPU ModelRunner wrappers for grouped Beam execution."""
 
+# Native NPU patch internals remain dynamically typed. Keep the helper
+# signatures and caller-side keyword checks covered by the NPU worker group.
+# mypy: disable-error-code="no-any-return,no-untyped-call,no-untyped-def,type-arg,union-attr,var-annotated"
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -16,21 +20,27 @@ from vllm_gr.v1.worker.constraint_hook import (
     apply_constrained_sample_override,
     try_sample_with_constraint_backend,
 )
-from vllm_gr.v1.worker.model_runner_common import (
+from vllm_gr.v1.worker.gr_context import (
+    _beam_full_graph_ready,
+    _beam_graph_enabled_for_run,
+    _create_beam_context,
+)
+from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
     _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
-    InputBatchProxy,
+)
+from vllm_gr.v1.worker.npu_model_runner_bookkeeping import (
+    _attach_beam_search_result,
     _beam_collapse_bookkeeping,
-    _beam_full_graph_ready,
-    _beam_graph_enabled_for_run,
+)
+from vllm_gr.v1.worker.npu_model_runner_inputs import (
+    InputBatchProxy,
     _beam_remap_inputs,
-    _create_beam_context,
     _materialize_logits_indices,
-    _reduce_sampler_output_for_worker_decision,
 )
 from vllm_gr.v1.worker.prefill_graph_runner import (
     SUPPORTED_NUM_REQS,
@@ -337,8 +347,6 @@ def make_patched_sample_tokens_npu(_orig_sample_tokens):
             stage_runner.pending_plan is not None or stage_runner.execution_error is not None
         ):
             return stage_runner.sample(grammar_output)
-        from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
-
         out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
         _attach_beam_search_result(self, out)
         return out
@@ -383,7 +391,6 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
         # max_num_seqs (logical requests), while Beam decode initially has one
         # sampler row per parent. Collapse the worker-selected payload before
         # upstream bookkeeping copies it to the fixed-size host buffer.
-        _reduce_sampler_output_for_worker_decision(self, sampler_output)
         if (
             sampler_output is not None
             and isinstance(getattr(sampler_output, "sampled_token_ids", None), torch.Tensor)
@@ -418,7 +425,7 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
         ) = res
 
         collapsed_req_ids, collapsed_idx, n = _beam_collapse_bookkeeping(
-            self, orig_input_batch, request_row_configs, beam_data, sampler_output
+            self, request_row_configs, beam_data, sampler_output
         )
 
         return (
@@ -875,7 +882,9 @@ def _capture_beam_decode_graph_width(runner, width: int) -> bool:
     """
     from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     gr_cfg = _get_gr_config(runner)
     if not gr_cfg.beam_graph_active:
@@ -1065,7 +1074,9 @@ def _retained_npu_suffix_kv_bytes(runner: Any) -> int:
 
 def capture_beam_decode_graph(runner: Any) -> bool:
     """Capture configured widths over private graphs and stable suffix banks."""
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     config = _get_gr_config(runner)
     if not config.beam_graph_active:

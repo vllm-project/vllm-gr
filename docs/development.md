@@ -16,11 +16,11 @@ All paths below are relative to the repository root.
 | Imports, initialization, runtime compatibility | `vllm_gr/plugin.py`, `vllm_gr/_env_check.py`, `vllm_gr/patch.py` | [Patch inventory](runtime_patch_inventory.md), [inventory data](patch_inventory.yaml) |
 | Configuration and public Beam API | `vllm_gr/config/`, `vllm_gr/entrypoints/gr.py` | [Offline configuration](../examples/offline_inference/beam_search/README.md), [online configuration](../examples/online_serving/beam_search/README.md) |
 | HTTP, gRPC, transport, and scheduling | `vllm_gr/entrypoints/`, `vllm_gr/v1/engine/` | [Beam batch contract](beam_batch_execution_contract.md), [async scheduling](async_scheduling.md), [gRPC/NumPy](grpc_numpy_upgrade.md) |
-| Beam state and candidate selection | `vllm_gr/v1/beam/` | [Decision helper contract](beam_search_decision_helper_contract.md) |
+| Beam state and candidate selection | `vllm_gr/v1/beam/` | [Beam batch contract](beam_batch_execution_contract.md), [GPU Beam state](beam_gpu_state.md) |
 | Worker, Attention, and graph execution | `vllm_gr/v1/worker/`, `vllm_gr/v1/attention/backends/`, `vllm_gr/ops/` | [Prefill capture](prefill_graph_capture.md), [ModelRunner V2](modelrunner_v2_multibatch.md), [NPU Prefill](npu_prefill_bsnd.md) |
 | Artifact loading and constrained Top-K | `vllm_gr/constraints/`, `tools/build_constraint_table.py` | [Artifact setup](onerec_v1_async_quickstart.md), [multi-Trie contract](multi_root_constraint_table.md) |
 | Platform registration and activation | `vllm_gr/platforms/` | [Platform contract](platform_backend_contract.md) |
-| Pangu and optional LMCache | `vllm_gr/pangu_compat.py`, `vllm_gr/lmcache_patch.py` | [Pangu examples](../examples/offline_inference/pangu1b/README.md), [LMCache](lmcache.md) |
+| Pangu compatibility | `vllm_gr/pangu_compat.py` | [Pangu examples](../examples/offline_inference/pangu1b/README.md) |
 
 The sections below identify distinctions that are easy to miss across modules.
 Detailed lifecycle and numerical rules stay in the linked contracts.

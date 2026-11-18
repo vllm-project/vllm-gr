@@ -57,7 +57,7 @@ class GRServeSubcommand(ServeSubcommand):
             self.name,
             help="Launch a local OpenAI-compatible API server for vllm-gr.",
             description=DESCRIPTION,
-            usage="vllm-gr serve [model_tag] [options]",
+            usage="%(prog)s [model_tag] --gr [options]",
         )
 
         serve_parser = make_arg_parser(serve_parser)

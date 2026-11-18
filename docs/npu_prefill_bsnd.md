@@ -112,5 +112,6 @@ A has BSND disabled, B enables the selected shapes. Keep model, catalog, actual
 tokenized inputs, cache policy, B/W/N and Decode configuration identical. Report
 capture time and memory separately from warmed-up request latency; collect
 profiles separately from timing. Confirm actual BSND hits in logs and zero
-per-layer FIA updates for those Prefill replays. No ABBA measurements are
-reported by this integration change.
+per-layer FIA updates for those Prefill replays. The
+[historical ABBA results](https://github.com/JiusiServe/vllm-gr/pull/499) record
+one round per shape for a specific Ascend 910B4 workload.

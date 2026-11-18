@@ -113,12 +113,36 @@ def test_implementations_subclass_the_contract() -> None:
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "changed_file", [*mypy_hook.CUDA_STAGE_FILES, "tools/pre_commit/mypy.py"]
+    "changed_file",
+    sorted(
+        {
+            *mypy_hook.CUDA_STAGE_FILES,
+            "tools/pre_commit/mypy.py",
+            # Pin moved owners independently of the routing list itself.
+            "vllm_gr/v1/worker/model_runner_contracts.py",
+            "vllm_gr/v1/worker/gr_gc.py",
+            "vllm_gr/v1/worker/gr_context.py",
+            "vllm_gr/v1/worker/gpu_model_runner_v2_patch.py",
+            "vllm_gr/v1/worker/gpu_model_runner_v2_resources.py",
+        }
+    ),
 )
 def test_mypy_checks_complete_boundary(changed_file: str) -> None:
     """Changing any boundary member checks its peers and negative cases too."""
     groups = mypy_hook.group_files([changed_file, "tests/test_gr_startup.py"])
     assert groups.pop(mypy_hook.CUDA_STAGE_GROUP) == mypy_hook.CUDA_STAGE_FILES
+    assert groups.pop("tests") == ["tests/test_gr_startup.py"]
+    assert not any(groups.values())
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "changed_file",
+    sorted(mypy_hook.NPU_WORKER_FILES),
+)
+def test_npu_worker_mypy_checks_all_callers(changed_file: str) -> None:
+    """Changing either NPU helper or caller checks the whole NPU worker boundary."""
+    groups = mypy_hook.group_files([changed_file, "tests/test_gr_startup.py"])
+    assert groups.pop(mypy_hook.NPU_WORKER_GROUP) == mypy_hook.NPU_WORKER_FILES
     assert groups.pop("tests") == ["tests/test_gr_startup.py"]
     assert not any(groups.values())
 

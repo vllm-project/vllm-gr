@@ -424,6 +424,23 @@ candidate order and freezes only global Beam selection semantics.
 
 ## Package boundary
 
+### NPU host terminal columns
+
+The fixed-horizon NPU terminal builder can produce the existing
+`BeamSequenceColumns` wire representation from the already transferred packed
+CPU buffer. It keeps Python score normalization, finite filtering and tie
+ordering unchanged. It creates owned little-endian column bytes only when at
+least 64 results are requested from at least 64 candidates, the history spans
+the complete generation budget, and no stop-aware truncation is needed. Small
+results, partial histories, and stop-aware output retain the row representation.
+All-invalid rows retain the existing failure and lazy normalization behavior.
+
+This changes CPU packaging only: the packed D2H, NPU selection and kernels are
+unchanged. Both public clients materialize the existing tuple-of-sequences API
+before returning. Measurements must include that materialization, not stop at
+column receipt. The column protocol predates this producer and is not a new
+protocol or a new NPU operator.
+
 `vllm_gr.v1.beam` lazily exposes existing production runtime primitives only.
 New contracts, codec, and CPU reference APIs are imported explicitly from
 their submodules. Importing the Beam package or `cpu_reference` does not import

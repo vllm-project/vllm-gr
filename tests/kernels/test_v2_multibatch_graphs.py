@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
     install_decode_model,
@@ -29,8 +29,10 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import (
     CudaStageHooksV2,
 )
-from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
-from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import (
+    capture_multibatch_forward,
+    close_v2_runtime,
+)
 from vllm_gr.v1.worker.model_runner_patch import make_load_model_with_constraint_backend
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -10,6 +10,9 @@ import triton.language as tl
 
 from vllm_gr.v1.attention.backends.beam_attention_state import AttentionState
 
+# Elements per merge program; the launch grid and the kernel must agree.
+_MERGE_BLOCK = 256
+
 
 @triton.jit
 def _prepare(
@@ -66,11 +69,13 @@ def _merge(
     LS1: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    request, head = tl.program_id(0), tl.program_id(1)
+    # One program per (request, head, tile): the former serial tile loop left
+    # only batch*heads CTAs (16 for B=1), making the merge as slow as the FA call.
+    request, head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     start, end = tl.load(CuQ + request), tl.load(CuQ + request + 1)
     length = tl.load(Lengths + request)
     offsets = tl.arange(0, BLOCK)
-    for tile in range(tl.cdiv((end - start) * D, BLOCK)):
+    if tile * BLOCK < (end - start) * D:
         flat = tile * BLOCK + offsets
         token, dim = start + flat // D, flat % D
         valid = token < end
@@ -169,7 +174,7 @@ def segmented_prefix(
     )
     result = torch.empty_like(query, memory_format=torch.contiguous_format)
     result_lse = torch.empty((heads, tokens), dtype=torch.float32, device=query.device)
-    _merge[(batch, heads)](
+    _merge[(batch, heads, triton.cdiv(max_query * dim, _MERGE_BLOCK))](
         out,
         lse,
         cu_query,
@@ -183,6 +188,6 @@ def segmented_prefix(
         chunk * key.shape[1],
         *out.stride(),
         *lse.stride(),
-        256,
+        _MERGE_BLOCK,
     )
     return AttentionState(result, result_lse)

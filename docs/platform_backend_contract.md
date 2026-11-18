@@ -151,8 +151,10 @@ Optional sample, sample-tokens, state-update, reload, and graph hooks remain
 owned by the corresponding platform module.
 
 `make_patched_execute_model()` is intentionally absent. It is shared GPU/NPU
-logic owned by `model_runner_common.py` and remains part of the neutral patch
-orchestrator.
+V1 adaptation owned by `model_runner_common.py`, imported only after V1
+selection. V2 owns its execute wrapper in `gpu_model_runner_v2_patch.py`; both
+use shared dispatch in `gr_execution.py`. Installation markers/checks live in
+the hardware-free `model_runner_contracts.py` rather than in V1 adaptation.
 
 The CUDA dispatcher selects MR V1 or MR V2 before installing their respective
 hooks. The provider's V1 hook getter is not a replacement for this selection;

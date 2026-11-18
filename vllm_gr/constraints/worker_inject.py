@@ -164,7 +164,7 @@ def _verify_runner_sample_hook(worker: Any) -> None:
     runner = getattr(worker, "model_runner", None)
     if runner is None:
         return
-    from vllm_gr.v1.worker.model_runner_common import (
+    from vllm_gr.v1.worker.model_runner_contracts import (
         _WORKER_EXECUTE_PATCH_MARKER,
         _WORKER_SAMPLE_PATCH_MARKER,
         _WORKER_SAMPLE_TOKENS_PATCH_MARKER,

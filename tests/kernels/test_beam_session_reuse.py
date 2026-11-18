@@ -9,8 +9,8 @@ import msgspec
 import pytest
 import torch
 
-from tests.kernels.test_beam_search_runner_cuda import _runtime as request_runtime
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_runner_test_utils import make_request_runner as request_runtime
+from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
     metadata,
