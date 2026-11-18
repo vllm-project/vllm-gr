@@ -600,4 +600,20 @@ def test_calibration_rejects_model_shorter_than_split_probe(monkeypatch):
         )
 
 
+@pytest.mark.l1
+def test_segmented_plan_requires_explicit_policy_opt_in(monkeypatch, tmp_path):
+    shape, args = _short_prefix_args(monkeypatch, tmp_path)
+    monkeypatch.setenv(policy.ENV_MIN_CHAIN_US, "8")
+    # A measured speedup is insufficient to change the default execution path.
+    for value in (None, "", "off", "invalid"):
+        if value is None:
+            monkeypatch.delenv(policy.ENV_PREFIX_POLICY, raising=False)
+        else:
+            monkeypatch.setenv(policy.ENV_PREFIX_POLICY, value)
+        assert policy.resolve_prefix_plan(shape, **args) is None
+    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
+    plan = policy.resolve_prefix_plan(shape, **args)
+    assert plan is not None and plan.segments > 1
+
+
 pytestmark = pytest.mark.cpu_test

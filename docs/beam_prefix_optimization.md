@@ -17,8 +17,11 @@ suffix fusion setting no longer forces FA2. The prefix policy compares:
 | Native split | Explicit `num_splits`, including `1` to avoid automatic splitting | FA3/FA4 adapter; FA2 varlen rejects values above 1 |
 | Framework segmented | One virtual-batch FA call over request × KV segment, followed by stable LSE merge | Plain paged FP16/BF16 prefix; no window, ALiBi, softcap or sinks |
 
-The default is ON for CUDA/FA2: the segment count comes from the device-local
-cost model described in the next section. FA3/FA4 are never overridden, because
+Native CUDA attention is the default. Set `VLLM_GR_PREFIX_POLICY=auto` to enable
+CUDA/FA2 segmentation with the device-local cost model described in the next
+section. The cost model measures execution time, so validate fixed-sample model
+Recall before enabling a plan that changes the attention reduction order.
+FA3/FA4 are never overridden, because
 their own split-K heuristic already pays a single fused combine. There are no
 L20, SM89 or SM90 dispatch branches.
 
@@ -62,7 +65,8 @@ changes cost; entries from another schema are ignored and re-measured. Schema 2
 follows the per-tile merge, whose per-segment overhead is far lower.
 
 `VLLM_GR_PREFIX_CALIBRATION=off` skips measurement and `VLLM_GR_PREFIX_POLICY=off`
-disables the whole segmentation path; delete the file to re-measure. Every
+keeps the default native path. Unset or unrecognized policy values also keep
+the native path. Delete the file to re-measure. Every
 failure path logs a warning and continues on the native path.
 
 ## CUDA graphs and fallback

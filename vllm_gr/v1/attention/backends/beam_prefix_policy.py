@@ -214,9 +214,9 @@ def remember_worker_flash_attn_version(worker: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shape, calibration and default-on planning
+# Shape, calibration and opt-in planning
 #
-# The default is ON for CUDA/FA2. Selection order is: measured per-device
+# CUDA/FA2 segmentation requires an explicit opt-in. Selection order is: measured per-device
 # calibration -> native. FA3/FA4 keep their own split-K heuristic
 # (num_splits=0): it is measured against the kernel it dispatches and its
 # per-split overhead is a single fused combine, so this module never overrides it.
@@ -326,7 +326,7 @@ _CALIBRATION_HEADER = """\
 #
 # Measured once per (device, model geometry) when the engine starts and reused by
 # later starts. Delete this file to force a re-measurement; start the engine with
-# VLLM_GR_PREFIX_CALIBRATION=off to skip calibration and the default-on path.
+# VLLM_GR_PREFIX_CALIBRATION=off to skip calibration and the segmented path.
 #
 # Cost model for one prefix attention call (length = graph length bucket):
 #   chain(S) = ceil(B * heads * ceil(W/128) * S / sm_count) * (length/S) * u
@@ -453,11 +453,9 @@ def store_calibration(
 
 
 def policy_mode() -> str:
-    """``auto`` (default) or ``off``; anything else keeps the safe ``auto``."""
+    """Enable measured segmentation only with an explicit ``auto`` policy."""
     raw = os.environ.get(ENV_PREFIX_POLICY)
-    if raw is not None and raw.strip().lower() == "off":
-        return "off"
-    return "auto"
+    return "auto" if raw is not None and raw.strip().lower() == "auto" else "off"
 
 
 def resolve_prefix_plan(

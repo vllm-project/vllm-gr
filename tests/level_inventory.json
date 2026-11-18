@@ -2035,6 +2035,7 @@
     "tests/test_grpc_entry.py::test_per_input_trie_selector_wire_and_batch_mapping": "l1",
     "tests/test_grpc_entry.py::test_prompt_and_generation_length_limit_after_truncation": "l1",
     "tests/test_grpc_entry.py::test_prompt_truncation_matches_native_renderer": "l1",
+    "tests/test_grpc_entry.py::test_pure_python_protobuf_keeps_private_descriptors": "l1",
     "tests/test_grpc_entry.py::test_single_generate_keeps_original_response_shape": "l2",
     "tests/test_grpc_entry.py::test_submission_failure_status_cleanup_and_recovery": "l2",
     "tests/test_grpc_entry.py::test_terminal_failure_status_and_subsequent_valid_request": "l2",
