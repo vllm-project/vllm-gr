@@ -106,6 +106,9 @@ class AscendBeamAttentionService:
 
     backend_id = "ascend"
 
+    def device_type(self) -> str:
+        return "npu"
+
     def execution_module(self) -> Any:
         """Return the module serving Decode and ordinary attention."""
         if self.decode_mode() == _XLLM_DECODE_MODE:
@@ -160,6 +163,10 @@ class AscendBeamAttentionService:
 
     def supports_short_suffix_attention(self) -> bool:
         # The fused short-suffix prefix path is a CUDA FlashAttention feature.
+        return False
+
+    def short_suffix_head_size_supported(self, head_size: int) -> bool:
+        del head_size
         return False
 
     def supports_prefill_version_selection(self) -> bool:
@@ -348,8 +355,46 @@ class AscendConfigService:
         return "npu"
 
 
+class AscendBeamMetadataProfile:
+    """Ascend's answers for shared Beam metadata construction."""
+
+    backend_id = "ascend"
+
+    def allocates_fixed_buffers(self) -> bool:
+        # ACL Graph FULL-mode Beam decode reads them; the cascade path ignores
+        # the device fields but still tolerates their presence.
+        return True
+
+    def needs_causal_mask_buffer(self) -> bool:
+        # BSND padded Prefill consumes a static causal mask.
+        return True
+
+    def uses_v2_prefill_capture(self) -> bool:
+        # Ascend has no native V2 Prefill capture in this release.
+        return False
+
+    def forces_single_reduction_split(self) -> bool:
+        return False
+
+    def packs_seqlens_non_blocking(self) -> bool:
+        # Ascend stages seqlens through a pinned host buffer as well.
+        return True
+
+    def allows_identity_block_table_slice(self) -> bool:
+        # A request-major incremental batch already holds its blocks in order.
+        return True
+
+    def marks_identity_prefix_rows(self) -> bool:
+        # The fused path can reuse dense rows when routing is proven identity.
+        return True
+
+    def writes_seqlens_per_tensor(self) -> bool:
+        return False
+
+
 __all__ = [
     "AscendBeamAttentionService",
+    "AscendBeamMetadataProfile",
     "AscendConfigService",
     "AscendStageExecutionService",
 ]

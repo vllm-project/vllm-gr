@@ -98,6 +98,9 @@ class CudaBeamAttentionService:
 
     backend_id = "cuda"
 
+    def device_type(self) -> str:
+        return "cuda"
+
     def execution_module(self) -> Any:
         self._reject_npu_only_decode_mode()
         from vllm_gr.v1.attention.backends import beam_attn_gpu
@@ -142,6 +145,13 @@ class CudaBeamAttentionService:
 
     def supports_short_suffix_attention(self) -> bool:
         return True
+
+    def short_suffix_head_size_supported(self, head_size: int) -> bool:
+        from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+            short_suffix_head_size_supported,
+        )
+
+        return bool(short_suffix_head_size_supported(head_size))
 
     def supports_prefill_version_selection(self) -> bool:
         return True
@@ -260,8 +270,45 @@ class CudaConfigService:
         return "cuda"
 
 
+class CudaBeamMetadataProfile:
+    """CUDA's answers for shared Beam metadata construction."""
+
+    backend_id = "cuda"
+
+    def allocates_fixed_buffers(self) -> bool:
+        # Graph capture needs addresses that survive replay.
+        return True
+
+    def needs_causal_mask_buffer(self) -> bool:
+        # The CUDA Prefill path builds its mask from the metadata it is given.
+        return False
+
+    def uses_v2_prefill_capture(self) -> bool:
+        return True
+
+    def forces_single_reduction_split(self) -> bool:
+        # Deterministic reductions need one split; the caller still checks the
+        # batch-invariant env flag.
+        return True
+
+    def packs_seqlens_non_blocking(self) -> bool:
+        # The host buffer is pinned, so the transfer can overlap.
+        return False
+
+    def allows_identity_block_table_slice(self) -> bool:
+        return False
+
+    def marks_identity_prefix_rows(self) -> bool:
+        return False
+
+    def writes_seqlens_per_tensor(self) -> bool:
+        # Fixed buffers are filled in place; a harness without them allocates.
+        return True
+
+
 __all__ = [
     "CudaBeamAttentionService",
+    "CudaBeamMetadataProfile",
     "CudaConfigService",
     "CudaStageExecutionService",
 ]

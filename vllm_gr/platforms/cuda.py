@@ -20,7 +20,12 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
-    from .services import BackendConfigService, BeamAttentionService, StageExecutionService
+    from .services import (
+        BackendConfigService,
+        BeamAttentionService,
+        BeamMetadataProfile,
+        StageExecutionService,
+    )
 
 
 @dataclass(frozen=True)
@@ -100,6 +105,12 @@ class CUDABackendProvider:
         from .cuda_services import CudaConfigService
 
         return CudaConfigService()
+
+    def create_beam_metadata_profile(self) -> BeamMetadataProfile:
+        """Return CUDA's answers for shared Beam metadata construction."""
+        from .cuda_services import CudaBeamMetadataProfile
+
+        return CudaBeamMetadataProfile()
 
     def create_stage_execution_service(self) -> StageExecutionService:
         """Return the CUDA stage execution service.

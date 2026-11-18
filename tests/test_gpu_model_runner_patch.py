@@ -777,8 +777,17 @@ def test_create_beam_context_uses_grconfig_params(device: str, enabled: bool | N
         assert call_kwargs["max_decode_steps"] == 10
         assert call_kwargs["dtype"] is torch.float16
         assert call_kwargs["max_batch"] == 1
+        # Short suffix is a backend capability now, so it follows the selected
+        # backend rather than the runner's device label.
+        from vllm_gr.platforms.loader import active_backend_service
+
+        supported = bool(
+            active_backend_service(
+                "create_beam_attention_service"
+            ).supports_short_suffix_attention()
+        )
         assert call_kwargs["enable_short_suffix_attention"] is (
-            device == "cuda" and enabled is not False
+            supported and enabled is not False
         )
 
 
@@ -797,8 +806,16 @@ def test_create_beam_context_dtype_from_model_config() -> None:
         parallel_config=SimpleNamespace(),
         device=torch.device("cpu"),
     )
-
-    with patch("vllm_gr.v1.beam.beam_attention_context.BeamAttentionContext") as MockCtx:
+    # Short suffix follows the selected backend, so pin one that does not offer
+    # it rather than relying on whichever backend this host activated.
+    unsupported = SimpleNamespace(supports_short_suffix_attention=lambda: False)
+    with (
+        patch(
+            "vllm_gr.platforms.loader.active_backend_service",
+            return_value=unsupported,
+        ),
+        patch("vllm_gr.v1.beam.beam_attention_context.BeamAttentionContext") as MockCtx,
+    ):
         MockCtx.return_value = MagicMock()
         gpu_patch._create_beam_context(runner, gr_cfg)
         call_kwargs = MockCtx.call_args[1]

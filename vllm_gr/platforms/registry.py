@@ -28,6 +28,7 @@ _REQUIRED_PROVIDER_METHODS = (
     "create_stage_execution_service",
     "create_beam_attention_service",
     "create_config_service",
+    "create_beam_metadata_profile",
     "select_runner_patch_module_name",
     "create_constrained_topk_execution",
 )

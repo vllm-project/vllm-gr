@@ -106,15 +106,18 @@ class BeamAttentionContext:
         enable_short_suffix_attention: bool = False,
     ):
         if enable_short_suffix_attention:
-            if device.type != "cuda":
+            # The fused short-suffix prefix belongs to the selected backend; a
+            # backend without it cannot serve this pool at all.
+            from vllm_gr.platforms.loader import active_backend_service
+
+            attention = active_backend_service("create_beam_attention_service")
+            if not attention.supports_short_suffix_attention():
+                raise ValueError("Short suffix attention is not supported by this backend")
+            if device.type != attention.device_type():
                 raise ValueError("Short suffix attention requires CUDA")
             if max_decode_steps < 1:
                 raise ValueError("Short suffix attention requires positive pool capacity")
-            from vllm_gr.v1.attention.backends.beam_attn_gpu import (
-                short_suffix_head_size_supported,
-            )
-
-            if not short_suffix_head_size_supported(head_dim) or dtype not in (
+            if not attention.short_suffix_head_size_supported(head_dim) or dtype not in (
                 torch.float16,
                 torch.bfloat16,
                 torch.float32,

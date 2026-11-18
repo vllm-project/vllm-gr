@@ -143,6 +143,16 @@ class LegacyProviderAdapter:
 
         return CudaConfigService()
 
+    def create_beam_metadata_profile(self) -> Any:
+        """Return the fixed metadata profile of the version-1 identity."""
+        if self.device_type == "npu":
+            from .ascend_services import AscendBeamMetadataProfile
+
+            return AscendBeamMetadataProfile()
+        from .cuda_services import CudaBeamMetadataProfile
+
+        return CudaBeamMetadataProfile()
+
     def create_constrained_topk_execution(
         self,
         *,

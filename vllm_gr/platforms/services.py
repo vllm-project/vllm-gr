@@ -110,6 +110,9 @@ class BeamAttentionService(Protocol):
 
     backend_id: str
 
+    def device_type(self) -> str:
+        """Return the tensor placement this backend executes on."""
+
     def execution_module(self) -> Any:
         """Return the module serving Decode and ordinary attention."""
 
@@ -135,6 +138,9 @@ class BeamAttentionService(Protocol):
 
     def supports_short_suffix_attention(self) -> bool:
         """Whether this backend implements the fused short-suffix prefix path."""
+
+    def short_suffix_head_size_supported(self, head_size: int) -> bool:
+        """Whether this backend's FlashAttention can produce prefix states for it."""
 
     def supports_prefill_version_selection(self) -> bool:
         """Whether this backend separates the Prefill FlashAttention version."""
@@ -246,8 +252,57 @@ class BackendConfigService(Protocol):
         """Return this backend's Constraint Table placement, or ``None``."""
 
 
+@runtime_checkable
+class BeamMetadataProfile(Protocol):
+    """Answer the device-metadata questions shared Beam metadata construction asks.
+
+    Beam metadata is built once per step and read by every layer, so these are
+    plain boolean answers on an object obtained once, not provider lookups. They
+    replace the ``_is_cuda`` / ``_is_npu`` flags that a device name used to set.
+
+    The distinction that matters is not which device the tensors live on, but
+    which backend's kernels will consume the metadata: a CUDA host's harness can
+    build metadata for a backend it is not running.
+    """
+
+    backend_id: str
+
+    def allocates_fixed_buffers(self) -> bool:
+        """Whether this backend needs pre-allocated fixed-address buffers.
+
+        Graph capture requires addresses that survive replay; a backend without
+        graph replay allocates per call and must not pay the allocation cost.
+        """
+
+    def needs_causal_mask_buffer(self) -> bool:
+        """Whether this backend's Prefill path consumes a static causal mask."""
+
+    def uses_v2_prefill_capture(self) -> bool:
+        """Whether this backend captures Prefill in the native V2 runner."""
+
+    def forces_single_reduction_split(self) -> bool:
+        """Whether deterministic reductions pin the split count to one."""
+
+    def packs_seqlens_non_blocking(self) -> bool:
+        """Whether seqlens uploads may run as a non-blocking host transfer."""
+
+    def allows_identity_block_table_slice(self) -> bool:
+        """Whether a request-major batch may slice its block table directly."""
+
+    def marks_identity_prefix_rows(self) -> bool:
+        """Whether prefix rows may be reused in place instead of gathered."""
+
+    def writes_seqlens_per_tensor(self) -> bool:
+        """Whether metadata construction writes each seqlens tensor directly.
+
+        A backend whose buffers are fixed-address writes into them; one without
+        fixed buffers builds fresh tensors per call.
+        """
+
+
 __all__ = [
     "BackendConfigService",
     "BeamAttentionService",
+    "BeamMetadataProfile",
     "StageExecutionService",
 ]

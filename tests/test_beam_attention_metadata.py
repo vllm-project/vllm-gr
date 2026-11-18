@@ -18,6 +18,30 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 
 
+def _profile(*, is_cuda: bool = False, is_npu: bool = False) -> Any:
+    """A metadata profile answering as the given placement used to.
+
+    Shared metadata asks the selected backend instead of reading ``_is_cuda`` /
+    ``_is_npu`` flags, so a test supplies that profile directly.
+    """
+    return SimpleNamespace(
+        backend_id="ascend" if is_npu else "cuda",
+        allocates_fixed_buffers=lambda: is_cuda or is_npu,
+        needs_causal_mask_buffer=lambda: is_npu,
+        uses_v2_prefill_capture=lambda: is_cuda,
+        forces_single_reduction_split=lambda: is_cuda,
+        packs_seqlens_non_blocking=lambda: is_npu,
+        allows_identity_block_table_slice=lambda: is_npu,
+        marks_identity_prefix_rows=lambda: is_npu,
+        writes_seqlens_per_tensor=lambda: is_cuda,
+    )
+
+
+def _set_placement(builder: Any, *, is_cuda: bool = False, is_npu: bool = False) -> None:
+    """Attach the metadata profile for a placement to an existing builder."""
+    builder._profile = _profile(is_cuda=is_cuda, is_npu=is_npu)
+
+
 def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
     builder = object.__new__(BeamAttentionMetadataBuilder)
     builder.vllm_config = SimpleNamespace(speculative_config=None)
@@ -30,8 +54,7 @@ def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
     builder.max_num_splits = 0
     builder.num_heads_q = 8
     builder.num_kv_heads = 2
-    builder._is_cuda = False
-    builder._is_npu = False
+    builder._profile = _profile()
     builder._fixed_buffers = False
     builder.npu_causal_atten_mask = None
     return builder
@@ -448,7 +471,7 @@ def test_only_npu_incremental_geometry_uses_async_upload(
     monkeypatch: pytest.MonkeyPatch, is_npu: bool
 ) -> None:
     builder = _make_fixed_builder()
-    builder._is_npu = is_npu
+    _set_placement(builder, is_npu=is_npu)
     transfers = []
 
     def upload(entries: Any, *, non_blocking: bool = False) -> None:
@@ -479,7 +502,7 @@ def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
         pytest.skip("Ascend NPU is not available")
     builder = _make_builder()
     builder.device = torch.device("npu")
-    builder._is_npu = True
+    _set_placement(builder, is_npu=True)
     with torch.inference_mode():
         builder._h2d_host = torch.zeros(64, dtype=torch.int32, pin_memory=True)
         builder._h2d_dev = torch.zeros(64, dtype=torch.int32, device="npu")
@@ -550,8 +573,7 @@ def test_prefix_block_table_view_requires_npu_incremental_identity_rows(
 ) -> None:
     """Basic slicing preserves B1/B4 block rows, cache hits and new requests."""
     builder = _make_fixed_builder()
-    builder._is_npu = is_npu
-    builder._is_cuda = not is_npu
+    _set_placement(builder, is_cuda=not is_npu, is_npu=is_npu)
     builder._prefix_block_table_buf = torch.zeros((4, 8), dtype=torch.int32)
     builder._suffix_cu_seqlens_q_buf = torch.zeros(16, dtype=torch.int32)
     builder._suffix_cu_seqlens_k_buf = torch.zeros(16, dtype=torch.int32)
@@ -626,7 +648,7 @@ def test_npu_mixed_metadata_keeps_indexed_block_rows_and_synchronous_upload(
     monkeypatch: pytest.MonkeyPatch, beam_first: bool
 ) -> None:
     builder = _make_fixed_builder()
-    builder._is_npu = True
+    _set_placement(builder, is_npu=True)
     req_ids = ["beam", "ordinary"] if beam_first else ["ordinary", "beam"]
     beam_index = req_ids.index("beam")
     common = _common_metadata([0, 2, 4], [3, 3], [[1, 2, 3, 4], [5, 6, 7, 8]])
@@ -1251,8 +1273,7 @@ def test_incremental_identity_rows_are_proved_only_for_npu(batch_size: int, is_n
         context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda _request: 0)),
     )
     builder = _make_builder()
-    builder._is_npu = is_npu
-    builder._is_cuda = not is_npu
+    _set_placement(builder, is_cuda=not is_npu, is_npu=is_npu)
     common = _common_metadata(
         list(range(0, rows + 1, width)),
         [4 + width] * batch_size,
@@ -1274,7 +1295,7 @@ def test_incremental_identity_rows_are_proved_only_for_npu(batch_size: int, is_n
 def test_identity_row_proof_is_not_reused_for_same_shape_changed_prefix() -> None:
     """Losing cached prefix blocks changes routing without changing B or W."""
     builder = _make_builder()
-    builder._is_npu = True
+    _set_placement(builder, is_npu=True)
     session = SimpleNamespace(
         is_active=True,
         beam_width=2,

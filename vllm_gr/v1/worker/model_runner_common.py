@@ -1546,6 +1546,12 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
 
     model_config = runner.model_config
     parallel_config = runner.parallel_config
+    # Fused short-suffix prefix is a backend capability, not a device property.
+    from vllm_gr.platforms.loader import active_backend_service
+
+    short_suffix_supported = bool(
+        active_backend_service("create_beam_attention_service").supports_short_suffix_attention()
+    )
 
     return BeamAttentionContext(
         max_batch=max_batch,
@@ -1557,7 +1563,7 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
         device=runner.device,
         dtype=model_config.dtype,
         enable_short_suffix_attention=(
-            runner.device.type == "cuda" and gr_cfg.enable_short_suffix_attention
+            short_suffix_supported and gr_cfg.enable_short_suffix_attention
         ),
     )
 

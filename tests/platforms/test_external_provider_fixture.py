@@ -60,6 +60,9 @@ class HostOnlyProvider:
     def create_config_service(self):
         raise NotImplementedError("host-only provider")
 
+    def create_beam_metadata_profile(self):
+        raise NotImplementedError("host-only provider")
+
     def select_runner_patch_module_name(self, *, prefer_v2=False):
         del prefer_v2
         raise NotImplementedError("host-only provider")

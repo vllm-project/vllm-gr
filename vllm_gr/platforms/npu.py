@@ -20,7 +20,12 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
 
-    from .services import BackendConfigService, BeamAttentionService, StageExecutionService
+    from .services import (
+        BackendConfigService,
+        BeamAttentionService,
+        BeamMetadataProfile,
+        StageExecutionService,
+    )
 
 #: Qualified name of the vendor platform class this provider supports. The
 #: check is a lineage lookup on the already-selected platform instance, so it
@@ -114,6 +119,12 @@ class NPUBackendProvider:
         from .ascend_services import AscendConfigService
 
         return AscendConfigService()
+
+    def create_beam_metadata_profile(self) -> BeamMetadataProfile:
+        """Return Ascend's answers for shared Beam metadata construction."""
+        from .ascend_services import AscendBeamMetadataProfile
+
+        return AscendBeamMetadataProfile()
 
     def create_stage_execution_service(self) -> StageExecutionService:
         """Return the Ascend stage execution service.

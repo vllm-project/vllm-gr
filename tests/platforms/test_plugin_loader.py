@@ -59,6 +59,9 @@ class FakeProvider:
     def create_config_service(self) -> Any:
         return object()
 
+    def create_beam_metadata_profile(self) -> Any:
+        return object()
+
     def select_runner_patch_module_name(self, *, prefer_v2: bool = False) -> str:
         del prefer_v2
         return "tests.platforms.fakes.patch"

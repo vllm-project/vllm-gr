@@ -13,7 +13,12 @@ if TYPE_CHECKING:
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
     from .identity import PlatformIdentity
-    from .services import BackendConfigService, BeamAttentionService, StageExecutionService
+    from .services import (
+        BackendConfigService,
+        BeamAttentionService,
+        BeamMetadataProfile,
+        StageExecutionService,
+    )
 
 #: Provider API implemented by built-in and external providers in this release.
 PROVIDER_API_VERSION = 2
@@ -148,6 +153,14 @@ class GRBackendProvider(Protocol):
         Shared configuration code calls this instead of testing a platform
         predicate, so adding a backend does not require edits to default
         pinning or promotion rules.
+        """
+        ...
+
+    def create_beam_metadata_profile(self) -> "BeamMetadataProfile":
+        """Return this backend's answers for shared Beam metadata construction.
+
+        Shared metadata code reads these flags instead of setting ``_is_cuda`` /
+        ``_is_npu`` from a device name.
         """
         ...
 

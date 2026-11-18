@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -170,8 +172,17 @@ def test_incremental_metadata_builder_uses_active_session_contract() -> None:
     builder.max_num_splits = 0
     builder.num_heads_q = 4
     builder.num_kv_heads = 2
-    builder._is_cuda = True
-    builder._is_npu = False
+    builder._profile = SimpleNamespace(
+        backend_id="cuda",
+        allocates_fixed_buffers=lambda: False,
+        needs_causal_mask_buffer=lambda: False,
+        uses_v2_prefill_capture=lambda: True,
+        forces_single_reduction_split=lambda: True,
+        packs_seqlens_non_blocking=lambda: False,
+        allows_identity_block_table_slice=lambda: False,
+        marks_identity_prefix_rows=lambda: False,
+        writes_seqlens_per_tensor=lambda: True,
+    )
     builder._fixed_buffers = False  # no pre-allocated buffers in test harness
     builder.npu_causal_atten_mask = None
 

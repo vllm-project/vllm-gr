@@ -65,6 +65,7 @@ def attention_service(
         supports_fp8_kv_cache=lambda: supports_fp8,
         supports_batch_invariance=lambda: supports_batch_invariance,
         supports_short_suffix_attention=lambda: supports_short_suffix,
+        short_suffix_head_size_supported=lambda head_size: supports_short_suffix,
         supports_prefill_version_selection=lambda: supports_short_suffix,
         requires_flash_attn_version=lambda: requires_flash_attn_version,
         requires_layer_kv_scale=lambda: requires_layer_kv_scale,

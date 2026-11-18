@@ -213,8 +213,11 @@ def _build_incremental_metadata(
         builder.max_num_splits = 0
         builder.num_heads_q = num_query_heads
         builder.num_kv_heads = NUM_KV_HEADS
-        builder._is_cuda = False
-        builder._is_npu = True
+        # The builder was created via __new__ (no __init__ provider lookup), so
+        # supply the profile the active Ascend backend would have returned.
+        from vllm_gr.platforms.ascend_services import AscendBeamMetadataProfile
+
+        builder._profile = AscendBeamMetadataProfile()
         # The builder was created via __new__ (no __init__ buffer allocation);
         # build() reads these attributes, so mirror the non-graph defaults.
         builder._fixed_buffers = False

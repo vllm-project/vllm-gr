@@ -279,8 +279,18 @@ def build_beam_attn_metadata(
         builder.num_heads_q = inputs.query.shape[1]
         builder.num_kv_heads = inputs.num_kv_heads
         device_type = getattr(device, "type", str(device).partition(":")[0])
-        builder._is_cuda = device_type == "cuda"
-        builder._is_npu = device_type == "npu"
+        # The builder was created via __new__ (no __init__ provider lookup), so
+        # supply the profile the selected backend would have returned. Using the
+        # provider classes means this harness checks the real answers instead of
+        # a hand-written replica that could drift from them.
+        if device_type == "npu":
+            from vllm_gr.platforms.ascend_services import AscendBeamMetadataProfile
+
+            builder._profile = AscendBeamMetadataProfile()
+        else:
+            from vllm_gr.platforms.cuda_services import CudaBeamMetadataProfile
+
+            builder._profile = CudaBeamMetadataProfile()
         builder._fixed_buffers = False  # no pre-allocated buffers in test harness
         if npu_causal_atten_mask is not None:
             # NPU cascade execution reads this for the causal STD/suffix calls.
