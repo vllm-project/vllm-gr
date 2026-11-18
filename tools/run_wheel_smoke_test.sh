@@ -70,7 +70,8 @@ echo "Importing installed wheel outside the source checkout"
     export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-}"
     "$PYTHON" - <<'PY'
 import os
-from email.parser import Parser
+import tarfile
+from email.parser import BytesParser, Parser
 from importlib import metadata
 from pathlib import Path
 
@@ -85,6 +86,11 @@ if not origin.is_relative_to(install_dir):
     raise SystemExit(f"vllm_gr imported outside wheel target: {origin}")
 
 version = metadata.version("vllm-gr")
+(sdist,) = (Path(os.environ["SOURCE_DIR"]) / "dist").glob("*.tar.gz")
+with tarfile.open(sdist) as archive:
+    info = archive.extractfile(f"{sdist.name.removesuffix('.tar.gz')}/PKG-INFO")
+    if info is None or BytesParser().parsebytes(info.read())["Version"] != version:
+        raise SystemExit(f"{sdist.name} PKG-INFO disagrees with installed version {version}")
 expected = os.environ["VLLM_GR_EXPECTED_VERSION"]
 if expected and version != expected:
     raise SystemExit(f"expected vllm-gr {expected}, found {version}")

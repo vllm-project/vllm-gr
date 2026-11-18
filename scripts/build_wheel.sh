@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-# Script to build wheel for vllm-gr
+# Build the vllm-gr source distribution and build its wheel from that archive.
 # Usage: ./build_wheel.sh [--python PYTHON] [--skip-clean]
 
 set -euo pipefail
@@ -49,10 +49,10 @@ fi
 "$PYTHON" -m pip install --quiet build wheel setuptools-scm
 
 echo "Building wheel with VLLM_GR_TARGET_DEVICE=${VLLM_GR_TARGET_DEVICE:-<auto-detected by setup.py>}"
-"$PYTHON" -m build --wheel
+"$PYTHON" -m build
 
-echo "Wheel built successfully!"
-ls -lh dist/*.whl
+echo "Built source and wheel distributions:"
+ls -lh dist/*.tar.gz dist/*.whl
 
 if command -v unzip >/dev/null 2>&1; then
     echo "Requires-Dist from wheel metadata:"

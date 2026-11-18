@@ -18,6 +18,7 @@ import importlib
 import json
 import os
 import platform
+import runpy
 import subprocess
 import sys
 import tomllib
@@ -102,8 +103,15 @@ def package_version(repo: Path, base: str) -> str:
         and node.value.id == "_release_version"
         for node in ast.walk(tree)
     )
+    # Inspect the source contract because A/B baselines may use either older scheme.
+    uses_checkout_version = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "checkout_version"
+        for node in ast.walk(tree)
+    )
     overrides = ["VLLM_GR_VERSION_OVERRIDE"]
-    if uses_scm:
+    if uses_scm or uses_checkout_version:
         overrides += [
             "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_GR",
             "SETUPTOOLS_SCM_PRETEND_VERSION",
@@ -112,7 +120,7 @@ def package_version(repo: Path, base: str) -> str:
         if value := os.environ.get(name):
             return value.strip().lstrip("vV").partition("+")[0]
     # Historical A/B baselines selected the declared base even at a Git tag.
-    if not uses_scm:
+    if not (uses_scm or uses_checkout_version):
         return base
     metadata = repo / "PKG-INFO"
     if metadata.is_file():
@@ -120,6 +128,11 @@ def package_version(repo: Path, base: str) -> str:
         if not version:
             raise ValueError("sdist PKG-INFO is missing its Version")
         return version.partition("+")[0]
+    if uses_checkout_version:
+        # Load the resolver's own helper, never Python code from the candidate tree.
+        helper = ROOT / "tools/packaging/git_version.py"
+        checkout_version = runpy.run_path(str(helper))["checkout_version"]
+        return str(checkout_version(repo, base))
     # Accept a checkout or linked worktree, but do not inherit a parent's Git
     # metadata when resolving an exported source directory.
     if not (repo / ".git").exists():
@@ -195,6 +208,7 @@ def source_digest(repo: Path) -> str:
         "vllm_gr/_env_check.py",
         "vllm_gr/version.py",
         "tools/ci/resolve_runtime.py",
+        "tools/packaging/git_version.py",
         ".pre-commit-config.yaml",
     )
     paths = {
@@ -240,7 +254,15 @@ def check_versions(expected: dict[str, str], installed: dict[str, str]) -> list[
             from packaging.version import InvalidVersion, Version
 
             try:
-                return Version(actual).public == Version(expected_version).public
+                observed = Version(actual)
+                wanted = Version(expected_version)
+                if wanted.local is None:
+                    return observed.public == wanted.public
+                # The source identity includes the commit. The wheel may
+                # append its build target to that same local version.
+                return observed == wanted or any(
+                    observed == Version(f"{wanted}.{device}") for device in ("cpu", "npu")
+                )
             except InvalidVersion:
                 return False
         return actual.partition("+")[0] == expected_version

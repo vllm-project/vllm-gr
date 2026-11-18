@@ -10,6 +10,7 @@ dependencies (CUDA/NPU/CPU) without requiring extras like `[gpu]`.
 
 import logging
 import os
+import runpy
 import sys
 import warnings
 from email.parser import Parser
@@ -18,7 +19,6 @@ from pathlib import Path
 from packaging.version import Version
 from setuptools import setup
 from setuptools_scm import get_version
-from setuptools_scm.version import ScmVersion
 
 logger = logging.getLogger("vllm_gr.setup")
 
@@ -109,12 +109,6 @@ def detect_target_device() -> str:
         return _cached_device
 
 
-def _release_version(version: ScmVersion) -> str:
-    # Only clean release tags choose a new public version. Untagged/dirty
-    # checkouts keep the declared compatibility baseline instead of 0.1.devN.
-    return str(version.tag) if version.exact else VLLM_GR_BASE_VERSION
-
-
 def get_vllm_gr_version() -> str:
     """
     Get the vllm-gr version with optional device-specific suffix.
@@ -143,14 +137,10 @@ def get_vllm_gr_version() -> str:
         if not version:
             raise ValueError("sdist PKG-INFO is missing its Version")
     else:
-        version = get_version(
-            root=str(ROOT_DIR),
-            fallback_root=str(ROOT_DIR),
-            dist_name="vllm-gr",
-            version_scheme=_release_version,
-            local_scheme="no-local-version",
-            fallback_version=VLLM_GR_BASE_VERSION,
-        )
+        # PEP 517 executes setup.py without necessarily adding the tree to sys.path.
+        version_tools = Path(__file__).resolve().parent / "tools/packaging/git_version.py"
+        checkout_version = runpy.run_path(str(version_tools))["checkout_version"]
+        version = checkout_version(ROOT_DIR, VLLM_GR_BASE_VERSION)
         device = detect_target_device()
 
         if device == "cuda":

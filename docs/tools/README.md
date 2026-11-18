@@ -342,12 +342,28 @@ device within the runtime-visible set.
 VLLM_GR_TARGET_DEVICE=cpu ./tools/run_wheel_smoke_test.sh --python python3
 ```
 
-Use `cuda` or `npu` for the other metadata targets. The script builds a wheel,
-installs it with `--no-deps` into a temporary directory, checks import origin
-and dependency metadata outside the source checkout, and runs packaging tests.
-It does not validate accelerator inference. Its build helper installs build
-tools and replaces `build/`, `dist/`, and generated package metadata; preserve
-any build artifacts needed for comparison before running it.
+Use `cuda` or `npu` for the other metadata targets. The build helper produces
+a source distribution and builds its wheel from that archive. A clean release
+or RC tag supplies the public version. Development builds include a commit
+distance and Git hash, for example `0.30.2.dev2+g0123456789ab.npu` two commits
+after `v0.30.1`. Use a checkout with its history and tags to reproduce a CI version.
+
+The smoke test installs the wheel with `--no-deps` into a temporary directory,
+checks import origin and dependency metadata outside the checkout, and runs
+packaging tests. The build helper installs build tools and replaces `build/`,
+`dist/`, and generated package metadata by default.
+
+To repeat the archive comparison from a clean checkout:
+
+```bash
+export VLLM_GR_TARGET_DEVICE=cpu
+bash scripts/build_wheel.sh --python python3
+python3 tools/check_wheel_contents.py
+```
+
+The comparison builds a second wheel from `git archive HEAD` for the same
+version and target, compares the package file lists, and reads both gRPC
+protocol files from the installed archive-built wheel.
 
 ### Benchmark acceptance
 

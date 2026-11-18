@@ -19,6 +19,7 @@ from typing import Protocol, cast
 
 import pytest
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 from tools.ci.resolve_runtime import check_versions, package_version
 
@@ -159,27 +160,29 @@ def test_release_version_by_device(version_source: _SetupModule, device: str) ->
     _assert_version(version_source, f"0.30.0{suffix}")
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
-    ("source_state", "expected"),
-    [
-        ("no-tag", "0.30.0"),
-        ("tag", "0.30.1"),
-        ("prerelease", "0.30.1rc1"),
-        ("after-tag", "0.30.0"),
-        ("dirty-tag", "0.30.0"),
-    ],
-)
-def test_git_version_source(version_source: _SetupModule, source_state: str, expected: str) -> None:
+@pytest.mark.parametrize("release_tag", [None, "0.30.1", "0.30.1rc1"])  # type: ignore[misc]
+def test_git_version_source(version_source: _SetupModule, release_tag: str | None) -> None:
     root = version_source.ROOT_DIR
     _init_git(root)
-    if source_state != "no-tag":
-        _git(root, "tag", "v0.30.1rc1" if source_state == "prerelease" else "v0.30.1")
-    if source_state == "after-tag":
-        _git(root, "commit", "--allow-empty", "-qm", "After release")
-    elif source_state == "dirty-tag":
-        (root / ".gitignore").write_text("vllm_gr/_version.py\n*.log\n")
     version_source._cached_device = "npu"
-    _assert_version(version_source, expected + "+npu")
+    if release_tag:
+        _git(root, "tag", f"v{release_tag}")
+        _assert_version(version_source, f"{release_tag}+npu")
+
+    next_release = {None: "0.30.0", "0.30.1": "0.30.2", "0.30.1rc1": "0.30.1rc2"}[release_tag]
+    versions = []
+    for step in (1, 2):
+        _git(root, "commit", "--allow-empty", "-qm", f"Development commit {step}")
+        node = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"], text=True
+        ).strip()
+        distance = step if release_tag else step + 1
+        expected = f"{next_release}.dev{distance}+g{node}.npu"
+        _assert_version(version_source, expected)
+        versions.append(Version(expected))
+    assert versions[0] < versions[1]
+    (root / ".gitignore").write_text("vllm_gr/_version.py\n*.log\n")
+    _assert_version(version_source, expected.removesuffix(".npu") + ".dirty.npu")
 
 
 def test_repeated_version_generation_does_not_leak_override(version_source: _SetupModule) -> None:
@@ -258,6 +261,9 @@ def package_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     source.mkdir()
     for name in ("setup.py", "pyproject.toml", "README.md", "LICENSE"):
         shutil.copy2(REPO_ROOT / name, source / name)
+    helper = Path("tools/packaging/git_version.py")
+    (source / helper.parent).mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / helper, source / helper)
     shutil.copytree(REPO_ROOT / "requirements", source / "requirements")
     (source / "vllm_gr").mkdir()
     (source / "vllm_gr" / "__init__.py").write_text("from ._version import __version__\n")

@@ -1,4 +1,6 @@
 include LICENSE NOTICE
+include tools/packaging/git_version.py
+include requirements/*.txt
 include benchmarks/open_one_rec/qwen3_soft_switch.jinja2
 include benchmarks/open_one_rec/qwen3_soft_switch.jinja2.license
 include benchmarks/open_one_rec/prompts/README.md

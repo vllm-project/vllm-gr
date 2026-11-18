@@ -1,0 +1,50 @@
+name: Wheel contents
+
+on:
+  pull_request:
+    branches: [main, 'release/v*']
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      - 'docs/**'
+      - 'examples/**'
+      - '**.md'
+  push:
+    branches: [main, 'release/v*']
+    paths-ignore:
+      - 'docs/**'
+      - 'examples/**'
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheel-contents-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    env:
+      VLLM_GR_TARGET_DEVICE: cpu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build sdist and wheel
+        run: bash scripts/build_wheel.sh --python python
+      - name: Compare wheel contents and read the installed protocol files
+        run: python tools/check_wheel_contents.py
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-gr-cpu-distributions-py3.12
+          path: |
+            dist/*.tar.gz
+            dist/*.whl
+          if-no-files-found: error
+          retention-days: 3

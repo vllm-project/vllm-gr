@@ -25,15 +25,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class TestRuntimeResolution(unittest.TestCase):
     def test_shipped_runtime_declarations_match_both_platforms(self) -> None:
+        gr_version = runtime.package_version(ROOT, "0.30.0")
         self.assertEqual(
             runtime.declarations(ROOT, "cuda"),
-            {"vllm": "0.30.0", "vllm-gr": "0.30.0"},
+            {"vllm": "0.30.0", "vllm-gr": gr_version},
         )
         self.assertEqual(
             runtime.declarations(ROOT, "npu"),
             {
                 "vllm": "0.30.0",
-                "vllm-gr": "0.30.0",
+                "vllm-gr": gr_version,
                 "vllm-ascend": "0.30.0rc2",
                 "triton-ascend": "3.6.0",
             },
@@ -156,7 +157,14 @@ class TestRuntimeResolution(unittest.TestCase):
             runtime.check_versions(spec["expected"], {"vllm": "0.30.1", "vllm-gr": "0.30.1"})
         )
         (worktree / "requirements/common.txt").write_text("# Dirty tree\n")
-        self.assertEqual(runtime.resolve(worktree, "cuda")["expected"]["vllm-gr"], "0.29.0")
+        node = subprocess.check_output(
+            ["git", "-C", str(worktree), "rev-parse", "--short=12", "HEAD"], text=True
+        ).strip()
+        expected_dev = f"0.30.2.dev0+g{node}.dirty"
+        self.assertEqual(runtime.resolve(worktree, "cuda")["expected"]["vllm-gr"], expected_dev)
+        self.assertTrue(
+            runtime.check_versions({"vllm-gr": expected_dev}, {"vllm-gr": "0.30.2.dev0+g000.npu"})
+        )
 
     def test_future_candidate_drives_runtime_without_ci_pin_changes(self) -> None:
         for name in (

@@ -47,11 +47,15 @@ remain responsible for reviewing generated changes and their validation.
 
 ## Pull request CI
 
-The [validation workflow](.github/workflows/pre-commit.yml) and
-[wheel workflow](.github/workflows/build_wheel.yml) target PRs into `main` and
-`decode_graph`. Full PR validation requires the `ready` label and a non-draft
-PR. Wheel builds also apply their path filters. Run local checks before asking
-maintainers to enable CI.
+The [wheel contents workflow](.github/workflows/wheel-contents.yml) runs on
+eligible PRs into `main` and `release/v*` when opened,
+updated, or reopened, including before the `ready` label is applied. It also
+runs on eligible pushes to `main` and `release/v*`. A Python 3.12 CPU build
+checks the source distribution against a Git archive and uploads both artifacts.
+
+The [full PR validation](.github/workflows/pre-commit.yml) and the
+[nine-job packaging matrix](.github/workflows/build_wheel.yml) require a
+non-draft PR with the `ready` label. Their path and branch filters still apply.
 
 Adding `ready`, pushing while it remains, or marking a labeled draft ready for
 review starts validation. Removing `ready` or converting the PR to draft
@@ -88,7 +92,7 @@ failed, cancelled, or skipped blocking jobs; a skipped run is not successful
 validation. Cancelling CI also stops Pangu jobs, whose cleanup steps still run
 after device mapping has succeeded.
 
-For non-draft PRs into `main` or `decode_graph`, adding `abtest` requests a
+For non-draft PRs targeting a branch covered by full validation, `abtest` requests a
 separate Beam V1 performance A/B run for changes that are not confirmed as
 documentation-only. Remove and re-add it to rerun. Its success alone does not
 satisfy full validation. A full `ready` run reuses an eligible A/B result for
