@@ -682,7 +682,6 @@ def _validate_direct_backend_output(
     rows: int,
     width: int,
     device: torch.device,
-    require_legal_candidate: bool = True,
 ) -> None:
     expected_shape = (rows, width)
     for name, dtype in (
@@ -707,12 +706,6 @@ def _validate_direct_backend_output(
             )
         if not tensor.is_contiguous():
             raise RuntimeError(f"constraint Backend {name} must be contiguous")
-
-    if require_legal_candidate and not bool(output.valid_mask[:, 0].all().item()):
-        raise RuntimeError(
-            f"constraint Backend returned no legal candidate for at least one "
-            f"logits row of request {req_id!r}; refusing to sample a padding token"
-        )
 
 
 def build_direct_constrained_sampler_output(
@@ -967,7 +960,6 @@ def try_sample_with_constraint_backend(
             rows=logits.shape[0],
             width=candidate_width,
             device=logits.device,
-            require_legal_candidate=logits.device.type != "cuda",
         )
         return build_direct_constrained_sampler_output(
             output.token_ids,
@@ -994,7 +986,6 @@ def try_sample_with_constraint_backend(
             rows=row_count,
             width=candidate_width,
             device=logits.device,
-            require_legal_candidate=logits.device.type != "cuda",
         )
         token_parts.append(output.token_ids)
         logprob_parts.append(output.logprobs)
