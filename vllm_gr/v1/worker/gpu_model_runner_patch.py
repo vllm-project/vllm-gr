@@ -9,6 +9,9 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.v1.attention.backends.beam_dense_prefill import (
+    requires_fresh_prefill_replay,
+)
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
@@ -27,6 +30,7 @@ from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
 )
+from vllm_gr.v1.worker.prefill_graph_common import scheduled_requests_are_fresh
 from vllm_gr.v1.worker.prefill_graph_runner import (
     SUPPORTED_NUM_REQS,
     get_prefill_graph_runner,
@@ -550,7 +554,15 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                     self, input_ids=input_ids, positions=positions, *args, **kwargs
                 )
         if scheduler_output is not None:
-            if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
+            if (
+                is_prefill_graph_enabled()
+                and is_prefill_phase_batch(self, scheduler_output)
+                # Dense-Prefill graphs replay only for fresh prompts.
+                and (
+                    not requires_fresh_prefill_replay()
+                    or scheduled_requests_are_fresh(self, scheduler_output)
+                )
+            ):
                 raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
                 # The scheduler already computed the batch's token total; only
                 # the request count is derived here (the runner re-derives the

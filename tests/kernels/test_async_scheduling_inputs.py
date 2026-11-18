@@ -19,8 +19,15 @@ from tests.kernels.beam_stage_test_utils import (
     prepare_binding,
     runtime,
 )
+from vllm_gr.v1.attention.backends import beam_attn_metadata
+from vllm_gr.v1.attention.backends import beam_attn_metadata_layout as layout
+from vllm_gr.v1.attention.backends import beam_attn_metadata_tensors as tensors
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+    build_async,
+    build_async_layout,
 )
 from vllm_gr.v1.engine.beam_search_v1 import GRRetireMetadata
 from vllm_gr.v1.engine.gr_async_scheduler import (
@@ -64,18 +71,25 @@ def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, 
             beam_params=msgspec.structs.replace(metadata(n=n).beam_params, beam_width=width),
         )
         with monkeypatch.context() as patch:
-            for name in (
-                "_geometry_cache",
-                "_geom_cache_key",
-                "_pack_int32_to_dev",
-                "_get_schedule",
+            patch.setattr(BeamAttentionMetadataBuilder, "_geometry_cache", forbidden)
+            # Future async implementations must not fall back to the legacy
+            # geometry/layout caches or the H2D upload helpers.
+            for module, name in (
+                (beam_attn_metadata, "_geom_cache_key"),
+                (layout, "_geom_cache_key"),
+                (layout, "_segment_requests"),
+                (layout, "_build_beam_mappings"),
+                (tensors, "cached_seqlens_views"),
+                (tensors, "upload_incremental_seqlens"),
+                (tensors, "pack_int32_to_dev"),
+                (tensors, "get_schedule"),
             ):
-                patch.setattr(BeamAttentionMetadataBuilder, name, forbidden)
+                patch.setattr(module, name, forbidden)
             for name in ("item", "cpu", "tolist"):
                 patch.setattr(torch.Tensor, name, forbidden)
             prepared = buffers.prepare_cpu(m, binding, block_ids=[[2 + step, 4]], slot=step % 2)
             views = buffers.upload(prepared)
-            built = BeamAttentionMetadataBuilder.build_async(
+            built = build_async(
                 layout=prepared.layout,
                 views=views,
                 session=SimpleNamespace(is_active=True, context=context),
@@ -113,7 +127,7 @@ def test_missing_cpu_mirrors_fail_without_device_fallback(mirror, monkeypatch):
     monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
     monkeypatch.setattr(torch.Tensor, "__bool__", forbidden)
     with pytest.raises(ValueError, match="CPU query/sequence mirrors"):
-        BeamAttentionMetadataBuilder.build_async_layout(
+        build_async_layout(
             width=4,
             prompt_len=7,
             decode_step=0,

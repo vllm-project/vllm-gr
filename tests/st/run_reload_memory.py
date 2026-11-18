@@ -283,8 +283,8 @@ def main() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--serve":
         sys.argv.pop(1)
-        from vllm_gr.entrypoints.cli.main import main as serve
+        from vllm_gr.entrypoints.cli.main import dispatch_main
 
-        serve()
+        dispatch_main()
     else:
         main()

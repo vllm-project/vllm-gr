@@ -7,6 +7,10 @@ request-local KV reorder, terminal materialization, and retirement stay owned
 by this runner for the complete session.
 """
 
+# Native eager-runner internals remain dynamically typed; the NPU worker mypy
+# group still checks the module together with its input/bookkeeping callers.
+# mypy: disable-error-code="index,misc,no-any-return,union-attr,var-annotated"
+
 from __future__ import annotations
 
 import math
@@ -419,7 +423,7 @@ class NPUEagerBeamStageRunner:
                 f"B*W token count: {total} != {plan.model_token_count}"
             )
 
-        from vllm_gr.v1.worker.model_runner_common import (
+        from vllm_gr.v1.worker.npu_model_runner_inputs import (
             InputBatchProxy,
             _get_positions_buffers,
             _materialize_logits_indices,
@@ -439,6 +443,7 @@ class NPUEagerBeamStageRunner:
                 list(execution.row_request_ids),
                 list(execution.row_request_indices),
                 list(plan.sampling_row_indices),
+                device=positions.device,
                 req_ids_key=execution.request_ids,
             )
             total = plan.model_token_count

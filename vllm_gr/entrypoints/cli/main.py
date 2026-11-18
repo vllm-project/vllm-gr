@@ -5,12 +5,16 @@
 
 from __future__ import annotations
 
+import argparse
+import importlib
 import importlib.metadata
 import sys
 
-from vllm_gr.logger import init_logger
-
-logger = init_logger(__name__)
+COMMANDS = {
+    "serve": ("vllm_gr.entrypoints.cli.serve", "Launch the GR HTTP or gRPC server."),
+    "bench": ("vllm_gr.entrypoints.cli.bench", "Run a repository benchmark workload."),
+    "check-env": ("vllm_gr.entrypoints.cli.check_env", "Validate the runtime environment."),
+}
 
 
 def _version() -> str:
@@ -22,57 +26,94 @@ def _version() -> str:
         return __version__
 
 
-def main() -> None:
-    # Configure this before importing vLLM. The parent value is inherited by
-    # EngineCore and Worker subprocesses launched by the serve command.
+def _mode_arguments(argv: list[str]) -> tuple[bool, list[str]]:
+    """Consume only the standalone mode switch before the forwarding delimiter."""
+    end = argv.index("--") if "--" in argv else len(argv)
+    selected = "--gr" in argv[:end]
+    if selected and (not argv or argv[0] not in COMMANDS):
+        raise SystemExit("Use 'vllm <serve|bench|check-env> ... --gr'; --gr follows the command.")
+    return selected, [arg for index, arg in enumerate(argv) if index >= end or arg != "--gr"]
+
+
+def dispatch_main() -> None:
+    """Handle the --gr mode delegated by the patched vLLM CLI."""
+    selected, argv = _mode_arguments(sys.argv[1:])
+    if not selected:
+        raise SystemExit("The vLLM-GR dispatcher requires the --gr switch.")
+    _gr_main(argv)
+
+
+def _add_mode_option(parser: argparse.ArgumentParser) -> None:
+    # The public configuration resolver uses dest="gr" for its JSON mapping.
+    # Keep that action and its conversion/defaults, giving it an unambiguous
+    # spelling when the standalone --gr token selects the command mode.
+    action = parser._option_string_actions.pop("--gr", None)
+    if action is not None:
+        action.option_strings = [
+            "--gr-config" if name == "--gr" else name for name in action.option_strings
+        ]
+        parser._option_string_actions["--gr-config"] = action
+    parser.add_argument(
+        "--gr", action="store_true", dest="_gr_mode", help="Use the vLLM-GR command."
+    )
+
+
+def _serving_parser_type():
+    # Prefer the shared typed YAML resolver when the installed runtime has it.
+    # Propagate dependency failures instead of silently bypassing that resolver.
+    try:
+        module = importlib.import_module("vllm_gr.entrypoints.cli.serve_config")
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm_gr.entrypoints.cli.serve_config":
+            raise
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+        return FlexibleArgumentParser
+    return module.GRArgumentParser
+
+
+def _gr_main(argv: list[str]) -> None:
     from vllm_gr._env_check import configure_model_runner_default
 
     configure_model_runner_default()
-
-    from vllm.entrypoints.serve.utils.api_utils import (
-        VLLM_SUBCMD_PARSER_EPILOG,
-        cli_env_setup,
-    )
+    from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    import vllm_gr.entrypoints.cli.check_env as gr_check_env
-    from vllm_gr.entrypoints.utils import patch_banner
-
-    patch_banner()
-
     cli_env_setup()
+    command = argv[0] if argv and argv[0] in COMMANDS else None
+    # Workload-owned arguments must not undergo serve-specific normalization.
+    parser_type = FlexibleArgumentParser
+    if command == "serve":
+        from vllm_gr.entrypoints.utils import patch_banner
 
-    parser = FlexibleArgumentParser(
-        description="vLLM-GR CLI",
-        epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
+        patch_banner()
+        parser_type = _serving_parser_type()
+    parser = parser_type(prog="vllm", description="vLLM-GR CLI")
+    parser.add_argument("-v", "--version", action="version", version=_version())
+    subparsers = parser.add_subparsers(dest="subparser")
+    commands = {}
+    for name, (module_name, help_text) in COMMANDS.items():
+        if name != command:
+            subparsers.add_parser(name, help=help_text)
+            continue
+        module = importlib.import_module(module_name)
+        for cmd in module.cmd_init():
+            child = cmd.subparser_init(subparsers)
+            child.set_defaults(dispatch_function=cmd.cmd)
+            _add_mode_option(child)
+            commands[cmd.name] = cmd
+    if command == "serve":
+        argv = [
+            arg.replace("--gr.", "--gr-config.", 1) if arg.startswith("--gr.") else arg
+            for arg in argv
+        ]
+    args = (
+        argparse.ArgumentParser.parse_args(parser, argv)
+        if command == "bench"
+        else parser.parse_args(argv)
     )
-    parser.add_argument(
-        "-v",
-        "--version",
-        action="version",
-        version=_version(),
-    )
-
-    subparsers = parser.add_subparsers(required=False, dest="subparser")
-    cmds = {}
-
-    # Keep the diagnostic path independent from the heavy serving import
-    # graph. A broken optional serving dependency must not prevent check-env
-    # from explaining the runtime problem.
-    command_list = gr_check_env.cmd_init()
-    if len(sys.argv) < 2 or sys.argv[1] != "check-env":
-        import vllm_gr.entrypoints.cli.serve as gr_serve
-
-        command_list = [*gr_serve.cmd_init(), *command_list]
-
-    for cmd in command_list:
-        cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
-        cmds[cmd.name] = cmd
-
-    args = parser.parse_args()
-    if args.subparser in cmds:
-        cmds[args.subparser].validate(args)
-
+    if args.subparser in commands:
+        commands[args.subparser].validate(args)
     if hasattr(args, "dispatch_function"):
         args.dispatch_function(args)
     else:
@@ -80,4 +121,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    dispatch_main()

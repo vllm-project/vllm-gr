@@ -144,3 +144,55 @@ def test_segmented_prefix_and_fused_suffix_graph():
     step.fill_(2)
     graph.replay()
     check(0, 3)
+
+
+@pytest.mark.l2
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "lengths,width,segments", [((2048,), 64, 8), ((2048, 1500, 777), 64, 4), ((1999, 2048), 33, 2)]
+)
+def test_segmented_merge_covers_every_query_tile(lengths, width, segments):
+    """width * head_dim spans several merge tiles; each tile is its own program.
+
+    The merge once looped over tiles inside a (request, head) program, which was
+    as slow as the FA call itself at W=64; it must stay equal to native.
+    """
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    if not is_fa_version_supported(2):
+        pytest.skip("backend unavailable")
+    torch.manual_seed(543)
+    heads, kv_heads, dim, page, max_len = 16, 8, 128, 16, 2048
+    batch, pages = len(lengths), max_len // page
+    q = torch.randn(batch * width, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch * pages, page, kv_heads, dim, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    meta = SimpleNamespace(
+        prefix_cu_seqlens_q_device=torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+        * width,
+        prefix_seqlens_kv_device=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        prefix_max_q_len=width,
+        prefix_max_seq_len=max_len,
+        prefix_block_table=torch.randperm(batch * pages, device="cuda")
+        .to(torch.int32)
+        .view(batch, pages),
+        prefix_scheduler_metadata=None,
+        max_num_splits=0,
+    )
+
+    def run(plan):
+        return prefix_attention(
+            q,
+            k,
+            v,
+            meta,
+            scale=dim**-0.5,
+            fa_version=2,
+            sliding_window_size=(-1, -1),
+            logits_soft_cap=0,
+            plan=plan,
+        )
+
+    native, split = run(PrefixPlan(2)), run(PrefixPlan(2, 1, segments))
+    torch.testing.assert_close(split.out.float(), native.out.float(), atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(split.lse, native.lse, atol=1e-4, rtol=1e-5)

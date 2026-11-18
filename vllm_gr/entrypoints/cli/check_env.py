@@ -43,7 +43,7 @@ class CheckEnvSubcommand(CLISubcommand):
                 "Validate vLLM/vLLM-Ascend versions, the selected platform, "
                 "and the active Triton-Ascend backend."
             ),
-            usage="vllm-gr check-env [--npu]",
+            usage="%(prog)s --gr [--npu]",
         )
         parser.add_argument(
             "--npu",

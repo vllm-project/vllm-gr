@@ -266,7 +266,7 @@ For instance 0, a minimal example is:
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 VLLM_GR_ADMIN_PORT=9100 \
-vllm-gr serve /updates/bootstrap/ckpt_1700000000 \
+vllm serve /updates/bootstrap/ckpt_1700000000 --gr \
   --grpc \
   --vllm-gr-config /etc/vllm-gr/gr-config.json \
   --host 127.0.0.1 --port 9000 \

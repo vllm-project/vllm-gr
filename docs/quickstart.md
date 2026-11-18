@@ -80,7 +80,8 @@ python -c "import vllm_gr; print(vllm_gr.__version__)"
 - [Offline OneRec V1 quickstart](onerec_v1_async_quickstart.md): prepare the
   catalog, compile an artifact, and run `GRLLM.beam_search_v1()`.
 - [Online V1 serving](../examples/online_serving/beam_search/README.md): start
-  `vllm-gr serve` with canonical configuration and send an OpenAI request.
+  `vllm serve MODEL --gr` with canonical configuration and send an OpenAI request.
+  Apply the [CLI dispatch patch](cli.md) before using the GR command.
 - [Beam configuration reference](../examples/offline_inference/beam_search/README.md):
   device selection, graph policy, and generation limits.
 
