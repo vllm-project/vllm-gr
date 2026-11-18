@@ -190,12 +190,12 @@
               {
                 "in": [
                   [
-                    8,
+                    1,
                     8,
                     8
                   ],
                   [
-                    8,
+                    1,
                     32,
                     8
                   ],
@@ -272,7 +272,7 @@
               {
                 "in": [
                   [
-                    8,
+                    1,
                     32,
                     8
                   ],
@@ -282,7 +282,7 @@
                     1
                   ],
                   [
-                    4,
+                    1,
                     32,
                     7
                   ]
@@ -333,42 +333,6 @@
                 "ref": "params.case.dtype"
               }
             ]
-          }
-        }
-      ]
-    },
-    "tests/kernels/attention/test_merge_tnd_interleaved_pool.py::test_extract_suffix_kv_contiguous_unchanged": {
-      "rules": [
-        {
-          "level": "l1",
-          "when": {
-            "eq": "cpu",
-            "ref": "params.device"
-          }
-        },
-        {
-          "level": "l2",
-          "when": {
-            "eq": "npu",
-            "ref": "params.device"
-          }
-        }
-      ]
-    },
-    "tests/kernels/attention/test_merge_tnd_interleaved_pool.py::test_extract_suffix_kv_on_interleaved_layout": {
-      "rules": [
-        {
-          "level": "l1",
-          "when": {
-            "eq": "cpu",
-            "ref": "params.device"
-          }
-        },
-        {
-          "level": "l2",
-          "when": {
-            "eq": "npu",
-            "ref": "params.device"
           }
         }
       ]
@@ -795,9 +759,6 @@
     "tests/kernels/test_sid_stage_topk_npu.py::test_npu_full_and_compact_sid_stages_match_independent_normalization": "l2",
     "tests/kernels/test_sid_stage_topk_npu.py::test_npu_sid_selection_consumes_updated_logits_without_reusing_padding": "l2",
     "tests/kernels/test_sid_stage_topk_npu.py::test_npu_tiny_temperature_preserves_sid_ties_and_excludes_projection_padding": "l2",
-    "tests/kernels/test_unconstrained_topk_cuda.py::test_unconstrained_topk_accepts_padded_rows_and_empty_tiles": "l2",
-    "tests/kernels/test_unconstrained_topk_cuda.py::test_unconstrained_topk_counts_only_finite_candidates": "l2",
-    "tests/kernels/test_unconstrained_topk_cuda.py::test_unconstrained_topk_matches_full_vocab_reference": "l2",
     "tests/kernels/test_unconstrained_topk_npu.py::test_npu_extreme_temperatures_preserve_finite_probability_mass": "l2",
     "tests/kernels/test_unconstrained_topk_npu.py::test_npu_selection_consumes_new_logits_at_the_same_storage_address": "l2",
     "tests/kernels/test_unconstrained_topk_npu.py::test_npu_topk_matches_independent_host_enumeration": "l2",
@@ -809,16 +770,6 @@
     "tests/legal/test_generate_grpc_proto.py::ProtoNoticeTests::test_a_blank_line_inside_the_header_does_not_truncate_it": "l1",
     "tests/legal/test_generate_grpc_proto.py::ProtoNoticeTests::test_a_file_without_a_comment_block_gets_no_notice": "l1",
     "tests/legal/test_generate_grpc_proto.py::ProtoNoticeTests::test_slash_comments_become_hash_comments": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_complete_headers_pass_unchanged": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_complete_proto_header_passes_unchanged": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_copyright_without_license_is_reported_not_guessed": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_empty_values_are_rejected": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_invalid_license_expression_is_rejected": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_missing_copyright_is_added_to_license_only_file": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_missing_header_is_added_with_project_holder": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_proto_header_uses_slash_comments": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_shebang_is_preserved_when_header_is_added": "l1",
-    "tests/legal/test_spdx_header.py::SPDXHeaderTests::test_unknown_file_type_is_reported_not_rewritten": "l1",
     "tests/packaging/test_install_metadata.py::test_common_requirements_exclude_vllm_and_dev_tools": "l1",
     "tests/packaging/test_install_metadata.py::test_failed_version_write_restores_override": "l1",
     "tests/packaging/test_install_metadata.py::test_get_install_requires_by_device": "l1",
@@ -1200,7 +1151,6 @@
     "tests/test_beam_resource_validation.py::test_invalid_live_changes_match_full_validator": "l1",
     "tests/test_beam_resource_validation.py::test_storage_offset_is_included_by_live_address": "l1",
     "tests/test_beam_resource_validation.py::test_unavailable_guard_api_uses_full_validation": "l1",
-    "tests/test_beam_runtime_primitives.py::test_compute_beam_bounds_behavior": "l1",
     "tests/test_beam_search_dispatch.py::test_completion_fallback_binds_ids_before_iteration": "l1",
     "tests/test_beam_search_dispatch.py::test_completion_schema_accepts_trie_id_list": "l1",
     "tests/test_beam_search_dispatch.py::test_dispatch_preserves_native_session_hint_for_both_engines": "l1",
@@ -1275,8 +1225,8 @@
     "tests/test_beam_search_v1_input_processor.py::test_npu_per_parent_beam_widths_is_rejected_before_submission": "l1",
     "tests/test_beam_search_v1_input_processor.py::test_npu_request_accepts_matching_width_and_canonical_backend": "l1",
     "tests/test_beam_search_v1_input_processor.py::test_npu_unconstrained_candidate_capacity_matches_retained_stage_widths": "l1",
+    "tests/test_beam_search_v1_input_processor.py::test_npu_unconstrained_request_enforces_supported_generation_length": "l1",
     "tests/test_beam_search_v1_input_processor.py::test_npu_unconstrained_request_needs_no_constraint_artifact": "l1",
-    "tests/test_beam_search_v1_input_processor.py::test_npu_unconstrained_request_rejects_unsupported_generation_length": "l1",
     "tests/test_beam_search_v1_input_processor.py::test_offline_compact_output_preserves_accepted_prompt_snapshot": "l1",
     "tests/test_beam_search_v1_input_processor.py::test_offline_inputs_preserve_caller_formed_batch_order": "l1",
     "tests/test_beam_search_v1_input_processor.py::test_offline_inputs_reject_unsupported_batch_size_before_admission": "l1",
@@ -1404,12 +1354,22 @@
     "tests/test_beam_v1_performance_gate.py::test_offline_rejects_import_from_another_checkout": "l1",
     "tests/test_beam_v1_performance_gate.py::test_offline_releases_consumed_outputs_before_next_call": "l1",
     "tests/test_beam_v1_performance_gate.py::test_shared_driver_imports_each_selected_runtime": "l1",
+    "tests/test_bench_cli.py::test_bare_bench_lists_scenarios": "l1",
+    "tests/test_bench_cli.py::test_gr_dispatch_selects_mode_without_mutating_process_argv": "l1",
+    "tests/test_bench_cli.py::test_gr_package_does_not_own_native_vllm_entrypoint": "l1",
+    "tests/test_bench_cli.py::test_list_scenarios": "l1",
+    "tests/test_bench_cli.py::test_mode_option_retains_typed_config_action": "l1",
+    "tests/test_bench_cli.py::test_mode_switch_preserves_configuration_and_forwarding_boundary": "l1",
+    "tests/test_bench_cli.py::test_mode_switch_requires_command_first": "l1",
+    "tests/test_bench_cli.py::test_module_runner_works_from_package_directory": "l1",
+    "tests/test_bench_cli.py::test_onerec_adapter_adds_exactly_one_native_bench": "l1",
+    "tests/test_bench_cli.py::test_online_bench_alias_preserves_runner_arguments": "l1",
+    "tests/test_bench_cli.py::test_parser_forwards_scenario_arguments": "l1",
+    "tests/test_bench_cli.py::test_scenario_registry_covers_all_existing_benchmarks": "l1",
     "tests/test_benchmark_branch_policy.py::TestBenchmarkBranchPolicy::test_all_npu_boards_resolve_unified_floors": "l1",
     "tests/test_benchmark_branch_policy.py::TestBenchmarkBranchPolicy::test_all_npu_profiles_preserve_custom_performance_and_pangu": "l1",
     "tests/test_benchmark_branch_policy.py::TestBenchmarkBranchPolicy::test_resolver_cli_unified_npu_and_strict_fallback": "l1",
     "tests/test_benchmark_branch_policy.py::TestBenchmarkBranchPolicy::test_workflow_branch_and_device_scope": "l1",
-    "tests/test_benchmark_policy_bootstrap.py::BenchmarkPolicyBootstrapTest::test_workflow_bootstrap": "l1",
-    "tests/test_benchmark_policy_runtime.py::BenchmarkPolicyRuntimeTest::test_runtime": "l1",
     "tests/test_build_constraint_triples.py::test_ab_to_c_key_does_not_collide_on_comma_in_tokens": "l1",
     "tests/test_build_constraint_triples.py::test_accepts_tuple_sequences": "l1",
     "tests/test_build_constraint_triples.py::test_compile_string_is_valid_json": "l1",
@@ -1855,10 +1815,6 @@
     "tests/test_gpu_model_runner_patch.py::test_patched_determine_pure_beam_batch_grants_full": "l1",
     "tests/test_gpu_model_runner_patch.py::test_patched_determine_session_missing_downgrades_full": "l1",
     "tests/test_gpu_model_runner_patch.py::test_patched_determine_width_mismatch_no_full": "l1",
-    "tests/test_gpu_model_runner_patch.py::test_postprocess_workspace_initializer_is_noop_off_cuda": "l1",
-    "tests/test_gpu_model_runner_patch.py::test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storage": "l1",
-    "tests/test_gpu_model_runner_patch.py::test_postprocess_workspace_load_wrapper_accounts_device_memory": "l1",
-    "tests/test_gpu_model_runner_patch.py::test_postprocess_workspace_load_wrapper_initializes_after_model_load": "l1",
     "tests/test_gpu_model_runner_patch.py::test_worker_graph_stats_hook_is_named_and_idempotent": "l1",
     "tests/test_gpu_model_runner_v2_patch.py::test_apply_v2_runner_patches_stamps_markers": "l1",
     "tests/test_gpu_model_runner_v2_patch.py::test_capture_order_and_failure_propagation": "l1",
@@ -2044,6 +2000,7 @@
     "tests/test_gr_startup.py::test_default_startup_capture_batch_size": "l1",
     "tests/test_gr_startup.py::test_eager_decode_keeps_forward_entry_and_slices_before_logits": "l1",
     "tests/test_gr_startup.py::test_failed_device_health_check_cannot_enable_fallback": "l1",
+    "tests/test_gr_startup.py::test_graph_replay_consumes_hidden_through_shared_logits": "l1",
     "tests/test_gr_startup.py::test_invalid_startup_capture_batch_size": "l1",
     "tests/test_gr_startup.py::test_missing_decode_graph_is_lazy_only_for_v1": "l1",
     "tests/test_gr_startup.py::test_mode_switch_releases_the_inactive_logits_buffer": "l1",
@@ -2060,7 +2017,6 @@
     "tests/test_gr_startup.py::test_v1_does_not_opt_into_optional_fallback": "l1",
     "tests/test_gr_startup.py::test_v1_startup_batch_override_does_not_change_v2": "l1",
     "tests/test_gr_startup.py::test_v2_decode_captures_only_configured_batches": "l1",
-    "tests/test_gr_startup.py::test_v2_graph_replay_consumes_hidden_through_shared_logits": "l1",
     "tests/test_grpc_entry.py::test_all_original_messages_fields_and_methods_are_retained": "l1",
     "tests/test_grpc_entry.py::test_backend_failure_returns_internal_and_aborts_session": "l2",
     "tests/test_grpc_entry.py::test_batch_response_preserves_variable_beams_and_releases_session": "l2",
@@ -2079,6 +2035,7 @@
     "tests/test_grpc_entry.py::test_per_input_trie_selector_wire_and_batch_mapping": "l1",
     "tests/test_grpc_entry.py::test_prompt_and_generation_length_limit_after_truncation": "l1",
     "tests/test_grpc_entry.py::test_prompt_truncation_matches_native_renderer": "l1",
+    "tests/test_grpc_entry.py::test_pure_python_protobuf_keeps_private_descriptors": "l1",
     "tests/test_grpc_entry.py::test_single_generate_keeps_original_response_shape": "l2",
     "tests/test_grpc_entry.py::test_submission_failure_status_cleanup_and_recovery": "l2",
     "tests/test_grpc_entry.py::test_terminal_failure_status_and_subsequent_valid_request": "l2",
@@ -2108,27 +2065,11 @@
     "tests/test_level_policy.py::test_strict_hook_accepts_explicit_level_and_rejects_conflict": "l1",
     "tests/test_level_policy.py::test_strict_hook_rejects_unclassified_and_normal_pytest_allows_it": "l1",
     "tests/test_level_policy.py::test_unknown_nodes_and_explicit_errors": "l1",
-    "tests/test_model_runner_common.py::test_beam_collapse_accumulates_partial_rows_and_clears_cache": "l1",
     "tests/test_model_runner_common.py::test_execute_wrapper_does_not_inline_non_none_output": "l1",
     "tests/test_model_runner_common.py::test_execute_wrapper_does_not_inline_when_gate_closed": "l1",
     "tests/test_model_runner_common.py::test_execute_wrapper_is_idempotent_and_restores_outer_context": "l1",
     "tests/test_model_runner_common.py::test_execute_wrapper_releases_depth_on_exception": "l1",
     "tests/test_model_runner_common.py::test_execute_wrapper_tracks_inflight_depth_for_gc_freeze": "l1",
-    "tests/test_model_runner_common.py::test_incremental_beam_decode_fills_constant_position_ids": "l1",
-    "tests/test_model_runner_common.py::test_incremental_layout_cache_short_circuits_remap": "l1",
-    "tests/test_model_runner_common.py::test_is_contiguous_range": "l1",
-    "tests/test_model_runner_common.py::test_logits_idx_tensor_shared_cache_reused_across_proxies": "l1",
-    "tests/test_model_runner_common.py::test_logprob_remux_preserves_flattening_and_placeholder_rows": "l1",
-    "tests/test_model_runner_common.py::test_materialize_logits_indices_contiguous_device_range": "l1",
-    "tests/test_model_runner_common.py::test_materialize_logits_indices_reuses_runner_buffer": "l1",
-    "tests/test_model_runner_common.py::test_mixed_batch_remap_installs_functional_proxy": "l1",
-    "tests/test_model_runner_common.py::test_position_helpers_support_buffer_forms_and_partial_beam": "l1",
-    "tests/test_model_runner_common.py::test_sampling_metadata_batched_gather_matches_per_attr_index": "l1",
-    "tests/test_model_runner_common.py::test_sampling_metadata_batched_gather_mixed_presence": "l1",
-    "tests/test_model_runner_common.py::test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment": "l1",
-    "tests/test_model_runner_common.py::test_sampling_metadata_remap_is_cached_and_warmed_at_remap": "l1",
-    "tests/test_model_runner_common.py::test_sampling_remap_cache_isolated_across_requests": "l1",
-    "tests/test_model_runner_common.py::test_sampling_remap_shared_cache_skips_gather_on_hit": "l1",
     "tests/test_model_runner_common.py::test_slim_v2_wrapper_fail_fast_on_legacy_beam_data": "l1",
     "tests/test_model_runner_common.py::test_slim_v2_wrapper_is_idempotent": "l1",
     "tests/test_model_runner_common.py::test_v2_plain_frame_native_execution_and_gc_cleanup": "l1",
@@ -2138,7 +2079,6 @@
     "tests/test_model_runner_common.py::test_warmup_rpc_dedupes_only_completed_freeze": "l1",
     "tests/test_model_runner_common.py::test_warmup_rpc_does_not_acknowledge_scheduled_pending_freeze": "l1",
     "tests/test_model_runner_common.py::test_warmup_rpc_failure_rolls_back_claim": "l1",
-    "tests/test_model_runner_common.py::test_worker_decision_reduces_sampler_payload_before_host_copy": "l1",
     "tests/test_model_runner_patch.py::test_apply_worker_patches_dispatches_to_v2_installer": "l1",
     "tests/test_model_runner_patch.py::test_dispatcher_installs_required_and_optional_hooks_once": "l1",
     "tests/test_model_runner_patch.py::test_dispatcher_installs_sample_tokens_hook_when_exposed": "l1",
@@ -2507,8 +2447,6 @@
     "tests/test_npu_model_runner_patch.py::test_npu_determine_width_mismatch_no_full": "l1",
     "tests/test_npu_model_runner_patch.py::test_npu_dynamic_beam_admission_requires_fixed_horizon": "l1",
     "tests/test_npu_model_runner_patch.py::test_npu_dynamic_parent_history_is_not_advanced_twice": "l1",
-    "tests/test_npu_model_runner_patch.py::test_npu_eager_attention_layout_keeps_request_ownership": "l1",
-    "tests/test_npu_model_runner_patch.py::test_npu_eager_decode_binds_winners_and_sampling_rows": "l1",
     "tests/test_npu_model_runner_patch.py::test_npu_eager_plan_keeps_logical_prefill_and_expands_decode_rows": "l1",
     "tests/test_npu_model_runner_patch.py::test_npu_execution_batch_flattens_only_the_xllm_attention_view": "l1",
     "tests/test_npu_model_runner_patch.py::test_npu_failed_execute_reaches_sample_without_native_fallback": "l1",
@@ -2737,6 +2675,8 @@
     "tests/test_npu_standard_graph.py::test_workspace_pool_rejects_invalid_getter_buffers_before_capture": "l1",
     "tests/test_npu_standard_graph.py::test_workspace_pool_separates_workspace_dtypes_at_equal_byte_capacity": "l1",
     "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_cuda_gate_does_not_require_an_ascend_runtime": "l1",
+    "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_empty_device_id_is_rejected": "l1",
+    "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_explicit_device_still_runs_the_parser_check": "l1",
     "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_matching_npu_runtime_reaches_tests_with_explicit_target": "l1",
     "tests/test_npu_test_gate.py::TestNPUGateRuntime::test_wrong_npu_runtime_stops_before_resources_and_pytest": "l1",
     "tests/test_npu_unconstrained_beam.py::test_candidate_selection_accepts_row_padding_without_host_tensor_reads": "l1",

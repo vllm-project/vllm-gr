@@ -367,11 +367,27 @@ message BeamSearchOptions {
 message BatchGenerateRequest {
   string batch_id = 1;
   repeated GenerateRequest requests = 2;
+  // Opt in to binary_beams for complete, equal-length Beam sequences.
+  // Other results retain the ordinary beams representation.
+  bool binary_beam_output = 3;
 }
 message BatchGenerateItem {
   string request_id = 1;
   repeated GenerateResponse responses = 2; // Legacy per-candidate response.
   BeamBatchOutput beams = 3; // Columnar response: all candidates in one message.
+  BinaryBeamBatchOutput binary_beams = 4; // Only when explicitly requested.
+}
+// Equal-length sequences, all finished by length without a stop token.
+// Buffers are little-endian, row-major: token/parent shapes [count, steps],
+// score shape [count]. Missing optional buffers mean the column was not requested.
+// This is an alternative to beams, never populated alongside it.
+message BinaryBeamBatchOutput {
+  uint32 count = 1;
+  uint32 steps = 2;
+  bytes output_ids_i32_le = 3;
+  optional bytes cumulative_logprobs_f32_le = 4;
+  optional bytes parent_beam_indices_i32_le = 5;
+  uint32 prompt_tokens = 6;
 }
 // Offsets have beam_count+1 entries; candidate i occupies [offset[i], offset[i+1]).
 // Metadata arrays have beam_count entries, with explicit presence for optional data.

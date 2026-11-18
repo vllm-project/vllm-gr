@@ -1,17 +1,14 @@
 # GR gRPC and NumPy token inputs
 
-## Background
+## Protocol and input handling
 
-The HTTP/JSON path constructs Python token lists and text responses. This
-change adds token-based GR gRPC serving and keeps prompts as NumPy arrays
-through Engine Core and Worker staging. The code baseline is `decode_graph`.
+GR gRPC accepts token prompts and keeps them as NumPy arrays through EngineCore
+and Worker staging.
 
-## Changes
-
-- Extend SMG protobuf 0.4.6 with beam options, `GenerateBatch` and optional
+- The schema extends SMG protobuf 0.4.6 with beam options, `GenerateBatch` and optional
   `input_ids_i64_le`, preserving original field numbers and method names.
   Schema headers identify the source and additions.
-- Accept either repeated uint32 tokens via `np.asarray(..., dtype=np.int64)`
+- The service accepts either repeated uint32 tokens via `np.asarray(..., dtype=np.int64)`
   or raw little-endian int64 bytes via `np.frombuffer`. Each binary buffer holds
   one prompt without a header or shape prefix; token count is byte length / 8.
   Conflicting fields, empty/unaligned data and negative tokens fail. After
@@ -26,11 +23,12 @@ through Engine Core and Worker staging. The code baseline is `decode_graph`.
   GetTokenizer remains UNIMPLEMENTED, as in the pinned upstream version.
 - `GenerateRequest.trie_id` selects a Trie for each input; omitted selects Trie 0.
   `GenerateBatch` members can select different Tries while sharing beam/output
-  options. Multi-Trie execution requires CUDA and a multi-Trie constraint table;
-  Engine Core validates IDs against the loaded table before admission. A single
-  Trie or unconstrained deployment accepts only ID 0. Nonzero IDs on NPU are
-  rejected, matching Python/HTTP.
-- Patch bindings and the servicer during upstream gRPC startup. Upstream owns
+  options. CUDA and NPU support Multi-Trie execution with a multi-Trie constraint
+  table. Engine Core validates IDs against the loaded table before admission.
+  A single-Trie or unconstrained deployment accepts only ID 0, matching
+  Python/HTTP. See [Multi-Trie constraint tables](multi_root_constraint_table.md)
+  for backend scoring semantics and execution limits.
+- GR installs the bindings and servicer during upstream gRPC startup. Upstream owns
   engine/listener initialization, standard health, reflection, keepalive,
   statistics and shutdown. GR supplies extended-schema reflection and drains
   session cleanup before engine shutdown.
@@ -62,10 +60,21 @@ cover the UVA assignment, buffer reuse, and array dtype/copy semantics.
 
 ## Usage and tests
 
+**Security:** In the supported vLLM runtime, the upstream gRPC listener is
+unencrypted and has no built-in authentication or authorization. The HTTP
+API key does not protect gRPC, including health and reflection. Do not expose
+the port to untrusted networks. Restrict backend access with network controls;
+use a trusted gateway when remote access requires TLS and access control. See
+the [security policy](../SECURITY.md) and the
+[vLLM security guide](https://docs.vllm.ai/en/latest/usage/security.html).
+Behavior depends on the installed vLLM version. In the reference implementation,
+omitting `--host` binds to `0.0.0.0`. The example below binds to loopback only;
+this limits reachability but does not add authentication.
+
 Install `pip install -e '.[grpc]'`, then use existing GR settings:
 
 ```bash
-vllm-gr serve /path/to/model --vllm-gr-config /path/to/gr-config.json --grpc --port 50051
+vllm serve /path/to/model --gr --vllm-gr-config /path/to/gr-config.json --grpc --host 127.0.0.1 --port 50051
 python examples/online_serving/grpc/client.py --address 127.0.0.1:50051
 python examples/online_serving/grpc/run_smoke.py --output /tmp/gr-grpc-smoke
 ```
@@ -81,20 +90,22 @@ after installing `grpcio-tools==1.84.0`.
 Focused tests cover pinned upstream wire compatibility, both token encodings,
 input/beam validation, batch/single output fields, cancellation/error cleanup,
 standard health/reflection/stats, array passthrough, codec transport, prefix
-hash identity, token growth and Worker staging. The affected test selection
-passes 493 cases; full repository CI and V2 graph/NPU model validation were
-not run. GPU verification includes the example and the workload below.
+hash identity, token growth and Worker staging.
 
-## Current code versus decode_graph
+## Historical HTTP and gRPC comparison
 
-Fresh measurements use a clean `decode_graph@2b84265` checkout for HTTP and the
-current working tree for both gRPC inputs. Single H20, FP16 V1 eager, identical
-random Qwen3 MoE weights (4.149B total / 0.311B active), B4 x 4096 prompt tokens,
-beam256, one Prefill plus three Decode forwards (four output tokens). Prefix
-cache, chunked prefill and constraints are disabled. Each path has 10 warmups
-and 200 measured requests, alternating GPU probes; all 600 outputs match.
+> Measured on NVIDIA H20 / date not recorded / ModelRunner V1 eager, FP16
+> (runtime versions not recorded). Not a performance guarantee.
 
-| Per batch (ms) | Baseline HTTP/JSON/list | Current gRPC binary | Current gRPC repeated |
+The [original gRPC validation](https://github.com/JiusiServe/vllm-gr/pull/542)
+used a [decode_graph snapshot](https://github.com/JiusiServe/vllm-gr/commit/2b84265)
+for HTTP and the gRPC implementation under review for both gRPC inputs. The paths shared random Qwen3 MoE weights (4.149B total / 0.311B
+active), batch size 4, 4096 input tokens per prompt and Beam width 256. Each
+request ran one Prefill and three Decode stages. Prefix Cache, Chunked Prefill
+and constraints were disabled. Each path used 10 warmups and 200 measured
+requests, alternating GPU probes. All 600 outputs matched.
+
+| Per batch (ms) | Baseline HTTP/JSON/list | gRPC binary | gRPC repeated |
 | --- | ---: | ---: | ---: |
 | Python frontend, input + output | 16.755 | 1.897 | 2.117 |
 | Model forward, excluding logits | 186.342 | 187.474 | 187.372 |
@@ -117,6 +128,36 @@ protocol work. HTTP returns text while gRPC returns token arrays, so frontend
 savings include decoding and response formatting. All samples are retained;
 isolated gRPC wall-time spikes affect means, so median/P95 are also reported.
 
-Final measurement code, source hashes, requests, logs and raw samples are
-archived outside the MR at
-`/workspace/ws/data/vllm-gr-mr-evidence-20261029/final-vs-decode-graph/`.
+## Binary Beam results
+
+The default `GenerateBatch` response retains the existing flat Beam fields.
+For large complete results, the internal result can travel as owned columns
+without constructing one Python object per candidate. This representation
+does not depend on input token encoding or a particular model architecture.
+
+Clients can additionally set `BatchGenerateRequest.binary_beam_output = true`.
+Eligible items then return `binary_beams` with `count`, `steps`, `prompt_tokens`,
+and little-endian int32 `output_ids_i32_le` in `[count, steps]` row order.
+Requested scores use optional FP32 `cumulative_logprobs_f32_le`; requested parent
+indices use optional int32 `parent_beam_indices_i32_le` with the same row shape.
+
+Clients opting in must handle both `binary_beams` and ordinary `beams`: small,
+stopped, or variable-length items retain the existing response. The binary
+option changes the output representation only; default gRPC, HTTP and offline
+outputs keep their existing behavior.
+
+For an existing `BatchGenerateRequest` and generated gRPC stub:
+
+```python
+request.binary_beam_output = True
+response = stub.GenerateBatch(request)
+for item in response.items:
+    if item.HasField("binary_beams"):
+        columns = item.binary_beams
+        tokens = np.frombuffer(columns.output_ids_i32_le, dtype="<i4").reshape(
+            columns.count, columns.steps
+        )
+    else:
+        # Existing flat Beam fields, including the small/STOP fallback.
+        tokens = item.beams.output_ids
+```

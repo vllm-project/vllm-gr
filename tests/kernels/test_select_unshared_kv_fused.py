@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Correctness tests for the Triton fused select_unshared_kv fast path.
 
 The fused path (select_unshared_kv_fused) must be element-wise identical to

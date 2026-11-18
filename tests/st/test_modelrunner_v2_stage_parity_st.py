@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disable-error-code="misc,no-untyped-call,no-any-return"
 """OneRec V2 public results, lifecycle and actual Prefill/Decode execution paths.
 
@@ -48,7 +48,7 @@ class OneRecV2ParityWorkerExtension:
 
         from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
         from vllm_gr.v1.worker.gpu_beam_stage_runner import GPUBeamStageRunner
-        from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+        from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
         from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
             GRPrefillCudaGraphManager,
         )
@@ -62,7 +62,7 @@ class OneRecV2ParityWorkerExtension:
         original_eager = GPUBeamStageRunner._forward
         original_full = manager.run_fullgraph
         original_piecewise = CUDAGraphWrapper.__call__
-        original_prefill = V2StageExecutionHooks.prefill_logits
+        original_prefill = CudaStageHooksV2.prefill_logits
 
         @wraps(original_replay)
         def replay(graph: Any) -> Any:
@@ -110,7 +110,7 @@ class OneRecV2ParityWorkerExtension:
             probes.enter_context(patch.object(GPUBeamStageRunner, "_forward", eager))
             probes.enter_context(patch.object(manager, "run_fullgraph", full))
             probes.enter_context(patch.object(CUDAGraphWrapper, "__call__", piecewise))
-            probes.enter_context(patch.object(V2StageExecutionHooks, "prefill_logits", prefill))
+            probes.enter_context(patch.object(CudaStageHooksV2, "prefill_logits", prefill))
             self._v2_parity_probe = probes.pop_all()
 
     def onerec_v2_stop_decode_probe(self) -> None:
@@ -120,7 +120,9 @@ class OneRecV2ParityWorkerExtension:
 
     def onerec_v2_parity_snapshot(self) -> dict[str, Any]:
         from tests.st.test_onerec_v1_scheduler_st import _worker_snapshot
-        from vllm_gr.v1.worker.model_runner_common import get_beam_graph_runtime_stats
+        from vllm_gr.v1.worker.gr_context import (
+            get_beam_graph_runtime_stats,
+        )
 
         snapshot = _worker_snapshot(self)
         if snapshot["retired"]:

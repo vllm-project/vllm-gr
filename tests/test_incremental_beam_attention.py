@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Unit contracts for the incremental Beam Attention computation layer."""
 
 from __future__ import annotations
@@ -140,7 +140,6 @@ def _incremental_metadata(beam_width: int, suffix_len: int) -> BeamAttentionMeta
         ),
         suffix_max_q_len=1,
         suffix_max_seq_len=suffix_len,
-        suffix_total_tokens=beam_width * suffix_len,
         num_prefix_indices=beam_width,
         num_heads=4,
         num_kv_heads=2,
@@ -195,7 +194,6 @@ def test_incremental_metadata_builder_uses_active_session_contract() -> None:
         "beam_data": {
             "request": {
                 "is_beam_decode": True,
-                "is_incremental_decode": True,
                 "beam_width": beam_width,
                 "beam_decode_steps": 1,
                 "prefix_len": prefix_len,
@@ -220,13 +218,7 @@ def test_incremental_metadata_builder_uses_active_session_contract() -> None:
     assert metadata.prefix_cu_seqlens_q_device.tolist() == [0, 3]
     assert metadata.prefix_block_table.tolist() == [[7, 8]]
     assert metadata.suffix_cu_seqlens_q_device.tolist() == [0, 1, 2, 3]
-    # In our 8ffc23d implementation, suffix_total_tokens is 0 for incremental
-    # decode because the suffix slot mapping is not generated (pool slice is
-    # used instead of gather from paged cache).
-    assert metadata.suffix_total_tokens == 0
-    # suffix_slot_mapping_out is an empty tensor (not None) in incremental path
-    assert metadata.suffix_slot_mapping_out is not None
-    assert metadata.suffix_slot_mapping_out.numel() == 0
+    assert metadata.suffix_cu_seqlens_k_device.tolist() == [0, 1, 2, 3]
 
 
 pytestmark = pytest.mark.cpu_test

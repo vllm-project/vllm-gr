@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 import json
+from enum import Enum, auto
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm_gr.ops.sliced_logits import (
+    SlicedLMHeadProxy,
     compute_sliced_logits,
     get_rank_vocab_bounds,
     get_vocab_slice_config,
@@ -18,6 +21,29 @@ from vllm_gr.ops.sliced_logits import (
 )
 from vllm_gr.utils.catalog import Catalog
 from vllm_gr.utils.npu_adapter import is_cuda_available
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("mode_name", ["REPLICATED", "STANDARD", "FINE_GRAINED", "PCP_X_TP"])  # type: ignore[misc]
+def test_sliced_proxy_uses_source_head_replicated_mode(mode_name: str) -> None:
+    class ParallelMode(Enum):
+        REPLICATED = auto()
+        STANDARD = auto()
+        FINE_GRAINED = auto()
+        PCP_X_TP = auto()
+
+    original = SimpleNamespace(parallel_mode=ParallelMode[mode_name])
+    proxy = SlicedLMHeadProxy(original, torch.ones(4, 2), 4)
+    assert proxy.parallel_mode is ParallelMode.REPLICATED
+    assert proxy.tp_size == 1
+    assert original.parallel_mode is ParallelMode[mode_name]
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_sliced_proxy_without_parallel_mode_needs_no_vendor_enum() -> None:
+    proxy = SlicedLMHeadProxy(SimpleNamespace(), torch.ones(4, 2), 4)
+    assert not hasattr(proxy, "parallel_mode")
+    assert proxy.tp_size == 1
 
 
 class MockLMHead(nn.Module):  # type: ignore[misc]

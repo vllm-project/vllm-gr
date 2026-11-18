@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disable-error-code="no-untyped-def,no-untyped-call,misc"
 """CUDA asynchronous scheduling preparation, output drain and fixed-address graph contracts."""
 
@@ -13,20 +13,29 @@ import msgspec
 import pytest
 import torch
 
-from tests.kernels.test_gpu_beam_stage_runner import (
+from tests.kernels.beam_stage_test_utils import (
     dispatch,
     metadata,
     prepare_binding,
     runtime,
 )
+from vllm_gr.v1.attention.backends import beam_attn_metadata
+from vllm_gr.v1.attention.backends import beam_attn_metadata_layout as layout
+from vllm_gr.v1.attention.backends import beam_attn_metadata_tensors as tensors
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+    build_async,
+    build_async_layout,
 )
 from vllm_gr.v1.engine.beam_search_v1 import GRRetireMetadata
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_RETIRE_RESULT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
+from vllm_gr.v1.worker import gr_gc as _gc_runtime
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.gr_inputs import ERROR_DISPATCH_STATE, GRInputBuffers
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
@@ -62,21 +71,28 @@ def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, 
             beam_params=msgspec.structs.replace(metadata(n=n).beam_params, beam_width=width),
         )
         with monkeypatch.context() as patch:
-            for name in (
-                "_geometry_cache",
-                "_geom_cache_key",
-                "_pack_int32_to_dev",
-                "_get_schedule",
+            patch.setattr(BeamAttentionMetadataBuilder, "_geometry_cache", forbidden)
+            # Future async implementations must not fall back to the legacy
+            # geometry/layout caches or the H2D upload helpers.
+            for module, name in (
+                (beam_attn_metadata, "_geom_cache_key"),
+                (layout, "_geom_cache_key"),
+                (layout, "_segment_requests"),
+                (layout, "_build_beam_mappings"),
+                (tensors, "cached_seqlens_views"),
+                (tensors, "upload_incremental_seqlens"),
+                (tensors, "pack_int32_to_dev"),
+                (tensors, "get_schedule"),
             ):
-                patch.setattr(BeamAttentionMetadataBuilder, name, forbidden)
+                patch.setattr(module, name, forbidden)
             for name in ("item", "cpu", "tolist"):
                 patch.setattr(torch.Tensor, name, forbidden)
             prepared = buffers.prepare_cpu(m, binding, block_ids=[[2 + step, 4]], slot=step % 2)
             views = buffers.upload(prepared)
-            built = BeamAttentionMetadataBuilder.build_async(
+            built = build_async(
                 layout=prepared.layout,
                 views=views,
-                session=SimpleNamespace(context=context),
+                session=SimpleNamespace(is_active=True, context=context),
                 mask=torch.ones(width, device="cuda", dtype=torch.bool),
                 slots=torch.full((width,), -1, device="cuda", dtype=torch.int64),
                 block_size=16,
@@ -111,7 +127,7 @@ def test_missing_cpu_mirrors_fail_without_device_fallback(mirror, monkeypatch):
     monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
     monkeypatch.setattr(torch.Tensor, "__bool__", forbidden)
     with pytest.raises(ValueError, match="CPU query/sequence mirrors"):
-        BeamAttentionMetadataBuilder.build_async_layout(
+        build_async_layout(
             width=4,
             prompt_len=7,
             decode_step=0,
@@ -177,11 +193,9 @@ def test_planned_state_mismatch_is_a_device_error_with_no_generated_successor(dt
 
 
 def test_retirement_waits_for_output_consumer_and_returns_release_proof(monkeypatch):
-    from vllm_gr.v1.worker import model_runner_common
-
     freezes: list[str] = []
     monkeypatch.setattr(
-        model_runner_common,
+        _gc_runtime,
         "schedule_warmup_gc_freeze",
         lambda: freezes.append("scheduled"),
     )
@@ -247,11 +261,10 @@ def test_legal_eos_is_an_ordinary_candidate_with_delayed_receipts(dtype):
 
 @torch.inference_mode()
 def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch):
-    from tests.kernels.test_gpu_beam_stage_runner import (
+    from tests.kernels.beam_stage_test_utils import (
         admission_worker,
         install_decode_model,
     )
-    from vllm_gr.v1.worker import model_runner_common
     from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
     from vllm_gr.v1.worker.gpu_beam_stage_runner import (
         GPUBeamStageRunner,
@@ -272,7 +285,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
     worker = admission_worker()
     freezes: list[str] = []
     monkeypatch.setattr(
-        model_runner_common,
+        _gc_runtime,
         "schedule_warmup_gc_freeze",
         lambda: freezes.append("scheduled"),
     )
@@ -290,7 +303,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         worker,
         lambda ids, positions: ids[:, None].to(torch.float16).expand(-1, 6) + positions[:, None],
     )
-    assert capture_async_forward(worker)
+    assert capture_async_forward(worker, hooks_type=CudaStageHooksV1)
     assert freezes == []
     owner = worker._gr_gpu_stage_runner
     graph = owner.graph
@@ -312,7 +325,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
             num_prompt_tokens=prompt,
             num_prompt_tokens_by_request=(prompt,),
         )
-        assert get_stage_runner(worker, dispatch(first)) is owner
+        assert get_stage_runner(worker, dispatch(first), hooks_type=CudaStageHooksV1) is owner
         assert owner.beam.state.max_new_tokens == budget
         if budget != previous_state.max_new_tokens:
             assert owner.beam.state is not previous_state

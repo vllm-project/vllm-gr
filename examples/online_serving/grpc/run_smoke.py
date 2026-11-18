@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Run the production --grpc CLI with random Llama weights and binary prompts."""
 
 import argparse
@@ -40,6 +40,7 @@ def main():
         "-m",
         "vllm_gr.entrypoints.cli.main",
         "serve",
+        "--gr",
         str(model),
         "--vllm-gr-config",
         str(config),

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 """Real attention, identical schedules: eager vs cold and reused CUDA graphs."""
 

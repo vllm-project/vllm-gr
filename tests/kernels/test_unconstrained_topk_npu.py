@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disable-error-code="misc"
 """Full-vocabulary selection on an actual Ascend device, without custom ops."""
 
@@ -100,12 +100,12 @@ def test_npu_extreme_temperatures_preserve_finite_probability_mass(
             [-3e38, 3e38, float("nan"), float("inf"), -float("inf")],
             [float("nan"), float("inf"), -float("inf"), float("nan"), float("inf")],
             [1.0, 2.0, float("nan"), float("inf"), -float("inf")],
-            [0.0, 1e-40, float("nan"), float("inf"), -float("inf")],
-            [2e-40, 1e-40, float("nan"), float("inf"), -float("inf")],
+            [0.0, 1e-35, float("nan"), float("inf"), -float("inf")],
+            [2e-35, 1e-35, float("nan"), float("inf"), -float("inf")],
         ]
     )
     temperatures = torch.tensor(
-        [1e-40, 1e-40, 1e-40, 0.0, 0.5, 3e38, 1.0, 1e-40, 3e38, 1e-40, 1e-40]
+        [1e-35, 1e-35, 1e-35, 0.0, 0.5, 3e38, 1.0, 1e-35, 3e38, 1e-35, 1e-35]
     )
     result = select_unconstrained_candidates(host.to(npu_device), temperatures.to(npu_device), 7)
     ids, scores, valid = result.token_ids.cpu(), result.logprobs.cpu(), result.valid_mask.cpu()

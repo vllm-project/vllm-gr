@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Reference guards for the bounded-retention Top-K and its candidate merge.
 
 Both pipelines must reproduce the stable ``(-score, index)`` order of the CPU
@@ -110,11 +110,14 @@ def test_mcap_matches_legacy_and_oracle(vocab_size: int, top_k: int) -> None:
     assert torch.equal(new_counts, ref_counts)
 
     ids_expected, lp_expected, masks = _oracle(logits_cpu, temperatures.cpu(), top_k)
+    assert new_counts.tolist() == masks
     for row, expected in enumerate(ids_expected):
         assert new_ids[row, : masks[row]].tolist() == expected.tolist()
         torch.testing.assert_close(
             new_lp[row, : masks[row]].cpu(), lp_expected[row], rtol=1e-4, atol=1e-4
         )
+        assert new_valid[row, : masks[row]].all().item()
+        assert not new_valid[row, masks[row] :].any().item()
 
 
 def test_mcap_repair_path_is_exact_and_actually_taken() -> None:
@@ -159,15 +162,19 @@ def test_mcap_accepts_padded_rows_empty_tiles_and_nan() -> None:
     logits[1, 0] = float("nan")
     temperatures = torch.ones(2, dtype=torch.float32, device="cuda")
 
-    (ref_ids, ref_lp, _, ref_counts), (new_ids, new_lp, new_valid, new_counts) = _run_both(
+    (ref_ids, ref_lp, ref_valid, ref_counts), (new_ids, new_lp, new_valid, new_counts) = _run_both(
         logits, temperatures, 3
     )
 
     assert torch.equal(new_ids, ref_ids)
     assert torch.equal(new_lp, ref_lp)
+    assert torch.equal(new_valid, ref_valid)
     assert torch.equal(new_counts, ref_counts)
     assert logits.stride() == (2112, 1)
     assert new_ids[0].tolist() == [0, 1, 2]
+    torch.testing.assert_close(
+        new_lp[0], torch.log_softmax(logits[0], dim=0)[:3], rtol=1e-4, atol=1e-4
+    )
     assert new_valid[0].all().item()
     assert not new_valid[1].any().item()
     assert new_counts.tolist() == [3, 0]
@@ -189,9 +196,19 @@ def test_mcap_counts_only_finite_candidates() -> None:
     assert torch.equal(new_ids, ref_ids)
     assert torch.equal(new_lp, ref_lp)
     assert torch.equal(new_valid, ref_valid)
+    assert torch.equal(new_counts, ref_counts)
     assert new_counts.tolist() == [1, 2, 0]
+    assert new_valid.tolist() == [
+        [True, False, False, False],
+        [True, True, False, False],
+        [False, False, False, False],
+    ]
     assert new_ids[0, 0].item() == 10
     assert new_ids[1, :2].tolist() == [1, 2]
+    torch.testing.assert_close(new_lp[0, 0].cpu(), torch.tensor(0.0))
+    torch.testing.assert_close(
+        new_lp[1, :2].cpu(), torch.log_softmax(torch.tensor([1.0, 0.0]), dim=0)
+    )
     assert torch.isneginf(new_lp[~new_valid]).all().item()
 
 

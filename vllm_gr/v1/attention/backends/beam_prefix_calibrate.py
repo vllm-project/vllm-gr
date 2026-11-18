@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Measure the device-local prefix cost model once, at engine start-up.
 
 The framework segmentation path has four device-local coefficients (serial
@@ -37,7 +37,6 @@ _MEMORY_BATCH = 4
 _MEMORY_WIDTH = 32
 _SPLIT_SEGMENTS = 8
 _MAX_CALIBRATION_TOKENS = 16384
-_MIN_CHAIN_TOKENS = 2048
 
 
 def _make_case(
@@ -141,8 +140,13 @@ def calibrate_prefix_device(
         "dtype": dtype,
         "block_size": block_size,
     }
-    chain_length = min(_MAX_CALIBRATION_TOKENS, (max_model_len // block_size) * block_size)
-    chain_length = max(chain_length, min(_MIN_CHAIN_TOKENS, max_model_len))
+    # The split probe needs a page count divisible by _SPLIT_SEGMENTS; otherwise
+    # its segment layout over-runs the block table and calibration is skipped
+    # for every max_model_len that is not a multiple of block_size * 8.
+    align = block_size * _SPLIT_SEGMENTS
+    chain_length = min(_MAX_CALIBRATION_TOKENS, max_model_len // align * align)
+    if chain_length == 0:
+        raise ValueError(f"max_model_len {max_model_len} is shorter than one split probe ({align})")
     other_length = min(chain_length, 8192)
 
     def shape(batch, width, length):

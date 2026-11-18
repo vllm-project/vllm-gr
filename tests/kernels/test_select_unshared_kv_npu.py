@@ -55,9 +55,11 @@ def _prefix_from_parents(parents: torch.Tensor, beam_size: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("batch,layer_num", [(1, 1), (2, 1), (2, 2)])
+@pytest.mark.parametrize("max_decode_steps", [3, 4, 6])
 def test_select_unshared_kv_npu_matches_torch_reference(
     batch: int,
     layer_num: int,
+    max_decode_steps: int,
 ) -> None:
     """Multi-step cache -> select pipeline must match the CPU reference."""
     torch.manual_seed(1234)
@@ -66,7 +68,6 @@ def test_select_unshared_kv_npu_matches_torch_reference(
     beam_size = 128
     kv_heads = 8
     head_dim = 128
-    max_decode_steps = 3
     num_blocks = batch
     pool_shape = (num_blocks, beam_size, kv_heads, max_decode_steps, head_dim)
     block_table = torch.arange(batch, dtype=torch.int32)

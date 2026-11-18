@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Numerical correctness tests for the Beam-Cascade attention backend on NPU.
 
 The GPU test (``test_cascade_beam_attn_gpu.py``) is the only test that

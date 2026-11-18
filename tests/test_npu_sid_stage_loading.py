@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Catalog-free SID maps share the existing runner projection lifecycle."""
 
 from collections.abc import Callable
@@ -44,6 +44,7 @@ def _runner() -> SimpleNamespace:
         "constraint_table": {"enabled": False, "backend": "npu", "max_top_k": 4},
     }
     return SimpleNamespace(
+        model=torch.nn.Module(),
         vllm_config=SimpleNamespace(additional_config={"vllm_gr": config}),
         model_config=SimpleNamespace(get_vocab_size=lambda: 40),
         device=torch.device("npu:0") if hasattr(torch, "npu") else "npu:0",

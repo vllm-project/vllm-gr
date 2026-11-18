@@ -54,12 +54,33 @@ python -m unittest tests.legal.test_spdx_header
 python tools/generate_grpc_proto.py --check
 ```
 
-The SPDX hook requires a non-empty `SPDX-License-Identifier` holding a valid SPDX
-expression and a non-empty `SPDX-FileCopyrightText`, and accepts several
-copyright lines. It adds a header with the project holder to a file that has
-neither line. It does not guess a license: a file with a copyright line but no
-license line is reported for a person to resolve.
+The SPDX hook always runs over every tracked source file (Python, shell,
+JavaScript, proto). It reads only the leading comment block: a tag after code,
+inside a string or in a heredoc is not a header. It requires a non-empty
+`SPDX-License-Identifier` holding a valid SPDX expression and a non-empty
+`SPDX-FileCopyrightText`, and accepts several copyright lines.
 
-It does not verify that the named holder is correct for a given file. A copied
-file that lacks a header would be labelled as project code, so check provenance
-before relying on it.
+It completes a header only for a file that has no header line at all, and it
+reports every other case for a person to resolve: a copyright line without a
+license line, a license line without a copyright line, and a plain
+`Copyright ...` comment with no SPDX line. The last one matters most, because
+an upstream copy often carries only that comment, and filling in the project
+holder would claim the file and pass on the next run. A rewrite keeps the BOM,
+the encoding cookie, the shebang and the line endings as they were, and a file
+that is not UTF-8 is reported instead of decoded with replacement characters.
+
+The hook enumerates the repository itself, so it checks the same files from any
+subdirectory. It fails the run when it completes a header, because pre-commit
+passes only when the hook changed nothing: stage the file again.
+
+`tools/pre_commit/spdx_policy.json` records the holder every file must carry,
+plus the six files that are copies of third-party code and keep the upstream
+holder instead. Any other holder written as `SPDX-FileCopyrightText` fails the
+check, as does registering a copy that is no longer tracked. A file derived
+from another project still carries the project holder; its upstream copyright
+is a plain comment, which the policy does not police.
+
+The policy covers the holder, not the license, so a project file may declare
+`Apache-2.0`, `Apache-2.0 AND BSD-3-Clause` and so on. It cannot show that a
+file is free of undisclosed copying, so provenance is still reviewed when a
+file is added.

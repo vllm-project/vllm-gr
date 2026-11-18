@@ -82,6 +82,17 @@ def generate(output: Path) -> None:
                 )
             else:
                 text = text.replace("_descriptor_pool.Default()", pool)
+            # The stock message builder registers classes in the default
+            # symbol database, which leaks private descriptors in pure Python.
+            text = text.replace(
+                "from google.protobuf.internal import builder as _builder\n",
+                "from google.protobuf.internal import builder as _builder\n"
+                "from .. import _protobuf\n",
+            )
+            text = text.replace(
+                "_builder.BuildTopDescriptorsAndMessages(",
+                "_protobuf.build_top_descriptors_and_messages(",
+            )
             module = "vllm_gr.entrypoints.grpc.generated." + path.stem
             text = text.replace(f"'{path.stem}'", repr(module))
         schema = path.name.split("_pb2")[0] + ".proto"

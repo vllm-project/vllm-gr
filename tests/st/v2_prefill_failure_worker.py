@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Test-only worker import injects a clean FULL capture refusal at startup.
 
 No CUDA stream is invalidated here. Real invalidation is covered in an isolated

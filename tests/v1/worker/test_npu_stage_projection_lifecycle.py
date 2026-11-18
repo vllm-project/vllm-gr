@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disable-error-code="misc"
 """Exercise stage projection ownership through the real worker lifecycle."""
 
@@ -251,7 +251,7 @@ def test_unsupported_worker_never_requests_compact_vocab_or_installs_projection(
         mapping["beam"].pop("execution_mode")
 
     make_load_model_with_constraint_backend(lambda self: _replace_model(self, 1.0))(runner)
-    assert runner.constraint_backend is lifecycle.backends[-1]
+    assert runner.constraint_backend.get() is lifecycle.backends[-1]
     assert runner.constraint_backend.stage_vocab is None
     assert getattr(runner, "_gr_npu_stage_projection", None) is None
     assert "_get_logits" not in vars(runner.model.logits_processor)

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 'use strict';
 
 // This module must be loaded from the pinned base revision, not the PR.
@@ -24,13 +24,17 @@ function isDocumentation(path) {
   return rootDocs.has(path) || (parts.length >= 2 && parts[0] === 'docs');
 }
 
-function currentSnapshot(live, pr, mergeSha, allowUnreadyAbtest) {
+// The ephemeral test merge commit is deliberately not compared here. GitHub
+// recomputes it whenever the base branch advances, so a run that queues for a
+// while would otherwise reject an unchanged pull request. The immutable head
+// and base commits still pin every fact this classifier depends on.
+function currentSnapshot(live, pr, allowUnreadyAbtest) {
   if (!live || live.state !== 'open' || live.number !== pr.number ||
       live.draft !== false || !Array.isArray(live.labels) ||
       !(live.labels.some(label => label && label.name === 'ready') ||
         (allowUnreadyAbtest && live.labels.some(label => label && label.name === 'abtest'))) ||
       !live.head || !live.base || live.head.sha !== pr.head.sha ||
-      live.base.sha !== pr.base.sha || live.merge_commit_sha !== mergeSha ||
+      live.base.sha !== pr.base.sha ||
       !Number.isSafeInteger(live.changed_files) || live.changed_files <= 0 ||
       live.changed_files >= MAX_FILES) {
     throw new Error('PR revisions or changed file count are invalid or changed.');
@@ -44,11 +48,10 @@ async function classify({github, context, core}) {
   try {
     const pr = context && context.payload && context.payload.pull_request;
     const repo = context && context.repo;
-    const mergeSha = context && context.sha;
     if (!context || !['pull_request', 'pull_request_review'].includes(context.eventName) ||
         !pr || !Number.isSafeInteger(pr.number) || pr.number <= 0 ||
         !pr.head || !pr.base || !shaPattern.test(pr.head.sha || '') ||
-        !shaPattern.test(pr.base.sha || '') || !shaPattern.test(mergeSha || '') ||
+        !shaPattern.test(pr.base.sha || '') ||
         !repo || typeof repo.owner !== 'string' || !repo.owner ||
         typeof repo.repo !== 'string' || !repo.repo) {
       throw new Error('Missing pinned pull request context.');
@@ -61,7 +64,7 @@ async function classify({github, context, core}) {
       context.payload.label.name === 'abtest';
     const getCurrent = async () => {
       const {data} = await github.rest.pulls.get(args);
-      return currentSnapshot(data, pr, mergeSha, allowUnreadyAbtest);
+      return currentSnapshot(data, pr, allowUnreadyAbtest);
     };
     const expected = await getCurrent();
     const seen = new Set();

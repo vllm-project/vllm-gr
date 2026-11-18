@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 
-"""System test: Pangu 1B online serving via ``vllm-gr serve``.
+"""System test: Pangu 1B online serving via ``vllm serve MODEL --gr``.
 
 Requires:
 - vLLM + GPU/NPU runtime
@@ -65,6 +65,7 @@ def _build_serve_cmd(model_path: str, port: int) -> list[str]:
         "-m",
         "vllm_gr.entrypoints.cli.main",
         "serve",
+        "--gr",
         model_path,
         "--host",
         "127.0.0.1",
@@ -213,7 +214,7 @@ def _chat_completion(
 @pytest.mark.npu_test
 @pytest.mark.model_test
 class TestPangu1bOnlineServeST(unittest.TestCase):
-    """End-to-end online ST for Pangu LLM passthrough via ``vllm-gr serve``."""
+    """End-to-end online ST for Pangu LLM passthrough via ``vllm serve MODEL --gr``."""
 
     base_url: str
     _server_ctx: AbstractContextManager[str]

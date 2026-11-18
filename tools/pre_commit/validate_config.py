@@ -11,6 +11,8 @@ import ast
 import inspect
 import sys
 from itertools import pairwise
+from pathlib import Path
+from typing import NoReturn
 
 import regex as re
 
@@ -53,9 +55,10 @@ def get_attr_docs(cls_node: ast.ClassDef) -> dict[str, str]:
 
 
 class ConfigValidator(ast.NodeVisitor):
-    def __init__(self): ...
+    def __init__(self, *, gr_config: bool = False) -> None:
+        self.gr_config = gr_config
 
-    def visit_ClassDef(self, node):
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
         # Validate class with both @config and @dataclass decorators
         decorators = [
             id
@@ -67,7 +70,11 @@ class ConfigValidator(ast.NodeVisitor):
             )
         ]
 
-        if set(decorators) == {"config", "dataclass"}:
+        if self.gr_config and node.name in {"GRConfig", "ConstraintTableConfig"}:
+            if "dataclass" not in decorators:
+                fail(f"Class {node.name} must be a dataclass.", node)
+            validate_class(node, require_metadata=True)
+        elif set(decorators) == {"config", "dataclass"}:
             validate_class(node)
         elif set(decorators) == {"config"}:
             fail(f"Class {node.name} with config decorator must be a dataclass.", node)
@@ -75,7 +82,48 @@ class ConfigValidator(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def validate_class(class_node: ast.ClassDef):
+def _call_name(value: ast.expr) -> str | None:
+    if isinstance(value, ast.Name):
+        return value.id
+    if isinstance(value, ast.Attribute):
+        return value.attr
+    return None
+
+
+def _field_kwargs(value: ast.expr | None) -> dict[str, ast.expr] | None:
+    if isinstance(value, ast.Call) and _call_name(value.func) == "field":
+        return {kw.arg: kw.value for kw in value.keywords if kw.arg is not None}
+    return None
+
+
+def _has_default(value: ast.expr | None) -> bool:
+    if value is None or _call_name(value) == "MISSING":
+        return False
+    kwargs = _field_kwargs(value)
+    if kwargs is None:
+        return True
+    return any(
+        name in kwargs and _call_name(kwargs[name]) != "MISSING"
+        for name in ("default", "default_factory")
+    )
+
+
+def _field_spec(stmt: ast.AnnAssign) -> ast.Call:
+    kwargs = _field_kwargs(stmt.value)
+    metadata = kwargs.get("metadata") if kwargs is not None else None
+    if isinstance(metadata, ast.Dict):
+        for key, value in zip(metadata.keys, metadata.values):
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == "gr"
+                and isinstance(value, ast.Call)
+                and _call_name(value.func) == "ConfigFieldSpec"
+            ):
+                return value
+    fail("Config field must declare ConfigFieldSpec in field metadata['gr'].", stmt)
+
+
+def validate_class(class_node: ast.ClassDef, *, require_metadata: bool = False) -> None:
     attr_docs = get_attr_docs(class_node)
 
     for stmt in class_node.body:
@@ -93,13 +141,34 @@ def validate_class(class_node: ast.ClassDef):
 
             if isinstance(stmt.target, ast.Name):
                 field_name = stmt.target.id
-                if stmt.value is None:
+                required = False
+                if require_metadata:
+                    spec = _field_spec(stmt)
+                    required = any(
+                        kw.arg == "required"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True
+                        for kw in spec.keywords
+                    )
+                    if (class_node.name, field_name) == (
+                        "ConstraintTableConfig",
+                        "max_top_k",
+                    ) and not required:
+                        fail("Field 'max_top_k' must explicitly declare required=True.", stmt)
+                    if required and (class_node.name, field_name) != (
+                        "ConstraintTableConfig",
+                        "max_top_k",
+                    ):
+                        fail(f"Unexpected required config field '{field_name}'.", stmt)
+                    if required and _has_default(stmt.value):
+                        fail(f"Required field '{field_name}' must not have a default.", stmt)
+                if not _has_default(stmt.value) and not required:
                     fail(
                         f"Field '{field_name}' in {class_node.name} must have a default value.",
                         stmt,
                     )
 
-                if field_name not in attr_docs:
+                if not attr_docs.get(field_name):
                     fail(
                         f"Field '{field_name}' in {class_node.name} must have a docstring.",
                         stmt,
@@ -130,18 +199,22 @@ def validate_class(class_node: ast.ClassDef):
                         )
 
 
-def validate_ast(tree: ast.stmt):
-    ConfigValidator().visit(tree)
+def validate_ast(tree: ast.AST, *, gr_config: bool = False) -> None:
+    ConfigValidator(gr_config=gr_config).visit(tree)
 
 
-def validate_file(file_path: str):
+def _is_gr_config_path(file_path: str) -> bool:
+    return Path(file_path).parts[-3:] == ("vllm_gr", "config", "models.py")
+
+
+def validate_file(file_path: str) -> None:
     try:
         print(f"Validating {file_path} config dataclasses ", end="")
         with open(file_path, encoding="utf-8") as f:
             source = f.read()
 
         tree = ast.parse(source, filename=file_path)
-        validate_ast(tree)
+        validate_ast(tree, gr_config=_is_gr_config_path(file_path))
     except ValueError as e:
         print(e)
         raise SystemExit(1) from e
@@ -149,12 +222,15 @@ def validate_file(file_path: str):
         print("✅")
 
 
-def fail(message: str, node: ast.stmt):
+def fail(message: str, node: ast.stmt) -> NoReturn:
     raise ValueError(f"❌ line({node.lineno}): {message}")
 
 
-def main():
+def main() -> None:
     for filename in sys.argv[1:]:
+        if _is_gr_config_path(filename):
+            validate_file(filename)
+            continue
         # Only run for Python files in vllm/ or tests/
         if not re.match(r"^(vllm|tests)/.*\.py$", filename):
             continue

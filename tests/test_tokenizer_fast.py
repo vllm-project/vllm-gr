@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Parity tests for ``vllm_gr.tokenizer_fast``.
 
 The raw Rust backend bypass must stay byte-identical to the HuggingFace

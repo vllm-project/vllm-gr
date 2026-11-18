@@ -1,3 +1,6 @@
 include LICENSE NOTICE
 include benchmarks/open_one_rec/qwen3_soft_switch.jinja2
 include benchmarks/open_one_rec/qwen3_soft_switch.jinja2.license
+include benchmarks/open_one_rec/prompts/README.md
+include benchmarks/open_one_rec/prompts/*.txt
+include benchmarks/open_one_rec/prompts/*.txt.license

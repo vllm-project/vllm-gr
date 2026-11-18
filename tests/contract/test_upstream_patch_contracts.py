@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: ignore-errors
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ def test_patch_inventories_are_aligned_and_complete() -> None:
     patch_ids = [patch["id"] for patch in patches]
     required_fields = {
         "owner",
+        "scope",
+        "backend_id",
         "installer",
         "activation",
         "validator_or_test",
@@ -36,6 +38,48 @@ def test_patch_inventories_are_aligned_and_complete() -> None:
     runtime_inventory = Path("docs/runtime_patch_inventory.md").read_text(encoding="utf-8")
     runtime_ids = re.findall(r"^### (GR-PATCH-\d{3})", runtime_inventory, re.MULTILINE)
     assert runtime_ids == patch_ids
+    for patch in patches:
+        section = runtime_inventory.split(f"### {patch['id']}", 1)[1].split("\n### ", 1)[0]
+        backend_id = patch["backend_id"] or "null"
+        assert f"Scope: `{patch['scope']}`; backend ID: `{backend_id}`" in section
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_common_and_selected_provider_patch_ownership_is_unique(
+    monkeypatch: pytest.MonkeyPatch, device_type: str
+) -> None:
+    from types import SimpleNamespace
+
+    import vllm.platforms
+
+    from vllm_gr.patch import CORE_PATCH_IDS
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
+
+    inventory = yaml.safe_load(Path("docs/patch_inventory.yaml").read_text(encoding="utf-8"))
+    patches = inventory["patches"]
+    assert all(
+        (p["scope"] == "core" and p["backend_id"] is None)
+        or (p["scope"] == "backend" and p["backend_id"] in {"cuda", "npu"})
+        for p in patches
+    )
+    monkeypatch.setattr(
+        vllm.platforms, "current_platform", SimpleNamespace(device_type=device_type)
+    )
+    monkeypatch.setattr(loader, "entry_points", lambda **kwargs: ())
+    _reset_backend_registry_for_tests()
+    try:
+        provider = loader.activate_current_backend()
+        core_ids = {p["id"] for p in patches if p["scope"] == "core"}
+        backend_ids = {p["id"] for p in patches if p["backend_id"] == device_type}
+        assert set(CORE_PATCH_IDS) == core_ids
+        assert set(provider.patch_ids) == backend_ids
+        claimed = (*CORE_PATCH_IDS, *provider.patch_ids)
+        assert len(claimed) == len(set(claimed))
+        assert set(claimed) == core_ids | backend_ids
+    finally:
+        _reset_backend_registry_for_tests()
 
 
 def test_engine_core_method_contracts() -> None:
@@ -50,6 +94,44 @@ def test_engine_core_method_contracts() -> None:
     run_signature = inspect.signature(EngineCoreProc.run_engine_core)
     assert run_signature.parameters["dp_rank"].default == 0
     assert run_signature.parameters["local_dp_rank"].default == 0
+
+
+@pytest.mark.l1
+def test_core_hot_update_utility_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from concurrent.futures import Future
+    from unittest.mock import Mock
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    from vllm_gr.v1.engine import hot_update
+
+    assert _parameter_names(EngineCoreProc.pause_scheduler) == ["self", "mode", "clear_cache"]
+    assert _parameter_names(EngineCoreProc.resume_scheduler) == ["self"]
+
+    class Core(EngineCoreProc):
+        pass
+
+    native_pause, native_resume = Core.pause_scheduler, Core.resume_scheduler
+    hot_update.install_core_hot_update_hooks(Core)
+    installed = {
+        name: getattr(Core, name) for name in ("service_status", "pause", "resume", "reload_trie")
+    }
+    hot_update.install_core_hot_update_hooks(Core)
+    assert all(getattr(Core, name) is method for name, method in installed.items())
+    assert Core.pause_scheduler is native_pause and Core.resume_scheduler is native_resume
+
+    core = object.__new__(Core)
+    pending = Future()
+    native_pause_call = Mock(return_value=pending)
+    native_resume_call = Mock()
+    monkeypatch.setattr(core, "pause_scheduler", native_pause_call)
+    monkeypatch.setattr(core, "resume_scheduler", native_resume_call)
+    assert getattr(core, "pause")() is pending
+    native_pause_call.assert_called_once_with(mode="wait", clear_cache=True)
+    assert not pending.done()
+    pending.set_result(None)
+    assert getattr(core, "resume")() == {"ok": True}
+    native_resume_call.assert_called_once_with()
 
 
 def test_scheduler_contracts() -> None:

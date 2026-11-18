@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """
 Sliced Logits Projection for vLLM / GR decoding.
 
@@ -13,19 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
-
-# vllm-ascend >= 0.30 swaps LogitsProcessor for AscendLogitsProcessor, whose
-# _get_logits routes by lm_head.parallel_mode before projecting. A sliced
-# proxy keeps its complete sliced vocabulary locally (tp_size=1, no
-# vocabulary-parallel communication), so it must present the replicated mode
-# instead of the source head's sharded one. Stacks without the enum are
-# unaffected: nothing on those code paths reads the attribute.
-try:
-    from vllm_ascend.ops.vocab_parallel_embedding import VocabParallelMode
-
-    _REPLICATED_PARALLEL_MODE: Any = VocabParallelMode.REPLICATED
-except ImportError:  # CUDA/CPU installations do not provide vllm-ascend
-    _REPLICATED_PARALLEL_MODE = None
 
 logger = init_logger("vllm.ops.sliced_logits")
 
@@ -47,11 +34,14 @@ class SlicedLMHeadProxy(nn.Module):
         self.num_embeddings_per_partition = sliced_num_embeddings
         self.org_vocab_size = sliced_num_embeddings
         self.tp_size = 1
-        if _REPLICATED_PARALLEL_MODE is not None:
-            # Routes AscendLogitsProcessor to its normal (no-communication)
-            # projection branch; the sharded modes would assume vocabulary
-            # parallelism the proxy does not participate in.
-            self.parallel_mode = _REPLICATED_PARALLEL_MODE
+        # AscendLogitsProcessor routes by the source head's layout enum. Reuse
+        # that enum's replicated value: this proxy owns its entire slice and
+        # performs no vocabulary-parallel communication. Reading the existing
+        # head avoids importing an unselected vendor runtime at module import.
+        parallel_mode = getattr(original_lm_head, "parallel_mode", None)
+        replicated_mode = getattr(type(parallel_mode), "REPLICATED", None)
+        if replicated_mode is not None:
+            self.parallel_mode = replicated_mode
 
 
 def set_vocab_slice_config(
@@ -119,6 +109,65 @@ def is_supported_unquantized_lm_head(lm_head: Any) -> bool:
         "UnquantizedLinearMethod",
         "UnquantizedBaseMethod",
     )
+
+
+def _get_sliced_head(
+    lm_head: Any,
+    embedding_bias: Optional[torch.Tensor],
+    cache_key: Tuple[int, int, int, int],
+    quant_group_size: int,
+) -> SlicedLMHeadProxy:
+    """Lazily initialize projection storage for this window."""
+    if getattr(lm_head, "_sliced_cache_key", None) == cache_key:
+        return lm_head._sliced_proxy
+
+    off, sz, rank_start, rank_end = cache_key
+    inter_start = max(off, rank_start)
+    inter_end = min(off + sz, rank_end)
+    local_start = inter_start - rank_start
+    local_end = inter_end - rank_start
+    local_sz = local_end - local_start
+    offset_aligned = (local_start // quant_group_size) * quant_group_size
+    end_idx = ((local_end + quant_group_size - 1) // quant_group_size) * quant_group_size
+    aligned_slice_size = end_idx - offset_aligned
+
+    sliced_w = (
+        lm_head.weight[offset_aligned : offset_aligned + aligned_slice_size]
+        .detach()
+        .clone()
+        .contiguous()
+    )
+    # Previously this derived cache was a registered Parameter. Native layerwise
+    # reload temporarily removes registered parameters before post-processing,
+    # making the cache unavailable to its refresh hook. Keep it as a plain Tensor:
+    # it is derived from checkpoint weights, not loaded from the checkpoint itself.
+    lm_head._sliced_weight = sliced_w
+    lm_head._sliced_bias = (
+        embedding_bias[offset_aligned : offset_aligned + aligned_slice_size]
+        .detach()
+        .clone()
+        .contiguous()
+        if embedding_bias is not None
+        else None
+    )
+    lm_head._sliced_cache_key = cache_key
+    lm_head._sliced_rel_start = local_start - offset_aligned
+    lm_head._sliced_rel_end = lm_head._sliced_rel_start + local_sz
+    lm_head._sliced_need_crop = aligned_slice_size > local_sz
+    # Normal nn.Module assignment would register this proxy as a child module,
+    # exposing its cached weight to the checkpoint loader too. Store it as an
+    # ordinary attribute; it still shares the cache refreshed by the reload hook.
+    object.__setattr__(
+        lm_head,
+        "_sliced_proxy",
+        SlicedLMHeadProxy(lm_head, lm_head._sliced_weight, aligned_slice_size),
+    )
+
+    logger.info(
+        f"vllm_gr: Cached pre-sliced contiguous lm_head weights (global range=[{inter_start}:{inter_end}], "
+        f"local offset={offset_aligned}, aligned slice_size={aligned_slice_size})"
+    )
+    return lm_head._sliced_proxy
 
 
 def compute_sliced_logits(
@@ -198,50 +247,9 @@ def compute_sliced_logits(
         dtype = getattr(logits_processor, "head_dtype", None) or hidden_states.dtype
         return torch.empty(empty_shape, dtype=dtype, device=hidden_states.device)
 
-    local_start = inter_start - rank_start
-    local_end = inter_end - rank_start
-    local_sz = local_end - local_start
-
-    cache_key = (off, sz, rank_start, rank_end)
-    if (
-        not hasattr(lm_head, "_sliced_weight")
-        or getattr(lm_head, "_sliced_cache_key", None) != cache_key
-    ):
-        offset_aligned = (local_start // quant_group_size) * quant_group_size
-        end_idx = ((local_end + quant_group_size - 1) // quant_group_size) * quant_group_size
-        aligned_slice_size = end_idx - offset_aligned
-
-        sliced_w = (
-            lm_head.weight[offset_aligned : offset_aligned + aligned_slice_size]
-            .detach()
-            .clone()
-            .contiguous()
-        )
-        if not isinstance(sliced_w, nn.Parameter):
-            sliced_w = nn.Parameter(sliced_w, requires_grad=False)
-
-        lm_head._sliced_weight = sliced_w
-        lm_head._sliced_bias = (
-            embedding_bias[offset_aligned : offset_aligned + aligned_slice_size]
-            .detach()
-            .clone()
-            .contiguous()
-            if embedding_bias is not None
-            else None
-        )
-        lm_head._sliced_cache_key = cache_key
-        lm_head._sliced_rel_start = local_start - offset_aligned
-        lm_head._sliced_rel_end = lm_head._sliced_rel_start + local_sz
-        lm_head._sliced_need_crop = aligned_slice_size > local_sz
-        lm_head._sliced_proxy = SlicedLMHeadProxy(
-            lm_head, lm_head._sliced_weight, aligned_slice_size
-        )
-        logger.info(
-            f"vllm_gr: Cached pre-sliced contiguous lm_head weights (global range=[{inter_start}:{inter_end}], "
-            f"local offset={offset_aligned}, aligned slice_size={aligned_slice_size})"
-        )
-
-    proxy = lm_head._sliced_proxy
+    proxy = _get_sliced_head(
+        lm_head, embedding_bias, (off, sz, rank_start, rank_end), quant_group_size
+    )
     if use_processor:
         # This projection is local even when the original head is TP-sharded.
         # Let upstream _apply_head honor head_dtype, then remove our alignment

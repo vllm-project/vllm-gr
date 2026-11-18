@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Unified V2 Prefill plan, capture publication, fallback and instance isolation."""
 
 from collections.abc import Callable
@@ -556,6 +556,39 @@ def test_failed_cuda_health_check_aborts(
     with pytest.raises(RuntimeError, match="device unhealthy"):
         manager.capture()
     assert not manager._graphs_captured
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_dense_prefill_capture_scope_and_fresh_replay(
+    runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_gr.v1.attention.backends import beam_dense_prefill as dense
+
+    scopes: list[bool] = []
+
+    def capture(manager: Any, *args: Any, **kwargs: Any) -> None:
+        scopes.append(dense.in_fresh_prefill_capture())
+        for desc in next(iter(manager._capture_descs.values())):
+            if desc.cg_mode == Mode.FULL:
+                manager.graphs[desc] = object()
+        manager._graphs_captured = True
+
+    monkeypatch.setattr(native.ModelCudaGraphManager, "capture", capture)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args: None)
+    manager = make_manager(runner)
+    manager.capture()
+    # Every GR Prefill sub-plan captures inside the fresh-Prefill scope.
+    assert scopes and all(scopes)
+    assert not dense.in_fresh_prefill_capture()
+    with manager.prefill_scope(scheduled()):
+        runner.req_states.num_computed_tokens_np[0] = 512  # cached Prefill suffix
+        monkeypatch.delenv(dense.ENV_DENSE_PREFILL, raising=False)
+        assert manager.dispatch(1, 127, None).cg_mode == Mode.FULL
+        monkeypatch.setenv(dense.ENV_DENSE_PREFILL, "fa2")
+        assert manager.dispatch(1, 127, None).cg_mode == Mode.PIECEWISE
+        runner.req_states.num_computed_tokens_np[0] = 0
+        assert manager.dispatch(1, 127, None).cg_mode == Mode.FULL
 
 
 pytestmark = pytest.mark.cpu_test

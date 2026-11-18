@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """CUDA constrained Top-K with table lookup and gather fused in Triton."""
 
 from __future__ import annotations
@@ -103,6 +103,7 @@ def _fused_topk_kernel(
     device_step,
     DEVICE_STEP: tl.constexpr,
     BLOCK: tl.constexpr,
+    OUTPUT_BLOCK: tl.constexpr,
     WINDOW_BLOCK: tl.constexpr,
 ):
     if DEVICE_STEP:
@@ -254,7 +255,13 @@ def _fused_topk_kernel(
     # promote the table offset before selecting the i64 sentinel.
     tie_key = tl.where(candidate_mask, offsets.to(tl.int64), 0x00000000FFFFFFFF)
     packed = (key64 << 32) | tie_key
-    sorted_pairs = tl.sort(packed, descending=False)
+    # Complement reverses signed-i64 order, retaining the exact score/tie key.
+    # Select only the output bucket instead of sorting the entire candidate row.
+    if OUTPUT_BLOCK == 1:
+        sorted_pairs = tl.min(packed, axis=0).expand_dims(0)
+    else:
+        sorted_pairs = ~tl.topk(~packed, OUTPUT_BLOCK)
+    offsets = tl.arange(0, OUTPUT_BLOCK)
     selected_offsets = (sorted_pairs & 0x00000000FFFFFFFF).to(tl.int64)
     sorted_keys = ((sorted_pairs >> 32) & 0x00000000FFFFFFFF).to(tl.int32)
     sorted_sign = sorted_keys >> 31
@@ -524,6 +531,127 @@ def _validate_nonoverlapping_outputs(outputs: tuple[tuple[str, torch.Tensor], ..
         ranges.append((name, tensor.device, begin, end))
 
 
+@triton.jit(
+    do_not_specialize=[
+        "logits_vocab_size",
+        "table_vocab_size",
+        "vocab_offset",
+        "pair_count",
+        "first_count",
+        "prefix1_value_count",
+        "prefix2_value_count",
+        "logits_row_stride",
+        "logits_vocab_stride",
+        "prefix_stride",
+        "temperature_count",
+        "top_k",
+    ]
+)
+def _stage_topk_kernel(
+    pointers,
+    logits_vocab_size,
+    table_vocab_size,
+    vocab_offset,
+    pair_count,
+    first_count,
+    prefix1_value_count,
+    prefix2_value_count,
+    logits_row_stride,
+    logits_vocab_stride,
+    prefix_stride,
+    temperature_count,
+    top_k,
+    device_step,
+    WRITE_WIRE_LOGPROBS: tl.constexpr,
+    PACK_PREFILL_RESULT: tl.constexpr,
+    TRIE_COUNT: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    OUTPUT_BLOCK: tl.constexpr,
+    WINDOW_BLOCK: tl.constexpr,
+):
+    # Scalar specialization controls do not recurse into tuple arguments.
+    # Keep strides and extents explicit, as in the original kernel, so the
+    # compiler retains its normalization reduction layout and fp32 rounding.
+    # The device remains authoritative, including stopped/error states. Each
+    # branch covers its complete stage degree; no Host prediction truncates it.
+    stage = tl.minimum(tl.maximum(tl.load(device_step), 0), 2)
+    if stage == 0:
+        _fused_topk_kernel(
+            *pointers,
+            logits_vocab_size,
+            table_vocab_size,
+            vocab_offset,
+            pair_count,
+            first_count,
+            prefix1_value_count,
+            prefix2_value_count,
+            logits_row_stride,
+            logits_vocab_stride,
+            prefix_stride,
+            temperature_count,
+            top_k,
+            WRITE_WIRE_LOGPROBS=WRITE_WIRE_LOGPROBS,
+            PACK_PREFILL_RESULT=PACK_PREFILL_RESULT,
+            TRIE_COUNT=TRIE_COUNT,
+            step=0,
+            device_step=None,
+            DEVICE_STEP=False,
+            BLOCK=BLOCKS[0],
+            OUTPUT_BLOCK=OUTPUT_BLOCK,
+            WINDOW_BLOCK=WINDOW_BLOCK,
+        )
+    elif stage == 1:
+        _fused_topk_kernel(
+            *pointers,
+            logits_vocab_size,
+            table_vocab_size,
+            vocab_offset,
+            pair_count,
+            first_count,
+            prefix1_value_count,
+            prefix2_value_count,
+            logits_row_stride,
+            logits_vocab_stride,
+            prefix_stride,
+            temperature_count,
+            top_k,
+            WRITE_WIRE_LOGPROBS=WRITE_WIRE_LOGPROBS,
+            PACK_PREFILL_RESULT=PACK_PREFILL_RESULT,
+            TRIE_COUNT=TRIE_COUNT,
+            step=1,
+            device_step=None,
+            DEVICE_STEP=False,
+            BLOCK=BLOCKS[1],
+            OUTPUT_BLOCK=OUTPUT_BLOCK,
+            WINDOW_BLOCK=WINDOW_BLOCK,
+        )
+    else:
+        _fused_topk_kernel(
+            *pointers,
+            logits_vocab_size,
+            table_vocab_size,
+            vocab_offset,
+            pair_count,
+            first_count,
+            prefix1_value_count,
+            prefix2_value_count,
+            logits_row_stride,
+            logits_vocab_stride,
+            prefix_stride,
+            temperature_count,
+            top_k,
+            WRITE_WIRE_LOGPROBS=WRITE_WIRE_LOGPROBS,
+            PACK_PREFILL_RESULT=PACK_PREFILL_RESULT,
+            TRIE_COUNT=TRIE_COUNT,
+            step=2,
+            device_step=None,
+            DEVICE_STEP=False,
+            BLOCK=BLOCKS[2],
+            OUTPUT_BLOCK=OUTPUT_BLOCK,
+            WINDOW_BLOCK=WINDOW_BLOCK,
+        )
+
+
 def _launch_rec_constrained_topk_cuda_out(
     logits: torch.Tensor,
     first_token_ids: torch.Tensor,
@@ -545,6 +673,7 @@ def _launch_rec_constrained_topk_cuda_out(
     out_prefill_payload: torch.Tensor | None = None,
     *,
     device_step: torch.Tensor | None = None,
+    stage_blocks: tuple[int, ...] | None = None,
     rows: int,
     block: int,
     flat_prefixes: torch.Tensor,
@@ -552,6 +681,50 @@ def _launch_rec_constrained_topk_cuda_out(
     trie_ids: torch.Tensor | None = None,
     first_token_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if stage_blocks is not None:
+        _stage_topk_kernel[(rows,)](
+            (
+                logits,
+                flat_prefixes,
+                trie_ids if trie_ids is not None else flat_prefixes,
+                first_token_offsets if first_token_offsets is not None else prefix1_offsets,
+                first_token_ids,
+                prefix1_offsets,
+                prefix1_values,
+                prefix1_pair_keys,
+                prefix2_value_offsets,
+                prefix2_values,
+                temperatures,
+                out_token_ids,
+                out_logprobs,
+                out_wire_logprobs if out_wire_logprobs is not None else out_logprobs,
+                out_valid_mask,
+                out_valid_counts,
+                out_prefill_status if out_prefill_status is not None else out_valid_counts,
+                out_prefill_payload if out_prefill_payload is not None else out_token_ids,
+            ),
+            logits.shape[1],
+            table_vocab_size,
+            vocab_offset,
+            prefix1_pair_keys.numel(),
+            first_token_ids.numel(),
+            prefix1_values.numel(),
+            prefix2_values.numel(),
+            logits.stride(0),
+            logits.stride(1),
+            flat_prefixes.shape[1],
+            temperatures.numel(),
+            top_k,
+            device_step,
+            WRITE_WIRE_LOGPROBS=out_wire_logprobs is not None,
+            PACK_PREFILL_RESULT=out_prefill_status is not None and out_prefill_payload is not None,
+            TRIE_COUNT=1 if first_token_offsets is None else first_token_offsets.numel() - 1,
+            BLOCKS=stage_blocks,
+            OUTPUT_BLOCK=triton.next_power_of_2(top_k),
+            WINDOW_BLOCK=2048,
+            num_warps=8 if block >= 2048 else 4,
+        )
+        return out_token_ids, out_logprobs, out_valid_mask, out_valid_counts
     _fused_topk_kernel[(rows,)](
         logits,
         flat_prefixes,
@@ -590,6 +763,7 @@ def _launch_rec_constrained_topk_cuda_out(
         device_step=device_step,
         DEVICE_STEP=device_step is not None,
         BLOCK=block,
+        OUTPUT_BLOCK=triton.next_power_of_2(top_k),
         WINDOW_BLOCK=2048,
         num_warps=8 if block >= 2048 else 4,
     )
@@ -725,6 +899,7 @@ def _rec_constrained_topk_cuda_out_unchecked(
     out_prefill_status: torch.Tensor | None = None,
     out_prefill_payload: torch.Tensor | None = None,
     device_step: torch.Tensor | None = None,
+    specialize_steps: bool = False,
     *,
     trie_ids: torch.Tensor | None = None,
     first_token_offsets: torch.Tensor | None = None,
@@ -746,6 +921,12 @@ def _rec_constrained_topk_cuda_out_unchecked(
     if device_step is not None:
         candidate_count = max(first_count, max_prefix1_degree, max_prefix2_degree)
     block = triton.next_power_of_2(max(top_k, candidate_count, 1))
+    stage_blocks = None
+    if specialize_steps and device_step is not None:
+        stage_blocks = tuple(
+            triton.next_power_of_2(max(top_k, degree, 1))
+            for degree in (first_count, max_prefix1_degree, max_prefix2_degree)
+        )
     flat_prefixes = sequence_group.view(rows, sequence_group.shape[-1])
     return _launch_rec_constrained_topk_cuda_out(
         logits,
@@ -767,6 +948,7 @@ def _rec_constrained_topk_cuda_out_unchecked(
         out_prefill_status,
         out_prefill_payload,
         device_step=device_step,
+        stage_blocks=stage_blocks,
         rows=rows,
         block=block,
         flat_prefixes=flat_prefixes,

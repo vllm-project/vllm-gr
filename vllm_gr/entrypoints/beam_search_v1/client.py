@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 """Submit, wait for, and clean up EngineCore-owned beam-search sessions."""
 
@@ -169,7 +169,9 @@ class BeamSearchClient:
                 raise TypeError("EngineCore returned a non-BeamBatchResult terminal value")
             session.terminal = True
             session.failed = result.failure is not None
-            return result
+            from vllm_gr.v1.beam.output_columns import materialize_beam_result
+
+            return materialize_beam_result(result)
         except EngineDeadError:
             raise
         except Exception as exc:  # noqa: BLE001 - EngineCore failure boundary
@@ -288,7 +290,9 @@ class AsyncBeamSearchClient:
             # exception returns to a caller that has no session handle.
             pass
 
-    async def wait_final(self, session: BeamSearchSession) -> BeamBatchResult:
+    async def wait_final(
+        self, session: BeamSearchSession, *, materialize: bool = True
+    ) -> BeamBatchResult:
         try:
             result = _get_engine_method(self.engine, "wait_gr_session")(
                 session.session_id, session.handle
@@ -299,6 +303,10 @@ class AsyncBeamSearchClient:
                 raise TypeError("EngineCore returned a non-BeamBatchResult terminal value")
             session.terminal = True
             session.failed = result.failure is not None
+            if materialize:
+                from vllm_gr.v1.beam.output_columns import materialize_beam_result
+
+                return materialize_beam_result(result)
             return result
         except EngineDeadError:
             raise

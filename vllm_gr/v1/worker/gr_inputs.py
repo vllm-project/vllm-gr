@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Asynchronous scheduling CPU preparation and ordered device binding, independent of output consumption."""
 
 from dataclasses import dataclass
@@ -7,8 +7,8 @@ from typing import Any
 
 import torch
 
-from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-    BeamAttentionMetadataBuilder,
+from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+    build_async_batch_layout,
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.engine.beam_search_v1 import GRStageMetadata
@@ -133,7 +133,7 @@ class GRInputBuffers:
             if len(block_ids[0]) < required:
                 raise ValueError("Asynchronous scheduling request is missing prompt KV block IDs")
             prompt_blocks.append(list(block_ids[0][:required]))
-        layout = BeamAttentionMetadataBuilder.build_async_batch_layout(
+        layout = build_async_batch_layout(
             width=self.width,
             prompt_lengths=list(view.num_prompt_tokens_by_request),
             decode_step=step,

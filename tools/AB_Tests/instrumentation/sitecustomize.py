@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Opt-in startup hook for the daily benchmark's lightweight CPU timers.
 
 Python imports ``sitecustomize`` automatically.  Keeping the hook in its own

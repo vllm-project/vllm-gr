@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Core contracts for NPU ModelRunner wrappers."""
 
 import struct
@@ -18,14 +18,15 @@ from vllm_gr.v1.beam.npu_execution_batch import (
     NPUBeamExecutionBatch,
     restore_npu_cache_pool_layout,
 )
+from vllm_gr.v1.worker import gr_context as _gr_context
+from vllm_gr.v1.worker import gr_execution as _gr_dispatch
 from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
-from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
 from vllm_gr.v1.worker.npu_beam_stage_adapter import (
-    NPUEagerFirstDecodeHandoff,
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
 from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
+from vllm_gr.v1.worker.npu_model_runner_inputs import InputBatchProxy
 
 
 def _eager_stage_output(
@@ -146,9 +147,7 @@ def test_npu_prefill_cache_hit_uses_scheduled_logits_and_full_decode_positions(
     winners = torch.arange(len(cached) * 3, dtype=torch.int32).view(len(cached), 3)
     input_ids = torch.empty(len(cached) * 3, dtype=torch.int32)
     positions = torch.empty_like(input_ids)
-    NPUEagerFirstDecodeHandoff.from_prefill(plan, winners).bind_first_decode(
-        decode_plan, input_ids, positions
-    )
+    decode_plan.prepare_decode_inputs(input_ids, positions, winners)
     assert input_ids.tolist() == winners.flatten().tolist()
     assert positions.tolist() == [
         length for length in plan.execution.num_prompt_tokens_by_request for _ in range(3)
@@ -208,7 +207,7 @@ def test_npu_prepare_unproxies_and_preserves_native_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     input_batch = SimpleNamespace(req_ids=["request"])
-    proxy = InputBatchProxy(input_batch, ["request"], [0], [0])
+    proxy = InputBatchProxy(input_batch, ["request"], [0], [0], device=torch.device("cpu"))
     spec_metadata = object()
     runner = SimpleNamespace(
         input_batch=proxy,
@@ -256,7 +255,6 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
     )
     ordinary_result = (["lp"], ["valid"], object(), ["request"], {"request": 0}, [3])
     sampler_output = object()
-    reduced: list[object] = []
 
     def original(
         self: Any,
@@ -266,27 +264,18 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
     ) -> tuple[Any, ...]:
         if getattr(scheduler_output, "fail", False):
             raise RuntimeError("boom")
-        if getattr(scheduler_output, "beam_data", {}):
-            assert reduced == [sampler_output]
         return ordinary_result
 
     def collapse(
         self: Any,
-        orig_batch: Any,
         configs: Any,
         beam_data: Any,
         sampler: Any,
     ) -> tuple[list[str], dict[str, int], int]:
-        assert orig_batch is original_batch
         assert sampler is sampler_output
         return ["beam"], {"beam": 0}, 1
 
     monkeypatch.setattr(npu_patch, "_beam_collapse_bookkeeping", collapse)
-    monkeypatch.setattr(
-        npu_patch,
-        "_reduce_sampler_output_for_worker_decision",
-        lambda _runner, output: reduced.append(output),
-    )
     wrapped = npu_patch.make_patched_bookkeeping_sync(original)
 
     assert wrapped(runner, SimpleNamespace(beam_data={}), sampler_output) is ordinary_result
@@ -351,7 +340,9 @@ def test_npu_sample_patch_is_signature_agnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The NPU legacy branch tolerates a different positional signature."""
-    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+    from vllm_gr.v1.worker.model_runner_contracts import (
+        _WORKER_SAMPLE_PATCH_MARKER,
+    )
 
     events: list[str] = []
     sample_output = object()
@@ -1165,9 +1156,7 @@ def test_npu_determine_width_mismatch_no_full() -> None:
 
 
 def _stub_gr_config(monkeypatch: pytest.MonkeyPatch, gr_cfg: Any) -> None:
-    import vllm_gr.v1.worker.model_runner_common as common
-
-    monkeypatch.setattr(common, "_get_gr_config", lambda r: gr_cfg)
+    monkeypatch.setattr(_gr_context, "_get_gr_config", lambda r: gr_cfg)
 
 
 def test_npu_capture_disabled_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1455,27 +1444,25 @@ def test_npu_capture_logs_requested_and_retained_resources(
     assert "excludes graph and scratch memory" in messages[-1]
 
 
-def test_npu_eager_decode_binds_winners_and_sampling_rows() -> None:
-    prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
-    plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("decode_step", "expected_positions"),
+    [(0, [2, 2, 2, 3, 3, 3, -1, -1]), (1, [3, 3, 3, 4, 4, 4, -1, -1])],
+)
+def test_npu_eager_decode_binds_previous_winners(
+    decode_step: int, expected_positions: list[int]
+) -> None:
+    plan = NPUEagerStagePlan.from_scheduler_output(
+        _eager_stage_output(kind="decode", decode_step=decode_step)
+    )
     input_ids = torch.full((8,), -1, dtype=torch.int32)
     positions = torch.full((8,), -1, dtype=torch.int64)
     winners = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
-    handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
 
-    handoff.bind_first_decode(plan, input_ids, positions)
+    plan.prepare_decode_inputs(input_ids, positions, winners)
 
     assert input_ids.tolist() == [11, 12, 13, 21, 22, 23, -1, -1]
-    assert positions.tolist() == [2, 2, 2, 3, 3, 3, -1, -1]
-    source = SimpleNamespace(
-        temperature=torch.tensor([0.5, 0.9]),
-        top_p=torch.tensor([0.8, 0.7]),
-    )
-    remapped = plan.remap_sampling_metadata(source)
-    assert remapped is not source
-    assert remapped.temperature.tolist() == pytest.approx([0.5] * 3 + [0.9] * 3)
-    assert remapped.top_p.tolist() == pytest.approx([0.8] * 3 + [0.7] * 3)
-    assert source.temperature.tolist() == pytest.approx([0.5, 0.9])
+    assert positions.tolist() == expected_positions
 
 
 class _NPUPositionTensor(torch.Tensor):  # type: ignore[misc]
@@ -1821,23 +1808,6 @@ def test_npu_decode_positions_dynamic_widths_match_original_across_async_steps(
         assert torch.all(actual[rows:] == -9)
 
 
-def test_npu_eager_attention_layout_keeps_request_ownership() -> None:
-    plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
-    layout = plan.build_decode_attention_layout(
-        block_ids_by_request=((10, 11), (20, 21)),
-        pool_slots=(4, 7),
-    )
-
-    assert layout.row_request_indices == (0, 0, 0, 1, 1, 1)
-    assert layout.row_beam_indices == (0, 1, 2, 0, 1, 2)
-    assert layout.query_start_locations == tuple(range(7))
-    assert layout.prefix_sequence_lengths == (2, 2, 2, 3, 3, 3)
-    assert layout.suffix_sequence_lengths == (1,) * 6
-    assert layout.prefix_block_tables[:3] == ((10, 11),) * 3
-    assert layout.prefix_block_tables[3:] == ((20, 21),) * 3
-    assert layout.pool_slots == (4, 7)
-
-
 def test_npu_capability_gate_allows_graph_mode_and_remains_npu_only() -> None:
     worker = SimpleNamespace(
         device="npu",
@@ -1859,12 +1829,21 @@ def test_npu_capability_gate_allows_graph_mode_and_remains_npu_only() -> None:
         validate_npu_eager_capabilities(worker)
 
 
-def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> None:
-    scheduler_output = _eager_stage_output(kind="decode")
+@pytest.mark.parametrize("decode_step", [0, 1])  # type: ignore[misc]
+def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler(
+    decode_step: int,
+) -> None:
+    scheduler_output = _eager_stage_output(kind="decode", decode_step=decode_step)
     plan = NPUEagerStagePlan.from_scheduler_output(scheduler_output)
-    prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
     winners = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
-    input_batch = SimpleNamespace(req_ids=list(plan.execution.request_ids))
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([0.5, 0.9]),
+        top_p=torch.tensor([0.8, 0.7]),
+        top_k=torch.tensor([5, 9], dtype=torch.int32),
+    )
+    input_batch = SimpleNamespace(
+        req_ids=list(plan.execution.request_ids), sampling_metadata=sampling_metadata
+    )
     worker = SimpleNamespace(
         device=torch.device("cpu"),
         input_ids=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32)),
@@ -1876,7 +1855,6 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> 
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker = worker
     stage.pending_plan = plan
-    stage.handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
     stage.latest_token_ids = winners
     runtime_output = stage._runtime_scheduler_output(scheduler_output, plan)
     worker._current_scheduler_output = runtime_output
@@ -1902,17 +1880,29 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> 
         "request-1": 1,
     }
     assert worker.input_ids.gpu[:6].tolist() == [11, 12, 13, 21, 22, 23]
-    assert worker.positions[:6].tolist() == [2, 2, 2, 3, 3, 3]
+    assert worker.positions[:6].tolist() == [value + decode_step for value in (2, 2, 2, 3, 3, 3)]
     assert logits.tolist() == list(range(6))
     assert total == 6
     assert isinstance(worker.input_batch, InputBatchProxy)
+    # Bookkeeping retains B logical ids; indexed/copy access maps B*W rows.
+    assert len(worker.input_batch.req_ids) == 2
+    assert worker.input_batch.req_ids.copy() == ["request-0"] * 3 + ["request-1"] * 3
+    assert worker.input_batch.req_ids[3] == "request-1"
+    assert input_batch.req_ids == ["request-0", "request-1"]
+    assert worker._current_beam_info["req_ids"] == input_batch.req_ids
+    remapped = worker.input_batch.sampling_metadata
+    assert remapped is sampling_metadata
+    assert remapped.temperature.tolist() == pytest.approx([0.5] * 3 + [0.9] * 3)
+    assert remapped.top_p.tolist() == pytest.approx([0.8] * 3 + [0.7] * 3)
+    assert remapped.top_k.tolist() == [5] * 3 + [9] * 3
+    assert remapped.top_k.dtype == torch.int32
+    assert remapped.temperature.is_contiguous() and remapped.top_p.is_contiguous()
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu", "cpu"])  # type: ignore[misc]
 def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
     from unittest.mock import Mock
 
-    import vllm_gr.v1.worker.model_runner_common as common
     from vllm_gr.v1.worker import gpu_beam_stage_runner, npu_beam_stage_runner
 
     output = object()
@@ -1926,11 +1916,14 @@ def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, d
     scheduled = _eager_stage_output(kind="prefill")
     if device == "cpu":
         with pytest.raises(ValueError, match="no execution adapter"):
-            common._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
+            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
         cuda.assert_not_called()
         npu.assert_not_called()
     else:
-        assert common._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks) is output
+        assert (
+            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
+            is output
+        )
         if device == "cuda":
             assert cuda.call_args.kwargs["hooks_type"] is hooks
             npu.assert_not_called()
@@ -1941,7 +1934,6 @@ def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, d
 
 def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-    from vllm_gr.v1.worker import model_runner_common as common
 
     def context(batch_size: int) -> BeamAttentionContext:
         return BeamAttentionContext(batch_size, 4, 1, 3, 2, 1, torch.device("cpu"), torch.float16)
@@ -1972,8 +1964,8 @@ def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch
         created.append(max_batch)
         return context(max_batch)
 
-    monkeypatch.setattr(common, "_create_beam_context", create)
-    monkeypatch.setattr(common, "_get_gr_config", lambda worker: object())
+    monkeypatch.setattr(_gr_context, "_create_beam_context", create)
+    monkeypatch.setattr(_gr_context, "_get_gr_config", lambda worker: object())
     for batch_size in (2, 1, 2):
         scheduled = _eager_stage_output(kind="decode", batch_size=batch_size, beam_width=4)
         next(iter(scheduled.gr_stage_metadata.values())).beam_params.max_tokens = 3
@@ -2003,8 +1995,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     """Mirror the 0.30.0rc2 first-decode call order through the real GR hooks."""
     from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
-    from vllm_gr.v1.worker import model_runner_common as common
-    from vllm_gr.v1.worker import npu_beam_stage_runner
+    from vllm_gr.v1.worker import npu_beam_stage_runner, npu_model_runner_inputs
 
     logical = _eager_stage_output(kind="decode")
     metadata = next(iter(logical.gr_stage_metadata.values()))
@@ -2029,7 +2020,6 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker, stage.previous = worker, prefill.execution
     stage.closed, stage.pending_plan, stage.execution_error = False, None, None
-    stage.handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
     stage.latest_token_ids = winners
     stage.session_request = None
     stage.attention_batch = SimpleNamespace(
@@ -2044,7 +2034,9 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     monkeypatch.setattr(npu_beam_stage_runner, "get_npu_stage_runner", lambda *args: stage)
     arange = torch.arange
     monkeypatch.setattr(torch, "arange", lambda *args, **kwargs: arange(*args, dtype=torch.int32))
-    monkeypatch.setattr(common, "_materialize_logits_indices", lambda _, rows: torch.tensor(rows))
+    monkeypatch.setattr(
+        npu_model_runner_inputs, "_materialize_logits_indices", lambda _, rows: torch.tensor(rows)
+    )
     seen: list[str] = []
 
     def update(self: Any, scheduled: Any) -> None:
@@ -2095,7 +2087,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
         seen.append("six_token_forward")
         return SimpleNamespace(logits=input_ids[:, None].float())
 
-    result = common._dispatch_stage_frame(worker, logical, native)
+    result = _gr_dispatch._dispatch_stage_frame(worker, logical, native)
     assert result.logits.shape == (6, 1)
     assert logical.total_num_scheduled_tokens == 2
     assert tuple(logical.num_scheduled_tokens.values()) == (1, 1)
@@ -2111,7 +2103,6 @@ def test_npu_failed_execute_reaches_sample_without_native_fallback(
 ) -> None:
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import model_runner_common as common
     from vllm_gr.v1.worker import npu_beam_stage_runner
 
     failure = ValueError("injected execute failure")
@@ -2127,7 +2118,7 @@ def test_npu_failed_execute_reaches_sample_without_native_fallback(
     if failure_point == "plan":
         monkeypatch.setattr(stage, "_validate_sequence", fail)
     with pytest.raises(ValueError) as execute_error:
-        common._dispatch_stage_frame(worker, scheduled, fail)
+        _gr_dispatch._dispatch_stage_frame(worker, scheduled, fail)
     assert execute_error.value is failure
     native_sample = Mock(side_effect=AssertionError("native sampler must not run"))
 
@@ -2191,7 +2182,6 @@ def test_npu_stage_runner_receipt_preserves_owner_generation() -> None:
     stage.pending_plan = plan
     stage.logits = torch.zeros((1, 16), dtype=torch.float32)
     stage.prefill_candidates = None
-    stage.handoff = None
     stage.latest_token_ids = None
     stage.attention_batch = None
     stage.closed = False
@@ -2200,6 +2190,129 @@ def test_npu_stage_runner_receipt_preserves_owner_generation() -> None:
 
     result = output.gr_worker_results[plan.execution.session_id]
     assert result.owner_generation == plan.execution.owner_generation == 1
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("candidate_top_k", "candidate_shape", "error_type", "message"),
+    [
+        (3, (2, 3), BeamExecutionContractError, "Prefill winner_token_ids must have shape (2, 2)"),
+        (1, (2, 1), BeamExecutionContractError, "Prefill winner_token_ids must have shape (2, 2)"),
+        (3, (2, 2), RuntimeError, "NPU candidate selection returned an invalid candidate shape"),
+        (2, (1, 2), RuntimeError, "NPU candidate selection returned an invalid candidate shape"),
+    ],
+)
+def test_npu_prefill_sample_preserves_candidate_and_winner_shape_errors(
+    candidate_top_k: int,
+    candidate_shape: tuple[int, int],
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    scheduled = _eager_stage_output(kind="prefill", beam_width=2 if candidate_top_k == 1 else 4)
+    metadata = next(iter(scheduled.gr_stage_metadata.values()))
+    metadata.beam_params.temperature = 0.0
+    # A dynamic schedule rejects K < W before sampling; exercise that case
+    # through fixed-width execution so it reaches the winner-shape check.
+    if candidate_top_k != 1:
+        metadata.beam_params.dynamic_beam_widths = (2, 2, 2)
+    metadata.beam_params.candidate_width = candidate_top_k
+    metadata.is_last_stage = False
+    plan = NPUEagerStagePlan.from_scheduler_output(scheduled)
+    candidates = ConstraintOutput(
+        token_ids=torch.ones(candidate_shape, dtype=torch.int32),
+        logprobs=torch.zeros(candidate_shape),
+        valid_mask=torch.ones(candidate_shape, dtype=torch.bool),
+    )
+
+    def select(logits: torch.Tensor, constraint: ConstraintMetadata) -> ConstraintOutput:
+        assert constraint.current_step == 0 and constraint.top_k == candidate_top_k
+        return candidates
+
+    worker = SimpleNamespace(
+        _current_scheduler_output=scheduled,
+        constraint_backend=SimpleNamespace(info=SimpleNamespace(max_rows=2), select=select),
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.worker, stage.pending_plan, stage.execution_error = worker, plan, None
+    previous_candidates = object()
+    previous_token_ids = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
+    logits = torch.zeros((2, 16))
+    stage.prefill_candidates = previous_candidates
+    stage.latest_token_ids = previous_token_ids
+    stage.logits = logits
+
+    with pytest.raises(error_type) as error:
+        stage.sample()
+
+    assert error.type is error_type
+    assert str(error.value) == message
+
+    if error_type is BeamExecutionContractError:
+        assert stage.prefill_candidates is candidates
+    else:
+        assert stage.prefill_candidates is previous_candidates
+    assert stage.latest_token_ids is previous_token_ids
+    assert stage.pending_plan is plan
+    assert stage.logits is logits
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_npu_decode_sample_accepts_candidate_width_distinct_from_winner_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker import npu_beam_stage_runner
+
+    scheduled = _eager_stage_output(kind="decode", batch_size=1, beam_width=2)
+    metadata = next(iter(scheduled.gr_stage_metadata.values()))
+    metadata.beam_params.temperature = 0.0
+    metadata.beam_params.candidate_width = 3
+    metadata.is_last_stage = False
+    metadata.output_device_state = None
+    plan = NPUEagerStagePlan.from_scheduler_output(scheduled)
+    candidates = ConstraintOutput(
+        token_ids=torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32),
+        logprobs=torch.zeros((2, 3)),
+        valid_mask=torch.ones((2, 3), dtype=torch.bool),
+    )
+    winners = torch.tensor([[11, 21]], dtype=torch.int32)
+
+    def select(logits: torch.Tensor, constraint: ConstraintMetadata) -> ConstraintOutput:
+        assert constraint.current_step == 1 and constraint.top_k == 3
+        return candidates
+
+    def decide(
+        worker: Any,
+        attention_batch: Any,
+        token_ids: torch.Tensor,
+        logprobs: torch.Tensor,
+        *,
+        is_last_step: bool,
+        result_width: int,
+    ) -> dict[str, torch.Tensor]:
+        assert token_ids is candidates.token_ids
+        assert logprobs.shape == (2, 3)
+        assert not is_last_step and result_width == 2
+        return {"out_token_ids": winners}
+
+    monkeypatch.setattr(npu_beam_stage_runner, "run_beam_decision_candidates", decide)
+    worker = SimpleNamespace(
+        _current_scheduler_output=scheduled,
+        constraint_backend=SimpleNamespace(info=SimpleNamespace(max_rows=2), select=select),
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.worker, stage.pending_plan, stage.execution_error = worker, plan, None
+    stage.logits = torch.zeros((2, 16))
+    stage.session_request = SimpleNamespace(
+        output_options=SimpleNamespace(include_parent_beam_indices=False)
+    )
+    stage.attention_batch = SimpleNamespace(
+        context=SimpleNamespace(decision=SimpleNamespace(sequence=torch.zeros((1, 2, 1))))
+    )
+
+    output = stage.sample()
+
+    assert stage.latest_token_ids is winners
+    assert output.gr_worker_results[plan.execution.session_id].stage_index == 1
 
 
 def test_npu_execution_batch_flattens_only_the_xllm_attention_view() -> None:
@@ -2413,6 +2526,86 @@ def _terminal_result_runner(
         ),
     )
     return stage
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "batch,width,steps", [(1, 64, 1), (1, 128, 3), (4, 64, 2), (4, 128, 3)]
+)
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "include_score,include_parents", [(True, True), (False, False), (True, False), (False, True)]
+)
+@pytest.mark.parametrize("penalty", [0.0, 1.0, -1.0])  # type: ignore[misc]
+def test_npu_cpu_columns_materialize_identically_to_stop_aware_rows(
+    batch: int, width: int, steps: int, include_score: bool, include_parents: bool, penalty: float
+) -> None:
+    from vllm_gr.v1.beam.batch_contracts import BeamSequenceColumns
+    from vllm_gr.v1.beam.output_columns import (
+        materialize_beam_result,
+        validate_complete_sequences,
+    )
+
+    stage = _terminal_result_runner(
+        batch,
+        returned=width,
+        penalty=penalty,
+        include_score=include_score,
+        include_parents=include_parents,
+    )
+    stage.session_request.beam_params.max_tokens = steps
+    tokens = torch.arange(batch * width * steps, dtype=torch.int32).view(batch, width, steps)
+    parents = torch.zeros_like(tokens)
+    # Ties, both signed zeros, and nonfinite candidates exercise the original
+    # Python ranking. Scores are transported as their original float32 bits.
+    scores = (torch.arange(batch * width, dtype=torch.float32).view(batch, width) % 7) * -0.125
+    scores[:, :5] = torch.tensor([float("nan"), float("inf"), -float("inf"), -0.0, 0.0])
+    columns = stage._build_terminal_result(tokens, scores, parents)
+    assert columns.output is not None
+    for item in columns.output.items:
+        assert isinstance(item.sequences, BeamSequenceColumns)
+        validate_complete_sequences(item.sequences)
+    # A stop ID absent from the input selects the unchanged row path without
+    # changing any sequence's length, score normalization, or return limit.
+    stage.session_request.beam_params.stop_token_ids = (2**31 - 1,)
+    rows = stage._build_terminal_result(tokens, scores, parents)
+    materialized = materialize_beam_result(columns)
+    assert materialized == rows
+    if include_score:
+        for left, right in zip(materialized.output.items, rows.output.items, strict=True):
+            assert [struct.pack("<f", x.cumulative_logprob) for x in left.sequences] == [
+                struct.pack("<f", x.cumulative_logprob) for x in right.sequences
+            ]
+    # Serialized columns own their bytes even after worker tensors are reused.
+    tokens.fill_(99)
+    parents.fill_(99)
+    scores.fill_(99)
+    assert materialize_beam_result(columns) == rows
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "width,returned,steps,budget,stop_ids",
+    [(32, 32, 3, 3, ()), (128, 2, 3, 3, ()), (64, 64, 2, 3, ()), (64, 64, 3, 3, (99,))],
+)
+def test_npu_cpu_columns_keep_unsupported_results_on_rows(
+    width: int, returned: int, steps: int, budget: int, stop_ids: tuple[int, ...]
+) -> None:
+    stage = _terminal_result_runner(1, returned=returned, stop_ids=stop_ids)
+    stage.session_request.beam_params.max_tokens = budget
+    tokens = torch.full((1, width, steps), 99, dtype=torch.int32)
+    result = stage._build_terminal_result(tokens, torch.zeros(1, width), torch.zeros_like(tokens))
+    assert result.output is not None
+    assert isinstance(result.output.items[0].sequences, tuple)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_npu_cpu_columns_all_invalid_preserves_lazy_normalization_failure() -> None:
+    stage = _terminal_result_runner(4, returned=64, penalty=1e6)
+    stage.session_request.beam_params.max_tokens = 3
+    tokens = torch.zeros(4, 64, 3, dtype=torch.int32)
+    result = stage._build_terminal_result(tokens, torch.full((4, 64), -float("inf")), tokens)
+    assert result.output is None
+    assert (result.failure.code, result.failure.item_index) == ("no_valid_beams", 0)
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]

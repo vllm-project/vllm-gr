@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Real CUDA capture/replay using the native V2 model factory and PW wrapper.
 
 The toy model covers reload/recovery; a boundary test uses real Prefill attention

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
+from collections.abc import Iterator
 from importlib.metadata import PackageNotFoundError
 from unittest import mock
 
@@ -13,29 +14,42 @@ from vllm_gr._env_check import (
 )
 
 
-def test_environment_checks_only_vllm_on_non_npu() -> None:
-    for device_type in ("cpu", "cuda"):
-        platform = mock.Mock(device_type=device_type)
-        expected = {"vllm": "0.30.0"}
+@pytest.fixture  # type: ignore[misc]
+def backend_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
 
-        with (
-            mock.patch("vllm.platforms.current_platform", platform),
-            mock.patch(
-                "vllm_gr._env_check.check_runtime_versions", return_value=expected
-            ) as check_versions,
-            mock.patch("vllm_gr._env_check.check_ascend_environment") as check_ascend,
-        ):
-            report = check_environment()
-
-        assert report is expected
-        check_versions.assert_called_once_with()
-        check_ascend.assert_not_called()
+    _reset_backend_registry_for_tests()
+    monkeypatch.setattr(loader, "entry_points", lambda **kwargs: ())
+    yield
+    _reset_backend_registry_for_tests()
 
 
-def test_environment_checks_ascend_runtime_on_npu() -> None:
+def test_environment_checks_only_vllm_on_non_npu(backend_registry: None) -> None:
+    from vllm_gr.platforms.cuda import CUDA_BACKEND
+    from vllm_gr.platforms.registry import get_active_backend
+
+    platform = mock.Mock(device_type="cuda")
+    with (
+        mock.patch("vllm.platforms.current_platform", platform),
+        mock.patch(
+            "vllm_gr._env_check.check_runtime_versions", return_value={"vllm": "0.30.0"}
+        ) as check_versions,
+        mock.patch("vllm_gr._env_check.check_ascend_environment") as check_ascend,
+    ):
+        assert check_environment() == {"vllm": "0.30.0", "platform": "cuda"}
+        assert get_active_backend() is CUDA_BACKEND
+
+    check_versions.assert_called_once_with()
+    check_ascend.assert_not_called()
+
+
+def test_environment_checks_ascend_runtime_on_npu(backend_registry: None) -> None:
+    from vllm_gr.platforms.npu import NPU_BACKEND
+    from vllm_gr.platforms.registry import get_active_backend
+
     platform = mock.Mock(device_type="npu")
-    expected = {"vllm": "0.30.0", "vllm-ascend": "0.30.0rc2"}
-
+    expected = {"vllm": "0.30.0", "vllm-ascend": "0.30.0rc2", "platform": "npu"}
     with (
         mock.patch("vllm.platforms.current_platform", platform),
         mock.patch("vllm_gr._env_check.check_runtime_versions") as check_versions,
@@ -43,10 +57,23 @@ def test_environment_checks_ascend_runtime_on_npu() -> None:
             "vllm_gr._env_check.check_ascend_environment", return_value=expected
         ) as check_ascend,
     ):
-        report = check_environment()
+        assert check_environment() is expected
+        assert get_active_backend() is NPU_BACKEND
 
-    assert report is expected
-    check_ascend.assert_called_once_with()
+    check_ascend.assert_called_once_with(require_npu_platform=True)
+    check_versions.assert_not_called()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_environment_rejects_unknown_platform_without_cuda_fallback(backend_registry: None) -> None:
+    from vllm_gr.platforms.errors import UnsupportedBackendError
+
+    with (
+        mock.patch("vllm.platforms.current_platform", mock.Mock(device_type="unknown")),
+        mock.patch("vllm_gr._env_check.check_runtime_versions") as check_versions,
+        pytest.raises(UnsupportedBackendError, match="unknown"),
+    ):
+        check_environment()
     check_versions.assert_not_called()
 
 

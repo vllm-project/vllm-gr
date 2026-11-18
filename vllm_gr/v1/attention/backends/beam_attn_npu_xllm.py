@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """xLLM fused-operator execution primitives for the Beam Attention backend.
 
 NPU-only execution module selected by ``_get_platform_execution_module`` when
 ``vllm_gr_npu_decode_execution == "xllm"``.  It replaces the cascade
 per-operator path only for the incremental beam decode branch; every other
-branch (std requests, prefill, suffix recompute) forwards to
+branch (std requests, prefill) forwards to
 ``beam_attn_npu`` unchanged, and the CUDA path is never touched.
 
 The incremental branch becomes a single fused ``x_attention`` call that
@@ -22,16 +22,20 @@ from typing import cast
 
 import torch
 import torch_npu
+from vllm.logger import init_logger
 
 from vllm_gr.ops.npu import beam_ops
 from vllm_gr.v1.attention.backends import beam_attn_npu
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
+    require_beam_decode_session,
 )
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     interleaved_pool_base,
 )
 from vllm_gr.v1.beam.npu_execution_batch import restore_npu_cache_pool_layout
+
+logger = init_logger(__name__)
 
 # Fail fast when the mode selects this module but the operator library is
 # missing: without this check the failure would surface at the first beam
@@ -271,6 +275,26 @@ def _gather_shared_blocks(
     return gathered_key, gathered_value, remapped_table
 
 
+def _direct_attention_output(
+    output: torch.Tensor, query: torch.Tensor, attn_metadata: BeamAttentionMetadata
+) -> torch.Tensor | None:
+    """Only pure Beam rows have a caller-owned contiguous leading view."""
+    if attn_metadata.std_indices is not None:
+        return None
+    from vllm_gr.ops.npu._xattention_out import x_attention_out_available
+
+    # Most deployments initially use the original allocating binding. Its
+    # cached absence must not add per-layer output views or format/alias checks.
+    if not x_attention_out_available():
+        return None
+    if not output.is_contiguous() or query.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    view = output[: attn_metadata.num_prefix_indices]
+    if view.shape != query.shape or view.dtype != query.dtype or view.device != query.device:
+        return None
+    return view
+
+
 def _xllm_incremental_decode(
     output: torch.Tensor,
     query: torch.Tensor,
@@ -359,6 +383,7 @@ def _xllm_incremental_decode(
         shared_key = key_cache.contiguous()
         shared_value = value_cache.contiguous()
 
+    direct_output = _direct_attention_output(output, beam_query, attn_metadata)
     out = beam_ops.x_attention(
         beam_query,
         shared_key,
@@ -369,7 +394,10 @@ def _xllm_incremental_decode(
         seqlens_kv,
         step_count,
         0.0,  # auto 1/sqrt(head_dim), validated above
+        out=direct_output,
     )
+    if direct_output is not None:
+        return
     # Scatter into the layer output: slice copy for a pure beam batch (rows
     # [0, num_prefix_indices) are exactly the beam rows; index_put_ here was
     # a host-blocking op), fancy-index scatter otherwise.
@@ -377,6 +405,43 @@ def _xllm_incremental_decode(
         output[: attn_metadata.num_prefix_indices] = out
     else:
         output[attn_metadata.prefix_indices] = out
+
+
+def _cascade_fallback_reason(
+    attn_metadata: BeamAttentionMetadata,
+    sliding_window_size: list[int] | tuple[int, int] | None,
+    logits_soft_cap: float,
+    s_aux: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    beam_pool: object | None,
+) -> str | None:
+    """Return why fused xLLM decode cannot run, or None when eligible."""
+
+    if not getattr(attn_metadata, "is_beam_decode", False):
+        return "not_beam_decode"
+    beam_session = getattr(attn_metadata, "beam_session", None)
+    if beam_session is None:
+        return "missing_beam_session"
+    if not beam_session.is_active:
+        return "inactive_beam_session"
+    if attn_metadata.std_indices is not None:
+        return "mixed_std_beam_batch"
+    if attn_metadata.prefix_indices is None:
+        return "missing_prefix_indices"
+    # (-1, -1) is the "no sliding window" sentinel used by models without one.
+    if sliding_window_size is not None and any(
+        window is not None and window >= 0 for window in sliding_window_size
+    ):
+        return "sliding_window"
+    if logits_soft_cap:
+        return "logits_soft_cap"
+    if s_aux is not None:
+        return "attention_sinks"
+    if alibi_slopes is not None:
+        return "alibi"
+    if beam_pool is None:
+        return "missing_beam_pool"
+    return None
 
 
 def cascade_attention(
@@ -397,12 +462,11 @@ def cascade_attention(
 
     Mixed std/beam batches and missing prefix_indices/pool are delegated
     to ``beam_attn_npu.cascade_attention``, which handles those layouts.
+    Invalid Beam decode metadata is rejected before either execution path.
     Sliding-window, softcap, ALiBi and sink configurations are unsupported
     by both NPU execution paths and rejected by ``BeamAttentionImpl`` at
     initialization; delegation does not add support for those semantics.
     """
-    beam_session = getattr(attn_metadata, "beam_session", None)
-    is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
 
     def _fallback_to_cascade() -> None:
         beam_attn_npu.cascade_attention(
@@ -420,54 +484,34 @@ def cascade_attention(
             beam_pool=beam_pool,
         )
 
-    if is_beam_decode and beam_session is not None and beam_session.is_active:
-        if attn_metadata.std_indices is not None:
-            # Mixed std/beam batch: the fused kernel only encodes beam rows;
-            # the cascade module handles both branches.
-            _fallback_to_cascade()
-            return
-        if attn_metadata.prefix_indices is None:
-            # No beam-row routing: cannot gather beam queries for the fused
-            # kernel.  Loud failure would be a user-visible crash for a shape
-            # cascade handles (its beam branch falls back to full gather).
-            _fallback_to_cascade()
-            return
-        # (-1, -1) is the "no sliding window" sentinel. BeamAttentionImpl
-        # rejects unsupported attention features before selecting this module.
-        if sliding_window_size is not None and any(
-            w is not None and w >= 0 for w in sliding_window_size
-        ):
-            _fallback_to_cascade()
-            return
-        if logits_soft_cap:
-            _fallback_to_cascade()
-            return
-        if s_aux is not None:
-            _fallback_to_cascade()
-            return
-        if alibi_slopes is not None:
-            _fallback_to_cascade()
-            return
-        if beam_pool is None:
-            # No per-layer pool passed: the fused kernel requires it, the
-            # cascade module falls back to metadata-based pool resolution.
-            _fallback_to_cascade()
-            return
-        _xllm_incremental_decode(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            attn_metadata,
-            beam_session,
-            beam_pool,
-            scale,
-        )
+    if getattr(attn_metadata, "is_beam_decode", False) or attn_metadata.prefix_indices is not None:
+        require_beam_decode_session(attn_metadata)
+
+    fallback_reason = _cascade_fallback_reason(
+        attn_metadata,
+        sliding_window_size,
+        logits_soft_cap,
+        s_aux,
+        alibi_slopes,
+        beam_pool,
+    )
+    if fallback_reason is not None:
+        logger.debug("NPU Beam xLLM decode fallback: %s", fallback_reason)
+        _fallback_to_cascade()
         return
 
-    # Std requests, prefill, recompute and mixed batches keep the cascade
-    # implementation.
-    _fallback_to_cascade()
+    beam_session = attn_metadata.beam_session
+    assert beam_session is not None
+    _xllm_incremental_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        beam_session,
+        beam_pool,
+        scale,
+    )
 
 
 __all__ = [

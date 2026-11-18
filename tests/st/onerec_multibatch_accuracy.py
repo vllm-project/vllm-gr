@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Real video accuracy for beam_search_v1, using the system benchmark evaluator.
 
 Run as a module in a fresh process. The runner flag selects ModelRunner;

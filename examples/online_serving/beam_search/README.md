@@ -16,9 +16,19 @@ for this example. NPU execution choices are documented in the NPU quickstart.
 
 ## Start the server
 
+The HTTP server uses vLLM's optional `--api-key` or `VLLM_API_KEY` and accepts
+`Authorization: Bearer <key>` on protected routes. Without a key, that check
+is disabled. In the supported vLLM runtime, the check covers paths beginning
+with `/v1`, `/v2`, `/inference`, and `/cohere`; other routes, such as `/health`
+and `/invocations`, are not covered, and `OPTIONS` requests are skipped. Verify
+the installed vLLM version and enabled routes. Restrict access to the backend
+and use the deployment's
+gateway for TLS, authentication, authorization, and route restrictions.
+See the [security policy](../../../SECURITY.md).
+
 ```bash
 export ONEREC_MODEL=/absolute/path/to/OneRec-1.7B
-vllm-gr serve "$ONEREC_MODEL" \
+vllm serve "$ONEREC_MODEL" --gr \
   --served-model-name onerec \
   --vllm-gr-config ./vllm_gr_config.yaml \
   --default-chat-template-kwargs '{"enable_thinking": false}' \

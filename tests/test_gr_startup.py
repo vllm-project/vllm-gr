@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Startup graph publication is conditional on capture, release and GPU health."""
 
+from collections.abc import Callable
+from functools import partial
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock
@@ -12,8 +14,10 @@ import torch
 from vllm_gr.v1.worker import gpu_beam_stage_runner as stages
 from vllm_gr.v1.worker import gr_startup as startup
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
-from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import capture_multibatch_forward
+from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
 
 CaptureRuntime = tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace, Mock, Mock]
 
@@ -81,10 +85,17 @@ def _capture(worker: SimpleNamespace, *, allow: bool = True) -> bool:
     return bool(capture_multibatch_forward(worker, allow_eager_fallback=allow))
 
 
-@pytest.mark.parametrize("hooks_type", [stages._StageExecutionHooks, V2StageExecutionHooks])  # type: ignore[misc]
+@pytest.mark.l1  # type: ignore[misc]
+def test_cuda_startup_requires_explicit_hooks(capture_runtime: CaptureRuntime) -> None:
+    with pytest.raises(ValueError, match="requires explicit stage hooks"):
+        startup.capture_async_forward(capture_runtime[0])
+    cast(Mock, stages.get_stage_runner).assert_not_called()
+
+
+@pytest.mark.parametrize("hooks_type", [CudaStageHooksV1, CudaStageHooksV2])  # type: ignore[misc]
 def test_success_publishes_only_after_release_and_sync(
     capture_runtime: CaptureRuntime,
-    hooks_type: type[stages._StageExecutionHooks],
+    hooks_type: type[CudaStageHooks],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, raising=False)
@@ -115,7 +126,7 @@ def test_opt_in_startup_capture_uses_requested_rows(
 ) -> None:
     monkeypatch.setenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, str(batch_size))
     worker, owner, _graph, _stream, _health = capture_runtime
-    assert startup.capture_async_forward(worker)
+    assert startup.capture_async_forward(worker, hooks_type=CudaStageHooksV1)
     scheduled = cast(Mock, stages.get_stage_runner).call_args.args[1]
     prefill = scheduled.gr_stage_metadata["__async_scheduling_startup_capture__"]
     decode = owner.prepare_cpu.call_args.args[0]
@@ -157,7 +168,11 @@ def test_prefix_calibration_precedes_decode_capture(
     monkeypatch.setattr(calibrate, "ensure_prefix_calibration", initialize)
     monkeypatch.setattr(startup, "_capture_batch", capture)
     worker = capture_runtime[0]
-    entry = capture_multibatch_forward if v2 else startup.capture_async_forward
+    entry = (
+        capture_multibatch_forward
+        if v2
+        else partial(startup.capture_async_forward, hooks_type=CudaStageHooksV1)
+    )
 
     assert entry(worker)
     initialize.assert_called_once_with(worker)
@@ -183,7 +198,11 @@ def test_default_startup_capture_batch_size(monkeypatch: pytest.MonkeyPatch) -> 
 def test_single_step_skips_decode_capture(capture_runtime: CaptureRuntime, v2: bool) -> None:
     worker, owner, _graph, _stream, _health = capture_runtime
     worker._vllm_gr_config.beam_max_decode_steps = 1
-    entry = capture_multibatch_forward if v2 else startup.capture_async_forward
+    entry = (
+        capture_multibatch_forward
+        if v2
+        else partial(startup.capture_async_forward, hooks_type=CudaStageHooksV1)
+    )
 
     assert not entry(worker)
     assert not entry(worker)
@@ -276,7 +295,7 @@ def test_v1_does_not_opt_into_optional_fallback(capture_runtime: CaptureRuntime)
     worker, owner, _graph, _stream, _health = capture_runtime
     owner.capture_forward.side_effect = BeamDecodeCaptureUnsupported("capture unsupported")
     with pytest.raises(BeamDecodeCaptureUnsupported):
-        startup.capture_async_forward(worker)
+        startup.capture_async_forward(worker, hooks_type=CudaStageHooksV1)
     assert not worker._gr_async_decode_graph_capture_failed
 
 
@@ -290,22 +309,56 @@ def test_successful_release_must_close_owner(capture_runtime: CaptureRuntime) ->
 
 
 @pytest.mark.parametrize("ready", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("use_v2", [False, True])  # type: ignore[misc]
 def test_repeated_startup_accepts_only_completed_capture(
-    capture_runtime: CaptureRuntime, ready: bool
+    capture_runtime: CaptureRuntime, ready: bool, use_v2: bool
 ) -> None:
     worker, owner, graph, _stream, _health = capture_runtime
     worker._gr_gpu_stage_runner = owner
     worker._gr_decode_capture_failures = {}
     worker._beam_decode_graph = graph
     graph.select = Mock(return_value=graph)
+    owner.hooks = CudaStageHooksV2(worker) if use_v2 else CudaStageHooksV1(worker)
     owner.graph = graph
     owner.closed = ready
+    capture: Callable[[SimpleNamespace], bool] = _capture
+    if not use_v2:
+        capture = partial(startup.capture_async_forward, hooks_type=CudaStageHooksV1)
     if ready:
-        assert _capture(worker)
+        assert capture(worker)
     else:
         with pytest.raises(RuntimeError, match="incomplete capture state"):
-            _capture(worker)
+            capture(worker)
     owner.capture_forward.assert_not_called()
+    cast(Mock, stages.get_stage_runner).assert_not_called()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("use_v2", [False, True])  # type: ignore[misc]
+def test_repeated_startup_rejects_different_hooks_without_recapture(
+    capture_runtime: CaptureRuntime, use_v2: bool
+) -> None:
+    worker, owner, graph, _stream, _health = capture_runtime
+    worker._gr_gpu_stage_runner = owner
+    worker._gr_decode_capture_failures = {}
+    worker._beam_decode_graph = graph
+    graph.select = Mock(return_value=graph)
+    hooks = CudaStageHooksV1(worker) if use_v2 else CudaStageHooksV2(worker)
+    owner.hooks = hooks
+    owner.graph = graph
+    owner.closed = True
+    capture: Callable[[SimpleNamespace], bool] = _capture
+    if not use_v2:
+        capture = partial(startup.capture_async_forward, hooks_type=CudaStageHooksV1)
+    with pytest.raises(ValueError, match="hooks cannot change"):
+        capture(worker)
+    assert owner.hooks is hooks
+    assert owner.graph is graph
+    assert owner.closed
+    assert worker._gr_decode_capture_failures == {}
+    graph.select.assert_not_called()
+    owner.capture_forward.assert_not_called()
+    cast(Mock, stages.get_stage_runner).assert_not_called()
 
 
 def test_decode_graph_capture_failure_falls_back_only_when_recorded() -> None:
@@ -340,7 +393,11 @@ def test_startup_batch_plan_is_selected_by_entry_not_environment(
     worker.vllm_config.scheduler_config.max_num_seqs = 4
     capture = Mock(return_value=None)
     monkeypatch.setattr(startup, "_capture_batch", capture)
-    entry = capture_multibatch_forward if v2 else startup.capture_async_forward
+    entry = (
+        capture_multibatch_forward
+        if v2
+        else partial(startup.capture_async_forward, hooks_type=CudaStageHooksV1)
+    )
     assert entry(worker)
     assert [call.args[1] for call in capture.call_args_list] == ([1, 2, 4] if v2 else [4])
     assert hasattr(worker, "_gr_decode_capture_failures") is v2
@@ -372,7 +429,7 @@ def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
         _decode_logits=Mock(return_value="logits"),
         _forward=Mock(),
     )
-    hooks = (V2StageExecutionHooks if v2 else stages._StageExecutionHooks)(worker)
+    hooks = (CudaStageHooksV2 if v2 else CudaStageHooksV1)(worker)
     hooks.decode_graph = Mock(return_value=graph)
     if v2:
         with pytest.raises(RuntimeError, match="not ready"):
@@ -403,8 +460,8 @@ def test_eager_decode_keeps_forward_entry_and_slices_before_logits(v2: bool) -> 
         _forward_hidden=Mock(),
         _decode_logits=Mock(return_value="logits"),
     )
-    hooks = (V2StageExecutionHooks if v2 else stages._StageExecutionHooks)(worker)
-    assert V2StageExecutionHooks.supports_transposed_head
+    hooks = (CudaStageHooksV2 if v2 else CudaStageHooksV1)(worker)
+    assert hooks.supports_transposed_head
 
     assert hooks.decode_logits(owner) == "logits"
     owner._forward.assert_called_once_with()
@@ -433,8 +490,11 @@ def test_eager_decode_keeps_forward_entry_and_slices_before_logits(v2: bool) -> 
     assert torch.equal(owner.hidden, smaller)
 
 
-def test_v2_graph_replay_consumes_hidden_through_shared_logits() -> None:
-    graph = SimpleNamespace(ready=True, replay=Mock(return_value="hidden"))
+@pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("sliced", [False, True])  # type: ignore[misc]
+def test_graph_replay_consumes_hidden_through_shared_logits(v2: bool, sliced: bool) -> None:
+    hidden = torch.zeros((2, 4))
+    graph = SimpleNamespace(ready=True, replay=Mock(return_value=hidden))
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
         _vllm_gr_config=SimpleNamespace(beam_graph_enabled=True, beam_online_batch_sizes=(1,)),
@@ -444,18 +504,31 @@ def test_v2_graph_replay_consumes_hidden_through_shared_logits() -> None:
         inputs=SimpleNamespace(width=4),
         dynamic=None,
         graph=None,
-        _head_slice_request=0,
+        _head_slice_request=16 if sliced else 0,
         _head_buffers=SimpleNamespace(release_full=Mock(), release_slice=Mock()),
+        _hidden_staging=None,
+        head_slice_cols=Mock(return_value=16),
         _forward_hidden=Mock(),
         _decode_logits=Mock(return_value="logits"),
         _forward=Mock(return_value="eager"),
     )
-    hooks = V2StageExecutionHooks(worker)
+    hooks = (CudaStageHooksV2 if v2 else CudaStageHooksV1)(worker)
     hooks.decode_graph = Mock(return_value=graph)
 
-    assert hooks.decode_logits(owner) == "logits"
+    result = hooks.decode_logits(owner)
+    if sliced:
+        assert result is None
+        assert owner.hidden is not hidden
+        assert torch.equal(owner.hidden, hidden)
+        assert owner._active_slice_cols == 16
+        owner._decode_logits.assert_not_called()
+        # A subsequent replay may overwrite the graph's output buffer.
+        hidden.fill_(7)
+        assert torch.equal(owner.hidden, torch.zeros((2, 4)))
+    else:
+        assert result == "logits"
+        owner._decode_logits.assert_called_once_with(hidden)
     graph.replay.assert_called_once_with()
-    owner._decode_logits.assert_called_once_with("hidden")
     owner._forward.assert_not_called()
 
 

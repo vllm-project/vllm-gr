@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 
 # Ensure that *.excalidraw.png files have the excalidraw metadata
 # embedded in them. This ensures they can be loaded back into

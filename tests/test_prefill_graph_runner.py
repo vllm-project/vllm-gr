@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Unit tests for BeamPrefillGraphRunner."""
 
 from types import SimpleNamespace
@@ -1223,10 +1223,12 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
 ) -> None:
     from contextlib import nullcontext
     from types import SimpleNamespace
+    from unittest.mock import Mock
 
     from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.worker import gpu_model_runner_patch as patch
     from vllm_gr.v1.worker import gr_async_output, gr_startup, model_runner_patch
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     stream = SimpleNamespace(wait_stream=lambda _other: None)
     monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
@@ -1278,8 +1280,17 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
         "_active_runner_module_name",
         lambda: model_runner_patch._GPU_PATCH_MODULE,
     )
+    # Pin the platform selector too: the installer binds the CUDA hooks class by
+    # reading the real vLLM platform, so this test must not depend on the host
+    # device (it fails on an NPU machine where the selector reports NPU).
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_active_platform_module_name",
+        lambda: model_runner_patch._GPU_PATCH_MODULE,
+    )
     monkeypatch.setattr(model_runner_patch, "_get_active_platform_module", lambda: platform)
-    monkeypatch.setattr(gr_startup, "capture_async_forward", lambda _runner: None)
+    capture_async = Mock(return_value=None)
+    monkeypatch.setattr(gr_startup, "capture_async_forward", capture_async)
     monkeypatch.setattr(
         model_runner_patch,
         "freeze_gc_after_graph_capture",
@@ -1287,8 +1298,10 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     )
 
     model_runner_patch.apply_worker_patches()
+    worker = Runner()
     with pytest.raises(RuntimeError) as raised:
-        Runner().capture_model()
+        worker.capture_model()
+    capture_async.assert_called_once_with(worker, hooks_type=CudaStageHooksV1)
     assert raised.value is error
     assert events == ["native"]
 
@@ -1365,6 +1378,32 @@ def test_npu_prefill_capture_skips_mixed_attention_groups() -> None:
     beam_builder = object.__new__(BeamAttentionMetadataBuilder)
     runner = SimpleNamespace(attn_groups=[[Group(beam_builder), Group(object())]])
     assert NPUPrefillGraphRunner._supports_beam_prefill_capture(runner) is False
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_scheduled_requests_are_fresh() -> None:
+    """Dense-Prefill graphs replay only when no scheduled request has computed tokens."""
+    import numpy as np
+
+    def batch(computed: list[int], scheduled: Any) -> tuple[Any, Any]:
+        runner = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                num_computed_tokens_cpu=np.array(computed),
+                req_id_to_index={"rA": 2, "rB": 0},
+            )
+        )
+        return runner, SimpleNamespace(num_scheduled_tokens=scheduled)
+
+    fresh = prefill_graph_common.scheduled_requests_are_fresh
+    # Scattered rows: the unscheduled row 1 carries context and is ignored.
+    assert fresh(*batch([0, 300, 0], {"rA": 4, "rB": 4})) is True
+    # A cached-Prefill suffix is a prefill-phase row but not fresh.
+    assert fresh(*batch([0, 300, 32], {"rA": 4, "rB": 4})) is False
+    assert fresh(*batch([0, 0, 0], {"rA": 4, "missing": 4})) is False
+    assert fresh(*batch([0, 0, 0], {})) is False
+    # Legacy positional list form.
+    assert fresh(*batch([0, 0, 7], [4, 4])) is True
+    assert fresh(*batch([0, 5, 0], [4, 4])) is False
 
 
 pytestmark = pytest.mark.cpu_test

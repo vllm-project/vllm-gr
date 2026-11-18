@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import cast
+
+from vllm_gr.config.schema import ConfigFieldSpec
 
 GR_CONFIG_SCHEMA_VERSION = 1
 CONSTRAINT_TABLE_FORMAT = "constraint_table_v1"
@@ -51,11 +54,6 @@ class ConstraintTableBackendEnum(str, Enum):
     NPU = "npu"
 
 
-# Default values for beam KV pool sizing — also used by parser.py (to decide
-# whether a value is the default and can be omitted from additional_config) and
-# by validation.py (as fallbacks).  Keep all three sites in sync.
-_BEAM_MAX_DECODE_STEPS_DEFAULT: int = 3  # OneRec SID: max_tokens=5 minus begin/end
-
 # Sentinel catalog_path for the NPU default Constraint Table backend: the
 # tables are auto-built from the tokenizer's s_a/s_b/s_c token groups instead
 # of a catalog triples document (OneRec default).
@@ -66,55 +64,98 @@ AUTO_CONSTRAINT_TABLE_PATH: str = "__vllm_gr_auto_constraint_table__"
 class ConstraintTableConfig:
     """Configuration for a prebuilt canonical constraint-table artifact."""
 
-    max_top_k: int
-    enabled: bool = False
-    backend: ConstraintTableBackendEnum = ConstraintTableBackendEnum.CUDA
-    path: str | None = None
-    format: str = CONSTRAINT_TABLE_FORMAT
-    artifact_digest: str | None = None
-    tokenizer_digest: str | None = None
+    max_top_k: int = field(
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constraint_table_max_top_k",
+                canonical_path=("max_top_k",),
+                canonical_required=True,
+                canonical_emit="always",
+                required=True,
+            )
+        }
+    )
+    """Required candidate capacity of the compiled constraint table."""
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constraint_table_enabled",
+                canonical_path=("enabled",),
+                canonical_emit="always",
+            )
+        },
+    )
+    """Enable constraint-table filtering for generation."""
+    backend: ConstraintTableBackendEnum = field(
+        default=ConstraintTableBackendEnum.CUDA,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constraint_table_backend",
+                canonical_path=("backend",),
+                canonical_emit="always",
+            )
+        },
+    )
+    """Execution placement of the constraint table."""
+    path: str | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constraint_table_path", canonical_path=("path",), canonical_emit="always"
+            )
+        },
+    )
+    """Absolute artifact path; YAML loading resolves relative paths first."""
+    format: str = field(
+        default=CONSTRAINT_TABLE_FORMAT,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constraint_table_format",
+                canonical_path=("format",),
+                canonical_emit="always",
+            )
+        },
+    )
+    """Supported constraint-table artifact format."""
+    artifact_digest: str | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_artifact_digest",
+                canonical_path=("artifact_digest",),
+                canonical_emit="always",
+            )
+        },
+    )
+    """Expected artifact SHA-256 digest, required when enabled."""
+    tokenizer_digest: str | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_tokenizer_digest",
+                canonical_path=("tokenizer_digest",),
+                canonical_emit="always",
+            )
+        },
+    )
+    """Expected tokenizer SHA-256 digest, required when enabled."""
     # Independent candidate width K: how many top-k candidates each beam row
     # expands into per step.  None keeps today's behaviour (K == beam_width).
     # K is an engine-lifetime constant because the postprocess workspace is
     # prewarmed at a fixed address.
-    candidate_width: int | None = None
+    candidate_width: int | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec("validate_candidate_width", canonical_path=("candidate_width",))
+        },
+    )
+    """Candidates per Beam row; None follows the configured Beam width."""
 
     def __post_init__(self) -> None:
-        from vllm_gr.config.validation import (
-            validate_artifact_digest,
-            validate_candidate_width,
-            validate_constraint_table_backend,
-            validate_constraint_table_enabled,
-            validate_constraint_table_format,
-            validate_constraint_table_max_top_k,
-            validate_constraint_table_path,
-            validate_tokenizer_digest,
-        )
+        from vllm_gr.config.validation import validate_config_fields
 
-        object.__setattr__(self, "enabled", validate_constraint_table_enabled(self.enabled))
-        object.__setattr__(self, "backend", validate_constraint_table_backend(self.backend))
-        object.__setattr__(self, "path", validate_constraint_table_path(self.path))
-        object.__setattr__(self, "format", validate_constraint_table_format(self.format))
-        object.__setattr__(
-            self,
-            "artifact_digest",
-            validate_artifact_digest(self.artifact_digest),
-        )
-        object.__setattr__(
-            self,
-            "tokenizer_digest",
-            validate_tokenizer_digest(self.tokenizer_digest),
-        )
-        object.__setattr__(
-            self,
-            "max_top_k",
-            validate_constraint_table_max_top_k(self.max_top_k),
-        )
-        object.__setattr__(
-            self,
-            "candidate_width",
-            validate_candidate_width(self.candidate_width),
-        )
+        validate_config_fields(self)
 
         if self.enabled:
             missing = [
@@ -148,11 +189,50 @@ class BeamExecutionMode(str, Enum):
 class GRConfig:
     """Validated vLLM-GR configuration reconstructed in each process."""
 
-    catalog_path: str | None = None
-    constraint_backend: ConstraintBackend = ConstraintBackend.TRIE
-    attention_backend: GRAttentionBackend | None = None
-    vocab_offset: int | None = None
-    vocab_slice_size: int | None = None
+    catalog_path: str | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec("validate_catalog_path", legacy_key="vllm_gr_catalog_path")
+        },
+    )
+    """Legacy catalog path; unset leaves catalog loading disabled."""
+    constraint_backend: ConstraintBackend = field(
+        default=ConstraintBackend.TRIE,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constraint_backend", legacy_key="vllm_gr_constraint_backend"
+            )
+        },
+    )
+    """Legacy constraint backend; table mode also requires a catalog path."""
+    attention_backend: GRAttentionBackend | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_attention_backend",
+                canonical_path=("attention_backend",),
+                legacy_key="vllm_gr_attention_backend",
+                canonical_emit="always",
+            )
+        },
+    )
+    """Optional attention backend override."""
+    vocab_offset: int | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec("validate_vocab_offset", legacy_key="vllm_gr_vocab_offset")
+        },
+    )
+    """Optional first token ID of a contiguous vocabulary slice."""
+    vocab_slice_size: int | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_vocab_slice_size", legacy_key="vllm_gr_vocab_slice_size"
+            )
+        },
+    )
+    """Optional size of a contiguous vocabulary slice."""
     # Beam-decode FULL CUDA graph (startup dummy capture, runtime replay-only).
     # beam_max_width is the single upper bound on beam width: it sizes the
     # worker's persistent beam KV pool AND the captured CUDA graph shape
@@ -166,103 +246,227 @@ class GRConfig:
     # ``constraint_table.candidate_width`` and is independent of it: K follows
     # beam_max_width when unset, and a beam wider than MAX_CANDIDATE_WIDTH must
     # state K explicitly (see resolve_candidate_width).
-    beam_graph_enabled: bool = True
-    beam_max_width: int | None = None
-    beam_max_decode_steps: int = _BEAM_MAX_DECODE_STEPS_DEFAULT
+    beam_graph_enabled: bool = field(
+        default=True,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_graph_enabled",
+                canonical_path=("beam", "graph_enabled"),
+                legacy_key="vllm_gr_beam_graph_enabled",
+                canonical_emit="always",
+                canonical_strict_bool=True,
+            )
+        },
+    )
+    """Enable Beam graph capture when a Beam pool is configured."""
+    beam_max_width: int | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_max_width",
+                canonical_path=("beam", "max_width"),
+                legacy_key="vllm_gr_beam_max_width",
+                canonical_emit="always",
+            )
+        },
+    )
+    """Maximum Beam row count; None disables the persistent Beam pool."""
+    beam_max_decode_steps: int = field(
+        default=3,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_max_decode_steps",
+                canonical_path=("beam", "max_decode_steps"),
+                legacy_key="vllm_gr_beam_max_decode_steps",
+                canonical_emit="always",
+            )
+        },
+    )
+    """Maximum Beam decode steps, excluding the SID begin and end tokens."""
     # None = unset: the runtime picks per-platform defaults (xllm on NPU when
     # the operator library is present, cascade otherwise and on CUDA).
-    npu_decode_execution: NPUDecodeExecution | None = None
+    npu_decode_execution: NPUDecodeExecution | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_npu_decode_execution", legacy_key="vllm_gr_npu_decode_execution"
+            )
+        },
+    )
+    """NPU decode mode; None leaves platform selection to the runtime."""
     # Canonical schema-v1 state. Keep these fields after every legacy field so
     # positional construction of the pre-schema dataclass remains compatible.
-    schema_version: int = GR_CONFIG_SCHEMA_VERSION
-    constraint_table: ConstraintTableConfig | None = None
+    schema_version: int = field(
+        default=GR_CONFIG_SCHEMA_VERSION,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_schema_version",
+                canonical_path=("schema_version",),
+                canonical_required=True,
+                canonical_emit="always",
+            )
+        },
+    )
+    """Canonical configuration schema version; required in mapping input."""
+    constraint_table: ConstraintTableConfig | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constraint_table",
+                canonical_path=("constraint_table",),
+                canonical_emit="always",
+            )
+        },
+    )
+    """Validated canonical artifact configuration, or None for legacy input."""
     # None = unset (the Driver applies platform defaults).  True moves the beam
     # decision (beam_search_group / beam_search_rec_final_select +
     # select_unshared_kv) into the accelerator worker and returns the result via
     # ModelRunnerOutput.beam_search_result, aligning with the asynchronous scheduling save flow.
     # CUDA beam deployments default to True; NPU requires xllm execution.
     # Explicit False is preserved; it does not enable a legacy frontend path.
-    beam_worker_decision: bool | None = None
+    beam_worker_decision: bool | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_worker_decision",
+                canonical_path=("beam", "worker_decision"),
+                legacy_key="vllm_gr_beam_worker_decision",
+            )
+        },
+    )
+    """Worker decision override; None defers selection and False opts out."""
     # Deprecated constructor input only. Validation consumes True with a
     # warning and rejects False; no engine-driven state is serialized.
-    beam_engine_driven: bool | None = None
+    beam_engine_driven: bool | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_engine_driven",
+                canonical_path=("beam", "engine_driven"),
+                legacy_key="vllm_gr_beam_engine_driven",
+                canonical_emit="never",
+                legacy_emit="never",
+            )
+        },
+    )
+    """Retired input; True warns and is consumed, and False is rejected."""
     # Unset keeps native inference enabled without selecting GR Beam.
-    beam_execution_mode: BeamExecutionMode | None = None
-    constrained_generation: bool | None = None
+    beam_execution_mode: BeamExecutionMode | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_execution_mode",
+                canonical_path=("beam", "execution_mode"),
+                legacy_key="vllm_gr_beam_execution_mode",
+            )
+        },
+    )
+    """Beam interface selection; None leaves native inference selected."""
+    constrained_generation: bool | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constrained_generation",
+                canonical_path=("constrained_generation",),
+                legacy_key="vllm_gr_constrained_generation",
+            )
+        },
+    )
+    """Constraint override; explicit False requests unconstrained generation."""
     # Exact logical B captured by the NPU Beam graph adapter. This is a graph
     # signature dimension, not a scheduler capacity: other B values do not use
     # the Beam FULL graph (native PIECEWISE/NONE dispatch remains available).
-    beam_graph_batch_size: int = 1
+    beam_graph_batch_size: int = field(
+        default=1,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_graph_batch_size",
+                canonical_path=("beam", "graph_batch_size"),
+                legacy_key="vllm_gr_beam_graph_batch_size",
+            )
+        },
+    )
+    """Exact logical batch size captured by the Beam graph adapter."""
 
     # Like beam_graph_enabled, this flag is dormant without a Beam pool.
-    enable_short_suffix_attention: bool = True
+    enable_short_suffix_attention: bool = field(
+        default=True,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_enable_short_suffix_attention",
+                canonical_path=("beam", "enable_short_suffix_attention"),
+                legacy_key="vllm_gr_enable_short_suffix_attention",
+            )
+        },
+    )
     """Fuse CUDA suffix attention and prefix merging by default; False opts out."""
 
-    prefill_flash_attn_version: int | str | None = "auto"
+    prefill_flash_attn_version: int | str | None = field(
+        default="auto",
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_prefill_flash_attn_version",
+                canonical_path=("beam", "prefill_flash_attn_version"),
+                legacy_key="vllm_gr_prefill_flash_attn_version",
+            )
+        },
+    )
     """CUDA prefill only: auto (default) prefers FA3; None inherits decode; or explicit 2/3."""
 
-    beam_graph_widths: tuple[int, ...] | None = None
+    beam_graph_widths: tuple[int, ...] | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_graph_widths",
+                canonical_path=("beam", "graph_widths"),
+                legacy_key="vllm_gr_beam_graph_widths",
+            )
+        },
+    )
     """Additional exact NPU Decode input widths to capture at startup."""
 
-    beam_online_batch_sizes: tuple[int, ...] = DEFAULT_ONLINE_BATCH_SIZES
+    beam_online_batch_sizes: tuple[int, ...] = field(
+        default=DEFAULT_ONLINE_BATCH_SIZES,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_online_batch_sizes",
+                canonical_path=("beam", "online_batch_sizes"),
+                legacy_key="vllm_gr_beam_online_batch_sizes",
+            )
+        },
+    )
     """Online batching policy and default CUDA capture sizes, not engine capacity."""
 
-    beam_sid_stage_vocab: bool = False
+    beam_sid_stage_vocab: bool = field(
+        default=False,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_sid_stage_vocab",
+                canonical_path=("beam", "sid_stage_vocab"),
+                legacy_key="vllm_gr_beam_sid_stage_vocab",
+            )
+        },
+    )
     """Opt into catalog-free NPU SA/SB/SC domains and stage-local probabilities."""
 
-    def __post_init__(self) -> None:
-        from vllm_gr.config.validation import (
-            validate_attention_backend,
-            validate_beam_engine_driven,
-            validate_beam_execution_mode,
-            validate_beam_graph_batch_size,
-            validate_beam_graph_enabled,
-            validate_beam_graph_widths,
-            validate_beam_max_decode_steps,
-            validate_beam_max_width,
-            validate_beam_online_batch_sizes,
-            validate_beam_sid_stage_vocab,
-            validate_beam_worker_decision,
-            validate_catalog_path,
-            validate_constrained_generation,
-            validate_constraint_backend,
-            validate_enable_short_suffix_attention,
-            validate_npu_decode_execution,
-            validate_prefill_flash_attn_version,
-            validate_schema_version,
-            validate_vocab_offset,
-            validate_vocab_slice_size,
-        )
+    beam_adapter_cache_enabled: bool = field(
+        default=False,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_adapter_cache_enabled",
+                canonical_path=("beam", "adapter_cache_enabled"),
+                legacy_key="vllm_gr_beam_adapter_cache_enabled",
+            )
+        },
+    )
+    """Opt into CUDA stage-adapter and Decode graph reuse across batch sizes."""
 
-        object.__setattr__(self, "catalog_path", validate_catalog_path(self.catalog_path))
-        object.__setattr__(
-            self,
-            "constraint_backend",
-            validate_constraint_backend(self.constraint_backend),
-        )
-        object.__setattr__(
-            self,
-            "attention_backend",
-            validate_attention_backend(self.attention_backend),
-        )
-        object.__setattr__(self, "vocab_offset", validate_vocab_offset(self.vocab_offset))
-        object.__setattr__(
-            self, "vocab_slice_size", validate_vocab_slice_size(self.vocab_slice_size)
-        )
-        object.__setattr__(
-            self,
-            "beam_graph_enabled",
-            validate_beam_graph_enabled(self.beam_graph_enabled),
-        )
-        object.__setattr__(
-            self,
-            "beam_graph_batch_size",
-            validate_beam_graph_batch_size(self.beam_graph_batch_size),
-        )
-        object.__setattr__(self, "beam_max_width", validate_beam_max_width(self.beam_max_width))
-        object.__setattr__(
-            self, "beam_graph_widths", validate_beam_graph_widths(self.beam_graph_widths)
-        )
+    def __post_init__(self) -> None:
+        from vllm_gr.config.validation import validate_config_fields
+
+        validate_config_fields(self)
+
         if self.beam_graph_widths is not None and (
             self.beam_max_width is None or max(self.beam_graph_widths) > self.beam_max_width
         ):
@@ -275,47 +479,6 @@ class GRConfig:
                     f"{MAX_NPU_BEAM_GRAPH_WIDTHS} captured widths including max_width, "
                     f"got {len(capture_widths)}; use fewer widths or disable beam graphs"
                 )
-        object.__setattr__(
-            self,
-            "beam_online_batch_sizes",
-            validate_beam_online_batch_sizes(self.beam_online_batch_sizes),
-        )
-        object.__setattr__(
-            self,
-            "beam_max_decode_steps",
-            validate_beam_max_decode_steps(self.beam_max_decode_steps),
-        )
-        object.__setattr__(
-            self,
-            "npu_decode_execution",
-            validate_npu_decode_execution(self.npu_decode_execution),
-        )
-        object.__setattr__(self, "schema_version", validate_schema_version(self.schema_version))
-        object.__setattr__(
-            self,
-            "constrained_generation",
-            validate_constrained_generation(self.constrained_generation),
-        )
-        if self.constraint_table is not None and not isinstance(
-            self.constraint_table, ConstraintTableConfig
-        ):
-            raise ValueError("vllm-gr constraint_table must be a ConstraintTableConfig or None")
-        object.__setattr__(
-            self,
-            "beam_worker_decision",
-            validate_beam_worker_decision(self.beam_worker_decision),
-        )
-        object.__setattr__(
-            self,
-            "beam_engine_driven",
-            validate_beam_engine_driven(self.beam_engine_driven),
-        )
-        object.__setattr__(
-            self, "beam_execution_mode", validate_beam_execution_mode(self.beam_execution_mode)
-        )
-        object.__setattr__(
-            self, "beam_sid_stage_vocab", validate_beam_sid_stage_vocab(self.beam_sid_stage_vocab)
-        )
         if self.beam_sid_stage_vocab and (
             self.constrained_generation is not False
             or self.beam_execution_mode is not BeamExecutionMode.V1
@@ -327,8 +490,6 @@ class GRConfig:
                 "beam.execution_mode='v1', beam.worker_decision=True, and "
                 "beam.max_decode_steps <= 3"
             )
-        validate_enable_short_suffix_attention(self.enable_short_suffix_attention)
-        validate_prefill_flash_attn_version(self.prefill_flash_attn_version)
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None
@@ -403,7 +564,7 @@ class GRConfig:
             return GRConfig()
         cached = getattr(vllm_config, "_vllm_gr_parsed_config", None)
         if cached is not None:
-            return cached
+            return cast(GRConfig, cached)
         from vllm_gr.config.parser import parse_gr_config
 
         parsed = parse_gr_config(vllm_config)

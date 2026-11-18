@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 import os
 import subprocess
@@ -47,7 +47,7 @@ class TestBenchmarkBranchPolicy(unittest.TestCase):
         step = next(
             item
             for item in workflow["jobs"]["benchmark-policy"]["steps"]
-            if item.get("name") == "Resolve base-owned benchmark policy"
+            if item.get("name") == "Resolve benchmark policy"
         )
         self.assertEqual(
             step["env"]["POLICY_TARGET_BRANCH"],

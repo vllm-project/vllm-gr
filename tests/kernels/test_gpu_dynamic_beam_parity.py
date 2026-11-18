@@ -1,6 +1,6 @@
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Opt-in parity between GPU dynamic widths and an independent CPU oracle.
 
 The oracle replays the same fixed-depth successor tree with the tiny model in

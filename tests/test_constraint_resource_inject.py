@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 """Tests for the driver/worker Constraint Tables resource injection."""
 
@@ -112,7 +112,9 @@ def test_set_gr_constraint_resources_fails_when_runner_lacks_sample_hook(
     tokenizer: MagicMock,
 ) -> None:
     """A Constraint Table worker without the raw-logits hook must fail startup."""
-    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+    from vllm_gr.v1.worker.model_runner_contracts import (
+        _WORKER_SAMPLE_PATCH_MARKER,
+    )
 
     resource = _build_resource(tokenizer)
     wire = to_wire(resource)
@@ -145,7 +147,7 @@ def test_set_gr_constraint_resources_accepts_v2_stage_hooks(
     tokenizer: MagicMock,
 ) -> None:
     """The V2 stage execute/sample_tokens pair satisfies the resource gate."""
-    from vllm_gr.v1.worker.model_runner_common import (
+    from vllm_gr.v1.worker.model_runner_contracts import (
         _WORKER_EXECUTE_PATCH_MARKER,
         _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
     )
@@ -189,8 +191,10 @@ def test_inject_constraint_resources_requires_complete_cuda_v1_stage_hooks(
     from vllm_gr.constraints import worker_inject
     from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_sample_tokens_gpu
     from vllm_gr.v1.worker.model_runner_common import (
-        _WORKER_SAMPLE_PATCH_MARKER,
         make_patched_execute_model,
+    )
+    from vllm_gr.v1.worker.model_runner_contracts import (
+        _WORKER_SAMPLE_PATCH_MARKER,
     )
 
     class FakeRunner:

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
 # Read-only: list all compute processes on the assigned GPUs.
 # Exit 0 when clear; remaining processes, query or termination errors fail.
 set -euo pipefail

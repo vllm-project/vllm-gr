@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """A refused request has to reach its caller as the caller's own mistake.
 
 The engine answers a request it will not run -- an ordinary one arriving while

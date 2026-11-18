@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """CUDA-only FA2-compatible short-suffix attention.
 
 Keep Gluon and NVIDIA MMA imports here so the shared dispatch module remains

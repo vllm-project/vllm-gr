@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class GRServeSubcommand(ServeSubcommand):
             self.name,
             help="Launch a local OpenAI-compatible API server for vllm-gr.",
             description=DESCRIPTION,
-            usage="vllm-gr serve [model_tag] [options]",
+            usage="%(prog)s [model_tag] --gr [options]",
         )
 
         serve_parser = make_arg_parser(serve_parser)

@@ -64,6 +64,40 @@ shared documentation must pass the character check. Generated gRPC bindings
 are excluded by the hook configuration. The commit-message hook supplies DCO
 sign-off using the configured Git identity.
 
+## CUDA stage hooks contract
+
+`CudaStageHooks` in `vllm_gr/v1/worker/gpu_stage_hooks.py` is an abstract base
+class. Both CUDA runners subclass it, so an implementation that leaves a
+required operation or policy abstract raises `TypeError` when the hooks object is
+constructed, before any dispatch, on any device, with no type checker involved.
+`validate_stage_hooks_type` additionally enforces the lifetime rule that one
+Worker keeps one concrete hooks type.
+
+The class-side `CudaStageHooksType` Protocol checks construction with one Worker
+argument and the admission sizing operation. A `type[CudaStageHooks]` annotation
+alone does not reject an incompatible subclass constructor. The runtime ABC
+checks completeness; mypy checks signatures, return types and policy types.
+
+The dedicated `cuda-stage` group in `tools/pre_commit/mypy.py` checks the contract,
+both implementations, the shared core, and all execution/startup binding modules
+together. The V2 graph factories and resource/startup owner are explicit targets,
+along with the shared input and graph base classes they extend. Installation
+contracts, GC coordination and configuration/context support are explicit
+targets as well; routing tests pin these owners independently of the file list. Changing any member or the hook script selects this complete boundary,
+even with `--follow-imports skip`. Native internals outside it remain dynamic.
+`tests/tools/cuda_stage_typing_cases.py` supplies valid V1/V2 bindings and invalid
+return, constructor and policy types, including the output-completion return
+type. Narrow expected-error annotations combined with `--warn-unused-ignores`
+make a weakened contract fail the same checker run.
+The group disables both cache reads and writes to avoid a mypy 1.11.1 placeholder
+serialization failure in these cyclic imports.
+
+Runtime and checker-routing regressions live in `tests/tools/test_cuda_stage_typing.py`.
+They remain CPU-only and do not launch checker subprocesses. The ordinary test
+group skips production imports, so runtime test subclass declarations use local
+`type: ignore[misc]` annotations for the inherited-`Any` diagnostic. The production
+boundary is checked separately by each Python-version mypy pre-commit hook.
+
 ## Failures and maintenance
 
 When a hook modifies files, inspect the diff and rerun that hook. For an

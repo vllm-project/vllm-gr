@@ -5,23 +5,30 @@
 - [Overview](#overview)
 - [Installation](#installation)
 - [Getting the Catalog](#getting-the-catalog)
+- [Build the V1 Constraint Artifact](#build-the-v1-constraint-artifact)
+- [Prepare the Canonical Configuration](#prepare-the-canonical-configuration)
 - [Invoking the Server](#invoking-the-server)
 - [Invoking the Client](#invoking-the-client)
+- [Result Verification](#result-verification)
 
 ## Overview
 
-This example demonstrates using an items catalog to eliminate non-existing items given by the recommendation system.
-Limiting the available items increases accuracy and enables reducing the search space to get the same accuracy but with less latency.
+Constraining generation to the catalog prevents out-of-catalog recommendations and can reduce the search space.
+Accuracy and latency should be evaluated for the selected model and catalog.
 
 ## Installation
 
-- Refer to [quickstart.md](../../../docs/quickstart.md) for installation.
+- Refer to [quickstart.md](../../../docs/quickstart.md) for CUDA installation or
+  [quickstart-ascend.md](../../../docs/quickstart-ascend.md) for Ascend installation.
 
 ## Getting the Catalog
 
 - Follow [Open One Rec Benchmark Dataset](../../../docs/benchmarks/README.md#open-one-rec-benchmark-dataset) for One Rec Benchmark Dataset retrieval.
-
-- Use `benchmarks/open_one_rec/tools/convert_catalog.py` to convert OpenOneRec sid2pid.json file to vllm-gr catalog format.
+- Use `benchmarks/open_one_rec/tools/convert_catalog.py` to convert the OpenOneRec
+  `sid2pid.json` file to the SID catalog format.
+- The resulting JSON list is the input to the triples converter and the expected
+  catalog used later by `verify_catalog.py`. It is not a canonical V1 serving
+  configuration.
 - For full usage/options, see [OpenOneRec tools README](../../../benchmarks/open_one_rec/tools/README.md).
 - OpenOneRec's list of acceptable SIDs is in `<OpenOneRecFolder>/sid2pid.json`.
 
@@ -33,44 +40,97 @@ python benchmarks/open_one_rec/tools/convert_catalog.py \
     --output-path ${MyFolder}/catalog.json
 ```
 
-## Invoking the Server
+## Build the V1 Constraint Artifact
 
-- Add the catalog attribute to server invocation
+V1 uses a Constraint Table artifact, not a JSON list passed directly to the
+server. Convert the SID catalog to a triples document, then compile it with the
+same model snapshot that the server will use:
 
 ```bash
- vllm-gr serve OpenOneRec/OneRec-1.7B \
-    --default-chat-template-kwargs '{"enable_thinking": false}' \
-    --max-logprobs 1024 \
-    --max-num-seqs 1024 \
-    --max-num-batched-tokens 16384 \
-    --scheduling-policy priority \
-    --catalog-path ${MyFolder}/catalog.json
+export ONEREC_REVISION=cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b
 
+python tools/build_constraint_triples.py \
+    --catalog ${MyFolder}/catalog.json \
+    --output ${MyFolder}/constraint_triples.json \
+    --begin '<|sid_begin|>' \
+    --end '<|sid_end|>'
+
+python tools/build_constraint_table.py \
+    --triples ${MyFolder}/constraint_triples.json \
+    --model OpenOneRec/OneRec-1.7B \
+    --revision "$ONEREC_REVISION" \
+    --output ${MyFolder}/constraint_table.safetensors \
+    --trust-remote-code
 ```
+
+Record the printed `artifact_digest` and `tokenizer_digest`. Both values are
+required by the canonical configuration.
+
+## Prepare the Canonical Configuration
+
+Create `vllm_gr_config.yaml` from the engine configuration in the
+[offline Beam Search V1 example](../../offline_inference/beam_search/README.md#engine-configuration).
+Set `constraint_table.path` to the absolute artifact path and replace both
+digest placeholders with the values printed by the build command. Use
+`constraint_table.backend: cuda` on GPU or `npu` on Ascend.
+
+The example uses `beam.max_width: 128`, `beam.max_decode_steps: 3`, and
+`beam.execution_mode: v1`. HTTP requests must use `n: 128`.
+
+## Invoking the Server
+
+Start the server with the canonical configuration:
+
+```bash
+vllm serve OpenOneRec/OneRec-1.7B --gr \
+    --revision "$ONEREC_REVISION" \
+    --vllm-gr-config ${MyFolder}/vllm_gr_config.yaml \
+    --default-chat-template-kwargs '{"enable_thinking": false}' \
+    --max-logprobs 128 \
+    --max-num-seqs 128 \
+    --max-num-batched-tokens 16384 \
+    --async-scheduling \
+    --no-enable-chunked-prefill
+```
+
+Do not pass the legacy `--catalog-path` serving option with this canonical V1
+configuration. The old frontend catalog injection flow is retired.
 
 ## Invoking the Client
 
-- Client execution does not change
-- see beam_search example [README.md](../beam_search/README.md#run-client-on-another-terminal) for client single prompt execution.
-- see benchmark documentation [README.md](../../../docs/benchmarks/README.md) for available benchmarks for online serving.
+- The request schema is unchanged. Set `n` to `128` and use the configured SID
+  boundary tokens.
+- `examples/online_serving/beam_search/client.sh` sends a Chat Completions
+  request to `/v1/chat/completions`. It uses the full model name
+  `OpenOneRec/OneRec-1.7B`, `n: 128`, and the configured SID boundary tokens.
+- See benchmark documentation
+  [README.md](../../../docs/benchmarks/README.md) for available benchmarks for
+  online serving.
 
-## Result verification
+## Result Verification
 
-A utility was added to check if client results are all within the catalog
+A utility checks whether client results are all within the SID catalog:
+
+Run the client from its expected directory, but retain `result.json` in the
+caller's working directory:
 
 ```bash
-bash examples/online_serving/beam_search/client.sh > result.json
-python examples/online_serving/catalog/verify_catalog.py result.json ${MyFolder}/catalog.json
+(cd examples/online_serving/beam_search && bash client.sh -b 128) > "${MyFolder}/result.json"
+python examples/online_serving/catalog/verify_catalog.py "${MyFolder}/result.json" "${MyFolder}/catalog.json"
 ```
 
-Expected results:
+`client.sh` sends a Chat Completions response. `verify_catalog.py` reads
+`choices[].message.content`, so do not substitute a `/v1/completions` response
+without changing the model name and result extraction.
+
+Representative results; catalog size, item order, and generated choices can
+vary:
 
 ```text
-Loading results from ../vllm/trc/test/result.json...
-Loading catalog from OpenOneRec/benchmark_data/catalog.json...
-Catalog loaded with 1519078 items.
-First 10 items in catalog: ['<|sid_begin|><s_a_7060><s_b_18><s_c_1748><|sid_end|>', '<|sid_begin|><s_a_522><s_b_2833><s_c_5018><|sid_end|>', '<|sid_begin|><s_a_5368><s_b_7001><s_c_5852><|sid_end|>', '<|sid_begin|><s_a_6118><s_b_1302><s_c_4114><|sid_end|>', '<|sid_begin|><s_a_4990><s_b_5835><s_c_5629><|sid_end|>', '<|sid_begin|><s_a_3492><s_b_2549><s_c_384><|sid_end|>', '<|sid_begin|><s_a_1280><s_b_6846><s_c_7175><|sid_end|>', '<|sid_begin|><s_a_1848><s_b_3131><s_c_3721><|sid_end|>', '<|sid_begin|><s_a_5001><s_b_2547><s_c_7816><|sid_end|>', '<|sid_begin|><s_a_4616><s_b_4751><s_c_2473><|sid_end|>']
-Verifying 512 generated choices...
+Loading results from ${MyFolder}/result.json...
+Loading catalog from ${MyFolder}/catalog.json...
+Catalog loaded with <catalog-size> items.
+Verifying 128 generated choices...
 
 SUCCESS: All generated items exist in the catalog.
 ```

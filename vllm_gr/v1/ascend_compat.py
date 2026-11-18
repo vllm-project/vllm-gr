@@ -1,29 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 """Compatibility patches for vLLM-Ascend integration points."""
 
 import logging
 from functools import wraps
-from typing import Any, cast
+from typing import Any
 
 import torch
 
-from vllm_gr.config import GRAttentionBackend, GRConfig
-
 logger = logging.getLogger(__name__)
 
-_ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
-_ASCEND_ORIGINAL_CACHED_GET_ATTN: Any = None
-_NPU_WORKER_PATCH_APPLIED = False
+_NPU_WORKER_ORIGINAL_ATTR = "_vllm_gr_npu_init_device_original"
 _PENALTY_WARMUP_GUARD_APPLIED = False
-
-
-def _get_current_gr_attention_backend() -> GRAttentionBackend | None:
-    """Read the validated GR backend marker used by the attention selector."""
-    from vllm.config import get_current_vllm_config_or_none
-
-    return GRConfig.from_vllm_config(get_current_vllm_config_or_none()).attention_backend
 
 
 def is_npu_platform() -> bool:
@@ -35,65 +24,20 @@ def is_npu_platform() -> bool:
     return getattr(current_platform, "device_type", None) == "npu"
 
 
-def _get_custom_beam_backend() -> type:
-    """Load CUSTOM on demand; the engine core resolves its supported layouts."""
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
-
-    return cast(type[Any], BeamAttentionBackend)
-
-
 def apply_ascend_attention_backend_patch(force: bool = False) -> int:
-    """Preserve explicit and marker-restored CUSTOM backend selection."""
-    global _ASCEND_ATTN_BACKEND_PATCH_APPLIED
-    global _ASCEND_ORIGINAL_CACHED_GET_ATTN
+    """Compatibility entry point for the hardware-neutral CUSTOM selector.
 
-    if _ASCEND_ATTN_BACKEND_PATCH_APPLIED and not force:
-        return 0
+    ``force`` is forwarded for call compatibility only; its value has no effect
+    on the selector installer, which always inspects the live target.
+    """
+    from vllm_gr.v1.attention.selector_patch import apply_custom_attention_backend_patch
 
-    try:
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    except ImportError:
-        return 0
-
-    try:
-        import vllm.v1.attention.selector as selector_mod
-    except ImportError:
-        return 0
-
-    if _ASCEND_ORIGINAL_CACHED_GET_ATTN is None:
-        _ASCEND_ORIGINAL_CACHED_GET_ATTN = selector_mod._cached_get_attn_backend
-    original_cached_fn = _ASCEND_ORIGINAL_CACHED_GET_ATTN
-
-    def _patched_cached_get_attn_backend(
-        backend: Any,
-        attn_selector_config: Any,
-        num_heads: int | None = None,
-    ) -> Any:
-        # Do not import an unselected backend during plugin initialization.
-        # If CUSTOM is selected, propagate its original import/registration
-        # error instead of swallowing it and reporting "not registered" later.
-        if backend == AttentionBackendEnum.CUSTOM:
-            return _get_custom_beam_backend()
-
-        if backend is None and _get_current_gr_attention_backend() is GRAttentionBackend.CUSTOM:
-            return _get_custom_beam_backend()
-
-        return original_cached_fn(
-            backend,
-            attn_selector_config,
-            num_heads=num_heads,
-        )
-
-    selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
-    _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
-    return 1
+    return apply_custom_attention_backend_patch(force=force)
 
 
 def patch_npu_worker_init_device() -> int:
     """Run vllm-gr patch installation before NPUWorker device initialization."""
-    global _NPU_WORKER_PATCH_APPLIED
-
-    if not is_npu_platform() or _NPU_WORKER_PATCH_APPLIED:
+    if not is_npu_platform():
         return 0
 
     try:
@@ -106,11 +50,12 @@ def patch_npu_worker_init_device() -> int:
         )
         return 0
 
-    # Spawned workers load plugins before constructing NPUWorker, whose
-    # __init__ validates Ascend config before init_device can run. Install
-    # the filter here too; a fresh worker cannot inherit EngineCore's patch.
+    # The config validator is called by NPUWorker.__init__, before init_device.
+    # Its module bindings can be restored independently of the device wrapper.
     _install_init_ascend_config_sanitizer()
     original_init_device = NPUWorker.init_device
+    if _NPU_WORKER_ORIGINAL_ATTR in getattr(original_init_device, "__dict__", {}):
+        return 0
 
     def _patched_init_device(self: Any) -> Any:
         from vllm_gr.patch import re_apply_patches
@@ -140,8 +85,8 @@ def patch_npu_worker_init_device() -> int:
         load_constraint_tables_on_worker(self)
         return result
 
+    setattr(_patched_init_device, _NPU_WORKER_ORIGINAL_ATTR, original_init_device)
     NPUWorker.init_device = _patched_init_device
-    _NPU_WORKER_PATCH_APPLIED = True
     return 1
 
 
@@ -215,42 +160,47 @@ def _install_init_ascend_config_sanitizer() -> None:
 
     from vllm_gr.config.parser import GR_CONFIG_KEY, GR_CONFIG_KEY_PREFIX
 
-    original = ascend_config_mod.init_ascend_config
-    if getattr(original, "_vllm_gr_sanitized", False):
-        return
+    current = ascend_config_mod.init_ascend_config
+    if getattr(current, "_vllm_gr_sanitized", False) is True:
+        sanitized = current
+        original = current.__wrapped__
+    else:
+        original = current
 
-    @wraps(original)
-    def _patched_init_ascend_config(vllm_config: Any) -> Any:
-        additional = getattr(vllm_config, "additional_config", None)
-        if not isinstance(additional, dict):
-            return original(vllm_config)
-        filtered = {
-            key: value
-            for key, value in additional.items()
-            if key != GR_CONFIG_KEY
-            and not (isinstance(key, str) and key.startswith(GR_CONFIG_KEY_PREFIX))
-        }
-        if len(filtered) == len(additional):
-            return original(vllm_config)
-        vllm_config.additional_config = filtered
-        try:
-            return original(vllm_config)
-        finally:
-            vllm_config.additional_config = additional
+        @wraps(original)
+        def _patched_init_ascend_config(vllm_config: Any) -> Any:
+            additional = getattr(vllm_config, "additional_config", None)
+            if not isinstance(additional, dict):
+                return original(vllm_config)
+            filtered = {
+                key: value
+                for key, value in additional.items()
+                if key != GR_CONFIG_KEY
+                and not (isinstance(key, str) and key.startswith(GR_CONFIG_KEY_PREFIX))
+            }
+            if len(filtered) == len(additional):
+                return original(vllm_config)
+            vllm_config.additional_config = filtered
+            try:
+                return original(vllm_config)
+            finally:
+                vllm_config.additional_config = additional
 
-    _patched_init_ascend_config._vllm_gr_sanitized = True  # type: ignore[attr-defined]
-    ascend_config_mod.init_ascend_config = _patched_init_ascend_config
+        _patched_init_ascend_config._vllm_gr_sanitized = True  # type: ignore[attr-defined]
+        sanitized = _patched_init_ascend_config
+        ascend_config_mod.init_ascend_config = sanitized
 
     # Modules imported later bind the patched function via their
     # `from vllm_ascend.ascend_config import init_ascend_config`; only update
-    # module-global bindings that were already created with the original.
+    # module-global bindings that point to the original, even if a previous
+    # installation already wrapped the definition in ascend_config.
     for module_name in (
         "vllm_ascend.patch.platform.patch_engine_core",
         "vllm_ascend.worker.worker",
     ):
         mod = sys.modules.get(module_name)
         if mod is not None and getattr(mod, "init_ascend_config", None) is original:
-            mod.init_ascend_config = _patched_init_ascend_config
+            mod.init_ascend_config = sanitized
 
 
 def _sanitize_engine_core_entry(
@@ -272,6 +222,12 @@ def _sanitize_engine_core_entry(
         _run_engine_core_patch_func as ascend_entry,
     )
 
+    # This NPU entry replaces the generic GR process wrapper. Repair the
+    # child's Core capabilities before native initialization begins; applying
+    # them from NPUWorker.init_device is too late for this Core's __init__.
+    from vllm_gr.patch import initialize_engine_core_beam_patches
+
+    initialize_engine_core_beam_patches()
     return ascend_entry(*args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
 
 

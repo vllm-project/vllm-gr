@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Platform-agnostic prefill graph components, buffers, and bucket matching."""
 
 from __future__ import annotations
@@ -301,6 +301,27 @@ def is_prefill_phase_batch(runner: Any, scheduler_output: Any) -> bool:
     # Legacy list form: no request IDs available, so positional rows.
     num_reqs = len(num_scheduled_tokens)
     return all(computed[i] < prompt[i] for i in range(num_reqs))
+
+
+def scheduled_requests_are_fresh(runner: Any, scheduler_output: Any) -> bool:
+    """True when no scheduled request has computed tokens (V1 input batch).
+
+    Graphs captured with dense CUDA Prefill attend over fresh K/V only, so they
+    must not replay for a request with context (see ``beam_dense_prefill``).
+    """
+    input_batch = getattr(runner, "input_batch", None)
+    computed = getattr(input_batch, "num_computed_tokens_cpu", None)
+    num_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
+    if computed is None or not num_scheduled_tokens:
+        return False
+    if isinstance(num_scheduled_tokens, dict):
+        req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+        if req_id_to_index is None:
+            return False
+        rows = [req_id_to_index.get(req_id) for req_id in num_scheduled_tokens]
+    else:
+        rows = list(range(len(num_scheduled_tokens)))
+    return all(row is not None and int(computed[row]) == 0 for row in rows)
 
 
 class PrefillBucketBuffers:

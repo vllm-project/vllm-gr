@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disable-error-code="misc,no-untyped-call,no-any-return"
 """Real OneRec weights through the native multiprocess Scheduler/Worker pipeline.
 
@@ -80,7 +80,9 @@ class OneRecV1STWorkerExtension:
         return _worker_snapshot(self)
 
     def onerec_v1_st_graphs(self) -> dict[str, Any]:
-        from vllm_gr.v1.worker.model_runner_common import get_beam_graph_runtime_stats
+        from vllm_gr.v1.worker.gr_context import (
+            get_beam_graph_runtime_stats,
+        )
 
         return get_beam_graph_runtime_stats(self)
 

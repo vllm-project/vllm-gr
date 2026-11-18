@@ -125,12 +125,24 @@ def _run_x_attention(
 
 
 @pytest.mark.parametrize(
-    "request_num,beam_size,kvlen_list,decode_step",
+    "request_num,beam_size,kvlen_list,decode_step,max_decode_steps",
     [
-        (1, 128, [128], 1),
-        (1, 128, [256], 2),
-        (2, 128, [256, 128], 2),
-        (2, 128, [128, 256], 3),
+        (1, 128, [128], 1, 3),
+        (1, 128, [256], 2, 3),
+        (2, 128, [256, 128], 2, 3),
+        (2, 128, [128, 256], 3, 3),
+        (1, 128, [128], 1, 4),
+        (1, 128, [256], 2, 4),
+        (2, 128, [256, 128], 2, 4),
+        (2, 128, [128, 256], 3, 4),
+        (1, 128, [128], 1, 6),
+        (1, 128, [256], 2, 6),
+        (2, 128, [256, 128], 2, 6),
+        (2, 128, [128, 256], 3, 6),
+        (1, 128, [256], 4, 6),
+        (2, 128, [256, 128], 4, 6),
+        (1, 128, [256], 5, 6),
+        (2, 128, [256, 128], 5, 6),
     ],
 )
 def test_x_attention_npu_matches_reference(
@@ -138,6 +150,7 @@ def test_x_attention_npu_matches_reference(
     beam_size: int,
     kvlen_list: list[int],
     decode_step: int,
+    max_decode_steps: int,
 ) -> None:
     """GQA shared-paged + unshared-contiguous attention vs CPU fp32 golden."""
     torch.manual_seed(1234)
@@ -161,9 +174,13 @@ def test_x_attention_npu_matches_reference(
         -1, 1
     )
     unshared_key = torch.empty(
-        (request_num * beam_size, KV_HEADS, MAX_DECODE_STEPS, HEAD_DIM), dtype=dtype
+        (request_num * beam_size, KV_HEADS, max_decode_steps, HEAD_DIM), dtype=dtype
     ).uniform_(-1, 1)
     unshared_value = torch.empty_like(unshared_key).uniform_(-1, 1)
+    # Unwritten capacity must be masked even when its values would dominate
+    # an incorrectly included attention row.
+    unshared_key[:, :, decode_step:, :].zero_()
+    unshared_value[:, :, decode_step:, :].fill_(1000)
 
     expected = _reference_x_attention(
         query,

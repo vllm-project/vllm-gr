@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """BeamAttentionPool — 5-D continuous KV pool for incremental decode.
 
 Each pool holds a single contiguous tensor pair (key/value) of shape

@@ -1,0 +1,48 @@
+{
+  "license": "Apache-2.0",
+  "copyright": "Copyright contributors to the vLLM-GR project",
+  "verbatim_copies": {
+    "tools/pre_commit/check_boolean_context_manager.py": {
+      "license": "Apache-2.0",
+      "copyrights": [
+        "Copyright contributors to the vLLM project"
+      ],
+      "source": "https://github.com/vllm-project/vllm"
+    },
+    "tools/pre_commit/enforce_regex_import.py": {
+      "license": "Apache-2.0",
+      "copyrights": [
+        "Copyright contributors to the vLLM project"
+      ],
+      "source": "https://github.com/vllm-project/vllm"
+    },
+    "tools/pre_commit/png-lint.sh": {
+      "license": "Apache-2.0",
+      "copyrights": [
+        "Copyright contributors to the vLLM project"
+      ],
+      "source": "https://github.com/vllm-project/vllm"
+    },
+    "tools/pre_commit/validate_config.py": {
+      "license": "Apache-2.0 AND MIT",
+      "copyrights": [
+        "Copyright contributors to the vLLM project"
+      ],
+      "source": "https://github.com/vllm-project/vllm"
+    },
+    "vllm_gr/entrypoints/grpc/generated/common_pb2.py": {
+      "license": "Apache-2.0",
+      "copyrights": [
+        "Copyright 2023-2024 SGLang Team"
+      ],
+      "source": "https://github.com/lightseekorg/smg"
+    },
+    "vllm_gr/entrypoints/grpc/proto/common.proto": {
+      "license": "Apache-2.0",
+      "copyrights": [
+        "Copyright 2023-2024 SGLang Team"
+      ],
+      "source": "https://github.com/lightseekorg/smg"
+    }
+  }
+}

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
@@ -265,7 +265,8 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
 
         import torch
 
-        import vllm_gr.v1.attention.backends.beam_attn_metadata as beam_attn_metadata
+        import vllm_gr.v1.attention.backends.beam_attn_metadata_tensors as beam_metadata_tensors
+        from vllm_gr.v1.attention.backends import beam_attn_metadata
 
         builder = object.__new__(beam_attn_metadata.BeamAttentionMetadataBuilder)
         builder.aot_schedule = True
@@ -282,7 +283,8 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
             "get_scheduler_metadata",
             return_value={},
         ) as scheduler:
-            builder._get_schedule(
+            beam_metadata_tensors.get_schedule(
+                builder._tensor_context(),
                 batch_size=2,
                 cu_query_lens=torch.tensor([0, 1, 2], dtype=torch.int32),
                 max_query_len=1,
@@ -290,6 +292,7 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
                 max_seq_len=8,
                 causal=True,
                 max_num_splits=0,
+                scheduler=beam_attn_metadata.get_scheduler_metadata,
             )
 
         kwargs = scheduler.call_args.kwargs
@@ -297,7 +300,7 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         assert "num_kv_heads" not in kwargs
 
     def test_batch_invariant_forces_single_flash_attention_split(self):
-        import vllm_gr.v1.attention.backends.beam_attn_gpu as beam_attn_gpu
+        from vllm_gr.v1.attention.backends import beam_attn_gpu
 
         with mock.patch.object(beam_attn_gpu.envs, "VLLM_BATCH_INVARIANT", True):
             assert beam_attn_gpu._num_splits(0) == 1

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Thin NPU provider with lazy Ascend-specific imports."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from .protocol import BeamAttentionExecution, ModelRunnerPatchHooks
 
@@ -19,6 +19,15 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class NPUBackendProvider:
     device_type: str = "npu"
+    # Semantic ownership includes deferred hooks and existing shared dispatch.
+    patch_ids: ClassVar[tuple[str, ...]] = (
+        "GR-PATCH-002",
+        "GR-PATCH-012",
+        "GR-PATCH-016",
+        "GR-PATCH-018",
+        "GR-PATCH-019",
+        "GR-PATCH-021",
+    )
 
     def check_environment(self) -> dict[str, str]:
         from vllm_gr._env_check import check_ascend_environment
@@ -26,13 +35,16 @@ class NPUBackendProvider:
         return check_ascend_environment(require_npu_platform=True)
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
+        del force  # Installers inspect their current targets on every call.
+        from vllm_gr import npu_spawn_patch
         from vllm_gr.v1 import ascend_compat
 
-        attention_count = ascend_compat.apply_ascend_attention_backend_patch(
-            force=force,
-        )
+        # Preserve spawn protection before native worker imports or process
+        # creation. NPUWorker initializes Ascend ops before its ModelRunner;
+        # keep that delayed import before the common Beam installer runs.
+        spawn_count = int(npu_spawn_patch.apply_npu_spawn_patch())
         worker_count = ascend_compat.patch_npu_worker_init_device()
-        return attention_count + worker_count
+        return spawn_count + worker_count
 
     def get_model_runner_hooks(self) -> ModelRunnerPatchHooks:
         return cast(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Bounded-retention full-vocabulary Beam Top-K.
 
 The legacy path keeps ``top_k`` candidates in every vocabulary tile (173 tiles

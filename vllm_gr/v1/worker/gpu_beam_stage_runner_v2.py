@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """ModelRunner V2 execution hooks for the persistent GR stage runner.
 
 The stage-runner core (``gpu_beam_stage_runner.GPUBeamStageRunner``) is
@@ -9,7 +9,7 @@ that surface onto the V2 ModelRunner
 
 - forward: ``set_forward_context`` + the torch.compile'd ``runner.model``
   (V2 has no ``_model_forward`` helper; the same route is proven by the V2
-  beam-decode graph capture, ``gpu_model_runner_v2_graph``).
+  beam-decode graph capture, ``gpu_model_runner_v2_resources``).
 - prefill logits: native ``execute_model`` publishes ``ExecuteModelState``
   carrying ``hidden_states``; logits are computed from
   ``hidden_states[logits_indices]`` (the ``patched_sample_v2`` contract).
@@ -26,8 +26,9 @@ that surface onto the V2 ModelRunner
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from vllm.logger import init_logger
@@ -38,19 +39,20 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
     _hidden_logits,
-    _StageExecutionHooks,
     should_replay_decode_graph,
 )
+from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooks
 
 logger = init_logger(__name__)
 
 
-class V2StageExecutionHooks(_StageExecutionHooks):
-    """_StageExecutionHooks bound to the V2 GPUModelRunner surface."""
+class CudaStageHooksV2(CudaStageHooks):
+    """V2 native operations and graph policy for the shared CUDA stage core."""
 
-    persistent_graph_install = False
+    persistent_graph_install: ClassVar[bool] = False
     # Both runners allocate and use the transposed head only when slicing is requested.
-    supports_transposed_head = True
+    supports_transposed_head: ClassVar[bool] = True
+    specialize_constraint_steps: ClassVar[bool] = True
 
     def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
         from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2InputBuffers
@@ -100,7 +102,10 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         )
 
     def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        assert owner.inputs is not None
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         worker = self.worker
         batch_size = len(owner.bindings)
@@ -202,7 +207,7 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             )
 
     def prefill_logits(
-        self, original: Any, scheduler_output: Any, *args: Any, **kwargs: Any
+        self, original: Callable[..., Any], scheduler_output: Any, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
         worker = self.worker
         from contextlib import nullcontext
@@ -263,11 +268,18 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         # GR bypasses native sample_tokens/postprocess, which normally advances
         # this GPU counter. update_requests only updates its CPU mirror; without
         # the device update a continuation gathers the previous chunk again.
-        # Every prefill chunk consumes its actual query length (not graph
-        # padding), even when it produces no Beam output. Generated token
-        # history remains owned by GR, so use the count-only native update.
+        # Complete GR Prefill consumes its actual query length (not graph
+        # padding), including after a Prefix Cache hit. Generated token history
+        # remains owned by GR, so use the count-only native update.
         worker.postprocess_num_computed_tokens(batch)
         return logits
+
+    def finish_native_output(self) -> None:
+        """Finish output submission without repeating native Prefill updates."""
+        self.worker.execute_model_state = None
+        # Preserve the existing GR reset even if native V2 did not create this
+        # V1-style field. This does not invoke a connector or clear GR buffers.
+        self.worker.kv_connector_output = None
 
     def prefill_stage_fence(self) -> None:
         # V2 prepares a fresh InputBatch per execute_model call; there are no
@@ -299,7 +311,9 @@ class V2StageExecutionHooks(_StageExecutionHooks):
 
 def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -> bool:
     """Unselected/refused shapes fall back; missing selected graphs remain fatal."""
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     cfg = _get_gr_config(worker)
     requested = not worker.model_config.enforce_eager and cfg.beam_graph_enabled

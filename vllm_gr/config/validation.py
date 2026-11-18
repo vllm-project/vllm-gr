@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Any, cast
 import regex as re
 
 from vllm_gr.config.models import (
-    _BEAM_MAX_DECODE_STEPS_DEFAULT,
     CONSTRAINT_TABLE_FORMAT,
     GR_CONFIG_SCHEMA_VERSION,
     MAX_BEAM_WIDTH,
@@ -20,11 +19,35 @@ from vllm_gr.config.models import (
     BeamExecutionMode,
     ConstraintBackend,
     ConstraintTableBackendEnum,
+    ConstraintTableConfig,
     GRAttentionBackend,
+    GRConfig,
     NPUDecodeExecution,
 )
+from vllm_gr.config.schema import config_default, config_fields
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def validate_config_fields(config: object) -> None:
+    """Normalize each declared field once, before checking model invariants."""
+    for item, spec in config_fields(type(config)):
+        validator = globals().get(spec.validator)
+        if not callable(validator):
+            raise ValueError(f"unknown config validator: {spec.validator}")
+        object.__setattr__(config, item.name, validator(getattr(config, item.name)))
+
+
+def validate_constraint_table(value: object) -> ConstraintTableConfig | None:
+    if value is not None and not isinstance(value, ConstraintTableConfig):
+        raise ValueError("vllm-gr constraint_table must be a ConstraintTableConfig or None")
+    return value
+
+
+def validate_beam_adapter_cache_enabled(value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError("beam.adapter_cache_enabled must be a boolean")
+    return value
 
 
 def validate_beam_execution_mode(value: object) -> BeamExecutionMode | None:
@@ -119,7 +142,7 @@ def validate_constraint_table_format(value: object) -> str:
             f"unsupported vllm-gr constraint_table.format {value!r}; "
             f"expected {CONSTRAINT_TABLE_FORMAT!r} or {MULTI_TRIE_CONSTRAINT_TABLE_FORMAT!r}"
         )
-    return value
+    return cast(str, value)
 
 
 def _validate_sha256(value: object, name: str) -> str | None:
@@ -268,7 +291,7 @@ def validate_beam_sid_stage_vocab(value: object) -> bool:
 
 def validate_beam_graph_enabled(value: object) -> bool:
     if value is None:
-        return True
+        return cast(bool, config_default(GRConfig, "beam_graph_enabled"))
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -367,6 +390,6 @@ def validate_beam_engine_driven(value: object) -> bool | None:
 
 def validate_beam_max_decode_steps(value: object) -> int:
     return _validate_positive_int(
-        value if value is not None else _BEAM_MAX_DECODE_STEPS_DEFAULT,
+        value if value is not None else config_default(GRConfig, "beam_max_decode_steps"),
         "beam_max_decode_steps",
     )

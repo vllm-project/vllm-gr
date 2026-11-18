@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Exercise the shell gate without selecting real accelerator devices."""
 
 import os
@@ -16,7 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(shutil.which("bash"), "Bash is required for shell-gate controls")
 class TestNPUGateRuntime(unittest.TestCase):
-    def run_gate(self, *, npu: bool, runtime_status: int = 0) -> tuple[int, str, list[str]]:
+    def run_gate(
+        self,
+        *,
+        npu: bool,
+        runtime_status: int = 0,
+        extra_args: list[str] | None = None,
+    ) -> tuple[int, str, list[str]]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             trace = root / "trace"
@@ -25,6 +31,27 @@ class TestNPUGateRuntime(unittest.TestCase):
                 "tools/resource.sh": (
                     f"npu_state={'true' if npu else 'false'}\n"
                     'get_gpu() { echo device >> "$GATE_TRACE"; echo 0; }\n'
+                    # run_test.sh runs the visibility parser check on every path,
+                    # so the stand-in must honor the same parsing contract.
+                    "_cuda_device_indices() {\n"
+                    # One event per gate run: the first call is the parser check.
+                    '    [ -e "$GATE_TRACE.indices" ] || {\n'
+                    '        echo indices >> "$GATE_TRACE"\n'
+                    '        : > "$GATE_TRACE.indices"\n'
+                    "    }\n"
+                    "    local n=$1\n"
+                    '    if [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then\n'
+                    "        seq 0 $((n - 1))\n"
+                    "        return 0\n"
+                    "    fi\n"
+                    '    [ -n "$CUDA_VISIBLE_DEVICES" ] || return 1\n'
+                    "    case $CUDA_VISIBLE_DEVICES in *[!0-9,]*) return 1 ;; esac\n"
+                    "    local IFS=',' i\n"
+                    "    for i in $CUDA_VISIBLE_DEVICES; do\n"
+                    '        [ "$i" -lt "$n" ] && echo "$i"\n'
+                    "    done\n"
+                    "    return 0\n"
+                    "}\n"
                     'python3() { echo "runtime:$*" >> "$GATE_TRACE"; '
                     'return "$RUNTIME_STATUS"; }\n'
                     'pre-commit() { echo cuda-tests >> "$GATE_TRACE"; }\n'
@@ -53,7 +80,7 @@ class TestNPUGateRuntime(unittest.TestCase):
                 LD_LIBRARY_PATH="",
             )
             result = subprocess.run(
-                ["bash", "tools/run_test.sh"],
+                ["bash", "tools/run_test.sh", *(extra_args or [])],
                 cwd=root,
                 env=env,
                 capture_output=True,
@@ -76,12 +103,24 @@ class TestNPUGateRuntime(unittest.TestCase):
         code, error, events = self.run_gate(npu=True)
         self.assertEqual(code, 0, error)
         self.assertTrue(events[0].startswith("runtime:"))
-        self.assertEqual(events[1:], ["resources", "device", "operators", "pytest:npu"])
+        self.assertEqual(events[1:], ["indices", "resources", "device", "operators", "pytest:npu"])
 
     def test_cuda_gate_does_not_require_an_ascend_runtime(self) -> None:
         code, error, events = self.run_gate(npu=False, runtime_status=1)
         self.assertEqual(code, 0, error)
-        self.assertEqual(events, ["resources", "device", "cuda-tests"])
+        self.assertEqual(events, ["indices", "resources", "device", "cuda-tests"])
+
+    def test_explicit_device_still_runs_the_parser_check(self) -> None:
+        code, error, events = self.run_gate(npu=False, extra_args=["--device-id", "3"])
+        self.assertEqual(code, 0, error)
+        # The parser check runs, auto-detection does not.
+        self.assertEqual(events, ["indices", "cuda-tests"])
+
+    def test_empty_device_id_is_rejected(self) -> None:
+        for args in (["--device-id="], ["--device-id", ""]):
+            code, error, events = self.run_gate(npu=False, extra_args=args)
+            self.assertNotEqual(code, 0)
+            self.assertIn("requires a non-empty value", error)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+# Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm
 # ruff: noqa: E402
 
 
@@ -211,7 +213,7 @@ def _native_impl() -> BeamAttentionImpl:
 @pytest.mark.parametrize("dtype", DTYPES)  # type: ignore[misc]
 @torch.inference_mode()  # type: ignore[misc]
 def test_native_kv_layout_cascade(layout: KVCacheLayout, dtype: torch.dtype) -> None:
-    """Check native cache writes, nonzero layer offsets and paged suffix gathers."""
+    """Check native prefix writes, nonzero layer offsets and pooled suffix attention."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     set_random_seed(17)
@@ -414,3 +416,103 @@ def test_native_kv_layout_incremental_pool(layout: KVCacheLayout, dtype: torch.d
     assert not caches["layer2"].count_nonzero()
     assert not context.pools[1].unshared_key[0].count_nonzero()
     session.end_session()
+
+
+@pytest.mark.parametrize("graph_replay", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore[misc]
+@pytest.mark.parametrize("fused", [False, True])  # type: ignore[misc]
+@pytest.mark.l2  # type: ignore[misc]
+@torch.inference_mode()  # type: ignore[misc]
+def test_incremental_forward_append_reorder_matches_dense(
+    graph_replay: bool, dtype: torch.dtype, fused: bool
+) -> None:
+    """Cache writes and repeated-parent reorder agree with independent dense history."""
+    from types import SimpleNamespace
+
+    from cascade_beam_attn_utils import build_beam_attn_metadata
+
+    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+
+    if not torch.cuda.is_available() or not is_fa_version_supported(2):
+        pytest.skip("CUDA FlashAttention 2 is required")
+    torch.manual_seed(81)
+    width, heads, kv_heads, dim, steps = 4, 8, 2, 128, 3
+    inputs = prepare_inputs(
+        1,
+        width,
+        heads,
+        kv_heads,
+        dim,
+        1,
+        22,
+        16,
+        dtype,
+        suffix_kv_len=steps,
+        device="cuda",
+        fa_version=2,
+    )
+    session = inputs.session
+    session.context.enable_short_suffix_attention = fused
+    session._state.decode_step = 0
+    session.context.decode_step_buf.zero_()
+    pool = session.pools[0]
+    pool.unshared_key.fill_(float("nan"))
+    pool.unshared_value.fill_(float("nan"))
+    metadata = build_beam_attn_metadata(inputs, "cuda")
+    query = torch.randn_like(inputs.query)
+    key = torch.randn(width, kv_heads, dim, device="cuda", dtype=dtype)
+    value = torch.randn_like(key)
+    output = torch.empty_like(query)
+    kv_cache = torch.cat((inputs.key_cache, inputs.value_cache), dim=-1).transpose(1, 2)
+    saved_prefix = kv_cache.clone()
+    impl = BeamAttentionImpl(heads, dim, inputs.scale, kv_heads, None, None, "auto")
+    impl.vllm_flash_attn_version = 2
+    layer = SimpleNamespace(layer_name="model.layers.0.self_attn")
+
+    def forward() -> None:
+        impl.forward(layer, query, key, value, kv_cache, metadata, output=output)
+
+    if graph_replay:
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(capture_stream):
+            for _ in range(2):
+                forward()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                forward()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+
+    prefix_k = inputs.key_cache[inputs.block_tables[0].long()].flatten(0, 1)[:19]
+    prefix_v = inputs.value_cache[inputs.block_tables[0].long()].flatten(0, 1)[:19]
+    history_k = key.new_empty(width, 0, kv_heads, dim)
+    history_v = value.new_empty(width, 0, kv_heads, dim)
+    parents = torch.tensor([1, 1, 3, 0], device="cuda", dtype=torch.long)
+    for step in range(steps):
+        assert session.decode_step == step
+        query.copy_(torch.randn_like(query))
+        key.copy_(torch.randn_like(key))
+        value.copy_(torch.randn_like(value))
+        session.context.decode_step_buf.fill_(step)
+        metadata.suffix_cu_seqlens_k_device.copy_(
+            torch.arange(width + 1, device="cuda", dtype=torch.int32) * (step + 1)
+        )
+        history_k = torch.cat((history_k, key[:, None].clone()), dim=1)
+        history_v = torch.cat((history_v, value[:, None].clone()), dim=1)
+        if graph_replay:
+            graph.replay()
+        else:
+            forward()
+        dense_k = torch.cat((prefix_k[None].expand(width, -1, -1, -1), history_k), dim=1)
+        dense_v = torch.cat((prefix_v[None].expand(width, -1, -1, -1), history_v), dim=1)
+        dense_k = dense_k.float().repeat_interleave(heads // kv_heads, dim=2)
+        dense_v = dense_v.float().repeat_interleave(heads // kv_heads, dim=2)
+        weights = torch.einsum("whd,wlhd->whl", query.float(), dense_k) * inputs.scale
+        expected = torch.einsum("whl,wlhd->whd", weights.softmax(-1), dense_v)
+        tolerance = 4e-3 if dtype == torch.bfloat16 else 5e-4
+        torch.testing.assert_close(output.float(), expected, atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(kv_cache, saved_prefix, atol=0, rtol=0)
+        if step + 1 < steps:
+            session.step_complete(parents)
+            history_k = history_k[parents].clone()
+            history_v = history_v[parents].clone()

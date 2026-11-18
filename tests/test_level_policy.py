@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 """Hardware-free tests of the CI level policy and pytest selection hook."""
 
@@ -67,7 +67,7 @@ def test_cascade_gpu_specification_partitions_full_parameter_matrix() -> None:
     values = product(
         [1, 4],
         [16, 32],
-        [(8, 8, 8), (8, 32, 8), (4, 64, 4), (4, 16, 4), (1, 16, 4), (1, 128, 1), (4, 32, 7)],
+        [(1, 8, 8), (1, 32, 8), (1, 64, 4), (1, 16, 4), (1, 16, 7), (1, 128, 1), (1, 32, 7)],
         [(4, 4), (8, 2), (16, 2)],
         [128, 256],
         ["float16", "bfloat16"],
@@ -94,7 +94,7 @@ def test_cascade_gpu_specification_partitions_full_parameter_matrix() -> None:
     assert levels.count("l2") == 24
     assert levels.count("l4") == 2664
     baseline = dict(
-        zip(names, (1, 16, (8, 32, 8), (4, 4), 128, "float16", 16, None, 2), strict=True)
+        zip(names, (1, 16, (1, 32, 8), (4, 4), 128, "float16", 16, None, 2), strict=True)
     )
     assert resolve_level(INVENTORY, key, {**baseline, "dtype": "float64"}, {}) == "l4"
 
@@ -115,7 +115,7 @@ def test_npu_case_specification_partitions_full_parameter_matrix() -> None:
     vals = product(
         [1, 4],
         [16, 32],
-        [(8, 32, 8), (4, 64, 4), (4, 16, 4), (1, 16, 4), (1, 128, 1), (4, 32, 7)],
+        [(1, 32, 8), (1, 64, 4), (1, 16, 4), (1, 16, 7), (1, 128, 1), (1, 32, 7)],
         [(4, 4), (8, 2), (16, 2)],
         [128],
         [32, 128],
@@ -136,7 +136,7 @@ def test_npu_case_specification_partitions_full_parameter_matrix() -> None:
     assert levels.count("l4") == 276
     assert (
         resolve_level(
-            INVENTORY, key, {"case": Case(1, 16, (8, 32, 8), 4, 4, 128, 128, "float32")}, {}
+            INVENTORY, key, {"case": Case(1, 16, (1, 32, 8), 4, 4, 128, 128, "float32")}, {}
         )
         == "l4"
     )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Unit tests for the pure-prefill graph interception (_model_forward patch)."""
 
 from types import SimpleNamespace
@@ -104,6 +104,60 @@ def test_gpu_model_forward_intercepts_pure_prefill(
     result = wrapped(runner, input_ids="ids", positions="pos")
     assert result == "orig_out"
     assert original_calls == [("ids", "pos"), ("ids", "pos"), ("ids", "pos")]
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_gpu_model_forward_dense_prefill_replays_only_fresh_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.attention.backends.beam_dense_prefill import ENV_DENSE_PREFILL
+
+    output_buf = torch.zeros(4, 16)
+
+    class FakePrefillRunner:
+        def match_bucket(self: Any, total_tokens: Any) -> Any:
+            return 128
+
+        def has_captured_graph(self: Any, bucket: Any, num_reqs: Any) -> Any:
+            return True
+
+        def execute_model_prefill(self: Any, *args: Any, **kwargs: Any) -> Any:
+            return output_buf
+
+    monkeypatch.setattr(gpu_patch_mod, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(gpu_patch_mod, "is_prefill_phase_batch", lambda self, so: True)
+    monkeypatch.setattr(gpu_patch_mod, "scheduled_requests_are_fresh", lambda self, so: so.fresh)
+    monkeypatch.setattr(
+        gpu_patch_mod, "get_prefill_graph_runner", lambda runner: FakePrefillRunner()
+    )
+    meta = SimpleNamespace(slot_mapping=torch.zeros(64, dtype=torch.int64))
+    monkeypatch.setattr(
+        "vllm.forward_context.get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"l": meta}),
+    )
+    wrapped = gpu_patch_mod.make_patched_model_forward_gpu(lambda self, *args, **kwargs: "orig_out")
+
+    def run(fresh: bool) -> Any:
+        scheduler_output = SimpleNamespace(fresh=fresh, num_scheduled_tokens={"r1": 30})
+        runner = SimpleNamespace(
+            _current_scheduler_output=scheduler_output,
+            input_batch=SimpleNamespace(
+                block_table=[
+                    SimpleNamespace(
+                        slot_mapping=SimpleNamespace(gpu=torch.zeros(64, dtype=torch.int64))
+                    )
+                ]
+            ),
+        )
+        return wrapped(runner, input_ids="ids", positions="pos")
+
+    # Without dense Prefill, a cached-Prefill suffix may replay the graph.
+    monkeypatch.delenv(ENV_DENSE_PREFILL, raising=False)
+    assert run(fresh=False) is output_buf
+    # With dense Prefill, only fresh prompts replay; others run the original forward.
+    monkeypatch.setenv(ENV_DENSE_PREFILL, "cudnn")
+    assert run(fresh=False) == "orig_out"
+    assert run(fresh=True) is output_buf
 
 
 pytestmark = pytest.mark.cpu_test

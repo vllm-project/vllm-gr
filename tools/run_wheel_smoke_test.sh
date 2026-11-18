@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
 # Build a wheel, install it into an isolated target directory, and smoke-test
 # the installed artifact without importing the source checkout.
 

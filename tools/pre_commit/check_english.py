@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """
 Verify that text in specified files or directories are in English and not in other languages.
 
@@ -22,6 +22,8 @@ EXCEPT_PATHS = [
     "benchmarks/open_one_rec",
     "trc",
     "docs/quickstart.md",
+    "docs/hot_update_tests.zh-CN.md",
+    "docs/weight_update_sidecar_design.zh-CN.md",
     "tests/resources/single_one_rec_prompt.txt",
 ]
 

@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Device routing and input ownership for native GR dispatches."""
+
+from __future__ import annotations
 
 from collections.abc import Callable
 from copy import copy, deepcopy
 from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+
+from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooksType
 
 
 def _copy_record(value: Any) -> Any:
@@ -87,21 +91,22 @@ def execute_gr_stage(
     scheduled: Any,
     original: Callable[..., Any],
     *args: Any,
-    hooks_type: type[Any] | None = None,
+    hooks_type: CudaStageHooksType | None = None,
     **kwargs: Any,
 ) -> Any:
     local = worker_input(scheduled)
     device_type = str(worker.device).split(":")[0]
     if device_type == "cuda":
         from vllm_gr.v1.worker.gpu_beam_stage_runner import (
-            _StageExecutionHooks,
             get_stage_runner,
         )
 
+        if hooks_type is None:
+            raise ValueError("CUDA GR execution requires explicit stage hooks")
         stage_runner = get_stage_runner(
             worker,
             local,
-            hooks_type=hooks_type or _StageExecutionHooks,
+            hooks_type=hooks_type,
         )
     elif device_type == "npu":
         from vllm_gr.v1.worker.npu_beam_stage_runner import get_npu_stage_runner
@@ -126,10 +131,53 @@ def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
             execute_gr_retirement as retire,
         )
     elif device_type == "npu":
-        from vllm_gr.v1.worker.npu_beam_stage_runner import (
-            execute_npu_gr_retirement as retire,
-        )
+        from vllm_gr.v1.worker.npu_beam_stage_runner import execute_npu_gr_retirement
+
+        return execute_npu_gr_retirement(worker, local)
     else:
         raise ValueError("beam_search_v1 has no retirement adapter for this device")
 
     return retire(worker, local)
+
+
+def _dispatch_retirement_frame(self: Any, scheduler_output: Any) -> Any:
+    """Handle a GR retirement control frame; returns the retire output.
+
+    Returns None when ``scheduler_output`` is not a retirement frame (the
+    caller continues with the normal dispatch).
+    """
+    from vllm_gr.v1.engine.gr_async_scheduler import GR_RETIRE_OUTPUT_ATTR
+
+    if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is None:
+        return None
+    return execute_gr_retirement(self, scheduler_output)
+
+
+def _dispatch_stage_frame(
+    self: Any,
+    scheduler_output: Any,
+    orig_execute_model: Callable[..., Any],
+    *args: Any,
+    hooks_type: CudaStageHooksType | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Handle a persistent GR stage frame (beam_search_v1 execution).
+
+    Returns ``_NOT_A_STAGE_FRAME`` when ``scheduler_output`` is not a stage
+    frame; otherwise the stage runner's execute() result.  On an execution
+    failure the error is recorded on the stage runner before re-raising —
+    the native BatchQueue associates the execute and sample Futures, so
+    sampling must also fail or valid-looking stale logits could hide a
+    failed execute Future from that native path.
+    """
+    from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+
+    if not getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
+        return _NOT_A_STAGE_FRAME
+    return execute_gr_stage(
+        self, scheduler_output, orig_execute_model, *args, hooks_type=hooks_type, **kwargs
+    )
+
+
+# Sentinel distinguishing "not a stage frame" from a legitimate None result.
+_NOT_A_STAGE_FRAME = object()

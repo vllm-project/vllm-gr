@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """NPU execution primitives for the Beam Attention backend."""
 
 from __future__ import annotations
@@ -14,9 +14,10 @@ from vllm.logger import init_logger
 
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
+    require_beam_decode_session,
+    resolve_beam_pool,
 )
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
-    extract_suffix_kv_pytorch,
     merge_tnd_attention_outputs,
 )
 from vllm_gr.v1.worker.prefill_graph_common import SUPPORTED_NUM_REQS
@@ -105,6 +106,11 @@ def cascade_attention(
     alibi_slopes: torch.Tensor | None = None,
     beam_pool: object = None,  # Per-layer pool, passed explicitly by forward()
 ) -> None:
+    if attn_metadata.is_beam_decode or attn_metadata.prefix_indices is not None:
+        beam_session = require_beam_decode_session(attn_metadata)
+        if attn_metadata.prefix_indices is not None:
+            pool = resolve_beam_pool(attn_metadata, beam_pool)
+
     if attn_metadata.std_indices is not None:
         if attn_metadata.prefix_indices is None:
             std_query = query[: attn_metadata.num_std_indices]
@@ -152,54 +158,28 @@ def cascade_attention(
             sparse_mode=0,
         )
 
-        # --- Incremental decode path: read suffix KV from pool slice ---
-        beam_session = getattr(attn_metadata, "beam_session", None)
-        is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
+        step = beam_session.decode_step  # host int, no .item()
+        slot = beam_session.slot
+        H = pool.num_kv_heads
+        D = pool.head_dim
+        W = int(getattr(beam_session, "attention_width", beam_session.beam_width))
 
-        if is_beam_decode and beam_session is not None and beam_session.is_active:
-            # Incremental decode: read suffix KV from pool slice
-            # instead of extract_suffix_kv_pytorch from paged cache.
-            # Prefer the explicitly-passed beam_pool; fall back to metadata
-            # for backward compatibility with callers that still set
-            # beam_layer_idx on the metadata.
-            if beam_pool is not None:
-                pool = beam_pool
-            else:
-                layer_idx = getattr(attn_metadata, "beam_layer_idx", 0)
-                pool = beam_session.pools[layer_idx]
-            step = beam_session.decode_step  # host int, no .item()
-            slot = beam_session.slot
-            H = pool.num_kv_heads
-            D = pool.head_dim
-            # Batch sessions flatten B requests into B*W attention rows;
-            # beam_width remains the per-request width on that facade.
-            W = int(getattr(beam_session, "attention_width", beam_session.beam_width))
+        # Read pool slice: [W, H, step+1, D]
+        pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
+        pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
 
-            # Read pool slice: [W, H, step+1, D]
-            pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
-            pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
-
-            # Copy to pre-allocated fixed buffer (avoiding new allocation)
-            # Reshape: [W, H, step+1, D] -> [W*(step+1), H, D]
-            total_kv = W * (step + 1)
-            suffix_k_buf = beam_session.suffix_k_buf
-            suffix_v_buf = beam_session.suffix_v_buf
-            suffix_k_buf[:total_kv] = pool_k.permute(0, 2, 1, 3).reshape(-1, H, D)
-            suffix_v_buf[:total_kv] = pool_v.permute(0, 2, 1, 3).reshape(-1, H, D)
-            suffix_k = suffix_k_buf[:total_kv]
-            suffix_v = suffix_v_buf[:total_kv]
-        else:
-            # Standard (recompute) path: extract_suffix_kv from paged cache
-            suffix_k, suffix_v = extract_suffix_kv_pytorch(
-                key_cache,
-                value_cache,
-                attn_metadata.suffix_slot_mapping_out,
-            )
+        # Copy to pre-allocated fixed buffer (avoiding new allocation)
+        # Reshape: [W, H, step+1, D] -> [W*(step+1), H, D]
+        total_kv = W * (step + 1)
+        suffix_k_buf = beam_session.suffix_k_buf
+        suffix_v_buf = beam_session.suffix_v_buf
+        suffix_k_buf[:total_kv] = pool_k.permute(0, 2, 1, 3).reshape(-1, H, D)
+        suffix_v_buf[:total_kv] = pool_v.permute(0, 2, 1, 3).reshape(-1, H, D)
 
         suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
             beam_query,
-            suffix_k,
-            suffix_v,
+            suffix_k_buf[:total_kv],
+            suffix_v_buf[:total_kv],
             num_query_heads=attn_metadata.num_heads,
             num_key_value_heads=attn_metadata.num_kv_heads,
             actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,

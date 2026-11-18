@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Fast detokenization helpers that bypass the HuggingFace Python wrapper.
 
 ``transformers`` ``batch_decode`` / batched ``decode`` first recursively

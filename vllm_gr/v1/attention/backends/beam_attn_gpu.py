@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """GPU execution primitives for the Beam Attention backend."""
 
 from __future__ import annotations
 
+import functools
 from copy import copy
 from typing import Any, NoReturn, cast
 
 import torch
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version as _get_flash_attn_version,
 )
@@ -23,8 +25,12 @@ from vllm_gr.v1.attention.backends.beam_attention_state import (
 )
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
+    require_beam_decode_session,
+    resolve_beam_pool,
 )
-from vllm_gr.v1.attention.backends.beam_attn_triton import extract_suffix_kv
+from vllm_gr.v1.attention.backends.beam_dense_prefill import in_fresh_prefill_capture
+
+logger = init_logger(__name__)
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -229,6 +235,119 @@ def reshape_and_cache(
     )
 
 
+# Minimum token count for the cuDNN dense Prefill; cuDNN SDPA rejects
+# single-token K/V and short shapes gain nothing over FA2.
+_CUDNN_DENSE_MIN_TOKENS = 64
+
+
+def _all_fresh_prompts(attn_metadata: Any) -> bool:
+    """Whether every request's K/V context is exactly its scheduled tokens.
+
+    The pure-Prefill metadata also serves eager batches and non-Beam decode
+    rows, whose earlier tokens live only in the paged cache. Missing CPU
+    mirrors count as "not fresh" so the paged path stays the default.
+    """
+    starts = getattr(attn_metadata, "query_start_loc_cpu", None)
+    lengths = getattr(attn_metadata, "seq_lens_cpu", None)
+    num_reqs = getattr(attn_metadata, "num_reqs", 0)
+    if not num_reqs or starts is None or lengths is None:
+        return False
+    if len(starts) < num_reqs + 1 or len(lengths) < num_reqs:
+        return False
+    return all(lengths[i] == starts[i + 1] - starts[i] for i in range(num_reqs))
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_cudnn_unavailable(reason: str) -> None:
+    logger.warning(
+        "vllm_gr: cuDNN dense Prefill unavailable (%s); using dense FA2", reason.splitlines()[0]
+    )
+
+
+def _dense_prefill_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: Any,
+    *,
+    scale: float,
+    mode: str,
+    causal: bool,
+    sliding_window_size: list[int] | tuple[int, int] | None,
+    logits_soft_cap: float,
+    s_aux: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+) -> bool:
+    """Attend over the contiguous fresh K/V instead of the paged cache.
+
+    Without cached context, request K/V rows align with its query rows, so
+    ``cu_seqlens_k == cu_seqlens_q``. Reading the paged cache forces FA2's
+    split-KV kernel (BlockM=64); the dense FA2 kernel (BlockM=128) and cuDNN
+    are faster on long prompts. Returns False when the layer configuration,
+    capture scope or request lengths do not allow it, leaving the caller on the
+    paged path. See ``beam_dense_prefill`` for the capture/replay contract.
+    """
+    if (
+        not causal
+        or alibi_slopes is not None
+        or s_aux is not None
+        or logits_soft_cap
+        or (sliding_window_size is not None and tuple(sliding_window_size) != (-1, -1))
+        or key.dtype != query.dtype
+        # A graph freezes this choice: outside a fresh-Prefill capture (e.g. a
+        # native decode capture from seq_len == 1 dummies) replay would see
+        # cached context, so only the paged path is safe.
+        or (torch.cuda.is_current_stream_capturing() and not in_fresh_prefill_capture())
+        or not _all_fresh_prompts(attn_metadata)
+    ):
+        return False
+    tokens = query.shape[0]
+    key, value = key[:tokens], value[:tokens]
+    if (
+        mode == "cudnn"
+        and getattr(attn_metadata, "num_reqs", 0) == 1
+        and tokens >= _CUDNN_DENSE_MIN_TOKENS
+    ):
+        # One request: padded tail rows past cu_seqlens_q[-1] come after every
+        # real row, so causal masking keeps them out of the real outputs.
+        import torch.nn.functional as F
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        try:
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                out = F.scaled_dot_product_attention(
+                    query.unsqueeze(0).transpose(1, 2),
+                    key.unsqueeze(0).transpose(1, 2),
+                    value.unsqueeze(0).transpose(1, 2),
+                    is_causal=True,
+                    scale=scale,
+                    enable_gqa=True,
+                )
+        except RuntimeError as error:
+            # Backend selection fails before any launch when this torch/cuDNN
+            # build cannot serve the shape; dense FA2 below still applies.
+            _warn_cudnn_unavailable(str(error))
+        else:
+            output[:tokens] = out[0].transpose(0, 1)
+            return True
+    cu_seqlens_q = attn_metadata.query_start_loc
+    max_q_len = attn_metadata.max_query_len
+    output[:tokens] = flash_attn_varlen_func(
+        q=query,
+        k=key,
+        v=value,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_q,
+        max_seqlen_q=max_q_len,
+        max_seqlen_k=max_q_len,
+        softmax_scale=scale,
+        causal=True,
+        fa_version=2,
+    )
+    return True
+
+
 def prefill_attention(
     output: torch.Tensor,
     query: torch.Tensor,
@@ -241,8 +360,16 @@ def prefill_attention(
     vllm_flash_attn_version: int,
     s_aux: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
+    dense_key: torch.Tensor | None = None,
+    dense_value: torch.Tensor | None = None,
+    dense_mode: str | None = None,
 ) -> None:
-    """Dedicated pure prefill attention execution for the prefill graph path."""
+    """Dedicated pure prefill attention execution for the prefill graph path.
+
+    ``dense_key``/``dense_value`` are this layer's freshly projected K/V. The
+    caller passes them only when every captured Prefill is a fresh prompt (no
+    prefix caching, no chunked Prefill); see ``_dense_prefill_attention``.
+    """
     cu_seqlens_q = getattr(attn_metadata, "query_start_loc", None)
     max_q_len = getattr(attn_metadata, "max_query_len", 0)
     seqused_k = getattr(attn_metadata, "seq_lens", None)
@@ -261,6 +388,23 @@ def prefill_attention(
     # FIA convention (queryT == last(actual_seq_qlen)).
     num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
     query = query[:num_actual_tokens]
+
+    if dense_key is not None and dense_value is not None and dense_mode is not None:
+        if _dense_prefill_attention(
+            output,
+            query,
+            dense_key,
+            dense_value,
+            attn_metadata,
+            scale=scale,
+            mode=dense_mode,
+            causal=causal,
+            sliding_window_size=sliding_window_size,
+            logits_soft_cap=logits_soft_cap,
+            s_aux=s_aux,
+            alibi_slopes=alibi_slopes,
+        ):
+            return
 
     std_out = flash_attn_varlen_func(
         q=query,
@@ -517,6 +661,11 @@ def cascade_attention(
     beam_pool: object = None,  # Per-layer pool, passed explicitly by forward()
     prefill_flash_attn_version: int | None = None,
 ) -> None:
+    if attn_metadata.is_beam_decode or attn_metadata.prefix_indices is not None:
+        beam_session = require_beam_decode_session(attn_metadata)
+        if attn_metadata.prefix_indices is not None:
+            pool = resolve_beam_pool(attn_metadata, beam_pool)
+
     if attn_metadata.std_indices is not None:
         if attn_metadata.prefix_indices is None:
             std_query = query[: attn_metadata.num_std_indices]
@@ -570,143 +719,99 @@ def cascade_attention(
             s_aux=s_aux,
         )
 
-        # --- Incremental decode path: read suffix KV from pool slice ---
-        beam_session = getattr(attn_metadata, "beam_session", None)
-        is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
+        slot = beam_session.slot
+        H = pool.num_kv_heads
+        D = pool.head_dim
+        W = beam_session.beam_width
+        max_steps = pool.max_decode_steps
+        # Pure incremental short decode: consume the pool directly and
+        # merge into the final output, avoiding packed KV and suffix FA2.
+        decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
+        if getattr(
+            beam_session.context, "enable_short_suffix_attention", False
+        ) and _is_pure_beam_decode(attn_metadata, W):
+            from vllm_gr.v1.attention.backends.beam_short_suffix import (
+                merge_short_suffix_attention,
+            )
 
-        if is_beam_decode and beam_session is not None and beam_session.is_active:
-            # Incremental decode: read suffix KV from pool slice
-            # instead of extract_suffix_kv from paged cache.
-            # Prefer the explicitly-passed beam_pool; fall back to metadata
-            # for backward compatibility with callers that still set
-            # beam_layer_idx on the metadata.
-            if beam_pool is not None:
-                pool = beam_pool
-            else:
-                layer_idx = getattr(attn_metadata, "beam_layer_idx", 0)
-                pool = beam_session.pools[layer_idx]
-            slot = beam_session.slot
-            H = pool.num_kv_heads
-            D = pool.head_dim
-            W = beam_session.beam_width
-            max_steps = pool.max_decode_steps
-            # Pure incremental short decode: consume the pool directly and
-            # merge into the final output, avoiding packed KV and suffix FA2.
-            decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
-            if getattr(
-                beam_session.context, "enable_short_suffix_attention", False
-            ) and _is_pure_beam_decode(attn_metadata, W):
-                from vllm_gr.v1.attention.backends.beam_short_suffix import (
-                    merge_short_suffix_attention,
-                )
+            merge_short_suffix_attention(
+                output[:W],
+                beam_query,
+                prefix_out,
+                prefix_lse,
+                pool.unshared_key,
+                pool.unshared_value,
+                slot,
+                decode_step_buf,
+                scale,
+                getattr(attn_metadata, "beam_active_mask", None),
+            )
+            return
 
-                merge_short_suffix_attention(
-                    output[:W],
-                    beam_query,
-                    prefix_out,
-                    prefix_lse,
-                    pool.unshared_key,
-                    pool.unshared_value,
-                    slot,
-                    decode_step_buf,
-                    scale,
-                    getattr(attn_metadata, "beam_active_mask", None),
-                )
-                return
+        suffix_k_buf = beam_session.suffix_k_buf
+        suffix_v_buf = beam_session.suffix_v_buf
 
-            suffix_k_buf = beam_session.suffix_k_buf
-            suffix_v_buf = beam_session.suffix_v_buf
+        # Copy the pool's valid suffix KV into the packed suffix buffer.
+        #
+        # Graph-compatible path: a Triton kernel reads decode_step from
+        # the device buffer and computes the packed destination offsets at
+        # runtime.  The eager path below uses host-side Python slices
+        # (`: step + 1`), which CUDA Graph capture would bake in — a
+        # graph captured at step=1 would forever copy only 2 KV rows.
+        decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
+        if decode_step_buf is not None and decode_step_buf.is_cuda:
+            from vllm_gr.v1.attention.backends.beam_graph_kernels import (
+                copy_suffix_kv_graph,
+            )
 
-            # Copy the pool's valid suffix KV into the packed suffix buffer.
-            #
-            # Graph-compatible path: a Triton kernel reads decode_step from
-            # the device buffer and computes the packed destination offsets at
-            # runtime.  The eager path below uses host-side Python slices
-            # (`: step + 1`), which CUDA Graph capture would bake in — a
-            # graph captured at step=1 would forever copy only 2 KV rows.
-            decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
-            if decode_step_buf is not None and decode_step_buf.is_cuda:
-                from vllm_gr.v1.attention.backends.beam_graph_kernels import (
-                    copy_suffix_kv_graph,
-                )
-
-                copy_suffix_kv_graph(
-                    pool.unshared_key,
-                    pool.unshared_value,
-                    suffix_k_buf,
-                    suffix_v_buf,
-                    slot,
-                    decode_step_buf,
-                    beam_width=W,
-                    active_mask=getattr(attn_metadata, "beam_active_mask", None),
-                )
-            else:
-                # Eager fallback: host-int slice copy (packed layout)
-                step = beam_session.decode_step  # host int
-                pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
-                pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
-
-                # Copy to suffix_buf in packed layout: [W*(step+1), H, D]
-                # Beam 0's KV rows first, then beam 1's, etc.
-                total_kv = W * (step + 1)
-                suffix_k_buf[:total_kv] = pool_k.permute(0, 2, 1, 3).reshape(-1, H, D)
-                suffix_v_buf[:total_kv] = pool_v.permute(0, 2, 1, 3).reshape(-1, H, D)
-
-            # CUDA Graph-compatible: pass the full suffix_buf (fixed shape)
-            # instead of a variable-length view. FA2 uses cu_seqlens_k to
-            # determine the actual KV boundaries — the padding zeros beyond
-            # the packed prefix don't affect the output.
-            # max_seqlen_k is set to max_steps (fixed upper bound).
-            # Verified: FA2 produces identical output with over-set max_seqlen_k
-            # when cu_seqlens_k correctly delimits each batch element's KV.
-            suffix_out, suffix_lse = flash_attn_varlen_func(
-                q=beam_query,
-                k=suffix_k_buf,
-                v=suffix_v_buf,
-                cu_seqlens_q=attn_metadata.suffix_cu_seqlens_q_device,
-                cu_seqlens_k=attn_metadata.suffix_cu_seqlens_k_device,
-                seqused_k=None,
-                max_seqlen_q=attn_metadata.suffix_max_q_len,
-                max_seqlen_k=max_steps,
-                softmax_scale=scale,
-                causal=True,
-                alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=None,
-                softcap=logits_soft_cap,
-                return_softmax_lse=True,
-                fa_version=vllm_flash_attn_version,
-                num_splits=_num_splits(0),
+            copy_suffix_kv_graph(
+                pool.unshared_key,
+                pool.unshared_value,
+                suffix_k_buf,
+                suffix_v_buf,
+                slot,
+                decode_step_buf,
+                beam_width=W,
+                active_mask=getattr(attn_metadata, "beam_active_mask", None),
             )
         else:
-            # Standard beam decode path: extract_suffix_kv from paged cache
-            contig_k, contig_v = extract_suffix_kv(
-                key_cache,
-                value_cache,
-                attn_metadata.suffix_slot_mapping_out,
-                attn_metadata.suffix_total_tokens,
-                attn_metadata.block_size,
-            )
+            # Eager fallback: host-int slice copy (packed layout)
+            step = beam_session.decode_step  # host int
+            pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
+            pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
 
-            suffix_out, suffix_lse = flash_attn_varlen_func(
-                q=beam_query,
-                k=contig_k,
-                v=contig_v,
-                cu_seqlens_q=attn_metadata.suffix_cu_seqlens_q_device,
-                cu_seqlens_k=attn_metadata.suffix_cu_seqlens_k_device,
-                seqused_k=None,
-                max_seqlen_q=attn_metadata.suffix_max_q_len,
-                max_seqlen_k=attn_metadata.suffix_max_seq_len,
-                softmax_scale=scale,
-                causal=True,
-                alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=None,
-                softcap=logits_soft_cap,
-                return_softmax_lse=True,
-                fa_version=vllm_flash_attn_version,
-                num_splits=_num_splits(0),
-            )
+            # Copy to suffix_buf in packed layout: [W*(step+1), H, D]
+            # Beam 0's KV rows first, then beam 1's, etc.
+            total_kv = W * (step + 1)
+            suffix_k_buf[:total_kv] = pool_k.permute(0, 2, 1, 3).reshape(-1, H, D)
+            suffix_v_buf[:total_kv] = pool_v.permute(0, 2, 1, 3).reshape(-1, H, D)
+
+        # CUDA Graph-compatible: pass the full suffix_buf (fixed shape)
+        # instead of a variable-length view. FA2 uses cu_seqlens_k to
+        # determine the actual KV boundaries — the padding zeros beyond
+        # the packed prefix don't affect the output.
+        # max_seqlen_k is set to max_steps (fixed upper bound).
+        # Verified: FA2 produces identical output with over-set max_seqlen_k
+        # when cu_seqlens_k correctly delimits each batch element's KV.
+        suffix_out, suffix_lse = flash_attn_varlen_func(
+            q=beam_query,
+            k=suffix_k_buf,
+            v=suffix_v_buf,
+            cu_seqlens_q=attn_metadata.suffix_cu_seqlens_q_device,
+            cu_seqlens_k=attn_metadata.suffix_cu_seqlens_k_device,
+            seqused_k=None,
+            max_seqlen_q=attn_metadata.suffix_max_q_len,
+            max_seqlen_k=max_steps,
+            softmax_scale=scale,
+            causal=True,
+            alibi_slopes=alibi_slopes,
+            window_size=sliding_window_size,
+            block_table=None,
+            softcap=logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=vllm_flash_attn_version,
+            num_splits=_num_splits(0),
+        )
 
         suffix_out, suffix_lse = normalize_flash_attn_state(
             suffix_out,

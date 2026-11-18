@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # mypy: disable-error-code="misc"
 """CPU references for catalog-free NPU Beam admission and candidate scoring."""
 
@@ -258,6 +258,8 @@ def test_catalog_free_prefill_uses_full_vocab_without_constraint_state(
 ) -> None:
     stage = _prefill_runner(batch_size, constrained=False)
     assert stage.logits is not None
+    assert stage.pending_plan is not None
+    execution = stage.pending_plan.execution
     logits = stage.logits.clone()
     # A leftover backend must not override explicit unconstrained generation.
     stage.worker.constraint_backend = SimpleNamespace(
@@ -270,7 +272,7 @@ def test_catalog_free_prefill_uses_full_vocab_without_constraint_state(
     assert stage.prefill_candidates is not None
     _assert_matches_reference(stage.prefill_candidates, logits, torch.full((batch_size,), 0.5), 2)
     assert stage.latest_token_ids is stage.prefill_candidates.token_ids
-    assert stage.handoff is not None
+    assert stage.previous is execution
     receipt = output.gr_worker_results["catalog-free-session"]
     assert not receipt.finished and not receipt.resources_released
     assert receipt.owner_generation == 1 and receipt.terminal_result is None
@@ -322,12 +324,21 @@ def test_unconstrained_startup_selects_the_existing_npu_graph_adapter(
     assert _capture_enabled(worker) is expected
 
 
-def test_npu_generation_capacity_is_checked_before_worker_state_is_allocated() -> None:
+@pytest.mark.parametrize("capacity", [3, 4, 5, 6, 7])
+def test_npu_generation_capacity_is_checked_before_worker_state_is_allocated(
+    capacity: int,
+) -> None:
     from vllm_gr.config import GRConfig
 
-    config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device="npu"))
+    config = SimpleNamespace(
+        additional_config={},
+        device_config=SimpleNamespace(device="npu"),
+        model_config=SimpleNamespace(
+            get_num_kv_heads=lambda parallel: 8, get_head_size=lambda: 128
+        ),
+    )
     GRConfig(
-        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=4
+        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=capacity
     ).write_to_vllm_config(config)
     worker = SimpleNamespace(
         device="npu",
@@ -336,8 +347,293 @@ def test_npu_generation_capacity_is_checked_before_worker_state_is_allocated() -
         parallel_config=None,
         vllm_config=config,
     )
-    with pytest.raises(ValueError, match="NPU.*3|NPU.*three"):
+    if capacity <= 6:
         validate_npu_eager_capabilities(worker)
+    else:
+        with pytest.raises(ValueError, match=r"NPU unconstrained.*1\.\.6 generated tokens"):
+            validate_npu_eager_capabilities(worker)
+
+
+def _generation_request(
+    steps: int, *, dynamic_beam_widths: tuple[int, ...] | None = None
+) -> BeamBatchRequest:
+    native = EngineCoreRequest(
+        request_id="native-generation-budget",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=steps, temperature=0.0, ignore_eos=True),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    return BeamBatchRequest(
+        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+        batch_id=native.request_id,
+        items=(BeamBatchItem(0, native),),
+        beam_params=BeamBatchParams(
+            2, steps, 0.0, (), True, dynamic_beam_widths=dynamic_beam_widths
+        ),
+        output_options=BeamOutputOptions(2, True, True, False),
+    )
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    "device,capacity,steps,error",
+    [
+        ("npu", 6, 1, None),
+        ("npu", 6, 2, None),
+        ("npu", 6, 3, None),
+        ("npu", 4, 4, None),
+        ("npu", 6, 4, None),
+        ("npu", 6, 5, None),
+        ("npu", 6, 6, None),
+        ("npu", 3, 4, "runtime limit 3"),
+        ("npu", 5, 6, "runtime limit 5"),
+        ("npu", 6, 7, r"NPU unconstrained.*1\.\.6 generated tokens"),
+        ("npu", 7, 6, r"NPU unconstrained.*1\.\.6 generated tokens"),
+        ("cuda", 4, 4, None),
+        ("cuda", 5, 5, None),
+        ("cuda", 6, 6, None),
+        ("cuda", 8, 8, None),
+    ],
+)
+def test_generation_horizon_checks_actual_request_and_capacity(
+    device: str, capacity: int, steps: int, error: str | None
+) -> None:
+    from vllm_gr.config import GRConfig
+    from vllm_gr.v1.engine.beam_search_v1 import (
+        validate_gr_device_config,
+        validate_gr_request,
+    )
+
+    config = SimpleNamespace(
+        additional_config={},
+        device_config=SimpleNamespace(device=device),
+        model_config=SimpleNamespace(
+            get_num_kv_heads=lambda parallel: 8, get_head_size=lambda: 128
+        ),
+    )
+    GRConfig(
+        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=capacity
+    ).write_to_vllm_config(config)
+    request = _generation_request(steps)
+
+    def validate() -> None:
+        validate_gr_device_config(config, request)
+        validate_gr_request(request, config=config)
+
+    if error is None:
+        validate()
+    else:
+        with pytest.raises(ValueError, match=error):
+            validate()
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("entry", ["startup", "request", "worker"])
+@pytest.mark.parametrize(
+    "capacity,heads,head_size,accepted",
+    [
+        (4, 8, 128, True),
+        (5, 8, 128, True),
+        (6, 8, 128, True),
+        (6, 63, 128, True),
+        (6, 64, 128, False),
+        (5, 64, 128, True),
+        (5, 76, 128, True),
+        (5, 77, 128, False),
+        (4, 95, 128, True),
+        (4, 96, 128, False),
+        (6, 31, 256, True),
+        (6, 32, 256, False),
+        (4, 48, 256, False),
+        (6, 1024, 128, False),
+        (6, 1, 65536, False),
+        (3, 64, 128, True),
+    ],
+)
+def test_extended_generation_fits_native_kv_reorder_buffer(
+    entry: str, capacity: int, heads: int, head_size: int, accepted: bool
+) -> None:
+    from vllm_gr.config import GRConfig
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
+
+    parallel = SimpleNamespace()
+    get_heads = Mock(return_value=heads)
+    model = SimpleNamespace(
+        dtype=torch.bfloat16, get_num_kv_heads=get_heads, get_head_size=lambda: head_size
+    )
+    config = SimpleNamespace(
+        additional_config={},
+        device_config=SimpleNamespace(device="npu"),
+        model_config=model,
+        parallel_config=parallel,
+    )
+    GRConfig(
+        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=capacity
+    ).write_to_vllm_config(config)
+
+    def validate() -> None:
+        if entry == "worker":
+            validate_npu_eager_capabilities(
+                SimpleNamespace(
+                    device="npu",
+                    use_async_scheduling=True,
+                    model_config=model,
+                    parallel_config=parallel,
+                    vllm_config=config,
+                )
+            )
+        else:
+            # A shorter request still uses the configured pool capacity.
+            request = _generation_request(3) if entry == "request" else None
+            validate_gr_device_config(config, request)
+
+    if accepted:
+        validate()
+    else:
+        with pytest.raises(ValueError, match="SelectUnsharedKV 95 KiB buffer"):
+            validate()
+    if capacity > 3:
+        get_heads.assert_called_once_with(parallel)
+    else:
+        get_heads.assert_not_called()
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    "heads,head_size", [(0, 128), (-1, 128), (True, 128), (8, 0), (8, None), (8, 128.0)]
+)
+def test_extended_generation_rejects_invalid_model_geometry(heads: Any, head_size: Any) -> None:
+    from vllm_gr.config import GRConfig
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
+
+    config = SimpleNamespace(
+        additional_config={},
+        device_config=SimpleNamespace(device="npu"),
+        model_config=SimpleNamespace(
+            get_num_kv_heads=lambda parallel: heads, get_head_size=lambda: head_size
+        ),
+    )
+    GRConfig(constrained_generation=False, beam_max_decode_steps=6).write_to_vllm_config(config)
+    with pytest.raises(ValueError, match="positive integer KV-head geometry"):
+        validate_gr_device_config(config)
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    "device,capacity,rejected", [("npu", 6, True), ("npu", 3, False), ("cuda", 6, False)]
+)
+@pytest.mark.parametrize("missing_model", [False, True])
+def test_extended_generation_fails_closed_without_model_geometry(
+    device: str, capacity: int, rejected: bool, missing_model: bool
+) -> None:
+    from vllm_gr.config import GRConfig
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
+
+    config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device=device))
+    if not missing_model:
+        config.model_config = SimpleNamespace()
+    GRConfig(constrained_generation=False, beam_max_decode_steps=capacity).write_to_vllm_config(
+        config
+    )
+    if rejected:
+        with pytest.raises(ValueError, match="above three tokens requires model KV-head geometry"):
+            validate_gr_device_config(config)
+    else:
+        validate_gr_device_config(config)
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("steps", [4, 5, 6])
+def test_bounded_generic_support_preserves_sid_stage_capacity(steps: int) -> None:
+    from vllm_gr.config import GRConfig
+    from vllm_gr.v1.engine.beam_search_v1 import (
+        validate_gr_device_config,
+        validate_gr_request,
+    )
+
+    with pytest.raises(ValueError, match=r"beam\.max_decode_steps <= 3"):
+        GRConfig(
+            constrained_generation=False,
+            beam_execution_mode="v1",
+            beam_worker_decision=True,
+            beam_max_width=2,
+            beam_max_decode_steps=steps,
+            beam_sid_stage_vocab=True,
+        )
+    config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device="npu"))
+    GRConfig(
+        constrained_generation=False,
+        beam_execution_mode="v1",
+        beam_worker_decision=True,
+        beam_max_width=2,
+        beam_max_decode_steps=3,
+        beam_sid_stage_vocab=True,
+    ).write_to_vllm_config(config)
+    request = _generation_request(steps)
+    validate_gr_device_config(config, request)
+    with pytest.raises(ValueError, match="runtime limit 3"):
+        validate_gr_request(request, config=config)
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("steps", [4, 5, 6])
+def test_bounded_generic_support_preserves_catalog_depth(steps: int) -> None:
+    from vllm_gr.config import (
+        ConstraintTableBackendEnum,
+        ConstraintTableConfig,
+        GRConfig,
+        write_canonical_gr_config,
+    )
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
+    config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device="npu"))
+    gr_config = GRConfig(
+        constrained_generation=True,
+        beam_max_width=2,
+        beam_max_decode_steps=6,
+        constraint_table=ConstraintTableConfig(
+            enabled=True,
+            backend=ConstraintTableBackendEnum.NPU,
+            path="/tmp/test-constraint-table.safetensors",
+            format="constraint_table_v1",
+            artifact_digest="sha256:" + "a" * 64,
+            tokenizer_digest="sha256:" + "b" * 64,
+            max_top_k=2,
+        ),
+    )
+    write_canonical_gr_config(config, gr_config)
+    table = GRConfig.from_vllm_config(config).constraint_table
+    assert table is not None and table.enabled and table.format == "constraint_table_v1"
+    validate_gr_request(_generation_request(3), config=config)
+    with pytest.raises(
+        ValueError,
+        match=rf"^effective generation length {steps} must equal constraint_table_v1 depth \(3\)$",
+    ):
+        validate_gr_request(_generation_request(steps), config=config)
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("entry", ["public", "wire"])
+@pytest.mark.parametrize("steps", [4, 5, 6])
+def test_bounded_generic_support_preserves_dynamic_schedule_contract(
+    entry: str, steps: int
+) -> None:
+    from vllm.exceptions import VLLMValidationError
+
+    from vllm_gr.sampling_params import BeamSearchParams
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
+    error_type = VLLMValidationError if entry == "public" else ValueError
+    with pytest.raises(error_type, match="dynamic_beam_widths"):
+        if entry == "public":
+            BeamSearchParams(beam_width=2, max_tokens=steps, dynamic_beam_widths=[2] * steps)
+        else:
+            validate_gr_request(_generation_request(steps, dynamic_beam_widths=(2,) * steps))
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu"])

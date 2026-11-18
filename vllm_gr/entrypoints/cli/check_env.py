@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class CheckEnvSubcommand(CLISubcommand):
                 "Validate vLLM/vLLM-Ascend versions, the selected platform, "
                 "and the active Triton-Ascend backend."
             ),
-            usage="vllm-gr check-env [--npu]",
+            usage="%(prog)s --gr [--npu]",
         )
         parser.add_argument(
             "--npu",

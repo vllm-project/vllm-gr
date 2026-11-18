@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Short incremental suffix attention, fused with the prefix-state merge.
 
 Read the persistent KV pool directly: no packed suffix, intermediate suffix

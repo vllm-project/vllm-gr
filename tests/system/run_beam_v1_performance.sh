@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
 
 set -euo pipefail
 
@@ -103,6 +106,7 @@ with socket.socket() as probe:
 PY
 server_args=(
   serve
+  --gr
   "$model"
   --port "$port"
   --served-model-name "$server_identity"
@@ -120,7 +124,7 @@ server_args=(
 if [[ ${#revision_args[@]} -gt 0 ]]; then
   server_args+=("${revision_args[@]}")
 fi
-vllm-gr "${server_args[@]}" > "$output_dir/server.log" 2>&1 &
+python -m vllm_gr.entrypoints.cli.main "${server_args[@]}" > "$output_dir/server.log" 2>&1 &
 server_pid=$!
 
 deadline=$((SECONDS + 600))

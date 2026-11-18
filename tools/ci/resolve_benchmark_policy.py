@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-"""Validate and resolve a branch-owned benchmark gate policy."""
+"""Validate and resolve the benchmark policy from the tested checkout."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 from copy import deepcopy
 from pathlib import Path
@@ -429,16 +431,20 @@ def write_github_env(values: dict[str, str], stream: TextIO) -> None:
     stream.writelines(f"{key}={value}\n" for key, value in values.items())
 
 
-def write_summary(values: dict[str, str], source_ref: str, bootstrap: bool, stream: TextIO) -> None:
+def write_summary(
+    values: dict[str, str],
+    source_ref: str,
+    bootstrap: bool,
+    stream: TextIO,
+    policy_sha256: str | None = None,
+) -> None:
     """Append the effective policy to the GitHub step summary."""
     stream.write("### Benchmark gate policy\n\n")
     if bootstrap:
-        stream.write(
-            "> [!WARNING]\n"
-            "> The target base predates the policy runtime. "
-            "Using the one-time strict bootstrap policy.\n\n"
-        )
+        stream.write("> [!WARNING]\n> Using the explicitly requested strict bootstrap policy.\n\n")
     stream.write(f"Source ref: `{source_ref}`\n\n")
+    if policy_sha256 is not None:
+        stream.write(f"Policy SHA-256: `{policy_sha256}`\n\n")
     rows = (
         ("Policy", values["BENCHMARK_POLICY_NAME"]),
         ("Device", values["BENCHMARK_DEVICE"]),
@@ -474,6 +480,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--board-id", default="unknown")
     parser.add_argument("--source-ref")
     parser.add_argument("--github-env", type=Path)
+    parser.add_argument("--github-output", type=Path)
     parser.add_argument("--github-step-summary", type=Path)
     return parser.parse_args()
 
@@ -491,20 +498,29 @@ def main() -> int:
     required = {
         "--device": args.device,
         "--source-ref": args.source_ref,
-        "--github-env": args.github_env,
         "--github-step-summary": args.github_step_summary,
     }
     missing = [name for name, value in required.items() if value is None]
     if missing:
         raise PolicyError("resolution requires " + ", ".join(missing))
+    if args.github_env is None and args.github_output is None:
+        raise PolicyError("resolution requires --github-env or --github-output")
 
     values = resolve_policy(policy, args.device, args.board_id)
     if args.bootstrap_strict:
         values["PANGU1B_POLICY_SOURCE"] = "strict-bootstrap"
-    with args.github_env.open("a", encoding="utf-8") as env_stream:
-        write_github_env(values, env_stream)
+    if args.github_env:
+        with args.github_env.open("a", encoding="utf-8") as env_stream:
+            write_github_env(values, env_stream)
+    if args.github_output:
+        with args.github_output.open("a", encoding="utf-8") as output_stream:
+            payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
+            output_stream.write(f"policy-json={payload}\n")
+    policy_sha256 = (
+        hashlib.sha256(args.policy_file.read_bytes()).hexdigest() if args.policy_file else None
+    )
     with args.github_step_summary.open("a", encoding="utf-8") as summary_stream:
-        write_summary(values, args.source_ref, args.bootstrap_strict, summary_stream)
+        write_summary(values, args.source_ref, args.bootstrap_strict, summary_stream, policy_sha256)
     return 0
 
 

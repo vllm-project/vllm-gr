@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Persistent eager NPU runtime for a fixed Beam Batch Session.
 
 Prefill stays logical B; Decode executes physical B*W rows. Candidate state,
 request-local KV reorder, terminal materialization, and retirement stay owned
 by this runner for the complete session.
 """
+
+# Native eager-runner internals remain dynamically typed; the NPU worker mypy
+# group still checks the module together with its input/bookkeeping callers.
+# mypy: disable-error-code="index,misc,no-any-return,union-attr,var-annotated"
 
 from __future__ import annotations
 
@@ -26,9 +30,11 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
+    BeamSequenceColumns,
 )
 from vllm_gr.v1.beam.beam_decision import run_beam_decision_candidates
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
 from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRRetireMetadata,
@@ -43,7 +49,6 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_WORKER_RESULT_ATTR,
 )
 from vllm_gr.v1.worker.npu_beam_stage_adapter import (
-    NPUEagerFirstDecodeHandoff,
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
@@ -59,11 +64,12 @@ class NPUEagerBeamStageRunner:
         self.pending_plan: NPUEagerStagePlan | None = None
         self.execution_error: Exception | None = None
         self.logical_scheduler_output: Any = None
-        self.handoff: NPUEagerFirstDecodeHandoff | None = None
         self.prefill_candidates: Any = None
         self.latest_token_ids: torch.Tensor | None = None
         self.parent_history: torch.Tensor | None = None
         self.session_request: BeamBatchRequest | None = None
+        self._session_trie_ids: tuple[int, ...] | None = None
+        self._trie_ids_by_width: dict[int, tuple[int, ...]] = {}
         self.decode_candidates: Any = None
         self.logits: torch.Tensor | None = None
         self.attention_batch: NPUBeamExecutionBatch | None = None
@@ -119,7 +125,7 @@ class NPUEagerBeamStageRunner:
                     plan.execution, self.attention_batch.sessions
                 )
             return
-        from vllm_gr.v1.worker.model_runner_common import (
+        from vllm_gr.v1.worker.gr_context import (
             _create_beam_context,
             _get_gr_config,
         )
@@ -176,6 +182,10 @@ class NPUEagerBeamStageRunner:
                 self.worker._gr_npu_eager_context = context
         if required_steps > context.decision.sequence.shape[2]:
             raise ValueError("NPU Beam history exceeds the configured Decode capacity")
+        if context.registry.num_active_sessions:
+            # begin_session resets the shared decision buffers, so an NPU
+            # batch must own the complete context before initializing slots.
+            raise RuntimeError("cannot initialize an NPU Beam batch in an active attention context")
         if self._uses_dynamic_state(plan):
             from vllm_gr.v1.beam.npu_dynamic_beam import prune_npu_stage_pools
 
@@ -187,51 +197,70 @@ class NPUEagerBeamStageRunner:
                 )
             prune_npu_stage_pools(context, keep_widths)
         sessions = []
-        for request_id, prompt_len in zip(
-            execution.request_ids,
-            execution.num_prompt_tokens_by_request,
-        ):
-            slot = context.registry.allocate(
-                request_id,
-                beam_width=execution.beam_width,
-                prefix_len=prompt_len,
-            )
-            session = BeamSearchSession(request_id, slot, context)
-            session.begin_session(execution.beam_width, prompt_len)
-            sessions.append(session)
-        self.attention_batch = NPUBeamExecutionBatch(execution, sessions)
-        if self._uses_dynamic_state(plan):
-            from vllm_gr.v1.beam.npu_dynamic_beam import NPUDynamicBeamState
+        allocated_request_ids = []
+        dynamic_state = None
+        parent_history = None
+        try:
+            for request_id, prompt_len in zip(
+                execution.request_ids,
+                execution.num_prompt_tokens_by_request,
+            ):
+                slot = context.registry.allocate(
+                    request_id,
+                    beam_width=execution.beam_width,
+                    prefix_len=prompt_len,
+                )
+                # The slot already belongs to this attempt even if constructing
+                # or beginning the session raises before it enters sessions.
+                allocated_request_ids.append(request_id)
+                session = BeamSearchSession(request_id, slot, context)
+                session.begin_session(execution.beam_width, prompt_len)
+                sessions.append(session)
+            attention_batch = NPUBeamExecutionBatch(execution, sessions)
+            if self._uses_dynamic_state(plan):
+                from vllm_gr.v1.beam.npu_dynamic_beam import NPUDynamicBeamState
 
-            if self.previous is None or self.previous.kind != "prefill":
-                raise RuntimeError("dynamic NPU Beam state requires the preceding Prefill")
-            self.dynamic_state = NPUDynamicBeamState(context, execution.batch_size, required_steps)
-            self.dynamic_state.initialize(self.prefill_candidates, self.previous.output_width)
-            self.worker._beam_context = context
-            self.worker._beam_sessions = {session.session_id: session for session in sessions}
-            return
-        width = execution.beam_width
-        candidates = self.prefill_candidates
-        initial_scores = candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf"))
-        # Candidates carry K columns while the decision state is W-wide, and the
-        # two are independent.  The candidates are score-ordered, so the first
-        # min(W, K) are the survivors; beams beyond that stay inactive with
-        # -inf scores (0 token id, since Prefill parents are zero by definition).
-        candidate_width = candidates.token_ids.shape[1]
-        live = min(width, candidate_width)
-        sequence = context.decision.sequence[: execution.batch_size, :width, 0]
-        scores = context.decision.beam_scores[: execution.batch_size, :width]
-        sequence[:, :live].copy_(candidates.token_ids[:, :live])
-        scores[:, :live].copy_(initial_scores[:, :live])
-        if live < width:
-            sequence[:, live:].zero_()
-            scores[:, live:].fill_(float("-inf"))
-        context.decision.worker_decode_steps = 1
-        self.parent_history = (
-            torch.zeros_like(context.decision.sequence) if self._needs_parent_history() else None
-        )
+                if self.previous is None or self.previous.kind != "prefill":
+                    raise RuntimeError("dynamic NPU Beam state requires the preceding Prefill")
+                dynamic_state = NPUDynamicBeamState(context, execution.batch_size, required_steps)
+                dynamic_state.initialize(self.prefill_candidates, self.previous.output_width)
+            else:
+                width = execution.beam_width
+                candidates = self.prefill_candidates
+                initial_scores = candidates.logprobs.masked_fill(
+                    ~candidates.valid_mask, float("-inf")
+                )
+                # Candidates carry K columns while the decision state is W-wide, and the
+                # two are independent.  The candidates are score-ordered, so the first
+                # min(W, K) are the survivors; beams beyond that stay inactive with
+                # -inf scores (0 token id, since Prefill parents are zero by definition).
+                candidate_width = candidates.token_ids.shape[1]
+                live = min(width, candidate_width)
+                sequence = context.decision.sequence[: execution.batch_size, :width, 0]
+                scores = context.decision.beam_scores[: execution.batch_size, :width]
+                sequence[:, :live].copy_(candidates.token_ids[:, :live])
+                scores[:, :live].copy_(initial_scores[:, :live])
+                if live < width:
+                    sequence[:, live:].zero_()
+                    scores[:, live:].fill_(float("-inf"))
+                context.decision.worker_decode_steps = 1
+                parent_history = (
+                    torch.zeros_like(context.decision.sequence)
+                    if self._needs_parent_history()
+                    else None
+                )
+            beam_sessions = {session.session_id: session for session in sessions}
+        except Exception:
+            # Registry release is host-only and also handles a begin_session
+            # that failed before its facade could be published.
+            for request_id in allocated_request_ids:
+                context.registry.release(request_id)
+            raise
+        self.attention_batch = attention_batch
+        self.dynamic_state = dynamic_state
+        self.parent_history = parent_history
         self.worker._beam_context = context
-        self.worker._beam_sessions = {session.session_id: session for session in sessions}
+        self.worker._beam_sessions = beam_sessions
 
     def _beam_data(self, plan: NPUEagerStagePlan, metadata: Any) -> dict[str, dict[str, Any]]:
         execution = plan.execution
@@ -288,55 +317,57 @@ class NPUEagerBeamStageRunner:
         metadata = self._metadata(scheduler_output)
         session_init = getattr(metadata, "session_init", None)
         if session_init is not None:
-            if any(item.trie_id != 0 for item in session_init.items):
-                raise ValueError("NPU currently supports trie_id=0 only")
             if plan.execution.kind != "prefill" or self.session_request is not None:
                 raise ValueError("NPU session_init must appear once on Prefill")
+        if plan.execution.kind == "prefill":
+            trie_ids = self._validate_session_trie_ids(plan, session_init)
+            self._session_trie_ids = trie_ids
+            self._trie_ids_by_width = {}
+        if session_init is not None:
             self.session_request = session_init
 
         self.pending_plan = plan
         self.logical_scheduler_output = scheduler_output
         self.worker._gr_npu_stage_runner = self
-        runtime_output = self._runtime_scheduler_output(scheduler_output, plan)
-        self.worker._current_scheduler_output = runtime_output
-        self.worker._gr_npu_stage_plan = plan
-        beam_info = None
         token = None
-        if plan.execution.kind == "decode":
-            self._ensure_attention_batch(plan)
-            assert self.attention_batch is not None
-            for session in self.attention_batch.sessions:
-                session._state.is_last_step = bool(metadata.is_last_stage)
-                if self._uses_dynamic_state(plan):
-                    session._state.decode_step = plan.execution.decode_step
-            beam_data = self._beam_data(plan, metadata)
-            beam_info = {
-                "beam_data": beam_data,
-                "req_ids": [],
-                "beam_session": self.attention_batch,
-            }
-            self.worker._current_beam_data = beam_data
-            self.worker._current_beam_info = beam_info
-            context = self.attention_batch.context
-            step = plan.execution.decode_step
-            assert step is not None
-            context.decode_step_buf.fill_(step)
-            context.decode_step_1based_buf.fill_(step + 1)
-            context.xllm_block_table_buf.copy_(
-                torch.arange(
-                    plan.execution.batch_size,
-                    dtype=torch.int32,
-                    device=self.worker.device,
-                )
-            )
-            from vllm_gr.v1.beam.context import BEAM_DATA_VAR
-
-            token = BEAM_DATA_VAR.set(beam_info)
-        else:
-            self.worker._current_beam_data = {}
-            self.worker._current_beam_info = {"beam_data": {}, "req_ids": []}
-
         try:
+            runtime_output = self._runtime_scheduler_output(scheduler_output, plan)
+            self.worker._current_scheduler_output = runtime_output
+            self.worker._gr_npu_stage_plan = plan
+            if plan.execution.kind == "decode":
+                self._ensure_attention_batch(plan)
+                assert self.attention_batch is not None
+                for session in self.attention_batch.sessions:
+                    session._state.is_last_step = bool(metadata.is_last_stage)
+                    if self._uses_dynamic_state(plan):
+                        session._state.decode_step = plan.execution.decode_step
+                beam_data = self._beam_data(plan, metadata)
+                beam_info = {
+                    "beam_data": beam_data,
+                    "req_ids": [],
+                    "beam_session": self.attention_batch,
+                }
+                self.worker._current_beam_data = beam_data
+                self.worker._current_beam_info = beam_info
+                context = self.attention_batch.context
+                step = plan.execution.decode_step
+                assert step is not None
+                context.decode_step_buf.fill_(step)
+                context.decode_step_1based_buf.fill_(step + 1)
+                context.xllm_block_table_buf.copy_(
+                    torch.arange(
+                        plan.execution.batch_size,
+                        dtype=torch.int32,
+                        device=self.worker.device,
+                    )
+                )
+                from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+
+                token = BEAM_DATA_VAR.set(beam_info)
+            else:
+                self.worker._current_beam_data = {}
+                self.worker._current_beam_info = {"beam_data": {}, "req_ids": []}
+
             result = original(self.worker, runtime_output, *args, **kwargs)
             state = getattr(self.worker, "execute_model_state", None)
             logits = getattr(state, "logits", None)
@@ -392,7 +423,7 @@ class NPUEagerBeamStageRunner:
                 f"B*W token count: {total} != {plan.model_token_count}"
             )
 
-        from vllm_gr.v1.worker.model_runner_common import (
+        from vllm_gr.v1.worker.npu_model_runner_inputs import (
             InputBatchProxy,
             _get_positions_buffers,
             _materialize_logits_indices,
@@ -412,6 +443,7 @@ class NPUEagerBeamStageRunner:
                 list(execution.row_request_ids),
                 list(execution.row_request_indices),
                 list(plan.sampling_row_indices),
+                device=positions.device,
                 req_ids_key=execution.request_ids,
             )
             total = plan.model_token_count
@@ -425,7 +457,9 @@ class NPUEagerBeamStageRunner:
         plan = self.pending_plan
         if grammar_output is not None or plan is None or self.logits is None:
             raise RuntimeError("NPU GR sample requires one pending stage and no grammar")
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         stage_metadata = self._metadata(self.worker._current_scheduler_output)
         if _get_gr_config(self.worker).constrained_generation is False:
@@ -448,7 +482,10 @@ class NPUEagerBeamStageRunner:
             if backend is None or not callable(getattr(backend, "select", None)):
                 raise RuntimeError("NPU GR requires a loaded canonical constraint backend")
             candidates = self._select_constraint_candidates(
-                backend, self.logits.contiguous(), metadata
+                backend,
+                self.logits.contiguous(),
+                metadata,
+                trie_ids=self._constraint_trie_ids(plan),
             )
         expected = (
             plan.execution.num_execution_rows,
@@ -461,7 +498,11 @@ class NPUEagerBeamStageRunner:
         execution = plan.execution
         if execution.kind == "prefill":
             self.prefill_candidates = candidates
-            self.handoff = NPUEagerFirstDecodeHandoff.from_prefill(plan, candidates.token_ids)
+            expected = (execution.batch_size, execution.output_width)
+            if tuple(candidates.token_ids.shape) != expected:
+                raise BeamExecutionContractError(
+                    f"Prefill winner_token_ids must have shape {expected}"
+                )
             self.latest_token_ids = candidates.token_ids
             if is_last:
                 # Filter and rank all finite candidates before the return limit.
@@ -569,7 +610,9 @@ class NPUEagerBeamStageRunner:
             dtype=torch.float32,
             device=logits.device,
         )
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         if getattr(_get_gr_config(self.worker), "beam_sid_stage_vocab", False):
             from vllm_gr.ops.npu.sid_stage_vocab import select_sid_stage_candidates
@@ -603,6 +646,8 @@ class NPUEagerBeamStageRunner:
         backend: Any,
         logits: torch.Tensor,
         metadata: ConstraintMetadata,
+        *,
+        trie_ids: tuple[int, ...] | None = None,
     ) -> ConstraintOutput:
         """Select candidates within one Backend call's row capacity.
 
@@ -613,8 +658,22 @@ class NPUEagerBeamStageRunner:
         max_rows = int(backend.info.max_rows)
         if max_rows < 1:
             raise RuntimeError(f"NPU constraint backend has invalid max_rows={max_rows}")
+        if trie_ids is not None and len(trie_ids) != logits.shape[0]:
+            raise RuntimeError("NPU Trie selectors must match physical candidate rows")
+
+        select_for_rows: (
+            Callable[[torch.Tensor, ConstraintMetadata, tuple[int, ...]], ConstraintOutput] | None
+        ) = None
+        if trie_ids is not None:
+            host_selector = getattr(backend, "select_for_rows", None)
+            if not callable(host_selector):
+                raise RuntimeError("NPU multi-trie selection requires host-row routing")
+            select_for_rows = host_selector
         if logits.shape[0] <= max_rows:
-            return backend.select(logits, metadata)
+            if trie_ids is None:
+                return backend.select(logits, metadata)
+            assert select_for_rows is not None
+            return select_for_rows(logits, metadata, trie_ids)
 
         outputs: list[ConstraintOutput] = []
         for start in range(0, logits.shape[0], max_rows):
@@ -627,8 +686,14 @@ class NPUEagerBeamStageRunner:
                 temperatures=temperatures,
                 current_step=metadata.current_step,
                 top_k=metadata.top_k,
+                trie_ids=None if metadata.trie_ids is None else metadata.trie_ids[start:stop],
             )
-            outputs.append(backend.select(logits[start:stop].contiguous(), chunk_metadata))
+            chunk_logits = logits[start:stop].contiguous()
+            if trie_ids is None:
+                outputs.append(backend.select(chunk_logits, chunk_metadata))
+            else:
+                assert select_for_rows is not None
+                outputs.append(select_for_rows(chunk_logits, chunk_metadata, trie_ids[start:stop]))
 
         return ConstraintOutput(
             token_ids=torch.cat([output.token_ids for output in outputs], dim=0),
@@ -685,23 +750,31 @@ class NPUEagerBeamStageRunner:
             pieces.append(parents[:, :, :steps].to(torch.int32).contiguous().reshape(-1))
         pieces.append(scores.to(torch.float32).contiguous().reshape(-1).view(torch.int32))
         packed = torch.cat(pieces).to("cpu")
-        sequence_rows = packed[:history_words].view(batch, width, steps).tolist()
+        params = request.beam_params
+        stop_ids = set(params.stop_token_ids) if not params.ignore_stop_tokens else set()
+        # Reuse the existing wire protocol after the existing packed D2H. Small
+        # results and stop-aware histories keep the row representation. Public
+        # clients still materialize every sequence before returning to callers.
+        use_columns = (
+            min(width, options.num_return_sequences) >= 64
+            and not stop_ids
+            and steps > 0
+            and steps == getattr(params, "max_tokens", None)
+        )
+        sequence_view = packed[:history_words].view(batch, width, steps)
+        sequence_rows = None if use_columns else sequence_view.tolist()
         parent_rows = None
+        parent_view = None
         score_offset = history_words
         if include_parents:
-            parent_rows = (
-                packed[history_words : 2 * history_words].view(batch, width, steps).tolist()
-            )
+            parent_view = packed[history_words : 2 * history_words].view(batch, width, steps)
+            parent_rows = None if use_columns else parent_view.tolist()
             score_offset += history_words
-        score_rows = (
-            packed[score_offset : score_offset + score_words]
-            .view(torch.float32)
-            .view(batch, width)
-            .tolist()
+        score_view = (
+            packed[score_offset : score_offset + score_words].view(torch.float32).view(batch, width)
         )
-        params = request.beam_params
+        score_rows = score_view.tolist()
         outputs = []
-        stop_ids = set(params.stop_token_ids) if not params.ignore_stop_tokens else set()
         for row, item in enumerate(request.items):
             ranked = []
             prompt_length = (
@@ -750,6 +823,32 @@ class NPUEagerBeamStageRunner:
                     )
                 )
             ranked.sort(key=lambda value: (value[0], value[1], -value[2]), reverse=True)
+            if use_columns and ranked:
+                selected_indices = [value[2] for value in ranked[: options.num_return_sequences]]
+                outputs.append(
+                    BeamRequestOutput(
+                        item.item_index,
+                        item.request.request_id,
+                        BeamSequenceColumns(
+                            count=len(selected_indices),
+                            steps=steps,
+                            token_ids=sequence_view.numpy()[row, selected_indices]
+                            .astype("<i4", copy=False)
+                            .tobytes(),
+                            cumulative_logprobs=score_view.numpy()[row, selected_indices]
+                            .astype("<f4", copy=False)
+                            .tobytes()
+                            if options.include_cumulative_logprob
+                            else None,
+                            parent_beam_indices=parent_view.numpy()[row, selected_indices]
+                            .astype("<i4", copy=False)
+                            .tobytes()
+                            if parent_view is not None
+                            else None,
+                        ),
+                    )
+                )
+                continue
             selected = []
             for _, score, beam, length, stop_index in ranked[: options.num_return_sequences]:
                 token_ids = sequence_rows[row][beam]
@@ -803,8 +902,41 @@ class NPUEagerBeamStageRunner:
                 sessions.pop(request_id, None)
         self.closed = True
         self.parent_history = None
+        self._session_trie_ids = None
+        self._trie_ids_by_width = {}
         self.logical_scheduler_output = None
         self.execution_error = None
+
+    def _validate_session_trie_ids(
+        self, plan: NPUEagerStagePlan, request: BeamBatchRequest | None
+    ) -> tuple[int, ...] | None:
+        """Validate immutable request selectors before retaining session state."""
+        backend = getattr(self.worker, "constraint_backend", None)
+        trie_count = backend.info.table_metadata.trie_count if backend is not None else 1
+        if type(trie_count) is not int or trie_count < 1:
+            raise RuntimeError("NPU constraint backend has an invalid live Trie count")
+        if request is None:
+            if trie_count > 1:
+                raise ValueError("NPU multi-trie execution requires the initial batch request")
+            return None
+        execution = plan.execution
+        execution.validate_request_order(tuple(item.request.request_id for item in request.items))
+        roots = tuple(item.trie_id for item in request.items)
+        if any(type(root) is not int or not 0 <= root < trie_count for root in roots):
+            raise ValueError("trie_id is outside the loaded constraint table")
+        # A single Trie needs neither per-row selectors nor hot-path dispatch.
+        return roots if trie_count > 1 else None
+
+    def _constraint_trie_ids(self, plan: NPUEagerStagePlan) -> tuple[int, ...] | None:
+        roots = getattr(self, "_session_trie_ids", None)
+        if roots is None:
+            return None
+        width = plan.execution.input_width
+        expanded = self._trie_ids_by_width.get(width)
+        if expanded is None:
+            expanded = plan.execution.expand_per_request(roots, name="trie_ids")
+            self._trie_ids_by_width[width] = expanded
+        return expanded
 
     def _constraint_prefixes(self, plan: NPUEagerStagePlan) -> torch.Tensor:
         rows = plan.execution.num_execution_rows

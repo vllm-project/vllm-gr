@@ -93,6 +93,12 @@ bash build_and_run.sh
 
 Return to the vllm-gr directory before continuing.
 
+For the optional caller-owned XAttention output binding, see
+[NPU XAttention output buffers](npu_xattention_out.md). Its separate build
+reuses the installed kernel and checks runtime versions and recorded binary
+identities. Validate the rebuilt binding as described in that guide; normal
+installation retains the allocating path.
+
 4. **Install vllm-gr**
 
 ```bash
@@ -192,6 +198,12 @@ at Decode, while the NPU model executes `batch_size * beam_width` tokens.
 
 The incremental beam decode branch on Ascend NPU has two execution modes,
 selected through the engine's `additional_config`:
+
+Both modes require an active Beam session and persistent suffix KV pool.
+The old paged-suffix recompute path has been removed: missing session state
+or invalid Decode metadata raises an error. The `xllm` fallback to `cascade`
+still uses incremental KV; ordinary requests, Prefill and standard prefix
+segments retain their paged-cache execution.
 
 - `xllm` (default when the xllm-ops library is installed): the
   fused path — a single `x_attention` kernel attends over the paged shared

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
 # Script to build wheel for vllm-gr
 # Usage: ./build_wheel.sh [--python PYTHON] [--skip-clean]
 

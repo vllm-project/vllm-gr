@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NPU eager input geometry for fixed Beam batch stages.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+"""NPU input geometry for Beam batch stages.
 
 Scheduler accounting stays at B logical requests. This adapter derives
-request-major B * W device views. Beam state, KV reorder, terminal transport,
-and graph execution intentionally belong to later stages.
+request-major B * W device views. The stage runner owns Beam state, KV reorder,
+terminal transport, and graph execution.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from copy import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -21,33 +20,6 @@ from vllm_gr.v1.beam.execution_batch import (
 )
 
 GR_STAGE_OUTPUT_ATTR = "gr_stage_metadata"
-_SAMPLING_TENSOR_ATTRS = (
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "frequency_penalties",
-    "presence_penalties",
-    "repetition_penalties",
-)
-
-
-@dataclass(frozen=True, slots=True)
-class NPUDecodeAttentionLayout:
-    """Request-isolated geometry for the NPU attention binder."""
-
-    request_ids: tuple[str, ...]
-    row_request_indices: tuple[int, ...]
-    row_beam_indices: tuple[int, ...]
-    query_start_locations: tuple[int, ...]
-    prefix_sequence_lengths: tuple[int, ...]
-    suffix_sequence_lengths: tuple[int, ...]
-    prefix_block_tables: tuple[tuple[int, ...], ...]
-    pool_slots: tuple[int, ...]
-
-    @property
-    def num_rows(self) -> int:
-        return len(self.row_request_indices)
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,125 +171,6 @@ class NPUEagerStagePlan:
                 )
             )
 
-    def remap_sampling_metadata(self, metadata: object) -> object:
-        """Copy and expand request-level sampling tensors onto physical rows."""
-
-        remapped = copy(metadata)
-        rows = self.execution.num_execution_rows
-        batch = self.execution.batch_size
-        if rows == batch:
-            return remapped
-        index_cache: dict[torch.device, torch.Tensor] = {}
-        for name in _SAMPLING_TENSOR_ATTRS:
-            value = getattr(metadata, name, None)
-            if not isinstance(value, torch.Tensor) or value.numel() == 0:
-                continue
-            if value.ndim == 0 or value.shape[0] == rows:
-                continue
-            if value.shape[0] != batch:
-                raise BeamExecutionContractError(
-                    f"sampling metadata {name!r} must have B or B*W leading rows"
-                )
-            index = index_cache.get(value.device)
-            if index is None:
-                index = torch.as_tensor(
-                    self.sampling_row_indices,
-                    dtype=torch.long,
-                    device=value.device,
-                )
-                index_cache[value.device] = index
-            setattr(remapped, name, value.index_select(0, index))
-        return remapped
-
-    def build_decode_attention_layout(
-        self,
-        *,
-        block_ids_by_request: Sequence[Sequence[int]],
-        pool_slots: Sequence[int],
-    ) -> NPUDecodeAttentionLayout:
-        """Build request-local prefix/suffix geometry for NPU eager attention."""
-
-        if self.execution.kind != "decode":
-            raise BeamExecutionContractError("attention layout requires a Decode plan")
-        batch = self.execution.batch_size
-        if len(block_ids_by_request) != batch or len(pool_slots) != batch:
-            raise BeamExecutionContractError(
-                "attention inputs need one block table and pool slot per request"
-            )
-        blocks: list[tuple[int, ...]] = []
-        for request_index, request_blocks in enumerate(block_ids_by_request):
-            normalized = tuple(request_blocks)
-            if not normalized or any(
-                isinstance(block, bool) or not isinstance(block, int) or block < 0
-                for block in normalized
-            ):
-                raise BeamExecutionContractError(
-                    f"block_ids_by_request[{request_index}] is invalid"
-                )
-            blocks.append(normalized)
-        slots = tuple(pool_slots)
-        if any(isinstance(slot, bool) or not isinstance(slot, int) or slot < 0 for slot in slots):
-            raise BeamExecutionContractError("pool slots must be non-negative integers")
-
-        step = self.execution.decode_step
-        assert step is not None
-        row_blocks = tuple(
-            blocks[request_index] for request_index in self.execution.row_request_indices
-        )
-        return NPUDecodeAttentionLayout(
-            request_ids=self.execution.request_ids,
-            row_request_indices=self.execution.row_request_indices,
-            row_beam_indices=self.execution.row_beam_indices,
-            query_start_locations=tuple(range(self.execution.num_execution_rows + 1)),
-            prefix_sequence_lengths=self.execution.expand_per_request(
-                self.execution.num_prompt_tokens_by_request,
-                name="prefix sequence lengths",
-            ),
-            suffix_sequence_lengths=(step + 1,) * self.execution.num_execution_rows,
-            prefix_block_tables=row_blocks,
-            pool_slots=slots,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class NPUEagerFirstDecodeHandoff:
-    """Device-resident Prefill winners consumed by Decode step zero."""
-
-    prefill: BeamBatchExecutionView
-    winner_token_ids: torch.Tensor
-
-    @classmethod
-    def from_prefill(
-        cls,
-        prefill_plan: NPUEagerStagePlan,
-        winner_token_ids: torch.Tensor,
-    ) -> NPUEagerFirstDecodeHandoff:
-        execution = prefill_plan.execution
-        expected = (execution.batch_size, execution.output_width)
-        if execution.kind != "prefill":
-            raise BeamExecutionContractError("winner handoff requires a Prefill plan")
-        if tuple(winner_token_ids.shape) != expected:
-            raise BeamExecutionContractError(f"Prefill winner_token_ids must have shape {expected}")
-        return cls(execution, winner_token_ids)
-
-    def bind_first_decode(
-        self,
-        decode_plan: NPUEagerStagePlan,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> None:
-        execution = decode_plan.execution
-        if execution.kind != "decode" or execution.decode_step != 0:
-            raise BeamExecutionContractError(
-                "Prefill winner handoff can bind only Decode step zero"
-            )
-        self.prefill.assert_same_logical_batch(execution)
-        decode_plan.prepare_decode_inputs(
-            input_ids,
-            positions,
-            self.winner_token_ids,
-        )
-
 
 def validate_npu_eager_capabilities(worker: object) -> None:
     """Fail before mutation when the NPU eager-or-graph adapter is unsupported.
@@ -364,8 +217,6 @@ def validate_npu_eager_capabilities(worker: object) -> None:
 
 
 __all__ = [
-    "NPUDecodeAttentionLayout",
-    "NPUEagerFirstDecodeHandoff",
     "NPUEagerStagePlan",
     "validate_npu_eager_capabilities",
 ]

@@ -1,6 +1,6 @@
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 from types import SimpleNamespace
 
 import pytest
@@ -59,7 +59,7 @@ def test_length_graphs_do_not_alias_and_new_storage_invalidates_all_buckets():
 def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
@@ -68,7 +68,7 @@ def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
     )
     graph = Mock(ready=False)
     graph.capture.side_effect = lambda *args, **kwargs: setattr(graph, "ready", True)
-    hooks = V2StageExecutionHooks(worker)
+    hooks = CudaStageHooksV2(worker)
     monkeypatch.setattr(hooks, "decode_graph", Mock(return_value=graph))
     owner = SimpleNamespace(
         bindings=(None,),
@@ -94,8 +94,9 @@ def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
 def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
     import torch
 
-    from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-        BeamAttentionMetadataBuilder as Builder,
+    from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+        build_async,
+        build_async_batch_layout,
     )
 
     monkeypatch.setattr(policy, "policy_mode", lambda: "auto")
@@ -110,7 +111,7 @@ def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
 
     def build(length, plan):
         monkeypatch.setattr(policy, "resolve_prefix_plan", lambda shape, **kwargs: plan)
-        layout = Builder.build_async_batch_layout(
+        layout = build_async_batch_layout(
             width=2,
             prompt_lengths=[length],
             decode_step=0,
@@ -118,10 +119,10 @@ def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
             max_blocks=1024,
         )
         views = {name: torch.tensor(values, dtype=torch.int32) for name, values in layout.items()}
-        return Builder.build_async(
+        return build_async(
             layout=layout,
             views=views,
-            session=SimpleNamespace(context=context),
+            session=SimpleNamespace(is_active=True, context=context),
             mask=torch.ones(2, dtype=torch.bool),
             slots=torch.full((2,), -1),
             block_size=16,
@@ -462,6 +463,157 @@ def test_short_prefix_stays_native(monkeypatch, tmp_path):
         block_size=16,
     )
     assert policy.resolve_prefix_plan(long, **args) is not None
+
+
+def _short_prefix_args(monkeypatch, tmp_path):
+    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(tmp_path / "calib.yaml"))
+    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
+    fingerprint = {"name": "NVIDIA L20", "capability": [8, 9], "sm_count": 92}
+    geometry = {"heads": 16, "kv_heads": 8, "dim": 128, "dtype": "torch.bfloat16", "block_size": 16}
+    policy.remember_calibration(
+        fingerprint,
+        geometry,
+        policy.PrefixCalibration(u_ns_per_token=31.6, c_comp_us=9.3e-5, c_mem_us=6.8e-3, m_us=4.0),
+    )
+    shape = policy.PrefixShape(
+        batch=1,
+        width=128,
+        length=1024,
+        heads=16,
+        kv_heads=8,
+        dim=128,
+        dtype="torch.bfloat16",
+        block_size=16,
+    )
+    args = {
+        "default_version": 2,
+        "fingerprint": fingerprint,
+        "supported_versions": (2,),
+        "sm_count": 92,
+    }
+    return shape, args
+
+
+@pytest.mark.l1
+def test_min_chain_override_admits_short_prefix(monkeypatch, tmp_path):
+    shape, args = _short_prefix_args(monkeypatch, tmp_path)
+    monkeypatch.delenv(policy.ENV_MIN_CHAIN_US, raising=False)
+    assert policy.resolve_prefix_plan(shape, **args) is None
+    monkeypatch.setenv(policy.ENV_MIN_CHAIN_US, "8")
+    plan = policy.resolve_prefix_plan(shape, **args)
+    assert plan is not None and plan.fa_version == 2 and plan.segments > 1
+    # Unparsable, non-finite or negative overrides keep the conservative default.
+    for invalid in ("fast", "nan", "inf", "-1"):
+        monkeypatch.setenv(policy.ENV_MIN_CHAIN_US, invalid)
+        assert policy._min_chain_us() == policy.MIN_CHAIN_US
+        assert policy.resolve_prefix_plan(shape, **args) is None
+
+
+@pytest.mark.l1
+def test_calibration_from_older_schema_is_remeasured(monkeypatch, tmp_path):
+    """Schema-1 coefficients were measured with the serial merge kernel."""
+    import yaml
+
+    path = tmp_path / "calib.yaml"
+    monkeypatch.setenv(policy.ENV_CALIBRATION_PATH, str(path))
+    fingerprint = {"name": "NVIDIA L20", "capability": [8, 9], "sm_count": 92}
+    other = {"name": "NVIDIA H20", "capability": [9, 0], "sm_count": 78}
+    geometry = {"heads": 16, "kv_heads": 8, "dim": 128, "dtype": "torch.bfloat16", "block_size": 16}
+    calibration = policy.PrefixCalibration(31.6, 9.3e-5, 6.8e-3, 4.0)
+    policy.store_calibration(fingerprint, geometry, calibration)
+    policy.store_calibration(other, geometry, calibration)
+    assert policy.load_calibration(fingerprint, geometry) == calibration
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert data["schema"] == policy.CALIBRATION_SCHEMA
+    data["schema"] = 1
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    assert policy.load_calibration(fingerprint, geometry) is None
+    # Re-measuring one device must not carry stale entries of other devices forward.
+    policy.store_calibration(fingerprint, geometry, calibration)
+    assert policy.load_calibration(fingerprint, geometry) == calibration
+    assert policy.load_calibration(other, geometry) is None
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("max_model_len", [1043, 10259, 10240, 20000])
+def test_calibration_probe_fits_split_layout(monkeypatch, max_model_len):
+    """The split probe's page count must divide by 8 or calibration is skipped.
+
+    Before the fix, max_model_len=10259 probed 641 pages and segmented_prefix
+    rejected the 8-way layout (648 pages), so no device ever got a calibration.
+    """
+    import torch
+
+    from vllm_gr.v1.attention.backends import beam_prefix_calibrate as calibrate
+
+    probes = []
+
+    def make_case(batch, width, length, **_):
+        probes.append((batch, width, length))
+        return object()
+
+    monkeypatch.setattr(calibrate, "_make_case", make_case)
+    monkeypatch.setattr(calibrate, "_measure", lambda case, plan, **_: 0.1)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=188),
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda *_: None)
+    calibrate.calibrate_prefix_device(
+        num_heads=16,
+        num_kv_heads=8,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        block_size=16,
+        max_model_len=max_model_len,
+    )
+    chain_length = probes[0][2]
+    assert probes[1][2] == chain_length  # the split probe reuses the chain length
+    assert chain_length % (16 * 8) == 0
+    assert 0 < chain_length <= max_model_len
+
+
+@pytest.mark.l1
+def test_calibration_rejects_model_shorter_than_split_probe(monkeypatch):
+    import torch
+
+    from vllm_gr.v1.attention.backends import beam_prefix_calibrate as calibrate
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=188),
+    )
+    # Stub the probes so a regression fails on the missing raise, not on CUDA.
+    monkeypatch.setattr(calibrate, "_make_case", lambda *args, **kwargs: object())
+    monkeypatch.setattr(calibrate, "_measure", lambda case, plan, **_: 0.1)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda *_: None)
+    with pytest.raises(ValueError, match="shorter than one split probe"):
+        calibrate.calibrate_prefix_device(
+            num_heads=16,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype=torch.bfloat16,
+            block_size=16,
+            max_model_len=100,
+        )
+
+
+@pytest.mark.l1
+def test_segmented_plan_requires_explicit_policy_opt_in(monkeypatch, tmp_path):
+    shape, args = _short_prefix_args(monkeypatch, tmp_path)
+    monkeypatch.setenv(policy.ENV_MIN_CHAIN_US, "8")
+    # A measured speedup is insufficient to change the default execution path.
+    for value in (None, "", "off", "invalid"):
+        if value is None:
+            monkeypatch.delenv(policy.ENV_PREFIX_POLICY, raising=False)
+        else:
+            monkeypatch.setenv(policy.ENV_PREFIX_POLICY, value)
+        assert policy.resolve_prefix_plan(shape, **args) is None
+    monkeypatch.setenv(policy.ENV_PREFIX_POLICY, "auto")
+    plan = policy.resolve_prefix_plan(shape, **args)
+    assert plan is not None and plan.segments > 1
 
 
 pytestmark = pytest.mark.cpu_test

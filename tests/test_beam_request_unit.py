@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Retained sampling and independent incremental-KV kernel contracts."""
 
 from typing import Any
@@ -15,6 +15,20 @@ def test_beam_search_params_enforces_global_width_limit() -> None:
     assert BeamSearchParams(beam_width=256, max_tokens=1).beam_width == 256
     with pytest.raises(VLLMValidationError, match=rf"\[1, {MAX_BEAM_WIDTH}\]"):
         BeamSearchParams(beam_width=MAX_BEAM_WIDTH + 1, max_tokens=1)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("strategy", ["fill", "null"])  # type: ignore[misc]
+def test_beam_search_params_accepts_catalog_strategies(strategy: str) -> None:
+    params = BeamSearchParams(beam_width=2, max_tokens=1, catalog_strategy=strategy)
+    assert params.catalog_strategy == strategy
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("strategy", ["", "sparse", "FILL"])  # type: ignore[misc]
+def test_beam_search_params_rejects_invalid_catalog_strategy(strategy: str) -> None:
+    with pytest.raises(VLLMValidationError, match="catalog_strategy must be"):
+        BeamSearchParams(beam_width=2, max_tokens=1, catalog_strategy=strategy)
 
 
 def _sub_patch_preserves_greedy_validation() -> None:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Compare baseline vs head offline AB summaries and emit a markdown delta report.
 
 Reads one or more ``vllm-gr-summary.json`` files per side (one per A-B-B-A

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Layout and device guards for NPU attention views and direct shared KV."""
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -62,6 +63,100 @@ def _metadata(rows: int) -> SimpleNamespace:
         num_prefix_indices=rows,
         prefix_indices=torch.arange(rows, dtype=torch.int64),
     )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("mixed", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "invalid_state", ["not_decode", "missing_session", "inactive_session", "multiple_queries"]
+)
+def test_xllm_rejects_invalid_beam_state_before_dispatch(
+    row_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    mixed: bool,
+    invalid_state: str,
+) -> None:
+    metadata = _metadata(4)
+    metadata.beam_session = SimpleNamespace(is_active=True)
+    metadata.suffix_max_q_len = 1
+    if mixed:
+        metadata.std_indices = torch.tensor([4])
+    if invalid_state == "not_decode":
+        metadata.is_beam_decode = False
+    elif invalid_state == "missing_session":
+        metadata.beam_session = None
+    elif invalid_state == "inactive_session":
+        metadata.beam_session.is_active = False
+    else:
+        metadata.suffix_max_q_len = 2
+
+    fused = Mock()
+    cascade = Mock()
+    monkeypatch.setattr(row_module, "_xllm_incremental_decode", fused)
+    monkeypatch.setattr(row_module.beam_attn_npu, "cascade_attention", cascade)
+    tensor = torch.empty(0)
+    error = ValueError if invalid_state == "multiple_queries" else RuntimeError
+    match = "one query token" if error is ValueError else "active beam session"
+    with pytest.raises(error, match=match):
+        row_module.cascade_attention(
+            tensor, tensor, tensor, tensor, metadata, None, 1.0, 0.0, 2, beam_pool=object()
+        )
+    fused.assert_not_called()
+    cascade.assert_not_called()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "case", ["eligible", "no_window", "standard", "mixed", "no_prefix", "session_pool"]
+)
+def test_xllm_valid_batches_keep_fused_or_cascade_routing(
+    row_module: ModuleType, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    metadata = _metadata(4)
+    metadata.beam_session = SimpleNamespace(is_active=True)
+    metadata.suffix_max_q_len = 1
+    pool = None if case == "session_pool" else object()
+    window = (-1, -1) if case == "no_window" else None
+    if case == "standard":
+        metadata.is_beam_decode = False
+        metadata.beam_session = None
+        metadata.prefix_indices = None
+        metadata.std_indices = torch.arange(4)
+    elif case == "mixed":
+        metadata.std_indices = torch.tensor([4])
+    elif case == "no_prefix":
+        metadata.prefix_indices = None
+        metadata.std_indices = torch.arange(4)
+
+    fused = Mock()
+    cascade = Mock()
+    monkeypatch.setattr(row_module, "_xllm_incremental_decode", fused)
+    monkeypatch.setattr(row_module.beam_attn_npu, "cascade_attention", cascade)
+    tensor = torch.empty(0)
+    row_module.cascade_attention(
+        tensor, tensor, tensor, tensor, metadata, window, 1.0, 0.0, 2, beam_pool=pool
+    )
+    if case in {"eligible", "no_window"}:
+        fused.assert_called_once_with(
+            tensor, tensor, tensor, tensor, metadata, metadata.beam_session, pool, 1.0
+        )
+        cascade.assert_not_called()
+    else:
+        cascade.assert_called_once_with(
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            metadata,
+            window,
+            1.0,
+            0.0,
+            2,
+            s_aux=None,
+            alibi_slopes=None,
+            beam_pool=pool,
+        )
+        fused.assert_not_called()
 
 
 @pytest.mark.parametrize("interleaved", [False, True])  # type: ignore[misc]
@@ -318,7 +413,8 @@ def test_npu_direct_shared_kv_preserves_original_table_and_storage(
     expected = expected.to(case.output.dtype)
     calls: list[tuple[Any, ...]] = []
 
-    def attention(*args: Any) -> torch.Tensor:
+    def attention(*args: Any, out: torch.Tensor | None = None) -> torch.Tensor:
+        assert out is None
         calls.append(args)
         assert args[0].data_ptr() == case.query.data_ptr()
         assert args[1] is case.key and args[2] is case.value
@@ -418,7 +514,8 @@ def test_unsupported_shared_kv_keeps_original_gather_dispatch(
         gathered.append(result)
         return cast(tuple[torch.Tensor, torch.Tensor, torch.Tensor], result)
 
-    def attention(*args: Any) -> torch.Tensor:
+    def attention(*args: Any, out: torch.Tensor | None = None) -> torch.Tensor:
+        assert out is None
         assert len(gathered) == 1
         assert args[1] is gathered[0][0] and args[2] is gathered[0][1]
         assert args[5] is gathered[0][2]
@@ -471,6 +568,7 @@ def test_cuda_forward_keeps_original_kv_gather(monkeypatch: pytest.MonkeyPatch) 
     )
     metadata = _metadata(4)
     metadata.beam_session = session
+    metadata.suffix_max_q_len = 1
     impl = object.__new__(beam_attn.BeamAttentionImpl)
     impl.kv_sharing_target_layer_name = None
     impl.kv_cache_dtype = "auto"

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """GR Prefill policy over the native V2 capture and replay implementation.
 
 One instance owns the FULL/PW plan. PW is captured first at the same sizes as
@@ -24,6 +24,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     ModelCudaGraphManager,
 )
 
+from vllm_gr.v1.attention.backends.beam_dense_prefill import (
+    fresh_prefill_capture,
+    requires_fresh_prefill_replay,
+)
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_PREFILL_GRAPH_BUCKET_STEP,
@@ -64,8 +68,13 @@ def get_gpu_prefill_buckets(runner: Any) -> list[int]:
     return list(sizes) if sizes is not None else get_default_buckets()
 
 
-def is_prefill_phase_batch_v2(runner: Any, scheduler_output: Any) -> bool:
+def is_prefill_phase_batch_v2(
+    runner: Any, scheduler_output: Any, *, require_fresh: bool = False
+) -> bool:
     """True when the scheduled batch is a pure prompt-prefill (V2 surface).
+
+    ``require_fresh`` additionally requires ``num_computed == 0`` for every
+    request, as graphs captured with dense CUDA Prefill need.
 
     Runs at DISPATCH time — before ``prepare_inputs`` builds this step's
     ``InputBatch`` — so it reads the persistent ``req_states`` arrays (kept
@@ -101,6 +110,8 @@ def is_prefill_phase_batch_v2(runner: Any, scheduler_output: Any) -> bool:
         if idx is None:
             return False
         if int(computed_np[idx]) >= int(prompt_np[idx]):
+            return False
+        if require_fresh and int(computed_np[idx]) != 0:
             return False
     return True
 
@@ -226,7 +237,8 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
             piecewise = plan.get(CUDAGraphMode.PIECEWISE, [])
             if piecewise:
                 self._capture_descs = {CUDAGraphMode.PIECEWISE: piecewise}
-                super().capture(*args, **kwargs)
+                with fresh_prefill_capture():
+                    super().capture(*args, **kwargs)
                 self._successful.update(piecewise)
             full = plan.get(CUDAGraphMode.FULL, [])
             if self._max_full_descs_to_capture is not None:
@@ -236,7 +248,10 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
             for desc in full:
                 self._capture_descs = {CUDAGraphMode.FULL: [desc]}
                 try:
-                    super().capture(*args, **kwargs)
+                    # These graphs replay only for fresh prompts when dense
+                    # Prefill is requested (see beam_dense_prefill).
+                    with fresh_prefill_capture():
+                        super().capture(*args, **kwargs)
                 except RuntimeError as error:
                     if not is_recoverable_capture_error(error):
                         raise
@@ -293,7 +308,11 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
                 piecewise = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, bucket, None)
                 if (
                     in_prefill
-                    and is_prefill_phase_batch_v2(self.runner, self._prefill_scope)
+                    and is_prefill_phase_batch_v2(
+                        self.runner,
+                        self._prefill_scope,
+                        require_fresh=requires_fresh_prefill_replay(),
+                    )
                     and full in self._successful
                     and full in self.graphs
                 ):

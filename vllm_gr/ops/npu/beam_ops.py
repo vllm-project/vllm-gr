@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 """NPU dispatch wrappers for the xLLM beam-search decode operators.
 
@@ -110,6 +110,8 @@ def x_attention(
     actual_shared_kvlen: torch.Tensor,
     decode_step_1based: int | torch.Tensor,
     scale_value: float = 0.0,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused shared-paged + unshared-contiguous beam attention.
 
@@ -125,6 +127,8 @@ def x_attention(
             host int or a persistent int32 ``[1]`` device tensor (graph
             capture/replay contract).
         scale_value: ``<= 0`` lets the kernel use ``1 / sqrt(head_dim)``.
+        out: Optional contiguous caller-owned output. The optional native
+            binding writes directly; installations without it allocate and copy.
 
     Returns:
         ``[batch * beam_size, num_heads, head_dim]``.
@@ -134,9 +138,15 @@ def x_attention(
         raise RuntimeError(
             f"NPU x_attention is unavailable ({unavailable_reason()}); use the cascade path instead"
         )
-    # unshared_block_tables is always None: the contiguous unshared layout is
-    # selected implicitly (see module docstring).
-    return custom_ops.x_attention(
+    if out is not None:
+        if out.shape != query.shape:
+            raise ValueError("x_attention out must have the same shape as query")
+        if out.dtype != query.dtype or out.device != query.device:
+            raise ValueError("x_attention out must match query dtype and device")
+        if not out.is_contiguous():
+            raise ValueError("x_attention out must be contiguous")
+    # Preserve the deployed contiguous-unshared ACLNN argument order.
+    args = (
         query,
         key_cache,
         value_cache,
@@ -148,6 +158,25 @@ def x_attention(
         _step_tensor(decode_step_1based, query.device),
         scale_value,
     )
+    if out is not None:
+        output_storage = out.untyped_storage().data_ptr()
+        if any(
+            isinstance(value, torch.Tensor) and value.untyped_storage().data_ptr() == output_storage
+            for value in args
+        ):
+            raise ValueError("x_attention out must not share storage with inputs")
+        from vllm_gr.ops.npu._xattention_out import get_x_attention_out
+
+        out_op = get_x_attention_out(out)
+        if out_op is not None:
+            # A native failure may follow a partial write. Never retry it.
+            out_op(*args, out)
+            return out
+    result = custom_ops.x_attention(*args)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def select_unshared_kv(

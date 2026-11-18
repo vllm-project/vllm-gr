@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Core contracts for active-platform ModelRunner patch dispatch."""
 
 import sys
@@ -10,6 +10,39 @@ import pytest
 
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
 from vllm_gr.v1.worker import gpu_model_runner_patch, model_runner_patch
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_active_cuda_worker_hot_update_utility_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    class Worker:
+        model_runner: Any
+
+        def reload_weights(self, weights_path: str) -> str:
+            return weights_path
+
+    module = ModuleType("vllm.v1.worker.gpu_worker")
+    setattr(module, "Worker", Worker)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_active_platform_module_name",
+        lambda: model_runner_patch._GPU_PATCH_MODULE,
+    )
+    native_reload = Worker.reload_weights
+    model_runner_patch._install_active_worker_resource_hook()
+    reload_trie = getattr(Worker, "reload_trie")
+    model_runner_patch._install_active_worker_resource_hook()
+    assert getattr(Worker, "reload_trie") is reload_trie
+    assert Worker.reload_weights is native_reload
+
+    worker = Worker()
+    backend = Mock()
+    worker.model_runner = SimpleNamespace(constraint_backend=backend)
+    assert getattr(worker, "reload_trie")("/tries/v2", "v2") == {"version": "v2", "ready": True}
+    backend.reload.assert_called_once_with("/tries/v2", "v2")
+    assert worker.reload_weights("/weights/v2") == "/weights/v2"
 
 
 def test_dispatcher_selects_one_platform_module(
@@ -112,7 +145,9 @@ def test_dispatcher_installs_required_and_optional_hooks_once(
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert getattr(Runner, "_patched_for_beam_pos_ids") is True
     # No _sample on this Runner -> the Constraint Tables hook must not be added.
-    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+    from vllm_gr.v1.worker.model_runner_contracts import (
+        _WORKER_SAMPLE_PATCH_MARKER,
+    )
 
     assert not hasattr(getattr(Runner, "_sample", None), _WORKER_SAMPLE_PATCH_MARKER)
 
@@ -138,7 +173,9 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
     monkeypatch.setattr(
         model_runner_patch, "_active_platform_module_name", lambda: platform_module_name
     )
-    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+    from vllm_gr.v1.worker.model_runner_contracts import (
+        _WORKER_SAMPLE_PATCH_MARKER,
+    )
     from vllm_gr.v1.worker.model_runner_patch import (
         _CONSTRAINT_LOAD_PATCH_MARKER,
         _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
@@ -249,7 +286,9 @@ def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     # V1-platform install test: pin the V2 flag off (see
     # test_dispatcher_selects_one_platform_module).
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
-    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_TOKENS_PATCH_MARKER
+    from vllm_gr.v1.worker.model_runner_contracts import (
+        _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
+    )
 
     class Runner:
         def execute_model(self, scheduler_output: Any) -> None:
@@ -403,6 +442,8 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
 def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     monkeypatch: pytest.MonkeyPatch, mode: BeamExecutionMode | None
 ) -> None:
+    import builtins
+
     from vllm_gr.v1.worker import gr_startup
 
     fake_platforms = ModuleType("vllm.platforms")
@@ -439,8 +480,22 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
         )
 
     monkeypatch.setattr(model_runner_patch, "import_module", import_npu)
-    monkeypatch.setattr(gr_startup, "capture_async_forward", lambda _: events.append("stages"))
+    monkeypatch.setattr(
+        gr_startup,
+        "capture_async_forward",
+        lambda _, *, hooks_type: events.append("stages")
+        if hooks_type is None
+        else pytest.fail("NPU received CUDA hooks"),
+    )
     monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
+
+    original_import = builtins.__import__
+
+    def without_cuda_hooks(name: str, *args: Any, **kwargs: Any) -> Any:
+        assert not name.startswith("vllm_gr.v1.worker.gpu_beam_stage_runner")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_cuda_hooks)
     model_runner_patch.apply_worker_patches()
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert Runner().capture_model() == 17
@@ -448,3 +503,40 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("use_v2", [False, True])  # type: ignore[misc]
+def test_public_installer_owns_numpy_staging_once(
+    monkeypatch: pytest.MonkeyPatch, use_v2: bool
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm_gr.v1.worker import gpu_model_runner_v2_patch as v2
+    from vllm_gr.v1.worker import gr_async_output
+    from vllm_gr.v1.worker import model_runner_patch as installer
+    from vllm_gr.v1.worker import numpy_staging
+
+    install = Mock()
+    discover = Mock(return_value=())
+    monkeypatch.setattr(numpy_staging, "install_numpy_staging", install)
+    monkeypatch.setattr(v2, "discover_worker_runners", discover)
+    monkeypatch.setattr(gr_async_output, "install_async_output_guard", lambda: False)
+    monkeypatch.setattr(installer, "_install_active_worker_resource_hook", lambda: None)
+    monkeypatch.setattr(
+        installer, "_active_platform_module_name", lambda: installer._GPU_PATCH_MODULE
+    )
+    monkeypatch.setattr(
+        installer,
+        "_active_runner_module_name",
+        lambda: (installer._V2_GPU_PATCH_MODULE if use_v2 else installer._GPU_PATCH_MODULE),
+    )
+    monkeypatch.setattr(
+        installer,
+        "_get_active_platform_module",
+        lambda: SimpleNamespace(discover_worker_runners=lambda: ()),
+    )
+    installer.apply_worker_patches()
+    install.assert_called_once_with()
+    assert discover.call_count == int(use_v2)

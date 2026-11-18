@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """vLLM-compatible logger helpers for vllm-gr."""
 
 from vllm.logger import init_logger as _init_vllm_logger

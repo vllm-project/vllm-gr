@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Unit tests for the worker-side beam decision (Asynchronous scheduling decode_select port).
 
 Covers the five correctness gaps fixed in the NPU post-processing port:

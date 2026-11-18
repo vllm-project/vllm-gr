@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """BeamAttentionContext — worker-level shared resource container for incremental decode.
 
 Holds the KV pools, session registry, and suffix temporary buffers needed

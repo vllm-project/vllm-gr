@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Narrow Ascend 0.30 allocation-policy bridge for dense Beam prefix KV."""
 
 from __future__ import annotations

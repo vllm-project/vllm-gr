@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Functional guards for Beam Attention metadata ownership."""
 
 from __future__ import annotations
@@ -11,10 +11,14 @@ import pytest
 import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
+from vllm_gr.v1.attention.backends import beam_attn_metadata_layout as layout
+from vllm_gr.v1.attention.backends import beam_attn_metadata_tensors as tensors
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
 )
+from vllm_gr.v1.attention.backends.beam_attn_metadata_async import build_async
+from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import BeamTensorBuffers
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 
 
@@ -33,8 +37,106 @@ def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
     builder._is_cuda = False
     builder._is_npu = False
     builder._fixed_buffers = False
+    builder._tensor_buffers = BeamTensorBuffers()
     builder.npu_causal_atten_mask = None
     return builder
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_builder_init_allocates_fixed_tensor_buffers(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.v1.attention.backend import AttentionMetadataBuilder
+
+    from vllm_gr.config import GRConfig
+    from vllm_gr.v1.attention.backends import beam_attn_metadata as metadata
+
+    sentinel = BeamTensorBuffers()
+    monkeypatch.setattr(
+        AttentionMetadataBuilder,
+        "__init__",
+        lambda self, kv_cache_spec, layer_names, vllm_config, device: setattr(
+            self, "device", device
+        ),
+    )
+    monkeypatch.setattr(metadata, "allocate_tensor_buffers", lambda **kwargs: sentinel)
+    monkeypatch.setattr(
+        GRConfig,
+        "from_vllm_config",
+        classmethod(
+            lambda cls, config: SimpleNamespace(
+                beam_max_width=4,
+                beam_worker_decision=False,
+            )
+        ),
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_attention_heads=lambda parallel_config: 8,
+            get_num_kv_heads=lambda parallel_config: 2,
+            get_head_size=lambda: 128,
+            max_model_len=128,
+        ),
+        parallel_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
+            max_cudagraph_capture_size=0,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
+    )
+    builder = BeamAttentionMetadataBuilder(
+        kv_cache_spec=SimpleNamespace(dtype=torch.float16, block_size=2),
+        layer_names=["layer"],
+        vllm_config=vllm_config,
+        device=torch.device("cuda"),
+    )
+
+    assert builder._fixed_buffers is True
+    assert builder._tensor_buffers is sentinel
+    assert builder._tensor_context().buffers is sentinel
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_allocate_tensor_buffers_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_zeros = torch.zeros
+
+    def zeros_without_pin_memory(*args: Any, **kwargs: Any) -> torch.Tensor:
+        kwargs.pop("pin_memory", None)
+        return real_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(tensors.torch, "zeros", zeros_without_pin_memory)
+    buffers = tensors.allocate_tensor_buffers(
+        device=torch.device("cpu"),
+        block_size=16,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=128,
+        max_beams=8,
+    )
+
+    assert buffers.prefix_cu_seqlens_q.shape == (33,)
+    assert buffers.suffix_seqlens_kv.shape == (32,)
+    assert buffers.prefix_block_table.shape == (4, 8)
+    assert buffers.std_indices.shape == (64,)
+    assert buffers.h2d_host.shape == (132,)
+    assert buffers.std_cu_seqlens_q.dtype is torch.int32
+    assert buffers.prefix_indices.dtype is torch.long
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("session", [None, SimpleNamespace(is_active=False)])  # type: ignore[misc]
+def test_build_async_rejects_inactive_session(session: Any) -> None:
+    with pytest.raises(RuntimeError, match="active beam session"):
+        build_async(
+            layout={},
+            views={},
+            session=session,
+            mask=torch.empty(0),
+            slots=torch.empty(0),
+            block_size=2,
+            max_model_len=8,
+            num_heads=1,
+            num_kv_heads=1,
+        )
 
 
 def _common_metadata(
@@ -64,7 +166,11 @@ def _build_metadata(
     req_ids: list[str],
     beam_data: dict[str, dict[str, Any]],
 ) -> BeamAttentionMetadata:
-    token = BEAM_DATA_VAR.set({"beam_data": beam_data, "req_ids": req_ids})
+    session = SimpleNamespace(
+        is_active=True,
+        context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda req_id: 0)),
+    )
+    token = BEAM_DATA_VAR.set({"beam_data": beam_data, "req_ids": req_ids, "beam_session": session})
     try:
         return _make_builder().build(0, common)
     finally:
@@ -154,8 +260,8 @@ def test_native_cpu_length_fallback_preserves_exact_lengths(
     ),
     [
         pytest.param(
-            [0, 4],
-            [8],
+            [0, 2],
+            [6],
             [[0, 1, 2, 3]],
             ["beam"],
             {
@@ -164,27 +270,27 @@ def test_native_cpu_length_fallback_preserves_exact_lengths(
                     "prefix_len": 4,
                     "beam_width": 2,
                     "beam_decode_steps": 2,
+                    "decode_step": 1,
                     "cache_len": 4,
                 }
             },
             {
                 "std_indices": [],
-                "prefix_indices": [0, 1, 2, 3],
+                "prefix_indices": [0, 1],
                 "std_q": [],
                 "std_kv": [],
-                "prefix_q": [4],
+                "prefix_q": [2],
                 "prefix_kv": [4],
-                "suffix_q": [2, 2],
+                "suffix_q": [1, 1],
                 "suffix_kv": [2, 2],
                 "std_blocks": None,
                 "prefix_blocks": [[0, 1]],
-                "suffix_slots": [100, 101, 102, 103],
             },
             id="beam-only",
         ),
         pytest.param(
-            [0, 2, 6],
-            [3, 8],
+            [0, 2, 4],
+            [3, 6],
             [[0, 1, 2, 3], [10, 11, 12, 13]],
             ["ordinary", "beam"],
             {
@@ -193,21 +299,21 @@ def test_native_cpu_length_fallback_preserves_exact_lengths(
                     "prefix_len": 4,
                     "beam_width": 2,
                     "beam_decode_steps": 2,
+                    "decode_step": 1,
                     "cache_len": 4,
                 }
             },
             {
                 "std_indices": [0, 1],
-                "prefix_indices": [2, 3, 4, 5],
+                "prefix_indices": [2, 3],
                 "std_q": [2],
                 "std_kv": [3],
-                "prefix_q": [4],
+                "prefix_q": [2],
                 "prefix_kv": [4],
-                "suffix_q": [2, 2],
+                "suffix_q": [1, 1],
                 "suffix_kv": [2, 2],
                 "std_blocks": [[0, 1]],
                 "prefix_blocks": [[10, 11]],
-                "suffix_slots": [102, 103, 104, 105],
             },
             id="mixed-batch",
         ),
@@ -251,14 +357,8 @@ def test_build_routes_standard_and_beam_metadata(
     prefix_blocks = (
         metadata.prefix_block_table.tolist() if metadata.prefix_block_table is not None else None
     )
-    suffix_slots = (
-        metadata.suffix_slot_mapping_out.tolist()
-        if metadata.suffix_slot_mapping_out is not None
-        else None
-    )
     assert std_blocks == expected["std_blocks"]
     assert prefix_blocks == expected["prefix_blocks"]
-    assert suffix_slots == expected["suffix_slots"]
 
     if expected["suffix_q"]:
         assert metadata.prefix_cu_seqlens_q_cpu == [
@@ -363,40 +463,79 @@ def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:
     assert updated.prefix_block_table.tolist() == [[7, 8]]
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_update_block_table_reuses_fixed_buffers() -> None:
+    builder = _make_builder()
+    builder._fixed_buffers = True
+    builder._tensor_buffers.std_block_table = torch.zeros((2, 3), dtype=torch.int32)
+    builder._tensor_buffers.prefix_block_table = torch.zeros((2, 3), dtype=torch.int32)
+    metadata = BeamAttentionMetadata(
+        num_actual_tokens=2,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_seq_len=6,
+        seq_lens=torch.tensor([3, 6], dtype=torch.int32),
+        block_table=torch.zeros((2, 3), dtype=torch.int32),
+        slot_mapping=torch.zeros(2, dtype=torch.int64),
+        std_block_table=torch.zeros((1, 3), dtype=torch.int32),
+        prefix_block_table=torch.zeros((1, 3), dtype=torch.int32),
+        std_req_idxs_cpu=[1],
+        prefix_req_idxs_cpu=[0],
+        max_prefix_blocks_count=2,
+    )
+    new_table = torch.tensor([[7, 8, 9], [10, 11, 12]], dtype=torch.int32)
+    new_slots = torch.tensor([20, 21], dtype=torch.int64)
+
+    updated = builder.update_block_table(metadata, new_table, new_slots)
+
+    assert (
+        updated.std_block_table.data_ptr()
+        == builder._tensor_buffers.std_block_table[:1, :3].data_ptr()
+    )
+    assert updated.std_block_table.tolist() == [[10, 11, 12]]
+    assert (
+        updated.prefix_block_table.data_ptr()
+        == builder._tensor_buffers.prefix_block_table[:1].data_ptr()
+    )
+    assert updated.prefix_block_table.tolist() == [[7, 8, 0]]
+
+
 def test_pack_int32_to_dev_matches_individual_copies() -> None:
     """Single-H2D staging scatters the same values as per-field copies.
 
     Uses CPU staging buffers (device="cpu") to exercise the fixed-buffer pack
-    path without a GPU: ``_pack_int32_to_dev`` must copy exactly the per-field
+    path without a GPU: ``pack_int32_to_dev`` must copy exactly the per-field
     host lists into the destination buffers in order.
     """
     builder = _make_builder()
-    builder._h2d_host = torch.zeros(16, dtype=torch.int32)
-    builder._h2d_dev = torch.zeros(16, dtype=torch.int32)
+    builder._tensor_buffers.h2d_host = torch.zeros(16, dtype=torch.int32)
+    builder._tensor_buffers.h2d_dev = torch.zeros(16, dtype=torch.int32)
 
     dst_a = torch.zeros(4, dtype=torch.int32)
     dst_b = torch.zeros(3, dtype=torch.int32)
-    builder._pack_int32_to_dev([(dst_a, [1, 2, 3, 4]), (dst_b, [5, 6, 7])])
+    tensors.pack_int32_to_dev(
+        builder._tensor_context(), [(dst_a, [1, 2, 3, 4]), (dst_b, [5, 6, 7])]
+    )
 
     assert dst_a.tolist() == [1, 2, 3, 4]
     assert dst_b.tolist() == [5, 6, 7]
     # Single contiguous staging: values are laid back-to-back on the host
     # staging, so the first transfer covers every field's source.
-    assert builder._h2d_host[:7].tolist() == [1, 2, 3, 4, 5, 6, 7]
-    assert builder._h2d_dev[:7].tolist() == [1, 2, 3, 4, 5, 6, 7]
+    assert builder._tensor_buffers.h2d_host[:7].tolist() == [1, 2, 3, 4, 5, 6, 7]
+    assert builder._tensor_buffers.h2d_dev[:7].tolist() == [1, 2, 3, 4, 5, 6, 7]
 
     # Empty entries are a no-op.
-    builder._pack_int32_to_dev([])
+    tensors.pack_int32_to_dev(builder._tensor_context(), [])
 
 
 def test_pack_int32_to_dev_leading_zero_cus() -> None:
     """cu_seqlens payloads carry the leading 0 element (prefix/suffix groups)."""
     builder = _make_builder()
-    builder._h2d_host = torch.zeros(6, dtype=torch.int32)
-    builder._h2d_dev = torch.zeros(6, dtype=torch.int32)
+    builder._tensor_buffers.h2d_host = torch.zeros(6, dtype=torch.int32)
+    builder._tensor_buffers.h2d_dev = torch.zeros(6, dtype=torch.int32)
 
     cu = torch.zeros(3, dtype=torch.int32)
-    builder._pack_int32_to_dev([(cu, [0, 2, 4])])
+    tensors.pack_int32_to_dev(builder._tensor_context(), [(cu, [0, 2, 4])])
 
     assert cu.tolist() == [0, 2, 4]
 
@@ -406,10 +545,10 @@ def test_async_metadata_upload_keeps_each_pending_host_payload_independent(
 ) -> None:
     """A second request cannot overwrite the source of an enqueued H2D."""
     builder = _make_builder()
-    builder._h2d_host = torch.zeros(16, dtype=torch.int32)
-    builder._h2d_dev = torch.zeros(16, dtype=torch.int32)
+    builder._tensor_buffers.h2d_host = torch.zeros(16, dtype=torch.int32)
+    builder._tensor_buffers.h2d_dev = torch.zeros(16, dtype=torch.int32)
     first, second = torch.zeros(4, dtype=torch.int32), torch.zeros(4, dtype=torch.int32)
-    staging_storage = builder._h2d_dev.untyped_storage().data_ptr()
+    staging_storage = builder._tensor_buffers.h2d_dev.untyped_storage().data_ptr()
     queued: list[tuple[torch.Tensor, torch.Tensor, bool]] = []
     allocated = []
     original_empty, original_copy = torch.empty, torch.Tensor.copy_
@@ -430,10 +569,12 @@ def test_async_metadata_upload_keeps_each_pending_host_payload_independent(
 
     monkeypatch.setattr(torch, "empty", allocate)
     monkeypatch.setattr(torch.Tensor, "copy_", enqueue)
-    builder._pack_int32_to_dev([(first, [1, 2, 3, 4])], non_blocking=True)
-    builder._h2d_host.fill_(-1)
-    builder._pack_int32_to_dev([(second, [5, 6, 7, 8])], non_blocking=True)
-    builder._h2d_host.fill_(-2)
+    tensors.pack_int32_to_dev(builder._tensor_context(), [(first, [1, 2, 3, 4])], non_blocking=True)
+    builder._tensor_buffers.h2d_host.fill_(-1)
+    tensors.pack_int32_to_dev(
+        builder._tensor_context(), [(second, [5, 6, 7, 8])], non_blocking=True
+    )
+    builder._tensor_buffers.h2d_host.fill_(-2)
     assert len(allocated) == 2
     assert allocated[0].data_ptr() != allocated[1].data_ptr()
     assert queued[0][2] and queued[2][2]
@@ -451,19 +592,20 @@ def test_only_npu_incremental_geometry_uses_async_upload(
     builder._is_npu = is_npu
     transfers = []
 
-    def upload(entries: Any, *, non_blocking: bool = False) -> None:
+    def upload(ctx: Any, entries: Any, *, non_blocking: bool = False) -> None:
         transfers.append(non_blocking)
 
-    monkeypatch.setattr(builder, "_pack_int32_to_dev", upload)
+    monkeypatch.setattr(tensors, "pack_int32_to_dev", upload)
     for step in (0, 1):
-        assert builder._upload_incremental_seqlens(
+        assert tensors.upload_incremental_seqlens(
+            builder._tensor_context(),
             ("beam", 4),
             step,
-            prefix_seqlens_kv_view=builder._prefix_seqlens_kv_buf[:1],
-            prefix_cu_seqlens_q_view=builder._prefix_cu_seqlens_q_buf[:2],
-            suffix_seqlens_kv_view=builder._suffix_seqlens_kv_buf[:4],
-            suffix_cu_seqlens_q_view=builder._suffix_cu_seqlens_q_buf[:5],
-            suffix_cu_seqlens_k_view=builder._suffix_cu_seqlens_k_buf[:5],
+            prefix_seqlens_kv_view=builder._tensor_buffers.prefix_seqlens_kv[:1],
+            prefix_cu_seqlens_q_view=builder._tensor_buffers.prefix_cu_seqlens_q[:2],
+            suffix_seqlens_kv_view=builder._tensor_buffers.suffix_seqlens_kv[:4],
+            suffix_cu_seqlens_q_view=builder._tensor_buffers.suffix_cu_seqlens_q[:5],
+            suffix_cu_seqlens_k_view=builder._tensor_buffers.suffix_cu_seqlens_k[:5],
             prefix_seqlens_kv_cpu=[8],
             prefix_cu_seqlens_q_cpu=[4],
             suffix_cu_seqlens_q_cpu=[1, 2, 3, 4],
@@ -481,8 +623,8 @@ def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
     builder.device = torch.device("npu")
     builder._is_npu = True
     with torch.inference_mode():
-        builder._h2d_host = torch.zeros(64, dtype=torch.int32, pin_memory=True)
-        builder._h2d_dev = torch.zeros(64, dtype=torch.int32, device="npu")
+        builder._tensor_buffers.h2d_host = torch.zeros(64, dtype=torch.int32, pin_memory=True)
+        builder._tensor_buffers.h2d_dev = torch.zeros(64, dtype=torch.int32, device="npu")
         work = torch.ones((1024, 1024), dtype=torch.float16, device="npu")
         scratch = torch.empty_like(work)
         stream = torch.npu.Stream()
@@ -497,8 +639,10 @@ def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
                 first = torch.empty(8, dtype=torch.int32, device="npu")
                 second = torch.empty(12, dtype=torch.int32, device="npu")
                 values = list(range(20 * request, 20 * request + 20))
-                builder._pack_int32_to_dev(
-                    [(first, values[:8]), (second, values[8:])], non_blocking=True
+                tensors.pack_int32_to_dev(
+                    builder._tensor_context(),
+                    [(first, values[:8]), (second, values[8:])],
+                    non_blocking=True,
                 )
                 results.append((first, second, values))
                 # The just-released upload source has exactly this size.
@@ -506,7 +650,7 @@ def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
                 churn = torch.empty(20, dtype=torch.int32, pin_memory=True)
                 churn.fill_(-1)
                 del churn
-                builder._h2d_host.fill_(-2)
+                builder._tensor_buffers.h2d_host.fill_(-2)
         stream.synchronize()
         for first, second, values in results:
             assert first.cpu().tolist() == values[:8]
@@ -519,19 +663,19 @@ def _make_fixed_builder() -> BeamAttentionMetadataBuilder:
     builder._fixed_buffers = True
     # Preallocate the fixed-address metadata buffers on CPU.
     max_segs = 8
-    builder._prefix_indices_buf = torch.zeros(max_segs, dtype=torch.long)
-    builder._std_indices_buf = torch.zeros(max_segs, dtype=torch.long)
-    builder._prefix_seqlens_kv_buf = torch.zeros(max_segs, dtype=torch.int32)
-    builder._suffix_seqlens_kv_buf = torch.zeros(max_segs, dtype=torch.int32)
-    builder._prefix_cu_seqlens_q_buf = torch.zeros(max_segs, dtype=torch.int32)
-    builder._suffix_cu_seqlens_q_buf = torch.zeros(max_segs, dtype=torch.int32)
-    builder._suffix_cu_seqlens_k_buf = torch.zeros(max_segs, dtype=torch.int32)
-    builder._std_cu_seqlens_q_buf = torch.zeros(max_segs, dtype=torch.int32)
-    builder._std_seqlens_kv_buf = torch.zeros(max_segs, dtype=torch.int32)
-    builder._prefix_block_table_buf = torch.zeros((1, 8), dtype=torch.int32)
-    builder._std_block_table_buf = torch.zeros((1, 8), dtype=torch.int32)
-    builder._h2d_host = torch.zeros(64, dtype=torch.int32)
-    builder._h2d_dev = torch.zeros(64, dtype=torch.int32)
+    builder._tensor_buffers.prefix_indices = torch.zeros(max_segs, dtype=torch.long)
+    builder._tensor_buffers.std_indices = torch.zeros(max_segs, dtype=torch.long)
+    builder._tensor_buffers.prefix_seqlens_kv = torch.zeros(max_segs, dtype=torch.int32)
+    builder._tensor_buffers.suffix_seqlens_kv = torch.zeros(max_segs, dtype=torch.int32)
+    builder._tensor_buffers.prefix_cu_seqlens_q = torch.zeros(max_segs, dtype=torch.int32)
+    builder._tensor_buffers.suffix_cu_seqlens_q = torch.zeros(max_segs, dtype=torch.int32)
+    builder._tensor_buffers.suffix_cu_seqlens_k = torch.zeros(max_segs, dtype=torch.int32)
+    builder._tensor_buffers.std_cu_seqlens_q = torch.zeros(max_segs, dtype=torch.int32)
+    builder._tensor_buffers.std_seqlens_kv = torch.zeros(max_segs, dtype=torch.int32)
+    builder._tensor_buffers.prefix_block_table = torch.zeros((1, 8), dtype=torch.int32)
+    builder._tensor_buffers.std_block_table = torch.zeros((1, 8), dtype=torch.int32)
+    builder._tensor_buffers.h2d_host = torch.zeros(64, dtype=torch.int32)
+    builder._tensor_buffers.h2d_dev = torch.zeros(64, dtype=torch.int32)
     return builder
 
 
@@ -552,16 +696,16 @@ def test_prefix_block_table_view_requires_npu_incremental_identity_rows(
     builder = _make_fixed_builder()
     builder._is_npu = is_npu
     builder._is_cuda = not is_npu
-    builder._prefix_block_table_buf = torch.zeros((4, 8), dtype=torch.int32)
-    builder._suffix_cu_seqlens_q_buf = torch.zeros(16, dtype=torch.int32)
-    builder._suffix_cu_seqlens_k_buf = torch.zeros(16, dtype=torch.int32)
+    builder._tensor_buffers.prefix_block_table = torch.zeros((4, 8), dtype=torch.int32)
+    builder._tensor_buffers.suffix_cu_seqlens_q = torch.zeros(16, dtype=torch.int32)
+    builder._tensor_buffers.suffix_cu_seqlens_k = torch.zeros(16, dtype=torch.int32)
     common = _common_metadata(
         [0, 2, 4, 6, 8],
         [8, 10, 12, 14],
         [list(range(8 * row, 8 * row + 8)) for row in range(4)],
     )
     expected = common.block_table_tensor[request_rows, :max_columns].clone()
-    fixed_address = builder._prefix_block_table_buf.data_ptr()
+    fixed_address = builder._tensor_buffers.prefix_block_table.data_ptr()
     advanced_reads = []
     original_getitem, original_empty = torch.Tensor.__getitem__, torch.empty
 
@@ -582,7 +726,8 @@ def test_prefix_block_table_view_requires_npu_incremental_identity_rows(
     rows = 2 * count
 
     def build(key: Any, step: int) -> torch.Tensor:
-        return builder._create_beam_tensors(
+        return tensors.create_beam_tensors(
+            builder._tensor_context(),
             common,
             prefix_indices=list(range(rows)),
             prefix_seqlens_q_cpu=[2] * count,
@@ -592,7 +737,6 @@ def test_prefix_block_table_view_requires_npu_incremental_identity_rows(
             suffix_cu_seqlens_q_cpu=list(range(1, rows + 1)),
             suffix_cu_seqlens_kv_cpu=list(range(step + 1, (rows + 1) * (step + 1), step + 1)),
             suffix_seqlens_kv_cpu=[step + 1] * rows,
-            suffix_slot_mapping_out_list=[],
             prefix_req_idxs_cpu=request_rows,
             max_prefix_blocks_count=max_columns,
             device=torch.device("cpu"),
@@ -612,7 +756,7 @@ def test_prefix_block_table_view_requires_npu_incremental_identity_rows(
     common.block_table_tensor.add_(100)
     blocks = build(key, 1)
     # Same-request incremental geometry retains its original prefix blocks;
-    # mixed/recompute geometry refreshes the current native block table.
+    # Mixed geometry refreshes the current native block table.
     torch.testing.assert_close(blocks[:, :max_columns], expected if incremental else expected + 100)
     if incremental:
         blocks = build(("request-b", tuple(request_rows)), 0)
@@ -633,19 +777,19 @@ def test_npu_mixed_metadata_keeps_indexed_block_rows_and_synchronous_upload(
     expected = common.block_table_tensor[beam_index : beam_index + 1, :2].clone()
     reads, transfers = [], []
     original_getitem = torch.Tensor.__getitem__
-    original_upload = builder._pack_int32_to_dev
+    original_upload = tensors.pack_int32_to_dev
 
     def getitem(tensor: torch.Tensor, key: Any) -> torch.Tensor:
         if tensor is common.block_table_tensor and isinstance(key[0], list):
             reads.append(tuple(key[0]))
         return original_getitem(tensor, key)
 
-    def upload(entries: Any, *, non_blocking: bool = False) -> None:
+    def upload(ctx: Any, entries: Any, *, non_blocking: bool = False) -> None:
         transfers.append(non_blocking)
-        original_upload(entries, non_blocking=non_blocking)
+        original_upload(ctx, entries, non_blocking=non_blocking)
 
     monkeypatch.setattr(torch.Tensor, "__getitem__", getitem)
-    monkeypatch.setattr(builder, "_pack_int32_to_dev", upload)
+    monkeypatch.setattr(tensors, "pack_int32_to_dev", upload)
     token = BEAM_DATA_VAR.set(
         {
             "req_ids": req_ids,
@@ -681,14 +825,15 @@ def test_incremental_seqlens_step_updates_device_in_place() -> None:
     builder = _make_fixed_builder()
     geom_key = ("beam", (1, 4, 8, 3), (0, 4), (4,), builder.block_size)
 
-    prefix_kv = builder._prefix_seqlens_kv_buf[:1]
-    prefix_cu = builder._prefix_cu_seqlens_q_buf[:2]
-    suffix_kv = builder._suffix_seqlens_kv_buf[:4]
-    suffix_cu_q = builder._suffix_cu_seqlens_q_buf[:5]
-    suffix_cu_k = builder._suffix_cu_seqlens_k_buf[:5]
+    prefix_kv = builder._tensor_buffers.prefix_seqlens_kv[:1]
+    prefix_cu = builder._tensor_buffers.prefix_cu_seqlens_q[:2]
+    suffix_kv = builder._tensor_buffers.suffix_seqlens_kv[:4]
+    suffix_cu_q = builder._tensor_buffers.suffix_cu_seqlens_q[:5]
+    suffix_cu_k = builder._tensor_buffers.suffix_cu_seqlens_k[:5]
 
     # First step (decode_step=0 -> suffix KV length 1).
-    ok = builder._upload_incremental_seqlens(
+    ok = tensors.upload_incremental_seqlens(
+        builder._tensor_context(),
         geom_key,
         0,
         prefix_seqlens_kv_view=prefix_kv,
@@ -711,7 +856,8 @@ def test_incremental_seqlens_step_updates_device_in_place() -> None:
     # step-derived suffix arrays refresh on device.
     suffix_kv.fill_(-1)  # poison to prove cache reuse does not repack fixed.
     suffix_cu_k.mul_(0)  # zero out
-    ok = builder._upload_incremental_seqlens(
+    ok = tensors.upload_incremental_seqlens(
+        builder._tensor_context(),
         geom_key,
         2,  # decode_step=2 -> suffix KV length 3
         prefix_seqlens_kv_view=prefix_kv,
@@ -734,14 +880,15 @@ def test_incremental_seqlens_step_updates_device_in_place() -> None:
 
 def test_incremental_seqlens_rejects_none_key() -> None:
     builder = _make_fixed_builder()
-    ok = builder._upload_incremental_seqlens(
+    ok = tensors.upload_incremental_seqlens(
+        builder._tensor_context(),
         None,
         0,
-        prefix_seqlens_kv_view=builder._prefix_seqlens_kv_buf[:1],
-        prefix_cu_seqlens_q_view=builder._prefix_cu_seqlens_q_buf[:2],
-        suffix_seqlens_kv_view=builder._suffix_seqlens_kv_buf[:4],
-        suffix_cu_seqlens_q_view=builder._suffix_cu_seqlens_q_buf[:5],
-        suffix_cu_seqlens_k_view=builder._suffix_cu_seqlens_k_buf[:5],
+        prefix_seqlens_kv_view=builder._tensor_buffers.prefix_seqlens_kv[:1],
+        prefix_cu_seqlens_q_view=builder._tensor_buffers.prefix_cu_seqlens_q[:2],
+        suffix_seqlens_kv_view=builder._tensor_buffers.suffix_seqlens_kv[:4],
+        suffix_cu_seqlens_q_view=builder._tensor_buffers.suffix_cu_seqlens_q[:5],
+        suffix_cu_seqlens_k_view=builder._tensor_buffers.suffix_cu_seqlens_k[:5],
         prefix_seqlens_kv_cpu=[8],
         prefix_cu_seqlens_q_cpu=[4],
         suffix_cu_seqlens_q_cpu=[1, 2, 3, 4],
@@ -754,24 +901,39 @@ def test_cached_seqlens_views_reuse_same_objects() -> None:
     builder = _make_fixed_builder()
     key = ("beam", (4, 8, 8), 16)
 
-    v1 = builder._cached_seqlens_views(key, n_pk=1, n_pc=2, n_sk=4, n_scq=5, n_sck=5)
-    v2 = builder._cached_seqlens_views(key, n_pk=1, n_pc=2, n_sk=4, n_scq=5, n_sck=5)
+    v1 = tensors.cached_seqlens_views(
+        builder._tensor_context(), key, n_pk=1, n_pc=2, n_sk=4, n_scq=5, n_sck=5
+    )
+    v2 = tensors.cached_seqlens_views(
+        builder._tensor_context(), key, n_pk=1, n_pc=2, n_sk=4, n_scq=5, n_sck=5
+    )
     assert v1 is not None and v2 is not None
     # Same object (not just equal values) on the second call.
     for a, b in zip(v1, v2):
         assert a is b
         assert a.data_ptr() == b.data_ptr()
     # Storage is the address-stable buffer.
-    assert v1[0].data_ptr() == builder._prefix_seqlens_kv_buf.data_ptr()
+    assert v1[0].data_ptr() == builder._tensor_buffers.prefix_seqlens_kv.data_ptr()
 
     # A different geometry key yields a separate view set.
-    other = builder._cached_seqlens_views(
-        ("beam2", (8, 16, 16), 16), n_pk=1, n_pc=2, n_sk=4, n_scq=5, n_sck=5
+    other = tensors.cached_seqlens_views(
+        builder._tensor_context(),
+        ("beam2", (8, 16, 16), 16),
+        n_pk=1,
+        n_pc=2,
+        n_sk=4,
+        n_scq=5,
+        n_sck=5,
     )
     assert other is not None
     assert other[0] is not v1[0]
     # None key falls back (no caching).
-    assert builder._cached_seqlens_views(None, n_pk=1, n_pc=1, n_sk=1, n_scq=1, n_sck=1) is None
+    assert (
+        tensors.cached_seqlens_views(
+            builder._tensor_context(), None, n_pk=1, n_pc=1, n_sk=1, n_scq=1, n_sck=1
+        )
+        is None
+    )
 
 
 def test_geom_cache_key_stable_without_decode_step() -> None:
@@ -789,8 +951,8 @@ def test_geom_cache_key_stable_without_decode_step() -> None:
         }
     }
     req_ids = ["beam"]
-    k1 = builder._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], True)
-    k2 = builder._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], True)
+    k1 = layout._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], True, builder.block_size)
+    k2 = layout._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], True, builder.block_size)
     assert k1 is not None
     assert k1 == k2
     # key[0] is the beam_view; only width/prefix_len/cache_len (not the
@@ -800,28 +962,37 @@ def test_geom_cache_key_stable_without_decode_step() -> None:
     # geometry -> identical key (cache hits).
     grown = dict(beam_data)
     grown["beam"] = dict(grown["beam"], beam_decode_steps=5)
-    k3 = builder._geom_cache_key(1, req_ids, grown, [0, 4], [5], True)
+    k3 = layout._geom_cache_key(1, req_ids, grown, [0, 4], [5], True, builder.block_size)
     assert k3 == k1
     # q_starts / seq_lens do not affect the key (per-step-varying, excluded).
-    k4 = builder._geom_cache_key(1, req_ids, beam_data, [0, 8], [8], True)
+    k4 = layout._geom_cache_key(1, req_ids, beam_data, [0, 8], [8], True, builder.block_size)
     assert k4 == k1
     # Non-incremental falls back.
-    assert builder._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], False) is None
+    assert (
+        layout._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], False, builder.block_size)
+        is None
+    )
     # Mixed batch (non-beam request) falls back.
     mixed = dict(beam_data)
     mixed["other"] = {"is_beam_decode": False, "beam_width": 1}
-    assert builder._geom_cache_key(2, ["beam", "other"], mixed, [0, 4, 6], [4, 2], True) is None
+    assert (
+        layout._geom_cache_key(
+            2, ["beam", "other"], mixed, [0, 4, 6], [4, 2], True, builder.block_size
+        )
+        is None
+    )
 
 
 def test_incremental_seqlens_through_create_beam_tensors() -> None:
-    """Full _create_beam_tensors with geom cached route keeps device suffix
+    """Full ``create_beam_tensors`` with geom cached route keeps device suffix
     arrays consistent across decode_step increments."""
     builder = _make_fixed_builder()
     common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
     geom_key = ("beam", (1, 4, 8, 3), (0, 4), (4,), builder.block_size)
 
     def run(step: int) -> Any:
-        return builder._create_beam_tensors(
+        return tensors.create_beam_tensors(
+            builder._tensor_context(),
             common,
             prefix_indices=[0, 1, 2, 3],
             prefix_seqlens_q_cpu=[4],
@@ -831,7 +1002,6 @@ def test_incremental_seqlens_through_create_beam_tensors() -> None:
             suffix_cu_seqlens_q_cpu=[1, 2, 3, 4],
             suffix_cu_seqlens_kv_cpu=[step + 1, 2 * (step + 1), 3 * (step + 1), 4 * (step + 1)],
             suffix_seqlens_kv_cpu=[step + 1] * 4,
-            suffix_slot_mapping_out_list=[],
             prefix_req_idxs_cpu=[0],
             max_prefix_blocks_count=2,
             device=torch.device("cpu"),
@@ -844,12 +1014,12 @@ def test_incremental_seqlens_through_create_beam_tensors() -> None:
     assert m0[1].tolist() == [8]  # prefix_seqlens_kv_device
     assert m0[2] == 16  # prefix_max_seq_len (4 blocks * block_size 2)
     assert m0[6].tolist() == [1, 1, 1, 1]  # suffix_seqlens_kv_device
-    assert m0[10].tolist() == [0, 1, 2, 3, 4]  # suffix_cu_seqlens_q_device
+    assert m0[8].tolist() == [0, 1, 2, 3, 4]  # suffix_cu_seqlens_q_device
 
     # Step 3: suffix KV length = 4, cu_seqlens_k = [0,4,8,12,16].
     m3 = run(3)
     assert m3[6].tolist() == [4, 4, 4, 4]
-    assert m3[11].tolist() == [0, 4, 8, 12, 16]
+    assert m3[9].tolist() == [0, 4, 8, 12, 16]
     # Fixed prefix untouched across the cached step.
     assert m3[1].tolist() == [8]
 
@@ -859,7 +1029,7 @@ def test_create_beam_tensors_geom_key_arrange_contiguity() -> None:
 
     The device-side arange fast path is only valid when ``prefix_indices`` is
     one contiguous range.  Supplying a geom_key does not by itself prove that
-    (the caller could hand over an arbitrary recompute/gather layout), so the
+    (standard rows may separate two beam requests), so the
     builder must still fall back to the host copy for a non-contiguous index
     list.  This guards the fast path against a future optimization that would
     turn a gather layout into a bogus strided arange."""
@@ -868,7 +1038,8 @@ def test_create_beam_tensors_geom_key_arrange_contiguity() -> None:
     geom_key = ("beam", (1, 4, 8, 3), (0, 4), (4,), builder.block_size)
 
     def run(prefix_indices: list[int]) -> Any:
-        return builder._create_beam_tensors(
+        return tensors.create_beam_tensors(
+            builder._tensor_context(),
             common,
             prefix_indices=prefix_indices,
             prefix_seqlens_q_cpu=[len(prefix_indices)],
@@ -878,7 +1049,6 @@ def test_create_beam_tensors_geom_key_arrange_contiguity() -> None:
             suffix_cu_seqlens_q_cpu=list(range(1, len(prefix_indices) + 1)),
             suffix_cu_seqlens_kv_cpu=[1] * len(prefix_indices),
             suffix_seqlens_kv_cpu=[1] * len(prefix_indices),
-            suffix_slot_mapping_out_list=[],
             prefix_req_idxs_cpu=[0],
             max_prefix_blocks_count=2,
             device=torch.device("cpu"),
@@ -905,7 +1075,8 @@ def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
     geom_key = ("beam", (1, 4, 8, 3), (0, 4), (4,), builder.block_size)
 
     def run(prefix_indices: list[int], **kw: Any) -> Any:
-        return builder._create_beam_tensors(
+        return tensors.create_beam_tensors(
+            builder._tensor_context(),
             common,
             prefix_indices=prefix_indices,
             prefix_seqlens_q_cpu=[len(prefix_indices)],
@@ -915,7 +1086,6 @@ def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
             suffix_cu_seqlens_q_cpu=list(range(1, len(prefix_indices) + 1)),
             suffix_cu_seqlens_kv_cpu=[1] * len(prefix_indices),
             suffix_seqlens_kv_cpu=[1] * len(prefix_indices),
-            suffix_slot_mapping_out_list=[],
             prefix_req_idxs_cpu=[0],
             max_prefix_blocks_count=2,
             device=torch.device("cpu"),
@@ -938,50 +1108,26 @@ def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
 
 def test_build_beam_mappings_incremental_returns_analytic_scalars() -> None:
     """The incremental path returns its scalar reductions analytically:
-    a contiguous prefix flag of True and per-geometry max q lens; the
-    recompute path returns False (scan required) and list-derived maxima."""
+    a contiguous prefix flag of True and per-geometry max q lens."""
     builder = _make_builder()
-    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
     geom_key = ("beam", (1, 4, 8, 8), builder.block_size)
 
-    inc = builder._build_beam_mappings(
+    inc = layout._build_beam_mappings(
         beam_req_idxs=[0],
         beam_prefix_lens=[8],
         beam_widths=[4],
-        beam_decode_steps=[1],
-        beam_cache_lens=[8],
         beam_q_start_offsets=[0],
         q_starts=[0, 4],
-        common_attn_metadata=common,
-        is_incremental=True,
         beam_decode_step_list=[2],
         geom_key=geom_key,
+        block_size=builder.block_size,
+        cache=builder._geometry_cache(),
     )
-    # Tail of the tuple: (..., max_prefix_blocks_count, contiguous, pql, sql, skl)
-    assert inc[-4] is True  # prefix_indices_contiguous
-    assert inc[-3] == 4  # prefix_max_q_len == beam_width
-    assert inc[-2] == 1  # suffix_max_q_len (one query token per beam)
-    assert inc[-1] == 3  # suffix_max_seq_len == decode_step + 1 (step=2)
-
-    rec = builder._build_beam_mappings(
-        beam_req_idxs=[0],
-        beam_prefix_lens=[8],
-        beam_widths=[4],
-        beam_decode_steps=[2],
-        beam_cache_lens=[8],
-        beam_q_start_offsets=[0],
-        q_starts=[0, 4],
-        common_attn_metadata=common,
-        is_incremental=False,
-        beam_decode_step_list=None,
-        geom_key=None,
-    )
-    # The recompute path reports the SCANNED verdict (this single-group layout
-    # happens to be contiguous); multi-group gather layouts scan False.
-    assert rec[-4] is True
-    assert rec[-3] == 4  # prefix_max_q_len derived from the group list
-    assert rec[-2] == 2  # suffix_max_q_len: recompute splits chunk budget (2/beam)
-    assert rec[-1] == 2  # suffix_max_seq_len derived from suffix_seqlens_kv list
+    assert isinstance(inc, layout.BeamMappings)
+    assert inc.prefix_indices_contiguous is True
+    assert inc.prefix_max_q_len == 4  # beam_width
+    assert inc.suffix_max_q_len == 1  # one query token per beam
+    assert inc.suffix_max_seq_len == 3  # decode_step + 1 (step=2)
 
 
 def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
@@ -993,54 +1139,53 @@ def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
     cumsum + tolist on every decode step, while the step-dependent suffix
     cumsum is still recomputed."""
     builder = _make_builder()
-    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
     geom_key = ("beam", (1, 4, 8, 8), builder.block_size)
 
     def run(step: int) -> Any:
-        return builder._build_beam_mappings(
+        return layout._build_beam_mappings(
             beam_req_idxs=[0],
             beam_prefix_lens=[8],
             beam_widths=[4],
-            beam_decode_steps=[1],
-            beam_cache_lens=[8],
             beam_q_start_offsets=[0],
             q_starts=[0, 4],
-            common_attn_metadata=common,
-            is_incremental=True,
             beam_decode_step_list=[step],
             geom_key=geom_key,
+            block_size=builder.block_size,
+            cache=builder._geometry_cache(),
         )
 
     m0 = run(0)
-    assert m0[7] == [4]  # prefix_cu_seqlens_q_cpu (cumsum([4]))
-    assert m0[8] == [8]  # prefix_cu_seqlens_kv_cpu (cumsum([8]))
-    assert m0[9] == [1, 2, 3, 4]  # suffix_cu_seqlens_q_cpu (cumsum([1]*4))
-    assert m0[10] == [1, 2, 3, 4]  # suffix_cu_seqlens_kv_cpu, step 0 -> s=1
+    assert m0.prefix_cu_seqlens_q == [4]  # cumsum([4])
+    assert m0.prefix_cu_seqlens_kv == [8]  # cumsum([8])
+    assert m0.suffix_cu_seqlens_q == [1, 2, 3, 4]  # cumsum([1]*4)
+    assert m0.suffix_cu_seqlens_kv == [1, 2, 3, 4]  # step 0 -> s=1
 
     # Same geometry, later step: fixed lists must be the SAME objects (cache
     # hit, no recompute); the step-derived suffix_cu_seqlens_kv changes.
     m1 = run(2)
-    assert m1[7] is m0[7] and m1[8] is m0[8] and m1[9] is m0[9]
-    assert m1[10] == [3, 6, 9, 12]  # step 2 -> s=3, recomputed
+    assert (
+        m1.prefix_cu_seqlens_q is m0.prefix_cu_seqlens_q
+        and m1.prefix_cu_seqlens_kv is m0.prefix_cu_seqlens_kv
+        and m1.suffix_cu_seqlens_q is m0.suffix_cu_seqlens_q
+    )
+    assert m1.suffix_cu_seqlens_kv == [3, 6, 9, 12]  # step 2 -> s=3, recomputed
 
     # A different geometry must not share the cached lists.
     other_key = ("beam", (2, 8, 16, 16), builder.block_size)
-    m2 = builder._build_beam_mappings(
+    m2 = layout._build_beam_mappings(
         beam_req_idxs=[0],
         beam_prefix_lens=[16],
         beam_widths=[2],
-        beam_decode_steps=[1],
-        beam_cache_lens=[16],
         beam_q_start_offsets=[0],
         q_starts=[0, 2],
-        common_attn_metadata=common,
-        is_incremental=True,
         beam_decode_step_list=[0],
         geom_key=other_key,
+        block_size=builder.block_size,
+        cache=builder._geometry_cache(),
     )
-    assert m2[7] is not m0[7]
-    assert m2[8] == [16]
-    assert m2[9] == [1, 2]
+    assert m2.prefix_cu_seqlens_q is not m0.prefix_cu_seqlens_q
+    assert m2.prefix_cu_seqlens_kv == [16]
+    assert m2.suffix_cu_seqlens_q == [1, 2]
 
 
 def test_build_geometry_hit_fast_path_replays_layout() -> None:
@@ -1220,10 +1365,14 @@ def test_block_table_copied_set_eviction_survives_fixed_buffers() -> None:
     btc = cache.get("block_table_copied")
     assert btc, "fixed-buffer build registered block_table_copied"
     assert any("req-a" in str(k) for k in btc)
+    uploaded = cache.get("uploaded_geometries")
+    assert uploaded, "fixed-buffer build registered its upload marker"
+    assert any("req-a" in str(k) for k in uploaded)
 
-    # Session B sweeps A's set entry without raising TypeError.
+    # Session B sweeps A's set entries without raising TypeError.
     run_build("req-b")
     assert not any("req-a" in str(k) for k in btc)
+    assert not any("req-a" in str(k) for k in uploaded)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
@@ -1313,3 +1462,87 @@ def test_identity_row_proof_is_not_reused_for_same_shape_changed_prefix() -> Non
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("session_state", ["missing", "inactive"])  # type: ignore[misc]
+def test_beam_builder_rejects_missing_active_session(session_state: str) -> None:
+    data = {
+        "beam": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "cache_len": 4,
+            "beam_width": 2,
+            "decode_step": 0,
+        }
+    }
+    token = BEAM_DATA_VAR.set(
+        {
+            "req_ids": ["beam"],
+            "beam_data": data,
+            "beam_session": None
+            if session_state == "missing"
+            else SimpleNamespace(is_active=False),
+        }
+    )
+    try:
+        with pytest.raises(RuntimeError, match="active beam session"):
+            _make_builder().build(0, _common_metadata([0, 2], [6], [[0, 1, 2]]))
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("step", [None, -1, True, 0.5])  # type: ignore[misc]
+def test_beam_builder_rejects_invalid_decode_step(step: Any) -> None:
+    data = {"beam": {"is_beam_decode": True, "prefix_len": 4, "cache_len": 4, "beam_width": 2}}
+    if step is not None:
+        data["beam"]["decode_step"] = step
+    with pytest.raises(ValueError, match="decode_step"):
+        _build_metadata(_common_metadata([0, 2], [6], [[0, 1, 2]]), ["beam"], data)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_cached_geometry_does_not_accept_multi_token_beam_queries() -> None:
+    builder = _make_builder()
+    session = SimpleNamespace(
+        is_active=True, context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda rid: 0))
+    )
+    data = {
+        "beam": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "cache_len": 4,
+            "beam_width": 2,
+            "decode_step": 0,
+        }
+    }
+    token = BEAM_DATA_VAR.set({"req_ids": ["beam"], "beam_data": data, "beam_session": session})
+    try:
+        builder.build(0, _common_metadata([0, 2], [6], [[0, 1, 2]]))
+        assert builder._geometry_cache()["layout"]
+        with pytest.raises(ValueError, match="one query token per beam"):
+            builder.build(0, _common_metadata([0, 4], [8], [[0, 1, 2]]))
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_interleaved_standard_rows_preserve_beam_indices() -> None:
+    data = {
+        rid: {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "cache_len": 4,
+            "beam_width": 2,
+            "decode_step": 1,
+        }
+        for rid in ("a", "b")
+    }
+    metadata = _build_metadata(
+        _common_metadata([0, 2, 3, 5], [6, 1, 6], [[0, 1, 2]] * 3), ["a", "ordinary", "b"], data
+    )
+    assert metadata.prefix_indices.tolist() == [0, 1, 3, 4]
+    assert metadata.std_indices.tolist() == [2]
+    assert metadata.prefix_seqlens_q_cpu == [2, 2]
+    assert metadata.suffix_seqlens_kv_cpu == [2] * 4

@@ -45,6 +45,10 @@ runtime. Set `VLLM_GR_TARGET_DEVICE` explicitly when installing from source or
 building wheels; `setup.py` selects the platform dependencies. No `[gpu]` extra
 is needed.
 
+For service security boundaries and vulnerability reporting, see the
+[security policy](SECURITY.md) and the upstream
+[vLLM security guide](https://docs.vllm.ai/en/latest/usage/security.html).
+
 ## Unified self-validation
 
 For code changes, start with [Contributing](CONTRIBUTING.md) and the

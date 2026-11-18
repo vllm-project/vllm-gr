@@ -12,6 +12,8 @@ semantics were already locked down by ``test_onerec_decode_ops.py``.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -65,6 +67,12 @@ def _build_inputs(
         (2, 16, 64, 64, 2),
         (1, 8, 32, 32, 2),
         (1, 8, 64, 32, 1),
+        (1, 32, 32, 32, 3),
+        (2, 32, 32, 32, 3),
+        (1, 32, 32, 32, 4),
+        (2, 32, 32, 32, 4),
+        (1, 32, 32, 32, 5),
+        (2, 32, 32, 32, 5),
     ],
 )
 def test_final_select_npu_matches_torch_reference(
@@ -102,6 +110,80 @@ def test_final_select_npu_matches_torch_reference(
     torch.testing.assert_close(npu_index.cpu(), exp_index, rtol=0, atol=0)
     torch.testing.assert_close(npu_logprobs.cpu(), exp_logprobs, rtol=0, atol=1e-5)
     torch.testing.assert_close(npu_sequence.cpu(), exp_sequence, rtol=0, atol=0)
+
+
+@pytest.mark.l2
+@pytest.mark.parametrize("request_num", [1, 2])
+@pytest.mark.parametrize("capacity,current_step", [(4, 2), (6, 2), (6, 4), (6, 5)])
+def test_final_select_compacts_history_from_configured_capacity(
+    request_num: int, capacity: int, current_step: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final selection retains the active prefix and leaves its tail unused."""
+    from vllm_gr.ops.npu import beam_ops
+    from vllm_gr.v1.beam.beam_decision import _run_npu_decision
+
+    beam_width = 32
+    sentinel = -1234567
+    inputs = _build_inputs(request_num, beam_width, beam_width, current_step)
+    log_probs, top_tokens, top_probs, history = inputs
+    expected = _beam_search_rec_final_select_torch(*inputs, current_step, beam_width)
+    sequence = torch.full(
+        (request_num, beam_width, capacity), sentinel, dtype=torch.int32, device=DEVICE
+    )
+    sequence[:, :, : current_step + 1].copy_(history.to(DEVICE))
+    buffers = SimpleNamespace(
+        worker_decode_steps=current_step,
+        sequence=sequence,
+        beam_scores=log_probs.to(DEVICE).reshape(request_num, beam_width),
+    )
+    session = SimpleNamespace(context=SimpleNamespace(decision=buffers), beam_width=beam_width)
+    native_select = beam_ops.beam_search_rec_final_select
+    native_calls = 0
+
+    def checked_select(
+        scores: torch.Tensor,
+        tokens: torch.Tensor,
+        probabilities: torch.Tensor,
+        compact_history: torch.Tensor,
+        step: int,
+        result_width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        nonlocal native_calls
+        assert compact_history.shape == (request_num, beam_width, current_step + 1)
+        assert compact_history.is_contiguous()
+        native_calls += 1
+        out_tokens, out_index, out_scores, out_sequence = native_select(
+            scores, tokens, probabilities, compact_history, step, result_width
+        )
+        return out_tokens, out_index, out_scores, out_sequence
+
+    monkeypatch.setattr(beam_ops, "beam_search_rec_final_select", checked_select)
+    actual = _run_npu_decision(
+        session, top_tokens.to(DEVICE), top_probs.to(DEVICE), True, beam_width
+    )
+    torch.npu.synchronize()
+    assert actual is not None
+    assert native_calls == 1
+    exp_tokens, exp_index, exp_scores, exp_sequence = expected
+    shape = (request_num, beam_width)
+    torch.testing.assert_close(
+        actual["out_token_ids"].cpu(), exp_tokens.reshape(shape), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual["out_token_index"].cpu(), exp_index.reshape(shape), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual["out_log_probs"].cpu(), exp_scores.reshape(shape), rtol=0, atol=1e-5
+    )
+    torch.testing.assert_close(actual["out_sequence"].cpu(), exp_sequence, rtol=0, atol=0)
+    torch.testing.assert_close(
+        buffers.sequence[:, :, : current_step + 1].cpu(), exp_sequence, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        buffers.beam_scores.cpu(), exp_scores.reshape(shape), rtol=0, atol=1e-5
+    )
+    assert buffers.sequence[:, :, current_step + 1 :].eq(sentinel).all().item()
+    assert buffers.worker_decode_steps == current_step + 1
 
 
 def test_final_select_npu_output_contract() -> None:

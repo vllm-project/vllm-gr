@@ -10,13 +10,14 @@ platform. The Ascend path relies on the vendor runtime; a CPU package install
 does not provide accelerator inference.
 
 Install the [pre-commit hooks](docs/PRE_COMMIT.md). Before runtime validation,
-confirm that the active interpreter imports this checkout, then run:
+confirm that the active interpreter imports this checkout, apply the
+[CLI dispatch patch](docs/cli.md), then run:
 
 ```bash
-vllm-gr check-env
+vllm check-env --gr
 ```
 
-Use `vllm-gr check-env --npu` for Ascend. This checks compatibility in an
+Use `vllm check-env --gr --npu` for Ascend. This checks compatibility in an
 installed runtime; it does not run inference. Keep model and dataset paths in
 the documented environment variables.
 
@@ -57,7 +58,16 @@ Adding `ready`, pushing while it remains, or marking a labeled draft ready for
 review starts validation. Removing `ready` or converting the PR to draft
 cancels its previous PR runs and skips new validation. Remove and re-add
 `ready` to request a fresh run. Unrelated labels do not start full validation;
-manual dispatches have their own job conditions.
+manual dispatches have their own job conditions. Submitting, editing, or
+dismissing a review does not start validation. To retry a cancelled or failed
+run for the same commit, use **Re-run all jobs** on that Actions run.
+
+A rerun keeps the original event's commit and ref; it does not test later PR
+commits. For updated code, push the commit while `ready` remains to start new
+validation. Check the latest attempt of the full validation run for that
+revision and its `Benchmark blocking gate`. Historical cancelled or failed
+runs remain visible. Jenkins comments report a separate pipeline and do not
+replace GitHub Actions checks.
 
 For PRs that only change Markdown files under `docs/` or the root files
 `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, and `CLAUDE.md`, the workflow runs
@@ -86,8 +96,9 @@ satisfy full validation. A full `ready` run reuses an eligible A/B result for
 the current revision or runs A/B when needed. Confirmed documentation-only PRs
 do not run A/B tests, including when `abtest` is added.
 
-Benchmark policy depends on the PR base and device. Video-100/Pangu policy
-resolution uses the PR base and can use a changed candidate policy from the PR;
+Video-100/Pangu benchmarks use the policy and resolver from the same workflow
+commit as the tests, with the existing branch and device settings. Policy and
+test changes can be reviewed together in one PR. See the
+[CI policy guide](docs/ci/benchmark-policy-approvals.md) and
+[benchmark guide](docs/tools/README.md#benchmark-acceptance).
 Recall baseline provenance has separate rules.
-Use the [benchmark guide](docs/tools/README.md#benchmark-acceptance) and inspect
-the target revision's workflows when interpreting a result.

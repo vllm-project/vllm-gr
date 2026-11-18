@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
 
 # Ensure the xllm-ops custom operator library is available on an Ascend NPU
 # server. If it is missing, clone the upstream repository, initialize its
