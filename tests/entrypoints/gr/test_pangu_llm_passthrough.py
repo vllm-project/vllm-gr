@@ -80,9 +80,6 @@ class TestPanguGrllmPassthrough(unittest.TestCase):
                 "vllm_gr.plugin.initialize_runtime",
                 return_value={"patch_count": 0},
             ),
-            mock.patch(
-                "vllm_gr.entrypoints.openai.beam_search_patch.patch_engine_core_process_entrypoint"
-            ),
         ):
             GRLLM(model="/fake/pangu")
 

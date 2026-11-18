@@ -87,7 +87,7 @@ def patch_admission_rejection_reporting():
     from vllm.entrypoints.generate.base.serving import GenerateBaseServing
     from vllm.exceptions import VLLMValidationError
 
-    from vllm_gr.v1.engine.async_llm import (
+    from vllm_gr.v1.engine.output_processor import (
         _CLIENT_REQUEST_ID,
         take_admission_rejection,
     )
@@ -136,7 +136,7 @@ def patch_client_request_id():
     from vllm.entrypoints.serve.engine.serving import BaseServing
     from vllm.v1.engine.output_processor import OutputProcessor
 
-    from vllm_gr.v1.engine.async_llm import (
+    from vllm_gr.v1.engine.output_processor import (
         _CLIENT_REQUEST_ID,
         remember_client_request_id,
     )
@@ -192,34 +192,17 @@ def patch_sampling():
     CompletionRequest.model_rebuild(force=True)
 
 
-def patch_engine_core_process_entrypoint() -> None:
-    """Wrap the EngineCore process entrypoint for spawn-based runtimes."""
-    from vllm.logger import init_logger
-    from vllm.v1.engine.core import EngineCoreProc
-
-    from vllm_gr.v1.engine.engine_core_patch import run_engine_core
-
-    init_logger(__name__).info("vllm-gr: patch_engine_core_process_entrypoint called")
-
-    # Save the original so the wrapper can delegate without recursion
-    # even if run_patch() is called again in a spawned child process.
-    current_run_engine_core = EngineCoreProc.run_engine_core
-    if current_run_engine_core is run_engine_core:
-        return
-    original_run_engine_core = getattr(
-        run_engine_core,
-        "_original_run_engine_core",
-        current_run_engine_core,
-    )
-    if original_run_engine_core is run_engine_core:
-        original_run_engine_core = current_run_engine_core
-    run_engine_core._original_run_engine_core = original_run_engine_core
-    EngineCoreProc.run_engine_core = run_engine_core
-
-
 def patch_batch_and_fork() -> None:
-    """Compatibility installer name for the V1 session pipeline."""
-    from vllm_gr.v1.engine.core_client_patch import apply_gr_session_patches
+    """Compatibility entry point for installing the V1 session hooks."""
+    from vllm_gr.patch import install_engine_session_hooks
 
-    apply_gr_session_patches()
-    patch_engine_core_process_entrypoint()
+    install_engine_session_hooks()
+
+
+def patch_engine_core_process_entrypoint() -> None:
+    """Compatibility entry point for installing the spawned EngineCore wrapper."""
+    from vllm_gr.v1.engine.engine_core_patch import (
+        patch_engine_core_process_entrypoint as install_core_entrypoint,
+    )
+
+    install_core_entrypoint()

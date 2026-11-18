@@ -98,16 +98,6 @@ class GRLLM(LLM):
         from vllm_gr.plugin import initialize_runtime
 
         initialize_runtime()
-        # Force the EngineCore process entrypoint swap: re_apply_patches may
-        # skip an already-marked batch_and_fork patch (e.g. when the general
-        # plugin ran first), and without the swap a spawn child re-imports the
-        # original run_engine_core and loses every worker hook.
-        from vllm_gr.entrypoints.openai.beam_search_patch import (
-            patch_engine_core_process_entrypoint,
-        )
-
-        patch_engine_core_process_entrypoint()
-
         self._shutdown_complete = False
         self._frontend_gc_registered = False
 

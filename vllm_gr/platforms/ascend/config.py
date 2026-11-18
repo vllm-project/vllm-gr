@@ -31,7 +31,7 @@ class AscendConfigService(BackendConfigService):
 
     def validate_engine(self, config: Any, gr: GRConfig) -> None:
         if gr.constrained_generation is False and gr.beam_max_width is not None:
-            from vllm_gr.v1.engine.beam_search import (
+            from vllm_gr.platforms.npu_admission import (
                 validate_npu_unconstrained_runner,
             )
 

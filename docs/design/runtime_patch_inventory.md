@@ -184,8 +184,8 @@ Coverage: `tests/engine/test_backend_plan_engine_args.py` and
   frontend methods, and preserves admission rejection identities.
 - Private/internal dependencies: client `_send_input` / `_send_input_message`,
   native output collectors, and the EngineCore utility channel for retirement.
-- `patch_batch_and_fork` is a retained installer name for this V1 pipeline;
-  it does not restore the retired frontend batch/fork protocol.
+- The frontend runtime plan calls `patch.install_engine_session_hooks` for offline,
+  HTTP and gRPC startup. It installs session methods and the spawned Core entrypoint.
 - Removal condition: upstream exposes equivalent session submission and lifecycle hooks.
 
 ### GR-PATCH-008 — EngineCoreRequestType Extension
@@ -213,7 +213,7 @@ native patch target. Coverage: `tests/platforms/test_backend_plan.py`.
 
 - Scope: `core`; backend ID: `null`
 
-- Sources: `vllm_gr/v1/engine/core.py`, `engine_core_patch.py`, `hot_update.py`
+- Sources: `vllm_gr/v1/engine/core.py`, `core_socket.py`, `engine_core_patch.py`, `hot_update.py`
 - Targets:
     - `EngineCore.__init__`
     - `EngineCoreProc.__init__`
@@ -575,7 +575,7 @@ The CUDA plugin subprocess test and sliced-logits proxy tests cover this boundar
 - Scope: `backend`; backend ID: `ascend`
 
 - Source / Installer: `vllm_gr/v1/ascend_compat.py`
-- Orchestration: `vllm_gr/engine/arg_utils_gr.py::create_engine_config`
+- Orchestration: `vllm_gr/platforms/ascend/config.py::AscendConfigService.finalize_native_config`
   and worker plugin initialization through `vllm_gr/patch.py::_apply_patches`
 - Targets:
     - `vllm.v1.engine.core.EngineCoreProc.run_engine_core` (process-global

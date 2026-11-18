@@ -32,8 +32,8 @@ from vllm_gr.v1.beam.batch_contracts import (
     admission_rejected,
     admission_rejection,
 )
-from vllm_gr.v1.engine import async_llm
-from vllm_gr.v1.engine.async_llm import (
+from vllm_gr.v1.engine import output_processor
+from vllm_gr.v1.engine.output_processor import (
     make_patched_process_outputs,
     note_admission_rejections,
     take_admission_rejection,
@@ -108,13 +108,13 @@ def raise_if_error(
     patch_admission_rejection_reporting()
     # The frontend sets this while it handles a request; each request is its
     # own task in production, so the test puts it back itself.
-    token = async_llm._CLIENT_REQUEST_ID.set(client_request_id)
+    token = output_processor._CLIENT_REQUEST_ID.set(client_request_id)
     try:
         # Read through the class so the test exercises whatever patch is
         # installed.
         GenerateBaseServing._raise_if_error(serving(processor), "error", request_id)
     finally:
-        async_llm._CLIENT_REQUEST_ID.reset(token)
+        output_processor._CLIENT_REQUEST_ID.reset(token)
 
 
 def test_ordinary_request_refusal_is_reported_as_a_client_error() -> None:
@@ -197,12 +197,12 @@ def test_the_output_processor_parks_the_reason_and_forwards_the_output() -> None
 
 
 def test_parking_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(async_llm, "_ADMISSION_REJECTION_MAX", 2)
+    monkeypatch.setattr(output_processor, "_ADMISSION_REJECTION_MAX", 2)
     processor = _Processor()
 
     note_admission_rejections(processor, [refusal(f"cmpl-{i}") for i in range(4)])
 
-    parked = getattr(processor, async_llm._ADMISSION_REJECTIONS_ATTR)
+    parked = getattr(processor, output_processor._ADMISSION_REJECTIONS_ATTR)
     assert list(parked) == ["cmpl-2", "cmpl-3"]
 
 
@@ -239,7 +239,7 @@ def test_a_mapped_refusal_is_consumed_once_under_either_identity() -> None:
     processor = _Processor()
     note_admission_rejections(processor, [refusal("cmpl-1-8b31d4")])
 
-    async_llm.remember_client_request_id(processor, "caller-name", "cmpl-1-8b31d4")
+    output_processor.remember_client_request_id(processor, "caller-name", "cmpl-1-8b31d4")
 
     with pytest.raises(VLLMValidationError) as caught:
         raise_if_error(processor, "cmpl-1", "caller-name")
@@ -253,7 +253,7 @@ def test_a_caller_name_finds_the_request_it_was_submitted_as() -> None:
     """The engine extends the id it is handed, so the two names are paired."""
     processor = _Processor()
     note_admission_rejections(processor, [refusal("cmpl-1-0-884f2ecb")])
-    async_llm.remember_client_request_id(processor, "caller-name", "cmpl-1-0-884f2ecb")
+    output_processor.remember_client_request_id(processor, "caller-name", "cmpl-1-0-884f2ecb")
 
     with pytest.raises(VLLMValidationError) as caught:
         raise_if_error(processor, "cmpl-1", "caller-name")
@@ -265,7 +265,7 @@ def test_a_caller_name_does_not_answer_for_another_request() -> None:
     """Both names are looked up exactly; neither is inferred from the other."""
     processor = _Processor()
     note_admission_rejections(processor, [refusal("cmpl-1-child-0-884f2ecb")])
-    async_llm.remember_client_request_id(processor, "caller-name", "cmpl-1-0-884f2ecb")
+    output_processor.remember_client_request_id(processor, "caller-name", "cmpl-1-0-884f2ecb")
 
     with pytest.raises(GenerationError):
         raise_if_error(processor, "cmpl-1", "caller-name")
@@ -275,8 +275,8 @@ def test_a_reused_caller_name_finds_the_latest_request_only() -> None:
     """A name the caller reuses belongs to the request it was last given to."""
     processor = _Processor()
     note_admission_rejections(processor, [refusal("cmpl-1-0-884f2ecb")])
-    async_llm.remember_client_request_id(processor, "caller-name", "cmpl-1-0-884f2ecb")
-    async_llm.remember_client_request_id(processor, "caller-name", "cmpl-1-0-1a2b3c4d")
+    output_processor.remember_client_request_id(processor, "caller-name", "cmpl-1-0-884f2ecb")
+    output_processor.remember_client_request_id(processor, "caller-name", "cmpl-1-0-1a2b3c4d")
 
     with pytest.raises(GenerationError):
         raise_if_error(processor, "cmpl-1", "caller-name")
@@ -286,7 +286,7 @@ def test_a_missing_mapped_refusal_does_not_consume_another_identity() -> None:
     processor = _Processor()
     note_admission_rejections(processor, [refusal("cmpl-1")])
 
-    async_llm.remember_client_request_id(processor, "caller-name", "cmpl-1-8b31d4")
+    output_processor.remember_client_request_id(processor, "caller-name", "cmpl-1-8b31d4")
     assert take_admission_rejection(client(processor), "missing", "caller-name") is None
     # The reason filed under the caller's own id is left where it was.
     assert take_admission_rejection(client(processor), "cmpl-1") == REASON

@@ -22,7 +22,7 @@ def argument_parsers(parser: argparse.ArgumentParser) -> Iterator[argparse.Argum
 def _native_parser() -> argparse.ArgumentParser:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    from vllm_gr.engine.arg_utils_gr import origin_add_cli_args
+    from vllm_gr.engine.arg_utils import origin_add_cli_args
 
     return origin_add_cli_args(FlexibleArgumentParser(add_help=False))
 

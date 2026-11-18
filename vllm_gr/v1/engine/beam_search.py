@@ -12,9 +12,18 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_gr.config import GRConfig
+from vllm_gr.config.execution import (
+    validate_gr_execution_config,
+    validate_gr_execution_runtime,
+)
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_MAX_DECODE_STEPS,
     configured_candidate_width,
+)
+from vllm_gr.platforms.errors import GRDeviceRequestError
+from vllm_gr.platforms.npu_admission import (
+    validate_decode_token_budget,
+    validate_npu_unconstrained_runner,
 )
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchParams,
@@ -43,63 +52,6 @@ from vllm_gr.v1.core.sched.session import (
 )
 
 
-class GRDeviceRequestError(ValueError):
-    """A request cannot run on an otherwise supported device configuration."""
-
-
-def validate_gr_execution_config(config: Any) -> None:
-    """Reject unsupported Asynchronous scheduling runtimes before native/Worker request allocation."""
-    from vllm_gr.config.execution import require_beam_config
-
-    require_beam_config(config)
-    validate_gr_execution_runtime(config)
-
-
-def validate_gr_execution_runtime(config: Any) -> None:
-    """Validate runtime capabilities after the persistent protocol is admitted."""
-    if not config.scheduler_config.async_scheduling:
-        raise ValueError("Asynchronous scheduling requires async_scheduling=True")
-    if getattr(config.scheduler_config, "enable_chunked_prefill", False):
-        raise ValueError("beam_search requires enable_chunked_prefill=False")
-    if getattr(config.scheduler_config, "long_prefill_token_threshold", 0):
-        raise ValueError("beam_search does not support partial Prefill scheduling")
-    parallel = getattr(config, "parallel_config", None)
-    for name in (
-        "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "decode_context_parallel_size",
-        "prefill_context_parallel_size",
-    ):
-        if getattr(parallel, name, 1) != 1:
-            raise ValueError("Asynchronous scheduling requires TP/PP/DP/DCP/PCP=1")
-    if getattr(parallel, "use_ubatching", False):
-        raise ValueError("Asynchronous scheduling does not support microbatching")
-    for name in ("speculative_config", "lora_config", "kv_transfer_config", "ec_transfer_config"):
-        if getattr(config, name, None) is not None:
-            raise ValueError(f"Asynchronous scheduling does not support {name}")
-    model = getattr(config, "model_config", None)
-    if any(
-        getattr(model, name, False)
-        for name in ("is_encoder_decoder", "is_hybrid", "is_multimodal_model")
-    ):
-        raise ValueError("Asynchronous scheduling requires a uniform text decoder model")
-    dtype = getattr(model, "dtype", None)
-    if dtype is not None and str(dtype) not in ("torch.float16", "torch.bfloat16"):
-        raise ValueError("Asynchronous scheduling requires FP16 or BF16")
-    if getattr(model, "quantization", None) is not None:
-        raise ValueError("Asynchronous scheduling does not support quantization")
-
-
-def validate_npu_unconstrained_runner(config: Any) -> None:
-    """Check the catalog-free NPU adapter before model or request allocation."""
-    from vllm_gr.v1.engine.npu_admission import (
-        validate_npu_unconstrained_runner as validate_runner,
-    )
-
-    validate_runner(config)
-
-
 def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
     """Reject unavailable adapters without importing a device runtime."""
     from vllm_gr.config import GRConfig
@@ -113,7 +65,7 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
     if gr_config.beam_sid_stage_vocab and (device is None or str(device).split(":")[0] != "npu"):
         raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
     if device is not None and str(device).split(":")[0] == "npu":
-        from vllm_gr.v1.engine.npu_admission import validate_npu_device_config
+        from vllm_gr.platforms.npu_admission import validate_npu_device_config
 
         validate_npu_device_config(config, gr_config, request)
     if (
@@ -163,32 +115,6 @@ def _reject_candidate_width_below_dynamic_schedule(
             )
 
 
-def _validate_npu_decode_token_budget(request: BeamBatchRequest, config: Any) -> None:
-    """Fit physical Decode rows in the native ModelRunner's token buffers."""
-    device = getattr(getattr(config, "device_config", None), "device", None)
-    if str(device).split(":")[0] != "npu" or request.beam_params.max_tokens == 1:
-        return
-    budget = getattr(getattr(config, "scheduler_config", None), "max_num_batched_tokens", None)
-    if budget is None:
-        return
-    params = request.beam_params
-    # Prefill produces the first winners. Each remaining invocation consumes
-    # the preceding stage's winners; the final output is never a model input.
-    input_width = (
-        params.beam_width
-        if params.dynamic_beam_widths is None
-        else max(params.dynamic_beam_widths[:-1])
-    )
-    physical_tokens = len(request.items) * input_width
-    if physical_tokens > budget:
-        raise ValueError(
-            f"NPU Beam Decode requires {physical_tokens} physical tokens "
-            f"(batch_size={len(request.items)} * peak_input_width={input_width}), "
-            f"exceeding max_num_batched_tokens={budget}; increase the token budget "
-            "or reduce the batch size or Decode input widths"
-        )
-
-
 def validate_gr_generation_budget(gr_config: GRConfig, max_tokens: int) -> None:
     """Fix constrained SID length to table depth; otherwise bound it by capacity."""
     table = gr_config.constraint_table
@@ -212,7 +138,7 @@ def validate_gr_request(
         gr_config = GRConfig.from_vllm_config(config)
         validate_gr_generation_budget(gr_config, request.beam_params.max_tokens)
         _reject_candidate_width_below_dynamic_schedule(gr_config, request.beam_params)
-        _validate_npu_decode_token_budget(request, config)
+        validate_decode_token_budget(request, config)
 
 
 class GRModelExecutorInterface(Protocol):

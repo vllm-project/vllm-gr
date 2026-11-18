@@ -192,11 +192,7 @@ def test_v1_heap_is_prepared_before_serving_and_released_on_close(
         events.append("engine_ready")
 
     monkeypatch.setattr(LLM, "__init__", initialize)
-    monkeypatch.setattr("vllm_gr.plugin.initialize_runtime", lambda: {})
-    monkeypatch.setattr(
-        "vllm_gr.entrypoints.openai.beam_search_patch.patch_engine_core_process_entrypoint",
-        lambda: None,
-    )
+    monkeypatch.setattr("vllm_gr.plugin.initialize_runtime", dict)
     monkeypatch.setattr(
         engine_lifecycle, "acquire_frontend_startup_heap", lambda: events.append("freeze")
     )

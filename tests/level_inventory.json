@@ -1774,6 +1774,7 @@
     "tests/platforms/test_runtime_versions.py::test_requires_ascend_distribution_on_npu": "l1",
     "tests/platforms/test_runtime_versions.py::test_supported_vllm_local_version": "l1",
     "tests/platforms/test_runtime_versions.py::test_supported_vllm_version": "l1",
+    "tests/st/test_engine_entrypoint_startup.py::test_engine_entrypoint_startup": "l3",
     "tests/st/test_modelrunner_v2_stage_parity_st.py::test_modelrunner_v2_stage_parity": "l4",
     "tests/st/test_multibatch_accuracy_checks.py::test_exact_ties_are_reported_without_claiming_exact_equality": "l1",
     "tests/st/test_multibatch_accuracy_checks.py::test_invalid_results_fail": "l1",

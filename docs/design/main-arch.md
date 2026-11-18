@@ -45,11 +45,19 @@ protocol names do not choose the native ModelRunner implementation.
 | --- | --- | --- |
 | Configuration | Canonical fields, validation and serialization | `vllm_gr/config/` |
 | Frontends | Offline calls, HTTP/gRPC conversion and result consumption | `vllm_gr/entrypoints/` |
-| EngineCore | Batch admission, session progress, cancellation and retirement | `vllm_gr/v1/engine/` |
+| Engine arguments and startup | Apply native options and GR settings, then admit the backend plan | `vllm_gr/engine/arg_utils.py`, `vllm_gr/engine/startup.py` |
+| V1 session transport and EngineCore | Register frontend sessions, submit batches in-process or through the Core socket, and admit them on the Core thread | `vllm_gr/v1/engine/` |
+| Scheduling and dispatch | Track session progress, cancellation and retirement; exchange stage records with workers | `vllm_gr/v1/core/sched/`, `vllm_gr/v1/beam/dispatch.py` |
 | Worker | Device Beam state, stage execution and storage lifetime | `vllm_gr/v1/worker/`, `vllm_gr/v1/beam/` |
 | Constraints | Artifact identity, root routing and candidate scoring | `vllm_gr/constraints/` |
 | Attention and operators | Backend-specific computation and KV operations | `vllm_gr/v1/attention/backends/`, `vllm_gr/ops/` |
 | Platform integration | Provider activation, environment checks and compatibility hooks | `vllm_gr/platforms/`, `vllm_gr/plugin.py`, `vllm_gr/patch.py` |
+
+Within `vllm_gr/v1/engine/`, `gr_session_client.py` owns the frontend session lifecycle.
+`core_client.py` submits batches, `core_socket.py` receives them across the process
+boundary, and `core.py` handles admission. `engine_core_patch.py` installs the
+Core hooks and the spawned process entry point. Prefix hashing lives in
+`vllm_gr/v1/core/kv_cache_utils.py`.
 
 ## State and lifecycle boundaries
 

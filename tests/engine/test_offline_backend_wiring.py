@@ -29,11 +29,11 @@ from unittest import mock
 import msgspec
 import pytest
 
-# ``arg_utils_gr`` / ``gr`` are cached in sys.modules once a process imports
+# ``arg_utils`` / ``gr`` are cached in sys.modules once a process imports
 # them (possibly against the real vLLM in CI).  Each test re-imports them
 # against its own fakes so patch state cannot leak across tests.
 _VLLM_GR_REIMPORT = (
-    "vllm_gr.engine.arg_utils_gr",
+    "vllm_gr.engine.arg_utils",
     "vllm_gr.entrypoints.gr",
 )
 
@@ -41,7 +41,7 @@ _VLLM_GR_REIMPORT = (
 def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide every vLLM module the offline GRLLM import chain needs."""
 
-    # ``arg_utils_gr`` patches this class (add_cli_args / create_engine_config /
+    # ``arg_utils`` patches this class (add_cli_args / create_engine_config /
     # from_cli_args / __init__), so it must carry the four originals first.
     class EngineArgs:
         def __init__(self, model: str = "", **kwargs: Any) -> None:
@@ -207,7 +207,7 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def _isolated_vllm_imports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Fake vLLM per test and re-import arg_utils_gr / gr against the fakes.
+    """Fake vLLM per test and re-import arg_utils / gr against the fakes.
 
     Both vllm-gr modules are cached process-wide (in CI they may already be
     imported against the real vLLM).  Re-importing them per test keeps the
@@ -246,7 +246,7 @@ class TestEngineArgsGrInitPatch:
     """The offline path reaches EngineCore only through this patch."""
 
     def test_patch_mounts_and_stashes_gr_values(self) -> None:
-        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+        from vllm_gr.engine.arg_utils import patch_add_cli_args
 
         patch_add_cli_args()
 
@@ -261,7 +261,7 @@ class TestEngineArgsGrInitPatch:
         assert EngineArgs(**vars(engine_args)).gr == engine_args.gr
 
     def test_patch_applies_engine_defaults_and_preserves_overrides(self) -> None:
-        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+        from vllm_gr.engine.arg_utils import patch_add_cli_args
 
         patch_add_cli_args()
 
@@ -318,8 +318,8 @@ class TestEngineArgsGrInitPatch:
     @pytest.mark.l1  # type: ignore[misc]
     def test_unconstrained_default_needs_no_artifact(self) -> None:
         """The default Beam engine must bind a model-specific constraint table."""
-        from vllm_gr.engine import arg_utils_gr
-        from vllm_gr.engine.arg_utils_gr import create_engine_config, patch_add_cli_args
+        from vllm_gr.engine import arg_utils
+        from vllm_gr.engine.arg_utils import create_engine_config, patch_add_cli_args
 
         patch_add_cli_args()
 
@@ -328,7 +328,7 @@ class TestEngineArgsGrInitPatch:
         engine_args = EngineArgs(model=None)
         vllm_config = _fake_config()
         with mock.patch.object(
-            arg_utils_gr,
+            arg_utils,
             "origin_create_engine_config",
             return_value=vllm_config,
         ):
@@ -348,9 +348,6 @@ class TestGrllmCanonicalConstruction:
             "vllm.logger": {"init_logger": logging.getLogger},
             "vllm_gr.utils.npu_adapter": {"release_accelerator_memory": mock.Mock()},
             "vllm_gr.plugin": {"initialize_runtime": mock.Mock()},
-            "vllm_gr.entrypoints.openai.beam_search_patch": {
-                "patch_engine_core_process_entrypoint": mock.Mock()
-            },
         }.items():
             module = ModuleType(name)
             vars(module).update(cast(dict[str, Any], symbols))

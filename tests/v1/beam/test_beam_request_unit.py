@@ -35,9 +35,9 @@ def _sub_patch_preserves_greedy_validation() -> None:
     """Installing GR must not change ordinary vLLM sampling validation."""
     from vllm.sampling_params import SamplingParams
 
-    from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
+    from vllm_gr.patch import install_engine_session_hooks
 
-    patch_batch_and_fork()
+    install_engine_session_hooks()
 
     try:
         SamplingParams(temperature=0.0, n=2)

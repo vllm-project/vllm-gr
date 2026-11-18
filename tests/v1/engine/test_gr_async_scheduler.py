@@ -55,7 +55,9 @@ from vllm_gr.v1.engine.core import _handle_submit_gr_session
 from vllm_gr.v1.engine.core_client import (
     submit_gr_session_async as submit_gr_session_to_core_async,
 )
-from vllm_gr.v1.engine.core_client_patch import sync_mp_submit_gr_session
+from vllm_gr.v1.engine.core_client import (
+    sync_mp_submit_gr_session,
+)
 from vllm_gr.v1.engine.gr_session_client import (
     SyncGRSessionHandle,
     _terminal_result,

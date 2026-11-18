@@ -17,10 +17,8 @@ pytest.importorskip("vllm")
 from vllm.v1.engine.core_client import InprocClient  # noqa: E402
 from vllm.v1.engine.exceptions import EngineDeadError  # noqa: E402
 
-from vllm_gr.v1.engine.core_client_patch import (  # noqa: E402
-    apply_engine_client_patches,
-    inproc_engine_failure,
-)
+from vllm_gr.v1.engine.core_client import inproc_engine_failure
+from vllm_gr.v1.engine.core_client_patch import apply_engine_client_patches
 
 
 class _FakeCore:

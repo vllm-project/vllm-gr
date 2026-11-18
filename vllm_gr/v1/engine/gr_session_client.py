@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -206,7 +207,7 @@ def abort_gr_session_sync(engine: Any, session_id: str) -> None:
     engine.output_processor.abort_requests([session_id], internal=True)
     core = engine.engine_core
     if hasattr(core, "engine_core"):
-        from vllm_gr.v1.engine.core_client_patch import inproc_engine_failure
+        from vllm_gr.v1.engine.core_client import inproc_engine_failure
 
         if inproc_engine_failure(core) is not None:
             # EngineCore failed during a step. Its in-flight dispatches will
@@ -279,3 +280,46 @@ def install_gr_frontend_methods(llm_engine_cls: type[Any], async_llm_cls: type[A
     async_llm_cls.wait_gr_session = wait_gr_session_async
     async_llm_cls.abort_gr_session = abort_gr_session_async
     async_llm_cls.release_gr_session = release_gr_session_async
+
+
+# Native frontend submission methods wrapped by the dead-engine rollback.
+_FRONTEND_NATIVE: dict[str, Callable[..., Any]] = {}
+
+
+def llm_engine_add_request(self: Any, *args: Any, **kwargs: Any) -> Any:
+    """Roll back frontend registration when EngineCore is dead.
+
+    Native ``LLMEngine.add_request`` registers each request (and, with n > 1,
+    each child and its parent) with the output processor before handing it to
+    EngineCore. A dead engine rejects the hand-off with EngineDeadError, which
+    would leave the registration behind on every retry. Only the entries added
+    by this call are removed; other errors keep native behavior.
+    """
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    processor = self.output_processor
+    states, parents = len(processor.request_states), len(processor.parent_requests)
+    try:
+        return _FRONTEND_NATIVE["llm_engine_add_request"](self, *args, **kwargs)
+    except EngineDeadError:
+        # Dicts keep insertion order, so this call's entries are the tail.
+        added = list(processor.request_states)[states:]
+        added += list(processor.parent_requests)[parents:]
+        if added:
+            processor.abort_requests(added, internal=True)
+        raise
+
+
+async def async_llm_add_request(self: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
+    """AsyncLLM counterpart of ``llm_engine_add_request`` for one request.
+
+    ``AsyncLLM.add_request`` checks ``errored`` before it registers anything,
+    but EngineCore can die between that check and the hand-off.
+    """
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    try:
+        return await _FRONTEND_NATIVE["async_llm_add_request"](self, request, *args, **kwargs)
+    except EngineDeadError:
+        self.output_processor.abort_requests([request.request_id], internal=True)
+        raise

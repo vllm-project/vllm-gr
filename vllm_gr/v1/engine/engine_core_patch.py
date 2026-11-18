@@ -161,8 +161,8 @@ def apply_engine_core_request_patches() -> None:
     from vllm_gr.v1.engine.core import (
         _handle_submit_gr_session,
         is_gr_session_retired,
-        process_input_sockets,
     )
+    from vllm_gr.v1.engine.core_socket import process_input_sockets
 
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
@@ -227,6 +227,26 @@ def apply_engine_core_child_patches() -> None:
 _run_engine_core_active = False
 
 
+def patch_engine_core_process_entrypoint() -> None:
+    """Wrap the EngineCore process entrypoint for spawn-based runtimes."""
+    from vllm.v1.engine.core import EngineCoreProc
+
+    # Save the original so the wrapper can delegate without recursion
+    # even if run_patch() is called again in a spawned child process.
+    current_run_engine_core = EngineCoreProc.run_engine_core
+    if current_run_engine_core is run_engine_core:
+        return
+    original_run_engine_core = getattr(
+        run_engine_core,
+        "_original_run_engine_core",
+        current_run_engine_core,
+    )
+    if original_run_engine_core is run_engine_core:
+        original_run_engine_core = current_run_engine_core
+    run_engine_core._original_run_engine_core = original_run_engine_core
+    EngineCoreProc.run_engine_core = run_engine_core
+
+
 def run_engine_core(
     *args,
     dp_rank: int = 0,
@@ -246,9 +266,9 @@ def run_engine_core(
     # Re-entry guard: detect if we're already inside run_engine_core
     if _run_engine_core_active:
         raise RuntimeError(
-            "run_engine_core re-entry detected. This indicates a recursive "
-            "call, likely due to patching being applied multiple times. "
-            "Check that patch_batch_and_fork() is only called once."
+            "run_engine_core re-entry detected. Check that "
+            "engine_core_patch.patch_engine_core_process_entrypoint() saved the original "
+            "EngineCoreProc.run_engine_core before installing the wrapper."
         )
 
     from vllm.v1.engine.core import EngineCoreProc
@@ -256,7 +276,7 @@ def run_engine_core(
     # Guard against recursion: if vllm_gr/init.py was auto-imported in
     # the child process, run_patch() will have replaced
     # EngineCoreProc.run_engine_core with *this* function again.
-    # Use the saved original stashed by patch_batch_and_fork() if
+    # Use the original saved by patch_engine_core_process_entrypoint() if
     # available; otherwise fall back to the current class attribute
     # (which is the unpatched original in a fresh child interpreter).
     original_run = getattr(run_engine_core, "_original_run_engine_core", None)

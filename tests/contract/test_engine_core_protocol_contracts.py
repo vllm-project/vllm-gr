@@ -3,6 +3,7 @@
 # mypy: ignore-errors
 """Production V1 transport inventory; retired message bytes stay reserved."""
 
+import importlib
 from contextlib import contextmanager
 from queue import Queue
 from threading import Event, Thread
@@ -412,6 +413,52 @@ def test_gr_dispatch_only_admits_v1(monkeypatch) -> None:
         engine, EngineCoreRequestType.SUBMIT_GR_SESSION, batch
     )
     assert handled == [(engine, batch)]
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    ("old", "owner"),
+    [
+        ("engine.arg_utils_gr", "engine.arg_utils"),
+        ("v1.engine.async_llm", "v1.engine.output_processor"),
+        ("v1.engine.npu_admission", "platforms.npu_admission"),
+    ],
+)
+def test_legacy_engine_import_uses_same_module(old, owner):
+    assert importlib.import_module(f"vllm_gr.{old}") is importlib.import_module(f"vllm_gr.{owner}")
+
+
+@pytest.mark.l1
+def test_legacy_engine_symbols_resolve_to_runtime_owners():
+    from vllm_gr.v1.engine import core, core_client, core_client_patch, core_socket
+    from vllm_gr.v1.engine.engine_core_patch import run_engine_core
+
+    assert core.process_input_sockets is core_socket.process_input_sockets
+    assert core_client_patch.inproc_engine_failure is core_client.inproc_engine_failure
+    assert run_engine_core.__module__ == "vllm_gr.v1.engine.engine_core_patch"
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize(
+    ("legacy_name", "owner", "installer"),
+    [
+        ("patch_batch_and_fork", "vllm_gr.patch", "install_engine_session_hooks"),
+        (
+            "patch_engine_core_process_entrypoint",
+            "vllm_gr.v1.engine.engine_core_patch",
+            "patch_engine_core_process_entrypoint",
+        ),
+    ],
+)
+def test_legacy_openai_installers_forward_to_runtime_owners(
+    monkeypatch, legacy_name, owner, installer
+):
+    from vllm_gr.entrypoints.openai import beam_search_patch
+
+    install = Mock()
+    monkeypatch.setattr(importlib.import_module(owner), installer, install)
+    getattr(beam_search_patch, legacy_name)()
+    install.assert_called_once_with()
 
 
 pytestmark = pytest.mark.cpu_test
