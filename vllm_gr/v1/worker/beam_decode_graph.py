@@ -136,7 +136,8 @@ class BeamDecodeGraph:
         self.capture_inputs = self.capture_attention = None
         self.worker._beam_graph_keys = set()
 
-    @torch.inference_mode()
+    # Torch is external to the checked GR boundary.
+    @torch.inference_mode()  # type: ignore[misc]
     def capture(self, forward: Callable[[bool], Any], *, persistent_install: bool) -> None:
         """Run the caller's input adapter twice eager, then capture Forward."""
         if self.ready:
@@ -162,7 +163,7 @@ class BeamDecodeGraph:
             self.install()
         self.context = self.worker._beam_context
         stream = torch.cuda.current_stream(self.worker.device)
-        side = torch.cuda.Stream(device=self.worker.device)  # type: ignore[no-untyped-call]
+        side = torch.cuda.Stream(device=self.worker.device)
         side.wait_stream(stream)
         set_cudagraph_capturing_enabled(True)
         self.capturing = True
@@ -238,7 +239,8 @@ class BeamDecodeGraph:
         return CUDAGraphWrapper.__call__(self.wrapper, *args, **kwargs)
 
 
-class _BeamDecodeModel(CUDAGraphWrapper):
+# Native vLLM stays outside the checked GR boundary.
+class _BeamDecodeModel(CUDAGraphWrapper):  # type: ignore[misc]
     """Route only Beam FULL forwards into the shared component.
 
     Other forwards keep the original native model wrapper and its registry.
@@ -278,7 +280,9 @@ def get_beam_decode_graph(
     beam_width: int | None = None,
     graph_type: type[BeamDecodeGraph] = BeamDecodeGraph,
 ) -> BeamDecodeGraph:
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     graph = getattr(worker, "_beam_decode_graph", None)
     if graph is None:

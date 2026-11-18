@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Exercise GR stage boundaries against real ModelRunner V2 request state."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +11,20 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-from tests.kernels.test_gpu_beam_stage_runner import dispatch, metadata, runtime
+from tests.kernels.beam_stage_test_utils import (
+    admission_worker,
+    dispatch,
+    metadata,
+    runtime,
+)
 from tests.kernels.v2_input_test_utils import make_native_v2_worker
-from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
+from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
+from vllm_gr.v1.engine.beam_search_v1 import validate_dispatch_session
+from vllm_gr.v1.engine.gr_async_scheduler import (
+    GR_STAGE_OUTPUT_ATTR,
+    GR_WORKER_RESULT_ATTR,
+)
+from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
@@ -53,7 +65,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(
         desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 8, 1)
         batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
         if specialized:
-            from vllm_gr.v1.worker.gpu_prefill_inputs import (
+            from vllm_gr.v1.worker.gpu_prefill_v2 import (
                 try_prepare_gr_prefill_inputs_v2,
             )
 
@@ -126,9 +138,69 @@ def test_terminal_output_retires_native_v2_request():
     assert worker.req_states.num_reqs == 1
 
 
-def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
-    from dataclasses import replace
+@pytest.mark.l2
+def test_ordinary_prefill_chunks_keep_native_state_and_token_progress():
+    """Use native input/count operations and stand-in forward/sampling callbacks."""
+    from unittest.mock import Mock
 
+    from vllm_gr.v1.worker.gpu_model_runner_v2_patch import (
+        make_patched_execute_model_v2,
+        make_patched_sample_tokens_v2,
+    )
+
+    prompt = list(range(10, 18))
+    worker = make_native_v2_worker(prompt)
+    worker.execute_model_state = None
+    finish = Mock(side_effect=AssertionError("ordinary chunk reached GR cleanup"))
+    worker._gr_gpu_stage_runner = SimpleNamespace(
+        pending=None, closed=True, hooks=SimpleNamespace(finish_native_output=finish)
+    )
+    observed = []
+
+    def native_execute(runner, scheduled):
+        assert runner.execute_model_state is None
+        runner.update_requests(scheduled)
+        desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, scheduled.total_num_scheduled_tokens, 1)
+        batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
+        batch = runner.prepare_inputs(scheduled, batch_state, desc)
+        count = scheduled.total_num_scheduled_tokens
+        observed.append((batch.input_ids[:count].clone(), batch.positions[:count].clone()))
+        runner.execute_model_state = SimpleNamespace(input_batch=batch)
+
+    def native_sample(runner, grammar):
+        assert grammar is None
+        state = runner.execute_model_state
+        assert state is not None
+        runner.execute_model_state = None
+        runner.postprocess_num_computed_tokens(state.input_batch)
+        return state
+
+    execute = make_patched_execute_model_v2(native_execute)
+    sample = make_patched_sample_tokens_v2(native_sample)
+    computed = 0
+    req_index = worker.req_states.req_id_to_index["session-0"]
+    for count in (2, 3, 3):
+        scheduled = SchedulerOutput.make_empty()
+        scheduled.num_scheduled_tokens = {"session-0": count}
+        scheduled.total_num_scheduled_tokens = count
+        scheduled.scheduled_cached_reqs.req_ids = ["session-0"]
+        scheduled.scheduled_cached_reqs.num_computed_tokens = [computed]
+        scheduled.scheduled_cached_reqs.new_block_ids = [None]
+        assert execute(worker, scheduled) is None
+        state = worker.execute_model_state
+        assert state is not None
+        assert sample(worker, None) is state
+        assert worker.execute_model_state is None
+        ids, positions = observed[-1]
+        assert ids.tolist() == prompt[computed : computed + count]
+        assert positions.tolist() == list(range(computed, computed + count))
+        computed += count
+        assert worker.req_states.num_computed_tokens.gpu[req_index].item() == computed
+    finish.assert_not_called()
+    assert worker.req_states.total_len.gpu[req_index].item() == len(prompt)
+
+
+def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
     worker = make_native_v2_worker([1], capacity=7)
     states = worker.req_states
     prompts = {"a": [101] * 9, "b": [202] * 2, "c": [303] * 7, "d": [404] * 5}
@@ -167,3 +239,66 @@ def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
         row = states.req_id_to_index[request_id]
         assert states.num_computed_tokens.gpu[row].item() == len(tokens)
     assert states.num_computed_tokens.gpu[states.req_id_to_index["session-0"]].item() == 0
+
+
+# The V2 surface shares the stage-runner core: ``CudaStageHooksV2`` only
+# replaces the native execution surface, so the dispatch-session record has to
+# be built, carried and re-checked here exactly as on the V1 surface.
+@pytest.mark.l2
+def test_v2_hooked_admission_records_the_session_once():
+    worker = admission_worker()
+    first = metadata(0)
+    owner = get_stage_runner(worker, dispatch(first), hooks_type=CudaStageHooksV2)
+    assert isinstance(owner.hooks, CudaStageHooksV2)
+    record = owner._dispatch_session
+    assert record is not None
+    assert record.session_id == first.session_id
+    owner.previous = first
+    assert owner.admit(dispatch(metadata(1))) is not None
+    assert owner._dispatch_session is record
+
+
+@pytest.mark.l2
+def test_v2_decode_does_not_revalidate_the_session_facts(monkeypatch):
+    from vllm_gr.v1.worker import gpu_beam_stage_runner as stage_runner_module
+
+    worker = admission_worker()
+    first = metadata(0)
+    owner = get_stage_runner(worker, dispatch(first), hooks_type=CudaStageHooksV2)
+    owner.previous = first
+
+    def explode(*args, **kwargs):
+        raise AssertionError("Decode revalidation rebuilt the session record")
+
+    monkeypatch.setattr(stage_runner_module, "validate_dispatch_session", explode)
+    assert owner.admit(dispatch(metadata(1))) is not None
+
+
+@pytest.mark.l2
+def test_v2_decode_rejects_a_record_from_another_logical_batch():
+    worker = admission_worker()
+    first = metadata(0)
+    owner = get_stage_runner(worker, dispatch(first), hooks_type=CudaStageHooksV2)
+    owner.previous = first
+    # Same session id, different logical batch: only the batch identity can
+    # catch it, which is the check the step path kept.
+    foreign = replace(metadata(0), request_ids=("session-0:1",))
+    foreign_dispatch = SimpleNamespace(num_scheduled_tokens={"session-0:1": 7})
+    setattr(foreign_dispatch, GR_STAGE_OUTPUT_ATTR, {"session-0": foreign})
+    owner._dispatch_session = validate_dispatch_session(foreign_dispatch)
+    with pytest.raises(
+        BeamExecutionContractError, match="logical Beam batch identity changed across stages"
+    ):
+        owner.admit(dispatch(metadata(1)))
+
+
+@pytest.mark.l2
+def test_v2_decode_still_checks_native_token_extent():
+    worker = admission_worker()
+    first = metadata(0)
+    owner = get_stage_runner(worker, dispatch(first), hooks_type=CudaStageHooksV2)
+    owner.previous = first
+    scheduled = dispatch(metadata(1))
+    scheduled.scheduled_cached_reqs = SimpleNamespace(req_ids=[], resumed_req_ids=set())
+    with pytest.raises(ValueError, match="no matching native request"):
+        owner.admit(scheduled)

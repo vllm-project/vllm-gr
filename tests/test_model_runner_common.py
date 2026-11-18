@@ -15,41 +15,19 @@ import pytest
 import torch
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.worker import gpu_model_runner_v2_patch as _v2_integration
+from vllm_gr.v1.worker import gr_gc as _gc_runtime
 from vllm_gr.v1.worker import model_runner_common as common
 
 
-def test_position_helpers_support_buffer_forms_and_partial_beam() -> None:
+@pytest.mark.l1  # type: ignore[misc]
+def test_position_helpers_support_buffer_forms() -> None:
     device = torch.full((8,), -1, dtype=torch.long)
     host = torch.full((8,), -1, dtype=torch.long)
-
-    buffered_runner = SimpleNamespace(positions=SimpleNamespace(gpu=device, cpu=host))
-    assert common._get_positions_buffers(buffered_runner) == (device, host)
-
-    plain_runner = SimpleNamespace(positions=device, _positions_cpu_buf=host)
-    assert common._get_positions_buffers(plain_runner) == (device, host)
-
-    logits_indices: list[int] = []
-    result = common._process_beam_decode_request(
-        {
-            "prefix_len": 10,
-            "beam_width": 2,
-            "beam_decode_steps": 4,
-            "cache_len": 12,
-        },
-        seq_len=3,
-        token_offset=1,
-        gpu_pos=device,
-        cpu_pos=host,
-        new_logits_indices=logits_indices,
-    )
-
-    assert result == (2, 1, 4, [0])
-    assert logits_indices == [2]
-    assert device.tolist() == [-1, 12, 13, 10, -1, -1, -1, -1]
-    assert torch.equal(device, host)
-
-    common._write_position_segments(0, [], [], device, host)
-    assert torch.equal(device, host)
+    buffered = SimpleNamespace(positions=SimpleNamespace(gpu=device, cpu=host))
+    plain = SimpleNamespace(positions=device, _positions_cpu_buf=host)
+    assert common._get_positions_buffers(buffered) == (device, host)
+    assert common._get_positions_buffers(plain) == (device, host)
 
 
 def test_incremental_beam_decode_fills_constant_position_ids() -> None:
@@ -70,7 +48,6 @@ def test_incremental_beam_decode_fills_constant_position_ids() -> None:
         gpu_pos=device,
         cpu_pos=host,
         new_logits_indices=logits_indices,
-        is_incremental=True,
     )
 
     assert result == (3, 3, 4, [0, 1, 2])
@@ -114,14 +91,15 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
                 "beam_width": 2,
                 "beam_decode_steps": 2,
                 "cache_len": 4,
+                "decode_step": 1,
             }
         }
     )
 
-    logits_indices = common._beam_remap_inputs(runner, scheduler_output, [2, 4, 1, 3])
+    logits_indices = common._beam_remap_inputs(runner, scheduler_output, [2, 2, 1, 3])
 
-    assert logits_indices == [3, 5, 9]
-    assert positions.gpu[2:6].tolist() == [4, 5, 4, 5]
+    assert logits_indices == [2, 3, 7]
+    assert positions.gpu[2:4].tolist() == [5, 5]
     assert torch.equal(positions.gpu, positions.cpu)
     assert scheduler_output._gr_request_row_configs == [
         ("ordinary", 0, 0, []),
@@ -214,18 +192,24 @@ def test_incremental_layout_cache_short_circuits_remap() -> None:
     assert so2._gr_request_row_configs == [("beam", 0, 4, [0, 1, 2, 3])]
     assert so2._gr_request_row_configs[0] is so1._gr_request_row_configs[0]
 
-    # A different token count (different layout key) must NOT hit the cache:
-    # the slow path reruns and builds a fresh (equal-valued) layout.  The row
-    # count still tracks beam_width (each beam contributes one token), so the
-    # logits list keeps 4 entries; only the per-frame token offsets differ.
+    # A token count inconsistent with the Beam width is rejected, even after
+    # this request has populated the layout cache.
     pos3 = SimpleNamespace(
         gpu=torch.zeros((5,), dtype=torch.long),
         cpu=torch.zeros((5,), dtype=torch.long),
     )
     r3, so3 = make_frame(2, pos3)
-    idx3 = common._beam_remap_inputs(r3, so3, [5])
-    assert idx3 == [0, 1, 2, 3]
-    assert so3._gr_request_row_configs[0] is not so2._gr_request_row_configs[0]
+    with pytest.raises(ValueError, match="one query token per beam"):
+        common._beam_remap_inputs(r3, so3, [5])
+
+    # Reusing a request id for a different prompt must rebuild the valid
+    # geometry instead of reusing stale positions or rejecting the new session.
+    pos4 = SimpleNamespace(gpu=torch.zeros(4), cpu=torch.zeros(4))
+    r4, so4 = make_frame(0, pos4)
+    so4.beam_data["beam"].update(prefix_len=11, cache_len=11)
+    assert common._beam_remap_inputs(r4, so4, [4]) == [0, 1, 2, 3]
+    assert pos4.gpu.tolist() == [11] * 4
+    assert so4._gr_request_row_configs[0] is not so2._gr_request_row_configs[0]
 
 
 def test_sampling_metadata_remap_is_cached_and_warmed_at_remap() -> None:
@@ -259,11 +243,12 @@ def test_sampling_metadata_remap_is_cached_and_warmed_at_remap() -> None:
                 "beam_width": 2,
                 "beam_decode_steps": 2,
                 "cache_len": 4,
+                "decode_step": 1,
             }
         }
     )
 
-    common._beam_remap_inputs(runner, scheduler_output, [4])
+    common._beam_remap_inputs(runner, scheduler_output, [2])
     proxy = runner.input_batch
 
     # Eager warm: the metadata was remapped during _beam_remap_inputs
@@ -828,12 +813,12 @@ def test_execute_wrapper_does_not_inline_non_none_output() -> None:
 
 def _reset_warmup_gc_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate the process-level freeze state per test."""
-    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_DONE", False)
-    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", False)
-    monkeypatch.setattr(common, "_WORKER_EXECUTE_DEPTH", 0)
-    monkeypatch.setattr(common, "_GC_FREEZE_IN_PROGRESS", False)
+    monkeypatch.setattr(_gc_runtime, "_GC_WARMUP_FREEZE_DONE", False)
+    monkeypatch.setattr(_gc_runtime, "_GC_WARMUP_FREEZE_COMPLETE", False)
+    monkeypatch.setattr(_gc_runtime, "_WORKER_EXECUTE_DEPTH", 0)
+    monkeypatch.setattr(_gc_runtime, "_GC_FREEZE_IN_PROGRESS", False)
     # Keep the quiescent fallback wait short in tests.
-    monkeypatch.setattr(common, "_QUIESCENT_WAIT_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(_gc_runtime, "_QUIESCENT_WAIT_TIMEOUT_S", 2.0)
 
 
 def _freeze_daemon_alive() -> bool:
@@ -865,18 +850,18 @@ def test_warmup_rpc_does_not_acknowledge_scheduled_pending_freeze(
         calls.append(raise_thresholds)
         return [700, 100_000, 100_000]
 
-    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+    monkeypatch.setattr(_gc_runtime, "_freeze_serving_gc", fake_freeze)
     # The automatic daemon claimed the one-shot; collection still pending.
-    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_DONE", True)
+    monkeypatch.setattr(_gc_runtime, "_GC_WARMUP_FREEZE_DONE", True)
 
-    result = common.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
+    result = _gc_runtime.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
 
     assert result["frozen"] is True
     assert "deduped" not in result
     # The RPC performed the freeze itself, so completion is guaranteed
     # before frozen=True was returned.
     assert calls == [True]
-    assert common._GC_WARMUP_FREEZE_COMPLETE is True
+    assert _gc_runtime._GC_WARMUP_FREEZE_COMPLETE is True
 
 
 def test_warmup_rpc_dedupes_only_completed_freeze(
@@ -889,10 +874,10 @@ def test_warmup_rpc_dedupes_only_completed_freeze(
         calls.append(raise_thresholds)
         return [700, 100_000, 100_000]
 
-    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
-    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", True)
+    monkeypatch.setattr(_gc_runtime, "_freeze_serving_gc", fake_freeze)
+    monkeypatch.setattr(_gc_runtime, "_GC_WARMUP_FREEZE_COMPLETE", True)
 
-    result = common.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
+    result = _gc_runtime.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
 
     assert result["frozen"] is True
     assert result["deduped"] is True
@@ -909,14 +894,14 @@ def test_warmup_rpc_failure_rolls_back_claim(
     def fake_freeze(*, raise_thresholds: bool) -> list[int]:
         raise RuntimeError("collect failed")
 
-    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+    monkeypatch.setattr(_gc_runtime, "_freeze_serving_gc", fake_freeze)
 
-    result = common.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
+    result = _gc_runtime.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
 
     assert result["frozen"] is False
     assert "error" in result
-    assert common._GC_WARMUP_FREEZE_DONE is False
-    assert common._GC_WARMUP_FREEZE_COMPLETE is False
+    assert _gc_runtime._GC_WARMUP_FREEZE_DONE is False
+    assert _gc_runtime._GC_WARMUP_FREEZE_COMPLETE is False
 
 
 def test_warmup_daemon_waits_for_quiescent_boundary(
@@ -935,18 +920,18 @@ def test_warmup_daemon_waits_for_quiescent_boundary(
         started.set()
         return [700, 100_000, 100_000]
 
-    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+    monkeypatch.setattr(_gc_runtime, "_freeze_serving_gc", fake_freeze)
 
-    common._enter_worker_execute()
+    _gc_runtime._enter_worker_execute()
     try:
-        assert common.schedule_warmup_gc_freeze() is True
-        assert common.schedule_warmup_gc_freeze() is False
+        assert _gc_runtime.schedule_warmup_gc_freeze() is True
+        assert _gc_runtime.schedule_warmup_gc_freeze() is False
         assert not started.wait(0.2), "freeze ran while execute_model was in flight"
     finally:
-        common._exit_worker_execute()
+        _gc_runtime._exit_worker_execute()
 
     assert started.wait(5.0), "freeze did not run at the quiescent boundary"
-    assert common._GC_WARMUP_FREEZE_COMPLETE is True
+    assert _gc_runtime._GC_WARMUP_FREEZE_COMPLETE is True
 
 
 def test_warmup_daemon_blocks_execute_reentry_until_freeze_finishes(
@@ -964,14 +949,14 @@ def test_warmup_daemon_blocks_execute_reentry_until_freeze_finishes(
         return [700, 100_000, 100_000]
 
     def enter_execute() -> None:
-        common._enter_worker_execute()
+        _gc_runtime._enter_worker_execute()
         try:
             execute_entered.set()
         finally:
-            common._exit_worker_execute()
+            _gc_runtime._exit_worker_execute()
 
-    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
-    assert common.schedule_warmup_gc_freeze() is True
+    monkeypatch.setattr(_gc_runtime, "_freeze_serving_gc", fake_freeze)
+    assert _gc_runtime.schedule_warmup_gc_freeze() is True
     assert freeze_started.wait(5.0)
 
     thread = threading.Thread(target=enter_execute)
@@ -983,7 +968,7 @@ def test_warmup_daemon_blocks_execute_reentry_until_freeze_finishes(
     assert not thread.is_alive()
     assert execute_entered.is_set()
     assert _wait_freeze_daemon_done()
-    assert common._GC_FREEZE_IN_PROGRESS is False
+    assert _gc_runtime._GC_FREEZE_IN_PROGRESS is False
 
 
 def test_warmup_daemon_skips_when_rpc_already_froze(
@@ -997,15 +982,15 @@ def test_warmup_daemon_skips_when_rpc_already_froze(
         calls.append(raise_thresholds)
         return [700, 100_000, 100_000]
 
-    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+    monkeypatch.setattr(_gc_runtime, "_freeze_serving_gc", fake_freeze)
     # Park the daemon behind the quiescence wait (a step is in flight), then
     # let the explicit RPC barrier complete a freeze while it waits.
-    common._enter_worker_execute()
+    _gc_runtime._enter_worker_execute()
     try:
-        assert common.schedule_warmup_gc_freeze() is True
-        monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", True)
+        assert _gc_runtime.schedule_warmup_gc_freeze() is True
+        monkeypatch.setattr(_gc_runtime, "_GC_WARMUP_FREEZE_COMPLETE", True)
     finally:
-        common._exit_worker_execute()
+        _gc_runtime._exit_worker_execute()
 
     assert _wait_freeze_daemon_done()
     assert calls == []
@@ -1015,17 +1000,17 @@ def test_execute_wrapper_tracks_inflight_depth_for_gc_freeze() -> None:
     depth_seen: dict[str, int] = {}
 
     def execute_model(self: Any, scheduler_output: Any) -> str:
-        depth_seen["during"] = common._WORKER_EXECUTE_DEPTH
+        depth_seen["during"] = _gc_runtime._WORKER_EXECUTE_DEPTH
         return "result"
 
     wrapped = common.make_patched_execute_model(execute_model)
     runner = _m2_runner()
     scheduler_output = SimpleNamespace(beam_data={})
 
-    assert common._WORKER_EXECUTE_DEPTH == 0
+    assert _gc_runtime._WORKER_EXECUTE_DEPTH == 0
     assert wrapped(runner, scheduler_output) == "result"
     assert depth_seen["during"] == 1
-    assert common._WORKER_EXECUTE_DEPTH == 0
+    assert _gc_runtime._WORKER_EXECUTE_DEPTH == 0
 
 
 def test_execute_wrapper_releases_depth_on_exception() -> None:
@@ -1033,7 +1018,7 @@ def test_execute_wrapper_releases_depth_on_exception() -> None:
         pass
 
     def execute_model(self: Any, scheduler_output: Any) -> None:
-        assert common._WORKER_EXECUTE_DEPTH == 1
+        assert _gc_runtime._WORKER_EXECUTE_DEPTH == 1
         raise ExpectedError
 
     wrapped = common.make_patched_execute_model(execute_model)
@@ -1042,7 +1027,7 @@ def test_execute_wrapper_releases_depth_on_exception() -> None:
 
     with pytest.raises(ExpectedError):
         wrapped(runner, scheduler_output)
-    assert common._WORKER_EXECUTE_DEPTH == 0
+    assert _gc_runtime._WORKER_EXECUTE_DEPTH == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1057,18 +1042,18 @@ def test_v2_plain_frame_native_execution_and_gc_cleanup(raises: bool) -> None:
 
     def native(self: Any, scheduled: Any) -> str:
         assert self is runner and scheduled is output
-        assert common._WORKER_EXECUTE_DEPTH == 1
+        assert _gc_runtime._WORKER_EXECUTE_DEPTH == 1
         if raises:
             raise RuntimeError("native failed")
         return "result"
 
-    wrapped = common.make_patched_execute_model_v2(native)
+    wrapped = _v2_integration.make_patched_execute_model_v2(native)
     if raises:
         with pytest.raises(RuntimeError, match="native failed"):
             wrapped(runner, output)
     else:
         assert wrapped(runner, output) == "result"
-    assert common._WORKER_EXECUTE_DEPTH == 0
+    assert _gc_runtime._WORKER_EXECUTE_DEPTH == 0
 
 
 def test_slim_v2_wrapper_fail_fast_on_legacy_beam_data(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1081,7 +1066,7 @@ def test_slim_v2_wrapper_fail_fast_on_legacy_beam_data(monkeypatch: pytest.Monke
     def execute_model(self: Any, output: Any) -> str:
         raise AssertionError("native execute_model must not run for a beam_data frame")
 
-    wrapped = common.make_patched_execute_model_v2(execute_model)
+    wrapped = _v2_integration.make_patched_execute_model_v2(execute_model)
     with pytest.raises(ValueError, match="legacy beam_data frames are not supported"):
         wrapped(runner, scheduler_output)
 
@@ -1090,8 +1075,65 @@ def test_slim_v2_wrapper_is_idempotent() -> None:
     def execute_model(self: Any, output: Any) -> str:
         return "result"
 
-    wrapped = common.make_patched_execute_model_v2(execute_model)
-    assert common.make_patched_execute_model_v2(wrapped) is wrapped
+    wrapped = _v2_integration.make_patched_execute_model_v2(execute_model)
+    assert _v2_integration.make_patched_execute_model_v2(wrapped) is wrapped
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("step", [None, -1, True])  # type: ignore[misc]
+def test_beam_input_rejects_missing_or_invalid_step(step: Any) -> None:
+    metadata = {"prefix_len": 4, "cache_len": 4, "beam_width": 2}
+    if step is not None:
+        metadata["decode_step"] = step
+    positions = torch.full((4,), -1)
+    logits: list[int] = []
+    with pytest.raises(ValueError, match="decode_step"):
+        common._process_beam_decode_request(metadata, 2, 0, positions, None, logits)
+    assert positions.tolist() == [-1] * 4
+    assert not logits
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_beam_input_rejects_full_suffix_rows() -> None:
+    metadata = {"prefix_len": 4, "cache_len": 4, "beam_width": 2, "decode_step": 1}
+    with pytest.raises(ValueError, match="one query token per beam"):
+        common._process_beam_decode_request(metadata, 4, 0, None, None, [])
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("raises", [False, True])  # type: ignore[misc]
+def test_v1_v2_wrappers_share_one_gc_execute_depth(
+    monkeypatch: pytest.MonkeyPatch, raises: bool
+) -> None:
+    _reset_warmup_gc_state(monkeypatch)
+    v1_runner, v2_runner = _m2_runner(), SimpleNamespace()
+    scheduled = SimpleNamespace(beam_data={})
+    error = RuntimeError("nested native failure")
+
+    def native_v1(runner: Any, output: Any) -> str:
+        assert runner is v1_runner and output is scheduled
+        assert _gc_runtime._WORKER_EXECUTE_DEPTH == 2
+        if raises:
+            raise error
+        return "native result"
+
+    v1 = common.make_patched_execute_model(native_v1)
+
+    def native_v2(runner: Any, output: Any) -> Any:
+        assert runner is v2_runner and output is scheduled
+        assert _gc_runtime._WORKER_EXECUTE_DEPTH == 1
+        return v1(v1_runner, output)
+
+    v2 = _v2_integration.make_patched_execute_model_v2(native_v2)
+    if raises:
+        with pytest.raises(RuntimeError) as caught:
+            v2(v2_runner, scheduled)
+        assert caught.value is error
+    else:
+        assert v2(v2_runner, scheduled) == "native result"
+    assert _gc_runtime._WORKER_EXECUTE_DEPTH == 0
+    assert not _gc_runtime._GC_FREEZE_IN_PROGRESS
+    assert not hasattr(v2_runner, "_current_beam_info")

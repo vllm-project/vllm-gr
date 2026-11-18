@@ -50,6 +50,7 @@ from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.engine.beam_search_v1 import (
+    GRDispatchSession,
     GRExecutionCapacity,
     GRRetireMetadata,
     GRRetireResult,
@@ -57,6 +58,7 @@ from vllm_gr.v1.engine.beam_search_v1 import (
     GRStageMetadata,
     GRWorkerResult,
     validate_dispatch,
+    validate_dispatch_session,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_RETIRE_OUTPUT_ATTR,
@@ -256,7 +258,9 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
 
 def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
     """Resolve decode graph replay, preserving unexpected-missing invariants."""
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     requested = not worker.model_config.enforce_eager and _get_gr_config(worker).beam_graph_enabled
     if not requested:
@@ -543,7 +547,12 @@ class GPUBeamStageRunner:
         self.hooks: CudaStageHooks = hooks
         self.previous: GRStageMetadata | None = None
         self.pending: tuple[BeamDispatchExecution, int] | None = None
-        self._validated_dispatch: tuple[Any, tuple[GRStageMetadata, ...]] | None = None
+        # Facts proven once per session by ``get_stage_runner``; every Decode
+        # admission of this session re-uses them instead of re-deriving them.
+        self._dispatch_session: GRDispatchSession | None = None
+        self._validated_dispatch: (
+            tuple[Any, tuple[GRStageMetadata, ...], GRDispatchSession] | None
+        ) = None
         self.control_lock = Lock()
         self.control_drained = Condition(self.control_lock)
         self.control_busy = [False] * CONTROL_CAPACITY
@@ -643,12 +652,13 @@ class GPUBeamStageRunner:
         validated = self._validated_dispatch
         self._validated_dispatch = None
         if validated is not None and validated[0] is scheduler_output:
-            stages = validated[1]
+            stages, self._dispatch_session = validated[1], validated[2]
         else:
             stages = validate_dispatch(
                 scheduler_output,
                 previous=self.previous,
                 bindings=self.bindings,
+                session=self._dispatch_session if self.previous is not None else None,
             )
         for m in stages:
             state, params = self.beam.state, m.beam_params
@@ -1054,8 +1064,7 @@ class GPUBeamStageRunner:
                 self.copy_stream.wait_event(self.produced_ready[slot])
                 self.host_control[slot].copy_(self.device_control[slot], non_blocking=True)
                 self.copy_done[slot].record(self.copy_stream)
-        self.worker.execute_model_state = None
-        self.worker.kv_connector_output = None
+        self.hooks.finish_native_output()
         self.pending = None
         return AsyncGPUBeamOutput(self, execution, slot, terminal_payload)
 
@@ -1193,7 +1202,7 @@ class AsyncGRRetireOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
             # serving session has fully drained and released its resources,
             # so the one-shot freeze covers lazily-created persistent state
             # without being consumed by the startup dummy session.
-            from vllm_gr.v1.worker.model_runner_common import (
+            from vllm_gr.v1.worker.gr_gc import (
                 schedule_warmup_gc_freeze,
             )
 
@@ -1240,9 +1249,10 @@ def get_stage_runner(
         if getattr(worker, "constraint_backend", None) is not existing.backend:
             raise ValueError("GR constraint backend binding changed before session release")
         return cast(GPUBeamStageRunner, existing)
-    stages = validate_dispatch(scheduler_output)
+    dispatch_session = validate_dispatch_session(scheduler_output)
+    stages = validate_dispatch(scheduler_output, session=dispatch_session)
     (m,) = stages
-    from vllm_gr.v1.worker.model_runner_common import (
+    from vllm_gr.v1.worker.gr_context import (
         _create_beam_context,
         _get_gr_config,
     )
@@ -1532,6 +1542,7 @@ def get_stage_runner(
         adapter.beam, adapter.bindings, adapter.backend = beam, binding_tuple, backend
         adapter.binding, adapter.batch_view = binding_tuple[0], view
         adapter.previous, adapter.pending = None, None
+        adapter._dispatch_session, adapter._validated_dispatch = None, None
         adapter.closed, adapter.cancelled = False, False
         adapter.terminal_release_requested = False
         adapter.terminal_release_claimed = False
@@ -1565,5 +1576,6 @@ def get_stage_runner(
         worker._gr_gpu_stage_runner_cache_key = cache_key
     elif hasattr(worker, "_gr_gpu_stage_runner_cache_key"):
         del worker._gr_gpu_stage_runner_cache_key
-    adapter._validated_dispatch = (scheduler_output, stages)
+    adapter._dispatch_session = dispatch_session
+    adapter._validated_dispatch = (scheduler_output, stages, dispatch_session)
     return cast(GPUBeamStageRunner, adapter)

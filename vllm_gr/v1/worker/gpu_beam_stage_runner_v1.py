@@ -65,6 +65,11 @@ class CudaStageHooksV1(CudaStageHooks):
             raise RuntimeError("native GR Prefill must return logits through execute_model_state")
         return worker.execute_model_state.logits
 
+    def finish_native_output(self) -> None:
+        """Drop native results after GR has submitted its output work."""
+        self.worker.execute_model_state = None
+        self.worker.kv_connector_output = None
+
     def prefill_stage_fence(self) -> None:
         """Wait for any native prefill reads of reused CPU input buffers.
 
@@ -112,7 +117,9 @@ class CudaStageHooksV1(CudaStageHooks):
         """V1 can capture a missing graph against a new stage's buffers."""
         assert owner.inputs is not None
         worker = self.worker
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         graph_enabled = (
             not worker.model_config.enforce_eager

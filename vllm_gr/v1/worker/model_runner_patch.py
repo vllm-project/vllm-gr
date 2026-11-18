@@ -14,16 +14,19 @@ from vllm.logger import init_logger
 
 from vllm_gr.config import ConstraintTableBackendEnum
 from vllm_gr.v1.worker.gpu_stage_hooks import CudaStageHooksType
-from vllm_gr.v1.worker.model_runner_common import (
+from vllm_gr.v1.worker.gr_context import (
+    get_beam_graph_runtime_stats,
+)
+from vllm_gr.v1.worker.gr_gc import (
+    freeze_gc_after_graph_capture,
+    freeze_gc_after_warmup,
+)
+from vllm_gr.v1.worker.model_runner_contracts import (
     _CONSTRAINT_LOAD_PATCH_MARKER,
     _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
     _WORKER_CAPTURE_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
-    freeze_gc_after_graph_capture,
-    freeze_gc_after_warmup,
-    get_beam_graph_runtime_stats,
     is_worker_runner_patched,
-    make_patched_execute_model,
 )
 
 logger = init_logger(__name__)
@@ -364,13 +367,22 @@ def apply_worker_patches() -> None:
         v2._apply_v2_runner_patches()
         return
 
+    from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
+
     platform_module = _get_active_platform_module()
     # Bind both execution and startup to the installed runner, not a dispatch-time flag.
     cuda_hooks_type: CudaStageHooksType | None = None
+    workspace_load_patcher = getattr(
+        platform_module, "make_load_model_with_beam_postprocess_workspace", None
+    )
     if _active_platform_module_name() == _GPU_PATCH_MODULE:
         from vllm_gr.v1.worker.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+        from vllm_gr.v1.worker.gpu_postprocess_workspace import (
+            make_load_model_with_beam_postprocess_workspace,
+        )
 
         cuda_hooks_type = CudaStageHooksV1
+        workspace_load_patcher = make_load_model_with_beam_postprocess_workspace
     constraint_max_batch = 1
     if _active_platform_module_name() == _NPU_PATCH_MODULE:
         from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
@@ -403,11 +415,6 @@ def apply_worker_patches() -> None:
         if reload_patcher is not None and callable(reload_weights):
             runner_class.reload_weights = reload_patcher(reload_weights)
 
-        workspace_load_patcher = getattr(
-            platform_module,
-            "make_load_model_with_beam_postprocess_workspace",
-            None,
-        )
         if workspace_load_patcher is not None and callable(
             getattr(runner_class, "load_model", None)
         ):
@@ -476,8 +483,10 @@ def apply_worker_patches() -> None:
                 def patched_capture_model(self: Any, *args: Any, **kwargs: Any) -> Any:
                     res = _orig(self, *args, **kwargs)
                     from vllm_gr.config import BeamExecutionMode
+                    from vllm_gr.v1.worker.gr_context import (
+                        _get_gr_config,
+                    )
                     from vllm_gr.v1.worker.gr_startup import capture_async_forward
-                    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
                     if _get_gr_config(self).beam_execution_mode is BeamExecutionMode.V1:
                         capture_async_forward(self, hooks_type=hooks_type)

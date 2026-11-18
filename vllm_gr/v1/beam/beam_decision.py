@@ -95,7 +95,9 @@ def worker_decision_enabled(runner: Any) -> bool:
     remains frontend-side and therefore keeps the frontend NumPy decision path.
     """
     from vllm_gr.config import ConstraintBackend
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.gr_context import (
+        _get_gr_config,
+    )
 
     gr_cfg = _get_gr_config(runner)
     if not bool(gr_cfg.beam_worker_decision):

@@ -1,7 +1,7 @@
 # OneRec offline V1 cache-miss benchmark
 
-Latest review fixes, precision diagnosis and same-code eager/Graph A/B:
-[VOCAB_SLICE_REVIEW.md](VOCAB_SLICE_REVIEW.md). Results below are historical.
+For historical projection and numerical diagnostics, see the
+[vocabulary slicing validation](VOCAB_SLICE_REVIEW.md).
 
 The existing entry point supports V1 with `--beam-search-v1`:
 
@@ -53,22 +53,22 @@ worktrees, sharing model files, dataset and constraints. Run A-B-B-A sequentiall
 with each pass independently initialized and warmed up. Do not install/switch
 packages between passes or run concurrent GPU workloads.
 
-On the test server the shared benchmark package is exposed under
-`/tmp/onerec-main-v1-ab/harness`; `PYTHONPATH=harness:implementation_repo`
-selects the same CLI for both implementations. Run from outside either checkout.
-The exact four-pass command is saved in `/tmp/onerec-main-v1-ab/run.sh`.
-
-The previous pre-tokenized benchmark and report are retained under
-`/tmp/onerec-vocab-slice-ab/` as historical artifacts; their numbers use a
-different timing boundary and workload and should not be compared directly.
+Run from outside both implementation checkouts. Put a common benchmark-only
+harness first on `PYTHONPATH`, followed by the implementation checkout under
+test. The harness must not contain `vllm_gr/`; a full repository checkout here
+would shadow the implementation being compared. Verify `vllm_gr.__file__`
+and the implementation revision before each pass.
 
 ## Measured A/B result (2026-09-18)
 
-One NVIDIA L20 (48 GB), BF16, TP=1; OpenOneRec/OneRec-1.7B revision
-`cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b`.
-Baseline A: `59299263902e27bf184bf75b2c3847c49b053778`.
-Fix B: `7b0f04c21aa06b3f0e0a55a1c59dc8cfd4f17962`.
-The same benchmark adapter is used for both implementations.
+> Measured on NVIDIA L20 (48 GB) / 2026-09-18 / runtime versions not recorded.
+> Not a performance guarantee.
+
+Both groups used the same [OneRec-1.7B model snapshot](https://huggingface.co/OpenOneRec/OneRec-1.7B/tree/cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b)
+in BF16 with tensor parallelism set to 1 and the same benchmark adapter.
+Group A used [full-vocabulary projection](https://github.com/JiusiServe/vllm-gr/commit/59299263902e27bf184bf75b2c3847c49b053778).
+Group B used [vocabulary slicing for CUDA Constraint Tables](https://github.com/JiusiServe/vllm-gr/commit/7b0f04c21aa06b3f0e0a55a1c59dc8cfd4f17962),
+which projects only the token range needed by the table.
 
 **Synthetic data**, not the gated RecIF video dataset (access unavailable).
 100 messages/metadata Parquet rows are loaded via the existing OneRec loader,
@@ -104,13 +104,7 @@ However, in both A/B pairs:
 - No request has the exact same full candidate set.
 - Maximum shared-candidate score difference is **0.2529010772705078**.
 
-This was reproducible across restarts. The later review validation localizes
-the discrepancy to BF16 projection reduction; see VOCAB_SLICE_REVIEW.md. Performance
-numbers must not be presented as a correctness pass or evidence that the fix
-is ready to merge.
-
-Raw results/logs: `/tmp/onerec-main-v1-ab/{A1,B1,B2,A2}.{json,log}`.
-Summary/checker: `/tmp/onerec-main-v1-ab/{summary.json,compare.py}`.
-Synthetic data: `/tmp/onerec-main-v1-ab/synthetic-data/video/video_test.parquet`.
-Every log contains 110 successful prefix-cache resets.
-Validation: 36 existing OneRec patch tests pass; Ruff lint/format checks pass.
+This was reproducible across restarts. The
+[vocabulary slicing diagnostics](VOCAB_SLICE_REVIEW.md) localized the
+discrepancy to BF16 projection reduction. The [original PR evidence](https://github.com/JiusiServe/vllm-gr/pull/405)
+records the historical comparison.

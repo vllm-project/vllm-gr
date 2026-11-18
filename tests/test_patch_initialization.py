@@ -45,7 +45,12 @@ def test_runtime_patch_order_preserves_ascend_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
+    from vllm_gr import npu_spawn_patch
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.npu import NPU_BACKEND
+    from vllm_gr.v1 import ascend_compat
 
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
     call_order: list[str] = []
 
     def apply_npu_spawn() -> int:
@@ -74,17 +79,17 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_pangu,
     )
     monkeypatch.setattr(
-        runtime_patch.npu_spawn_patch,
+        npu_spawn_patch,
         "apply_npu_spawn_patch",
         apply_npu_spawn,
     )
     monkeypatch.setattr(
-        runtime_patch.ascend_compat,
-        "apply_ascend_attention_backend_patch",
+        runtime_patch.selector_patch,
+        "apply_custom_attention_backend_patch",
         apply_attention,
     )
     monkeypatch.setattr(
-        runtime_patch.ascend_compat,
+        ascend_compat,
         "patch_npu_worker_init_device",
         patch_npu_worker,
     )
@@ -95,7 +100,7 @@ def test_runtime_patch_order_preserves_ascend_initialization(
     )
 
     assert runtime_patch._apply_patches(force=True) == 5
-    assert call_order == ["pangu", "npu_spawn", "attention", "npu_worker", "beam"]
+    assert call_order == ["pangu", "attention", "npu_spawn", "npu_worker", "beam"]
 
 
 def test_optional_patch_count_tracks_actual_installation(
@@ -688,6 +693,14 @@ def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
     assert "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ
 
     # Re-applying over the wrapped target must not stack another layer.
+    assert npu_spawn_patch.apply_npu_spawn_patch() is False
+    assert system_utils._maybe_force_spawn is wrapped
+
+    # A later native import can restore the directly imported executor alias.
+    monkeypatch.setattr(multiproc_executor, "_maybe_force_spawn", upstream)
+    assert npu_spawn_patch.apply_npu_spawn_patch() is True
+    assert system_utils._maybe_force_spawn is wrapped
+    assert multiproc_executor._maybe_force_spawn is wrapped
     assert npu_spawn_patch.apply_npu_spawn_patch() is False
 
 

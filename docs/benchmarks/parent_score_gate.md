@@ -13,23 +13,24 @@ offline and online accuracy separately against the same minimum thresholds:
 
 | Target branch / runner | pass@1 minimum | pass@32 minimum | recall@32 minimum |
 | --- | ---: | ---: | ---: |
-| `main` or `decode_graph` / any GPU or NPU | 0.05 | 0.21 | 0.030 |
-| Other branches / any GPU or NPU | 0.09 | 0.29 | 0.04 |
+| `main` or `decode_graph` / GPU | 0.05 | 0.21 | 0.030 |
+| Other branches / GPU | 0.09 | 0.29 | 0.04 |
+| Any target branch / NPU with the NPU accuracy profile | 0.05 | 0.21 | 0.030 |
 
-Every metric must meet its minimum; equality passes. An accuracy value below
-its minimum fails with exit code `86`. For example, the reported offline
-`pass@1 = 0.06` fails the old `0.09` floor but meets the shared `0.05` floor.
-Passing that one metric does not establish that the whole CI run passes.
+Every metric must meet its minimum. Equality passes. An accuracy value below
+its minimum fails with exit code `86`.
 
 The gate runs the video task with 100 prompts, beam width 128 and concurrency 1.
-Performance thresholds and failure modes, online execution checks, and the
-separate Pangu policy are unchanged by this adjustment.
 
 ## Baseline evidence
 
-The before commit is `bac1451557f108cc8bdf81b5b37160fc43690b3f`; the runtime fix is
-`0f5018516f8205cc1f5a5e9cd6f74bb1216565f1`. The results below use OneRec-1.7B,
-the video task, 100 samples, beam width 128 and temperature 0.6.
+The L20 comparison uses the [baseline before the fix](https://github.com/JiusiServe/vllm-gr/commit/bac1451557f108cc8bdf81b5b37160fc43690b3f)
+and the [fix that preserves cumulative parent scores across Decode](https://github.com/JiusiServe/vllm-gr/commit/0f5018516f8205cc1f5a5e9cd6f74bb1216565f1).
+The workload uses OneRec-1.7B, 100 video samples, Beam width 128 and
+temperature 0.6.
+
+> Measured on NVIDIA L20 and A100 / dates not recorded / runtime versions
+> not recorded. These are historical accuracy measurements for CI calibration.
 
 | Device / run | pass@1 | pass@32 | recall@32 |
 | --- | ---: | ---: | ---: |
@@ -109,7 +110,7 @@ test changes can land together through ordinary PR review. See the
 The independent Jenkins pipeline may use a different policy source; confirm
 its effective source and thresholds in its own logs.
 
-After updating the runtime PR, check the **Resolve benchmark policy** job's
+For a CI run, check the **Resolve benchmark policy** job's
 summary for the source ref, the device's policy selector above, and the effective
 floors. If the selector is missing or the old floors remain, check that the run
 includes the workflow selector and that its tested commit contains the policy

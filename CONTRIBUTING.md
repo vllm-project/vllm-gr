@@ -57,7 +57,16 @@ Adding `ready`, pushing while it remains, or marking a labeled draft ready for
 review starts validation. Removing `ready` or converting the PR to draft
 cancels its previous PR runs and skips new validation. Remove and re-add
 `ready` to request a fresh run. Unrelated labels do not start full validation;
-manual dispatches have their own job conditions.
+manual dispatches have their own job conditions. Submitting, editing, or
+dismissing a review does not start validation. To retry a cancelled or failed
+run for the same commit, use **Re-run all jobs** on that Actions run.
+
+A rerun keeps the original event's commit and ref; it does not test later PR
+commits. For updated code, push the commit while `ready` remains to start new
+validation. Check the latest attempt of the full validation run for that
+revision and its `Benchmark blocking gate`. Historical cancelled or failed
+runs remain visible. Jenkins comments report a separate pipeline and do not
+replace GitHub Actions checks.
 
 For PRs that only change Markdown files under `docs/` or the root files
 `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, and `CLAUDE.md`, the workflow runs

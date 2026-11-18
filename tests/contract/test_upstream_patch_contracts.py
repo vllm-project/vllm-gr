@@ -22,6 +22,8 @@ def test_patch_inventories_are_aligned_and_complete() -> None:
     patch_ids = [patch["id"] for patch in patches]
     required_fields = {
         "owner",
+        "scope",
+        "backend_id",
         "installer",
         "activation",
         "validator_or_test",
@@ -36,6 +38,48 @@ def test_patch_inventories_are_aligned_and_complete() -> None:
     runtime_inventory = Path("docs/runtime_patch_inventory.md").read_text(encoding="utf-8")
     runtime_ids = re.findall(r"^### (GR-PATCH-\d{3})", runtime_inventory, re.MULTILINE)
     assert runtime_ids == patch_ids
+    for patch in patches:
+        section = runtime_inventory.split(f"### {patch['id']}", 1)[1].split("\n### ", 1)[0]
+        backend_id = patch["backend_id"] or "null"
+        assert f"Scope: `{patch['scope']}`; backend ID: `{backend_id}`" in section
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_common_and_selected_provider_patch_ownership_is_unique(
+    monkeypatch: pytest.MonkeyPatch, device_type: str
+) -> None:
+    from types import SimpleNamespace
+
+    import vllm.platforms
+
+    from vllm_gr.patch import CORE_PATCH_IDS
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
+
+    inventory = yaml.safe_load(Path("docs/patch_inventory.yaml").read_text(encoding="utf-8"))
+    patches = inventory["patches"]
+    assert all(
+        (p["scope"] == "core" and p["backend_id"] is None)
+        or (p["scope"] == "backend" and p["backend_id"] in {"cuda", "npu"})
+        for p in patches
+    )
+    monkeypatch.setattr(
+        vllm.platforms, "current_platform", SimpleNamespace(device_type=device_type)
+    )
+    monkeypatch.setattr(loader, "entry_points", lambda **kwargs: ())
+    _reset_backend_registry_for_tests()
+    try:
+        provider = loader.activate_current_backend()
+        core_ids = {p["id"] for p in patches if p["scope"] == "core"}
+        backend_ids = {p["id"] for p in patches if p["backend_id"] == device_type}
+        assert set(CORE_PATCH_IDS) == core_ids
+        assert set(provider.patch_ids) == backend_ids
+        claimed = (*CORE_PATCH_IDS, *provider.patch_ids)
+        assert len(claimed) == len(set(claimed))
+        assert set(claimed) == core_ids | backend_ids
+    finally:
+        _reset_backend_registry_for_tests()
 
 
 def test_engine_core_method_contracts() -> None:

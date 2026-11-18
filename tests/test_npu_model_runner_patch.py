@@ -342,7 +342,9 @@ def test_npu_sample_patch_is_signature_agnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The NPU legacy branch tolerates a different positional signature."""
-    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+    from vllm_gr.v1.worker.model_runner_contracts import (
+        _WORKER_SAMPLE_PATCH_MARKER,
+    )
 
     events: list[str] = []
     sample_output = object()
@@ -1156,9 +1158,7 @@ def test_npu_determine_width_mismatch_no_full() -> None:
 
 
 def _stub_gr_config(monkeypatch: pytest.MonkeyPatch, gr_cfg: Any) -> None:
-    import vllm_gr.v1.worker.model_runner_common as common
-
-    monkeypatch.setattr(common, "_get_gr_config", lambda r: gr_cfg)
+    monkeypatch.setattr(_gr_context, "_get_gr_config", lambda r: gr_cfg)
 
 
 def test_npu_capture_disabled_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1905,7 +1905,6 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler(
 def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
     from unittest.mock import Mock
 
-    import vllm_gr.v1.worker.model_runner_common as common
     from vllm_gr.v1.worker import gpu_beam_stage_runner, npu_beam_stage_runner
 
     output = object()
@@ -1919,11 +1918,14 @@ def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, d
     scheduled = _eager_stage_output(kind="prefill")
     if device == "cpu":
         with pytest.raises(ValueError, match="no execution adapter"):
-            common._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
+            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
         cuda.assert_not_called()
         npu.assert_not_called()
     else:
-        assert common._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks) is output
+        assert (
+            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
+            is output
+        )
         if device == "cuda":
             assert cuda.call_args.kwargs["hooks_type"] is hooks
             npu.assert_not_called()
@@ -1934,7 +1936,6 @@ def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, d
 
 def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-    from vllm_gr.v1.worker import model_runner_common as common
 
     def context(batch_size: int) -> BeamAttentionContext:
         return BeamAttentionContext(batch_size, 4, 1, 3, 2, 1, torch.device("cpu"), torch.float16)
@@ -1965,8 +1966,8 @@ def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch
         created.append(max_batch)
         return context(max_batch)
 
-    monkeypatch.setattr(common, "_create_beam_context", create)
-    monkeypatch.setattr(common, "_get_gr_config", lambda worker: object())
+    monkeypatch.setattr(_gr_context, "_create_beam_context", create)
+    monkeypatch.setattr(_gr_context, "_get_gr_config", lambda worker: object())
     for batch_size in (2, 1, 2):
         scheduled = _eager_stage_output(kind="decode", batch_size=batch_size, beam_width=4)
         next(iter(scheduled.gr_stage_metadata.values())).beam_params.max_tokens = 3
@@ -2087,7 +2088,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
         seen.append("six_token_forward")
         return SimpleNamespace(logits=input_ids[:, None].float())
 
-    result = common._dispatch_stage_frame(worker, logical, native)
+    result = _gr_dispatch._dispatch_stage_frame(worker, logical, native)
     assert result.logits.shape == (6, 1)
     assert logical.total_num_scheduled_tokens == 2
     assert tuple(logical.num_scheduled_tokens.values()) == (1, 1)
@@ -2103,7 +2104,6 @@ def test_npu_failed_execute_reaches_sample_without_native_fallback(
 ) -> None:
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import model_runner_common as common
     from vllm_gr.v1.worker import npu_beam_stage_runner
 
     failure = ValueError("injected execute failure")
@@ -2119,7 +2119,7 @@ def test_npu_failed_execute_reaches_sample_without_native_fallback(
     if failure_point == "plan":
         monkeypatch.setattr(stage, "_validate_sequence", fail)
     with pytest.raises(ValueError) as execute_error:
-        common._dispatch_stage_frame(worker, scheduled, fail)
+        _gr_dispatch._dispatch_stage_frame(worker, scheduled, fail)
     assert execute_error.value is failure
     native_sample = Mock(side_effect=AssertionError("native sampler must not run"))
 
@@ -2527,6 +2527,84 @@ def _terminal_result_runner(
         ),
     )
     return stage
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("batch,width,steps", [(1, 64, 1), (1, 128, 3), (4, 64, 2), (4, 128, 3)])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "include_score,include_parents", [(True, True), (False, False), (True, False), (False, True)]
+)
+@pytest.mark.parametrize("penalty", [0.0, 1.0, -1.0])  # type: ignore[misc]
+def test_npu_cpu_columns_materialize_identically_to_stop_aware_rows(
+    batch: int, width: int, steps: int, include_score: bool, include_parents: bool, penalty: float
+) -> None:
+    from vllm_gr.v1.beam.batch_contracts import BeamSequenceColumns
+    from vllm_gr.v1.beam.output_columns import (
+        materialize_beam_result,
+        validate_complete_sequences,
+    )
+
+    stage = _terminal_result_runner(
+        batch,
+        returned=width,
+        penalty=penalty,
+        include_score=include_score,
+        include_parents=include_parents,
+    )
+    stage.session_request.beam_params.max_tokens = steps
+    tokens = torch.arange(batch * width * steps, dtype=torch.int32).view(batch, width, steps)
+    parents = torch.zeros_like(tokens)
+    # Ties, both signed zeros, and nonfinite candidates exercise the original
+    # Python ranking. Scores are transported as their original float32 bits.
+    scores = (torch.arange(batch * width, dtype=torch.float32).view(batch, width) % 7) * -0.125
+    scores[:, :5] = torch.tensor([float("nan"), float("inf"), -float("inf"), -0.0, 0.0])
+    columns = stage._build_terminal_result(tokens, scores, parents)
+    assert columns.output is not None
+    for item in columns.output.items:
+        assert isinstance(item.sequences, BeamSequenceColumns)
+        validate_complete_sequences(item.sequences)
+    # A stop ID absent from the input selects the unchanged row path without
+    # changing any sequence's length, score normalization, or return limit.
+    stage.session_request.beam_params.stop_token_ids = (2**31 - 1,)
+    rows = stage._build_terminal_result(tokens, scores, parents)
+    materialized = materialize_beam_result(columns)
+    assert materialized == rows
+    if include_score:
+        for left, right in zip(materialized.output.items, rows.output.items, strict=True):
+            assert [struct.pack("<f", x.cumulative_logprob) for x in left.sequences] == [
+                struct.pack("<f", x.cumulative_logprob) for x in right.sequences
+            ]
+    # Serialized columns own their bytes even after worker tensors are reused.
+    tokens.fill_(99)
+    parents.fill_(99)
+    scores.fill_(99)
+    assert materialize_beam_result(columns) == rows
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "width,returned,steps,budget,stop_ids",
+    [(32, 32, 3, 3, ()), (128, 2, 3, 3, ()), (64, 64, 2, 3, ()), (64, 64, 3, 3, (99,))],
+)
+def test_npu_cpu_columns_keep_unsupported_results_on_rows(
+    width: int, returned: int, steps: int, budget: int, stop_ids: tuple[int, ...]
+) -> None:
+    stage = _terminal_result_runner(1, returned=returned, stop_ids=stop_ids)
+    stage.session_request.beam_params.max_tokens = budget
+    tokens = torch.full((1, width, steps), 99, dtype=torch.int32)
+    result = stage._build_terminal_result(tokens, torch.zeros(1, width), torch.zeros_like(tokens))
+    assert result.output is not None
+    assert isinstance(result.output.items[0].sequences, tuple)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_npu_cpu_columns_all_invalid_preserves_lazy_normalization_failure() -> None:
+    stage = _terminal_result_runner(4, returned=64, penalty=1e6)
+    stage.session_request.beam_params.max_tokens = 3
+    tokens = torch.zeros(4, 64, 3, dtype=torch.int32)
+    result = stage._build_terminal_result(tokens, torch.full((4, 64), -float("inf")), tokens)
+    assert result.output is None
+    assert (result.failure.code, result.failure.item_index) == ("no_valid_beams", 0)
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]

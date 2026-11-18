@@ -190,12 +190,12 @@
               {
                 "in": [
                   [
-                    8,
+                    1,
                     8,
                     8
                   ],
                   [
-                    8,
+                    1,
                     32,
                     8
                   ],
@@ -272,7 +272,7 @@
               {
                 "in": [
                   [
-                    8,
+                    1,
                     32,
                     8
                   ],
@@ -282,7 +282,7 @@
                     1
                   ],
                   [
-                    4,
+                    1,
                     32,
                     7
                   ]
@@ -333,42 +333,6 @@
                 "ref": "params.case.dtype"
               }
             ]
-          }
-        }
-      ]
-    },
-    "tests/kernels/attention/test_merge_tnd_interleaved_pool.py::test_extract_suffix_kv_contiguous_unchanged": {
-      "rules": [
-        {
-          "level": "l1",
-          "when": {
-            "eq": "cpu",
-            "ref": "params.device"
-          }
-        },
-        {
-          "level": "l2",
-          "when": {
-            "eq": "npu",
-            "ref": "params.device"
-          }
-        }
-      ]
-    },
-    "tests/kernels/attention/test_merge_tnd_interleaved_pool.py::test_extract_suffix_kv_on_interleaved_layout": {
-      "rules": [
-        {
-          "level": "l1",
-          "when": {
-            "eq": "cpu",
-            "ref": "params.device"
-          }
-        },
-        {
-          "level": "l2",
-          "when": {
-            "eq": "npu",
-            "ref": "params.device"
           }
         }
       ]
@@ -795,9 +759,6 @@
     "tests/kernels/test_sid_stage_topk_npu.py::test_npu_full_and_compact_sid_stages_match_independent_normalization": "l2",
     "tests/kernels/test_sid_stage_topk_npu.py::test_npu_sid_selection_consumes_updated_logits_without_reusing_padding": "l2",
     "tests/kernels/test_sid_stage_topk_npu.py::test_npu_tiny_temperature_preserves_sid_ties_and_excludes_projection_padding": "l2",
-    "tests/kernels/test_unconstrained_topk_cuda.py::test_unconstrained_topk_accepts_padded_rows_and_empty_tiles": "l2",
-    "tests/kernels/test_unconstrained_topk_cuda.py::test_unconstrained_topk_counts_only_finite_candidates": "l2",
-    "tests/kernels/test_unconstrained_topk_cuda.py::test_unconstrained_topk_matches_full_vocab_reference": "l2",
     "tests/kernels/test_unconstrained_topk_npu.py::test_npu_extreme_temperatures_preserve_finite_probability_mass": "l2",
     "tests/kernels/test_unconstrained_topk_npu.py::test_npu_selection_consumes_new_logits_at_the_same_storage_address": "l2",
     "tests/kernels/test_unconstrained_topk_npu.py::test_npu_topk_matches_independent_host_enumeration": "l2",
@@ -1190,7 +1151,6 @@
     "tests/test_beam_resource_validation.py::test_invalid_live_changes_match_full_validator": "l1",
     "tests/test_beam_resource_validation.py::test_storage_offset_is_included_by_live_address": "l1",
     "tests/test_beam_resource_validation.py::test_unavailable_guard_api_uses_full_validation": "l1",
-    "tests/test_beam_runtime_primitives.py::test_compute_beam_bounds_behavior": "l1",
     "tests/test_beam_search_dispatch.py::test_completion_fallback_binds_ids_before_iteration": "l1",
     "tests/test_beam_search_dispatch.py::test_completion_schema_accepts_trie_id_list": "l1",
     "tests/test_beam_search_dispatch.py::test_dispatch_preserves_native_session_hint_for_both_engines": "l1",
@@ -1843,10 +1803,6 @@
     "tests/test_gpu_model_runner_patch.py::test_patched_determine_pure_beam_batch_grants_full": "l1",
     "tests/test_gpu_model_runner_patch.py::test_patched_determine_session_missing_downgrades_full": "l1",
     "tests/test_gpu_model_runner_patch.py::test_patched_determine_width_mismatch_no_full": "l1",
-    "tests/test_gpu_model_runner_patch.py::test_postprocess_workspace_initializer_is_noop_off_cuda": "l1",
-    "tests/test_gpu_model_runner_patch.py::test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storage": "l1",
-    "tests/test_gpu_model_runner_patch.py::test_postprocess_workspace_load_wrapper_accounts_device_memory": "l1",
-    "tests/test_gpu_model_runner_patch.py::test_postprocess_workspace_load_wrapper_initializes_after_model_load": "l1",
     "tests/test_gpu_model_runner_patch.py::test_worker_graph_stats_hook_is_named_and_idempotent": "l1",
     "tests/test_gpu_model_runner_v2_patch.py::test_apply_v2_runner_patches_stamps_markers": "l1",
     "tests/test_gpu_model_runner_v2_patch.py::test_capture_order_and_failure_propagation": "l1",
@@ -2110,7 +2066,6 @@
     "tests/test_model_runner_common.py::test_materialize_logits_indices_contiguous_device_range": "l1",
     "tests/test_model_runner_common.py::test_materialize_logits_indices_reuses_runner_buffer": "l1",
     "tests/test_model_runner_common.py::test_mixed_batch_remap_installs_functional_proxy": "l1",
-    "tests/test_model_runner_common.py::test_position_helpers_support_buffer_forms_and_partial_beam": "l1",
     "tests/test_model_runner_common.py::test_sampling_metadata_batched_gather_matches_per_attr_index": "l1",
     "tests/test_model_runner_common.py::test_sampling_metadata_batched_gather_mixed_presence": "l1",
     "tests/test_model_runner_common.py::test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment": "l1",

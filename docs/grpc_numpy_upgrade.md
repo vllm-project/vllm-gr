@@ -1,17 +1,14 @@
 # GR gRPC and NumPy token inputs
 
-## Background
+## Protocol and input handling
 
-The HTTP/JSON path constructs Python token lists and text responses. This
-change adds token-based GR gRPC serving and keeps prompts as NumPy arrays
-through Engine Core and Worker staging. The code baseline is `decode_graph`.
+GR gRPC accepts token prompts and keeps them as NumPy arrays through EngineCore
+and Worker staging.
 
-## Changes
-
-- Extend SMG protobuf 0.4.6 with beam options, `GenerateBatch` and optional
+- The schema extends SMG protobuf 0.4.6 with beam options, `GenerateBatch` and optional
   `input_ids_i64_le`, preserving original field numbers and method names.
   Schema headers identify the source and additions.
-- Accept either repeated uint32 tokens via `np.asarray(..., dtype=np.int64)`
+- The service accepts either repeated uint32 tokens via `np.asarray(..., dtype=np.int64)`
   or raw little-endian int64 bytes via `np.frombuffer`. Each binary buffer holds
   one prompt without a header or shape prefix; token count is byte length / 8.
   Conflicting fields, empty/unaligned data and negative tokens fail. After
@@ -31,7 +28,7 @@ through Engine Core and Worker staging. The code baseline is `decode_graph`.
   A single-Trie or unconstrained deployment accepts only ID 0, matching
   Python/HTTP. See [Multi-Trie constraint tables](multi_root_constraint_table.md)
   for backend scoring semantics and execution limits.
-- Patch bindings and the servicer during upstream gRPC startup. Upstream owns
+- GR installs the bindings and servicer during upstream gRPC startup. Upstream owns
   engine/listener initialization, standard health, reflection, keepalive,
   statistics and shutdown. GR supplies extended-schema reflection and drains
   session cleanup before engine shutdown.
@@ -93,20 +90,22 @@ after installing `grpcio-tools==1.84.0`.
 Focused tests cover pinned upstream wire compatibility, both token encodings,
 input/beam validation, batch/single output fields, cancellation/error cleanup,
 standard health/reflection/stats, array passthrough, codec transport, prefix
-hash identity, token growth and Worker staging. The affected test selection
-passes 493 cases; full repository CI and V2 graph/NPU model validation were
-not run. GPU verification includes the example and the workload below.
+hash identity, token growth and Worker staging.
 
-## Current code versus decode_graph
+## Historical HTTP and gRPC comparison
 
-Fresh measurements use a clean `decode_graph@2b84265` checkout for HTTP and the
-current working tree for both gRPC inputs. Single H20, FP16 V1 eager, identical
-random Qwen3 MoE weights (4.149B total / 0.311B active), B4 x 4096 prompt tokens,
-beam256, one Prefill plus three Decode forwards (four output tokens). Prefix
-cache, chunked prefill and constraints are disabled. Each path has 10 warmups
-and 200 measured requests, alternating GPU probes; all 600 outputs match.
+> Measured on NVIDIA H20 / date not recorded / ModelRunner V1 eager, FP16
+> (runtime versions not recorded). Not a performance guarantee.
 
-| Per batch (ms) | Baseline HTTP/JSON/list | Current gRPC binary | Current gRPC repeated |
+The [original gRPC validation](https://github.com/JiusiServe/vllm-gr/pull/542)
+used a [decode_graph snapshot](https://github.com/JiusiServe/vllm-gr/commit/2b84265)
+for HTTP and the gRPC implementation under review for both gRPC inputs. The paths shared random Qwen3 MoE weights (4.149B total / 0.311B
+active), batch size 4, 4096 input tokens per prompt and Beam width 256. Each
+request ran one Prefill and three Decode stages. Prefix Cache, Chunked Prefill
+and constraints were disabled. Each path used 10 warmups and 200 measured
+requests, alternating GPU probes. All 600 outputs matched.
+
+| Per batch (ms) | Baseline HTTP/JSON/list | gRPC binary | gRPC repeated |
 | --- | ---: | ---: | ---: |
 | Python frontend, input + output | 16.755 | 1.897 | 2.117 |
 | Model forward, excluding logits | 186.342 | 187.474 | 187.372 |
@@ -128,10 +127,6 @@ client/server difference includes transport/runtime scheduling, not just wire
 protocol work. HTTP returns text while gRPC returns token arrays, so frontend
 savings include decoding and response formatting. All samples are retained;
 isolated gRPC wall-time spikes affect means, so median/P95 are also reported.
-
-Final measurement code, source hashes, requests, logs and raw samples are
-archived outside the MR at
-`/workspace/ws/data/vllm-gr-mr-evidence-20261029/final-vs-decode-graph/`.
 
 ## Binary Beam results
 

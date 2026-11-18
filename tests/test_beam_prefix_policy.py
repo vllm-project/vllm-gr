@@ -121,7 +121,7 @@ def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
         return Builder.build_async(
             layout=layout,
             views=views,
-            session=SimpleNamespace(context=context),
+            session=SimpleNamespace(is_active=True, context=context),
             mask=torch.ones(2, dtype=torch.bool),
             slots=torch.full((2,), -1),
             block_size=16,

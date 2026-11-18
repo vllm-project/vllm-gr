@@ -78,8 +78,24 @@ class CudaStageHooks(ABC):
 
         Consume native Prefill output as required by this runner, including
         counters normally advanced by its sampler. V2 clears its pending native
-        state here; V1 retains its existing core-side cleanup. Every chunk must
-        advance by its actual query length, including chunks without Beam output.
+        state here; V1 retains it until finish_native_output. Counter updates
+        use actual query lengths, including after a Prefix Cache hit. GR
+        admission requires complete, output-producing Prefill; this operation
+        does not enable Chunked Prefill.
+        """
+
+    @abstractmethod
+    def finish_native_output(self) -> None:
+        """Drop native result references after GR output work has been submitted.
+
+        Called before clearing the pending dispatch, including cancelled
+        dispatches. Earlier execute, sampling or output-submission failures
+        must not reach this operation. A hook failure propagates without
+        clearing pending or returning a successful receipt.
+
+        This neither waits for GPU/output consumers nor releases GR resources.
+        It does not advance native counters: V2's earlier Prefill consumption
+        and bookkeeping remain in prefill_logits.
         """
 
     @abstractmethod

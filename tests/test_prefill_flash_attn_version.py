@@ -171,8 +171,22 @@ def test_mixed_cascade_keeps_prefix_suffix_on_fa2(
         return state
 
     monkeypatch.setattr(beam_attn_gpu, "clear_empty_prefix_states", clear_empty)
-    monkeypatch.setattr(
-        beam_attn_gpu, "extract_suffix_kv", lambda *args: (torch.zeros(1), torch.zeros(1))
+    pool = SimpleNamespace(
+        num_kv_heads=2,
+        head_dim=8,
+        max_decode_steps=1,
+        unshared_key=torch.zeros(1, 1, 2, 1, 8),
+        unshared_value=torch.zeros(1, 1, 2, 1, 8),
+    )
+    session = SimpleNamespace(
+        is_active=True,
+        slot=0,
+        beam_width=1,
+        decode_step=0,
+        context=SimpleNamespace(enable_short_suffix_attention=False),
+        pools=[pool],
+        suffix_k_buf=torch.empty(1, 2, 8),
+        suffix_v_buf=torch.empty(1, 2, 8),
     )
 
     md = SimpleNamespace(
@@ -192,9 +206,8 @@ def test_mixed_cascade_keeps_prefix_suffix_on_fa2(
         prefix_scheduler_metadata=None,
         prefix_block_table=torch.zeros(1, 1, dtype=torch.int32),
         max_num_splits=0,
-        beam_session=None,
-        suffix_slot_mapping_out=torch.zeros(1, dtype=torch.int64),
-        suffix_total_tokens=1,
+        is_beam_decode=True,
+        beam_session=session,
         block_size=16,
         suffix_cu_seqlens_q_device=torch.tensor([0, 1]),
         suffix_cu_seqlens_k_device=torch.tensor([0, 1]),

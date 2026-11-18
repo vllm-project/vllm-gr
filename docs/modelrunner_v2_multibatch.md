@@ -13,8 +13,11 @@ skips unused native sampler initialization and refresh, while preserving
 request removal, model state, block IDs and per-slot prompt-logprob resets.
 Every member must pass admission before any slot changes. Ordinary, mixed,
 new-plus-cached and unsupported batches retain native registration.
-`gpu_prefill_requests_v2` owns this registration and its staged-write ABI;
-the V2 stage hooks own execution and lifecycle transitions.
+`gpu_prefill_v2` owns registration, the staged-write ABI and guarded V2
+input preparation. V1 preparation remains in `gpu_prefill_inputs`; the V2
+stage hooks own execution and lifecycle transitions. Both CUDA integrations
+use `gpu_postprocess_workspace` for workspace initialization and load-time
+device-memory accounting; V2 does not import V1 patch implementation code.
 
 Fresh batches on an empty native request set can flush token, total-length,
 computed-token and single-group block-table writes through one packed transfer
@@ -74,14 +77,82 @@ current stage degrees and Trie count. A capacity change therefore compiles
 during table loading rather than the first request. Failed warmup releases the
 candidate backend before it can become active.
 
+### Graph installation and startup ownership
+
+`gpu_model_runner_v2_patch.py` owns the marker-guarded factories for native
+KV initialization, graph-memory profiling and model capture. The existing
+`gpu_model_runner_v2_resources.py` owns multi-batch Decode capture together
+with fixed input storage, graph bindings and runtime invalidation.
+`gpu_prefill_graph_runner_v2.py` owns native FULL/PIECEWISE planning and replay.
+
+```mermaid
+flowchart LR
+    I["V2 patch integration"] -->|"native plan and capture"| P["Prefill graph manager"]
+    I -->|"Decode capture and lifecycle callbacks"| R["V2 resource support"]
+    R -->|"explicit V2 hooks binding"| S["Shared startup capture"]
+```
+
+Startup installs the Prefill plan, runs native capture, then captures configured
+Decode batches. Profiling measures the complete GR plan in the native temporary
+pool and includes Decode/fixed-state memory. It restores the native capture flag
+after Decode capture, including failures, and never freezes GC for profiling.
+The native profiler tears down its temporary KV state before GR cleanup runs.
+Ordinary non-Beam capture retains native behavior; graph hooks remain optional
+capabilities of the native runner. Moving these operations does not change
+resource ownership, consumer-drain prerequisites or release timing.
+
+### Execution and shared support ownership
+
+V2 owns `make_patched_execute_model_v2` in `gpu_model_runner_v2_patch.py`.
+`model_runner_common.py` is limited to native V1 execution adaptation and active
+input proxies/row/logprob bookkeeping used by NPU. The public installer imports
+that V1 wrapper only after selecting V1; V2 does not load this adaptation module.
+
+Shared responsibilities have explicit owners:
+
+- `model_runner_contracts.py`: hardware-free patch markers and completeness checks.
+- `gr_execution.py`: frame classification, input isolation, stage/retirement
+  execution and failure propagation. Its one sentinel distinguishes an ordinary
+  frame from a handled stage whose legitimate result is `None`.
+- `gr_gc.py`: all Worker-side process-level GC state, locks, execute-depth accounting,
+  background freeze coordination and capture/warmup RPC functions.
+- `gr_context.py`: cached GR configuration, context construction and graph
+  diagnostics. Configuration remains cached on the native runner.
+
+```mermaid
+flowchart LR
+    V1["V1 integration and native adaptation"] --> D["GR dispatch and input isolation"]
+    V2["V2 integration"] --> D
+    V1 --> G["One process-level GC coordinator"]
+    V2 --> G
+    V1 --> C["GR configuration and context support"]
+    V2 --> C
+    I["Public patch installer"] --> K["Lightweight installation contracts"]
+```
+
+Both execute wrappers enter/leave the same GC coordination boundary, including
+exceptions. The existing freeze thresholds, timeout, retry and acknowledgement
+semantics are retained. Async sampling keeps V1 request context alive past
+`execute_model`; ordinary V2 frames continue to execute natively. Public Worker
+RPC names are unchanged and their functions remain importable in spawned workers.
+The public CUDA installer owns NumPy staging installation for both versions;
+version-specific sampling delegates retain their own installation markers and
+call the shared stage sampler. Resource invalidation and consumer-drain timing
+are unchanged. Frontend request guards and startup-heap leases retain their
+separate owner in `utils/engine_lifecycle.py`; these guard a different request
+lifetime, including when engines run in process.
+
 ### V1 compatibility boundary
 
-ModelRunner V1 retains the behavior of the rebased parent `7ee1d95`: the GR
-Prefill grid and per-request capacity clamp, exact native-input admission for
-async Prefill, B=1 startup Decode capture, and lazy capture against stage-owned
-buffers when a new batch needs a graph. Its Backend row bound, retirement and
-shutdown semantics remain unchanged. Upstream V1/NPU fixes in that parent,
-including B=2 Prefill capture, are retained.
+ModelRunner V1 uses the GR Prefill grid, clamps capture to the per-request
+capacity and requires exact native input extents for async Prefill admission.
+It captures B=1 Decode at startup and can lazily capture against stage-owned
+buffers when a new batch needs a graph.
+
+Beam attention uses incremental Decode with one query token per beam;
+full-suffix recomputation is not supported. NPU retains incremental row views
+and B=2 Prefill capture support. Backend row bounds, retirement and shutdown
+remain the responsibility of their existing implementations.
 
 Set `beam.adapter_cache_enabled: true` in the canonical service configuration
 to opt into cross-batch adapter caching. It defaults to false, preserving the
@@ -121,12 +192,65 @@ Shared graph construction has an optional graph class; V2 uses a subclass for
 storage/model validation.
 There is no new environment switch or duplicated Beam state machine.
 
-The contracts document eleven operations and three policy flags,
-including Prefill row ordering/counter updates, the V1 Host-input fence, input
-storage lifetime and capture recovery. They do not move remaining native field
-cleanup out of the core or unify graph policies. The dedicated mypy group checks
-the ABC, class-side Protocol, both implementations, core and binding sites together;
-see [CUDA stage hooks contract](PRE_COMMIT.md#cuda-stage-hooks-contract).
+### Native output completion boundary
+
+`GPUBeamStageRunner.sample()` calls `hooks.finish_native_output()` after
+submitting GR device output work and recording its producer/copy events,
+immediately before clearing the pending dispatch and returning the asynchronous receipt.
+This includes cancelled dispatches that still need an asynchronous receipt.
+Admission continues to require complete, output-producing Prefill; the hook
+does not enable Chunked Prefill.
+
+Partial GR Prefill is rejected before native execution or cleanup. Ordinary
+non-GR chunks retain their native execution and sampling path. A Prefix Cache
+hit can reduce the query length of complete GR Prefill; it is not a non-final
+chunk. The V2 native-state device tests cover actual query-length accounting
+and ordinary chunk progress with native input/count operations and stand-in
+forward/sampling callbacks.
+
+The hook drops native result references; it does not wait for the output
+consumer, release GR resources, advance native counters, or retire requests.
+
+The call is deliberately outside a `finally` block. An earlier execute,
+sampling or output-enqueue failure leaves the native result and pending stage
+at their existing failure boundary. A hook exception propagates and prevents
+the receipt from being returned or the pending dispatch from being cleared.
+
+Both CUDA implementations clear `execute_model_state` followed by
+`kv_connector_output`. V1 retains native Prefill logits until this boundary.
+V2 continues to clear its pending native state inside `prefill_logits`, before
+selecting hidden rows and updating computed-token counters; completion does
+not move or repeat those operations. Native V2 obtains connector output through
+its connector rather than a persistent V1-style Worker field. Its hook preserves
+the previous GR assignment of `kv_connector_output = None`, including when
+that attribute was absent; it does not invoke the connector.
+
+State and operations at the native-output boundary have these owners:
+
+| State or operation | Owner and responsibility |
+| --- | --- |
+| Completion writes to `execute_model_state` and `kv_connector_output` | V1/V2 `finish_native_output()`, called after device output submission and before clearing `pending` |
+| Prefill logits/hidden rows, native computed-token updates and Host input fence | Version hooks, with runner-specific state consumption, bookkeeping and fence ordering |
+| `pending`, execution failures, cancellation and asynchronous receipts | Shared stage orchestration |
+| `_current_scheduler_output`, `_current_beam_data`, `_current_beam_info` | Shared stage GR dispatch metadata |
+| Model/head, configuration and attention/KV metadata reads | Shared stage and head helpers |
+| Input buffers, graph/cache handles, workspace, context and sessions | Worker/stage resource owners retain allocation and invalidation responsibility; output completion does not release these resources |
+
+Host tests in `tests/test_cuda_native_output.py` cover the completion and failure
+ordering. `tests/kernels/test_gpu_beam_stage_lifecycle.py` exercises real CUDA
+output consumption for both hook implementations, including cancellation and
+terminal output. The ABC rejects missing completion implementations at
+construction; the complete-boundary mypy fixture rejects an incompatible
+completion return type.
+Pytest does not start checker subprocesses.
+
+The contracts describe eleven instance operations and three policy flags,
+plus class-side construction and admission sizing. They cover Prefill row
+ordering/counter updates, output completion, the V1 Host-input fence, input
+storage lifetime and capture recovery. Version-specific graph policies remain
+in their implementations. The dedicated mypy group checks the ABC, class-side
+Protocol, both implementations, core and binding sites together; see
+[CUDA stage hooks contract](PRE_COMMIT.md#cuda-stage-hooks-contract).
 
 Both runners retain upstream's opt-in vocabulary-sliced LM head. Decode hooks
 may return `None` after staging hidden states for sliced sampling; those states
@@ -247,11 +371,10 @@ V2 FULL Prefill replay, fixed input addresses, absence of V2 request-time
 capture, candidate structure and resource release. Repeated matching
 shapes must produce identical outputs after batch switches.
 
-To verify V1 baseline behavior, copy this single probe into a checkout of
-`7ee1d95`, run `--runner v1 --mode graph`, then run the current checkout with
-`--reference /path/to/baseline/results.json`. This requires exact ordered
-candidates and scores for every matching case. `--expected-source` can
-additionally assert the Worker imports the intended checkout.
+To compare two revisions, run the same probe with matching inputs and runner
+settings. Pass the first run's JSON as `--reference` in the second run to
+require exact ordered candidates and scores for matching cases.
+`--expected-source` can check the Worker's import source.
 
 Cross-B or Graph/Eager equality is a separate numerical investigation; it is
 not a required identity in this probe. Different shapes can change BF16

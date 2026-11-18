@@ -1,4 +1,6 @@
-schema_version: 2
+# Authoritative patch ownership inventory. Independent core/provider assertions
+# are checked against it; see docs/runtime_patch_inventory.md for the rationale.
+schema_version: 3
 
 pre_upgrade_baseline:
   vllm: "0.22.1"
@@ -7,20 +9,25 @@ pre_upgrade_baseline:
 current_runtime:
   cuda:
     vllm: "0.30.0"
-    status: validated_with_release_precision_decision_pending
+    upgrade_evidence: "https://github.com/JiusiServe/vllm-gr/pull/553"
+    upgrade_validation_status: validated_with_release_precision_decision_pending
   npu:
     vllm: "0.30.0"
     vllm_ascend: "0.30.0rc2"
     validation_baseline_commit: "43bc85f9b375281452d0af7005dc9fa752f43884"
-    status: baseline_validated_config_refactor_requires_npu_revalidation
+    upgrade_validation_status: baseline_validated_config_refactor_requires_npu_revalidation
 
 patches:
   - id: GR-PATCH-000
+    scope: core
+    backend_id: null
     owner: vllm_gr/plugin.py
     installer: vllm_gr.plugin.register
     activation: vLLM loads the vllm.general_plugins entry point
     validator_or_test:
       - tests/test_patch_initialization.py::test_plugin_exposes_simple_per_patch_status
+      - tests/platforms/test_runtime_wiring.py
+      - tests/platforms/test_import_isolation.py::test_cuda_plugin_initialization_does_not_import_ascend
     process_roles: [main, engine_core, worker]
     target: vllm_gr.plugin.register
     risk: high
@@ -28,24 +35,33 @@ patches:
     removal_condition: runtime patch installation is no longer required
 
   - id: GR-PATCH-001
-    owner: vllm_gr/v1/ascend_compat.py
-    installer: vllm_gr.v1.ascend_compat.apply_ascend_attention_backend_patch
+    scope: core
+    backend_id: null
+    owner: vllm_gr/v1/attention/selector_patch.py
+    installer: vllm_gr.v1.attention.selector_patch.apply_custom_attention_backend_patch
     activation: the vLLM attention selector is importable and the wrapper is not installed
     validator_or_test:
       - tests/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
+      - tests/test_ascend_compat.py::test_selector_reinstalls_over_replaced_upstream_target
+      - tests/test_ascend_compat.py::test_selector_cache_reset_preserves_installed_callable
+      - tests/test_gr_config.py::test_attention_selector_config_reader_propagates_validation_errors
       - tests/integration/test_ascend_attention_backend.py
     process_roles: [engine_core, worker]
     target: vllm.v1.attention.selector._cached_get_attn_backend
     risk: critical
     contract: attention-selector-signature
-    removal_condition: vLLM-Ascend preserves and resolves explicit CUSTOM backend intent
+    removal_condition: upstream preserves and resolves explicit and marker-restored CUSTOM backend intent on every supported platform
 
   - id: GR-PATCH-002
+    scope: backend
+    backend_id: npu
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.patch_npu_worker_init_device
-    activation: the active platform is NPU and the hook is not installed
+    activation: the selected NPU provider revalidates early config bindings on every call and wraps NPUWorker.init_device only when needed; unavailable native worker imports are retried on later initialization
     validator_or_test:
       - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+      - tests/test_ascend_compat.py::test_npu_worker_reinstalls_over_replaced_upstream_target
+      - tests/test_ascend_compat.py::test_worker_rechecks_config_bindings_without_rewrapping_device_hook
     process_roles: [worker]
     target: vllm_ascend.worker.worker.NPUWorker.init_device
     risk: high
@@ -53,6 +69,8 @@ patches:
     removal_condition: stable NPU worker initialization installs compatibility before ModelRunner construction
 
   - id: GR-PATCH-003
+    scope: core
+    backend_id: null
     owner: vllm_gr/logprobs.py
     installer: vllm_gr.logprobs_patch.patch_flat_logprobs
     activation: the required frontend patch plan detects the method is not installed
@@ -66,6 +84,8 @@ patches:
     removal_condition: the GR implementation is no longer needed or is available upstream
 
   - id: GR-PATCH-004
+    scope: core
+    backend_id: null
     owner: vllm_gr/entrypoints/openai/serving_engine.py and protocol.py
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_beam_search and patch_sampling
     activation: the required frontend patch plan detects either method is not installed
@@ -82,6 +102,8 @@ patches:
     removal_condition: upstream exposes grouped-Beam serving and sampling extension points
 
   - id: GR-PATCH-005
+    scope: core
+    backend_id: null
     owner: vllm_gr/engine/arg_utils_gr.py
     installer: vllm_gr.engine.arg_utils_gr.patch_add_cli_args
     activation: the required frontend patch plan detects GR EngineArgs methods are not installed
@@ -95,6 +117,8 @@ patches:
     removal_condition: vLLM configuration hooks cover every active GR option
 
   - id: GR-PATCH-007
+    scope: core
+    backend_id: null
     owner: vllm_gr/v1/engine/core_client.py, core_client_patch.py, and async_llm.py
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_batch_and_fork
     activation: the required frontend patch plan detects grouped Beam client methods are incomplete
@@ -111,6 +135,8 @@ patches:
     removal_condition: vLLM exposes stable grouped request, control-message, and routing hooks
 
   - id: GR-PATCH-008
+    scope: core
+    backend_id: null
     owner: vllm_gr/v1/engine/wire.py
     installer: vllm_gr.v1.engine.wire.register_engine_core_request_types
     activation: frontend and EngineCore installers require the GR wire values
@@ -124,6 +150,8 @@ patches:
     removal_condition: stable upstream messages carry grouped Beam operations without Enum mutation
 
   - id: GR-PATCH-009
+    scope: core
+    backend_id: null
     owner: vllm_gr/v1/engine/core.py, engine_core_patch.py, and hot_update.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
     activation: the shared EngineCore plan, including the sanitized NPU child entrypoint, detects incomplete request dispatch or Trie-capacity initialization; the same installer mounts hot-update utilities independently of the optional management listener
@@ -142,6 +170,8 @@ patches:
     removal_condition: vLLM exposes stable control-message, request-dispatch, and named management utility extension points
 
   - id: GR-PATCH-010
+    scope: core
+    backend_id: null
     owner: vllm_gr/v1/engine/engine_core_patch.py and gr_async_scheduler.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_scheduler_patch
     activation: the EngineCore patch plan detects scheduler metadata propagation is absent
@@ -155,22 +185,32 @@ patches:
     removal_condition: explicit upstream scheduler metadata hooks carry grouped Beam state
 
   - id: GR-PATCH-011
+    scope: backend
+    backend_id: cuda
     owner: vllm_gr/v1/worker/gpu_model_runner_patch.py and gpu_model_runner_v2_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/gpu_prefill_requests_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/gpu_stage_hooks.py, vllm_gr/v1/worker/gpu_beam_stage_runner.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/gpu_postprocess_workspace.py, vllm_gr/v1/worker/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/gpu_prefill_inputs.py, vllm_gr/v1/worker/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/gpu_stage_hooks.py, vllm_gr/v1/worker/gpu_beam_stage_runner.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the selected CUDA ModelRunner V1 or V2 is discovered and its hooks are incomplete; the common installer mounts Worker utilities and model-load hooks regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_gpu_model_runner_patch.py
+      - tests/test_gpu_postprocess_workspace.py
+      - tests/platforms/test_import_isolation.py
       - tests/kernels/test_beam_batch_switch_reuse.py
       - tests/test_gpu_model_runner_v2_patch.py
       - tests/kernels/test_gr_prefill_v2.py
+      - tests/kernels/test_v2_multibatch_graphs.py
+      - tests/kernels/test_beam_pool_recapture.py
       - tests/kernels/test_stage_topk_v2.py
       - tests/test_model_runner_patch.py
       - tests/test_model_runner_patch.py::test_active_cuda_worker_hot_update_utility_contract
       - tests/sidecar/test_worker_update.py
       - tests/v1/worker/test_constraint_lifecycle.py
       - tests/test_model_runner_stage_binding.py
+      - tests/test_cuda_native_output.py
+      - tests/test_v2_multibatch.py
+      - tests/kernels/test_gpu_beam_stage_lifecycle.py
+      - tests/kernels/test_gpu_beam_stage_v2_state.py
       - tests/test_gr_startup.py
       - tests/tools/test_cuda_stage_typing.py
       - tests/st/test_modelrunner_v2_stage_parity_st.py
@@ -181,8 +221,10 @@ patches:
     removal_condition: stable upstream grouped input/output, Worker utility, and constraint-backend lifecycle hooks replace private runner mutation
 
   - id: GR-PATCH-012
+    scope: backend
+    backend_id: npu
     owner: vllm_gr/v1/worker/npu_model_runner_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: NPUModelRunner is discovered for the active platform and its hooks are incomplete; the delayed NPUWorker.init_device wrapper mounts common Worker utilities before native initialization, independently of the management listener; online Trie reload remains rejected by Core on NPU
     validator_or_test:
@@ -201,6 +243,8 @@ patches:
     removal_condition: vLLM-Ascend exposes stable grouped input/output, Worker utility, and constraint-backend lifecycle hooks
 
   - id: GR-PATCH-013
+    scope: core
+    backend_id: null
     owner: vllm_gr/v1/attention/backends/beam_attn.py
     installer: vllm_gr.v1.attention.backends.beam_attn register_backend decorator
     activation: the facade module is imported and CUSTOM is selected for GR Beam Attention
@@ -221,10 +265,11 @@ patches:
         - BeamAttentionMetadata
         - BeamAttentionMetadataBuilder
         - BEAM_DATA_VAR
-        - _compute_beam_bounds
     removal_condition: vLLM supports named third-party backend identities without a shared CUSTOM slot
 
   - id: GR-PATCH-015
+    scope: core
+    backend_id: null
     owner: vllm_gr/ops/sliced_logits.py
     shared_helpers: vllm_gr/ops/lm_head_cache.py
     installer: vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch
@@ -232,6 +277,7 @@ patches:
     validator_or_test:
       - vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch return value
       - tests/test_sliced_logits.py
+      - tests/platforms/test_import_isolation.py::test_cuda_plugin_initialization_does_not_import_ascend
       - tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload
       - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
     process_roles: [worker]
@@ -241,9 +287,11 @@ patches:
     removal_condition: vLLM exposes stable output-projection and logprob-width hooks
 
   - id: GR-PATCH-016
+    scope: backend
+    backend_id: npu
     owner: vllm_gr/npu_spawn_patch.py
     installer: vllm_gr.npu_spawn_patch.apply_npu_spawn_patch
-    activation: engine configuration loading triggers the vllm.general_plugins entry point
+    activation: the selected NPU provider installs or repairs spawn protection before importing the native worker
     validator_or_test:
       - vllm_gr.npu_spawn_patch.apply_npu_spawn_patch return value
       - tests/test_patch_initialization.py::test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings
@@ -255,6 +303,8 @@ patches:
     removal_condition: upstream _maybe_force_spawn() covers NPU (or delegates to the platform interface)
 
   - id: GR-PATCH-018
+    scope: backend
+    backend_id: npu
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_penalties_warmup_oom_guard
     activation: NPUWorker init_device runs in the child process and the native penalties warmup callable is present
@@ -268,15 +318,19 @@ patches:
     removal_condition: vllm-ascend sizes the warmup dummies from the available NPU budget, or vllm-gr no longer runs a large vocabulary beside the KV cache
 
   - id: GR-PATCH-019
+    scope: backend
+    backend_id: npu
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer and patch_npu_worker_init_device
-    activation: NPU engine configuration and worker plugin initialization; entrypoint re-asserted on every create_engine_config call and initializes the shared EngineCore plan before native construction
+    activation: NPU engine configuration and every worker plugin initialization, independently of the device hook; repair native config caller bindings even when the sanitizer is installed; entrypoint re-asserted on every create_engine_config call and initializes the shared EngineCore plan before native construction
     validator_or_test:
       - vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer return value
       - tests/test_ascend_compat.py::test_ascend_config_filter_preserves_engine_identity_and_gr_config
       - tests/test_ascend_compat.py::test_ascend_config_filter_restores_mapping_on_native_failure
       - tests/test_ascend_compat.py::test_ascend_entry_installs_filter_before_delegating
       - tests/test_ascend_compat.py::test_worker_installs_config_filter_before_constructor
+      - tests/test_ascend_compat.py::test_worker_rechecks_config_bindings_without_rewrapping_device_hook
+      - tests/test_ascend_compat.py::test_config_binding_recheck_preserves_unrelated_overrides
       - NPU EngineCore startup (vllm-ascend AscendConfig pydantic extra="forbid")
     process_roles: [main, engine_core, worker]
     target: vllm.v1.engine.core.EngineCoreProc.run_engine_core and vllm_ascend.ascend_config.init_ascend_config
@@ -285,6 +339,8 @@ patches:
     removal_condition: vllm-ascend's AscendConfig accepts unknown additional_config keys, or vllm-gr stops carrying its configuration in additional_config
 
   - id: GR-PATCH-020
+    scope: core
+    backend_id: null
     owner: vllm_gr/pangu_compat.py
     installer: vllm_gr.pangu_compat.apply_pangu_tied_embeddings_patch
     activation: runtime initialization; wrapper preserves ties only for PanguEmbeddedForCausalLM with tie_word_embeddings enabled
@@ -298,6 +354,8 @@ patches:
     removal_condition: upstream distinguishes Pangu's zero-filled lm_head placeholder from an independent projection weight
 
   - id: GR-PATCH-021
+    scope: backend
+    backend_id: npu
     owner: vllm_gr/v1/npu_kv_layout.py
     installer: vllm_gr.v1.npu_kv_layout.apply_npu_contiguous_kv_cache_patch
     activation: NPUWorker init_device before native runner construction; known Ascend 0.30.0rc2 bindings

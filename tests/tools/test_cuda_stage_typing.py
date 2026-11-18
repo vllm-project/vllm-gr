@@ -27,6 +27,7 @@ def test_every_operation_is_abstract() -> None:
         "required_constraint_rows",
         "forward_hidden",
         "prefill_logits",
+        "finish_native_output",
         "prefill_stage_fence",
         "consume_native_state",
         "decode_block_ids",
@@ -53,6 +54,7 @@ def test_incomplete_implementation_cannot_be_instantiated() -> None:
 
         def forward_hidden(self, *args: Any, **kwargs: Any) -> Any: ...
         def prefill_logits(self, *args: Any, **kwargs: Any) -> Any: ...
+        def finish_native_output(self) -> None: ...
         def prefill_stage_fence(self) -> None: ...
         def consume_native_state(self, scheduler_output: Any) -> None: ...
         # decode_block_ids deliberately omitted
@@ -81,6 +83,7 @@ def test_validate_rejects_a_different_hooks_class() -> None:
 
         def forward_hidden(self, *args: Any, **kwargs: Any) -> Any: ...
         def prefill_logits(self, *args: Any, **kwargs: Any) -> Any: ...
+        def finish_native_output(self) -> None: ...
         def prefill_stage_fence(self) -> None: ...
         def consume_native_state(self, scheduler_output: Any) -> None: ...
         def decode_block_ids(self, session_id: str) -> list[list[int]]:
@@ -110,7 +113,19 @@ def test_implementations_subclass_the_contract() -> None:
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "changed_file", [*mypy_hook.CUDA_STAGE_FILES, "tools/pre_commit/mypy.py"]
+    "changed_file",
+    sorted(
+        {
+            *mypy_hook.CUDA_STAGE_FILES,
+            "tools/pre_commit/mypy.py",
+            # Pin moved owners independently of the routing list itself.
+            "vllm_gr/v1/worker/model_runner_contracts.py",
+            "vllm_gr/v1/worker/gr_gc.py",
+            "vllm_gr/v1/worker/gr_context.py",
+            "vllm_gr/v1/worker/gpu_model_runner_v2_patch.py",
+            "vllm_gr/v1/worker/gpu_model_runner_v2_resources.py",
+        }
+    ),
 )
 def test_mypy_checks_complete_boundary(changed_file: str) -> None:
     """Changing any boundary member checks its peers and negative cases too."""

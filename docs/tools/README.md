@@ -185,9 +185,23 @@ runtime conftest, matching the wheel smoke script:
 python -m pytest --confcutdir=tests/packaging -q tests/packaging/test_install_metadata.py
 ```
 
-That command requires pip, pytest, setuptools, setuptools-scm, packaging, and Git, but does not establish
-inference support. Check the [coverage map](../development.md#select-regression-coverage)
+That command requires Git, pytest, packaging, and the build tools declared in
+the `dev` extra, including pip, setuptools, setuptools-scm, and wheel.
+Build isolation alone does not install
+these tools into the test environment. It does not establish inference support.
+Check the [coverage map](../development.md#select-regression-coverage)
 for the tests associated with other code areas.
+
+The configuration declaration and AST-hook tests also have a standalone entry
+point. They use pytest and regex without importing the inference runtime:
+
+```bash
+python -m pytest --confcutdir=tests/config -q tests/config
+```
+
+This invocation covers only the declaration and hook boundary. Run the existing
+`tests/test_gr_config*.py` and related runtime configuration tests normally, with
+their shared fixtures, in the prepared development environment.
 
 ### Test tiers
 

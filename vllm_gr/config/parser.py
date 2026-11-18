@@ -4,128 +4,49 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping
+from dataclasses import MISSING
+from enum import Enum
 from pathlib import Path
-from typing import Final, TypeAlias, cast
+from typing import Any, Final, TypeAlias, cast
 
-from vllm_gr.config.models import (
-    _BEAM_MAX_DECODE_STEPS_DEFAULT,
-    CONSTRAINT_TABLE_FORMAT,
-    DEFAULT_ONLINE_BATCH_SIZES,
-    GR_CONFIG_SCHEMA_VERSION,
-    ConstraintBackend,
-    ConstraintTableConfig,
-    GRConfig,
-)
-from vllm_gr.config.validation import (
-    validate_artifact_digest,
-    validate_attention_backend,
-    validate_beam_engine_driven,
-    validate_beam_execution_mode,
-    validate_beam_graph_batch_size,
-    validate_beam_graph_enabled,
-    validate_beam_graph_widths,
-    validate_beam_max_decode_steps,
-    validate_beam_max_width,
-    validate_beam_online_batch_sizes,
-    validate_beam_sid_stage_vocab,
-    validate_beam_worker_decision,
-    validate_candidate_width,
-    validate_catalog_path,
-    validate_constrained_generation,
-    validate_constraint_backend,
-    validate_constraint_table_backend,
-    validate_constraint_table_enabled,
-    validate_constraint_table_format,
-    validate_constraint_table_max_top_k,
-    validate_constraint_table_path,
-    validate_enable_short_suffix_attention,
-    validate_npu_decode_execution,
-    validate_prefill_flash_attn_version,
-    validate_schema_version,
-    validate_tokenizer_digest,
-    validate_vocab_offset,
-    validate_vocab_slice_size,
+from vllm_gr.config.models import ConstraintTableConfig, GRConfig
+from vllm_gr.config.schema import (
+    canonical_keys,
+    config_fields,
+    field_default,
+    legacy_key,
+    should_emit,
 )
 
 GR_CONFIG_KEY: Final = "vllm_gr"
 GRConfigInput: TypeAlias = str | Path | Mapping[str, object] | GRConfig
-CATALOG_PATH_KEY: Final = "vllm_gr_catalog_path"
-CONSTRAINT_BACKEND_KEY: Final = "vllm_gr_constraint_backend"
-ATTENTION_BACKEND_KEY: Final = "vllm_gr_attention_backend"
-VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
-VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
-PREFILL_FA_VERSION_KEY: Final = "vllm_gr_prefill_flash_attn_version"
-SHORT_SUFFIX_ATTENTION_KEY: Final = "vllm_gr_enable_short_suffix_attention"
-BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
-BEAM_ADAPTER_CACHE_ENABLED_KEY: Final = "vllm_gr_beam_adapter_cache_enabled"
-BEAM_GRAPH_BATCH_SIZE_KEY: Final = "vllm_gr_beam_graph_batch_size"
-BEAM_GRAPH_WIDTHS_KEY: Final = "vllm_gr_beam_graph_widths"
-BEAM_ONLINE_BATCH_SIZES_KEY: Final = "vllm_gr_beam_online_batch_sizes"
-BEAM_MAX_WIDTH_KEY: Final = "vllm_gr_beam_max_width"
-BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
-NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
-BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
-BEAM_ENGINE_DRIVEN_KEY: Final = "vllm_gr_beam_engine_driven"
-BEAM_EXECUTION_MODE_KEY: Final = "vllm_gr_beam_execution_mode"
-BEAM_SID_STAGE_VOCAB_KEY: Final = "vllm_gr_beam_sid_stage_vocab"
-CONSTRAINED_GENERATION_KEY: Final = "vllm_gr_constrained_generation"
+CATALOG_PATH_KEY: Final = legacy_key(GRConfig, "catalog_path")
+CONSTRAINT_BACKEND_KEY: Final = legacy_key(GRConfig, "constraint_backend")
+ATTENTION_BACKEND_KEY: Final = legacy_key(GRConfig, "attention_backend")
+VOCAB_OFFSET_KEY: Final = legacy_key(GRConfig, "vocab_offset")
+VOCAB_SLICE_SIZE_KEY: Final = legacy_key(GRConfig, "vocab_slice_size")
+PREFILL_FA_VERSION_KEY: Final = legacy_key(GRConfig, "prefill_flash_attn_version")
+SHORT_SUFFIX_ATTENTION_KEY: Final = legacy_key(GRConfig, "enable_short_suffix_attention")
+BEAM_GRAPH_ENABLED_KEY: Final = legacy_key(GRConfig, "beam_graph_enabled")
+BEAM_ADAPTER_CACHE_ENABLED_KEY: Final = legacy_key(GRConfig, "beam_adapter_cache_enabled")
+BEAM_GRAPH_BATCH_SIZE_KEY: Final = legacy_key(GRConfig, "beam_graph_batch_size")
+BEAM_GRAPH_WIDTHS_KEY: Final = legacy_key(GRConfig, "beam_graph_widths")
+BEAM_ONLINE_BATCH_SIZES_KEY: Final = legacy_key(GRConfig, "beam_online_batch_sizes")
+BEAM_MAX_WIDTH_KEY: Final = legacy_key(GRConfig, "beam_max_width")
+BEAM_MAX_DECODE_STEPS_KEY: Final = legacy_key(GRConfig, "beam_max_decode_steps")
+NPU_DECODE_EXECUTION_KEY: Final = legacy_key(GRConfig, "npu_decode_execution")
+BEAM_WORKER_DECISION_KEY: Final = legacy_key(GRConfig, "beam_worker_decision")
+BEAM_ENGINE_DRIVEN_KEY: Final = legacy_key(GRConfig, "beam_engine_driven")
+BEAM_EXECUTION_MODE_KEY: Final = legacy_key(GRConfig, "beam_execution_mode")
+BEAM_SID_STAGE_VOCAB_KEY: Final = legacy_key(GRConfig, "beam_sid_stage_vocab")
+CONSTRAINED_GENERATION_KEY: Final = legacy_key(GRConfig, "constrained_generation")
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
-    {
-        CATALOG_PATH_KEY,
-        CONSTRAINT_BACKEND_KEY,
-        ATTENTION_BACKEND_KEY,
-        VOCAB_OFFSET_KEY,
-        VOCAB_SLICE_SIZE_KEY,
-        BEAM_GRAPH_ENABLED_KEY,
-        BEAM_ADAPTER_CACHE_ENABLED_KEY,
-        SHORT_SUFFIX_ATTENTION_KEY,
-        PREFILL_FA_VERSION_KEY,
-        BEAM_GRAPH_BATCH_SIZE_KEY,
-        BEAM_GRAPH_WIDTHS_KEY,
-        BEAM_ONLINE_BATCH_SIZES_KEY,
-        BEAM_MAX_WIDTH_KEY,
-        BEAM_MAX_DECODE_STEPS_KEY,
-        NPU_DECODE_EXECUTION_KEY,
-        BEAM_WORKER_DECISION_KEY,
-        BEAM_ENGINE_DRIVEN_KEY,
-        BEAM_EXECUTION_MODE_KEY,
-        BEAM_SID_STAGE_VOCAB_KEY,
-        CONSTRAINED_GENERATION_KEY,
-    }
+    spec.legacy_key for _, spec in config_fields(GRConfig) if spec.legacy_key is not None
 )
-_TOP_LEVEL_KEYS: Final = frozenset(
-    {"schema_version", "beam", "constraint_table", "attention_backend", "constrained_generation"}
-)
-_BEAM_KEYS: Final = frozenset(
-    {
-        "graph_enabled",
-        "adapter_cache_enabled",
-        "enable_short_suffix_attention",
-        "prefill_flash_attn_version",
-        "graph_batch_size",
-        "graph_widths",
-        "online_batch_sizes",
-        "max_width",
-        "max_decode_steps",
-        "worker_decision",
-        "engine_driven",
-        "execution_mode",
-        "sid_stage_vocab",
-    }
-)
-_CONSTRAINT_TABLE_KEYS: Final = frozenset(
-    {
-        "enabled",
-        "backend",
-        "path",
-        "format",
-        "artifact_digest",
-        "tokenizer_digest",
-        "max_top_k",
-        "candidate_width",
-    }
-)
+_TOP_LEVEL_KEYS: Final = canonical_keys(GRConfig)
+_BEAM_KEYS: Final = canonical_keys(GRConfig, ("beam",))
+_CONSTRAINT_TABLE_KEYS: Final = canonical_keys(ConstraintTableConfig)
 
 
 def _reject_unknown_gr_keys(additional_config: Mapping[object, object]) -> None:
@@ -176,86 +97,81 @@ def _normalize_artifact_path(
     return str((normalized_base / artifact_path).resolve(strict=False))
 
 
+def _canonical_kwargs(
+    cls: type[Any], mapping: Mapping[str, object], *, prefix: str = ""
+) -> dict[str, Any]:
+    """Supply only explicit inputs; constructor defaults remain authoritative."""
+    result: dict[str, Any] = {}
+    for item, spec in config_fields(cls):
+        if spec.canonical_path is None:
+            continue
+        value: object = mapping
+        for part in spec.canonical_path:
+            value = value.get(part, MISSING) if isinstance(value, Mapping) else MISSING
+        name = prefix + ".".join(spec.canonical_path)
+        if value is MISSING:
+            if spec.canonical_required:
+                raise ValueError(f"vllm-gr configuration requires {name}")
+            continue
+        if spec.canonical_strict_bool and not isinstance(value, bool):
+            raise ValueError(f"vllm-gr {name} must be a boolean")
+        result[item.name] = value
+    return result
+
+
+def _primitive(value: object) -> object:
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, ConstraintTableConfig):
+        return _canonical_mapping(value)
+    return value
+
+
+def _canonical_mapping(config: GRConfig | ConstraintTableConfig) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for item, spec in config_fields(type(config)):
+        path = spec.canonical_path
+        value = getattr(config, item.name)
+        if path is None or not should_emit(item, value, spec.canonical_emit):
+            continue
+        target = result
+        for part in path[:-1]:
+            target = cast(dict[str, object], target.setdefault(part, {}))
+        target[path[-1]] = _primitive(value)
+    return result
+
+
 def gr_config_from_mapping(
     raw: object,
     *,
     base_dir: str | Path | None = None,
 ) -> GRConfig:
     """Build a validated config from a canonical schema-v1 mapping."""
-
     mapping = _as_string_mapping(raw, "configuration")
     _reject_unknown_mapping_keys(mapping, _TOP_LEVEL_KEYS, "configuration")
-    if "schema_version" not in mapping:
-        raise ValueError("vllm-gr configuration requires schema_version")
-
     beam_raw = _as_string_mapping(mapping.get("beam", {}), "beam")
     _reject_unknown_mapping_keys(beam_raw, _BEAM_KEYS, "beam")
     table_raw = _as_string_mapping(mapping.get("constraint_table", {}), "constraint_table")
     _reject_unknown_mapping_keys(table_raw, _CONSTRAINT_TABLE_KEYS, "constraint_table")
-    if "max_top_k" not in table_raw:
-        raise ValueError("vllm-gr configuration requires constraint_table.max_top_k")
 
-    graph_enabled = beam_raw.get("graph_enabled", True)
-    if not isinstance(graph_enabled, bool):
-        raise ValueError("vllm-gr beam.graph_enabled must be a boolean")
-
-    table = ConstraintTableConfig(
-        enabled=validate_constraint_table_enabled(table_raw.get("enabled", False)),
-        backend=validate_constraint_table_backend(table_raw.get("backend", "cuda")),
-        path=validate_constraint_table_path(
-            _normalize_artifact_path(table_raw.get("path"), base_dir=base_dir)
-        ),
-        format=validate_constraint_table_format(table_raw.get("format", CONSTRAINT_TABLE_FORMAT)),
-        artifact_digest=validate_artifact_digest(table_raw.get("artifact_digest")),
-        tokenizer_digest=validate_tokenizer_digest(table_raw.get("tokenizer_digest")),
-        max_top_k=validate_constraint_table_max_top_k(table_raw["max_top_k"]),
-        candidate_width=validate_candidate_width(table_raw.get("candidate_width")),
-    )
-    return GRConfig(
-        attention_backend=validate_attention_backend(mapping.get("attention_backend")),
-        beam_graph_enabled=graph_enabled,
-        beam_adapter_cache_enabled=beam_raw.get("adapter_cache_enabled", False),
-        prefill_flash_attn_version=validate_prefill_flash_attn_version(
-            beam_raw.get("prefill_flash_attn_version", "auto")
-        ),
-        enable_short_suffix_attention=validate_enable_short_suffix_attention(
-            beam_raw.get("enable_short_suffix_attention", True)
-        ),
-        beam_graph_batch_size=validate_beam_graph_batch_size(beam_raw.get("graph_batch_size", 1)),
-        beam_graph_widths=validate_beam_graph_widths(beam_raw.get("graph_widths")),
-        beam_online_batch_sizes=validate_beam_online_batch_sizes(
-            beam_raw.get("online_batch_sizes", DEFAULT_ONLINE_BATCH_SIZES)
-        ),
-        beam_max_width=validate_beam_max_width(beam_raw.get("max_width")),
-        beam_max_decode_steps=validate_beam_max_decode_steps(
-            beam_raw.get("max_decode_steps", _BEAM_MAX_DECODE_STEPS_DEFAULT)
-        ),
-        beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
-        beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
-        beam_execution_mode=validate_beam_execution_mode(beam_raw.get("execution_mode")),
-        beam_sid_stage_vocab=validate_beam_sid_stage_vocab(beam_raw.get("sid_stage_vocab", False)),
-        schema_version=validate_schema_version(
-            mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
-        ),
-        constraint_table=table,
-        constrained_generation=validate_constrained_generation(
-            mapping.get("constrained_generation")
-        ),
-    )
+    values = _canonical_kwargs(GRConfig, {**mapping, "beam": beam_raw})
+    table_values = _canonical_kwargs(ConstraintTableConfig, table_raw, prefix="constraint_table.")
+    if "path" in table_values:
+        table_values["path"] = _normalize_artifact_path(table_values["path"], base_dir=base_dir)
+    values["constraint_table"] = ConstraintTableConfig(**table_values)
+    return GRConfig(**values)
 
 
 def _reject_lossy_canonical_conversion(config: GRConfig) -> None:
-    legacy_values = []
-    if config.catalog_path is not None:
-        legacy_values.append("catalog_path")
-    if config.constraint_backend is not ConstraintBackend.TRIE:
-        legacy_values.append("constraint_backend")
-    if config.vocab_offset is not None:
-        legacy_values.append("vocab_offset")
-    if config.vocab_slice_size is not None:
-        legacy_values.append("vocab_slice_size")
-    if config.npu_decode_execution is not None:
-        legacy_values.append("npu_decode_execution")
+    legacy_values = [
+        item.name
+        for item, spec in config_fields(GRConfig)
+        if spec.canonical_path is None
+        and spec.legacy_key is not None
+        and getattr(config, item.name) != field_default(item)
+    ]
     if legacy_values:
         raise ValueError(
             "cannot encode legacy-only GRConfig field(s) in canonical schema-v1: "
@@ -265,68 +181,12 @@ def _reject_lossy_canonical_conversion(config: GRConfig) -> None:
 
 def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     """Convert a canonical config to JSON/pickle-safe primitive values."""
-
     if not isinstance(config, GRConfig):
         raise TypeError("config must be a GRConfig")
     _reject_lossy_canonical_conversion(config)
-    table = config.constraint_table
-    if table is None:
+    if config.constraint_table is None:
         raise ValueError("cannot encode GRConfig without canonical constraint_table state")
-    beam: dict[str, object] = {
-        "graph_enabled": config.beam_graph_enabled,
-        "max_width": config.beam_max_width,
-        "max_decode_steps": config.beam_max_decode_steps,
-    }
-    if config.prefill_flash_attn_version != "auto":
-        beam["prefill_flash_attn_version"] = config.prefill_flash_attn_version
-    if config.beam_adapter_cache_enabled:
-        beam["adapter_cache_enabled"] = True
-    if not config.enable_short_suffix_attention:
-        beam["enable_short_suffix_attention"] = False
-    if config.beam_graph_batch_size != 1:
-        beam["graph_batch_size"] = config.beam_graph_batch_size
-    if config.beam_graph_widths is not None:
-        beam["graph_widths"] = list(config.beam_graph_widths)
-    if config.beam_online_batch_sizes != DEFAULT_ONLINE_BATCH_SIZES:
-        beam["online_batch_sizes"] = list(config.beam_online_batch_sizes)
-    # Keep omitted values omitted so existing schema-v1 artifacts round-trip
-    # byte-for-byte at the mapping level.  Explicit False is significant: it
-    # is the CUDA runtime-default opt-out and must survive Driver -> Worker
-    # serialization just like explicit True.
-    if config.beam_worker_decision is not None:
-        beam["worker_decision"] = config.beam_worker_decision
-    if config.beam_execution_mode is not None:
-        beam["execution_mode"] = config.beam_execution_mode.value
-    if config.beam_sid_stage_vocab:
-        beam["sid_stage_vocab"] = True
-
-    constraint_table: dict[str, object] = {
-        "enabled": table.enabled,
-        "backend": table.backend.value,
-        "path": table.path,
-        "format": table.format,
-        "artifact_digest": table.artifact_digest,
-        "tokenizer_digest": table.tokenizer_digest,
-        "max_top_k": table.max_top_k,
-    }
-    # Omitted means K == beam_max_width; keep it omitted so pre-decoupling
-    # schema-v1 artifacts round-trip byte-for-byte at the mapping level.
-    if table.candidate_width is not None:
-        constraint_table["candidate_width"] = table.candidate_width
-
-    return {
-        "schema_version": config.schema_version,
-        "beam": beam,
-        "constraint_table": constraint_table,
-        "attention_backend": (
-            config.attention_backend.value if config.attention_backend is not None else None
-        ),
-        **(
-            {"constrained_generation": config.constrained_generation}
-            if config.constrained_generation is not None
-            else {}
-        ),
-    }
+    return _canonical_mapping(config)
 
 
 def load_gr_config(path: str | Path) -> GRConfig:
@@ -391,52 +251,11 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
     if canonical_present:
         return gr_config_from_mapping(additional_config[GR_CONFIG_KEY])
     return GRConfig(
-        prefill_flash_attn_version=validate_prefill_flash_attn_version(
-            additional_config.get(PREFILL_FA_VERSION_KEY, "auto")
-        ),
-        catalog_path=validate_catalog_path(additional_config.get(CATALOG_PATH_KEY)),
-        constraint_backend=validate_constraint_backend(
-            additional_config.get(CONSTRAINT_BACKEND_KEY, "trie")
-        ),
-        attention_backend=validate_attention_backend(additional_config.get(ATTENTION_BACKEND_KEY)),
-        vocab_offset=validate_vocab_offset(additional_config.get(VOCAB_OFFSET_KEY)),
-        vocab_slice_size=validate_vocab_slice_size(additional_config.get(VOCAB_SLICE_SIZE_KEY)),
-        enable_short_suffix_attention=validate_enable_short_suffix_attention(
-            additional_config.get(SHORT_SUFFIX_ATTENTION_KEY, True)
-        ),
-        beam_graph_enabled=validate_beam_graph_enabled(
-            additional_config.get(BEAM_GRAPH_ENABLED_KEY, True)
-        ),
-        beam_adapter_cache_enabled=additional_config.get(BEAM_ADAPTER_CACHE_ENABLED_KEY, False),
-        beam_graph_batch_size=validate_beam_graph_batch_size(
-            additional_config.get(BEAM_GRAPH_BATCH_SIZE_KEY, 1)
-        ),
-        beam_graph_widths=validate_beam_graph_widths(additional_config.get(BEAM_GRAPH_WIDTHS_KEY)),
-        beam_online_batch_sizes=validate_beam_online_batch_sizes(
-            additional_config.get(BEAM_ONLINE_BATCH_SIZES_KEY, DEFAULT_ONLINE_BATCH_SIZES)
-        ),
-        beam_max_width=validate_beam_max_width(additional_config.get(BEAM_MAX_WIDTH_KEY)),
-        beam_max_decode_steps=validate_beam_max_decode_steps(
-            additional_config.get(BEAM_MAX_DECODE_STEPS_KEY, _BEAM_MAX_DECODE_STEPS_DEFAULT)
-        ),
-        npu_decode_execution=validate_npu_decode_execution(
-            additional_config.get(NPU_DECODE_EXECUTION_KEY)
-        ),
-        beam_worker_decision=validate_beam_worker_decision(
-            additional_config.get(BEAM_WORKER_DECISION_KEY)
-        ),
-        beam_engine_driven=validate_beam_engine_driven(
-            additional_config.get(BEAM_ENGINE_DRIVEN_KEY)
-        ),
-        beam_execution_mode=validate_beam_execution_mode(
-            additional_config.get(BEAM_EXECUTION_MODE_KEY)
-        ),
-        beam_sid_stage_vocab=validate_beam_sid_stage_vocab(
-            additional_config.get(BEAM_SID_STAGE_VOCAB_KEY, False)
-        ),
-        constrained_generation=validate_constrained_generation(
-            additional_config.get(CONSTRAINED_GENERATION_KEY)
-        ),
+        **{
+            item.name: additional_config[spec.legacy_key]
+            for item, spec in config_fields(GRConfig)
+            if spec.legacy_key is not None and spec.legacy_key in additional_config
+        }
     )
 
 
@@ -455,118 +274,14 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
             "use write_canonical_gr_config"
         )
 
-    catalog_path = validate_catalog_path(gr_config.catalog_path)
-    constraint_backend = validate_constraint_backend(gr_config.constraint_backend)
-    attention_backend = validate_attention_backend(gr_config.attention_backend)
-    vocab_offset = validate_vocab_offset(gr_config.vocab_offset)
-    vocab_slice_size = validate_vocab_slice_size(gr_config.vocab_slice_size)
-    npu_decode_execution = validate_npu_decode_execution(gr_config.npu_decode_execution)
-    constrained_generation = validate_constrained_generation(gr_config.constrained_generation)
-    beam_sid_stage_vocab = validate_beam_sid_stage_vocab(gr_config.beam_sid_stage_vocab)
-
-    if catalog_path is None:
-        additional_config.pop(CATALOG_PATH_KEY, None)
-    else:
-        additional_config[CATALOG_PATH_KEY] = catalog_path
-
-    if constraint_backend.value == "trie":
-        additional_config.pop(CONSTRAINT_BACKEND_KEY, None)
-    else:
-        additional_config[CONSTRAINT_BACKEND_KEY] = constraint_backend.value
-
-    if attention_backend is None:
-        additional_config.pop(ATTENTION_BACKEND_KEY, None)
-    else:
-        additional_config[ATTENTION_BACKEND_KEY] = attention_backend.value
-
-    if vocab_offset is None:
-        additional_config.pop(VOCAB_OFFSET_KEY, None)
-    else:
-        additional_config[VOCAB_OFFSET_KEY] = vocab_offset
-
-    if vocab_slice_size is None:
-        additional_config.pop(VOCAB_SLICE_SIZE_KEY, None)
-    else:
-        additional_config[VOCAB_SLICE_SIZE_KEY] = vocab_slice_size
-
-    if gr_config.prefill_flash_attn_version == "auto":
-        additional_config.pop(PREFILL_FA_VERSION_KEY, None)
-    else:
-        additional_config[PREFILL_FA_VERSION_KEY] = gr_config.prefill_flash_attn_version
-
-    if gr_config.enable_short_suffix_attention:
-        additional_config.pop(SHORT_SUFFIX_ATTENTION_KEY, None)
-    else:
-        additional_config[SHORT_SUFFIX_ATTENTION_KEY] = False
-
-    if constrained_generation is None:
-        additional_config.pop(CONSTRAINED_GENERATION_KEY, None)
-    else:
-        additional_config[CONSTRAINED_GENERATION_KEY] = constrained_generation
-
-    if gr_config.beam_graph_enabled:
-        additional_config.pop(BEAM_GRAPH_ENABLED_KEY, None)
-    else:
-        additional_config[BEAM_GRAPH_ENABLED_KEY] = False
-    if gr_config.beam_adapter_cache_enabled:
-        additional_config[BEAM_ADAPTER_CACHE_ENABLED_KEY] = True
-    else:
-        additional_config.pop(BEAM_ADAPTER_CACHE_ENABLED_KEY, None)
-
-    if gr_config.beam_graph_batch_size == 1:
-        additional_config.pop(BEAM_GRAPH_BATCH_SIZE_KEY, None)
-    else:
-        additional_config[BEAM_GRAPH_BATCH_SIZE_KEY] = gr_config.beam_graph_batch_size
-
-    if gr_config.beam_graph_widths is None:
-        additional_config.pop(BEAM_GRAPH_WIDTHS_KEY, None)
-    else:
-        additional_config[BEAM_GRAPH_WIDTHS_KEY] = list(gr_config.beam_graph_widths)
-
-    if gr_config.beam_max_width is None:
-        additional_config.pop(BEAM_MAX_WIDTH_KEY, None)
-    else:
-        additional_config[BEAM_MAX_WIDTH_KEY] = gr_config.beam_max_width
-
-    if gr_config.beam_online_batch_sizes == DEFAULT_ONLINE_BATCH_SIZES:
-        additional_config.pop(BEAM_ONLINE_BATCH_SIZES_KEY, None)
-    else:
-        additional_config[BEAM_ONLINE_BATCH_SIZES_KEY] = list(gr_config.beam_online_batch_sizes)
-
-    if gr_config.beam_max_decode_steps == _BEAM_MAX_DECODE_STEPS_DEFAULT:
-        additional_config.pop(BEAM_MAX_DECODE_STEPS_KEY, None)
-    else:
-        additional_config[BEAM_MAX_DECODE_STEPS_KEY] = gr_config.beam_max_decode_steps
-
-    if npu_decode_execution is None:
-        # Unset stays out of the serialized config; the runtime resolves it
-        # per platform at load time.
-        additional_config.pop(NPU_DECODE_EXECUTION_KEY, None)
-    else:
-        # Both explicit modes round-trip: an explicit 'cascade' opt-out must
-        # survive a write so it cannot be silently re-defaulted to xllm.
-        additional_config[NPU_DECODE_EXECUTION_KEY] = npu_decode_execution.value
-
-    beam_worker_decision = validate_beam_worker_decision(gr_config.beam_worker_decision)
-    if beam_worker_decision is None:
-        # Unset stays out of the serialized config; the driver resolves
-        # platform defaults before worker initialization.
-        additional_config.pop(BEAM_WORKER_DECISION_KEY, None)
-    else:
-        # Both explicit values round-trip (an opt-out must survive a write).
-        additional_config[BEAM_WORKER_DECISION_KEY] = beam_worker_decision
-
-    # Accepted only at ingress; never propagate a retired control to workers.
-    additional_config.pop(BEAM_ENGINE_DRIVEN_KEY, None)
-
-    if gr_config.beam_execution_mode is None:
-        additional_config.pop(BEAM_EXECUTION_MODE_KEY, None)
-    else:
-        additional_config[BEAM_EXECUTION_MODE_KEY] = gr_config.beam_execution_mode.value
-    if beam_sid_stage_vocab:
-        additional_config[BEAM_SID_STAGE_VOCAB_KEY] = True
-    else:
-        additional_config.pop(BEAM_SID_STAGE_VOCAB_KEY, None)
+    for item, spec in config_fields(GRConfig):
+        if spec.legacy_key is None:
+            continue
+        value = getattr(gr_config, item.name)
+        if should_emit(item, value, spec.legacy_emit):
+            additional_config[spec.legacy_key] = _primitive(value)
+        else:
+            additional_config.pop(spec.legacy_key, None)
 
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:

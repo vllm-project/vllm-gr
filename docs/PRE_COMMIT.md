@@ -80,11 +80,15 @@ checks completeness; mypy checks signatures, return types and policy types.
 
 The dedicated `cuda-stage` group in `tools/pre_commit/mypy.py` checks the contract,
 both implementations, the shared core, and all execution/startup binding modules
-together. Changing any member or the hook script selects this complete boundary,
+together. The V2 graph factories and resource/startup owner are explicit targets,
+along with the shared input and graph base classes they extend. Installation
+contracts, GC coordination and configuration/context support are explicit
+targets as well; routing tests pin these owners independently of the file list. Changing any member or the hook script selects this complete boundary,
 even with `--follow-imports skip`. Native internals outside it remain dynamic.
 `tests/tools/cuda_stage_typing_cases.py` supplies valid V1/V2 bindings and invalid
-return, constructor and policy types. Narrow expected-error annotations combined
-with `--warn-unused-ignores` make a weakened contract fail the same checker run.
+return, constructor and policy types, including the output-completion return
+type. Narrow expected-error annotations combined with `--warn-unused-ignores`
+make a weakened contract fail the same checker run.
 The group disables both cache reads and writes to avoid a mypy 1.11.1 placeholder
 serialization failure in these cyclic imports.
 

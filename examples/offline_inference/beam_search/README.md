@@ -418,51 +418,15 @@ determinism is not asserted. Captured context/KV/state-buffer addresses must sta
 unchanged, replay must resume for the final B=2, and N=1 must finish without Decode
 dispatches. This is a correctness test, not a profile or performance measurement.
 
-#### Open precision limitation: NPU-PREFILL-PADDING-001
+#### Padded NPU Prefill precision
 
-The exact-bucket regression narrows coverage; it **does not fix or certify padded
-Prefill precision**. Clear `VLLM_GR_TEST_PADDED_PREFILL` for the default test.
-The temporary layer/operator probes are not part of this submission; only small
-forward metadata and real replay counters are observed, without model hooks.
-The unequal-length eager-only public API test is also unchanged.
+Padding can change BF16 candidate order and scores. In the historical
+OneRec Qwen3 1.7B test on 2026-10-15, the same 290-token batch matched eager
+with an exact bucket but differed when padded to 384. Compiled execution
+at the padded shape also differed without replay. The accelerator model and
+runtime versions for this result were not recorded in this guide.
 
-Observed on 2026-10-15 with OneRec Qwen3 1.7B, BF16, TP=1, B=2, W=8, N=3,
-prefix caching enabled with independent request salts, and native compilation:
-
-| Actual Prefill / configuration | Observed strict comparison |
-| --- | --- |
-| 290 tokens, independent Prefill graph disabled; Beam FULL Decode retained | Passed |
-| 290 tokens, exact 290 bucket replay | Passed |
-| 290 tokens, single 384 bucket or multiple buckets selecting 384 | Failed; eager/graph ranks and scores differ; request 1 shares 7/8 candidates |
-| 290 tokens padded to 384, direct compiled execution without independent Prefill replay | Matches graph; still differs from eager |
-| 128+128 actual-token / 256-bucket regression | Passed: both requests have identical 8/8 ordered Beams and zero eager/graph score difference |
-
-The earliest observed mismatch is at layer 0 attention input Q/K; V is identical.
-Padding/shape-dependent execution reproduces the difference without replay, but
-the responsible operator is not isolated. The later layer-0 probe stopped on a
-missing `vllm.unquantized_gemm` observation in eager; fusion-on/off is **unverified**.
-The 290/384 evidence uses identical inputs, unlike the new equal-length regression.
-Passing the new test alone cannot prove a unique root cause or resolve this issue.
-Evidence logs: `npu_prefill_off_20261015_095103.log`,
-`npu_prefill_exact290_20261015_104950.log`,
-`npu_prefill_single384_20261015_110649.log`,
-`npu_prefill_384_noreplay_20261015_113506/run.log`, and
-`npu_layer0_384_20261015_144555/run.log` in the local `test_results` archive.
-
-The server run `npu_exact128x2_20261015_150212/run.log` finished with
-`1 passed, 16 warnings in 286.65s`. The native control and all three graph B=2
-runs reported an actual `256` Prefill replay. Prefill and both Decode stages'
-recorded arrays matched eager exactly; Decode FULL counts progressed 2 -> 4 -> 6.
-The intervening B=1 produced two expected `shape_miss` fallbacks, captured buffer
-addresses stayed stable, and N=1 completed without additional Decode dispatches.
-Cross-B eager B=1/B=2 remained diagnostic: 8/8 candidate overlap but different
-ordering, with maximum score difference 0.405815125. This is separate from same-B
-eager/graph parity. The elapsed 286.65s is whole-suite time, not inference latency.
-This hardware log predates diagnostic cleanup and carries no server Git SHA;
-the final cleaned submission must not be described as independently NPU-retested.
-
-Retain the original strict failing regression as an explicit opt-in (no xfail,
-skip, warning-only comparison, or relaxed tolerance). Run:
+Run the opt-in strict comparison in a prepared Ascend environment:
 
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
@@ -472,10 +436,8 @@ VLLM_GR_PREFILL_GRAPH_BUCKET_STEP=384 VLLM_GR_PREFILL_GRAPH_MAX_BUCKET=384 \
   tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
 ```
 
-For a same-input exact-bucket control, change both `384` values to `290`.
-Before merging, reviewers must explicitly accept this unresolved padded case;
-a green bounded regression is not a claim of full Prefill parity. Production
-padding behavior is unchanged by this test-scope adjustment.
+For the same-input exact-bucket control, set both bucket values to `290`.
+The default regression exercises a different, exact 256-token batch.
 
 ### Measure latency without profiling
 
@@ -495,17 +457,19 @@ inside the API is included. `--repeat` cannot be combined with `--profile-dir`.
 Without either option, the script still runs one batch.
 
 For NPU graph B=1/2/4, run this loop from the repository root. Each B starts a
-separate engine and captures its own fixed `(B, W)` shape:
+separate engine and captures its own fixed `(B, W)` shape. Set `CATALOG` to
+the triples JSON prepared in [Constraint Table artifact](#constraint-table-artifact).
 
 ```bash
 set -o pipefail
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+CATALOG=/absolute/path/to/constraint_triples.json
 BENCH_RUN="$PWD/test-results/graph_latency_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BENCH_RUN"
 for B in 1 2 4; do
   python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
     --model /path/to/OneRec_Qwen3_1.7B \
-    --catalog examples/offline_inference/beam_search/interactive_constraint_triples.json \
+    --catalog "$CATALOG" \
     --prompt tests/resources/single_one_rec_prompt.txt \
     --constraint-backend npu --execution graph \
     --batch-size "$B" --beam-width 128 --input-len 128 \
@@ -685,11 +649,12 @@ For NPU B=2/W=128, run from the repository root:
 ```bash
 set -o pipefail
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+CATALOG=/absolute/path/to/constraint_triples.json
 PROFILE_RUN="$PWD/test-results/bs2_bw128_profile_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$PROFILE_RUN/logs"
 python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
   --model /path/to/OneRec_Qwen3_1.7B \
-  --catalog examples/offline_inference/beam_search/interactive_constraint_triples.json \
+  --catalog "$CATALOG" \
   --prompt tests/resources/single_one_rec_prompt.txt \
   --constraint-backend npu --execution graph \
   --batch-size 2 --beam-width 128 --input-len 128 \

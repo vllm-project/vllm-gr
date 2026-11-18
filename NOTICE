@@ -86,8 +86,17 @@ is not changed by a source header:
   benchmarks/open_one_rec/qwen3_soft_switch.jinja2
   benchmarks/open_one_rec/qwen3_soft_switch.jinja2.license
 
-These notices concern the imported code and template; they do not grant rights
-to external evaluation datasets referenced by that code.
+The LLM-as-Judge prompts below are the upstream prompt constants moved out of
+the code into data files, each with a separate attribution file. Their text is
+unchanged; only the final space is stored as a newline and restored on load.
+Paths on the left are under benchmarks/open_one_rec/prompts/; the right column
+names the upstream constant under benchmarks/benchmark/tasks/v1_0/:
+  item_understand_wip_extraction.txt    item_understand/utils.py WIP_EXTRACTION_PROMPT
+  item_understand_wip_matching.txt      item_understand/utils.py WIP_MATCHING_PROMPT
+  rec_reason_evaluation.txt             rec_reason/utils.py EVALUATION_PROMPT
+
+These notices concern the imported code, template and prompts; they do not
+grant rights to external evaluation datasets referenced by that code.
 
 SMG gRPC schemas and generated bindings
 --------------------------------------

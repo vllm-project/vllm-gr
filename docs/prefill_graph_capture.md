@@ -2,7 +2,7 @@
 
 ModelRunner V1 and V2 have separate capture policies. Selecting V2 must not
 change V1's configuration or execution behavior. Both can capture B=1/2/4
-where admitted by `max_num_seqs`; V1 legacy Beam execution remains B=1.
+where admitted by `max_num_seqs`.
 
 Both runners default to the request-count policy `beam.online_batch_sizes`,
 whose default is `[1, 2, 4]`. An explicit policy such as `[1, 3, 7]` selects
@@ -14,7 +14,7 @@ or Decode capture. Capture counts are filtered by `max_num_seqs` in both runners
 
 ## ModelRunner V1: preserve the GR grid
 
-V1 retains the policy of `7ee1d95`. Its default GR grid runs from 128 to 8192
+The default V1 GR grid runs from 128 to 8192
 in steps of 128. `VLLM_GR_PREFILL_GRAPH_BUCKET_STEP` and
 `VLLM_GR_PREFILL_GRAPH_MAX_BUCKET` configure that grid. Native
 `cudagraph_capture_sizes` does not replace it. Explicit internal constructor

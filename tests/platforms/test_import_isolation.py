@@ -58,4 +58,118 @@ for module_name in (
     )
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_cuda_plugin_initialization_does_not_import_ascend() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    code = """
+import sys
+
+# On Ascend images, importing torch autoloads the torch_npu device backend
+# (torch >= 2.10 entry-point auto-loading) and importing vllm activates the
+# vendor ascend platform plugin during platform detection. Those vendor
+# imports are properties of the machine image, not of vllm-gr's backend
+# selection, so they cannot be forbidden here. The enforceable isolation
+# contract is that vllm-gr's own Ascend integration stays unloaded while the
+# CUDA provider initializes.
+blocked = ("vllm_gr.v1.ascend_compat", "vllm_gr.npu_spawn_patch")
+
+def reject_ascend(event, args):
+    # Metadata probes (find_spec) are allowed; importing the GR Ascend
+    # integration is not.
+    if event == "import" and args[0] in blocked:
+        raise AssertionError(f"unselected backend imported: {args[0]}")
+
+sys.addaudithook(reject_ascend)
+import vllm.platforms
+from vllm.platforms.interface import Platform
+
+# Synthetic device identity: exercise host initialization, not CUDA execution.
+platform = Platform()
+platform.device_type = "cuda"
+vllm.platforms.current_platform = platform
+from vllm_gr.platforms import loader
+loader.entry_points = lambda **kwargs: ()
+
+from vllm_gr.plugin import initialize_runtime
+first = initialize_runtime()
+assert first["patch_count"] > 0, first
+assert set(first["patches"].values()) == {"applied"}, first
+second = initialize_runtime()
+assert second["patch_count"] == 0, second
+assert set(second["patches"].values()) == {"already_applied"}, second
+assert not any(name in sys.modules for name in blocked)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "module_name",
+    [
+        "vllm_gr.v1.worker.gpu_postprocess_workspace",
+        "vllm_gr.v1.worker.gpu_model_runner_v2_patch",
+    ],
+)
+def test_shared_workspace_and_v2_do_not_import_v1_integration(module_name: str) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    code = """
+import importlib
+import importlib.abc
+import sys
+
+forbidden = {
+    "vllm_gr.v1.worker.model_runner_common",
+    "vllm_gr.v1.worker.gpu_model_runner_patch",
+    "vllm_gr.v1.worker.gpu_prefill_inputs",
+    "vllm_gr.v1.worker.npu_model_runner_patch",
+}
+
+class RejectInactiveIntegration(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in forbidden:
+            raise AssertionError(f"unexpected integration dependency: {fullname}")
+
+sys.meta_path.insert(0, RejectInactiveIntegration())
+importlib.import_module(sys.argv[1])
+assert not forbidden.intersection(sys.modules)
+"""
+    subprocess.run(
+        [sys.executable, "-c", code, module_name],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_runner_contracts_import_stays_hardware_free() -> None:
+    code = """
+import sys
+from vllm_gr.v1.worker import model_runner_contracts
+
+assert callable(model_runner_contracts.is_worker_runner_patched)
+for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
+             "vllm_gr.v1.worker.model_runner_common",
+             "vllm_gr.v1.worker.gpu_model_runner_v2_patch"):
+    assert name not in sys.modules, name
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )

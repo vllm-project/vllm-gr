@@ -21,7 +21,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
-from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 logger = init_logger(__name__)
 
@@ -81,14 +80,12 @@ class BeamAttentionMetadata:
     prefix_seqlens_kv_cpu: list | None = None
     prefix_cu_seqlens_kv_cpu: list | None = None
 
-    # Unique suffix split-gather channels
+    # Per-beam incremental suffix lengths
     suffix_cu_seqlens_q_device: torch.Tensor | None = None
     suffix_cu_seqlens_k_device: torch.Tensor | None = None
     suffix_seqlens_kv_device: torch.Tensor | None = None
     suffix_max_q_len: int = 0
     suffix_max_seq_len: int = 0
-    suffix_total_tokens: int = 0
-    suffix_slot_mapping_out: torch.Tensor | None = None
     suffix_seqlens_q_cpu: list | None = None
     suffix_cu_seqlens_q_cpu: list | None = None
     suffix_seqlens_kv_cpu: list | None = None
@@ -124,8 +121,7 @@ class BeamAttentionMetadata:
     seq_lens_cpu: list | None = None
 
     # --- Incremental decode fields ---
-    # When is_beam_decode is True and beam_session is available,
-    # the attention forward uses the incremental decode path.
+    # Beam decode requires an active session and persistent suffix KV pool.
     is_beam_decode: bool = False
     beam_active_mask: torch.Tensor | None = None
     beam_session: Any = None  # BeamSearchSession reference
@@ -139,6 +135,28 @@ class BeamAttentionMetadata:
     # Host proof that the current NPU batch routes every row in order. Graph
     # dispatch must preserve this layout: replay does not re-run Python guards.
     npu_prefix_rows_are_identity: bool = False
+
+
+def require_beam_decode_session(metadata: BeamAttentionMetadata) -> Any:
+    """Reject obsolete beam metadata before any attention/cache kernel runs."""
+    session = getattr(metadata, "beam_session", None)
+    if not getattr(metadata, "is_beam_decode", False) or session is None or not session.is_active:
+        raise RuntimeError("Beam decode requires an active beam session and KV pool")
+    if metadata.prefix_indices is not None and metadata.suffix_max_q_len != 1:
+        raise ValueError("Beam decode requires exactly one query token per beam")
+    return session
+
+
+def resolve_beam_pool(metadata: BeamAttentionMetadata, beam_pool: Any = None) -> Any:
+    """Resolve the explicit layer pool, or the session pool for direct callers."""
+    session = require_beam_decode_session(metadata)
+    if beam_pool is not None:
+        return beam_pool
+    layer_idx = getattr(metadata, "beam_layer_idx", 0)
+    pools = getattr(session, "pools", ())
+    if not 0 <= layer_idx < len(pools) or pools[layer_idx] is None:
+        raise RuntimeError("Beam decode requires a KV pool for the attention layer")
+    return pools[layer_idx]
 
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
@@ -159,6 +177,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         if (
             type(width) is not int
             or width < 1
+            or type(decode_step) is not int
+            or decode_step < 0
             or not batch
             or len(block_ids_by_request) != batch
             or any(type(length) is not int or length < 1 for length in prompt_lengths)
@@ -243,6 +263,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         Native execution uses block-aligned model/pool bounds. A matching
         measured profile enables bounded prefix-length graph buckets.
         """
+        if session is None or not session.is_active:
+            raise RuntimeError("Beam decode requires an active beam session and KV pool")
         rows = len(layout["positions"])
         batch = len(layout["prefix_lengths"])
         width = rows // batch
@@ -326,7 +348,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_cpu=list(layout["suffix_query"]),
             suffix_seqlens_kv_cpu=list(layout["suffix_lengths"]),
             suffix_cu_seqlens_kv_cpu=list(layout["suffix_offsets"]),
-            suffix_total_tokens=layout["suffix_offsets"][-1],
             incremental_suffix_kv_len=layout["suffix_lengths"][0],
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -573,8 +594,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         Without eviction a long-running server accumulates one entry per
         historical request in each sub-cache (cu_lists, views, layout,
         schedule, block_table_copied), so the builder sweeps them whenever a
-        NEW geometry is admitted.  ``empty_slot_out`` is keyed by device and
-        is deliberately left alone.
+        NEW geometry is admitted.
         """
         if geom_key is None:
             return
@@ -592,20 +612,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     bucket.discard(k)
                 else:
                     del bucket[k]
-
-    def _empty_slot_out(self, device) -> torch.Tensor:
-        """Per-device cached empty slot-mapping tensor.
-
-        Incremental decode never produces a suffix slot mapping (the pool
-        slice replaces the gather), so every decode step would otherwise pay
-        a fresh ``torch.empty(0)`` allocation for the same shapeless tensor.
-        """
-        cache = self._geometry_cache().setdefault("empty_slot_out", {})
-        empty = cache.get(device)
-        if empty is None:
-            empty = torch.empty(0, dtype=torch.int32, device=device)
-            cache[device] = empty
-        return empty
 
     def _cached_seqlens_views(
         self,
@@ -756,8 +762,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         beam_req_idxs = []
         beam_prefix_lens = []
         beam_widths = []
-        beam_decode_steps = []
-        beam_cache_lens = []
         beam_q_start_offsets = []
         beam_decode_step_list = []  # incremental decode step
         beam_pool_slots = []  # per beam-request slot index
@@ -782,10 +786,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
                 beam_prefix_lens.append(prefix_len)
                 beam_widths.append(mdata["beam_width"])
-                beam_decode_steps.append(mdata["beam_decode_steps"])
-                beam_cache_lens.append(cache_len)
                 beam_q_start_offsets.append(q_offset)
-                beam_decode_step_list.append(mdata.get("decode_step", 0))
+                beam_decode_step_list.append(mdata["decode_step"])
 
                 # Get pool slot for this request from the session registry
                 pool_slot = 0  # default for max_batch=1
@@ -804,8 +806,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             beam_req_idxs,
             beam_prefix_lens,
             beam_widths,
-            beam_decode_steps,
-            beam_cache_lens,
             beam_q_start_offsets,
             beam_decode_step_list,
             beam_pool_slots,
@@ -847,217 +847,80 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         beam_req_idxs,
         beam_prefix_lens,
         beam_widths,
-        beam_decode_steps,
-        beam_cache_lens,
         beam_q_start_offsets,
         q_starts,
-        common_attn_metadata,
-        is_incremental: bool = False,
-        beam_decode_step_list: list | None = None,
+        beam_decode_step_list,
+        *,
         geom_key=None,
     ):
-        """Builds attention mapping metadata for all active beams in a batch.
-
-        This method decomposes the query token allocations (chunk budgets) for
-        each request into prefix (shared history) and suffix (beam-specific lookahead)
-        computations.
-
-        When is_incremental=True (incremental decode path), each beam contributes
-        1 query token and decode_step+1 suffix KV tokens. The suffix slot mapping
-        is not needed (pool slice is used instead of gather).
-        """
-        # Prefix attention tracking lists
-        beam_prefix_indices = []
-        prefix_seqlens_q_cpu = []
-        prefix_seqlens_kv_cpu = []
-        prefix_req_idxs_cpu = []
-
-        # Suffix attention tracking lists
-        suffix_seqlens_q_cpu = []
-        suffix_seqlens_kv_cpu = []
-        beam_suffix_slot_mapping_out_list = []
-
-        max_prefix_len = max(beam_prefix_lens) if beam_prefix_lens else 0
-        max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
-
-        out_slot = 0
-        # Incremental decode emits ``prefix_indices`` as a single contiguous
-        # ``range(q_start, q_start + w)`` per request, so the device-side
-        # strided-arange fast path in ``_create_beam_tensors`` is always valid
-        # and its per-element ``all()`` scan can be skipped.  The recompute
-        # path merges arbitrary prefix groups and must keep the scan.
-        incremental_only = True
-        for idx, (req_idx, prefix_len, w, steps, cache_len, q_offset) in enumerate(
-            zip(
-                beam_req_idxs,
-                beam_prefix_lens,
-                beam_widths,
-                beam_decode_steps,
-                beam_cache_lens,
-                beam_q_start_offsets,
-            )
+        """Build one query per beam, sharing prefix KV and reading suffix KV from pools."""
+        prefix_indices = []
+        prefix_q = []
+        prefix_kv = []
+        suffix_q = []
+        suffix_kv = []
+        prefix_req_idxs = []
+        contiguous = True
+        previous_end = None
+        for req_idx, prefix_len, width, offset, step in zip(
+            beam_req_idxs,
+            beam_prefix_lens,
+            beam_widths,
+            beam_q_start_offsets,
+            beam_decode_step_list,
+            strict=True,
         ):
-            q_start = q_starts[req_idx] + q_offset
-            q_end = q_starts[req_idx + 1]
-            q_len = q_end - q_start
-            if w == 0 or steps == 0 or q_len <= 0:
+            start = q_starts[req_idx] + offset
+            end = q_starts[req_idx + 1]
+            if start == end:
+                # A prefix-only chunk has no beam queries yet.
                 continue
+            if end - start != width:
+                raise ValueError("Beam decode requires exactly one query token per beam")
+            contiguous = contiguous and (previous_end is None or previous_end == start)
+            previous_end = end
+            prefix_indices.extend(range(start, end))
+            prefix_q.append(width)
+            prefix_kv.append(prefix_len)
+            prefix_req_idxs.append(req_idx)
+            suffix_q.extend([1] * width)
+            suffix_kv.extend([step + 1] * width)
 
-            # --- Incremental decode path ---
-            if is_incremental and beam_decode_step_list is not None:
-                decode_step = beam_decode_step_list[idx]
-                # Each beam: 1 query token, decode_step+1 suffix KV tokens
-                # Prefix: all beams share the same prefix_len
-                # List-multiplication extends in C (vs a per-beam Python append
-                # loop that dominates the host time of _build_beam_mappings for
-                # beam_width=128 on every decode step).
-                suffix_seqlens_q_cpu.extend([1] * w)
-                suffix_seqlens_kv_cpu.extend([decode_step + 1] * w)
-
-                # All beams share the same prefix group
-                beam_prefix_indices.extend(range(q_start, q_start + w))
-                prefix_seqlens_q_cpu.append(w)  # total query tokens for prefix
-                # Remainder-block analysis (PREFIX_REMAINDER_BLOCK_ANALYSIS.md):
-                # the trailing partial-block tokens belong to the prefix
-                # (shared KV), NOT to the suffix. Their KV is written to the
-                # paged cache during prefill, and prefix FA reads exactly
-                # prefix_len KV via seqused_k, so FA ignores the remainder-block
-                # padding automatically. Using the exact prefix_len (not the
-                # block-aligned length) preserves those trailing prefix tokens.
-                prefix_seqlens_kv_cpu.append(prefix_len)
-                prefix_req_idxs_cpu.append(req_idx)
-                continue
-
-            # --- Standard (recompute) path ---
-            incremental_only = False
-            q_curr = q_start
-            chunk_budget = q_len
-            prefix_groups = []  # Elements: [group_q_start, group_q_len, group_cache_len]
-
-            b_prefix_len = min(cache_len, prefix_len)
-            b_cache_len = cache_len
-            # Loop 1: Partition query tokens across the w active beams for this request
-            for b in range(w):
-                if chunk_budget <= 0:
-                    break
-
-                b_uncached, b_suffix_len, _b_past_suffix, _b_physical = _compute_beam_bounds(
-                    b, prefix_len, b_cache_len, steps, chunk_budget
-                )
-
-                full_mapping = np.arange(out_slot, out_slot + b_suffix_len, dtype=np.int32)
-
-                # Invariant: Merge adjacent beams that share the exact same prefix length
-                # into a single prefix group to parallelize key/value lookup during attention.
-                if prefix_groups and prefix_groups[-1][2] == b_prefix_len:
-                    prefix_groups[-1][1] += b_uncached
-                else:
-                    prefix_groups.append([q_curr, b_uncached, b_prefix_len])
-
-                beam_suffix_slot_mapping_out_list.extend(full_mapping)
-                suffix_seqlens_q_cpu.append(b_uncached)
-                suffix_seqlens_kv_cpu.append(b_suffix_len)
-
-                # Advance state for the next beam
-                b_cache_len += b_uncached
-                q_curr += b_uncached
-                chunk_budget -= b_uncached
-                out_slot += b_uncached
-                b_prefix_len = min(b_cache_len, prefix_len)
-
-            # Loop 2: Record grouped prefix indexing lists for the attention kernel
-            for group_q_start, group_q_len, group_cache_len in prefix_groups:
-                beam_prefix_indices.extend(range(group_q_start, group_q_start + group_q_len))
-                prefix_seqlens_q_cpu.append(group_q_len)
-                prefix_seqlens_kv_cpu.append(group_cache_len)
-                prefix_req_idxs_cpu.append(req_idx)
-
-        # Helper to compute prefix cumulative sums
-        prefix_cu_seqlens_q_cpu = None
-        prefix_cu_seqlens_kv_cpu = None
-        suffix_cu_seqlens_q_cpu = None
-        suffix_cu_seqlens_kv_cpu = None
-
-        # Pure incremental decode keeps the three non-step cumulative sums
-        # (prefix_cu_seqlens_q / prefix_cu_seqlens_kv / suffix_cu_seqlens_q)
-        # fixed per geometry, so a geom_key hit reuses them instead of paying a
-        # numpy cumsum + tolist on every decode step.  The step-dependent
-        # suffix_cu_seqlens_kv is always recomputed below.
-        fixed_cached = None
-        if geom_key is not None:
-            fixed_cached = self._geometry_cache().setdefault("cu_lists", {}).get(geom_key)
-        if fixed_cached is not None:
-            prefix_cu_seqlens_q_cpu, prefix_cu_seqlens_kv_cpu, suffix_cu_seqlens_q_cpu = (
-                fixed_cached
+        fixed_cache = self._geometry_cache().setdefault("cu_lists", {})
+        fixed = fixed_cache.get(geom_key) if geom_key is not None else None
+        if fixed is None:
+            fixed = (
+                np.cumsum(prefix_q).tolist() if prefix_q else None,
+                np.cumsum(prefix_kv).tolist() if prefix_kv else None,
+                list(range(1, len(suffix_q) + 1)) if suffix_q else None,
             )
-        else:
-            if prefix_seqlens_q_cpu:
-                prefix_cu_seqlens_q_cpu = np.cumsum(prefix_seqlens_q_cpu).tolist()
-                prefix_cu_seqlens_kv_cpu = np.cumsum(prefix_seqlens_kv_cpu).tolist()
-            if suffix_seqlens_q_cpu:
-                suffix_cu_seqlens_q_cpu = np.cumsum(suffix_seqlens_q_cpu).tolist()
-            if geom_key is not None and suffix_seqlens_kv_cpu:
-                # Only cache when suffix_seqlens_kv is geometry-fixed (incremental
-                # decode would make it step-dependent and cache it wrongly).
-                cache = self._geometry_cache().setdefault("cu_lists", {})
-                cache[geom_key] = (
-                    prefix_cu_seqlens_q_cpu,
-                    prefix_cu_seqlens_kv_cpu,
-                    suffix_cu_seqlens_q_cpu,
+            if geom_key is not None and suffix_q:
+                fixed_cache[geom_key] = fixed
+        # Mixed batches need not have the same Decode step for every request.
+        suffix_cu_kv = None
+        if suffix_kv:
+            if geom_key is not None:
+                step_length = suffix_kv[0]
+                suffix_cu_kv = list(
+                    range(step_length, (len(suffix_kv) + 1) * step_length, step_length)
                 )
-        if suffix_seqlens_kv_cpu:
-            if incremental_only and beam_decode_step_list:
-                # cumsum([s+1]*w) == [s+1, 2(s+1), ..., w(s+1)]: a strided
-                # range materializes it directly, skipping the numpy cumsum
-                # + tolist pair (the only step-dependent host list on the
-                # hot decode path).
-                s = beam_decode_step_list[0] + 1
-                w_kv = len(suffix_seqlens_kv_cpu)
-                suffix_cu_seqlens_kv_cpu = list(range(s, (w_kv + 1) * s, s))
             else:
-                suffix_cu_seqlens_kv_cpu = np.cumsum(suffix_seqlens_kv_cpu).tolist()
-
-        # Scalar reductions for ``_create_beam_tensors``.  The incremental
-        # path knows them analytically (single prefix group of w tokens, one
-        # query token per beam); the recompute path falls back to the list
-        # max / contiguity scan (it is not the hot decode loop).
-        if incremental_only:
-            prefix_indices_contiguous = True
-            prefix_max_q_len = prefix_seqlens_q_cpu[0] if prefix_seqlens_q_cpu else 0
-            suffix_max_q_len = 1
-            # suffix_seqlens_kv is [decode_step+1]*w on this path, so the max
-            # is the step value itself (no list scan in _create_beam_tensors).
-            suffix_max_seq_len = (
-                beam_decode_step_list[0] + 1
-                if beam_decode_step_list and suffix_seqlens_kv_cpu
-                else 0
-            )
-        else:
-            prefix_indices_contiguous = bool(beam_prefix_indices) and all(
-                beam_prefix_indices[i] == beam_prefix_indices[0] + i
-                for i in range(len(beam_prefix_indices))
-            )
-            prefix_max_q_len = max(prefix_seqlens_q_cpu) if prefix_seqlens_q_cpu else 0
-            suffix_max_q_len = max(suffix_seqlens_q_cpu) if suffix_seqlens_q_cpu else 0
-            suffix_max_seq_len = max(suffix_seqlens_kv_cpu) if suffix_seqlens_kv_cpu else 0
-
+                suffix_cu_kv = np.cumsum(suffix_kv).tolist()
+        max_prefix_len = max(beam_prefix_lens, default=0)
         return (
-            beam_prefix_indices,
-            prefix_seqlens_q_cpu,
-            prefix_seqlens_kv_cpu,
-            suffix_seqlens_q_cpu,
-            suffix_seqlens_kv_cpu,
-            prefix_req_idxs_cpu,
-            beam_suffix_slot_mapping_out_list,
-            prefix_cu_seqlens_q_cpu,
-            prefix_cu_seqlens_kv_cpu,
-            suffix_cu_seqlens_q_cpu,
-            suffix_cu_seqlens_kv_cpu,
-            max_prefix_blocks_count,
-            prefix_indices_contiguous,
-            prefix_max_q_len,
-            suffix_max_q_len,
-            suffix_max_seq_len,
+            prefix_indices,
+            prefix_q,
+            prefix_kv,
+            suffix_q,
+            suffix_kv,
+            prefix_req_idxs,
+            *fixed,
+            suffix_cu_kv,
+            (max_prefix_len + self.block_size - 1) // self.block_size,
+            contiguous,
+            max(prefix_q, default=0),
+            1 if suffix_q else 0,
+            max(suffix_kv, default=0),
         )
 
     def _pack_int32_to_dev(
@@ -1190,7 +1053,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         suffix_cu_seqlens_q_cpu,
         suffix_cu_seqlens_kv_cpu,
         suffix_seqlens_kv_cpu,
-        suffix_slot_mapping_out_list,
         prefix_req_idxs_cpu,
         max_prefix_blocks_count,
         device,
@@ -1210,9 +1072,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             ) = None
             prefix_max_q_len = prefix_max_seq_len = 0
             suffix_cu_seqlens_q_device = suffix_cu_seqlens_k_device = suffix_seqlens_kv_device = (
-                suffix_slot_mapping_out
-            ) = None
-            suffix_max_q_len = suffix_max_seq_len = suffix_total_tokens = 0
+                None
+            )
+            suffix_max_q_len = suffix_max_seq_len = 0
             prefix_scheduler_metadata = None
             return (
                 prefix_indices_tensor,
@@ -1222,9 +1084,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 prefix_max_q_len,
                 prefix_block_table,
                 suffix_seqlens_kv_device,
-                suffix_slot_mapping_out,
                 suffix_max_seq_len,
-                suffix_total_tokens,
                 suffix_cu_seqlens_q_device,
                 suffix_cu_seqlens_k_device,
                 suffix_max_q_len,
@@ -1251,7 +1111,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # from _build_beam_mappings (True only on the incremental path,
             # where each request contributes one ``range(q_start, q_start+w)``);
             # callers that do not supply it fall back to the per-element scan,
-            # and anything non-contiguous (multi-request recompute layout)
+            # and anything non-contiguous (beam rows interleaved with standard rows)
             # falls back to the host list transfer.
             if num_prefix and (
                 prefix_indices_contiguous
@@ -1307,22 +1167,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_block_table = common_attn_metadata.block_table_tensor[
                 prefix_req_idxs_cpu, :max_prefix_blocks_count
             ].contiguous()
-
-        if suffix_slot_mapping_out_list:
-            suffix_total_tokens = len(suffix_slot_mapping_out_list)
-            if num_prefix > 0:
-                suffix_map_tensor = torch.tensor(
-                    suffix_slot_mapping_out_list, dtype=torch.long, device=device
-                ).clamp_(0, num_prefix - 1)
-                global_chunk_token_indices = prefix_indices_tensor[suffix_map_tensor]
-                suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
-                    global_chunk_token_indices
-                ].to(dtype=torch.int32)
-            else:
-                suffix_slot_mapping_out = self._empty_slot_out(device)
-        else:
-            suffix_total_tokens = 0
-            suffix_slot_mapping_out = self._empty_slot_out(device)
 
         if self._fixed_buffers:
             num_prefix_groups = len(prefix_seqlens_kv_cpu)
@@ -1441,9 +1285,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_max_q_len,
             prefix_block_table,
             suffix_seqlens_kv_device,
-            suffix_slot_mapping_out,
             suffix_max_seq_len,
-            suffix_total_tokens,
             suffix_cu_seqlens_q_device,
             suffix_cu_seqlens_k_device,
             suffix_max_q_len,
@@ -1486,24 +1328,46 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         # Get beam_session early so _segment_requests can use it for slot lookup
         beam_session = beam_info.get("beam_session") if beam_info else None
 
-        # Check if we have an active beam session for incremental decode.
-        # Derived directly from the SCHEDULED requests' beam_data (not from
-        # _segment_requests output) so the geometry-hit fast path below can
-        # skip segmentation entirely.
-        is_incremental = (
-            beam_session is not None
-            and beam_session.is_active
-            and any(
-                (m := beam_data.get(rid)) is not None
-                and m.get("is_beam_decode", False)
-                and "decode_step" in m
-                for rid in req_ids
-            )
-        )
+        # Validate scheduled beam requests before either metadata construction or
+        # a geometry-cache hit. Old suffix-recompute metadata is not supported.
+        is_incremental = False
+        for index, req_id in enumerate(req_ids[:num_reqs]):
+            mdata = beam_data.get(req_id)
+            if not mdata or not mdata.get("is_beam_decode", False):
+                continue
+            is_incremental = True
+            if beam_session is None or not beam_session.is_active:
+                raise RuntimeError("Beam decode requires an active beam session and KV pool")
+            step = mdata.get("decode_step")
+            width = mdata.get("beam_width")
+            if type(step) is not int or step < 0:
+                raise ValueError("Beam decode requires a nonnegative integer decode_step")
+            if type(width) is not int or width < 1:
+                raise ValueError("Beam decode requires a positive integer beam_width")
+            # Pure Decode must fit its physical rows even when a cached layout
+            # would otherwise bypass _build_beam_mappings. Prefix chunks are
+            # segmented separately below, preserving their standard rows.
+            if (
+                mdata["cache_len"] >= mdata["prefix_len"]
+                and q_starts[index + 1] - q_starts[index] != width
+            ):
+                raise ValueError("Beam decode requires exactly one query token per beam")
 
         geom_key = self._geom_cache_key(
             num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list, is_incremental
         )
+        if (
+            is_incremental
+            and len(
+                {
+                    beam_data[rid]["decode_step"]
+                    for rid in req_ids[:num_reqs]
+                    if beam_data.get(rid, {}).get("is_beam_decode", False)
+                }
+            )
+            > 1
+        ):
+            geom_key = None
         # Sweep entries left behind by finished sessions: keys whose request
         # ids no longer overlap the current batch will never be read again.
         self._evict_stale_geometry_entries(geom_key)
@@ -1525,8 +1389,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 beam_req_idxs,
                 beam_prefix_lens,
                 beam_widths,
-                beam_decode_steps,
-                beam_cache_lens,
                 beam_q_start_offsets,
                 beam_pool_slots,
                 prefix_seqlens_q_cpu,
@@ -1568,15 +1430,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_req_idxs = []
             std_cu_seqlens_q_cpu = None
             std_cu_seqlens_kv_cpu = None
-            suffix_slot_mapping_out_list = []
         else:
             (
                 std_reqs,
                 beam_req_idxs,
                 beam_prefix_lens,
                 beam_widths,
-                beam_decode_steps,
-                beam_cache_lens,
                 beam_q_start_offsets,
                 beam_decode_step_list,
                 beam_pool_slots,
@@ -1627,7 +1486,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 suffix_seqlens_q_cpu,
                 suffix_seqlens_kv_cpu,
                 prefix_req_idxs_cpu,
-                suffix_slot_mapping_out_list,
                 prefix_cu_seqlens_q_cpu,
                 prefix_cu_seqlens_kv_cpu,
                 suffix_cu_seqlens_q_cpu,
@@ -1641,17 +1499,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 beam_req_idxs,
                 beam_prefix_lens,
                 beam_widths,
-                beam_decode_steps,
-                beam_cache_lens,
                 beam_q_start_offsets,
                 q_starts,
-                common_attn_metadata,
-                is_incremental=is_incremental,
-                beam_decode_step_list=beam_decode_step_list,
+                beam_decode_step_list,
                 geom_key=geom_key,
             )
             # Register the layout for the geometry-hit fast path.  Only the
-            # pure incremental case is eligible (mixed/recompute batches keep
+            # pure incremental case is eligible (mixed batches keep
             # the per-frame reconstruction).
             if geom_key is not None and is_incremental and not std_reqs:
                 geom_layout_cache.clear()
@@ -1659,8 +1513,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     beam_req_idxs,
                     beam_prefix_lens,
                     beam_widths,
-                    beam_decode_steps,
-                    beam_cache_lens,
                     beam_q_start_offsets,
                     beam_pool_slots,
                     prefix_seqlens_q_cpu,
@@ -1702,9 +1554,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_max_q_len,
             prefix_block_table,
             suffix_seqlens_kv_device,
-            suffix_slot_mapping_out,
             suffix_max_seq_len,
-            suffix_total_tokens,
             suffix_cu_seqlens_q_device,
             suffix_cu_seqlens_k_device,
             suffix_max_q_len,
@@ -1719,7 +1569,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_cpu,
             suffix_cu_seqlens_kv_cpu,
             suffix_seqlens_kv_cpu,
-            suffix_slot_mapping_out_list,
             prefix_req_idxs_cpu,
             max_prefix_blocks_count,
             device,
@@ -1789,8 +1638,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_seqlens_kv_device=suffix_seqlens_kv_device,
             suffix_max_q_len=suffix_max_q_len,
             suffix_max_seq_len=suffix_max_seq_len,
-            suffix_total_tokens=suffix_total_tokens,
-            suffix_slot_mapping_out=suffix_slot_mapping_out,
             suffix_seqlens_q_cpu=suffix_seqlens_q_cpu,
             suffix_cu_seqlens_q_cpu=suffix_cu_seqlens_q_cpu,
             suffix_seqlens_kv_cpu=suffix_seqlens_kv_cpu,

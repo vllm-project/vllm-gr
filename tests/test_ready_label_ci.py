@@ -261,6 +261,13 @@ class TestReadyLabelCI(unittest.TestCase):
                             expected,
                         )
 
+    @pytest.mark.l1  # type: ignore[misc]
+    def test_reviews_do_not_trigger_validation(self) -> None:
+        for filename, workflow in self.workflows.items():
+            with self.subTest(workflow=filename):
+                triggers = workflow.get("on", workflow.get(True))
+                self.assertNotIn("pull_request_review", triggers)
+
     def test_manual_dispatch_remains_enabled_without_push(self) -> None:
         for workflow in self.workflows.values():
             triggers = workflow.get("on", workflow.get(True))

@@ -26,6 +26,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
+    BeamSequenceColumns,
 )
 from vllm_gr.v1.beam.beam_decision import run_beam_decision_candidates
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
@@ -120,7 +121,7 @@ class NPUEagerBeamStageRunner:
                     plan.execution, self.attention_batch.sessions
                 )
             return
-        from vllm_gr.v1.worker.model_runner_common import (
+        from vllm_gr.v1.worker.gr_context import (
             _create_beam_context,
             _get_gr_config,
         )
@@ -451,7 +452,9 @@ class NPUEagerBeamStageRunner:
         plan = self.pending_plan
         if grammar_output is not None or plan is None or self.logits is None:
             raise RuntimeError("NPU GR sample requires one pending stage and no grammar")
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         stage_metadata = self._metadata(self.worker._current_scheduler_output)
         if _get_gr_config(self.worker).constrained_generation is False:
@@ -602,7 +605,9 @@ class NPUEagerBeamStageRunner:
             dtype=torch.float32,
             device=logits.device,
         )
-        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+        from vllm_gr.v1.worker.gr_context import (
+            _get_gr_config,
+        )
 
         if getattr(_get_gr_config(self.worker), "beam_sid_stage_vocab", False):
             from vllm_gr.ops.npu.sid_stage_vocab import select_sid_stage_candidates
@@ -740,23 +745,31 @@ class NPUEagerBeamStageRunner:
             pieces.append(parents[:, :, :steps].to(torch.int32).contiguous().reshape(-1))
         pieces.append(scores.to(torch.float32).contiguous().reshape(-1).view(torch.int32))
         packed = torch.cat(pieces).to("cpu")
-        sequence_rows = packed[:history_words].view(batch, width, steps).tolist()
+        params = request.beam_params
+        stop_ids = set(params.stop_token_ids) if not params.ignore_stop_tokens else set()
+        # Reuse the existing wire protocol after the existing packed D2H. Small
+        # results and stop-aware histories keep the row representation. Public
+        # clients still materialize every sequence before returning to callers.
+        use_columns = (
+            min(width, options.num_return_sequences) >= 64
+            and not stop_ids
+            and steps > 0
+            and steps == getattr(params, "max_tokens", None)
+        )
+        sequence_view = packed[:history_words].view(batch, width, steps)
+        sequence_rows = None if use_columns else sequence_view.tolist()
         parent_rows = None
+        parent_view = None
         score_offset = history_words
         if include_parents:
-            parent_rows = (
-                packed[history_words : 2 * history_words].view(batch, width, steps).tolist()
-            )
+            parent_view = packed[history_words : 2 * history_words].view(batch, width, steps)
+            parent_rows = None if use_columns else parent_view.tolist()
             score_offset += history_words
-        score_rows = (
-            packed[score_offset : score_offset + score_words]
-            .view(torch.float32)
-            .view(batch, width)
-            .tolist()
+        score_view = (
+            packed[score_offset : score_offset + score_words].view(torch.float32).view(batch, width)
         )
-        params = request.beam_params
+        score_rows = score_view.tolist()
         outputs = []
-        stop_ids = set(params.stop_token_ids) if not params.ignore_stop_tokens else set()
         for row, item in enumerate(request.items):
             ranked = []
             prompt_length = (
@@ -805,6 +818,32 @@ class NPUEagerBeamStageRunner:
                     )
                 )
             ranked.sort(key=lambda value: (value[0], value[1], -value[2]), reverse=True)
+            if use_columns and ranked:
+                selected_indices = [value[2] for value in ranked[: options.num_return_sequences]]
+                outputs.append(
+                    BeamRequestOutput(
+                        item.item_index,
+                        item.request.request_id,
+                        BeamSequenceColumns(
+                            count=len(selected_indices),
+                            steps=steps,
+                            token_ids=sequence_view.numpy()[row, selected_indices]
+                            .astype("<i4", copy=False)
+                            .tobytes(),
+                            cumulative_logprobs=score_view.numpy()[row, selected_indices]
+                            .astype("<f4", copy=False)
+                            .tobytes()
+                            if options.include_cumulative_logprob
+                            else None,
+                            parent_beam_indices=parent_view.numpy()[row, selected_indices]
+                            .astype("<i4", copy=False)
+                            .tobytes()
+                            if parent_view is not None
+                            else None,
+                        ),
+                    )
+                )
+                continue
             selected = []
             for _, score, beam, length, stop_index in ranked[: options.num_return_sequences]:
                 token_ids = sequence_rows[row][beam]

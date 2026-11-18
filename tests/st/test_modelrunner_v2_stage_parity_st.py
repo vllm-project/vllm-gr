@@ -120,7 +120,9 @@ class OneRecV2ParityWorkerExtension:
 
     def onerec_v2_parity_snapshot(self) -> dict[str, Any]:
         from tests.st.test_onerec_v1_scheduler_st import _worker_snapshot
-        from vllm_gr.v1.worker.model_runner_common import get_beam_graph_runtime_stats
+        from vllm_gr.v1.worker.gr_context import (
+            get_beam_graph_runtime_stats,
+        )
 
         snapshot = _worker_snapshot(self)
         if snapshot["retired"]:

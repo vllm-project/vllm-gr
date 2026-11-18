@@ -13,11 +13,31 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm_gr import npu_spawn_patch, pangu_compat
+from vllm_gr import pangu_compat
 from vllm_gr.ops import sliced_logits_patch
-from vllm_gr.v1 import ascend_compat
+from vllm_gr.v1.attention import selector_patch
 
 logger = logging.getLogger("vllm_gr.patch")
+
+# Semantic ownership, independent of which process orchestrates an installer.
+# Built-in providers declare their hardware-owned IDs in ``patch_ids``.
+# These independent architectural assertions are checked against the authoritative
+# docs/patch_inventory.yaml; they do not drive installation. See the ownership
+# rationale in docs/runtime_patch_inventory.md.
+CORE_PATCH_IDS = (
+    "GR-PATCH-000",
+    "GR-PATCH-001",
+    "GR-PATCH-003",
+    "GR-PATCH-004",
+    "GR-PATCH-005",
+    "GR-PATCH-007",
+    "GR-PATCH-008",
+    "GR-PATCH-009",
+    "GR-PATCH-010",
+    "GR-PATCH-013",
+    "GR-PATCH-015",
+    "GR-PATCH-020",
+)
 
 
 class BeamPatchStatus(str, Enum):
@@ -540,19 +560,27 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
 def _apply_patches(force: bool = False) -> int:
     """Apply all runtime patches needed by vllm-gr."""
+    from vllm_gr.platforms.loader import activate_current_backend
+
+    # re_apply_patches is also called directly by fresh worker processes.
+    provider = activate_current_backend()
     # ModelConfig construction happens before model loading, so preserve the
     # official Pangu tied-weight layout at the earliest runtime boundary.
     pangu_count = int(pangu_compat.apply_pangu_tied_embeddings_patch())
-    # Install the NPU-aware spawn guard before anything can create worker
-    # processes, so engine startup inherits the corrected start-method choice.
-    npu_spawn_count = int(npu_spawn_patch.apply_npu_spawn_patch())
-    ascend_attn_count = ascend_compat.apply_ascend_attention_backend_patch(force=force)
-    # Import/patch NPUWorker before the beam patch tries to access
-    # NPUModelRunner. vllm-ascend's worker module deliberately initializes
-    # vllm_ascend.ops first, avoiding an import-order cycle through device_op.
-    npu_worker_count = ascend_compat.patch_npu_worker_init_device()
+    # CUSTOM selection is shared by CUDA and Ascend. Install it before a
+    # provider imports its native worker; it must not become an NPU-only hook.
+    attention_count = selector_patch.apply_custom_attention_backend_patch(force=force)
+    try:
+        # The selected provider installs its early hooks before the Beam
+        # plan can discover ModelRunner classes or create worker processes.
+        backend_count: int = provider.apply_runtime_patches(force=force)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Runtime patches for backend {provider.device_type!r} failed; "
+            "initialization may be partial, restart the process"
+        ) from exc
     beam_count = _apply_gr_beam_patches(force=force)
-    return pangu_count + npu_spawn_count + ascend_attn_count + npu_worker_count + beam_count
+    return pangu_count + attention_count + backend_count + beam_count
 
 
 def re_apply_patches() -> int:

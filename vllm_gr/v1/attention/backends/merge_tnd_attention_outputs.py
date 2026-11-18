@@ -36,41 +36,6 @@ def interleaved_pool_base(k_cache, v_cache):
         return None
 
 
-def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping_out):
-    """
-    Pure PyTorch equivalent of the paged_kv_to_contig_suffix_kernel.
-    Replaces indirect pointer math with vectorized advanced indexing.
-
-    Args:
-        k_cache: Tensor of shape [num_blocks, block_size, num_heads, head_dim]
-        v_cache: Tensor of shape [num_blocks, block_size, num_heads, head_dim]
-        slot_mapping_out: Indices indicating which slots to extract
-    """
-    num_heads, head_dim = k_cache.shape[2], k_cache.shape[3]
-
-    base = interleaved_pool_base(k_cache, v_cache)
-    if base is not None:
-        # K/V-interleaved pool (vllm-ascend 0.30): the flat ``.view`` below
-        # is not expressible on the strided per-layer views. Gather by
-        # (block, half, offset) directly from the contiguous base instead.
-        block = k_cache.shape[1]
-        flat = slot_mapping_out.reshape(-1)
-        block_idx = torch.div(flat, block, rounding_mode="floor")
-        token_idx = flat - block_idx * block
-        return base[block_idx, 0, token_idx], base[block_idx, 1, token_idx]
-
-    # 1. Collapse paged blocks [num_blocks, block_size, heads, dim]
-    # into a flat token space [total_physical_slots, heads, dim]
-    k_flat = k_cache.view(-1, num_heads, head_dim)
-    v_flat = v_cache.view(-1, num_heads, head_dim)
-
-    # 2. Vectorized gather: Selects all matching token rows across all heads/dimensions
-    out_k = k_flat[slot_mapping_out]
-    out_v = v_flat[slot_mapping_out]
-
-    return out_k, out_v
-
-
 def merge_tnd_attention_outputs(
     out1: torch.Tensor, lse1: torch.Tensor, out2: torch.Tensor, lse2: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:

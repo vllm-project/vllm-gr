@@ -164,18 +164,16 @@ def check_ascend_environment(*, require_npu_platform: bool = False) -> dict[str,
 
 
 def check_environment() -> dict[str, str]:
-    """Validate the runtime selected by vLLM's current platform.
+    """Activate and validate the provider selected by native vLLM.
 
-    Keep platform-specific dispatch at the environment-check boundary so
-    runtime entry points do not need to know which accelerator dependencies
-    are required.  In particular, non-NPU platforms must not import or
-    validate the optional Ascend runtime.
+    Providers call the leaf version/environment checks above, not this
+    dispatcher. Unknown platforms fail through the registry before patches
+    are applied; unselected vendor runtimes are never validated here.
     """
-    from vllm.platforms import current_platform
+    from vllm_gr.platforms.loader import activate_current_backend
 
-    if str(current_platform.device_type) == "npu":
-        return check_ascend_environment()
-    return check_runtime_versions()
+    report: dict[str, str] = activate_current_backend().check_environment()
+    return report
 
 
 def check_opencv_env() -> None:
