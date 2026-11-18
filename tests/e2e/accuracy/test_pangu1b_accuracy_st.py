@@ -26,9 +26,9 @@ from unittest import mock
 
 import pytest
 
-from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
+from tests.e2e.pangu1b_st_common import get_model_path, require_pangu_st_runtime
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATASET = ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
 DEFAULT_MIN_ACCURACY = os.environ.get(
     "PANGU1B_OFFLINE_ACCURACY_THRESHOLD",
@@ -126,7 +126,7 @@ class TestPangu1bAccuracyUnitHooks(unittest.TestCase):
     def test_require_pangu_st_runtime_skips_without_model_path(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch(
-                "tests.st.pangu1b_st_common.has_vllm",
+                "tests.e2e.pangu1b_st_common.has_vllm",
                 return_value=True,
             ):
                 with self.assertRaises(unittest.SkipTest):

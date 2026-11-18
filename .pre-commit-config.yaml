@@ -61,6 +61,8 @@ repos:
     rev: v0.47.0
     hooks:
     - id: markdownlint
+      # Keep nodeenv from selecting a prerelease when bootstrapping this hook.
+      language_version: lts
       exclude: '.*\.inc\.md'
 
 

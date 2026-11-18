@@ -73,6 +73,6 @@ V1 also retains runtime Decode capture after batch changes, while V2 uses its
 startup captures. Separate this capture work from steady-state timing when
 that distinction matters to the experiment.
 
-Use `tests.st.model_runner_policy_isolation` for V1 baseline/current behavior
+Use `tests.e2e.function.model_runner_policy_isolation` for V1 baseline/current behavior
 checks and V2 batch-switch checks. Historical experiments that aligned the
 runners' capture plans are not proof of V1 baseline compatibility.

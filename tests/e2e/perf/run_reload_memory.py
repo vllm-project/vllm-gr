@@ -173,7 +173,7 @@ def main() -> None:
     from transformers import AutoTokenizer
 
     from examples.online_serving.grpc.prepare_model import prepare_model
-    from tests.st.run_checkpoint_reload import prepare, request, server
+    from tests.e2e.function.run_checkpoint_reload import prepare, request, server
     from vllm_gr.constraints.tokenizer_digest import compute_tokenizer_digest
 
     parser = argparse.ArgumentParser(description=__doc__)

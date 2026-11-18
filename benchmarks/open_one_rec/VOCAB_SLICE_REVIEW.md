@@ -120,10 +120,10 @@ From the repository root, activate the repository environment, then:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 USE_TF=0
-export PYTHONPATH="$PWD/tests/st:$PWD"
+export PYTHONPATH="$PWD/tests/e2e/perf:$PWD"
 for mode in eager graph; do
   for projection in full slice; do
-    python tests/st/run_vocab_slice_v1_review.py \
+    python tests/e2e/perf/run_vocab_slice_v1_review.py \
       --model /absolute/path/to/OneRec-1.7B \
       --dataset-path /absolute/path/to/OneRecData \
       --constraint-triples /absolute/path/to/video_constraint_triples.json \

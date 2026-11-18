@@ -400,7 +400,7 @@ On a configured Ascend server, run the opt-in public-API regression:
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
   python -m pytest --run-slow -s -v --tb=short \
-  tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
+  tests/e2e/function/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
 ```
 
 This test uses W=8, N=3 and a small catalog, loads eager, native-without-Beam-FULL
@@ -433,7 +433,7 @@ VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
 VLLM_GR_TEST_PADDED_PREFILL=1 VLLM_ENABLE_PREFILL_CUDAGRAPH=1 \
 VLLM_GR_PREFILL_GRAPH_BUCKET_STEP=384 VLLM_GR_PREFILL_GRAPH_MAX_BUCKET=384 \
   python -m pytest --run-slow -s -v --tb=short \
-  tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
+  tests/e2e/function/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
 ```
 
 For the same-input exact-bucket control, set both bucket values to `290`.

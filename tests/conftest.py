@@ -21,7 +21,7 @@ _TIER_MARKERS = ("cpu_test", "gpu_test", "npu_test")
 
 
 def _require_tier_markers(items: list[pytest.Item]) -> None:
-    # Directory conftests under tests/kernels and tests/st add their defaults
+    # Directory conftests under tests/kernels and tests/e2e add their defaults
     # before this hook runs, and pytest's own -m deselection runs after it, so
     # this sees every collected item.
     missing = sorted(

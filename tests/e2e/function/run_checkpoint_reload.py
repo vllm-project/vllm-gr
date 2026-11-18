@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Exercise original weight reload over production gRPC and HTTP control APIs.
 
-Usage: python tests/st/run_checkpoint_reload.py --output /tmp/ckpt-reload
+Usage: python tests/e2e/function/run_checkpoint_reload.py --output /tmp/ckpt-reload
 Uses local tiny random Llama/Qwen3 checkpoints, optionally with GR head caches.
 No downloads.
 """
@@ -28,7 +28,7 @@ from vllm_gr.entrypoints.grpc.generated import vllm_engine_pb2 as pb
 from vllm_gr.entrypoints.grpc.generated import vllm_engine_pb2_grpc as rpc
 from vllm_gr.sidecar import default_ckpt_checker
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def free_port() -> int:
@@ -255,7 +255,7 @@ def main() -> None:
     first, second, config = prepare(output, args.head_cache, args.tied_weights)
     launcher = None
     if args.head_cache != "none":
-        launcher = Path(__file__).with_name("run_reload_memory.py")
+        launcher = Path(__file__).resolve().parents[1] / "perf" / "run_reload_memory.py"
         os.environ["GR_RELOAD_MEMORY_LOG"] = str(output / "cache-memory.jsonl")
         os.environ["GR_RELOAD_HEAD_CACHE"] = args.head_cache
         (output / "cache-memory.jsonl").write_text("")

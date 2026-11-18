@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from examples.online_serving.grpc.prepare_model import prepare_model
-from tests.st.run_checkpoint_reload import outputs, request, server
+from tests.e2e.function.run_checkpoint_reload import outputs, request, server
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler
 from vllm_gr.constraints.json_compiler import compile_relations_json

@@ -411,7 +411,7 @@ def _inputs(work_dir: Path) -> tuple[Any, ...]:
             "tokenizer_digest": tokenizer_digest,
         },
     }
-    prompt_text = (Path(__file__).parents[1] / "resources/single_one_rec_prompt.txt").read_text()
+    prompt_text = (Path(__file__).parents[2] / "resources/single_one_rec_prompt.txt").read_text()
     source = tokenizer.encode(prompt_text, add_special_tokens=False)
     newline = tokenizer.encode("\n", add_special_tokens=False)
     assert len(newline) == 1
@@ -439,7 +439,7 @@ def _engine_kwargs(model: str, config: dict[str, Any]) -> dict[str, Any]:
         compilation_config={
             "cudagraph_capture_sizes": [1, 2, 16, *range(128, 2049, 128)],
         },
-        worker_extension_cls="tests.st.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
+        worker_extension_cls="tests.e2e.function.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
     )
 
 
@@ -1209,12 +1209,12 @@ def test_onerec_v1_completion_batch_online(
         command = [
             sys.executable,
             "-m",
-            "tests.st.test_onerec_v1_scheduler_st",
+            "tests.e2e.function.test_onerec_v1_scheduler_st",
             str(tmp_path),
             mode,
         ]
         with subprocess.Popen(
-            command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
+            command, cwd=Path(__file__).parents[3], env=env, start_new_session=True
         ) as process:
             try:
                 assert process.wait(timeout=550) == 0, f"OneRec {mode} subprocess failed"
@@ -1252,12 +1252,17 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool, runner: str) -
         ),
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
-    command = [sys.executable, "-m", "tests.st.test_onerec_v1_scheduler_st", str(tmp_path)]
+    command = [
+        sys.executable,
+        "-m",
+        "tests.e2e.function.test_onerec_v1_scheduler_st",
+        str(tmp_path),
+    ]
     if online:
         command.append("--online")
     process_started = time.monotonic()
     with subprocess.Popen(
-        command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
+        command, cwd=Path(__file__).parents[3], env=env, start_new_session=True
     ) as process:
         try:
             assert process.wait(timeout=600) == 0, "OneRec V1 scheduling subprocess failed"

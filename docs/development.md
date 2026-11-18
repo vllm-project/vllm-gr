@@ -127,7 +127,7 @@ rg --files tests -g '*graph*' -g '*model_runner*'
 | Provider registration and import isolation | `tests/platforms/` |
 | Artifact, scoring, and backend behavior | `tests/constraints/`, `tests/tools/` |
 | Worker and kernels | `tests/v1/worker/`, `tests/kernels/`, `tests/integration/` |
-| OneRec/model integration and acceptance scripts | `tests/st/`, `tests/system/` |
+| OneRec/model integration and acceptance scripts | `tests/e2e/`, `tests/system/` |
 | Wheel metadata and installation | `tests/packaging/` |
 
 Directory names do not establish runtime requirements. Follow the

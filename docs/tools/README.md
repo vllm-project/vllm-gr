@@ -16,7 +16,7 @@ targeted check does not satisfy every CI gate.
 | Other pre-commit hooks | `SKIP=run-tests pre-commit run --all-files` | Prepared hook environments; explicitly excludes pytest |
 | Targeted regression | `python -m pytest -q <test-file-or-node>` | Dependencies and fixtures of the selected tests; inspect device checks |
 | Kernel/integration | Selected `tests/kernels/` or `tests/integration/` files | Matching CUDA or Ascend runtime and a usable device |
-| Model/system | Selected `tests/st/` files or documented probes | Device, model snapshot, configuration/artifact, and any test data |
+| Model/system | Selected `tests/e2e/` files or documented probes | Device, model snapshot, configuration/artifact, and any test data |
 | Local full test runner | `./tools/run_test.sh` | Available accelerator, installed runtime, model dependencies; platform behavior below |
 | Wheel smoke | `tools/run_wheel_smoke_test.sh` | Build tooling; validates installed wheel metadata/imports outside the checkout |
 | Benchmark acceptance | `tests/system/` scripts and CI workflow | Fixed inputs, resolved branch/device policy, and saved results |
@@ -227,7 +227,7 @@ A device marker on a test, class, or `pytest.param` overrides the module's
 `cpu_test`; the expressions above implement that. A test marked both
 `gpu_test` and `npu_test` runs once on each kind of accelerator host. Do not
 use `-m 'not cpu_test'` on an accelerator host: it drops the device tests that
-live in `cpu_test` modules. `tests/kernels/` and `tests/st/` default
+live in `cpu_test` modules. `tests/kernels/` and `tests/e2e/` default
 undeclared tests to `gpu_test`, so NPU and host-side tests there must declare
 their tier.
 
@@ -277,11 +277,11 @@ offline. An example CUDA system run is:
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec-1.7B \
 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
-python -m pytest --run-slow -q tests/st/test_onerec_v1_scheduler_st.py
+python -m pytest --run-slow -q tests/e2e/function/test_onerec_v1_scheduler_st.py
 ```
 
 For NPU end-to-end coverage, use
-`tests/st/test_onerec_v1_npu_e2e.py` with `--run-slow`, the Ascend runtime,
+`tests/e2e/function/test_onerec_v1_npu_e2e.py` with `--run-slow`, the Ascend runtime,
 xllm-ops, and `ASCEND_RT_VISIBLE_DEVICES`. Pangu tests use `PANGU1B_MODEL_PATH`
 or `PANGU_MODEL_PATH`; see the [Pangu guide](../../examples/offline_inference/pangu1b/README.md).
 Missing prerequisites may cause skips or failures depending on the test.

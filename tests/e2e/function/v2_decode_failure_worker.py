@@ -5,7 +5,9 @@
 
 from typing import Any
 
-from tests.st.test_modelrunner_v2_stage_parity_st import OneRecV2ParityWorkerExtension
+from tests.e2e.function.test_modelrunner_v2_stage_parity_st import (
+    OneRecV2ParityWorkerExtension,
+)
 from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
 _forward_hidden = CudaStageHooksV2.forward_hidden

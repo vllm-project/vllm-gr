@@ -45,7 +45,7 @@ def _run_offline_beam_search_v1(
         {}
         if evidence is None
         else dict(
-            worker_extension_cls="tests.st.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension"
+            worker_extension_cls="tests.e2e.function.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension"
         )
     )
     if full_prefill:
@@ -71,7 +71,7 @@ def _run_offline_beam_search_v1(
         **probe,
     ) as llm:
         if evidence is not None:
-            from tests.st.test_onerec_v1_scheduler_st import (
+            from tests.e2e.function.test_onerec_v1_scheduler_st import (
                 _check_completion_prefill,
                 _check_v2_graph_events,
                 _check_v2_idle,
@@ -178,7 +178,7 @@ def _run_offline_beam_search_v1(
 
 
 def _run_offline_gr_beam_search_v1_target(loops: int) -> None:
-    from tests.st.test_onerec_v1_scheduler_st import _inputs
+    from tests.e2e.function.test_onerec_v1_scheduler_st import _inputs
 
     # The memory-delta check below needs two engine lifecycles in one process.
     with TemporaryDirectory(prefix="gr-offline-v1-") as tmp:
@@ -233,7 +233,7 @@ def test_offline_gr_beam_search_v1(loops: int, monkeypatch: pytest.MonkeyPatch) 
 
 
 def _run_unconstrained_target(work_dir: Path, full_prefill: bool = False) -> None:
-    from tests.st.test_onerec_v1_scheduler_st import _inputs
+    from tests.e2e.function.test_onerec_v1_scheduler_st import _inputs
 
     model, _, config, source, newline, _ = _inputs(work_dir)
     config["constraint_table"] = {"enabled": False, "max_top_k": config["beam"]["max_width"]}

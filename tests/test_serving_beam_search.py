@@ -42,7 +42,7 @@ async def beam_search_test(loops: int) -> None:
         ) from exc
     if not 0 < gpu_memory_utilization <= 1:
         raise ValueError("VLLM_GR_TEST_GPU_MEMORY_UTILIZATION must be in (0, 1]")
-    from tests.st.test_onerec_v1_scheduler_st import _inputs
+    from tests.e2e.function.test_onerec_v1_scheduler_st import _inputs
 
     with TemporaryDirectory(prefix="gr-online-v1-") as directory:
         model_name, _, config, _, _, _ = _inputs(Path(directory))

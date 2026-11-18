@@ -55,7 +55,7 @@ The measurements used the original instrumentation and exact-bucket replay.
 
 ## Current system test
 
-The [OneRec Scheduler/Worker system test](../tests/st/test_onerec_v1_scheduler_st.py)
+The [OneRec Scheduler/Worker system test](../tests/e2e/function/test_onerec_v1_scheduler_st.py)
 uses public offline and online Beam Search V1 with CUDA ModelRunner V1 and V2.
 It checks complete candidates, scheduling and resource retirement. The test
 disables Chunked Prefill. Its HTTP batching cases also compare online results
@@ -63,5 +63,5 @@ with independent offline results.
 
 ```bash
 USE_TF=0 CUDA_VISIBLE_DEVICES=0 VLLM_GR_TEST_MODEL=/path/to/OneRec-1.7B \
-  python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py
+  python -m pytest --run-slow -v -s tests/e2e/function/test_onerec_v1_scheduler_st.py
 ```

@@ -299,10 +299,10 @@ state and actual CUDA replay check request order and storage reuse.
 | B-switch replay, fixed storage, configured B=3/7 and 6/8, per-shape fallback | `tests/kernels/test_v2_multibatch_graphs.py` |
 | Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
 | Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |
-| Existing public protocol, generation steps and scheduler integration | `tests/st/test_onerec_v1_scheduler_st.py`, `tests/st/test_modelrunner_v2_stage_parity_st.py` |
+| Existing public protocol, generation steps and scheduler integration | `tests/e2e/function/test_onerec_v1_scheduler_st.py`, `tests/e2e/function/test_modelrunner_v2_stage_parity_st.py` |
 | Unconstrained B=1/4, V1/V2 Eager, default Graph and explicit FULL Prefill | `tests/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1` |
-| Real-model multi-batch execution and V1 baseline comparison | `tests/st/model_runner_policy_isolation.py` (manual CLI) |
-| Real video business accuracy and cross-B comparison | `tests/st/onerec_multibatch_accuracy.py` (manual CLI) |
+| Real-model multi-batch execution and V1 baseline comparison | `tests/e2e/function/model_runner_policy_isolation.py` (manual CLI) |
+| Real video business accuracy and cross-B comparison | `tests/e2e/accuracy/onerec_multibatch_accuracy.py` (manual CLI) |
 
 Partial-prompt cases exercise low-level input-helper parity with native vLLM;
 they do not extend the public GR scope to Chunked Prefill.
@@ -318,7 +318,7 @@ a fresh process and output directory. For example:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
-python -m tests.st.model_runner_policy_isolation \
+python -m tests.e2e.function.model_runner_policy_isolation \
   --runner v2 --mode graph --output /tmp/v2-multibatch-graph
 ```
 
@@ -375,7 +375,7 @@ Run each runner in a fresh process, with a new output directory:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
-python -m tests.st.onerec_multibatch_accuracy \
+python -m tests.e2e.accuracy.onerec_multibatch_accuracy \
   --runner v2 --batches 1 2 4 --num-prompts 100 \
   --triples "$ONEREC_TRIPLES" --artifact "$ONEREC_ARTIFACT" \
   --output /tmp/onerec-v2-multibatch
@@ -390,7 +390,7 @@ cross-batch comparisons separately.
 
 ## Online functional validation
 
-The shared `tests/st/test_onerec_v1_scheduler_st.py` suite explicitly
+The shared `tests/e2e/function/test_onerec_v1_scheduler_st.py` suite explicitly
 parameterizes ModelRunner V1 and V2. The V1 in its filename and public
 `beam_search_v1` API names denotes the GR protocol, not a runner override.
 Select `test_onerec_v1_completion_batch_online` with `-k v2` to exercise

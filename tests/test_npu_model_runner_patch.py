@@ -2545,7 +2545,10 @@ def test_npu_cpu_columns_materialize_identically_to_stop_aware_rows(
     batch: int, width: int, steps: int, include_score: bool, include_parents: bool, penalty: float
 ) -> None:
     from vllm_gr.v1.beam.batch_contracts import BeamSequenceColumns
-    from vllm_gr.v1.beam.output_columns import materialize_beam_result, validate_complete_sequences
+    from vllm_gr.v1.beam.output_columns import (
+        materialize_beam_result,
+        validate_complete_sequences,
+    )
 
     stage = _terminal_result_runner(
         batch,

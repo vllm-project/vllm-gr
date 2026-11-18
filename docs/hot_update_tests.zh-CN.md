@@ -17,7 +17,7 @@ pytest 数量包含参数化用例；独立服务测试脚本单独记录。
 新增覆盖原生 reload 部分失败、Sidecar 重启后源版本撤回、并发 reload/resume 拒绝、取消和 CPU/GPU tied-head 缓存刷新。
 
 真实服务修复验证也已通过：
-`tests/st/run_checkpoint_reload.py --graph --head-cache sliced --tied-weights`（Llama）
+`tests/e2e/function/run_checkpoint_reload.py --graph --head-cache sliced --tied-weights`（Llama）
 和 `--graph --head-cache transposed --tied-weights`（Qwen3）。
 每组完成三次原生 reload，缓存地址不变、GPU 活跃分配稳定；失败后拒绝 resume/reload，
 人工重启服务后输出与新加载的服务一致。每组记录到 5 次 prefill 和 10 次 decode graph replay。
@@ -90,20 +90,20 @@ checkpoint 为单个权重文件的 Hugging Face safetensors 目录，架构和�
 
 | 测试项 | 对应脚本 / 场景 | 已记录结果 |
 | --- | --- | --- |
-| 请求正在执行时，通过真实 Sidecar 客户端完成 checkpoint 更新；原请求保持旧权重输出，并验证排空 → reload → resume 顺序 | `tests/st/run_pause_drain.py --output <directory>` | 修复前复现 null 响应错误，修复后通过。H20、multiprocess Core、tiny FP16 Llama，B4 × 64 tokens、3 步生成。使用真实 ControlClient/PausedUpdateProcess；仅在测试启动器中延迟 stage 并记录事件，确认原生 drain Future 尚未完成。 |
-| checkpoint A→B 后输出变化；B→A 时暂停期间提交的请求等待 resume，之后复现 A 的输出 | `tests/st/run_checkpoint_reload.py`: `A -> B`, `B -> A` | eager 和 `--graph` 模式均通过 |
-| checkpoint 路径错误时保持暂停及无效，不发布失败版本；拒绝 resume 和再次 reload，重启模型服务后恢复 | `tests/st/run_checkpoint_reload.py`: `failed reload stays paused and invalid until manual service restart` | 新约定于 2026-11-10 在 tied Llama/Qwen3 + `--graph` 下验证 |
-| 热更到 B 的服务与直接加载 B 启动的独立服务，输出 token 和 beam offsets 一致 | `tests/st/run_checkpoint_reload.py`: `reloaded B matches fresh B` | eager 和 graph 模式均通过 |
-| sliced / transposed 两种 GR head 缓存优化下，reload 后缓存值正确、地址不变 | `tests/st/run_checkpoint_reload.py --graph --head-cache sliced` 和 `--head-cache transposed`：全部四个 checkpoint 场景 | 通过；sliced Llama 窗口 `[0, 16)`，transposed Qwen3；显存分配稳定在 226.560 / 226.571 MiB |
-| Trie 不经过 pause/resume 完成 A→B→A；候选属于当前 Trie，恢复 A 后顺序一致，旧表过期后仍正常 | `tests/st/run_trie_reload.py`: `A -> B`, `after retention expires`, `B -> A` | eager 和 graph 模式均通过 |
-| 非法 Trie 文件更新失败，当前版本和输出保持不变 | `tests/st/run_trie_reload.py`: `invalid artifact rejected` | eager 和 graph 模式均通过 |
-| 连续多次原生 checkpoint reload 后，GPU 活跃显存不持续增长 | `tests/st/run_reload_memory.py --cycles 10`, 启用/不启用 `--graph`：checkpoint 循环 | 通过；活跃分配稳定在 98.360 / 226.554 MiB；reload 峰值为 98.391 / 226.585 MiB |
-| 旧 Trie 过期后释放对应 GPU 显存，多次 reload 不累积活跃分配 | `tests/st/run_reload_memory.py --cycles 10`, 启用/不启用 `--graph`：Trie 循环 | 通过；新旧表共存时为 106.861 / 235.055 MiB，过期后为 102.609 / 230.803 MiB；每次释放 4.252 MiB |
-| 发现 HDFS 已完成版本、下载一次、两个服务按并发 1 滚动更新；版本不变时跳过更新 | `tests/st/run_sidecar_hdfs.py`: `01-ready-version-and-rolling`, `02-no-change`, `10-final-no-change` | 真实 HDFS 和两个启用 graph 的服务验证通过 |
-| checkpoint 文件大小变化时，在 pause 前拒绝更新 | `tests/st/run_sidecar_hdfs.py`: `03-default-checker-rejection` | 通过；原有推理仍正常 |
-| 部分实例 reload 失败后，启动新 Sidecar 继续滚动更新 | `tests/st/run_sidecar_hdfs.py`: `04-partial-rollout-failure`, `05-restart-reconcile` | 通过；仅剩余未完成实例执行 reload |
-| resume 失败后恢复，不重复 reload 已加载的目标 checkpoint | `tests/st/run_sidecar_hdfs.py`: `06-resume-failure`, `07-restart-resume-only` | 通过；目标版本已提交且暂停的实例仅执行 resume |
-| 下载并同时在线更新 Trie，不调用 pause/resume，再恢复之前的内容 | `tests/st/run_sidecar_hdfs.py`: `08-online-trie`, `09-trie-back-to-a` | 通过；旧表过期后候选仍属于当前 Trie |
+| 请求正在执行时，通过真实 Sidecar 客户端完成 checkpoint 更新；原请求保持旧权重输出，并验证排空 → reload → resume 顺序 | `tests/e2e/function/run_pause_drain.py --output <directory>` | 修复前复现 null 响应错误，修复后通过。H20、multiprocess Core、tiny FP16 Llama，B4 × 64 tokens、3 步生成。使用真实 ControlClient/PausedUpdateProcess；仅在测试启动器中延迟 stage 并记录事件，确认原生 drain Future 尚未完成。 |
+| checkpoint A→B 后输出变化；B→A 时暂停期间提交的请求等待 resume，之后复现 A 的输出 | `tests/e2e/function/run_checkpoint_reload.py`: `A -> B`, `B -> A` | eager 和 `--graph` 模式均通过 |
+| checkpoint 路径错误时保持暂停及无效，不发布失败版本；拒绝 resume 和再次 reload，重启模型服务后恢复 | `tests/e2e/function/run_checkpoint_reload.py`: `failed reload stays paused and invalid until manual service restart` | 新约定于 2026-11-10 在 tied Llama/Qwen3 + `--graph` 下验证 |
+| 热更到 B 的服务与直接加载 B 启动的独立服务，输出 token 和 beam offsets 一致 | `tests/e2e/function/run_checkpoint_reload.py`: `reloaded B matches fresh B` | eager 和 graph 模式均通过 |
+| sliced / transposed 两种 GR head 缓存优化下，reload 后缓存值正确、地址不变 | `tests/e2e/function/run_checkpoint_reload.py --graph --head-cache sliced` 和 `--head-cache transposed`：全部四个 checkpoint 场景 | 通过；sliced Llama 窗口 `[0, 16)`，transposed Qwen3；显存分配稳定在 226.560 / 226.571 MiB |
+| Trie 不经过 pause/resume 完成 A→B→A；候选属于当前 Trie，恢复 A 后顺序一致，旧表过期后仍正常 | `tests/e2e/function/run_trie_reload.py`: `A -> B`, `after retention expires`, `B -> A` | eager 和 graph 模式均通过 |
+| 非法 Trie 文件更新失败，当前版本和输出保持不变 | `tests/e2e/function/run_trie_reload.py`: `invalid artifact rejected` | eager 和 graph 模式均通过 |
+| 连续多次原生 checkpoint reload 后，GPU 活跃显存不持续增长 | `tests/e2e/perf/run_reload_memory.py --cycles 10`, 启用/不启用 `--graph`：checkpoint 循环 | 通过；活跃分配稳定在 98.360 / 226.554 MiB；reload 峰值为 98.391 / 226.585 MiB |
+| 旧 Trie 过期后释放对应 GPU 显存，多次 reload 不累积活跃分配 | `tests/e2e/perf/run_reload_memory.py --cycles 10`, 启用/不启用 `--graph`：Trie 循环 | 通过；新旧表共存时为 106.861 / 235.055 MiB，过期后为 102.609 / 230.803 MiB；每次释放 4.252 MiB |
+| 发现 HDFS 已完成版本、下载一次、两个服务按并发 1 滚动更新；版本不变时跳过更新 | `tests/e2e/function/run_sidecar_hdfs.py`: `01-ready-version-and-rolling`, `02-no-change`, `10-final-no-change` | 真实 HDFS 和两个启用 graph 的服务验证通过 |
+| checkpoint 文件大小变化时，在 pause 前拒绝更新 | `tests/e2e/function/run_sidecar_hdfs.py`: `03-default-checker-rejection` | 通过；原有推理仍正常 |
+| 部分实例 reload 失败后，启动新 Sidecar 继续滚动更新 | `tests/e2e/function/run_sidecar_hdfs.py`: `04-partial-rollout-failure`, `05-restart-reconcile` | 通过；仅剩余未完成实例执行 reload |
+| resume 失败后恢复，不重复 reload 已加载的目标 checkpoint | `tests/e2e/function/run_sidecar_hdfs.py`: `06-resume-failure`, `07-restart-resume-only` | 通过；目标版本已提交且暂停的实例仅执行 resume |
+| 下载并同时在线更新 Trie，不调用 pause/resume，再恢复之前的内容 | `tests/e2e/function/run_sidecar_hdfs.py`: `08-online-trie`, `09-trie-back-to-a` | 通过；旧表过期后候选仍属于当前 Trie |
 
 graph 测试开启 Inductor（`compilation.mode=3`）、原生 FULL/PIECEWISE graph，
 以及 GR prefill/decode graph。显存测试观察到每个服务 12 次 prefill 和 24 次 decode graph replay。
@@ -132,7 +132,7 @@ HDFS 脚本还要求 `--hdfs-root <writable-test-root>`。
 | Native/GR 调度、准入、派发与回执、取消、清理、pause 和 prefix cache 规则 | `tests/test_gr_async_scheduler.py` | 完整 CI 选择中通过，包含新增排队请求 reset 用例 |
 | 切片投影、裁剪与对齐、bias、TP/gather、量化回退和原生 dtype 行为 | `tests/test_sliced_logits.py`; `tests/sidecar/test_worker_update.py` | 完整 CI 选择中通过：89 项已有投影用例和 8 项 Worker 更新用例 |
 | constraint 加载和发布、失败及退出清理、显存统计和投影窗口 | `tests/v1/worker/test_constraint_lifecycle.py` | 完整 CI 选择中通过，fixture 遵循 wrapper 契约 |
-| 真模型 V1/V2 对齐、completion batch、异步调度及离线/服务生命周期 | `tests/st/test_modelrunner_v2_stage_parity_st.py`; `tests/st/test_onerec_v1_scheduler_st.py`; `tests/test_offline_beam_search.py`; `tests/test_serving_beam_search.py` | 开启 slow tests 后通过；覆盖 eager/graph、自定义 batch、无约束生成、回退和实际 graph replay |
+| 真模型 V1/V2 对齐、completion batch、异步调度及离线/服务生命周期 | `tests/e2e/function/test_modelrunner_v2_stage_parity_st.py`; `tests/e2e/function/test_onerec_v1_scheduler_st.py`; `tests/test_offline_beam_search.py`; `tests/test_serving_beam_search.py` | 开启 slow tests 后通过；覆盖 eager/graph、自定义 batch、无约束生成、回退和实际 graph replay |
 | 已有 GPU 和模拟 NPU 生命周期 fixture 适配 VersionedConstraintTable | `tests/kernels/test_multi_trie_beam.py`; `tests/kernels/test_v2_multibatch_graphs.py`; `tests/v1/worker/test_npu_stage_projection_lifecycle.py` | 两个 GPU 文件 19 项通过；CPU 模拟 NPU 生命周期文件 11 项通过。仅修改测试构造或对象身份断言，不代表 NPU 硬件验证 |
 | 格式与静态检查：SPDX、isort、Ruff、typos、Markdown、workflow/shell 和 mypy 3.11/3.12/3.13 | `pre-commit run --all-files --show-diff-on-failure` | 全部适用静态 hook 通过；run-tests 单独执行。仓库外的本地配置选择系统 Node |
 | Python 3.11/3.12/3.13 × CPU/CUDA 的 wheel 构建和安装 | `tools/run_wheel_smoke_test.sh` | 本轮六种组合全部通过 |

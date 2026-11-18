@@ -32,7 +32,7 @@ from vllm_gr.ops.npu import beam_ops
 
 assert beam_ops.is_available(), f"NPU Beam operators are required: {beam_ops.unavailable_reason()}"
 
-from tests.st.test_onerec_v1_npu_e2e import (  # noqa: E402
+from tests.e2e.function.test_onerec_v1_npu_e2e import (  # noqa: E402
     _BEGIN_TOKEN,
     _END_TOKEN,
     _assert_batch_equal,
@@ -296,7 +296,7 @@ def _run_regression(work_dir: Path) -> None:
         max_num_seqs=64,
         max_logprobs=_WIDTH,
         gpu_memory_utilization=0.5,
-        worker_extension_cls="tests.st.test_npu_dynamic_beam_st.DynamicBeamTestWorkerExtension",
+        worker_extension_cls="tests.e2e.function.test_npu_dynamic_beam_st.DynamicBeamTestWorkerExtension",
     )
     reference: list[list[Any]] = []
     ordinary_reference: list[list[int]] = []
@@ -398,9 +398,9 @@ def test_npu_dynamic_beam_full_model_eager_graph(tmp_path: Path) -> None:
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
         VLLM_ENABLE_PREFILL_CUDAGRAPH="0",
     )
-    command = [sys.executable, "-m", "tests.st.test_npu_dynamic_beam_st", str(tmp_path)]
+    command = [sys.executable, "-m", "tests.e2e.function.test_npu_dynamic_beam_st", str(tmp_path)]
     with subprocess.Popen(
-        command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
+        command, cwd=Path(__file__).parents[3], env=env, start_new_session=True
     ) as process:
         try:
             assert process.wait(timeout=900) == 0, "NPU dynamic Beam E2E subprocess failed"

@@ -861,11 +861,11 @@
     "tests/platforms/test_registry.py::test_registering_same_provider_object_is_idempotent": "l1",
     "tests/platforms/test_registry.py::test_registers_cuda_and_fake_providers": "l1",
     "tests/platforms/test_registry.py::test_unknown_backend_is_rejected_without_cuda_fallback": "l1",
-    "tests/st/test_modelrunner_v2_stage_parity_st.py::test_modelrunner_v2_stage_parity": "l4",
-    "tests/st/test_npu_dynamic_beam_st.py::test_npu_dynamic_beam_full_model_eager_graph": "l4",
-    "tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch": "l4",
-    "tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_public_api_end_to_end": "l3",
-    "tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_async_scheduling": {
+    "tests/e2e/function/test_modelrunner_v2_stage_parity_st.py::test_modelrunner_v2_stage_parity": "l4",
+    "tests/e2e/function/test_npu_dynamic_beam_st.py::test_npu_dynamic_beam_full_model_eager_graph": "l4",
+    "tests/e2e/function/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch": "l4",
+    "tests/e2e/function/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_public_api_end_to_end": "l3",
+    "tests/e2e/function/test_onerec_v1_scheduler_st.py::test_onerec_v1_async_scheduling": {
       "default": "l3",
       "rules": [
         {
@@ -885,7 +885,7 @@
         }
       ]
     },
-    "tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online": {
+    "tests/e2e/function/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online": {
       "default": "l3",
       "rules": [
         {
@@ -909,22 +909,22 @@
         }
       ]
     },
-    "tests/st/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyST::test_gsm8k_mini_accuracy_cli": "l4",
-    "tests/st/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_default_dataset_exists": "l1",
-    "tests/st/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_explicit_block_size_override_is_preserved": "l1",
-    "tests/st/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_extract_final_answer": "l1",
-    "tests/st/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_npu_defaults_to_compatible_block_size": "l1",
-    "tests/st/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_require_pangu_st_runtime_skips_without_model_path": "l1",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_chat_completions_smoke": "l4",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_gsm8k_mini_online_accuracy": "l4",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_health_endpoint": "l4",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_recommend_api_disabled_for_llm_mode": "l4",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_v1_models_lists_served_model": "l4",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_default_dataset_exists": "l1",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_min_accuracy_environment_value_is_float": "l1",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_serve_command_builder": "l1",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_serve_command_builder_accepts_block_size_override": "l1",
-    "tests/st/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_serve_command_builder_defaults_to_128_on_npu": "l1",
+    "tests/e2e/accuracy/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyST::test_gsm8k_mini_accuracy_cli": "l4",
+    "tests/e2e/accuracy/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_default_dataset_exists": "l1",
+    "tests/e2e/accuracy/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_explicit_block_size_override_is_preserved": "l1",
+    "tests/e2e/accuracy/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_extract_final_answer": "l1",
+    "tests/e2e/accuracy/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_npu_defaults_to_compatible_block_size": "l1",
+    "tests/e2e/accuracy/test_pangu1b_accuracy_st.py::TestPangu1bAccuracyUnitHooks::test_require_pangu_st_runtime_skips_without_model_path": "l1",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_chat_completions_smoke": "l4",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_gsm8k_mini_online_accuracy": "l4",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_health_endpoint": "l4",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_recommend_api_disabled_for_llm_mode": "l4",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineServeST::test_v1_models_lists_served_model": "l4",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_default_dataset_exists": "l1",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_min_accuracy_environment_value_is_float": "l1",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_serve_command_builder": "l1",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_serve_command_builder_accepts_block_size_override": "l1",
+    "tests/e2e/accuracy/test_pangu1b_online_st.py::TestPangu1bOnlineUnitHooks::test_serve_command_builder_defaults_to_128_on_npu": "l1",
     "tests/test_ascend_compat.py::test_ascend_config_filter_leaves_ordinary_config_untouched": "l1",
     "tests/test_ascend_compat.py::test_ascend_config_filter_preserves_engine_identity_and_gr_config": "l1",
     "tests/test_ascend_compat.py::test_ascend_config_filter_restores_mapping_on_native_failure": "l1",

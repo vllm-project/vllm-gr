@@ -27,7 +27,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from tests.st.npu_beam_diagnostics import NPUForwardTrace
+from tests.e2e.function.npu_beam_diagnostics import NPUForwardTrace
 
 try:
     import torch_npu  # noqa: F401
@@ -53,7 +53,7 @@ _END_TOKEN = "<|sid_end|>"
 
 
 def _prompt_tokens(tokenizer: Any, length: int) -> list[int]:
-    source_path = Path(__file__).parents[1] / "resources/single_one_rec_prompt.txt"
+    source_path = Path(__file__).parents[2] / "resources/single_one_rec_prompt.txt"
     source = tokenizer.encode(source_path.read_text(), add_special_tokens=False)
     newline = tokenizer.encode("\n", add_special_tokens=False)
     assert len(newline) == 1
@@ -415,7 +415,7 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
     }
     if graph:
         engine_kwargs["worker_extension_cls"] = (
-            "tests.st.test_onerec_v1_npu_e2e.OneRecNPUGraphTestWorkerExtension"
+            "tests.e2e.function.test_onerec_v1_npu_e2e.OneRecNPUGraphTestWorkerExtension"
         )
     comparison_prompts = _comparison_prompts(tokenizer, exact_prefill=exact_prefill)
     if graph:
@@ -643,12 +643,12 @@ def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
-    command = [sys.executable, "-m", "tests.st.test_onerec_v1_npu_e2e", str(tmp_path)]
+    command = [sys.executable, "-m", "tests.e2e.function.test_onerec_v1_npu_e2e", str(tmp_path)]
     if graph:
         command.append("--graph")
     with subprocess.Popen(
         command,
-        cwd=Path(__file__).parents[2],
+        cwd=Path(__file__).parents[3],
         env=env,
         start_new_session=True,
     ) as process:
