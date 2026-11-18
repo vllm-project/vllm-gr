@@ -10,7 +10,9 @@ from unittest import mock
 import pytest
 import torch
 
-pytestmark = pytest.mark.npu_test
+from tools.hardware_marks import hardware_marks
+
+pytestmark = hardware_marks(res={"npu": "A3"}, num_cards=1)
 
 
 def _require_npu_runtime() -> None:

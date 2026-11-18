@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
 from vllm_gr.v1.beam.dynamic_beam import (
@@ -31,7 +32,9 @@ def context(batch, device):
     )
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu_test)])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=hardware_marks(res={"cuda": "A100"}, num_cards=1))]
+)
 @pytest.mark.parametrize("batch", [1, 2, 4])
 @pytest.mark.parametrize("source,target", [(4, 2), (2, 4), (3, 3)])
 def test_request_local_kv_fanout(device, batch, source, target):
@@ -168,7 +171,9 @@ def test_widening_keeps_multiple_winners_from_one_parent():
     torch.testing.assert_close(result["out_log_probs"], torch.tensor([[-0.2, -0.3], [-0.3, -0.4]]))
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu_test)])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=hardware_marks(res={"cuda": "A100"}, num_cards=1))]
+)
 def test_decode_branch_candidates_are_independent_from_retained_widths(device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")

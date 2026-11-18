@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from tests.constraints.test_table import make_table
 from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableConfig
 from vllm_gr.constraints import loader
@@ -17,8 +18,9 @@ from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.loader import load_constraint_backend
 
+
 pytestmark = [
-    pytest.mark.gpu_test,
+    *hardware_marks(res={"cuda": "A100"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
 ]
 

@@ -17,12 +17,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from vllm_gr.ops.onerec_decode import _beam_search_rec_final_select_torch
+
 
 # mypy: disable-error-code="misc"
 
 
-pytestmark = pytest.mark.npu_test
+pytestmark = hardware_marks(res={"npu": "A3"}, num_cards=1)
 
 
 try:

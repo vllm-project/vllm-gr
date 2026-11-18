@@ -12,6 +12,8 @@ from collections.abc import Callable, Sequence
 
 import pytest
 
+from tools.hardware_marks import hardware_test
+
 
 def _innermost(target: Callable[..., object]) -> Callable[..., object]:
     """Follow wrapper chains down to the function that owns the real signature.
@@ -140,7 +142,7 @@ def test_sampling_patch_covers_both_openai_prompt_shapes(monkeypatch) -> None:
     assert CompletionRequest.to_beam_search_params is to_beam_search_params
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 def test_vllm_ascend_model_runner_patch_contract() -> None:
     if importlib.util.find_spec("vllm_ascend") is None:
         pytest.skip("vllm-ascend is not installed")

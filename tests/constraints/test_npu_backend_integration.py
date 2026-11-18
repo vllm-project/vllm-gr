@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from tests.constraints.test_table import make_table
 from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableConfig
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
@@ -20,7 +21,8 @@ from vllm_gr.ops.npu.rec_constrained_topk import (
     is_available as rec_constrained_topk_npu_available,
 )
 
-pytestmark = pytest.mark.npu_test
+
+pytestmark = hardware_marks(res={"npu": "A3"}, num_cards=1)
 
 try:
     import torch_npu  # noqa: F401

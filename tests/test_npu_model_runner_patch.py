@@ -26,6 +26,8 @@ from vllm_gr.v1.worker.npu_beam_stage_adapter import (
 )
 from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
 
+from tools.hardware_marks import hardware_marks, hardware_test
+
 
 def _eager_stage_output(
     *,
@@ -1368,7 +1370,7 @@ def test_npu_verify_and_record_appends_to_existing_keys() -> None:
     assert runner._beam_graph_keys == {4, 8}
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("first_path", ["ordinary", "beam"])  # type: ignore[misc]
 def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
     monkeypatch: pytest.MonkeyPatch, first_path: str
@@ -1730,7 +1732,7 @@ def test_npu_decode_positions_retain_input_validation(invalid: str, message: str
     assert torch.all(positions.as_subclass(torch.Tensor) == -9)
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     "prompt_lengths",
@@ -1770,7 +1772,7 @@ def test_npu_decode_positions_match_original_construction_across_async_steps(
         assert actual[rows:].cpu().tolist() == [-9, -9]
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     "dynamic_beam_widths", [(128, 64, 32), (32, 128, 256)]
@@ -2399,7 +2401,7 @@ def test_npu_terminal_result_keeps_batch_identity_and_output_options() -> None:
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "device", ["cpu", pytest.param("npu", marks=pytest.mark.npu_test)]
+    "device", ["cpu", pytest.param("npu", marks=hardware_marks(res={"npu": "A3"}, num_cards=1))]
 )
 @pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
 @pytest.mark.parametrize("result_width", [1, 2])  # type: ignore[misc]

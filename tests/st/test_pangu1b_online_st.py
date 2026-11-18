@@ -31,7 +31,9 @@ from unittest import mock
 import pytest
 import requests
 
+from tools.hardware_marks import hardware_test
 from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
@@ -209,8 +211,7 @@ def _chat_completion(
     return body
 
 
-@pytest.mark.gpu_test
-@pytest.mark.npu_test
+@hardware_test(res={"cuda": "A100", "npu": "A3"}, num_cards=1)
 @pytest.mark.model_test
 class TestPangu1bOnlineServeST(unittest.TestCase):
     """End-to-end online ST for Pangu LLM passthrough via ``vllm-gr serve``."""

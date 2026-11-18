@@ -13,8 +13,10 @@ from typing import Any
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_test
 from vllm_gr.v1.attention import backends
 from vllm_gr.v1.attention.backends import beam_attn
+
 
 try:
     import torch_npu  # noqa: F401
@@ -152,7 +154,7 @@ def test_platform_dispatch_selects_exactly_one_execution_module(
     assert selected is (gpu_module if expected == "gpu" else npu_module)
 
 
-@pytest.mark.npu_test  # type: ignore[misc]
+@hardware_test(res={"npu": "A3"}, num_cards=1)  # type: ignore[misc]
 @pytest.mark.skipif(  # type: ignore[misc]
     not _TORCH_NPU_IMPORTABLE, reason="torch_npu is not installed"
 )

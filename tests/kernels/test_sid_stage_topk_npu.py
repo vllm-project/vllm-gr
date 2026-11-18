@@ -11,12 +11,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from vllm_gr.ops.npu.sid_stage_vocab import (
     build_sid_stage_vocab,
     select_sid_stage_candidates,
 )
 
-pytestmark = pytest.mark.npu_test
+
+pytestmark = hardware_marks(res={"npu": "A3"}, num_cards=1)
 
 
 @pytest.fixture

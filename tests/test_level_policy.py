@@ -11,7 +11,7 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -28,6 +28,139 @@ pytest_plugins = ("pytester",)
 INVENTORY = json.loads(
     Path(__file__).with_name("level_inventory.json").read_text(encoding="utf-8")
 )["tests"]
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_cuda_sku_selection_and_setup(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(cuda="fake"),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            get_device_name=lambda index: "NVIDIA L40S",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    pytester.makepyprojecttoml(pyproject.read_text(encoding="utf-8"))
+    pytester.makeconftest('pytest_plugins = ("tests.conftest",)')
+    sample = pytester.makepyfile(
+        """
+        import pytest
+        from tools.hardware_marks import hardware_marks, hardware_test
+
+        pytestmark = pytest.mark.l2
+
+        @pytest.fixture(autouse=True)
+        def reset_vocab_slice_config():
+            pass
+
+        @pytest.mark.gpu_test
+        def test_generic():
+            pass
+
+        @hardware_test("H100", "L40S")
+        def test_supported():
+            pass
+
+        @pytest.mark.parametrize("sku", [
+            pytest.param("L40", marks=hardware_marks("L40")),
+            pytest.param("L40S", marks=hardware_marks("L40S")),
+        ])
+        def test_model(sku):
+            assert sku == "L40S"
+        """
+    )
+    result = pytester.runpytest(
+        sample, "--strict-test-levels", "--strict-markers", "-m", "l2 and gpu_test"
+    )
+    result.assert_outcomes(passed=2, skipped=2)
+    result = pytester.runpytest(sample, "-m", "gpu_test and L40S")
+    result.assert_outcomes(passed=2, deselected=2)
+    result = pytester.runpytest(sample, "--collect-only", "-m", "gpu_test and A100 and cards_1")
+    assert "test_generic" in result.stdout.str()
+    result.assert_outcomes(deselected=3)
+
+    st = pytester.mkdir("st")
+    directory_conftest = pyproject.parent / "tests" / "st" / "conftest.py"
+    (st / "conftest.py").write_text(
+        directory_conftest.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (st / "test_default.py").write_text("def test_default(): pass\n", encoding="utf-8")
+    result = pytester.runpytest(st, "--collect-only", "-m", "gpu_test and A100 and cards_1")
+    assert "test_default" in result.stdout.str()
+    result.assert_outcomes(deselected=0)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_npu_sku_and_card_selection(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(version=SimpleNamespace(cuda=None)))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            npu=SimpleNamespace(
+                is_available=lambda: True,
+                device_count=lambda: 2,
+                get_device_name=lambda index: "Ascend910_9391",
+            )
+        ),
+    )
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    pytester.makepyprojecttoml(pyproject.read_text(encoding="utf-8"))
+    pytester.makeconftest('pytest_plugins = ("tests.conftest",)')
+    sample = pytester.makepyfile(
+        """
+        import pytest
+        from tools.hardware_marks import hardware_marks, hardware_test
+
+        pytestmark = pytest.mark.l2
+
+        @pytest.fixture(autouse=True)
+        def reset_vocab_slice_config():
+            pass
+
+        @pytest.mark.parametrize("device", [
+            pytest.param("npu", marks=pytest.mark.npu_test),
+            pytest.param("both", marks=[pytest.mark.gpu_test, pytest.mark.npu_test]),
+            pytest.param("cpu", marks=pytest.mark.cpu_test),
+        ])
+        def test_default_resources(device):
+            pass
+
+        @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards={"cuda": 4, "npu": 2})
+        def test_split():
+            pass
+
+        @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
+        def test_shared():
+            pass
+
+        @hardware_test(res={"npu": "A3"}, num_cards=4)
+        def test_insufficient():
+            pytest.fail("requires four cards")
+
+        @pytest.mark.parametrize("sku", [
+            pytest.param("A2", marks=hardware_marks(res={"npu": "A2"})),
+            pytest.param("A3", marks=hardware_marks(res={"npu": "A3"})),
+        ])
+        def test_model(sku):
+            assert sku == "A3"
+        """
+    )
+    result = pytester.runpytest(sample, "--strict-test-levels", "--strict-markers")
+    result.assert_outcomes(passed=6, skipped=3)
+    result = pytester.runpytest(sample, "-m", "npu_test and A3 and cards_2")
+    result.assert_outcomes(passed=2, deselected=7)
+    result = pytester.runpytest(sample, "--collect-only", "-m", "H100 and cards_4")
+    assert "test_split[cuda]" in result.stdout.str()
+    result.assert_outcomes(deselected=8)
+    result = pytester.runpytest(sample, "-m", "gpu_test and A100 and npu_test and A3 and cards_1")
+    result.assert_outcomes(passed=1, deselected=8)
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]

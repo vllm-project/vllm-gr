@@ -43,6 +43,9 @@ from dataclasses import dataclass
 
 import torch
 
+from tools.hardware_marks import hardware_marks
+
+
 try:
     import pytest
 except ImportError:  # keeps the module importable without pytest installed
@@ -51,7 +54,7 @@ except ImportError:  # keeps the module importable without pytest installed
 # Declare the tier before the module-level skip below, so the directory
 # default never relabels this NPU suite as gpu_test.
 if pytest is not None:
-    pytestmark = pytest.mark.npu_test
+    pytestmark = hardware_marks(res={"npu": "A3"}, num_cards=1)
 
 # ---------------------------------------------------------------------------
 # NPU availability. Both `import torch_npu` and `torch.device("npu")` raise

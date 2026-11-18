@@ -14,8 +14,10 @@ import psutil
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from vllm_gr.entrypoints.gr import GRLLM
 from vllm_gr.sampling_params import BeamSearchParams
+
 
 if not torch.cuda.is_available():
     pytest.skip("beam_search_v1 requires CUDA", allow_module_level=True)
@@ -287,4 +289,4 @@ def test_offline_unconstrained_beam_search_v1(
             process.join()
 
 
-pytestmark = pytest.mark.gpu_test
+pytestmark = hardware_marks(res={"cuda": "A100"}, num_cards=1)

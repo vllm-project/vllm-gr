@@ -27,6 +27,8 @@ from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingM
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 
+from tools.hardware_marks import hardware_marks
+
 if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 
@@ -179,4 +181,4 @@ def test_serving_gr_beam_search(loops: int) -> None:
     assert p.exitcode == 0
 
 
-pytestmark = pytest.mark.gpu_test
+pytestmark = hardware_marks(res={"cuda": "A100"}, num_cards=1)

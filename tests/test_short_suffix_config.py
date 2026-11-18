@@ -12,6 +12,7 @@ from typing import Any, Literal
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_test
 from vllm_gr.config import GRConfig, gr_config_from_mapping, gr_config_to_mapping
 from vllm_gr.v1.attention.backends.beam_attn_gpu import (
     GPUBeamAttentionBatch,
@@ -304,7 +305,7 @@ def test_context_rejects_nonpositive_capacity_before_allocating(capacity: int) -
         )
 
 
-@pytest.mark.gpu_test
+@hardware_test(res={"cuda": "A100"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("capacity", [4, 8, 16, 32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

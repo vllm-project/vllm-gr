@@ -207,8 +207,8 @@ their shared fixtures, in the prepared development environment.
 
 Every test declares the platforms it runs on with a tier marker registered in
 `pyproject.toml`; collection fails and lists the modules when one is missing.
-As in upstream vLLM, the markers only describe the environment and never skip
-a test, so each host selects its tier with `-m`:
+The platform markers describe the environment. Each host selects its tier
+with `-m`:
 
 ```bash
 python -m pytest tests -m 'cpu_test and not gpu_test and not npu_test'  # CPU host
@@ -257,6 +257,43 @@ def test_npu_path() -> None: ...
 
 When only some parameters need a device, mark those parameters, for example
 `pytest.param("cuda", marks=pytest.mark.gpu_test)`.
+
+#### Accelerator models and card counts
+
+Use `hardware_test` to declare accelerator models and the minimum number of
+visible devices. It adds the platform, model, and `cards_N` markers.
+`pyproject.toml` registers CUDA models under `[cuda-sku]`, Ascend A2, A3,
+A5, and 310P under `[npu-sku]`, and counts 1 through 8 under
+`[hardware-cards]`. Counts default to 1.
+
+```python
+from tools.hardware_marks import hardware_test
+
+
+@hardware_test(
+    res={"cuda": ["H100", "H20"], "npu": "A3"},
+    num_cards={"cuda": 4, "npu": 2},
+)
+def test_model_specific_path():
+    ...
+```
+
+Different counts create separate platform cases so each has one
+`cards_N` marker. Use `hardware_marks` for module-level or
+`pytest.param` marks with one count per item. For example, select two-card
+A3 cases with `-m "l2 and npu_test and A3 and cards_2"`.
+
+At collection, plain `gpu_test` defaults to A100 and plain `npu_test`
+defaults to A3. Both default to `cards_1`. This also applies to directory
+defaults and parameter marks. Explicit models and card counts take precedence.
+The CI level runner selects by platform. During setup, a resource-specific case
+skips unless a declared platform meets the minimum count and all of its
+visible devices match the allowed models. On mixed-model hosts, restrict
+device visibility before starting pytest.
+
+The `check-mark` pre-commit hook checks test sources for direct SKU or
+`cards_N` marks. Declare these through the hardware helpers so each item
+also carries its platform requirements.
 
 ### Device and model tests
 

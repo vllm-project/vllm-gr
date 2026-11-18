@@ -10,8 +10,10 @@ from pathlib import Path
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
+
 pytestmark = [
-    pytest.mark.gpu_test,
+    *hardware_marks(res={"cuda": "A100"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
 ]
 

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 import torch
 
+from tools.hardware_marks import hardware_marks
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     install_decode_model,
@@ -19,8 +20,9 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 from vllm_gr.v1.worker.gpu_model_runner_v2_resources import capture_multibatch_forward
 from vllm_gr.v1.worker.gr_startup import _capture_batch
 
+
 pytestmark = [
-    pytest.mark.gpu_test,
+    *hardware_marks(res={"cuda": "A100"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
 ]
 
