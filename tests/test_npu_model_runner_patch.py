@@ -14,16 +14,10 @@ from vllm.v1.core.sched.output import NewRequestData
 
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
 from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
-from vllm_gr.v1.beam.npu_execution_batch import (
-    NPUBeamExecutionBatch,
-    restore_npu_cache_pool_layout,
-)
+from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch, restore_npu_cache_pool_layout
 from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
 from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
-from vllm_gr.v1.worker.npu_beam_stage_adapter import (
-    NPUEagerStagePlan,
-    validate_npu_eager_capabilities,
-)
+from vllm_gr.v1.worker.npu_beam_stage_adapter import NPUEagerStagePlan,validate_npu_eager_capabilities
 from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
 
 
