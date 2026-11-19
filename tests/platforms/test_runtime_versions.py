@@ -3,6 +3,7 @@
 
 from collections.abc import Iterator
 from importlib.metadata import PackageNotFoundError
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -12,6 +13,18 @@ from vllm_gr._env_check import (
     check_environment,
     check_runtime_versions,
 )
+
+
+class _FakeAscendPlatform:
+    """Synthetic Ascend identity: the vendor class lineage, no vendor import."""
+
+    _enum = "OOT"
+    device_type = "npu"
+    device_name = "npu"
+
+
+_FakeAscendPlatform.__module__ = "vllm_ascend.platform"
+_FakeAscendPlatform.__qualname__ = "NPUPlatform"
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -29,7 +42,7 @@ def test_environment_checks_only_vllm_on_non_npu(backend_registry: None) -> None
     from vllm_gr.platforms.cuda import CUDA_BACKEND
     from vllm_gr.platforms.registry import get_active_backend
 
-    platform = mock.Mock(device_type="cuda")
+    platform = SimpleNamespace(_enum="CUDA", device_type="cuda", device_name="cuda")
     with (
         mock.patch("vllm.platforms.current_platform", platform),
         mock.patch(
@@ -45,10 +58,10 @@ def test_environment_checks_only_vllm_on_non_npu(backend_registry: None) -> None
 
 
 def test_environment_checks_ascend_runtime_on_npu(backend_registry: None) -> None:
-    from vllm_gr.platforms.npu import NPU_BACKEND
+    from vllm_gr.platforms.ascend import NPU_BACKEND
     from vllm_gr.platforms.registry import get_active_backend
 
-    platform = mock.Mock(device_type="npu")
+    platform = _FakeAscendPlatform()
     expected = {"vllm": "0.30.0", "vllm-ascend": "0.30.0rc2", "platform": "npu"}
     with (
         mock.patch("vllm.platforms.current_platform", platform),
@@ -69,7 +82,10 @@ def test_environment_rejects_unknown_platform_without_cuda_fallback(backend_regi
     from vllm_gr.platforms.errors import UnsupportedBackendError
 
     with (
-        mock.patch("vllm.platforms.current_platform", mock.Mock(device_type="unknown")),
+        mock.patch(
+            "vllm.platforms.current_platform",
+            SimpleNamespace(_enum="UNSPECIFIED", device_type="unknown"),
+        ),
         mock.patch("vllm_gr._env_check.check_runtime_versions") as check_versions,
         pytest.raises(UnsupportedBackendError, match="unknown"),
     ):

@@ -12,6 +12,14 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
+    from .identity import PlatformIdentity
+
+#: Provider API implemented by built-in and external providers in this release.
+PROVIDER_API_VERSION = 2
+
+#: API version assumed for entry points that do not declare one.
+LEGACY_PROVIDER_API_VERSION = 1
+
 
 class ModelRunnerPatchHooks(Protocol):
     """Required hooks for the V1 ModelRunner patch dispatcher.
@@ -73,10 +81,31 @@ class BeamAttentionExecution(Protocol):
 
 
 class GRBackendProvider(Protocol):
-    """Process-local provider for one canonical vLLM device type."""
+    """Process-local provider for one stable GR backend identity."""
 
     @property
-    def device_type(self) -> str: ...
+    def backend_id(self) -> str: ...
+
+    @property
+    def device_type(self) -> str:
+        """Tensor placement of the supported platform; not the identity."""
+
+    @property
+    def api_version(self) -> int: ...
+
+    @property
+    def gr_version_range(self) -> str | None: ...
+
+    @property
+    def vllm_version_range(self) -> str | None: ...
+
+    @property
+    def vendor_version_range(self) -> str | None: ...
+
+    @property
+    def vendor_distribution(self) -> str | None: ...
+
+    def matches(self, identity: PlatformIdentity) -> bool: ...
 
     def check_environment(self) -> dict[str, str]: ...
 

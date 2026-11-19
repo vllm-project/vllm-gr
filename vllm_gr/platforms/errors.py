@@ -11,11 +11,23 @@ class InvalidBackendProviderError(BackendRegistryError):
     pass
 
 
+class InvalidBackendVersionError(BackendRegistryError):
+    pass
+
+
 class DuplicateBackendRegistrationError(BackendRegistryError):
     pass
 
 
 class UnsupportedBackendError(BackendRegistryError):
+    pass
+
+
+class AmbiguousBackendError(BackendRegistryError):
+    pass
+
+
+class IncompatibleBackendError(BackendRegistryError):
     pass
 
 

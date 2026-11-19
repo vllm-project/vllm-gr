@@ -10,8 +10,9 @@ from unittest import mock
 
 import pytest
 
-from vllm_gr.platforms import cuda, npu
-from vllm_gr.platforms.builtins import register_builtin_backends
+from vllm_gr.platforms.ascend import provider as npu
+from vllm_gr.platforms.cuda import provider as cuda
+from vllm_gr.platforms.loader import load_backend_plugins
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     resolve_backend,
@@ -27,11 +28,11 @@ def teardown_function() -> None:
 
 
 def test_builtin_providers_register_idempotently() -> None:
-    register_builtin_backends()
-    register_builtin_backends()
+    load_backend_plugins()
+    load_backend_plugins()
 
     assert resolve_backend("cuda") is cuda.CUDA_BACKEND
-    assert resolve_backend("npu") is npu.NPU_BACKEND
+    assert resolve_backend("ascend") is npu.NPU_BACKEND
 
 
 def test_cuda_provider_lazily_returns_platform_modules(
@@ -117,11 +118,10 @@ def test_cuda_environment_check_validates_platform_and_versions(
 ) -> None:
     from vllm_gr import _env_check
 
-    vllm_module = ModuleType("vllm")
     platforms = ModuleType("vllm.platforms")
-    platforms.current_platform = SimpleNamespace(device_type="cuda")  # type: ignore[attr-defined]
-    vllm_module.platforms = platforms  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    platforms.current_platform = SimpleNamespace(  # type: ignore[attr-defined]
+        _enum="CUDA", device_type="cuda", device_name="cuda"
+    )
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
 
     report = {"vllm": "0.30.0"}
@@ -134,8 +134,10 @@ def test_cuda_environment_check_validates_platform_and_versions(
     }
     check_versions.assert_called_once_with()
 
-    platforms.current_platform.device_type = "cpu"
-    with pytest.raises(RuntimeError, match="requires the CUDA platform"):
+    platforms.current_platform = SimpleNamespace(  # type: ignore[attr-defined]
+        _enum="ROCM", device_type="cuda", device_name="cuda"
+    )
+    with pytest.raises(RuntimeError, match="requires the native CUDA platform"):
         cuda.CUDA_BACKEND.check_environment()
 
 

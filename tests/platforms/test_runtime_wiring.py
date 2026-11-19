@@ -27,15 +27,32 @@ def isolated_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     _reset_backend_registry_for_tests()
 
 
+class _SyntheticAscendPlatform:
+    """Ascend identity built from the vendor class lineage, without the vendor."""
+
+    _enum = "OOT"
+    device_type = "npu"
+    device_name = "npu"
+
+
+_SyntheticAscendPlatform.__module__ = "vllm_ascend.platform"
+_SyntheticAscendPlatform.__qualname__ = "NPUPlatform"
+
+
+def _synthetic_platform(device_type: str) -> object:
+    """Return a synthetic native platform for each supported backend."""
+    if device_type == "npu":
+        return _SyntheticAscendPlatform()
+    return SimpleNamespace(_enum="CUDA", device_type="cuda", device_name="cuda")
+
+
 @pytest.mark.parametrize("device_type", ["cuda", "npu"])  # type: ignore[misc]
 def test_plugin_routes_validation_and_patches_through_selected_provider(
     monkeypatch: pytest.MonkeyPatch, device_type: str
 ) -> None:
     import vllm.platforms
 
-    monkeypatch.setattr(
-        vllm.platforms, "current_platform", SimpleNamespace(device_type=device_type)
-    )
+    monkeypatch.setattr(vllm.platforms, "current_platform", _synthetic_platform(device_type))
     events: list[str] = []
 
     def hook(name: str, result: object) -> Mock:
@@ -66,7 +83,8 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
     for _ in range(2):
         events.clear()
         state = plugin.initialize_runtime()
-        assert get_active_backend().device_type == device_type
+        expected_backend_id = "ascend" if device_type == "npu" else "cuda"
+        assert get_active_backend().backend_id == expected_backend_id
         backend_events = ["spawn", "worker"] if device_type == "npu" else []
         assert events == [
             "defaults",
@@ -95,7 +113,7 @@ def test_environment_failure_prevents_runtime_patch_installation(
 ) -> None:
     import vllm.platforms
 
-    monkeypatch.setattr(vllm.platforms, "current_platform", SimpleNamespace(device_type="cuda"))
+    monkeypatch.setattr(vllm.platforms, "current_platform", _synthetic_platform("cuda"))
     monkeypatch.setattr(_env_check, "configure_model_runner_default", lambda: None)
     monkeypatch.setattr(
         _env_check, "check_runtime_versions", Mock(side_effect=RuntimeError("version"))
@@ -113,7 +131,7 @@ def test_partial_provider_failure_stops_common_plan_and_retains_cause(
     import vllm.platforms
 
     # Exercise the direct entry used by a fresh worker, before any env dispatch.
-    monkeypatch.setattr(vllm.platforms, "current_platform", SimpleNamespace(device_type="npu"))
+    monkeypatch.setattr(vllm.platforms, "current_platform", _synthetic_platform("npu"))
     monkeypatch.setattr(patch.pangu_compat, "apply_pangu_tied_embeddings_patch", lambda: False)
     monkeypatch.setattr(
         patch.selector_patch, "apply_custom_attention_backend_patch", lambda **kw: 0
@@ -125,9 +143,9 @@ def test_partial_provider_failure_stops_common_plan_and_retains_cause(
     beam = Mock()
     monkeypatch.setattr(patch, "_apply_gr_beam_patches", beam)
 
-    with pytest.raises(RuntimeError, match="backend 'npu'.*partial.*restart") as raised:
+    with pytest.raises(RuntimeError, match="backend 'ascend'.*partial.*restart") as raised:
         patch.re_apply_patches()
     assert raised.value.__cause__ is failure
-    assert get_active_backend().device_type == "npu"
+    assert get_active_backend().backend_id == "ascend"
     spawn.assert_called_once_with()
     beam.assert_not_called()

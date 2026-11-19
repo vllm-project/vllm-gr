@@ -44,6 +44,16 @@ _CONSTRAINT_EXECUTION_ENV = "VLLM_GR_CONSTRAINT_EXECUTION"
 _TORCH_OVERRIDE = "torch"
 
 
+def _backend_label(provider: Any) -> str:
+    """Describe the active provider for a startup diagnostic.
+
+    The backend ID is the GR implementation; tensor placement stays available
+    through the platform identity when the two differ.
+    """
+    backend_id = getattr(provider, "backend_id", None)
+    return repr(backend_id) if isinstance(backend_id, str) else repr(provider)
+
+
 def create_constraint_execution(
     *,
     device: str | Any | None = None,
@@ -77,18 +87,16 @@ def create_constraint_execution(
     provider = activate_current_backend()
     adapter = provider.create_constrained_topk_execution(device=device)
     if adapter is None:
-        platform = provider.device_type
         raise RuntimeError(
             "constraint_backend='constraint_table' cannot start: the active "
-            f"platform {platform!r} does not implement Constraint Table "
+            f"backend {_backend_label(provider)} does not implement Constraint Table "
             "execution. Constraint Tables are not available on this platform; "
             "starting must fail explicitly rather than fall back to Trie."
         )
     if not adapter.is_available():
-        platform = provider.device_type
         raise RuntimeError(
             "constraint_backend='constraint_table' cannot start: the active "
-            f"platform {platform!r} provides a Constraint Table adapter but "
+            f"backend {_backend_label(provider)} provides a Constraint Table adapter but "
             "its custom operator is unavailable (is_available()=False). "
             "Verify the operator binary / environment; starting must fail "
             "explicitly rather than fall back to Trie."
@@ -227,13 +235,16 @@ def prepare_constraint_table(
     constrained request runs, never at the first constrained step.
     """
     from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
+    from vllm_gr.platforms.identity import current_platform_identity
     from vllm_gr.platforms.loader import activate_current_backend
 
-    provider = activate_current_backend()
+    # Activate the provider before validation so an unsupported platform fails
+    # here rather than at the first constrained step.
+    activate_current_backend()
     if gr_config is not None:
         validate_constraint_table_platform(
             gr_config,
-            device_type=provider.device_type,
+            device_type=current_platform_identity().device_type,
         )
     # Startup-time fail-fast (issue #246 §7): the probe adapter is discarded;
     # the Worker lazily creates its own with the runner device (N3).

@@ -4,9 +4,10 @@
 
 The platform backend boundary separates hardware-neutral vLLM-GR runtime
 orchestration from CUDA- and NPU-specific implementations. A backend provider
-binds an exact canonical vLLM `device_type` to ModelRunner patch hooks,
-Beam Attention execution primitives, environment validation, and any
-platform-specific compatibility patches.
+binds declared provider metadata and an identity match against the native
+platform vLLM already selected to ModelRunner patch hooks, Beam Attention
+execution primitives, environment validation, and any platform-specific
+compatibility patches.
 
 Production startup already uses provider activation, environment validation,
 runtime compatibility patches, and the constrained TopK execution factory.
@@ -22,8 +23,9 @@ EngineCore, or Worker process owns an independent registry.
 The general-plugin startup sequence is:
 
 1. Configure the ModelRunner default before platform-dependent configuration.
-2. `check_environment()` registers built-ins, loads external providers, activates
-   the current vLLM `device_type`, and invokes the provider's environment check.
+2. `check_environment()` registers built-ins, loads external providers, selects
+   the provider matching the current native platform identity, and invokes its
+   environment check.
 3. `re_apply_patches()` reuses that provider (or activates it in a fresh process).
 4. Install the shared Pangu and CUSTOM attention selector compatibility hooks.
 5. Invoke `provider.apply_runtime_patches(force=True)`. The NPU provider installs
@@ -66,21 +68,61 @@ needs platform-specific behavior. Activation does not itself run environment
 checks or apply patches.
 
 Only one backend may be active in a process. Re-activating the same provider
-is idempotent; switching to another provider is an error. Backend aliases are
-not resolved by the registry. In particular, `gpu` does not mean `cuda` and
-`ascend` does not mean `npu`.
+is idempotent; switching to another provider is an error. Backend IDs are not
+aliased by the registry. In particular, `gpu` does not mean `cuda`, and the
+built-in Ascend provider's ID is `ascend`, not the `npu` tensor device type.
 
 An unknown backend is always an error in the registry APIs and never falls
 back to CUDA. This registry guarantee does not describe every independent
 worker or attention dispatch branch.
 
+## Platform identity and deterministic selection
+
+A backend ID is a stable GR implementation identity, not tensor placement.
+NVIDIA CUDA and AMD ROCm both report `device_type == "cuda"`, so selection
+cannot key on it.
+
+`vllm_gr.platforms.identity` is the only bridge from the native platform to GR.
+It builds an immutable `PlatformIdentity` from the live `current_platform`
+instance: the upstream platform enum name, the tensor `device_type`, the
+`device_name`, and the qualified class name plus full MRO lineage. Reading it
+imports no vendor runtime and instantiates nothing, so the packaging and import
+isolation guarantees still hold. Native vLLM remains the only hardware
+selection authority, and no availability probe is made here.
+
+Selection follows these rules:
+
+1. Register built-ins that are not explicitly disabled, then discover external
+   entry points. Validate the complete batch before committing.
+2. Reject a duplicate backend ID from a different provider, reporting both
+   origins, before any match is evaluated.
+3. Call `provider.matches(identity)` for every registered provider.
+4. With an explicit `VLLM_GR_BACKEND`, that ID must exist and match the selected
+   platform. An explicit request can resolve ambiguity but cannot suppress a
+   duplicate-ID error or make an incompatible platform match.
+5. Without an explicit request, exactly one provider must match. Zero matches is
+   `UnsupportedBackendError`; several is `AmbiguousBackendError`. Discovery order
+   and priority scores are never used as tie-breakers.
+
+Core holds no hardware identity allowlist. `matches()` is the only place a
+platform identity is accepted or rejected, so adding a backend never edits a
+table under `platforms/`.
+
 ## Provider contract
 
-A provider exposes one canonical `device_type` and five methods:
+A provider exposes declared metadata, an identity match, and five operations:
 
 ```python
 class GRBackendProvider(Protocol):
-    device_type: str
+    backend_id: str
+    device_type: str            # placement, for diagnostics only
+    api_version: int            # currently 2
+    gr_version_range: str | None
+    vllm_version_range: str | None
+    vendor_version_range: str | None
+    vendor_distribution: str | None
+
+    def matches(self, identity: PlatformIdentity) -> bool: ...
 
     def check_environment(self) -> dict[str, str]: ...
 
@@ -101,10 +143,16 @@ class GRBackendProvider(Protocol):
     ) -> "ConstrainedTopKExecution | None": ...
 ```
 
-Registration validates only `device_type` and the presence of the five
-callable methods. It must not invoke the methods. This preserves lazy imports
-and allows CUDA and NPU providers to coexist in the registry without loading
-both hardware runtimes.
+Registration validates `backend_id`, the declared `api_version`, and the
+presence of `matches` and the five callable operations. It never invokes them.
+This preserves lazy imports and keeps CUDA and Ascend providers registered in
+one process without loading either hardware runtime.
+
+The built-in mappings are `backend_id="cuda"` for the native CUDA platform and
+`backend_id="ascend"` for the supported Ascend platform. The Ascend provider
+matches the vendor class lineage (`vllm_ascend.platform.NPUPlatform`) as well as
+`device_type == "npu"`, because the vendor platform's upstream enum is `OOT`,
+which another out-of-tree platform could also report.
 
 Provider objects are registered directly. Entry points must not expose a
 provider class or an arbitrary factory.
@@ -189,13 +237,45 @@ External packages register provider objects in this entry-point group:
 
 ```toml
 [project.entry-points."vllm_gr.platform_backends"]
-npu = "vllm_gr_npu.provider:NPU_BACKEND"
+ascend = "vllm_gr_npu.provider:NPU_BACKEND"
 ```
 
-The entry-point name must exactly equal `provider.device_type`. Providers are
+The API-v2 entry-point name must exactly equal `provider.backend_id`. Providers are
 loaded once per process. A provider cannot silently override a built-in or
-another external provider; duplicate device types from different objects are
-errors and diagnostics identify both registration sources.
+another external provider; duplicate IDs from different objects are errors, and
+diagnostics identify both registration sources plus the installed distribution
+and version when entry-point metadata provides them.
+
+`VLLM_GR_DISABLE_BUILTIN_BACKENDS` is a comma-separated list of backend IDs. It
+is read before built-in registration, so an external distribution can replace a
+built-in with no code change. The switch must be set consistently in every
+participating process. It removes one built-in; it never suppresses the
+duplicate-ID check.
+
+## Provider API versions
+
+An entry point either declares `api_version` explicitly or is adapted through
+the deprecated version-1 path, which is selected by `getattr(provider,
+"api_version", 1)` and never by duck typing.
+
+- A version-1 object is wrapped in `LegacyProviderAdapter` and is recognized only
+  for the two identities that shipped unversioned: `cuda` maps to the CUDA
+  provider ID and `npu` to `ascend`. The installed entry point retains its
+  original device-type name. The CUDA adapter requires the native CUDA enum
+  and CUDA placement. The adapter emits a deprecation warning naming its source.
+- A version-1 object is never upgraded in place, and its optional attributes are
+  never read as evidence of version-2 capability. Every declared range of the
+  adapter is `None`.
+- A version-1 object for any other device placement is rejected and must
+  declare `api_version=2`, `backend_id` and `matches(identity)`.
+- An unknown `api_version` is rejected with `InvalidBackendVersionError`.
+
+Declared ranges are checked against installed distribution metadata before
+activation. An unsatisfied range is advisory by default and logged with the
+provider identity; setting `VLLM_GR_STRICT_PROVIDER_RANGES=1` makes it a startup
+failure. An invalid version specifier or missing required declaration fails
+registration. A missing installed vendor distribution follows the same
+warning or strict-failure policy as a version mismatch.
 
 Plugin discovery validates the complete batch before committing registrations,
 so a failing entry point does not leave an earlier provider partially
@@ -203,27 +283,30 @@ registered.
 
 ## Current built-in mappings
 
-| Provider method | CUDA mapping | NPU mapping |
-| --- | --- | --- |
+| Provider method | CUDA mapping | Ascend mapping |
+| --- | --- | --- | --- |
+| `backend_id` | `cuda` | `ascend` |
 | `device_type` | `cuda` | `npu` |
+| `matches()` | `platform_enum == "CUDA"` and `device_type == "cuda"` | `device_type == "npu"` and `vllm_ascend.platform.NPUPlatform` in the lineage |
 | `check_environment()` | Validate current CUDA platform, then `check_runtime_versions()` | `check_ascend_environment(require_npu_platform=True)` |
 | `apply_runtime_patches()` | No early compatibility hooks | NPU spawn protection, then NPUWorker initialization hook; return the summed patch count |
 | `get_model_runner_hooks()` | `cuda/v1/gpu_model_runner_patch` | `npu/npu_model_runner_patch` |
 | `get_attention_execution()` | `beam_attn_gpu` | `beam_attn_npu` |
 | `create_constrained_topk_execution()` | Lazy-loads a fresh `CUDAConstrainedTopKExecution(device=device)` | Lazy-loads a fresh `NPUConstrainedTopKExecution(device=device)` |
 
-The NPU provider is built in during the initial migration so the contract is
-exercised against all current Ascend requirements. A later stage may move it
-to a separately distributed package.
+The Ascend provider is built in during the initial migration so the contract is
+exercised against all current Ascend requirements. A later stage may move it to
+a separately distributed package, and `VLLM_GR_DISABLE_BUILTIN_BACKENDS` is what
+makes that extraction possible without a code change.
 
 ## Regression after removing the built-in NPU provider
 
 When the built-in NPU provider is removed, regression coverage must install or
-inject an external `npu` entry point and rerun the same contract tests:
+inject an external `ascend` entry point and rerun the same contract tests:
 
 1. Importing and registering core built-ins still loads no NPU modules.
-2. The external `npu` provider resolves and activates for the canonical NPU
-   platform.
+2. The external `ascend` provider resolves and activates for the supported
+   Ascend platform identity.
 3. Its environment check delegates to the complete Ascend validation.
 4. The shared CUSTOM selector runs before its spawn/worker hooks and patch
    counts are summed. CUDA retains CUSTOM routing without importing Ascend.

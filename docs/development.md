@@ -33,8 +33,10 @@ offline entry point. Runtime initialization belongs to
 repeatable initialization in the relevant frontend, EngineCore, and Worker
 processes; frontend startup alone does not establish Worker patch installation.
 
-Platform registration is hardware-import-free. Provider activation does not
-replace the separate Worker and Attention dispatchers. The
+Platform registration is hardware-import-free. Provider selection keys on a
+declared backend ID matched against the native platform identity, not on tensor
+device type. Provider activation does not replace the separate Worker and
+Attention dispatchers. The
 [platform contract](platform_backend_contract.md) explains these boundaries;
 the [patch inventory](runtime_patch_inventory.md) records installation ownership.
 

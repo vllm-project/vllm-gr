@@ -576,7 +576,7 @@ def _apply_patches(force: bool = False) -> int:
         backend_count: int = provider.apply_runtime_patches(force=force)
     except Exception as exc:
         raise RuntimeError(
-            f"Runtime patches for backend {provider.device_type!r} failed; "
+            f"Runtime patches for backend {provider.backend_id!r} failed; "
             "initialization may be partial, restart the process"
         ) from exc
     beam_count = _apply_gr_beam_patches(force=force)

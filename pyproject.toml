@@ -83,6 +83,15 @@ Issues = "https://github.com/JiusiServe/vllm-gr/issues"
 [project.entry-points."vllm.general_plugins"]
 vllm_gr = "vllm_gr.plugin:register"
 
+[project.entry-points."vllm_gr.platform_backends"]
+cuda = "vllm_gr.platforms.cuda.provider:CUDA_BACKEND"
+ascend = "vllm_gr.platforms.ascend.provider:NPU_BACKEND"
+
+# Historical v1 entry points identify tensor placement instead of the provider.
+[project.entry-points."vllm_gr.legacy_placements"]
+cuda = "vllm_gr.platforms.cuda.provider:CUDA_BACKEND"
+npu = "vllm_gr.platforms.ascend.provider:NPU_BACKEND"
+
 [project.scripts]
 vllm-gr-sidecar = "vllm_gr.sidecar.__main__:main"
 
