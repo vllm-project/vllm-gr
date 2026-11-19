@@ -66,6 +66,19 @@ async def _measured_engine(builder: Any, args: Any) -> AsyncIterator[Any]:
             await manager.__aexit__(*sys.exc_info())
 
 
+@contextmanager
+def _measured_sync_engine(builder: Any, **kwargs: Any) -> Any:
+    # GRLLM construction performs startup, before its __enter__ is called.
+    with _measure("engine_startup_seconds"):
+        manager = builder(**kwargs)
+        engine = manager.__enter__()
+    try:
+        yield engine
+    finally:
+        with _measure("engine_shutdown_seconds"):
+            manager.__exit__(*sys.exc_info())
+
+
 _BEAM_WIDTH = int(os.environ.get("VLLM_GR_TEST_WIDTH", "128"))
 _EAGER = os.environ.get("VLLM_GR_TEST_EAGER", "0") == "1"
 _UNCONSTRAINED = os.environ.get("VLLM_GR_TEST_UNCONSTRAINED", "0") == "1"
@@ -516,7 +529,9 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
     rows: list[dict[str, Any]] = []
     reference: dict[tuple[int, int], list[tuple[tuple[int, ...], float]]] = {}
-    with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **_engine_kwargs(model, config)) as llm:
+    with _measured_sync_engine(
+        GRLLM, vllm_gr_config=config, shutdown_timeout=10, **_engine_kwargs(model, config)
+    ) as llm:
         expected_client = (
             "InprocClient"
             if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"
@@ -591,7 +606,7 @@ async def _run_online(work_dir: Path) -> None:
         shutdown_timeout=10,
         **_engine_kwargs(model, config),
     )
-    async with build_async_engine_client_from_engine_args(args) as engine:
+    async with _measured_engine(build_async_engine_client_from_engine_args, args) as engine:
         processes = list(engine.engine_core.resources.engine_manager.processes)
         serving = GenerateBaseServing(
             engine_client=engine,
@@ -797,7 +812,7 @@ def _run_completion_reference(work_dir: Path) -> None:
 
     model, config, sizes, kwargs, prompts, _ = _completion_inputs(work_dir)
     rows = []
-    with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **kwargs) as llm:
+    with _measured_sync_engine(GRLLM, vllm_gr_config=config, shutdown_timeout=10, **kwargs) as llm:
         processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
         llm.collective_rpc("onerec_v1_st_observe")
         for count in sizes:
