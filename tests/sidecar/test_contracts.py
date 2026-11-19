@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -14,13 +13,7 @@ import pytest
 from pydantic import TypeAdapter
 
 from vllm_gr.entrypoints.management import CheckpointReload, Target, TrieReload, router
-from vllm_gr.sidecar import (
-    ControlClient,
-    Instance,
-    UpdateContext,
-    UpdateTask,
-    default_checker,
-)
+from vllm_gr.sidecar import ControlClient, Instance, UpdateContext
 from vllm_gr.sidecar.contracts import (
     CONTROL_PATHS,
     PAUSE_PATH,
@@ -29,7 +22,7 @@ from vllm_gr.sidecar.contracts import (
     RESUME_PATH,
     STATUS_PATH,
 )
-from vllm_gr.update_status import ResourceType, ServiceState, ServiceStatus
+from vllm_gr.update_status import ServiceState, ServiceStatus
 
 
 def test_client_paths_match_production_router() -> None:
@@ -86,39 +79,6 @@ def test_service_status_wire_fields_are_the_shared_contract() -> None:
         == status
     )
     assert {state.value for state in ServiceState} == {"running", "paused"}
-
-
-class _FileSystem:
-    async def get_latest_version(self, address: str) -> str | None:
-        return None
-
-    async def download(self, address: str, version: str, target_dir: Path) -> None:
-        return None
-
-
-class _Mode:
-    def groups(self, instances: Sequence[Instance]) -> Iterable[Sequence[Instance]]:
-        return ()
-
-
-class _Process:
-    async def run(self, instance: Instance, context: UpdateContext, *, checker: Any = None) -> bool:
-        return False
-
-
-def test_update_task_uses_the_shared_default_checker(tmp_path: Path) -> None:
-    resources: tuple[ResourceType, ...] = ("checkpoint", "trie")
-    for resource_type in resources:
-        task = UpdateTask(
-            name=resource_type,
-            filesystem=_FileSystem(),
-            address="hdfs://cluster/models",
-            target_dir=tmp_path / resource_type,
-            update_mode=_Mode(),
-            update_process=_Process(),
-            resource_type=resource_type,
-        )
-        assert task.checker is default_checker(resource_type)
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

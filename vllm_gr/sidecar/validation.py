@@ -6,14 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vllm_gr.update_status import ResourceType
-
-from .contracts import Checker, UpdateError
-
-
-def default_checker(resource_type: ResourceType) -> Checker:
-    """Return the inspected default comparison for one resource type."""
-    return default_ckpt_checker if resource_type == "checkpoint" else default_trie_checker
+from .contracts import UpdateError
 
 
 def _files(directory: Path) -> dict[str, int]:

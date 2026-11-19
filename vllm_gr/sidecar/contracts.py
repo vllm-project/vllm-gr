@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from vllm_gr.update_status import ResourceType, ServiceStatus
+from vllm_gr.update_status import ResourceType as ResourceType
+from vllm_gr.update_status import ServiceStatus as ServiceStatus
 
 Checker = Callable[[Path | None, Path], bool | Awaitable[bool]]
 
