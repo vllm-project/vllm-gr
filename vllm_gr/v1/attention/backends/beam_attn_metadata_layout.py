@@ -322,25 +322,26 @@ def build_async_batch_layout(
         or any(type(length) is not int or length < 1 for length in prompt_lengths)
     ):
         raise ValueError("Asynchronous scheduling batch geometry is invalid")
-    query = [item * width for item in range(batch + 1)]
     rows = batch * width
+    positions: list[int] = []
     blocks: list[int] = []
-    for request_blocks in block_ids_by_request:
+    for prompt, request_blocks in zip(prompt_lengths, block_ids_by_request):
         if len(request_blocks) > max_blocks:
             raise ValueError("Asynchronous scheduling prefix block table exceeds capacity")
+        positions.extend([prompt + decode_step] * width)
         blocks.extend(request_blocks)
         blocks.extend([0] * (max_blocks - len(request_blocks)))
     suffix_length = decode_step + 1
     return {
-        "positions": [prompt + decode_step for prompt in prompt_lengths for _ in range(width)],
-        "query": query,
+        "positions": positions,
+        "query": list(range(0, rows + 1, width)),
         "sequence": [prompt + suffix_length for prompt in prompt_lengths],
         "prefix_lengths": list(prompt_lengths),
         "blocks": blocks,
         "logits": list(range(rows)),
         "suffix_query": list(range(rows + 1)),
         "suffix_lengths": [suffix_length] * rows,
-        "suffix_offsets": [item * suffix_length for item in range(rows + 1)],
+        "suffix_offsets": list(range(0, rows * suffix_length + 1, suffix_length)),
     }
 
 
