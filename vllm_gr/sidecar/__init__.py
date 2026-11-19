@@ -19,7 +19,7 @@ from .controller import Sidecar
 from .filesystems import HDFSDownloader
 from .modes import RollingUpdate, SyncUpdate
 from .processes import OnlineUpdateProcess, PausedUpdateProcess
-from .validation import default_ckpt_checker, default_trie_checker
+from .validation import default_checker, default_ckpt_checker, default_trie_checker
 
 __all__ = [
     "Checker",
@@ -40,6 +40,7 @@ __all__ = [
     "UpdateMode",
     "UpdateProcess",
     "UpdateTask",
+    "default_checker",
     "default_ckpt_checker",
     "default_trie_checker",
 ]

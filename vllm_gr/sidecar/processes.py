@@ -13,7 +13,7 @@ from vllm_gr.update_status import ServiceState, ServiceStatus
 
 from .client import ControlClient
 from .contracts import Checker, Control, Instance, UpdateContext, UpdateError
-from .validation import default_ckpt_checker, default_trie_checker
+from .validation import default_checker
 
 
 async def _check_resource(
@@ -21,13 +21,7 @@ async def _check_resource(
     context: UpdateContext,
     checker: Checker | None,
 ) -> None:
-    selected = (
-        checker
-        if checker is not None
-        else (
-            default_ckpt_checker if context.resource_type == "checkpoint" else default_trie_checker
-        )
-    )
+    selected = checker if checker is not None else default_checker(context.resource_type)
     resource_path = status.path_for(context.resource_type)
     old_path = Path(resource_path) if resource_path is not None else None
     try:

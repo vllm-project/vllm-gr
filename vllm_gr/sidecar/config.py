@@ -9,16 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from vllm_gr.update_status import ResourceType
+
 from .contracts import (
     Checker,
     FileSystem,
     Instance,
-    ResourceType,
     UpdateMode,
     UpdateProcess,
     check_name,
 )
-from .validation import default_ckpt_checker, default_trie_checker
+from .validation import default_checker
 
 
 @dataclass(frozen=True)
@@ -53,13 +54,7 @@ class UpdateTask:
         if type(self.max_local_checkpoints) is not int or self.max_local_checkpoints < 1:
             raise ValueError("max_local_checkpoints must be a positive integer")
         if self.checker is None:
-            object.__setattr__(
-                self,
-                "checker",
-                default_ckpt_checker
-                if self.resource_type == "checkpoint"
-                else default_trie_checker,
-            )
+            object.__setattr__(self, "checker", default_checker(self.resource_type))
         elif not callable(self.checker):
             raise ValueError("checker must be callable")
         if (
