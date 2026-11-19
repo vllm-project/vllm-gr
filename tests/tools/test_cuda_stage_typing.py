@@ -139,8 +139,9 @@ def test_mypy_checks_complete_boundary(changed_file: str) -> None:
     "changed_file",
     sorted(mypy_hook.NPU_WORKER_FILES),
 )
-def test_npu_worker_mypy_checks_all_callers(changed_file: str) -> None:
-    """Changing either NPU helper or caller checks the whole NPU worker boundary."""
+def test_npu_worker_mypy_checks_complete_boundary(changed_file: str) -> None:
+    """Changing any NPU owner or production caller checks the complete boundary."""
+
     groups = mypy_hook.group_files([changed_file, "tests/test_gr_startup.py"])
     assert groups.pop(mypy_hook.NPU_WORKER_GROUP) == mypy_hook.NPU_WORKER_FILES
     assert groups.pop("tests") == ["tests/test_gr_startup.py"]

@@ -30,7 +30,7 @@ class _ForwardCase:
             sys.modules, "vllm_gr.v1.attention.backends.beam_attn_npu", backend_module
         )
         runner_module = importlib.import_module("vllm_gr.v1.worker.npu_prefill_graph_runner")
-        self.patch = importlib.import_module("vllm_gr.v1.worker.npu_model_runner_patch")
+        self.prefill = importlib.import_module("vllm_gr.v1.worker.npu_model_runner_prefill")
         monkeypatch.delenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", raising=False)
         self.owner = SimpleNamespace(
             device=torch.device("cpu"),
@@ -77,13 +77,13 @@ class _ForwardCase:
             "get_forward_context",
             lambda: SimpleNamespace(attn_metadata={"layer": self.metadata}),
         )
-        monkeypatch.setattr(self.patch, "is_prefill_graph_enabled", lambda: True)
+        monkeypatch.setattr(self.prefill, "is_prefill_graph_enabled", lambda: True)
         self.native = Mock(return_value=object())
 
         def native(*args: Any, **kwargs: Any) -> Any:
             return self.native(*args, **kwargs)
 
-        self.forward = self.patch.make_patched_model_forward_npu(native)
+        self.forward = self.prefill.make_patched_model_forward_npu(native)
         self.input_ids = torch.arange(4, dtype=torch.int32, device="cpu")
         self.positions = self.input_ids.clone()
 
@@ -195,7 +195,7 @@ def test_latched_failure_blocks_every_later_forward_route(
     if route == "decode":
         case.owner.input_batch.num_computed_tokens_cpu = [2, 2]
     elif route == "disabled":
-        monkeypatch.setattr(case.patch, "is_prefill_graph_enabled", lambda: False)
+        monkeypatch.setattr(case.prefill, "is_prefill_graph_enabled", lambda: False)
     elif route == "missing_bucket":
         case.owner._current_scheduler_output.num_scheduled_tokens = {"a": 99}
         case.owner._current_scheduler_output.total_num_scheduled_tokens = 99

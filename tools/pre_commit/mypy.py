@@ -53,15 +53,19 @@ CUDA_STAGE_FILES = [
     "tests/tools/cuda_stage_typing_cases.py",
 ]
 
-# Check the NPU input/bookkeeping helpers together with both production callers
-# so a signature change cannot escape caller-side validation.
+# Check the NPU ModelRunner facade, input/bookkeeping helpers, graph/prefill/SID
+# owners, and the production caller together so signatures and re-exports stay aligned.
 NPU_WORKER_GROUP = "npu-worker"
 NPU_WORKER_FILES = [
     "vllm_gr/v1/worker/npu_model_runner_patch.py",
     "vllm_gr/v1/worker/npu_beam_stage_runner.py",
     "vllm_gr/v1/worker/npu_model_runner_inputs.py",
     "vllm_gr/v1/worker/npu_model_runner_bookkeeping.py",
+    "vllm_gr/v1/worker/npu_model_runner_capture.py",
+    "vllm_gr/v1/worker/npu_model_runner_prefill.py",
+    "vllm_gr/v1/worker/npu_model_runner_sid.py",
 ]
+
 
 # After fixing errors resulting from changing follow_imports
 # from "skip" to "silent", move the following directories to FILES

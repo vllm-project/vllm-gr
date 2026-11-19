@@ -226,12 +226,16 @@ patches:
     scope: backend
     backend_id: npu
     owner: vllm_gr/v1/worker/npu_model_runner_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/npu_model_runner_inputs.py, vllm_gr/v1/worker/npu_model_runner_bookkeeping.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
+    shared_helpers: vllm_gr/v1/worker/npu_model_runner_inputs.py, vllm_gr/v1/worker/npu_model_runner_bookkeeping.py, vllm_gr/v1/worker/npu_model_runner_capture.py, vllm_gr/v1/worker/npu_model_runner_prefill.py, vllm_gr/v1/worker/npu_model_runner_sid.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: NPUModelRunner is discovered for the active platform and its hooks are incomplete; the delayed NPUWorker.init_device wrapper mounts common Worker utilities before native initialization, independently of the management listener; online Trie reload remains rejected by Core on NPU
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_npu_model_runner_patch.py
+      - tests/test_npu_model_runner_patch_capture.py
+      - tests/test_npu_model_runner_patch_determine.py
+      - tests/test_npu_model_runner_patch_stage.py
+      - tests/test_npu_model_runner_patch_terminal.py
       - tests/test_model_runner_patch.py
       - tests/test_npu_prefill_bsnd.py
       - tests/test_prefill_graph_runner.py
