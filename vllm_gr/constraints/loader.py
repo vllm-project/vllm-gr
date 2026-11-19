@@ -32,6 +32,12 @@ from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
 from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab, build_npu_stage_vocab
 from vllm_gr.constraints.npu_tables import npu_trie_arrays
+from vllm_gr.constraints.registry import (
+    ConstraintImplementation,
+    ConstraintTableRequest,
+    register_implementation,
+    resolve_constraint_implementation,
+)
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
@@ -568,6 +574,148 @@ def _run_npu_readiness(
         )
 
 
+def _admit_cuda(
+    config: ConstraintTableConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Reject a CUDA configuration before the Artifact is opened.
+
+    The sort-capacity check runs in the builder, after the artifact is loaded.
+    Only the dtype and placement gates are decidable from configuration alone,
+    so only they run here.
+    """
+    if config.max_top_k > MAX_CANDIDATE_WIDTH:
+        raise ValueError(
+            f"CUDA constraint max_top_k must be <= {MAX_CANDIDATE_WIDTH}, "
+            f"got {config.max_top_k}"
+        )
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"CUDA constraint logits must be fp16/bf16, got {dtype}")
+    if device.type != "cuda":
+        raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
+    return None
+
+
+def _build_cuda(request: ConstraintTableRequest, admitted: Any) -> ConstraintBackend:
+    del admitted
+    backend, cases = _upload_cuda_backend(
+        request.table,
+        device=request.device,
+        max_top_k=request.max_top_k,
+        max_rows=request.max_rows,
+    )
+    try:
+        _run_cuda_readiness(
+            backend,
+            cases=cases,
+            device=request.device,
+            dtype=request.dtype,
+            max_rows=request.max_rows,
+        )
+        backend._mark_ready()  # noqa: SLF001
+        return backend
+    except BaseException:
+        backend.close()
+        raise
+
+
+def _admit_npu(
+    config: ConstraintTableConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> NPUConstraintOp:
+    """Reject an Ascend configuration and resolve its operator before artifact I/O."""
+    from vllm_gr.ops.npu.rec_constrained_topk import (
+        MAX_TOP_K,
+        resolve_rec_constrained_topk_npu,
+    )
+
+    del dtype
+    if config.max_top_k > MAX_TOP_K:
+        raise ValueError(f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {config.max_top_k}")
+    if device.type != "npu":
+        raise RuntimeError(f"NPU constraint backend requires an NPU device, got {device}")
+    return resolve_rec_constrained_topk_npu()
+
+
+def _build_npu(request: ConstraintTableRequest, admitted: Any) -> ConstraintBackend:
+    op = admitted
+    _reject_unsupported_last_vocab_prefix(request.table)
+    backend, cases = _upload_npu_backend(
+        request.table,
+        device=request.device,
+        op=op,
+        max_top_k=request.max_top_k,
+        max_rows=request.max_rows,
+        enable_npu_stage_vocab=request.enable_stage_vocab,
+    )
+    try:
+        _run_npu_readiness(
+            backend,
+            cases=cases,
+            device=request.device,
+            dtype=request.dtype,
+            max_rows=request.max_rows,
+        )
+        backend._mark_ready()  # noqa: SLF001
+        return backend
+    except BaseException:
+        backend.close()
+        raise
+
+
+def _admit_cpu(
+    config: ConstraintTableConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Host selection needs no compile-ahead and no device-specific admission."""
+    del config, device, dtype
+    return None
+
+
+def _build_cpu(request: ConstraintTableRequest, admitted: Any) -> ConstraintBackend:
+    del admitted
+    info = _backend_info(
+        request.table,
+        backend=ConstraintTableBackendEnum.CPU,
+        max_top_k=request.max_top_k,
+        max_rows=request.max_rows,
+        host_memory_bytes=request.table.total_bytes,
+        device_memory_bytes=0,
+    )
+    return CPUConstraintBackend(request.table, info)
+
+
+# The built-in implementations register here, so the loader resolves exactly the
+# same three through the same registry an external package would use. Their
+# IDs are the historical placement names; ``legacy_enum`` keeps payloads that
+# only set ``constraint_table.backend`` working unchanged.
+for _implementation in (
+    ConstraintImplementation(
+        implementation_id="cuda",
+        legacy_enum=ConstraintTableBackendEnum.CUDA,
+        admit=_admit_cuda,
+        build=_build_cuda,
+    ),
+    ConstraintImplementation(
+        implementation_id="npu",
+        legacy_enum=ConstraintTableBackendEnum.NPU,
+        admit=_admit_npu,
+        build=_build_npu,
+    ),
+    ConstraintImplementation(
+        implementation_id="cpu",
+        legacy_enum=ConstraintTableBackendEnum.CPU,
+        admit=_admit_cpu,
+        build=_build_cpu,
+    ),
+):
+    register_implementation(_implementation)
+del _implementation
+
+
 def load_constraint_backend(
     config: ConstraintTableConfig,
     *,
@@ -577,7 +725,13 @@ def load_constraint_backend(
     max_rows: int,
     enable_npu_stage_vocab: bool = False,
 ) -> ConstraintBackend | None:
-    """Load exactly one independent Backend, or return ``None`` when disabled."""
+    """Load exactly one independent Backend, or return ``None`` when disabled.
+
+    The implementation is resolved from the constraint registry, so an
+    implementation registered elsewhere runs here without a selection branch.
+    Admission runs before the Artifact is read; building owns upload, readiness
+    and readiness-failure cleanup.
+    """
 
     if not config.enabled:
         return None
@@ -590,33 +744,8 @@ def load_constraint_backend(
     if config.path is None or config.artifact_digest is None or config.tokenizer_digest is None:
         raise ValueError("enabled constraint table configuration is incomplete")
 
-    op: NPUConstraintOp | None = None
-    if config.backend is ConstraintTableBackendEnum.CUDA:
-        # The CUDA sort-capacity check runs in _upload_cuda_backend, after the
-        # artifact is loaded. Only the dtype and placement gates are decidable
-        # from configuration alone, so only they are checked here.
-        if config.max_top_k > MAX_CANDIDATE_WIDTH:
-            raise ValueError(
-                f"CUDA constraint max_top_k must be <= {MAX_CANDIDATE_WIDTH}, "
-                f"got {config.max_top_k}"
-            )
-        if dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError(f"CUDA constraint logits must be fp16/bf16, got {dtype}")
-        if device.type != "cuda":
-            raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
-    if config.backend is ConstraintTableBackendEnum.NPU:
-        from vllm_gr.ops.npu.rec_constrained_topk import (
-            MAX_TOP_K,
-            resolve_rec_constrained_topk_npu,
-        )
-
-        if config.max_top_k > MAX_TOP_K:
-            raise ValueError(
-                f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {config.max_top_k}"
-            )
-        if device.type != "npu":
-            raise RuntimeError(f"NPU constraint backend requires an NPU device, got {device}")
-        op = resolve_rec_constrained_topk_npu()
+    implementation = resolve_constraint_implementation(config)
+    admitted = implementation.admit(config, device, dtype)
 
     table = load_constraint_table_artifact(
         config.path,
@@ -625,65 +754,19 @@ def load_constraint_backend(
         expected_vocab_size=vocab_size,
         expected_format=config.format,
     )
-    if config.backend is ConstraintTableBackendEnum.CPU:
-        info = _backend_info(
-            table,
-            backend=ConstraintTableBackendEnum.CPU,
-            max_top_k=config.max_top_k,
-            max_rows=max_rows,
-            host_memory_bytes=table.total_bytes,
-            device_memory_bytes=0,
-        )
-        return CPUConstraintBackend(table, info)
-    if config.backend is ConstraintTableBackendEnum.CUDA:
-        backend, cases = _upload_cuda_backend(
-            table,
-            device=device,
-            max_top_k=config.max_top_k,
-            max_rows=max_rows,
-        )
-        del table
-        try:
-            _run_cuda_readiness(
-                backend,
-                cases=cases,
-                device=device,
-                dtype=dtype,
-                max_rows=max_rows,
-            )
-            backend._mark_ready()  # noqa: SLF001
-            return backend
-        except BaseException:
-            backend.close()
-            raise
-    if config.backend is not ConstraintTableBackendEnum.NPU or op is None:
-        raise RuntimeError(f"unsupported constraint table backend {config.backend!r}")
-
-    _reject_unsupported_last_vocab_prefix(table)
-    backend, cases = _upload_npu_backend(
-        table,
-        device=device,
-        op=op,
-        max_top_k=config.max_top_k,
-        max_rows=max_rows,
-        enable_npu_stage_vocab=enable_npu_stage_vocab,
-    )
-    # Each root's readiness case retains only bounded Python token tuples,
-    # never NumPy views. Drop the full Host table before launching readiness.
-    del table
-    try:
-        _run_npu_readiness(
-            backend,
-            cases=cases,
+    # The request owns the Host table. A failed build never sees a partially
+    # uploaded Backend: the implementation closes its own device state first.
+    return implementation.build(
+        ConstraintTableRequest(
+            table=table,
             device=device,
             dtype=dtype,
+            max_top_k=config.max_top_k,
             max_rows=max_rows,
-        )
-        backend._mark_ready()  # noqa: SLF001
-        return backend
-    except BaseException:
-        backend.close()
-        raise
+            enable_stage_vocab=enable_npu_stage_vocab,
+        ),
+        admitted,
+    )
 
 
 __all__ = ["load_constraint_backend"]

@@ -291,6 +291,25 @@ The per-adapter table classes, artifact identity and payload compatibility stay
 in `vllm_gr/constraints/` and remain backend-owned; the provider selects which
 implementation runs, it does not define the canonical selection semantics.
 
+### Constraint implementation identity
+
+Which implementation executes a table is a separate question from which hardware
+provider is active, and it is answered by a registry rather than an enum.
+`vllm_gr/constraints/registry.py` holds one `ConstraintImplementation` per
+`implementation_id`; the record owns admission (before the artifact is read) and
+construction (upload, readiness, and cleanup after a failed readiness).
+
+`constraint_table.implementation_id` names that ID directly. When it is absent,
+`constraint_table.backend` selects the implementation that historically served
+that placement, so payloads written before the field existed keep their
+behavior. An explicit ID wins over a disagreeing enum, and an unknown ID fails
+with the registered set rather than falling back.
+
+Adding an implementation therefore means calling `register_implementation`; it
+does not mean adding an enum member or a branch to `loader.py`. The built-in
+`cpu`, `cuda` and `npu` implementations register through the same call an
+external package would use.
+
 ## External provider entry points
 
 External packages register provider objects in this entry-point group:

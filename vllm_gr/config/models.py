@@ -98,6 +98,22 @@ class ConstraintTableConfig:
         },
     )
     """Execution placement of the constraint table."""
+    implementation_id: str | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_constraint_implementation_id",
+                canonical_path=("implementation_id",),
+            )
+        },
+    )
+    """Registered implementation that executes the table.
+
+    ``None`` keeps the historical behavior: the ``backend`` enum selects the
+    implementation that has always served it. An explicit ID is resolved through
+    the constraint registry, so an implementation registered by an external
+    package runs without editing a core enum or a selection table.
+    """
     path: str | None = field(
         default=None,
         metadata={
