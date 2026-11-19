@@ -4,6 +4,9 @@
 """Full-schema compatibility, binary conversion and actual gRPC transport tests."""
 
 import asyncio
+import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -104,6 +107,48 @@ def test_all_original_messages_fields_and_methods_are_retained() -> None:
     new = pb.GenerateRequest.FromString(old.SerializeToString())
     assert new.request_id == "old" and new.text == "hello"
     assert not new.HasField("beam_search")
+
+
+@pytest.mark.parametrize("gr_first", [True, False])  # type: ignore[misc]
+def test_pure_python_protobuf_keeps_private_descriptors(gr_first: bool) -> None:
+    pytest.importorskip("smg_grpc_proto")
+    script = """
+import sys
+from copy import copy
+from importlib import import_module
+
+from google.protobuf import descriptor_pool
+from google.protobuf.internal import api_implementation
+
+assert api_implementation.Type() == "python"
+gr_module = "vllm_gr.entrypoints.grpc.generated.vllm_engine_pb2"
+smg_module = "smg_grpc_proto.generated.vllm_engine_pb2"
+if sys.argv[1] == "True":
+    gr, smg = import_module(gr_module), import_module(smg_module)
+else:
+    smg, gr = import_module(smg_module), import_module(gr_module)
+
+default_pool = descriptor_pool.Default()
+for name in ("vllm_engine.proto", "common.proto"):
+    original = default_pool.FindFileByName(name)
+    extended = gr.DESCRIPTOR.pool.FindFileByName(name)
+    assert original.pool is default_pool
+    assert extended.pool is gr.DESCRIPTOR.pool
+    assert original is not extended
+assert default_pool.FindFileByName("vllm_engine.proto") is smg.DESCRIPTOR
+assert "beam_search" in gr.GenerateRequest.DESCRIPTOR.fields_by_name
+assert "beam_search" not in smg.GenerateRequest.DESCRIPTOR.fields_by_name
+entry_type = gr.SamplingParams.LogitBiasEntry
+entry = entry_type(key=7, value=-1.0)
+# Shallow copy uses the message reducer to reconstruct the nested class.
+restored = copy(entry)
+assert type(restored) is entry_type and restored == entry
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(gr_first)],
+        env={**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"},
+        check=True,
+    )
 
 
 @pytest.mark.parametrize("binary", [False, True])  # type: ignore[misc]

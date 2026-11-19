@@ -734,8 +734,8 @@ class GPUBeamStageRunner:
         from vllm_gr.v1.attention.backends.beam_attn_gpu import (
             GPUBeamAttentionBatch,
         )
-        from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-            BeamAttentionMetadataBuilder,
+        from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+            build_async,
         )
 
         if self.prepared is None or self.prepared.metadata != m or self.inputs is None:
@@ -745,7 +745,7 @@ class GPUBeamStageRunner:
         worker = self.worker
         views = self.inputs.upload(self.prepared)
         self.device_positions = views["positions"]
-        self.metadata = BeamAttentionMetadataBuilder.build_async(
+        self.metadata = build_async(
             layout=self.prepared.layout,
             views=views,
             session=GPUBeamAttentionBatch(

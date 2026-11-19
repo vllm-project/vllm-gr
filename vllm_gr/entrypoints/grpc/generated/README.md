@@ -21,6 +21,8 @@ The script also rewrites the protoc output so that:
 - descriptors are registered in a private `DescriptorPool`, so they do not
   collide with the unmodified `smg-grpc-proto` descriptors when an application
   imports both.
+- message classes are built from private descriptors without registering them
+  in protobuf's default symbol database, including on the pure-Python backend.
 
 ## Drift check
 

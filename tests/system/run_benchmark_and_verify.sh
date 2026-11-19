@@ -248,7 +248,7 @@ wait_for_server() {
 }
 
 echo "Starting OneRec online server"
-vllm-gr serve \
+python -m vllm_gr.entrypoints.cli.main serve --gr \
   --vllm-gr-config "$config_path" \
   --async-scheduling \
   --no-enable-chunked-prefill \

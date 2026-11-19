@@ -135,6 +135,18 @@ def test_mypy_checks_complete_boundary(changed_file: str) -> None:
     assert not any(groups.values())
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "changed_file",
+    sorted(mypy_hook.NPU_WORKER_FILES),
+)
+def test_npu_worker_mypy_checks_all_callers(changed_file: str) -> None:
+    """Changing either NPU helper or caller checks the whole NPU worker boundary."""
+    groups = mypy_hook.group_files([changed_file, "tests/test_gr_startup.py"])
+    assert groups.pop(mypy_hook.NPU_WORKER_GROUP) == mypy_hook.NPU_WORKER_FILES
+    assert groups.pop("tests") == ["tests/test_gr_startup.py"]
+    assert not any(groups.values())
+
+
 def test_mypy_boundary_avoids_cache_and_requires_negative_errors(monkeypatch: Any) -> None:
     """Pin checker flags without starting a checker subprocess in pytest."""
     commands: list[list[str]] = []

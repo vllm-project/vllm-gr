@@ -38,7 +38,7 @@ python examples/offline_inference/pangu1b/pangu_generate.py \
 Start a local OpenAI-compatible server:
 
 ```bash
-vllm-gr serve "$PANGU1B_MODEL_PATH" \
+vllm serve "$PANGU1B_MODEL_PATH" --gr \
     --trust-remote-code \
     --dtype bfloat16 \
     --max-model-len 32768 \

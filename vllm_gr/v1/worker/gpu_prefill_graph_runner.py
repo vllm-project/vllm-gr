@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 
 from vllm_gr.config import BeamExecutionMode, GRConfig
 from vllm_gr.utils.npu_adapter import is_cuda_available
+from vllm_gr.v1.attention.backends.beam_dense_prefill import fresh_prefill_capture
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_ENABLE_PREFILL_GRAPH,
@@ -323,6 +324,9 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     # Capture CUDA graph
                     graph = torch.cuda.CUDAGraph()
                     with (
+                        # These graphs replay only for fresh prompts when dense
+                        # Prefill is requested (see beam_dense_prefill).
+                        fresh_prefill_capture(),
                         torch.cuda.graph(graph, pool=pool, stream=torch.cuda.current_stream()),
                         set_forward_context(
                             attn_metadata,

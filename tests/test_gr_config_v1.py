@@ -574,7 +574,7 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
             "bash",
             "-eu",
             "-c",
-            r"""vllm-gr() { printf '%s\0' "$@"; }
+            r"""python() { printf '%s\0' "$@"; }
 """
             + command
             + "\nwait",
@@ -591,7 +591,9 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
     parser = FlexibleArgumentParser()
     serve = GRServeSubcommand()
     serve.subparser_init(parser.add_subparsers(dest="subparser"))
-    args = parser.parse_args(captured.stdout.decode().split("\0")[:-1])
+    argv = captured.stdout.decode().split("\0")[:-1]
+    assert argv[:4] == ["-m", "vllm_gr.entrypoints.cli.main", "serve", "--gr"]
+    args = parser.parse_args(["serve", *argv[4:]])
     serve.validate(args)
     # ServeSubcommand.cmd normally normalizes the positional model before
     # constructing EngineArgs. Keep this config-only test local and offline.

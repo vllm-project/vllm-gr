@@ -19,6 +19,7 @@ from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
 from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
 from vllm_gr.v1.worker.npu_beam_stage_adapter import NPUEagerStagePlan, validate_npu_eager_capabilities
 from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
+from vllm_gr.v1.worker.npu_model_runner_inputs import InputBatchProxy
 
 
 def _eager_stage_output(
@@ -199,7 +200,7 @@ def test_npu_prepare_unproxies_and_preserves_native_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     input_batch = SimpleNamespace(req_ids=["request"])
-    proxy = InputBatchProxy(input_batch, ["request"], [0], [0])
+    proxy = InputBatchProxy(input_batch, ["request"], [0], [0], device=torch.device("cpu"))
     spec_metadata = object()
     runner = SimpleNamespace(
         input_batch=proxy,
@@ -247,7 +248,6 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
     )
     ordinary_result = (["lp"], ["valid"], object(), ["request"], {"request": 0}, [3])
     sampler_output = object()
-    reduced: list[object] = []
 
     def original(
         self: Any,
@@ -257,27 +257,18 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
     ) -> tuple[Any, ...]:
         if getattr(scheduler_output, "fail", False):
             raise RuntimeError("boom")
-        if getattr(scheduler_output, "beam_data", {}):
-            assert reduced == [sampler_output]
         return ordinary_result
 
     def collapse(
         self: Any,
-        orig_batch: Any,
         configs: Any,
         beam_data: Any,
         sampler: Any,
     ) -> tuple[list[str], dict[str, int], int]:
-        assert orig_batch is original_batch
         assert sampler is sampler_output
         return ["beam"], {"beam": 0}, 1
 
     monkeypatch.setattr(npu_patch, "_beam_collapse_bookkeeping", collapse)
-    monkeypatch.setattr(
-        npu_patch,
-        "_reduce_sampler_output_for_worker_decision",
-        lambda _runner, output: reduced.append(output),
-    )
     wrapped = npu_patch.make_patched_bookkeeping_sync(original)
 
     assert wrapped(runner, SimpleNamespace(beam_data={}), sampler_output) is ordinary_result
@@ -1997,8 +1988,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     """Mirror the 0.30.0rc2 first-decode call order through the real GR hooks."""
     from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
-    from vllm_gr.v1.worker import model_runner_common as common
-    from vllm_gr.v1.worker import npu_beam_stage_runner
+    from vllm_gr.v1.worker import npu_beam_stage_runner, npu_model_runner_inputs
 
     logical = _eager_stage_output(kind="decode")
     metadata = next(iter(logical.gr_stage_metadata.values()))
@@ -2037,7 +2027,9 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     monkeypatch.setattr(npu_beam_stage_runner, "get_npu_stage_runner", lambda *args: stage)
     arange = torch.arange
     monkeypatch.setattr(torch, "arange", lambda *args, **kwargs: arange(*args, dtype=torch.int32))
-    monkeypatch.setattr(common, "_materialize_logits_indices", lambda _, rows: torch.tensor(rows))
+    monkeypatch.setattr(
+        npu_model_runner_inputs, "_materialize_logits_indices", lambda _, rows: torch.tensor(rows)
+    )
     seen: list[str] = []
 
     def update(self: Any, scheduled: Any) -> None:
@@ -2530,7 +2522,9 @@ def _terminal_result_runner(
 
 
 @pytest.mark.l1  # type: ignore[misc]
-@pytest.mark.parametrize("batch,width,steps", [(1, 64, 1), (1, 128, 3), (4, 64, 2), (4, 128, 3)])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "batch,width,steps", [(1, 64, 1), (1, 128, 3), (4, 64, 2), (4, 128, 3)]
+)
 @pytest.mark.parametrize(  # type: ignore[misc]
     "include_score,include_parents", [(True, True), (False, False), (True, False), (False, True)]
 )
