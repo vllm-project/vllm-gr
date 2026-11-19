@@ -96,7 +96,7 @@ def test_tensor_layout_change_updates_every_layer(cache: CacheHarness, change: s
     ],
 )
 def test_changed_task_config_updates_every_layer(
-    cache: CacheHarness, name: str, value: int | float
+    cache: CacheHarness, name: str, value: float
 ) -> None:
     cache.assert_full_update()
     setattr(cache.entry.layers[1], name, value)
@@ -182,14 +182,14 @@ def test_recapture_invalidates_cache_and_restores_capture_state(
     cache: CacheHarness, capture_raises: bool
 ) -> None:
     cache.assert_full_update()
-    state = cache.backend._GRAPH_CAPTURE_STATE
+    state = cache.backend._capture_entry
     previous_entry = object()
-    state.update(capturing=True, entry=previous_entry)
+    token = state.set(previous_entry)
 
     def recapture() -> None:
         with cache.backend.prefill_graph_capture(cache.entry):
             assert cache.entry._last_update_signature is None
-            assert state == {"capturing": True, "entry": cache.entry}
+            assert state.get() is cache.entry
             if capture_raises:
                 raise RuntimeError("injected capture failure")
 
@@ -198,7 +198,8 @@ def test_recapture_invalidates_cache_and_restores_capture_state(
             recapture()
     else:
         recapture()
-    assert state == {"capturing": True, "entry": previous_entry}
+    assert state.get() is previous_entry
+    state.reset(token)
     cache.assert_full_update()
 
 

@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from tests.helpers.attention import profile
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
 )
@@ -195,8 +196,9 @@ def build_beam_attn_metadata(
         builder.max_num_splits = 0
         builder.num_heads_q = inputs.query.shape[1]
         builder.num_kv_heads = inputs.num_kv_heads
-        builder._is_cuda = builder.device.type == "cuda"
-        builder._is_npu = builder.device.type == "npu"
+        builder._profile = profile(
+            cuda=builder.device.type == "cuda", ascend=builder.device.type == "npu"
+        )
         builder._fixed_buffers = False
         builder.npu_causal_atten_mask = npu_causal_atten_mask
         return builder.build(0, MockCommonAttentionMetadata(inputs, device))

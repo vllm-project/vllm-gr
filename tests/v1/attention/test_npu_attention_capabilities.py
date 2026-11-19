@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.helpers.attention import bind_attention
 from vllm_gr.v1.attention.backends import beam_attn
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
@@ -26,9 +27,8 @@ def attention_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         }
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", False)
+    bind_attention(monkeypatch, beam_attn, cuda=False)
     return config
 
 
@@ -51,7 +51,7 @@ def _assert_rejected_before_initialization(
 ) -> None:
     resolve = Mock(side_effect=AssertionError("must reject before resolving execution module"))
     tensor = Mock(side_effect=AssertionError("must reject before allocating ALiBi tensor"))
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", resolve)
+    bind_attention(monkeypatch, beam_attn, cuda=False, execution=resolve)
     monkeypatch.setattr(torch, "tensor", tensor)
 
     # Call the real initializer on an observable empty instance so a rejected
@@ -128,7 +128,7 @@ def test_npu_default_features_keep_existing_normalization(
     flash_version = Mock(return_value=None)
     execution = SimpleNamespace(get_flash_attn_version=flash_version)
     resolve = Mock(return_value=execution)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", resolve)
+    bind_attention(monkeypatch, beam_attn, cuda=False, execution=resolve)
 
     impl = beam_attn.BeamAttentionImpl(**_options(logits_soft_cap=soft_cap))
 
@@ -154,11 +154,9 @@ def test_cuda_features_are_not_rejected_by_npu_capability_guard(
     attention_config: SimpleNamespace,
     features: dict[str, Any],
 ) -> None:
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
     flash_version = Mock(return_value=2)
     execution = SimpleNamespace(get_flash_attn_version=flash_version)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
+    bind_attention(monkeypatch, beam_attn, cuda=True, execution=lambda: execution)
 
     impl = beam_attn.BeamAttentionImpl(**_options(**features))
 

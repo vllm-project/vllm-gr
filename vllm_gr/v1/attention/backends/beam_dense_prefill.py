@@ -24,6 +24,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import Any
 
 ENV_DENSE_PREFILL = "VLLM_GR_DENSE_PREFILL"
 DENSE_PREFILL_MODES = ("fa2", "cudnn")
@@ -39,8 +40,33 @@ def requested_dense_prefill_mode() -> str | None:
     return raw if raw in DENSE_PREFILL_MODES else None
 
 
-def requires_fresh_prefill_replay() -> bool:
-    """Whether Prefill graph replay must be limited to requests without context."""
+def admitted_dense_prefill_mode(
+    requested: str | None,
+    *,
+    prefix_caching: bool,
+    chunked_prefill: bool,
+    kv_transfer: bool,
+    batch_invariant: bool,
+) -> str | None:
+    """Dense attention can consume fresh K/V only when no cached prefix is needed."""
+    if prefix_caching or chunked_prefill or kv_transfer or batch_invariant:
+        return None
+    return requested
+
+
+def requires_fresh_prefill_replay(runner: Any = None) -> bool:
+    """Use the same mode that was fixed on this runner's captured layers."""
+    binding = getattr(runner, "_gr_backend_binding", None)
+    if binding is not None:
+        return bool(getattr(binding.attention_executor, "requires_fresh_prefill", False))
+    config = getattr(runner, "vllm_config", None)
+    if config is not None:
+        from vllm_gr.platforms.plan import read_backend_plan
+
+        plan = read_backend_plan(config)
+        if plan is not None:
+            # Native graph warmup can precede publication of the complete binding.
+            return plan.choices.to_dict().get("dense_prefill_mode") is not None
     return requested_dense_prefill_mode() is not None
 
 

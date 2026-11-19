@@ -44,6 +44,7 @@ patches:
       - tests/v1/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
       - tests/v1/test_ascend_compat.py::test_selector_reinstalls_over_replaced_upstream_target
       - tests/v1/test_ascend_compat.py::test_selector_cache_reset_preserves_installed_callable
+      - tests/v1/test_ascend_compat.py::test_custom_selector_rejects_unsupported_geometry
       - tests/engine/test_gr_config.py::test_attention_selector_config_reader_propagates_validation_errors
       - tests/integration/test_ascend_attention_backend.py
     process_roles: [engine_core, worker]
@@ -256,6 +257,7 @@ patches:
     activation: the facade module is imported and CUSTOM is selected for GR Beam Attention
     validator_or_test:
       - tests/v1/attention/test_beam_attention_platform_execution.py
+      - tests/platforms/test_attention_binding.py
       - tests/v1/attention/test_beam_attention_metadata.py
       - tests/v1/attention/test_attention_backend_custom.py
     process_roles: [engine_core, worker]
@@ -263,6 +265,7 @@ patches:
     risk: high
     contract: custom-attention-registry
     ownership:
+      executor_binding: vllm_gr.platforms.attention
       metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata
       gpu_execution: vllm_gr.v1.attention.backends.beam_attn_gpu
       npu_execution: vllm_gr.v1.attention.backends.beam_attn_npu

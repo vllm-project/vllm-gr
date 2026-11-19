@@ -13,6 +13,8 @@ reference it but do not own it.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool, _validate_pool_dtype
@@ -104,17 +106,24 @@ class BeamAttentionContext:
         device: torch.device,
         dtype: torch.dtype,
         enable_short_suffix_attention: bool = False,
+        attention: Any = None,
     ):
+        if attention is None:
+            from vllm_gr.platforms.attention import AttentionExecutor, for_config
+            from vllm_gr.platforms.errors import UnsupportedBackendError
+
+            try:
+                attention = for_config()
+            except UnsupportedBackendError:
+                # A stand-alone host pool may use the portable tensor implementation.
+                attention = AttentionExecutor()
+        self.attention = attention
         if enable_short_suffix_attention:
-            if device.type != "cuda":
+            if not attention.supports_short_suffix_device(device):
                 raise ValueError("Short suffix attention requires CUDA")
             if max_decode_steps < 1:
                 raise ValueError("Short suffix attention requires positive pool capacity")
-            from vllm_gr.v1.attention.backends.beam_attn_gpu import (
-                short_suffix_head_size_supported,
-            )
-
-            if not short_suffix_head_size_supported(head_dim) or dtype not in (
+            if not attention.short_suffix_head_size_supported(head_dim) or dtype not in (
                 torch.float16,
                 torch.bfloat16,
                 torch.float32,
@@ -153,7 +162,7 @@ class BeamAttentionContext:
         # Stable CUDA pointer tables consumed by the fused all-layer KV
         # reorder.  Building these once removes two per-step device tensors and
         # the matching in-place pointer-offset kernels from postprocessing.
-        if device.type == "cuda":
+        if attention.uses_pool_pointers:
             self.pool_key_ptrs = torch.tensor(
                 [pool.unshared_key.data_ptr() for pool in self.pools],
                 dtype=torch.int64,
@@ -202,7 +211,7 @@ class BeamAttentionContext:
         # read them; on GPU the Triton copy_suffix/cache_unshared kernels read
         # ``decode_step_buf`` alone, so the per-step fill_ of the xllm buffers
         # (two redundant launches on the same stream) is skipped there.
-        self._gr_uses_xllm_buffers = getattr(device, "type", None) == "npu"
+        self._gr_uses_xllm_buffers = attention.decode_mode() == "xllm"
 
         # aux_key_buf / aux_value_buf: pre-allocated PER-LAYER scratch buffers
         # for select_unshared_kv. The leading dim is num_layers: the fused

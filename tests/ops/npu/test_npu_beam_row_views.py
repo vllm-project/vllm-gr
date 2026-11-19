@@ -14,6 +14,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.helpers.attention import bind_attention
 from tests.helpers.paths import REPO_ROOT
 
 
@@ -44,7 +45,9 @@ def row_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         stub.__file__ = "/mock/torch_npu/__init__.py"
         monkeypatch.setitem(sys.modules, "torch_npu", stub)
     monkeypatch.setattr(beam_ops, "is_available", lambda: True)
-    source = REPO_ROOT / "vllm_gr/v1/attention/backends/beam_attn_npu_xllm.py"
+    source = (
+        REPO_ROOT / "vllm_gr/v1/attention/backends/beam_attn_npu_xllm.py"
+    )
     spec = importlib.util.spec_from_file_location("_test_npu_beam_row_views_xllm", source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -554,9 +557,7 @@ def test_cuda_forward_keeps_original_kv_gather(monkeypatch: pytest.MonkeyPatch) 
         cascade_attention=lambda **_kwargs: None,
         select_beam_rows=forbid_select,
     )
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
+    bind_attention(monkeypatch, beam_attn, cuda=True, execution=lambda: execution)
     pool = SimpleNamespace(unshared_key=torch.empty(1), unshared_value=torch.empty(1))
     session = SimpleNamespace(
         is_active=True,

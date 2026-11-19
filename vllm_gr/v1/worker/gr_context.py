@@ -143,7 +143,11 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
     model_config = runner.model_config
     parallel_config = runner.parallel_config
 
+    from vllm_gr.platforms.attention import for_runner
+
+    executor = for_runner(runner)
     return BeamAttentionContext(
+        attention=executor,
         max_batch=max_batch,
         max_beams=int(gr_cfg.beam_max_width),
         num_kv_heads=model_config.get_num_kv_heads(parallel_config),
@@ -153,6 +157,6 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
         device=runner.device,
         dtype=model_config.dtype,
         enable_short_suffix_attention=(
-            runner.device.type == "cuda" and gr_cfg.enable_short_suffix_attention
+            executor.supports_short_suffix_attention() and gr_cfg.enable_short_suffix_attention
         ),
     )

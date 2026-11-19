@@ -11,6 +11,7 @@ from functools import wraps
 from types import ModuleType
 from typing import Any
 
+from .attention import bind_attention, loading_attention, validate_selected_attention
 from .plan import BackendPlan, read_backend_plan
 from .planning import normalize_backend_request, resolve_backend_plan
 
@@ -85,6 +86,10 @@ def _clear_unplanned_stage(runner: Any, keep: Any = None) -> None:
 
 
 def close_backend_binding(runner: Any) -> None:
+    native_attention = getattr(runner, "_gr_native_attention", None)
+    if native_attention is not None:
+        del runner._gr_native_attention
+        _close_services([native_attention])
     binding = getattr(runner, _BINDING_ATTR, None)
     setattr(runner, _BINDING_ATTR, None)
     adapter = binding.runner_adapter if binding is not None else None
@@ -116,7 +121,9 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
         # Readiness attests the admitted plan and the services already bound.
         return existing
     provider = activate_current_backend()
-    local = resolve_backend_plan(provider, normalize_backend_request(config, provider))
+    local = resolve_backend_plan(
+        provider, normalize_backend_request(config, provider, admitted=plan)
+    )
     if local.fingerprint != plan.fingerprint:
         raise RuntimeError(
             f"Worker backend plan mismatch: engine={plan.fingerprint}, worker={local.fingerprint}"
@@ -154,11 +161,13 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
             ):
                 raise RuntimeError("Worker did not bind a Beam decision operator")
         attention = None
-        if choices.get("requires_attention", False):
-            attention = selected.create_attention_executor(plan=plan, device=device)
+        if choices.get("requires_attention", False) or plan.request.uses_custom_attention:
+            attention = bind_attention(runner, selected, plan)
             created.append(attention)
             if attention is None:
                 raise RuntimeError("Backend did not bind the required attention executor")
+            if plan.request.uses_custom_attention:
+                validate_selected_attention(runner, attention, plan)
         constraint = None
         if choices.get("constraint") == "legacy":
             constraint = getattr(runner, "_gr_constraint_execution", None)
@@ -205,9 +214,16 @@ def bind_after_model_load(
         if close_runtime is not None:
             # Reject undrained native work before replacing the current generation.
             close_runtime(self)
+        if (
+            getattr(self, _BINDING_ATTR, None) is not None
+            or getattr(self, "_gr_native_attention", None) is not None
+        ):
+            # Native layers constructed below must bind to the new model generation.
+            close_backend_binding(self)
         try:
-            result = original(self, *args, **kwargs)
-            bind_backend_services(self)
+            with loading_attention(self):
+                result = original(self, *args, **kwargs)
+                bind_backend_services(self)
         except BaseException:
             from vllm_gr.v1.worker.model_runner_patch import close_constraint_backend
 

@@ -562,7 +562,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                 and is_prefill_phase_batch(self, scheduler_output)
                 # Dense-Prefill graphs replay only for fresh prompts.
                 and (
-                    not requires_fresh_prefill_replay()
+                    not requires_fresh_prefill_replay(self)
                     or scheduled_requests_are_fresh(self, scheduler_output)
                 )
             ):

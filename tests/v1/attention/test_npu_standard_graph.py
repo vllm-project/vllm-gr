@@ -539,7 +539,7 @@ def test_missing_tasks_only_defer_for_proven_fresh_enpu_capture(
     elif unproven_state == "mismatched_native_descriptor":
         wrapper.concrete_aclgraph_entries[descriptor] = _NativeACLGraphEntry(_Descriptor(2))
     elif unproven_state == "bad_native_registry":
-        setattr(wrapper, "concrete_aclgraph_entries", None)
+        wrapper.concrete_aclgraph_entries = None
     else:
         graph.owner._vllm_gr_standard_fia_entries = object()
     with pytest.raises(RuntimeError):
@@ -577,7 +577,7 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
         raise AssertionError("KV sharing must skip reshape_and_cache")
 
     npu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_npu")
-    monkeypatch.setattr(npu_module, "_GRAPH_CAPTURE_STATE", {"capturing": False}, raising=False)
+    monkeypatch.setattr(npu_module, "in_prefill_capture", lambda: False, raising=False)
     standard_module = ModuleType("vllm_gr.v1.attention.backends.npu_standard_graph")
     monkeypatch.setattr(standard_module, "capture_standard_fia", capture, raising=False)
     for name, module in (("beam_attn_npu", npu_module), ("npu_standard_graph", standard_module)):
@@ -592,14 +592,14 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
         ),
     )
     monkeypatch.setattr(context_module, "get_forward_context", lambda: context)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
-    monkeypatch.setattr(
-        beam_attn,
-        "_get_platform_execution_module",
-        lambda: SimpleNamespace(reshape_and_cache=unexpected_cache_write),
-    )
+    from vllm_gr.platforms.ascend.attention import AscendAttention
+
+    service = AscendAttention("cascade")
+    service.execution_module = lambda: SimpleNamespace(reshape_and_cache=unexpected_cache_write)
+    service.prefill_module = lambda: SimpleNamespace(prefill_attention=fallback)
+    monkeypatch.setattr(beam_attn, "for_config", lambda *args: service)
     implementation = SimpleNamespace(
+        _execution=service,
         kv_sharing_target_layer_name="shared-cache",
         kv_cache_dtype="auto",
         sliding_window=None,
@@ -638,6 +638,7 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
         yield SimpleNamespace(
             invoke=invoke,
             facade=beam_attn,
+            service=service,
             npu=npu_module,
             capture_calls=capture_calls,
             fallback_calls=fallback_calls,
@@ -677,10 +678,9 @@ def test_prefill_capture_wiring_preserves_platform_and_private_graph_guards(
 ) -> None:
     wiring = prefill_wiring
     if guard == "gpu":
-        wiring.facade.NPU_DEVICE = False
-        wiring.facade.CUDA_DEVICE = True
+        wiring.service.has_standard_prefill_capture = lambda: False
     else:
-        wiring.npu._GRAPH_CAPTURE_STATE["capturing"] = True
+        wiring.npu.in_prefill_capture = lambda: True
     assert wiring.invoke() is wiring.output
     assert wiring.capture_calls == []
     assert wiring.global_config_calls == []

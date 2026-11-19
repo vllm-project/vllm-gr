@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from ..identity import PlatformIdentity, platform_identity
 from ..interface import (
@@ -53,6 +53,18 @@ class CUDABackendProvider(BuiltinPlanSupport):
         native = request.native.to_dict()
         if gr["npu_decode_execution"] == "xllm":
             raise ValueError("CUDA does not support npu_decode_execution='xllm'")
+        from vllm_gr.v1.attention.backends.beam_dense_prefill import (
+            admitted_dense_prefill_mode,
+        )
+
+        custom_attention = gr["attention_backend"] == "CUSTOM"
+        dense_prefill = admitted_dense_prefill_mode(
+            native.get("dense_prefill_request") if custom_attention else None,
+            batch_invariant=bool(native.get("dense_prefill_batch_invariant")),
+            kv_transfer=bool(native.get("has_kv_transfer")),
+            prefix_caching=bool(native.get("cache_config", {}).get("enable_prefix_caching")),
+            chunked_prefill=bool(native.get("scheduler_config", {}).get("enable_chunked_prefill")),
+        )
         table = gr["constraint_table"] or {}
         constraint = (
             "canonical"
@@ -68,9 +80,11 @@ class CUDABackendProvider(BuiltinPlanSupport):
                     "runner": runner_id(native["use_v2_model_runner"]),
                     "attention": "vllm_gr.v1.attention.backends.beam_attn_gpu",
                     "prefill_attention": "cuda.cascade",
+                    "dense_prefill_mode": dense_prefill,
                     "decode_attention": "cuda.cascade",
                     "prefill_flash_attn_version": gr["prefill_flash_attn_version"],
-                    "requires_attention": gr["attention_backend"] == "CUSTOM",
+                    "kv_layout": native.get("kv_cache_layout"),
+                    "requires_attention": custom_attention,
                     "constraint": constraint,
                     "constraint_implementation": "cuda" if constraint != "none" else None,
                     "operator_policy": "cuda.onerec",
@@ -79,6 +93,33 @@ class CUDABackendProvider(BuiltinPlanSupport):
                 }
             ),
         )
+
+    def native_attention(self, config: Any) -> Any:
+        from os import environ
+
+        from vllm_gr.config import GRConfig
+
+        from .attention import CudaAttention
+
+        mode = GRConfig.from_vllm_config(config).npu_decode_execution
+        if mode is not None and mode.value == "xllm":
+            raise ValueError("CUDA does not support npu_decode_execution='xllm'")
+        return CudaAttention(kv_layout=environ.get("VLLM_KV_CACHE_LAYOUT"))
+
+    def attention_admission(self, *, plan: BackendPlan) -> Any:
+        return self._attention_for_plan(plan)
+
+    def _attention_for_plan(self, plan: BackendPlan) -> Any:
+        from .attention import CudaAttention
+
+        require_provider_plan(self, plan)
+        return CudaAttention(plan=plan)
+
+    def create_attention_executor(self, *, plan: BackendPlan, device: object) -> Any:
+        executor = self._attention_for_plan(plan)
+        if not executor.execution_module().is_available():
+            raise RuntimeError("Admitted Cuda attention implementation is unavailable")
+        return executor
 
     matches_legacy_identity = matches
 
@@ -114,7 +155,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
         *,
         device: str | torch.device | None = None,
         plan: BackendPlan | None = None,
-    ) -> "ConstrainedTopKExecution | None":
+    ) -> ConstrainedTopKExecution | None:
         """Create the production CUDA Constraint Table execution adapter."""
         from vllm_gr.constraints.execution import CUDAConstrainedTopKExecution
 

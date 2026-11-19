@@ -118,6 +118,155 @@ def test_selector_routes_custom_marker_and_native_backends(
     ]
 
 
+@pytest.mark.parametrize("from_marker", [False, True])
+def test_custom_selector_rejects_unsupported_geometry(
+    monkeypatch: pytest.MonkeyPatch, from_marker: bool
+) -> None:
+    import torch
+    import vllm.v1.attention.selector as selector
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    from vllm_gr.platforms import attention
+    from vllm_gr.platforms.attention import AttentionExecutor
+
+    _install_selector_patch(monkeypatch)
+    policy = AttentionExecutor(SimpleNamespace(is_available=lambda: True))
+    monkeypatch.setattr(attention, "_admission", lambda config: policy)
+    monkeypatch.setattr(
+        selector_patch, "_get_current_gr_attention_backend", lambda: GRAttentionBackend.CUSTOM
+    )
+    request = selector.AttentionSelectorConfig(
+        head_size=7, dtype=torch.bfloat16, kv_cache_dtype="auto", block_size=16
+    )
+    selected = None if from_marker else AttentionBackendEnum.CUSTOM
+    with pytest.raises(ValueError, match="head_size") as failure:
+        selector._cached_get_attn_backend(selected, request, num_heads=8)
+    assert str(failure.value).count("head_size") == 1
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("as_path", [False, True])  # type: ignore[misc]
+def test_provider_selects_and_validates_its_own_custom_backend(
+    monkeypatch: pytest.MonkeyPatch, as_path: bool
+) -> None:
+    import torch
+    import vllm.v1.attention.selector as selector
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    from vllm_gr.platforms import attention, loader
+    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+    from vllm_gr.v1.attention.backends.beam_attn_metadata import (
+        BeamAttentionMetadataBuilder,
+    )
+
+    class VendorBuilder(BeamAttentionMetadataBuilder):
+        pass
+
+    class VendorBackend(BeamAttentionBackend):
+        @staticmethod
+        def get_builder_cls() -> type[VendorBuilder]:
+            return VendorBuilder
+
+        @classmethod
+        def validate_configuration(cls, **kwargs: Any) -> list[str]:
+            return [] if kwargs["head_size"] == 96 else ["vendor requires head_size=96"]
+
+    monkeypatch.setattr(sys.modules[__name__], "VendorBackend", VendorBackend, raising=False)
+    choose = mock.Mock(return_value=f"{__name__}.VendorBackend" if as_path else VendorBackend)
+    policy = SimpleNamespace(get_attn_backend_cls=choose)
+    monkeypatch.setattr(attention, "construction_config", lambda: None)
+    monkeypatch.setattr(
+        loader,
+        "activate_current_backend",
+        lambda: SimpleNamespace(native_attention=lambda config: policy),
+    )
+    _install_selector_patch(monkeypatch)
+    request = selector.AttentionSelectorConfig(
+        head_size=96, dtype=torch.bfloat16, kv_cache_dtype="auto", block_size=16
+    )
+    backend = selector._cached_get_attn_backend(AttentionBackendEnum.CUSTOM, request, num_heads=8)
+    choose.assert_called_once_with(attn_selector_config=request, num_heads=8)
+    assert backend is VendorBackend and backend.get_builder_cls() is VendorBuilder
+    with pytest.raises(ValueError, match="vendor requires head_size=96"):
+        selector._cached_get_attn_backend(
+            AttentionBackendEnum.CUSTOM, request._replace(head_size=64)
+        )
+    choose.return_value = object
+    with pytest.raises(TypeError, match="concrete vLLM AttentionBackend"):
+        selector._cached_get_attn_backend(AttentionBackendEnum.CUSTOM, request)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_ascend_runner_bootstrap_checks_model_geometry_before_layer_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+    from vllm.config import ModelConfig, set_current_vllm_config
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import get_attn_backend
+
+    from vllm_gr.platforms import attention
+    from vllm_gr.platforms.ascend.attention import AscendAttention
+    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+
+    model: Any = SimpleNamespace(
+        use_mla=False,
+        is_mm_prefix_lm=False,
+        rswa_window=None,
+        model_arch_config=SimpleNamespace(head_size=128),
+    )
+    model.get_head_size = lambda: ModelConfig.get_head_size(model)
+    native: Any = SimpleNamespace(
+        model_config=model,
+        cache_config=None,
+        kv_transfer_config=None,
+        speculative_config=None,
+        attention_config=SimpleNamespace(
+            backend=AttentionBackendEnum.CUSTOM, backend_per_kind={}, use_non_causal=False
+        ),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1, decode_context_parallel_size=1
+        ),
+    )
+    policy = AscendAttention("cascade")
+    monkeypatch.setattr(attention, "_admission", lambda config: policy)
+    monkeypatch.setattr(
+        policy, "execution_module", lambda: SimpleNamespace(is_available=lambda: True)
+    )
+    _install_selector_patch(monkeypatch)
+    with set_current_vllm_config(native):
+
+        def runner_probe() -> type:
+            # NPUModelRunner.__init__ in vllm-ascend v0.30.0rc2, before model load.
+            backend: type = get_attn_backend(
+                0,
+                torch.bfloat16,
+                None,
+                use_mla=model.use_mla,
+                use_sparse=False,
+                use_mm_prefix=model.is_mm_prefix_lm,
+            )
+            return backend
+
+        assert runner_probe() is BeamAttentionBackend
+        model.model_arch_config.head_size = 7
+        with pytest.raises(ValueError, match="head_size"):
+            runner_probe()
+        model.model_arch_config.head_size = 128
+        model.use_mla = True
+        with pytest.raises(ValueError, match="MLA"):
+            runner_probe()
+        model.use_mla = False
+        with pytest.raises(ValueError, match="head_size"):
+            get_attn_backend(0, torch.bfloat16, "auto")
+        with pytest.raises(ValueError, match="head_size"):
+            get_attn_backend(0, torch.bfloat16, None, num_heads=8)
+        with attention.loading_attention(SimpleNamespace(vllm_config=native)):
+            with pytest.raises(ValueError, match="head_size"):
+                runner_probe()
+            assert get_attn_backend(128, torch.bfloat16, "auto") is BeamAttentionBackend
+
+
 def test_selector_installation_is_idempotent_and_force_uses_original(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

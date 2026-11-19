@@ -111,7 +111,9 @@ installers run or their ordering.
 - Platforms: CUDA and NPU
 - Risk: Critical
 - Behavior: resolves the GR Beam Attention backend when CUSTOM is selected
-  explicitly or restored from the serialized GR marker.
+  explicitly or restored from the serialized GR marker. Both paths validate
+  the native selector configuration with the backend's admission policy
+  before constructing a layer or allocating runner resources.
 - Installation: inspect the live selector on every call, including `force=True`;
   reuse its wrapper or wrap a newly replaced upstream callable. The legacy
   `apply_ascend_attention_backend_patch` function delegates to this installer.
@@ -504,7 +506,9 @@ and Decode capture policy remain active when this cache is disabled.
 - Mechanism: `register_backend(AttentionBackendEnum.CUSTOM)`
 - Mutation: supported process-global registry override
 - Risk: High
-- Behavior: registers the GR Beam Attention backend in the official CUSTOM slot.
+- Behavior: registers GR Beam Attention in the official CUSTOM slot. Model load binds
+  the runner's executor to each layer. Native metadata builders use their layer group
+  to locate the same executor for physical packing and cache writes.
 - Ownership:
     - Beam Attention metadata and builder:
       `vllm_gr.v1.attention.backends.beam_attn_metadata`;

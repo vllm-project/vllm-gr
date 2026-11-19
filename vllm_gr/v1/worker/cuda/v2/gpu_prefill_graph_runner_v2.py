@@ -311,7 +311,7 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
                     and is_prefill_phase_batch_v2(
                         self.runner,
                         self._prefill_scope,
-                        require_fresh=requires_fresh_prefill_replay(),
+                        require_fresh=requires_fresh_prefill_replay(self.runner),
                     )
                     and full in self._successful
                     and full in self.graphs

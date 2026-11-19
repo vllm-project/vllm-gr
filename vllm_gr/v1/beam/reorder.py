@@ -27,15 +27,6 @@ from __future__ import annotations
 
 import torch
 
-_FALLBACK_LOGGED = False
-
-
-def _resolve_mode() -> str:
-    """Read the process-global decode execution mode (cascade | xllm)."""
-    from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
-
-    return _get_npu_decode_execution()
-
 
 def _group_token_num_from_parents(parent: torch.Tensor) -> torch.Tensor:
     """Request-local prefix sums of surviving-child counts per source beam.
@@ -102,36 +93,6 @@ def reorder_unshared_kv(
             back to the per-layer cascade kernel.
     """
     pools = list(pools)
-    if _resolve_mode() == "xllm":
-        pool_beam_width = pools[0].unshared_key.shape[1]
-        if _fused_reorder_applies(parent, pool_beam_width):
-            from vllm_gr.ops.npu import beam_ops
-
-            beam_ops.select_unshared_kv(
-                parent.to(torch.int32).contiguous(),
-                [p.unshared_key for p in pools],
-                [p.unshared_value for p in pools],
-                torch.tensor([slot], dtype=torch.int32, device=parent.device),
-                _group_token_num_from_parents(parent).to(parent.device),
-                decode_step + 1,
-                pool_beam_width,
-                len(pools),
-            )
-            return
-
-        global _FALLBACK_LOGGED
-        if not _FALLBACK_LOGGED:
-            from vllm.logger import init_logger
-
-            init_logger(__name__).debug(
-                "xllm decode execution fell back to the cascade KV reorder: "
-                "the fused select_unshared_kv requires full-width parents "
-                "sorted by source beam (got width=%d, pool width=%d)",
-                parent.numel(),
-                pool_beam_width,
-            )
-            _FALLBACK_LOGGED = True
-
     # Cascade mode (GPU / non-xllm).  Try the Triton fused fast path first:
     # one gather + one scatter launch covering every layer at once.  It
     # declines (returns False) on non-CUDA / non-Triton / unexpected pool or

@@ -11,6 +11,7 @@ import pytest
 import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
+from tests.helpers.attention import profile
 from vllm_gr.v1.attention.backends import beam_attn_metadata_layout as layout
 from vllm_gr.v1.attention.backends import beam_attn_metadata_tensors as tensors
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
@@ -34,8 +35,7 @@ def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
     builder.max_num_splits = 0
     builder.num_heads_q = 8
     builder.num_kv_heads = 2
-    builder._is_cuda = False
-    builder._is_npu = False
+    builder._profile = profile(cuda=False, ascend=False)
     builder._fixed_buffers = False
     builder._tensor_buffers = BeamTensorBuffers()
     builder.npu_causal_atten_mask = None
@@ -47,8 +47,14 @@ def test_builder_init_allocates_fixed_tensor_buffers(monkeypatch: pytest.MonkeyP
     from vllm.v1.attention.backend import AttentionMetadataBuilder
 
     from vllm_gr.config import GRConfig
+    from vllm_gr.platforms import attention
     from vllm_gr.v1.attention.backends import beam_attn_metadata as metadata
 
+    monkeypatch.setattr(
+        attention,
+        "for_config",
+        lambda *args, **kw: SimpleNamespace(metadata_profile=profile(cuda=True)),
+    )
     sentinel = BeamTensorBuffers()
     monkeypatch.setattr(
         AttentionMetadataBuilder,
@@ -589,7 +595,7 @@ def test_only_npu_incremental_geometry_uses_async_upload(
     monkeypatch: pytest.MonkeyPatch, is_npu: bool
 ) -> None:
     builder = _make_fixed_builder()
-    builder._is_npu = is_npu
+    builder._profile = profile(cuda=False, ascend=is_npu)
     transfers = []
 
     def upload(ctx: Any, entries: Any, *, non_blocking: bool = False) -> None:
@@ -621,7 +627,7 @@ def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
         pytest.skip("Ascend NPU is not available")
     builder = _make_builder()
     builder.device = torch.device("npu")
-    builder._is_npu = True
+    builder._profile = profile(cuda=False, ascend=True)
     with torch.inference_mode():
         builder._tensor_buffers.h2d_host = torch.zeros(64, dtype=torch.int32, pin_memory=True)
         builder._tensor_buffers.h2d_dev = torch.zeros(64, dtype=torch.int32, device="npu")
@@ -694,8 +700,7 @@ def test_prefix_block_table_view_requires_npu_incremental_identity_rows(
 ) -> None:
     """Basic slicing preserves B1/B4 block rows, cache hits and new requests."""
     builder = _make_fixed_builder()
-    builder._is_npu = is_npu
-    builder._is_cuda = not is_npu
+    builder._profile = profile(cuda=not is_npu, ascend=is_npu)
     builder._tensor_buffers.prefix_block_table = torch.zeros((4, 8), dtype=torch.int32)
     builder._tensor_buffers.suffix_cu_seqlens_q = torch.zeros(16, dtype=torch.int32)
     builder._tensor_buffers.suffix_cu_seqlens_k = torch.zeros(16, dtype=torch.int32)
@@ -770,7 +775,7 @@ def test_npu_mixed_metadata_keeps_indexed_block_rows_and_synchronous_upload(
     monkeypatch: pytest.MonkeyPatch, beam_first: bool
 ) -> None:
     builder = _make_fixed_builder()
-    builder._is_npu = True
+    builder._profile = profile(cuda=False, ascend=True)
     req_ids = ["beam", "ordinary"] if beam_first else ["ordinary", "beam"]
     beam_index = req_ids.index("beam")
     common = _common_metadata([0, 2, 4], [3, 3], [[1, 2, 3, 4], [5, 6, 7, 8]])
@@ -1400,8 +1405,7 @@ def test_incremental_identity_rows_are_proved_only_for_npu(batch_size: int, is_n
         context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda _request: 0)),
     )
     builder = _make_builder()
-    builder._is_npu = is_npu
-    builder._is_cuda = not is_npu
+    builder._profile = profile(cuda=not is_npu, ascend=is_npu)
     common = _common_metadata(
         list(range(0, rows + 1, width)),
         [4 + width] * batch_size,
@@ -1423,7 +1427,7 @@ def test_incremental_identity_rows_are_proved_only_for_npu(batch_size: int, is_n
 def test_identity_row_proof_is_not_reused_for_same_shape_changed_prefix() -> None:
     """Losing cached prefix blocks changes routing without changing B or W."""
     builder = _make_builder()
-    builder._is_npu = True
+    builder._profile = profile(cuda=False, ascend=True)
     session = SimpleNamespace(
         is_active=True,
         beam_width=2,

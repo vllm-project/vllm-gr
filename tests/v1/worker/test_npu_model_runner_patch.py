@@ -169,11 +169,7 @@ def test_npu_prefill_rejects_incomplete_or_invalid_cached_progress(fault: str) -
         scheduled.num_scheduled_tokens[request.req_id] += -1 if fault == "short" else 1
         scheduled.total_num_scheduled_tokens = sum(scheduled.num_scheduled_tokens.values())
     else:
-        setattr(
-            request,
-            "num_computed_tokens",
-            {"negative": -1, "noninteger": 128.0, "boolean": True}[fault],
-        )
+        request.num_computed_tokens = {"negative": -1, "noninteger": 128.0, "boolean": True}[fault]
     with pytest.raises(BeamExecutionContractError):
         NPUEagerStagePlan.from_scheduler_output(scheduled)
 
@@ -378,7 +374,6 @@ def test_npu_sample_patch_parses_keyword_logits_and_spec_metadata(
 
     def direct(self: Any, logits: Any, spec_decode_metadata: Any) -> None:
         events.append(("direct", logits, spec_decode_metadata))
-        return None
 
     def original(
         self: Any,
@@ -613,12 +608,9 @@ def _decision_stub(
     monkeypatch.setattr(
         beam_decision,
         "run_beam_decision",
-        lambda runner,
-        session,
-        sampler_output,
-        is_last_step,
-        result_width,
-        v2_layout=False: decision,
+        lambda runner, session, sampler_output, is_last_step, result_width, v2_layout=False: (
+            decision
+        ),
     )
 
 
@@ -779,7 +771,7 @@ def test_npu_determine_session_missing_downgrades_full() -> None:
     runner = SimpleNamespace(_current_beam_info=beam_info)
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
-    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: True
     try:
         wrapped = _make_determine_wrapper(native)
         result = wrapped(runner, num_tokens=4)
@@ -797,7 +789,7 @@ def test_npu_determine_mixed_batch_downgrades_full() -> None:
     runner = SimpleNamespace(_current_beam_info=beam_info)
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
-    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: True
     try:
         wrapped = _make_determine_wrapper(native)
         result = wrapped(runner, num_tokens=8)
@@ -816,7 +808,7 @@ def test_npu_determine_nonzero_slot_downgrades_full() -> None:
     runner = SimpleNamespace(_current_beam_info=beam_info)
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
-    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: True
     try:
         wrapped = _make_determine_wrapper(native)
         result = wrapped(runner, num_tokens=4)
@@ -839,7 +831,7 @@ def test_npu_determine_cascade_mode_downgrades_full() -> None:
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
     orig_enabled = npu_patch._beam_graph_enabled_for_run
-    npu_patch._npu_xllm_decode_mode_active = lambda: False
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: False
     npu_patch._beam_graph_enabled_for_run = lambda r: True
     try:
         wrapped = _make_determine_wrapper(native)
@@ -868,7 +860,7 @@ def test_npu_determine_pure_beam_batch_grants_full() -> None:
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
     orig_enabled = npu_patch._beam_graph_enabled_for_run
-    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: True
     npu_patch._beam_graph_enabled_for_run = lambda r: True
     try:
         wrapped = _make_determine_wrapper(native)
@@ -910,7 +902,7 @@ def test_npu_determine_same_token_count_wrong_shape_falls_back(native_mode: str)
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
     orig_enabled = npu_patch._beam_graph_enabled_for_run
-    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: True
     npu_patch._beam_graph_enabled_for_run = lambda r: True
     try:
         wrapped = _make_determine_wrapper(native)
@@ -974,7 +966,7 @@ def test_npu_determine_attributes_uncaptured_nonidentity_batch_to_shape_miss(
     tokens = batch_size * 4
     assert not npu_patch._npu_beam_identity_layout_matches(runner, beam_info, tokens)
     native = (getattr(CUDAGraphMode, native_mode), BatchDescriptor(num_tokens=tokens), "extra")
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     monkeypatch.setattr(npu_patch, "_beam_graph_enabled_for_run", lambda _runner: True)
 
     wrapped = _make_determine_wrapper(native)
@@ -1048,7 +1040,7 @@ def test_npu_determine_rejects_nonidentity_layout_at_same_shape(
         beam_info["beam_data"]["beam-0"]["beam_decode_steps"] = 2
 
     native = (getattr(CUDAGraphMode, native_mode), BatchDescriptor(num_tokens=8), "extra")
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     monkeypatch.setattr(npu_patch, "_beam_graph_enabled_for_run", lambda _runner: True)
     result = _make_determine_wrapper(native)(runner, num_tokens=8)
     expected_mode = CUDAGraphMode.PIECEWISE if native_mode == "PIECEWISE" else CUDAGraphMode.NONE
@@ -1064,7 +1056,7 @@ def test_npu_determine_does_not_reuse_identity_grant_after_prefix_layout_changes
 
     runner = _identity_layout_runner()
     native = (CUDAGraphMode.NONE, BatchDescriptor(num_tokens=8))
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     monkeypatch.setattr(npu_patch, "_beam_graph_enabled_for_run", lambda _runner: True)
     wrapped = _make_determine_wrapper(native)
     assert wrapped(runner, num_tokens=8)[0] == CUDAGraphMode.FULL
@@ -1090,7 +1082,7 @@ def test_npu_determine_active_lora_downgrades_full() -> None:
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
     orig_enabled = npu_patch._beam_graph_enabled_for_run
-    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: True
     npu_patch._beam_graph_enabled_for_run = lambda r: True
     try:
         wrapped = _make_determine_wrapper(native)
@@ -1114,7 +1106,7 @@ def test_npu_determine_graph_disabled_no_full() -> None:
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
     orig_enabled = npu_patch._beam_graph_enabled_for_run
-    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: True
     npu_patch._beam_graph_enabled_for_run = lambda r: False
     try:
         wrapped = _make_determine_wrapper(native)
@@ -1139,7 +1131,7 @@ def test_npu_determine_width_mismatch_no_full() -> None:
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
     orig_enabled = npu_patch._beam_graph_enabled_for_run
-    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._npu_xllm_decode_mode_active = lambda runner: True
     npu_patch._beam_graph_enabled_for_run = lambda r: True
     try:
         wrapped = _make_determine_wrapper(native)
@@ -1173,7 +1165,7 @@ def test_npu_capture_cascade_mode_returns_false(monkeypatch: pytest.MonkeyPatch)
         monkeypatch,
         SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
     )
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: False)
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: False)
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False)
     )
@@ -1185,7 +1177,7 @@ def test_npu_capture_tp_gt1_returns_false(monkeypatch: pytest.MonkeyPatch) -> No
         monkeypatch,
         SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
     )
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=2, use_ubatching=False),
     )
@@ -1197,7 +1189,7 @@ def test_npu_capture_ubatching_returns_false(monkeypatch: pytest.MonkeyPatch) ->
         monkeypatch,
         SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
     )
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=True),
     )
@@ -1238,7 +1230,7 @@ def test_npu_capture_reentry_returns_true(
             beam_graph_widths=graph_widths,
         ),
     )
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     installs = _stub_beam_graph_install(monkeypatch, ready_widths=(4,))
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False),
@@ -1264,7 +1256,7 @@ def test_npu_capture_forwards_run_under_inference_mode(
     """
     import contextlib
 
-    import vllm.compilation.monitor as monitor
+    from vllm.compilation import monitor
 
     _stub_gr_config(
         monkeypatch,
@@ -1276,7 +1268,7 @@ def test_npu_capture_forwards_run_under_inference_mode(
             beam_graph_widths=graph_widths,
         ),
     )
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     monkeypatch.setattr(monitor, "set_cudagraph_capturing_enabled", lambda *_: None)
 
     side_stream = SimpleNamespace(wait_stream=lambda *_: None)

@@ -19,6 +19,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_gr.platforms.attention import MetadataProfile
 from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
     _build_beam_mappings,
     _build_std_mappings,
@@ -36,18 +37,6 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import (
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 
 logger = init_logger(__name__)
-
-
-def get_scheduler_metadata(*args, **kwargs):
-    from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
-
-    if not is_flash_attn_varlen_func_available():
-        raise RuntimeError("BeamAttentionMetadataBuilder requires FlashAttention scheduler support")
-    from vllm.v1.attention.backends.fa_utils import (
-        get_scheduler_metadata as _get_scheduler_metadata,
-    )
-
-    return _get_scheduler_metadata(*args, **kwargs)
 
 
 @dataclass
@@ -167,6 +156,7 @@ def resolve_beam_pool(metadata: BeamAttentionMetadata, beam_pool: Any = None) ->
 
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
+    _profile = MetadataProfile()
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
 
@@ -178,9 +168,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        device_type = getattr(device, "type", str(device).partition(":")[0])
-        self._is_cuda = device_type == "cuda"
-        self._is_npu = device_type == "npu"
+        from vllm_gr.platforms.attention import for_config
+
+        executor = for_config(vllm_config, layer_names=layer_names)
+        self._profile = executor.metadata_profile
+        track = getattr(executor, "track_builder", None)
+        if track is not None:
+            track(self)
         # Default: no pre-allocated fixed-address buffers.  Overridden to True
         # below when CUDA (or, in the future, ACL Graph on NPU) needs them.
         # Tests / kernel harnesses that skip __init__ keep the default and
@@ -193,7 +187,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         from vllm_gr.config import GRConfig
 
         self._v2_gr_prefill_capture = (
-            self._is_cuda
+            self._profile.uses_v2_prefill_capture
             and envs.VLLM_USE_V2_MODEL_RUNNER
             and GRConfig.from_vllm_config(vllm_config).beam_worker_decision
         )
@@ -224,18 +218,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         self.aot_sliding_window: tuple[int, int] | None = None
 
-        if self._is_npu:
-            self.npu_causal_atten_mask = (
-                torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(self.device)
-            )
-        else:
-            self.npu_causal_atten_mask = None
+        self.npu_causal_atten_mask = self._profile.make_causal_mask(self.device)
 
         # --- Fixed-address metadata buffers for graph capture compatibility ---
         # CUDA and NPU pre-allocate maximum-sized buffers so build() can return
         # address-stable views for graph replay.  Thread the buffers through a
         # BeamTensorContext instead of reading them individually in build().
-        self._fixed_buffers = self._is_cuda or self._is_npu
+        self._fixed_buffers = self._profile.allocates_fixed_buffers
         self._tensor_buffers = BeamTensorBuffers()
         if self._fixed_buffers:
             from vllm_gr.config import GRConfig
@@ -267,9 +256,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         ):
             max_num_splits = self.max_num_splits
 
-        if self._is_cuda and envs.VLLM_BATCH_INVARIANT:
+        if self._profile.forces_single_reduction_split and envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
         return max_num_splits
+
+    def invalidate_geometry(self) -> None:
+        self._geometry_cache().clear()
 
     def _geometry_cache(self) -> dict:
         cache = getattr(self, "_geom_cache", None)
@@ -284,8 +276,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             device=getattr(self, "device", torch.device("cpu")),
             block_size=self.block_size,
             fixed_buffers=getattr(self, "_fixed_buffers", False),
-            is_cuda=getattr(self, "_is_cuda", False),
-            is_npu=getattr(self, "_is_npu", False),
+            profile=self._profile,
             cache=self._geometry_cache(),
             buffers=(getattr(self, "_tensor_buffers", None) or BeamTensorBuffers()),
             num_heads_q=getattr(self, "num_heads_q", 0),
@@ -600,7 +591,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_max_q_len=prefix_max_q_len,
             suffix_max_q_len=suffix_max_q_len,
             suffix_max_seq_len=suffix_max_seq_len,
-            scheduler=get_scheduler_metadata,
+            scheduler=self._profile.scheduler_metadata,
         )
 
         # Determine incremental decode metadata
@@ -612,7 +603,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         # Use the current CPU routing, including geometry-hit q_start updates.
         # Counts or contiguity alone do not prove a zero-based identity range.
         npu_prefix_rows_are_identity = (
-            getattr(self, "_is_npu", False)
+            self._profile.marks_identity_prefix_rows
             and is_incremental
             and not std_indices
             and len(prefix_indices) > 0

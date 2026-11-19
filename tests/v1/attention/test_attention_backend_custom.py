@@ -213,10 +213,12 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         from vllm_gr.v1.attention.backends import beam_attn
 
         execution = SimpleNamespace(is_available=lambda: True)
+        from vllm_gr.platforms.cuda.attention import CudaAttention
+
+        service = CudaAttention()
         with (
-            mock.patch.object(beam_attn, "CUDA_DEVICE", True),
-            mock.patch.object(beam_attn, "NPU_DEVICE", False),
-            mock.patch.object(beam_attn, "_get_platform_execution_module", return_value=execution),
+            mock.patch.object(beam_attn, "admission_for_config", return_value=service),
+            mock.patch.object(service, "execution_module", return_value=execution),
         ):
             reasons = beam_attn.BeamAttentionBackend.validate_configuration(
                 head_size=128,
@@ -240,7 +242,16 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         from vllm_gr.v1.attention.backends import beam_attn
 
         def shape_for(layout):
-            with mock.patch.object(vllm_envs, "VLLM_KV_CACHE_LAYOUT", layout):
+            from vllm_gr.platforms.attention import AttentionExecutor
+
+            with (
+                mock.patch.object(
+                    beam_attn,
+                    "admission_for_config",
+                    return_value=AttentionExecutor(kv_layout=layout),
+                ),
+                mock.patch.object(vllm_envs, "VLLM_KV_CACHE_LAYOUT", layout),
+            ):
                 return beam_attn.BeamAttentionBackend.get_kv_cache_shape(8, 128, 2, 64)
 
         # Default (unset) and the token-major NHD view.
@@ -280,8 +291,8 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         builder.aot_sliding_window = (-1, -1)
 
         with mock.patch.object(
-            beam_attn_metadata,
-            "get_scheduler_metadata",
+            type(builder._profile),
+            "scheduler_metadata",
             return_value={},
         ) as scheduler:
             beam_metadata_tensors.get_schedule(
@@ -293,7 +304,7 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
                 max_seq_len=8,
                 causal=True,
                 max_num_splits=0,
-                scheduler=beam_attn_metadata.get_scheduler_metadata,
+                scheduler=builder._profile.scheduler_metadata,
             )
 
         kwargs = scheduler.call_args.kwargs

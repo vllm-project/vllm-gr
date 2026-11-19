@@ -145,16 +145,17 @@ class BSNDRegressions(unittest.TestCase):
     ) -> tuple[Callable[..., Any], tuple[Any, ...], list[tuple[str, Any]]]:
         calls: list[tuple[str, Any]] = []
         platform = SimpleNamespace(reshape_and_cache=lambda *args: calls.append(("cache", args)))
-        fn = extract(
-            BACKEND,
-            "prefill_forward",
-            {
-                "NPU_DEVICE": True,
-                "CUDA_DEVICE": False,
-                "_get_platform_execution_module": lambda: platform,
-            },
+        from vllm_gr.platforms.ascend.attention import AscendAttention
+
+        service = AscendAttention("cascade")
+        service.execution_module = lambda: platform
+        service.prefill_module = lambda: SimpleNamespace(
+            prefill_attention=lambda **kw: calls.append(("tnd", kw)),
+            prefill_attention_bsnd=lambda **kw: calls.append(("bsnd", kw)),
         )
+        fn = extract(BACKEND, "prefill_forward", {"_dense_prefill_kwargs": lambda *args: {}})
         owner = SimpleNamespace(
+            _execution=service,
             kv_sharing_target_layer_name=None,
             kv_cache_dtype="auto",
             scale=0.25,
@@ -226,7 +227,7 @@ class BSNDRegressions(unittest.TestCase):
         # This is ordinary eager TND, not standard FULL graph capture.
         modes = SimpleNamespace(NONE="NONE", FULL="FULL")
         context = SimpleNamespace(cudagraph_runtime_mode=modes.NONE, capturing=False)
-        helper = SimpleNamespace(_GRAPH_CAPTURE_STATE={"capturing": False})
+        helper = SimpleNamespace(in_prefill_capture=lambda: False)
         with patch.dict(
             "sys.modules",
             {

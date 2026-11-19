@@ -38,8 +38,8 @@ declared backend ID matched against the native platform identity, not on tensor
 device type. GR EngineArgs carries an immutable BackendPlan to workers; runner
 service binding and an EngineCore readiness collective verify agreement before
 request acceptance. The active provider selects the worker hooks. The runner owns its
-prepare, execute and sample adapter. The attention backend selects its execution
-module. The
+prepare, execute and sample adapter. Each CUSTOM attention layer retains its
+runner's executor for Prefill, Decode and KV writes. The
 [platform contract](platform_backend_contract.md) explains these boundaries;
 the [patch inventory](runtime_patch_inventory.md) records installation ownership.
 

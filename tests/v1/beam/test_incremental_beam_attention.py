@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tests.helpers.attention import profile
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
@@ -169,8 +170,7 @@ def test_incremental_metadata_builder_uses_active_session_contract() -> None:
     builder.max_num_splits = 0
     builder.num_heads_q = 4
     builder.num_kv_heads = 2
-    builder._is_cuda = True
-    builder._is_npu = False
+    builder._profile = profile(cuda=True, ascend=False)
     builder._fixed_buffers = False  # no pre-allocated buffers in test harness
     builder.npu_causal_atten_mask = None
 

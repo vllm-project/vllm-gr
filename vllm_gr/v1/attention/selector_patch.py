@@ -3,7 +3,8 @@
 
 """Hardware-neutral CUSTOM attention selection for GR runtime initialization."""
 
-from typing import Any, cast
+from inspect import isabstract
+from typing import Any
 
 from vllm_gr.config import GRAttentionBackend, GRConfig
 
@@ -16,10 +17,38 @@ def _get_current_gr_attention_backend() -> GRAttentionBackend | None:
     return GRConfig.from_vllm_config(get_current_vllm_config_or_none()).attention_backend
 
 
-def _get_custom_beam_backend() -> type:
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+def _get_custom_beam_backend(selector_config: Any, *, num_heads: int | None = None) -> type:
+    from vllm.platforms import current_platform
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+    from vllm.v1.attention.backend import AttentionBackend
 
-    return cast(type[Any], BeamAttentionBackend)
+    from vllm_gr.platforms.attention import admission_for_config, selector_admission
+
+    with selector_admission(selector_config, num_heads=num_heads) as admitted:
+        select = getattr(admission_for_config(), "get_attn_backend_cls", None)
+        if select is None:
+            from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+
+            backend = BeamAttentionBackend
+        else:
+            backend = select(attn_selector_config=admitted, num_heads=num_heads)
+            if isinstance(backend, str):
+                backend = resolve_obj_by_qualname(backend)
+            if (
+                not isinstance(backend, type)
+                or not issubclass(backend, AttentionBackend)
+                or isabstract(backend)
+            ):
+                raise TypeError(
+                    "CUSTOM attention provider must select a concrete vLLM AttentionBackend class"
+                )
+        reasons = backend.validate_configuration(
+            device_capability=current_platform.get_device_capability(),
+            **admitted._asdict(),
+        )
+    if reasons:
+        raise ValueError(f"CUSTOM Beam attention does not support this configuration: {reasons}")
+    return backend
 
 
 def clear_attention_backend_cache() -> None:
@@ -57,9 +86,9 @@ def apply_custom_attention_backend_patch(force: bool = False) -> int:
     ) -> Any:
         # Preserve the original CUSTOM import error rather than hiding it.
         if backend == AttentionBackendEnum.CUSTOM:
-            return _get_custom_beam_backend()
+            return _get_custom_beam_backend(attn_selector_config, num_heads=num_heads)
         if backend is None and _get_current_gr_attention_backend() is GRAttentionBackend.CUSTOM:
-            return _get_custom_beam_backend()
+            return _get_custom_beam_backend(attn_selector_config, num_heads=num_heads)
         return original(backend, attn_selector_config, num_heads=num_heads)
 
     setattr(_patched_cached_get_attn_backend, _ORIGINAL_ATTR, original)

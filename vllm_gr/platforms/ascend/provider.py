@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from ..identity import PlatformIdentity
 from ..interface import (
@@ -15,7 +15,7 @@ from ..interface import (
     ModelRunnerInstaller,
 )
 from ..plan import BackendPlan, BackendRequest, PlanData
-from ..services import BoundService, BuiltinPlanSupport, require_provider_plan
+from ..services import BuiltinPlanSupport, require_provider_plan
 
 if TYPE_CHECKING:
     import torch
@@ -77,6 +77,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
                     "attention": "vllm_gr.v1.attention.backends.beam_attn_npu",
                     "prefill_attention": "ascend.cascade",
                     "decode_attention": gr["npu_decode_execution"] or "auto",
+                    "kv_layout": request.native.to_dict().get("kv_cache_layout"),
                     "requires_attention": gr["attention_backend"] == "CUSTOM",
                     "constraint": constraint,
                     "constraint_implementation": "npu" if constraint != "none" else None,
@@ -87,23 +88,37 @@ class NPUBackendProvider(BuiltinPlanSupport):
             ),
         )
 
-    def create_attention_executor(self, *, plan: BackendPlan, device: object) -> BoundService:
-        require_provider_plan(self, plan)
-        from vllm_gr.v1.attention.backends import beam_attn
+    def native_attention(self, config: Any) -> Any:
+        from os import environ
 
-        # Preserve the existing capability-sensitive default until #713 moves
-        # its selection into the executor. Report the actual module to the
-        # engine so workers cannot silently disagree on the auto choice.
-        actual = beam_attn._get_npu_decode_execution()
-        requested = plan.choices.to_dict()["decode_attention"]
-        if requested != "auto" and actual != requested:
-            raise RuntimeError(
-                "Ascend attention mode is already fixed by another engine; use a separate process"
-            )
-        module = beam_attn._get_platform_execution_module()
-        if not module.is_available():
-            raise RuntimeError("Ascend attention implementation is unavailable")
-        return BoundService(plan, module, device=device)
+        from vllm_gr.config import GRConfig
+
+        from .attention import AscendAttention
+
+        configured = GRConfig.from_vllm_config(config).npu_decode_execution
+
+        return AscendAttention(
+            (configured.value if configured else "auto") if config is not None else "cascade",
+            kv_layout=environ.get("VLLM_KV_CACHE_LAYOUT"),
+        )
+
+    def attention_admission(self, *, plan: BackendPlan) -> Any:
+        return self._attention_for_plan(plan)
+
+    def _attention_for_plan(self, plan: BackendPlan) -> Any:
+        from .attention import AscendAttention
+
+        require_provider_plan(self, plan)
+        return AscendAttention(
+            plan.choices.to_dict()["decode_attention"],
+            kv_layout=plan.choices.to_dict().get("kv_layout"),
+        )
+
+    def create_attention_executor(self, *, plan: BackendPlan, device: object) -> Any:
+        executor = self._attention_for_plan(plan)
+        if not executor.execution_module().is_available():
+            raise RuntimeError("Admitted Ascend attention implementation is unavailable")
+        return executor
 
     def matches_legacy_identity(self, identity: PlatformIdentity) -> bool:
         """API v1 selected Ascend by its original tensor placement."""
@@ -143,7 +158,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
         *,
         device: str | torch.device | None = None,
         plan: BackendPlan | None = None,
-    ) -> "NPUConstrainedTopKExecution":
+    ) -> NPUConstrainedTopKExecution:
         """Create a fresh NPU constrained top-k execution adapter.
 
         The adapter is stateful (holds loaded tables + digest), so a new

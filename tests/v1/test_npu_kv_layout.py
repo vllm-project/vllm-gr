@@ -51,12 +51,11 @@ def policy(monkeypatch: pytest.MonkeyPatch) -> Any:
         return getattr(vllm_config, "native_result", False)
 
     beam = SimpleNamespace(
-        NPU_DEVICE=True,
-        CUDA_DEVICE=False,
         BeamAttentionImpl=_BeamImpl,
         AttentionType=SimpleNamespace(DECODER="decoder"),
-        _get_npu_decode_execution=lambda: "xllm",
+        decode_mode=lambda: "xllm",
     )
+    _BeamImpl._execution = beam
     modules = {
         "vllm.platforms": SimpleNamespace(current_platform=SimpleNamespace(device_type="npu")),
         "vllm_ascend.attention.utils": SimpleNamespace(requires_contiguous_pa_kv_cache=native),
@@ -340,9 +339,9 @@ def test_other_layouts_do_not_opt_in(
 def test_actual_execution_and_operator_presence_required(policy: Any) -> None:
     wrapper = _installed(policy)
     beam = policy.modules["vllm_gr.v1.attention.backends.beam_attn"]
-    beam._get_npu_decode_execution = lambda: "cascade"
+    beam.decode_mode = lambda: "cascade"
     assert wrapper(*_case()) is False
-    beam._get_npu_decode_execution = lambda: "xllm"
+    beam.decode_mode = lambda: "xllm"
     policy.modules["vllm_gr.ops.npu.beam_ops"].is_available = lambda: False
     assert wrapper(*_case()) is False
 
@@ -426,7 +425,7 @@ def test_unknown_binding_contract_is_not_overwritten(policy: Any, mismatch: str)
 def test_idempotence_and_known_original_alias_repair(policy: Any, alias: str) -> None:
     wrapper = _installed(policy)
     assert policy.module.apply_npu_contiguous_kv_cache_patch() == 0
-    setattr(policy.modules[alias], "requires_contiguous_pa_kv_cache", policy.native)
+    policy.modules[alias].requires_contiguous_pa_kv_cache = policy.native
     assert policy.module.apply_npu_contiguous_kv_cache_patch() == 1
     assert policy.modules[alias].requires_contiguous_pa_kv_cache is wrapper
     assert policy.module.apply_npu_contiguous_kv_cache_patch() == 0

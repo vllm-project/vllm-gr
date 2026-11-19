@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -213,7 +214,12 @@ def cascade_attention(
 # path can wrap the FIA call in a graph task group (vllm-ascend's
 # full-graph recipe: static ops captured plain, FIA in a task group, host
 # seq-lens lists pre-built outside the capture).
-_GRAPH_CAPTURE_STATE: dict[str, Any] = {"capturing": False, "entry": None}
+_capture_entry: ContextVar[Any] = ContextVar("gr_ascend_prefill_entry", default=None)
+
+
+def in_prefill_capture() -> bool:
+    return _capture_entry.get() is not None
+
 
 _WEAK_TENSOR_UNAVAILABLE_WARNED = False
 
@@ -291,13 +297,11 @@ class NPUPrefillGraphEntry:
 def prefill_graph_capture(entry: NPUPrefillGraphEntry):
     """Marks the prefill fast path as graph-capturing and registers layer tasks."""
     entry._last_update_signature = None
-    prev = (_GRAPH_CAPTURE_STATE["capturing"], _GRAPH_CAPTURE_STATE["entry"])
-    _GRAPH_CAPTURE_STATE["capturing"] = True
-    _GRAPH_CAPTURE_STATE["entry"] = entry
+    token = _capture_entry.set(entry)
     try:
         yield
     finally:
-        _GRAPH_CAPTURE_STATE["capturing"], _GRAPH_CAPTURE_STATE["entry"] = prev
+        _capture_entry.reset(token)
 
 
 def prefill_attention(
@@ -323,7 +327,7 @@ def prefill_attention(
     num_reqs = attn_metadata.num_reqs
     if num_reqs <= 0:
         return
-    if attn_metadata.is_prefill_graph_exec and _GRAPH_CAPTURE_STATE["capturing"]:
+    if attn_metadata.is_prefill_graph_exec and in_prefill_capture():
         _prefill_attention_graph(
             output=output,
             query=query,
@@ -415,7 +419,7 @@ def _prefill_attention_graph(
     completion with stream-level waits (``wait_stream`` pairs), which makes
     per-layer event granularity redundant.
     """
-    entry = _GRAPH_CAPTURE_STATE["entry"]
+    entry = _capture_entry.get()
     assert entry is not None, "NPU prefill graph capture requires an active entry"
     num_reqs = attn_metadata.num_reqs
     qsl = attn_metadata.query_start_loc_cpu

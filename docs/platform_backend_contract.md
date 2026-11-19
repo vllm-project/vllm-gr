@@ -15,8 +15,8 @@ GR EngineArgs also publishes an immutable backend plan. Model load binds its
 services to the native runner, and EngineCore checks every worker's readiness
 before its constructor returns. See [Engine plans](#engine-plans-and-service-binding).
 The active provider supplies the process hooks for the native ModelRunner.
-Planned runners dispatch through their own adapter. Beam Attention continues
-to select its execution module in the attention backend.
+Planned runners dispatch through their own adapter. Each CUSTOM attention layer
+retains its runner's bound attention executor for Prefill, Decode and KV writes.
 
 ## Lifecycle and process model
 
@@ -124,8 +124,11 @@ constraint implementation, stage path, and graph/eager policy. Native defaults
 and existing configuration validation remain authoritative during migration.
 Ascend's unset Decode mode retains its capability-sensitive `auto` behavior;
 readiness also compares the actual bound implementation so workers cannot
-choose different modes silently. An explicitly requested mode conflicting
-with the existing process-global attention mode requires a separate process.
+choose different modes silently. Each runner resolves its own Decode mode. Ascend Prefill always uses cascade,
+including when Decode uses xllm. CUDA records the dense Prefill option and its
+configuration eligibility during admission. Both native runner generations use
+that choice for the fresh-prompt replay guard. CUDA supports an independent Prefill FlashAttention
+version. The admitted KV layout and actual Decode implementation travel with the owner.
 
 The runner owns `BackendBinding`. Binding verifies the received plan against
 local configuration and runtime versions, runs provider capability validation,
@@ -466,3 +469,42 @@ agreed availability when it admits a request's width schedule, before reserving
 session or KV state. Prefill-only requests and requests handled by the dynamic
 decision path can run without these operators. Configurations without
 an admitted plan retain a runner-local service from the installed native class.
+
+### CUSTOM attention binding
+
+During native model load, a construction scope provides the owning runner to
+attention layers. The first layer requests the executor for the admitted plan
+and worker device. Subsequent layers share it, and successful startup transfers
+that same executor to the runner binding. On failure the construction scope
+releases provisional resources. Forward and cache writes use the layer's saved
+executor. Metadata builders select the same owner through their native layer
+names and use its physical packing profile. Native attention retains its own
+selection and execution when GR does not request CUSTOM.
+
+At worker startup the concrete layer implementation may check its runner's
+executor with `validate_gr_attention_executor(executor, plan)`. The built-in
+Beam implementation checks its execution primitives and the selected Prefill
+graph path. Incremental Beam Decode also requires a suffix writer. The default
+writer calls `cache_unshared_kv` on the primitive module. A provider that
+implements `write_suffix_kv` directly owns that operation. Self-contained
+native implementations retain their own backend validation.
+
+An external planning provider can implement `attention_admission(plan=...)`
+for stateless early selector queries. Its admission policy may implement
+`get_attn_backend_cls(attn_selector_config=..., num_heads=...)` and return a
+concrete vLLM `AttentionBackend` class or its qualified import path. That class
+supplies the implementation and metadata builder. The default is
+`BeamAttentionBackend`. Both explicit and marker-restored CUSTOM validate the
+selected class against the normalized geometry before creating a layer.
+Implement `create_attention_executor(plan=..., device=...)` for execution.
+Primitive-only providers retain the original getter
+for cold capability queries. A backend can subclass
+`vllm_gr.platforms.attention.AttentionExecutor` and override its Prefill and
+Decode modules, supported combinations, KV layout/views, cache writes, reorder,
+and metadata profile. Invalidation releases cached geometry before recapture.
+Closing a runner releases only that runner's resources.
+
+Ascend 0.30.0rc2 probes the native attention backend before loading layers with
+a zero head size and unspecified KV dtype. For that runner probe the Ascend
+policy supplies the configured model head size and validates the complete
+selector request. Layer construction always validates the layer's own geometry.

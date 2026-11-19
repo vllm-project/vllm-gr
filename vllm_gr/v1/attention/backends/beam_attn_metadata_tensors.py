@@ -24,6 +24,9 @@ __all__ = [
 ]
 
 
+from vllm_gr.platforms.attention import MetadataProfile
+
+
 @dataclass
 class BeamTensorBuffers:
     prefix_cu_seqlens_q: torch.Tensor | None = None
@@ -46,8 +49,7 @@ class BeamTensorContext:
     device: torch.device
     block_size: int
     fixed_buffers: bool
-    is_cuda: bool
-    is_npu: bool
+    profile: MetadataProfile
     cache: dict
     buffers: BeamTensorBuffers
     num_heads_q: int = 0
@@ -148,7 +150,7 @@ def upload_incremental_seqlens(
                 (prefix_cu_seqlens_q_view, [0] + list(prefix_cu_seqlens_q_cpu)),
                 (suffix_cu_seqlens_q_view, [0] + list(suffix_cu_seqlens_q_cpu)),
             ],
-            non_blocking=ctx.is_npu,
+            non_blocking=ctx.profile.packs_seqlens_non_blocking,
         )
         uploaded.add(geom_key)
 
@@ -342,7 +344,7 @@ def create_std_tensors(
         std_block_table = common_attn_metadata.block_table_tensor[
             std_req_idxs, :num_std_blocks
         ].contiguous()
-        if ctx.is_cuda:
+        if ctx.profile.writes_seqlens_per_tensor:
             # Tests / kernel harnesses that skip __init__ buffer alloc.
             std_cu_seqlens_q_device = torch.tensor(
                 [0] + std_cu_seqlens_q_cpu, dtype=torch.int32, device=device
@@ -472,7 +474,7 @@ def create_beam_tensors(
         if geom_key is None or geom_key not in copied:
             source = common_attn_metadata.block_table_tensor
             if (
-                ctx.is_npu
+                ctx.profile.allows_identity_block_table_slice
                 and geom_key is not None
                 and all(row == index for index, row in enumerate(prefix_req_idxs_cpu))
             ):
@@ -557,7 +559,7 @@ def create_beam_tensors(
                     (suffix_cu_seqlens_k_device, [0] + list(suffix_cu_seqlens_kv_cpu)),
                 ],
             )
-    elif ctx.is_cuda:
+    elif ctx.profile.writes_seqlens_per_tensor:
         # Tests / kernel harnesses that skip __init__ buffer alloc.
         prefix_seqlens_kv_device = torch.tensor(
             prefix_seqlens_kv_cpu, dtype=torch.int32, device=device

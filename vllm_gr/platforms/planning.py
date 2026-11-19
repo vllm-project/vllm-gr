@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import asdict
 from enum import Enum
@@ -85,7 +86,9 @@ def provider_compatibility(provider: Any) -> PlanData:
     )
 
 
-def normalize_backend_request(config: Any, provider: Any) -> BackendRequest:
+def normalize_backend_request(
+    config: Any, provider: Any, *, admitted: BackendPlan | None = None
+) -> BackendRequest:
     from vllm_gr.config import GRConfig
 
     native: dict[str, Any] = {}
@@ -97,6 +100,27 @@ def normalize_backend_request(config: Any, provider: Any) -> BackendRequest:
         if section == "model_config" and values["dtype"] is not None:
             values["dtype"] = str(values["dtype"])
         native[section] = values
+    # These opt-ins are startup inputs. A worker checking the transferred plan
+    # must not replace them with the environment of another co-resident engine.
+    from vllm_gr.v1.attention.backends.beam_dense_prefill import (
+        requested_dense_prefill_mode,
+    )
+
+    if admitted is None:
+        selected_dense = requested_dense_prefill_mode()
+        # Match native vLLM's integer environment option without importing
+        # vLLM or a device module during engine request normalization.
+        batch_invariant = (
+            bool(int(os.environ.get("VLLM_BATCH_INVARIANT", "0"))) if selected_dense else False
+        )
+    else:
+        options = admitted.request.native.to_dict()
+        selected_dense = options.get("dense_prefill_request")
+        batch_invariant = options.get("dense_prefill_batch_invariant", False)
+    native["dense_prefill_request"] = selected_dense
+    native["dense_prefill_batch_invariant"] = batch_invariant
+    native["has_kv_transfer"] = getattr(config, "kv_transfer_config", None) is not None
+    native["kv_cache_layout"] = os.environ.get("VLLM_KV_CACHE_LAYOUT")
     native["use_v2_model_runner"] = bool(getattr(config, "use_v2_model_runner", False))
     model = getattr(config, "model_config", None)
     text_config = getattr(model, "hf_text_config", None)

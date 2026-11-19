@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_gr.platforms.ascend.attention import AscendAttention
+from vllm_gr.platforms.cuda.attention import ENV_DENSE_PREFILL, CudaAttention
 from vllm_gr.v1.attention.backends import beam_attn
 
 
@@ -38,24 +40,24 @@ def test_dense_prefill_mode_requires_fresh_prompts(monkeypatch, raw, cuda, confi
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", False)
 
     if raw is None:
-        monkeypatch.delenv(beam_attn.ENV_DENSE_PREFILL, raising=False)
+        monkeypatch.delenv(ENV_DENSE_PREFILL, raising=False)
     else:
-        monkeypatch.setenv(beam_attn.ENV_DENSE_PREFILL, raw)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", cuda)
+        monkeypatch.setenv(ENV_DENSE_PREFILL, raw)
+    executor = CudaAttention() if cuda else AscendAttention("cascade")
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    assert beam_attn._resolve_dense_prefill_mode() == expected
+    assert executor.dense_prefill_mode(config) == expected
 
 
 def test_dense_prefill_mode_off_when_batch_invariant(monkeypatch):
     import vllm.config
 
-    monkeypatch.setenv(beam_attn.ENV_DENSE_PREFILL, "cudnn")
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
+    monkeypatch.setenv(ENV_DENSE_PREFILL, "cudnn")
+    executor = CudaAttention()
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", _config)
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", True)
-    assert beam_attn._resolve_dense_prefill_mode() is None
+    assert executor.dense_prefill_mode(_config()) is None
     monkeypatch.setattr(beam_attn.envs, "VLLM_BATCH_INVARIANT", False)
-    assert beam_attn._resolve_dense_prefill_mode() == "cudnn"
+    assert executor.dense_prefill_mode(_config()) == "cudnn"
 
 
 @pytest.mark.parametrize(

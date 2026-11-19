@@ -443,20 +443,11 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
     return patched_bookkeeping_sync
 
 
-def _npu_xllm_decode_mode_active() -> bool:
-    """True iff the NPU decode execution mode resolves to the fused xllm path.
+def _npu_xllm_decode_mode_active(runner: Any) -> bool:
+    """Only the admitted xllm implementation has a graph-safe suffix cache."""
+    from vllm_gr.platforms.attention import for_runner
 
-    Only the xllm fused path is graph-safe: the cascade NPU path slices the
-    beam pool with host-int decode_step values (beam_attn_npu.py), which a
-    captured graph would freeze.  Resolved lazily through the same
-    per-process cache the attention backend uses (``_get_npu_decode_execution``).
-    """
-    try:
-        from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
-
-        return _get_npu_decode_execution() == "xllm"
-    except Exception:
-        return False
+    return for_runner(runner).decode_mode() == "xllm"
 
 
 def _downgrade_to_none(result):
@@ -601,7 +592,7 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
 
         # Only the fused xllm path is graph-safe on NPU (the cascade path
         # bakes host-int pool slices; see _npu_xllm_decode_mode_active).
-        if not _npu_xllm_decode_mode_active():
+        if not _npu_xllm_decode_mode_active(self):
             return _npu_graph_fallback(self, result, "unsupported_decode_mode")
 
         # Exact-width gate: compare the UNPADDED scheduled token count
@@ -895,7 +886,7 @@ def _capture_beam_decode_graph_width(runner, width: int) -> bool:
     # Only the fused xllm execution path is graph-safe on NPU (the cascade
     # path slices the beam pool with host-int decode_step values, which a
     # captured graph would freeze).
-    if not _npu_xllm_decode_mode_active():
+    if not _npu_xllm_decode_mode_active(runner):
         logger.info(
             "vllm-gr: beam decode ACL graph requires the xllm decode execution "
             "mode; Beam FULL graph will not be used"

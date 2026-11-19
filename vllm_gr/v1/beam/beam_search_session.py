@@ -93,8 +93,6 @@ class BeamSearchSession:
         """
         state = self._state
         if not state.is_last_step:
-            from vllm_gr.v1.beam.reorder import reorder_unshared_kv
-
             # Hand the context's PER-LAYER [num_layers, ...] aux buffers to the
             # reorder dispatcher.  In cascade mode the fused Triton path uses
             # the whole tensor for its single all-layer launch; the per-layer
@@ -105,7 +103,7 @@ class BeamSearchSession:
             pool_key_ptrs = getattr(self.context, "pool_key_ptrs", None)
             pool_value_ptrs = getattr(self.context, "pool_value_ptrs", None)
 
-            reorder_unshared_kv(
+            self.context.attention.reorder_kv(
                 parent,
                 self.slot,
                 self.context.pools,
