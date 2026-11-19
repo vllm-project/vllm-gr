@@ -43,7 +43,7 @@ class FakeProvider:
     vendor_distribution: str | None = None
 
     def matches(self, identity: PlatformIdentity) -> bool:
-        return identity.device_type == self.device_type
+        return bool(identity.device_type == self.device_type)
 
     def check_environment(self) -> dict[str, str]:
         return {}
@@ -103,7 +103,7 @@ def test_registering_same_provider_object_is_idempotent() -> None:
     assert resolve_backend("fake") is provider
 
 
-@pytest.mark.parametrize("factory", [3, lambda self, required: None])
+@pytest.mark.parametrize("factory", [3, lambda self, required: None])  # type: ignore[misc]
 def test_invalid_config_factory_fails_registration(
     monkeypatch: pytest.MonkeyPatch, factory: Any
 ) -> None:

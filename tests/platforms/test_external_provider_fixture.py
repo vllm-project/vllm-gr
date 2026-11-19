@@ -371,3 +371,109 @@ print("planned")
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "planned" in result.stdout
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_installed_provider_installs_and_verifies_native_runner(tmp_path: Path) -> None:
+    source = _PROVIDER_MODULE.replace(
+        "BACKEND = HostOnlyProvider()",
+        """
+from types import SimpleNamespace
+from vllm_gr.platforms.plan import BackendPlan, PlanData
+from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle, install_runner_lifecycle
+
+class HostRunner:
+    def prepare_inputs(self, value):
+        return value
+
+    def execute_model(self, value):
+        return value
+
+class Hooks:
+    def discover_worker_runners(self):
+        return (("HostRunner", HostRunner),)
+
+    def is_patched(self, cls):
+        return has_runner_lifecycle(cls, __name__)
+
+    def install(self):
+        install_runner_lifecycle(HostRunner, __name__, prepare="prepare_inputs")
+
+class RunnerProvider(HostOnlyProvider):
+    plan_api_version = 1
+    adapter_revision = "host-v1"
+
+    def get_model_runner_hooks(self):
+        return Hooks()
+
+    def resolve(self, request):
+        return BackendPlan(self.backend_id, self.api_version, request, PlanData({"runner": __name__}))
+
+    def validate_worker(self, *, plan, native_runner):
+        assert self.get_model_runner_hooks().is_patched(type(native_runner))
+
+    def create_model_runner_adapter(self, *, plan, native_runner):
+        width = plan.request.config.to_dict()["beam_max_width"]
+        return SimpleNamespace(implementation_id="host.runner", prepare_inputs=lambda v: v,
+                               execute_model=lambda v: (width, v))
+
+    def create_attention_executor(self, *, plan, device):
+        raise AssertionError("not requested")
+
+BACKEND = RunnerProvider()
+""",
+    )
+    site_packages = _install_provider(
+        tmp_path,
+        distribution="vllm-gr-host-runner",
+        module="host_runner",
+        backend_id="host_only",
+        source=source,
+    )
+    result = _run(
+        """
+import logging
+from unittest.mock import patch
+from types import ModuleType
+
+logger = ModuleType("vllm.logger")
+logger.init_logger = logging.getLogger
+sys.modules["vllm.logger"] = logger
+from vllm_gr.config import GRConfig
+from vllm_gr.platforms import interface, protocol
+from vllm_gr.platforms.binding import worker_backend_readiness
+from vllm_gr.platforms.planning import admit_backend_plan
+from vllm_gr.platforms.registry import get_active_backend
+from vllm_gr.v1.worker import model_runner_patch as worker
+
+assert protocol.GRBackendProvider is interface.GRBackendProvider
+assert protocol.ModelRunnerPatchHooks is interface.ModelRunnerPatchHooks
+assert protocol.BeamAttentionExecution is interface.BeamAttentionExecution
+runners = worker.discover_active_worker_runners()
+from host_runner import BACKEND, HostRunner
+assert runners == (("HostRunner", HostRunner),)
+assert get_active_backend() is BACKEND
+assert not worker.is_active_worker_runner_patched(HostRunner)
+# The native multiprocessing guard is independent of the runner protocol.
+with patch("vllm_gr.v1.worker.gr_async_output.install_async_output_guard"):
+    worker.apply_worker_patches()
+    installed = HostRunner.execute_model
+    worker.apply_worker_patches()
+assert HostRunner.execute_model is installed
+assert HostRunner().execute_model(42) == 42
+assert worker.is_active_worker_runner_patched(HostRunner)
+for width in (4, 8):
+    runner = HostRunner()
+    runner.vllm_config = SimpleNamespace(additional_config={})
+    GRConfig(beam_max_width=width).write_to_vllm_config(runner.vllm_config)
+    plan = admit_backend_plan(runner.vllm_config)
+    report = worker_backend_readiness(SimpleNamespace(model_runner=runner))
+    assert report["fingerprint"] == plan.fingerprint
+    assert runner.execute_model(42) == (width, 42)
+assert not any(f"vllm_gr.v1.worker.{name}" in sys.modules for name in
+               ("cuda.v1.gpu_model_runner_patch", "cuda.v2.gpu_model_runner_v2_patch", "npu.npu_model_runner_patch"))
+""",
+        site_packages=site_packages,
+        project_root=Path(__file__).resolve().parents[2],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

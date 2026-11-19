@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -179,22 +180,39 @@ def test_missing_vendor_distribution_is_reported(monkeypatch: pytest.MonkeyPatch
     assert any("vllm-ascend" in failure for failure in failures)
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "ambient_log_level", [logging.WARNING, logging.ERROR], ids=["warning-root", "error-root"]
+)
 def test_strict_mode_fails_and_default_mode_only_warns(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    ambient_log_level: int,
 ) -> None:
     monkeypatch.setattr(compat, "_installed_version", lambda name: "0.22.1")
     provider = RangedProvider(vllm_version_range="==0.30.0")
 
     monkeypatch.delenv(compat._STRICT_ENV, raising=False)
     compat._warn_range_once.cache_clear()
-    compat.enforce_declared_ranges(provider)
-    compat.enforce_declared_ranges(provider)
-    assert caplog.text.count("compatibility range that does not hold") == 1
+    try:
+        with caplog.at_level(ambient_log_level):
+            # Collection can raise the root threshold. Capture this logger at
+            # WARNING explicitly and restore both levels after the assertion.
+            with caplog.at_level(logging.WARNING, logger=compat.logger.name):
+                compat.enforce_declared_ranges(provider)
+                compat.enforce_declared_ranges(provider)
+                records = [record for record in caplog.records if record.name == compat.logger.name]
+                assert len(records) == 1
+                assert records[0].levelno == logging.WARNING
+                assert "compatibility range that does not hold" in records[0].getMessage()
 
-    monkeypatch.setenv(compat._STRICT_ENV, "1")
-    with pytest.raises(InvalidBackendProviderError, match=compat._STRICT_ENV):
-        compat.enforce_declared_ranges(provider)
+                monkeypatch.setenv(compat._STRICT_ENV, "1")
+                with pytest.raises(InvalidBackendProviderError, match=compat._STRICT_ENV):
+                    compat.enforce_declared_ranges(provider)
+                assert [
+                    record for record in caplog.records if record.name == compat.logger.name
+                ] == records
+    finally:
+        compat._warn_range_once.cache_clear()
 
 
 def test_unparsable_declared_range_is_a_provider_defect(

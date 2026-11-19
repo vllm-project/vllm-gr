@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
+from vllm_gr.platforms.ascend import provider as npu
+from vllm_gr.platforms.cuda import provider as cuda
 from vllm_gr.v1.worker import model_runner_patch
 from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
 
@@ -26,15 +28,10 @@ def test_active_cuda_worker_hot_update_utility_contract(monkeypatch: pytest.Monk
     module = ModuleType("vllm.v1.worker.gpu_worker")
     setattr(module, "Worker", Worker)
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_active_platform_module_name",
-        lambda: model_runner_patch._GPU_PATCH_MODULE,
-    )
     native_reload = Worker.reload_weights
-    model_runner_patch._install_active_worker_resource_hook()
+    cuda.install_worker_utilities()
     reload_trie = getattr(Worker, "reload_trie")
-    model_runner_patch._install_active_worker_resource_hook()
+    cuda.install_worker_utilities()
     assert getattr(Worker, "reload_trie") is reload_trie
     assert Worker.reload_weights is native_reload
 
@@ -49,51 +46,15 @@ def test_active_cuda_worker_hot_update_utility_contract(monkeypatch: pytest.Monk
 def test_dispatcher_selects_one_platform_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # This test exercises the V1 platform routing; pin the V2 flag off so an
-    # ambient VLLM_USE_V2_MODEL_RUNNER=1 (e.g. a V2 CI shard) cannot reroute
-    # _active_runner_module_name to the V2 module.
-    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
-    # Fake vllm.platforms so the test runs without a real vLLM install.
-    fake_platforms = ModuleType("vllm.platforms")
-    setattr(fake_platforms, "current_platform", SimpleNamespace(device_type="npu"))
-    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
-
-    assert model_runner_patch._active_platform_module_name() == (
-        model_runner_patch._NPU_PATCH_MODULE
-    )
-    getattr(fake_platforms, "current_platform").device_type = "cuda"
-    assert model_runner_patch._active_platform_module_name() == (
-        model_runner_patch._GPU_PATCH_MODULE
-    )
-
-    selected = object()
-    imported: list[str] = []
-
-    def import_selected(name: str) -> object:
-        imported.append(name)
-        return selected
-
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_active_platform_module_name",
-        lambda: model_runner_patch._NPU_PATCH_MODULE,
-    )
-    monkeypatch.setattr(
-        model_runner_patch,
-        "import_module",
-        import_selected,
-    )
-
-    assert model_runner_patch._get_active_platform_module() is selected
-    assert imported == [model_runner_patch._NPU_PATCH_MODULE]
+    target = (("ExternalRunner", object),)
+    hooks = SimpleNamespace(discover_worker_runners=lambda: target)
+    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: hooks)
+    assert model_runner_patch.discover_active_worker_runners() == target
 
 
 def test_dispatcher_installs_required_and_optional_hooks_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # V1-platform install test: pin the V2 flag off (see
-    # test_dispatcher_selects_one_platform_module).
-    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
     native_result = object()
 
     class Runner:
@@ -121,7 +82,7 @@ def test_dispatcher_installs_required_and_optional_hooks_once(
     )
     monkeypatch.setattr(
         model_runner_patch,
-        "_get_active_platform_module",
+        "get_runner_hooks",
         lambda: platform_module,
     )
 
@@ -141,27 +102,22 @@ def test_dispatcher_installs_required_and_optional_hooks_once(
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    ("platform_module_name", "expected_max_batch"),
+    ("device_type", "expected_max_batch"),
     [
-        (model_runner_patch._GPU_PATCH_MODULE, 1),
-        (model_runner_patch._NPU_PATCH_MODULE, max(SUPPORTED_BEAM_BATCH_SIZES)),
+        ("cuda", 1),
+        ("npu", max(SUPPORTED_BEAM_BATCH_SIZES)),
     ],
 )
 def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
     monkeypatch: pytest.MonkeyPatch,
-    platform_module_name: str,
+    device_type: str,
     expected_max_batch: int,
 ) -> None:
-    # V1-platform install test: pin the V2 flag off (see
-    # test_dispatcher_selects_one_platform_module).
-    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
-    monkeypatch.setattr(
-        model_runner_patch, "_active_platform_module_name", lambda: platform_module_name
-    )
     from vllm_gr.v1.worker.model_runner_patch import (
         _CONSTRAINT_LOAD_PATCH_MARKER,
         _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
     )
+    from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
     class Runner:
         def execute_model(self, scheduler_output: Any) -> None:
@@ -194,12 +150,15 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
         def reload_weights(self) -> None:
             return None
 
+    # Exercise the platform installer's real capacity setting. The reduced V1
+    # hook surface keeps the test focused on native fallback and load ownership.
+    runner_hooks = gpu_model_runner_patch if device_type == "cuda" else npu_model_runner_patch
     platform_module = SimpleNamespace(
-        discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
+        discover_worker_runners=lambda: (("TestRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
     )
     platform_hooks: list[str] = []
-    if platform_module_name == model_runner_patch._NPU_PATCH_MODULE:
+    if device_type == "npu":
 
         def install_platform_load(original: Any) -> Any:
             platform_hooks.append("load")
@@ -211,11 +170,16 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
 
         platform_module.make_patched_load_model = install_platform_load
         platform_module.make_patched_shutdown = install_platform_shutdown
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_get_active_platform_module",
-        lambda: platform_module,
-    )
+
+    install_v1 = model_runner_patch.install_v1_worker_hooks
+
+    def install_test_runner(hooks: Any, **kwargs: Any) -> None:
+        assert hooks is runner_hooks
+        install_v1(platform_module, **kwargs)
+
+    monkeypatch.setattr(model_runner_patch, "install_v1_worker_hooks", install_test_runner)
+    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: runner_hooks)
+    monkeypatch.setattr(cuda, "install_worker_hooks", lambda: None)
 
     load_wrapper = model_runner_patch.make_load_model_with_constraint_backend
     max_batches: list[int] = []
@@ -265,9 +229,6 @@ def test_npu_module_exports_sample_tokens_alias() -> None:
 def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # V1-platform install test: pin the V2 flag off (see
-    # test_dispatcher_selects_one_platform_module).
-    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
     from vllm_gr.v1.worker.model_runner_contracts import (
         _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
     )
@@ -308,7 +269,7 @@ def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     )
     monkeypatch.setattr(
         model_runner_patch,
-        "_get_active_platform_module",
+        "get_runner_hooks",
         lambda: platform_module,
     )
 
@@ -317,49 +278,37 @@ def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     assert getattr(Runner.sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, False)
 
 
-# ---------------------------------------------------------------------------
-# V2 dispatch: _active_runner_module_name + apply_worker_patches branching
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(  # type: ignore[misc]
     "device_type,use_v2",
-    [("cuda", False), ("cuda", True), ("npu", True), ("cpu", True), ("hip", True)],
+    [("cuda", False), ("cuda", True), ("npu", True)],
 )
 def test_dispatcher_routes_platform_before_v2_flag(
     monkeypatch: pytest.MonkeyPatch,
     device_type: str,
     use_v2: bool,
 ) -> None:
-    """Only CUDA opts into V2; Ascend fallback keeps the NPU patch module."""
-    fake_platforms = ModuleType("vllm.platforms")
-    monkeypatch.setattr(
-        fake_platforms, "current_platform", SimpleNamespace(device_type=device_type), raising=False
-    )
-    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
-
-    def v2_flag() -> bool:
-        assert device_type == "cuda", "non-CUDA routing must not consult the V2 flag"
-        return use_v2
-
-    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", v2_flag)
-    expected = model_runner_patch._GPU_PATCH_MODULE
-    if device_type == "npu":
-        expected = model_runner_patch._NPU_PATCH_MODULE
-    elif device_type == "cuda" and use_v2:
-        expected = model_runner_patch._V2_GPU_PATCH_MODULE
-    assert model_runner_patch._active_runner_module_name() == expected
+    """CUDA defers runner discovery until the Worker knows its configuration."""
+    envs = ModuleType("vllm.envs")
+    if device_type == "cuda":
+        setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", use_v2)
+    monkeypatch.setitem(sys.modules, "vllm.envs", envs)
+    provider = cuda.CUDA_BACKEND if device_type == "cuda" else npu.NPU_BACKEND
+    from vllm_gr.platforms.cuda import runner
 
     target = (("selected", object),)
+    monkeypatch.setattr(runner, "discover_worker_runners", lambda: target)
     imported: list[str] = []
 
     def import_selected(name: str) -> Any:
         imported.append(name)
         return SimpleNamespace(discover_worker_runners=lambda: target)
 
-    monkeypatch.setattr(model_runner_patch, "import_module", import_selected)
+    monkeypatch.setattr(cuda if device_type == "cuda" else npu, "import_module", import_selected)
+    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", provider.get_model_runner_hooks)
     assert model_runner_patch.discover_active_worker_runners() == target
-    assert imported == [expected]
+    assert imported == (
+        [] if device_type == "cuda" else ["vllm_gr.v1.worker.npu.npu_model_runner_patch"]
+    )
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -373,19 +322,15 @@ def test_numpy_token_staging_installs_for_cuda_runners_only(
 ) -> None:
     """V1 and V2 share StagedWriteTensor, so staging is runner-agnostic."""
     from vllm_gr.v1.worker.cuda import numpy_staging
+    from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
+    runner_hooks = gpu_model_runner_patch if device_type == "cuda" else npu_model_runner_patch
     calls: list[str] = []
+    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: runner_hooks)
+    monkeypatch.setattr(runner_hooks, "discover_worker_runners", lambda: ())
+    monkeypatch.setattr(cuda, "install_worker_utilities", lambda: None)
     monkeypatch.setattr(numpy_staging, "install_numpy_staging", lambda: calls.append("staging"))
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_active_platform_module_name",
-        lambda: (
-            model_runner_patch._GPU_PATCH_MODULE
-            if device_type == "cuda"
-            else model_runner_patch._NPU_PATCH_MODULE
-        ),
-    )
-    model_runner_patch._install_numpy_token_staging()
+    model_runner_patch.apply_worker_patches()
     assert calls == expected
 
 
@@ -398,22 +343,8 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
 
     import vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch as v2_patch_module
 
-    fake_platforms = ModuleType("vllm.platforms")
-    monkeypatch.setattr(
-        fake_platforms, "current_platform", SimpleNamespace(device_type="cuda"), raising=False
-    )
-    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
-    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: True)
-    monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
-    monkeypatch.setattr(
-        model_runner_patch, "_install_numpy_token_staging", lambda: called.append("staging")
-    )
-    # The platform path must not be touched under V2.
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_get_active_platform_module",
-        lambda: (_ for _ in ()).throw(AssertionError("V1 installer must not run")),
-    )
+    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: v2_patch_module)
+    monkeypatch.setattr(cuda, "install_worker_hooks", lambda: called.append("staging"))
     monkeypatch.setattr(v2_patch_module, "_apply_v2_runner_patches", lambda: called.append("v2"))
 
     model_runner_patch.apply_worker_patches()
@@ -428,13 +359,6 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
 
     from vllm_gr.v1.worker import gr_startup
 
-    fake_platforms = ModuleType("vllm.platforms")
-    monkeypatch.setattr(
-        fake_platforms, "current_platform", SimpleNamespace(device_type="npu"), raising=False
-    )
-    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
-    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: True)
-    monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
     events: list[str] = []
 
     class Runner:
@@ -446,6 +370,9 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
         def _prepare_inputs(self, *args: Any) -> None:
             pass
 
+        def _update_states(self, *args: Any) -> None:
+            pass
+
         def _bookkeeping_sync(self, *args: Any) -> None:
             pass
 
@@ -453,15 +380,16 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
             events.append("native")
             return 17
 
-    def import_npu(name: str) -> Any:
-        assert name == model_runner_patch._NPU_PATCH_MODULE
-        return SimpleNamespace(
-            discover_worker_runners=lambda: (("NPUModelRunner", Runner),),
-            make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
-            capture_beam_decode_graph=lambda _: events.append("legacy"),
-        )
+    from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
-    monkeypatch.setattr(model_runner_patch, "import_module", import_npu)
+    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: npu_model_runner_patch)
+    monkeypatch.setattr(npu_model_runner_patch, "capture_prefill_graphs", lambda _: None)
+    monkeypatch.setattr(
+        npu_model_runner_patch, "discover_worker_runners", lambda: (("NPU", Runner),)
+    )
+    monkeypatch.setattr(
+        npu_model_runner_patch, "capture_beam_decode_graph", lambda _: events.append("legacy")
+    )
     monkeypatch.setattr(
         gr_startup,
         "capture_async_forward",
@@ -492,7 +420,6 @@ pytestmark = pytest.mark.cpu_test
 def test_public_installer_owns_numpy_staging_once(
     monkeypatch: pytest.MonkeyPatch, use_v2: bool
 ) -> None:
-    from types import SimpleNamespace
     from unittest.mock import Mock
 
     from vllm_gr.v1.worker import gr_async_output
@@ -505,19 +432,10 @@ def test_public_installer_owns_numpy_staging_once(
     monkeypatch.setattr(numpy_staging, "install_numpy_staging", install)
     monkeypatch.setattr(v2, "discover_worker_runners", discover)
     monkeypatch.setattr(gr_async_output, "install_async_output_guard", lambda: False)
-    monkeypatch.setattr(installer, "_install_active_worker_resource_hook", lambda: None)
+    monkeypatch.setattr(cuda, "install_worker_utilities", lambda: None)
+    monkeypatch.setattr(gpu_model_runner_patch, "discover_worker_runners", lambda: ())
     monkeypatch.setattr(
-        installer, "_active_platform_module_name", lambda: installer._GPU_PATCH_MODULE
-    )
-    monkeypatch.setattr(
-        installer,
-        "_active_runner_module_name",
-        lambda: (installer._V2_GPU_PATCH_MODULE if use_v2 else installer._GPU_PATCH_MODULE),
-    )
-    monkeypatch.setattr(
-        installer,
-        "_get_active_platform_module",
-        lambda: SimpleNamespace(discover_worker_runners=lambda: ()),
+        installer, "get_runner_hooks", lambda: v2 if use_v2 else gpu_model_runner_patch
     )
     installer.apply_worker_patches()
     install.assert_called_once_with()

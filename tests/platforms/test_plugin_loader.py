@@ -40,7 +40,7 @@ class FakeProvider:
     vendor_distribution: str | None = None
 
     def matches(self, identity: PlatformIdentity) -> bool:
-        return identity.device_type == self.device_type
+        return bool(identity.device_type == self.device_type)
 
     def check_environment(self) -> dict[str, str]:
         return {}

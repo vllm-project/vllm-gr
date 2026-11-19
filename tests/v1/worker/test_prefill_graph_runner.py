@@ -1131,7 +1131,7 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import gr_async_output, gr_startup, model_runner_patch
+    from vllm_gr.v1.worker import gr_startup, model_runner_patch
     from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
     from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
@@ -1177,22 +1177,6 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
         make_patched_prepare_inputs=lambda original: original,
         capture_prefill_graphs=patch.capture_prefill_graphs,
     )
-    monkeypatch.setattr(gr_async_output, "install_async_output_guard", lambda: None)
-    monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_active_runner_module_name",
-        lambda: model_runner_patch._GPU_PATCH_MODULE,
-    )
-    # Pin the platform selector too: the installer binds the CUDA hooks class by
-    # reading the real vLLM platform, so this test must not depend on the host
-    # device (it fails on an NPU machine where the selector reports NPU).
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_active_platform_module_name",
-        lambda: model_runner_patch._GPU_PATCH_MODULE,
-    )
-    monkeypatch.setattr(model_runner_patch, "_get_active_platform_module", lambda: platform)
     capture_async = Mock(return_value=None)
     monkeypatch.setattr(gr_startup, "capture_async_forward", capture_async)
     monkeypatch.setattr(
@@ -1201,7 +1185,7 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
         lambda _runner: events.append("freeze"),
     )
 
-    model_runner_patch.apply_worker_patches()
+    model_runner_patch.install_v1_worker_hooks(platform, cuda_hooks_type=CudaStageHooksV1)
     worker = Runner()
     with pytest.raises(RuntimeError) as raised:
         worker.capture_model()

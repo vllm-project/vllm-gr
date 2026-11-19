@@ -153,7 +153,7 @@ def _install_init_ascend_config_sanitizer() -> None:
 
     import vllm_ascend.ascend_config as ascend_config_mod
 
-    from vllm_gr.config.parser import GR_CONFIG_KEY
+    from vllm_gr.config.parser import BACKEND_TRANSPORT_KEYS, GR_CONFIG_KEY
 
     current = ascend_config_mod.init_ascend_config
     if getattr(current, "_vllm_gr_sanitized", False) is True:
@@ -167,7 +167,11 @@ def _install_init_ascend_config_sanitizer() -> None:
             additional = getattr(vllm_config, "additional_config", None)
             if not isinstance(additional, dict):
                 return original(vllm_config)
-            filtered = {key: value for key, value in additional.items() if key != GR_CONFIG_KEY}
+            filtered = {
+                key: value
+                for key, value in additional.items()
+                if key != GR_CONFIG_KEY and key not in BACKEND_TRANSPORT_KEYS
+            }
             if len(filtered) == len(additional):
                 return original(vllm_config)
             vllm_config.additional_config = filtered

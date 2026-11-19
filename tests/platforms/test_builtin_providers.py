@@ -38,23 +38,25 @@ def test_builtin_providers_register_idempotently() -> None:
 def test_cuda_provider_lazily_returns_platform_modules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gpu_runner = object()
+    envs = ModuleType("vllm.envs")
+    setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+    monkeypatch.setitem(sys.modules, "vllm.envs", envs)
+    from vllm_gr.platforms.cuda import runner
+
     gpu_attention = object()
     imported: list[str] = []
 
     def import_module(name: str) -> object:
         imported.append(name)
         return {
-            "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch": gpu_runner,
             "vllm_gr.v1.attention.backends.beam_attn_gpu": gpu_attention,
         }[name]
 
     monkeypatch.setattr(cuda, "import_module", import_module)
 
-    assert cuda.CUDA_BACKEND.get_model_runner_hooks() is gpu_runner
+    assert cuda.CUDA_BACKEND.get_model_runner_hooks() is runner
     assert cuda.CUDA_BACKEND.get_attention_execution() is gpu_attention
     assert imported == [
-        "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
         "vllm_gr.v1.attention.backends.beam_attn_gpu",
     ]
 

@@ -103,7 +103,9 @@ def test_cuda_dispatch_requires_explicit_hooks(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.l1  # type: ignore[misc]
 def test_v1_installer_binds_execution_and_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr.platforms.cuda import provider as cuda
     from vllm_gr.v1.worker import gr_startup, model_runner_patch
+    from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
 
     class Runner:
         device = "cuda"
@@ -119,21 +121,13 @@ def test_v1_installer_binds_execution_and_capture(monkeypatch: pytest.MonkeyPatc
         def capture_model(self) -> str:
             return "native capture"
 
-    platform = model_runner_patch._GPU_PATCH_MODULE
-    monkeypatch.setattr(model_runner_patch, "_active_platform_module_name", lambda: platform)
-    monkeypatch.setattr(model_runner_patch, "_active_runner_module_name", lambda: platform)
-    monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
-    monkeypatch.setattr(model_runner_patch, "_install_numpy_token_staging", lambda: None)
-    monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
+    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: gpu_model_runner_patch)
+    monkeypatch.setattr(gpu_model_runner_patch, "capture_prefill_graphs", lambda _: None)
+    monkeypatch.setattr(cuda, "install_worker_hooks", lambda: None)
     monkeypatch.setattr(
-        model_runner_patch,
-        "_get_active_platform_module",
-        lambda: SimpleNamespace(
-            discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
-            make_patched_prepare_inputs=lambda original: original,
-            capture_beam_decode_graph=_unexpected_native,
-        ),
+        gpu_model_runner_patch, "discover_worker_runners", lambda: (("GPU", Runner),)
     )
+    monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
     capture = Mock()
     get_owner = Mock(return_value=SimpleNamespace(execute=Mock(return_value="stage")))
     monkeypatch.setattr(gr_startup, "capture_async_forward", capture)

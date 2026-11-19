@@ -9,7 +9,7 @@ import os
 from functools import cache
 
 from .errors import InvalidBackendProviderError
-from .protocol import GRBackendProvider
+from .interface import GRBackendProvider
 
 logger = logging.getLogger("vllm_gr.platforms.compat")
 

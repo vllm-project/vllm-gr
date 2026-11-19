@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import json
-import pickle
+import multiprocessing
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from typing import Any
@@ -60,7 +60,7 @@ class Service:
 class Provider:
     backend_id = "test-backend"
     api_version = 2
-    plan_api_version = 1
+    plan_api_version: int | None = 1
     adapter_revision = "test-adapter-v1"
 
     def __init__(self) -> None:
@@ -107,7 +107,7 @@ def config(width: int = 16) -> Any:
     return native
 
 
-@pytest.fixture
+@pytest.fixture  # type: ignore[misc]
 def provider(monkeypatch: pytest.MonkeyPatch) -> Provider:
     selected = Provider()
     monkeypatch.setattr(loader, "activate_current_backend", lambda: selected)
@@ -115,18 +115,17 @@ def provider(monkeypatch: pytest.MonkeyPatch) -> Provider:
 
 
 def test_canonical_encoding_is_deeply_immutable_and_order_independent() -> None:
-    source = {"options": {"tiles": [32, 64]}, "name": "external"}
-    value = PlanData(source)
-    source["options"]["tiles"].append(128)
+    options = {"tiles": [32, 64]}
+    value = PlanData({"options": options, "name": "external"})
+    options["tiles"].append(128)
     decoded = value.to_dict()
     decoded["options"]["tiles"].append(256)
     assert value == PlanData({"name": "external", "options": {"tiles": [32, 64]}})
-    assert pickle.loads(pickle.dumps(value)) == value
     with pytest.raises(FrozenInstanceError):
-        value.canonical_json = "{}"  # type: ignore[misc]
+        setattr(value, "canonical_json", "{}")
 
 
-@pytest.mark.parametrize(
+@pytest.mark.parametrize(  # type: ignore[misc]
     "value", [object(), {1: "key"}, {"set": {1, 2}}, {"n": float("nan")}, {"n": float("inf")}]
 )
 def test_rejects_nonportable_values(value: Any) -> None:
@@ -142,8 +141,30 @@ def test_wire_round_trip_and_repeated_admission_preserve_config(provider: Provid
     assert plan == admit_backend_plan(native)
     assert parse_gr_config(native) == original
     assert BackendPlan.from_wire(json.loads(json.dumps(plan.to_wire()))) == plan
-    assert pickle.loads(pickle.dumps(plan)) == plan
     assert len(plan.fingerprint) == 64
+
+
+def test_spawn_round_trip_preserves_plan_and_data(provider: Provider) -> None:
+    plan = admit_backend_plan(config())
+    assert plan is not None
+    data = PlanData({"options": {"tiles": [32, 64]}, "name": "external"})
+    payload = (data, plan)
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    with receiver, sender:
+        process = context.Process(target=sender.send, args=(payload,))
+        process.start()
+        sender.close()
+        try:
+            assert receiver.poll(30), "Spawned worker did not return the backend plan"
+            assert receiver.recv() == payload
+            process.join(timeout=30)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join()
+            process.close()
 
 
 def test_service_requirements_extend_existing_wire_plans() -> None:
@@ -199,7 +220,7 @@ def test_explicit_service_ids_bind_and_reject_matching_but_wrong_worker_reports(
     assert len(provider.created) == 3 and all(service.closed for service in provider.created)
 
 
-@pytest.mark.parametrize("service", ["attention", "stage", "graph"])
+@pytest.mark.parametrize("service", ["attention", "stage", "graph"])  # type: ignore[misc]
 def test_unmet_pinned_requirement_rolls_back_binding(
     provider: Provider, monkeypatch: pytest.MonkeyPatch, service: str
 ) -> None:
@@ -246,7 +267,7 @@ def test_canonical_table_reports_its_identity_and_keeps_its_native_owner(
     assert not table.closed and runner.constraint_backend is table
 
 
-@pytest.mark.parametrize(
+@pytest.mark.parametrize(  # type: ignore[misc]
     "field,value", [("schema_version", 2), ("schema_version", True), ("plan_api_version", 2)]
 )
 def test_wire_rejects_unsupported_schema(provider: Provider, field: str, value: Any) -> None:
@@ -299,8 +320,7 @@ def test_two_engines_bind_their_own_plan_runner_and_device(provider: Provider) -
 def test_worker_configuration_drift_fails_before_any_factory(provider: Provider) -> None:
     native = config()
     admit_backend_plan(native)
-    native.additional_config["vllm_gr_beam_max_width"] = 32
-    native._vllm_gr_parsed_config = None
+    GRConfig(beam_max_width=32).write_to_vllm_config(native)
     with pytest.raises(RuntimeError, match="plan mismatch"):
         bind_backend_services(SimpleNamespace(vllm_config=native, device="test:0"))
     assert provider.created == []
@@ -340,7 +360,7 @@ def test_partial_factory_failure_releases_already_created_services(
     assert getattr(runner, "_gr_backend_binding", None) is None
 
 
-@pytest.mark.parametrize(
+@pytest.mark.parametrize(  # type: ignore[misc]
     "fault", ["missing", "count", "not-ready", "fingerprint", "implementation"]
 )
 def test_readiness_requires_every_worker_to_agree(provider: Provider, fault: str) -> None:
@@ -381,7 +401,7 @@ def test_failed_engine_gate_shuts_down_executor(provider: Provider) -> None:
     assert not hasattr(engine, "_gr_backend_fingerprint")
 
 
-@pytest.mark.parametrize("failure", [None, "local", "remote", "plan-drift"])
+@pytest.mark.parametrize("failure", [None, "local", "remote", "plan-drift"])  # type: ignore[misc]
 def test_external_launcher_readiness_gathers_each_rank(
     provider: Provider, monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
@@ -403,7 +423,7 @@ def test_external_launcher_readiness_gathers_each_rank(
     group = object()
     received = []
 
-    def gather(reports: list, local: dict, **kwargs: Any) -> None:
+    def gather(reports: list[dict[str, Any]], local: dict[str, Any], **kwargs: Any) -> None:
         assert kwargs["group"] is group
         received.append(local)
         reports[:] = [local, remote]
@@ -436,7 +456,7 @@ def test_external_launcher_readiness_gathers_each_rank(
     assert received[0]["ready"] is (failure != "local")
 
 
-@pytest.mark.parametrize("service", ["runner", "attention", "constraint"])
+@pytest.mark.parametrize("service", ["runner", "attention", "constraint"])  # type: ignore[misc]
 def test_readiness_rejects_missing_required_service(provider: Provider, service: str) -> None:
     native = config()
     plan = admit_backend_plan(native)
@@ -508,7 +528,7 @@ def test_unknown_reserved_key_still_fails_and_invalid_plan_is_not_ignored() -> N
     with pytest.raises(ValueError, match="envelope"):
         read_backend_plan(native)
     native.additional_config["vllm_gr_backend_typo"] = 1
-    with pytest.raises(ValueError, match="unknown"):
+    with pytest.raises(ValueError, match="Removed vLLM-GR"):
         parse_gr_config(native)
 
 

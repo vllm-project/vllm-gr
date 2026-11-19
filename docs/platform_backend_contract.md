@@ -14,9 +14,9 @@ runtime compatibility patches, and the constrained TopK execution factory.
 GR EngineArgs also publishes an immutable backend plan. Model load binds its
 services to the native runner, and EngineCore checks every worker's readiness
 before its constructor returns. See [Engine plans](#engine-plans-and-service-binding).
-The worker and attention dispatchers still select their implementations
-directly; the two provider getters describe available modules but do not
-replace those dispatchers.
+The active provider supplies the process hooks for the native ModelRunner.
+Planned runners dispatch through their own adapter. Beam Attention continues
+to select its execution module in the attention backend.
 
 ## Lifecycle and process model
 
@@ -75,9 +75,7 @@ is idempotent; switching to another provider is an error. Backend IDs are not
 aliased by the registry. In particular, `gpu` does not mean `cuda`, and the
 built-in Ascend provider's ID is `ascend`, not the `npu` tensor device type.
 
-An unknown backend is always an error in the registry APIs and never falls
-back to CUDA. This registry guarantee does not describe every independent
-worker or attention dispatch branch.
+An unsupported platform fails provider selection before worker hook discovery.
 
 ## Engine plans and service binding
 
@@ -93,8 +91,7 @@ copied into immutable canonical data; decoded views cannot mutate the plan.
 EngineArgs writes the envelope to
 `additional_config["vllm_gr_backend_plan"]` after normalizing configuration.
 The ordinary native configuration transport carries this JSON/pickle-safe
-data to workers. Canonical and legacy GR parsing both reserve this key; it is
-not a legacy option and does not create a canonical/legacy conflict. Backend
+data to workers. The canonical GR parser preserves this key alongside the serialized GR settings. Backend
 options use the separate `vllm_gr_backend_options` object. The provider validates
 its own option schema. Built-ins currently retain their typed `GRConfig`
 options and reject additional options; an external provider can add its own
@@ -148,10 +145,16 @@ with the existing process-global attention mode requires a separate process.
 
 The runner owns `BackendBinding`. Binding verifies the received plan against
 local configuration and runtime versions, runs provider capability validation,
-then constructs required services. After model load, the readiness RPC reports
-the bound services and their admitted plan. Native KV-cache profiling can
-adjust the maximum model length before this RPC. Partial construction releases services
-already created. Reload/shutdown detach the binding, release owned services,
+then constructs required services. Native model loading or KV-cache profiling
+can reduce `max_model_len` before the first binding or a later full reload.
+Worker comparison retains the admitted positive length for a positive runtime
+length no larger than that limit. The live configuration keeps its fitted
+length, which provider capability validation receives with the native runner.
+Length increases, invalid lengths, and changes to other configuration or
+compatibility fields still fail comparison before any service factory runs.
+After model load, the readiness RPC reports the bound services and their
+original admitted plan. Partial construction releases services already
+created. Reload/shutdown detach the binding, release owned services,
 and clear the legacy execution alias. Stateless module bindings do not close
 process-wide modules. Canonical constraint artifacts retain their current
 loader and lifecycle owner; readiness requires successful load before binding.
@@ -164,12 +167,8 @@ request acceptance. With vLLM's external launcher, each executor owns one
 worker. The engines gather those local reports using the native world
 CPU group so every participating rank verifies the same result.
 
-This is the plan/binding migration for RFC #706, following #748. Actual native
-Runner dispatch (#711), stage/operator routing (#712), attention admissibility
-and per-layer ownership (#713), constraint identity migration (#714), and
-graph/resource integration (#715) remain separate changes. The compatibility
-bindings preserve those current implementations; they do not claim those
-later migrations are complete.
+Stage and operator routing, attention admissibility, constraint identity and
+graph resource ownership have separate implementation slices in RFC #706.
 
 Host-only contract coverage can run without Torch or vLLM:
 
@@ -239,7 +238,7 @@ class GRBackendProvider(Protocol):
         force: bool = False,
     ) -> int: ...
 
-    def get_model_runner_hooks(self) -> ModelRunnerPatchHooks: ...
+    def get_model_runner_hooks(self) -> ModelRunnerInstaller | ModelRunnerPatchHooks: ...
 
     def get_attention_execution(self) -> BeamAttentionExecution: ...
 
@@ -285,7 +284,29 @@ the registration function is explicitly called.
 
 ## ModelRunner patch hooks
 
-V1 platform ModelRunner hook modules must provide:
+The public contract lives in `vllm_gr/platforms/interface.py`. Existing providers
+can still import the original types from `platforms/protocol.py`.
+The worker installer and its startup verifier use the selected provider's
+`get_model_runner_hooks()`. An out-of-tree provider may return a module or
+object implementing the following interface.
+
+```python
+class ModelRunnerInstaller(Protocol):
+    def discover_worker_runners(self) -> tuple[tuple[str, type], ...]: ...
+    def install(self) -> None: ...
+    def is_patched(self, runner_class: type) -> bool: ...
+```
+
+`install()` runs at process startup and must tolerate repeated calls.
+`is_patched()` inspects the live native class. A missing target or incomplete
+installation fails the startup check. Implementations that use the existing
+V1 wrapper factories can keep their original hook contract.
+
+CUDA installs its process hook on `Worker.init_device`. At worker startup vLLM
+has resolved `use_v2_model_runner`, including overrides such as watermarking.
+Before the worker creates its runner, the hook checks that choice against the
+admitted plan, installs the selected class's wrappers, and verifies them.
+Workers in one process can use different generations.
 
 ```python
 class ModelRunnerPatchHooks(Protocol):
@@ -309,9 +330,22 @@ selection. V2 owns its execute wrapper in `cuda/v2/gpu_model_runner_v2_patch.py`
 use shared dispatch in `gr_execution.py`. Installation markers/checks live in
 the hardware-free `model_runner_contracts.py` rather than in V1 adaptation.
 
-The CUDA dispatcher selects MR V1 or MR V2 before installing their respective
-hooks. The provider's V1 hook getter is not a replacement for this selection;
-NPU continues to use its existing runner path.
+The CUDA provider chooses the V1 or V2 hook module at patch installation.
+The Ascend provider supplies its V1 hooks and preserves deferred worker
+initialization. Built-in adapters bind the installed prepare, execute and
+sample entry points to one native runner after model load. The installed
+entry points use that runner's binding, preserving the native return object
+and the separate sampling/completion boundary. Calls during bootstrap or
+on unplanned runners use the installed native path directly. Shutdown and a
+full model reload release the binding through the owning runner.
+
+An external provider using `install_runner_lifecycle()` supplies a plan-bound
+adapter with `prepare_inputs` and `execute_model`, plus `sample_tokens` when
+its native runner exposes that entry point. Each method receives the arguments
+of its corresponding native call. The factory receives the runner instance
+once during binding. The installed-provider regression in
+`tests/platforms/test_external_provider_fixture.py` exercises discovery,
+installation, worker readiness and dispatch for two different engine plans.
 
 ## Beam Attention execution
 
@@ -324,7 +358,7 @@ Platform Attention execution provides:
 - `cascade_attention()`.
 
 The complete call signatures are defined by
-`vllm_gr.platforms.protocol.BeamAttentionExecution`. The current
+`vllm_gr.platforms.interface.BeamAttentionExecution`. The current
 `beam_attn_gpu.py` and `beam_attn_npu.py` modules satisfy the contract directly;
 providers return those modules rather than copying or wrapping their kernels.
 
@@ -395,7 +429,7 @@ registered.
 | `matches()` | `platform_enum == "CUDA"` and `device_type == "cuda"` | `device_type == "npu"` and `vllm_ascend.platform.NPUPlatform` in the lineage |
 | `check_environment()` | Validate current CUDA platform, then `check_runtime_versions()` | `check_ascend_environment(require_npu_platform=True)` |
 | `apply_runtime_patches()` | No early compatibility hooks | NPU spawn protection, then NPUWorker initialization hook; return the summed patch count |
-| `get_model_runner_hooks()` | `cuda/v1/gpu_model_runner_patch` | `npu/npu_model_runner_patch` |
+| `get_model_runner_hooks()` | `cuda/v1/gpu_model_runner_patch` or `cuda/v2/gpu_model_runner_v2_patch` | `npu/npu_model_runner_patch` |
 | `get_attention_execution()` | `beam_attn_gpu` | `beam_attn_npu` |
 | `create_constrained_topk_execution()` | Lazy-loads a fresh `CUDAConstrainedTopKExecution(device=device)` | Lazy-loads a fresh `NPUConstrainedTopKExecution(device=device)` |
 

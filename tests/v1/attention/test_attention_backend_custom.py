@@ -300,3 +300,11 @@ if __name__ == "__main__":
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture(autouse=True)
+def _isolate_backend_plan_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise configuration policy independently of a native backend install."""
+    from vllm_gr.platforms import planning
+
+    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)

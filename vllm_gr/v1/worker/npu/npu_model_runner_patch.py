@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from functools import wraps
 from time import perf_counter
@@ -27,6 +28,7 @@ from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
+    is_worker_runner_patched,
 )
 from vllm_gr.v1.worker.npu.npu_model_runner_inputs import (
     InputBatchProxy,
@@ -1118,3 +1120,21 @@ def capture_prefill_graphs(runner) -> None:
 
 
 make_patched_model_forward = make_patched_model_forward_npu
+
+
+def is_patched(runner_class: type) -> bool:
+    from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle
+
+    return is_worker_runner_patched(runner_class) and has_runner_lifecycle(runner_class, __name__)
+
+
+def install() -> None:
+    """Install the Ascend runner after its native worker initializes device ops."""
+    from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
+    from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
+
+    install_v1_worker_hooks(
+        sys.modules[__name__],
+        constraint_max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
+        implementation_id=__name__,
+    )

@@ -8,7 +8,7 @@ from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 from .errors import BackendNotActiveError, UnsupportedBackendError
-from .protocol import ConfigProvider
+from .interface import ConfigProvider
 from .registry import get_active_backend
 
 if TYPE_CHECKING:

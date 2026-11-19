@@ -105,7 +105,7 @@ class _ForwardCase:
 
 @pytest.fixture
 def backend(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    return cast(ModuleType, load_backend(monkeypatch))
+    return load_backend(monkeypatch)
 
 
 @pytest.fixture

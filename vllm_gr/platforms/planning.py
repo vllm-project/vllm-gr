@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from enum import Enum
 from importlib import metadata
 from typing import Any
@@ -141,6 +141,32 @@ def resolve_backend_plan(provider: Any, request: BackendRequest) -> BackendPlan:
     ):
         raise ValueError("Backend resolve() changed request or provider identity")
     return plan
+
+
+def normalize_worker_backend_request(
+    config: Any, provider: Any, admitted_plan: BackendPlan
+) -> BackendRequest:
+    """Compare admission inputs while allowing native model-length autofit."""
+    request = normalize_backend_request(config, provider)
+    native = request.native.to_dict()
+    model = native["model_config"]
+    admitted_model = admitted_plan.request.native.to_dict().get("model_config", {})
+    admitted_length = (
+        admitted_model.get("max_model_len") if isinstance(admitted_model, Mapping) else None
+    )
+    actual_length = model["max_model_len"]
+    if (
+        type(admitted_length) is int
+        and type(actual_length) is int
+        and 0 < actual_length <= admitted_length
+    ):
+        # The plan retains the admitted limit; native load/profiling may fit a
+        # smaller runtime allocation before first bind or a later full reload.
+        # Do not overwrite the live config: validate_worker sees its actual size.
+        # Increases, invalid lengths and every other input remain fingerprinted.
+        model["max_model_len"] = admitted_length
+        request = replace(request, native=PlanData(native))
+    return request
 
 
 def admit_backend_plan(config: Any) -> BackendPlan | None:

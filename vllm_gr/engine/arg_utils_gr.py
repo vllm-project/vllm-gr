@@ -184,8 +184,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         overrides,
         startup_document=getattr(self, "_gr_startup_document", None),
         worker_decision_default=_beam_worker_decision_default(
-            service,
-            beam_width_configured=True, worker_decision=None
+            service, beam_width_configured=True, worker_decision=None
         ),
     )
     attention = getattr(config, "attention_config", None)

@@ -66,7 +66,7 @@ def test_identity_is_immutable_and_hashable() -> None:
     identity = platform_identity(_VendorPlatform())
 
     with pytest.raises(AttributeError):
-        identity.device_type = "cuda"  # type: ignore[misc]
+        setattr(identity, "device_type", "cuda")
     assert hash(identity)
 
 

@@ -832,3 +832,11 @@ def test_fused_suffix_uses_the_fa2_emulating_kernel_for_every_prefix_backend(
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture(autouse=True)
+def _isolate_backend_plan_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise configuration policy independently of a native backend install."""
+    from vllm_gr.platforms import planning
+
+    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)

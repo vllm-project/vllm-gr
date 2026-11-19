@@ -237,7 +237,7 @@ def test_model_runner_verifier_checks_shared_discovery_set(
     )
     monkeypatch.setattr(
         model_runner_patch,
-        "is_worker_runner_patched",
+        "is_active_worker_runner_patched",
         lambda runner: runner is PatchedRunner,
     )
 

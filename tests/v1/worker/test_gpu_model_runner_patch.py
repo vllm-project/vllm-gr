@@ -470,19 +470,16 @@ def test_worker_graph_stats_hook_is_named_and_idempotent(
 ) -> None:
     import vllm.v1.worker.gpu_worker as gpu_worker
 
-    import vllm_gr.v1.worker.model_runner_patch as dispatcher
+    from vllm_gr.platforms.cuda import provider as cuda
 
     class FakeWorker:
         pass
 
     monkeypatch.setattr(gpu_worker, "Worker", FakeWorker)
-    monkeypatch.setattr(
-        dispatcher, "_active_platform_module_name", lambda: dispatcher._GPU_PATCH_MODULE
-    )
 
-    dispatcher._install_active_worker_resource_hook()
+    cuda.install_worker_utilities()
     first = getattr(FakeWorker, "get_gr_beam_graph_runtime_stats")
-    dispatcher._install_active_worker_resource_hook()
+    cuda.install_worker_utilities()
 
     assert first is _gr_context.get_beam_graph_runtime_stats
     assert getattr(FakeWorker, "get_gr_beam_graph_runtime_stats") is first

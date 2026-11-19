@@ -8,9 +8,12 @@ import logging
 import os
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .plan import PLAN_API_VERSION, BackendPlan, BackendRequest, PlanData
+
+if TYPE_CHECKING:
+    from .interface import ModelRunnerAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -71,16 +74,18 @@ def require_provider_plan(provider: Any, plan: BackendPlan) -> None:
 
 
 class BuiltinPlanSupport:
-    """Temporary module delegation while lifecycle consumers migrate."""
+    """Bind a native runner and its admitted attention implementation."""
 
     plan_api_version = PLAN_API_VERSION
-    adapter_revision = "plan-bindings-v1"
+    adapter_revision = "native-runner-v1"
 
-    def create_model_runner_adapter(self, *, plan: BackendPlan, native_runner: Any) -> BoundService:
+    def create_model_runner_adapter(
+        self, *, plan: BackendPlan, native_runner: Any
+    ) -> ModelRunnerAdapter:
+        from vllm_gr.v1.worker.runner_lifecycle import bind_native_runner
+
         require_provider_plan(self, plan)
-        return BoundService(
-            plan, import_module(plan.choices.to_dict()["runner"]), native_runner=native_runner
-        )
+        return bind_native_runner(plan, native_runner)
 
     def create_attention_executor(self, *, plan: BackendPlan, device: Any) -> BoundService:
         require_provider_plan(self, plan)
@@ -93,12 +98,6 @@ class BuiltinPlanSupport:
 
     def validate_worker(self, *, plan: BackendPlan, native_runner: Any) -> None:
         require_provider_plan(self, plan)
-        from vllm_gr.v1.worker.model_runner_patch import _active_runner_module_name
-
-        if _active_runner_module_name() != plan.choices.to_dict()["runner"]:
-            raise RuntimeError(
-                "Worker native runner selection differs from the admitted backend plan"
-            )
         # Keep the existing device and execution validators as the capability
         # authority until their owning adapter migrations. No second policy.
         if plan.request.config.to_dict()["beam_execution_mode"] == "v1":
@@ -145,11 +144,22 @@ class LegacyPlanningProvider:
         require_provider_plan(self.provider, plan)
         self.provider.check_environment()
 
-    def create_model_runner_adapter(self, *, plan: BackendPlan, native_runner: Any) -> BoundService:
+    def create_model_runner_adapter(self, *, plan: BackendPlan, native_runner: Any) -> Any:
         require_provider_plan(self.provider, plan)
-        return BoundService(
-            plan, self.provider.get_model_runner_hooks(), native_runner=native_runner
-        )
+        hooks = self.provider.get_model_runner_hooks()
+        installed = getattr(type(native_runner), "_gr_runner_implementation_id", None)
+        if installed is not None:
+            from vllm_gr.v1.worker.runner_lifecycle import bind_native_runner
+
+            # Legacy plans delegate to an existing module, without admitting
+            # a new implementation choice on the provider's behalf.
+            verify = getattr(hooks, "is_patched", None)
+            if getattr(hooks, "__name__", None) != installed and not (
+                callable(verify) and verify(type(native_runner))
+            ):
+                raise RuntimeError("Legacy runner hooks differ from the installed native runner")
+            return bind_native_runner(plan, native_runner, implementation_id=installed)
+        return BoundService(plan, hooks, native_runner=native_runner)
 
     def create_attention_executor(self, *, plan: BackendPlan, device: Any) -> BoundService:
         require_provider_plan(self.provider, plan)

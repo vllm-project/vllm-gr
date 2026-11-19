@@ -764,7 +764,7 @@ class BeamAttentionBackend(AttentionBackend):
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
         # Preserve the Ascend-compatible block size that
-        # _apply_npu_default_block_size pins onto the running config (128).
+        # the Ascend provider applies to the running config (128).
         # vLLM 0.30's platform hook otherwise resolves an unspecified size back
         # to a 16-multiple geometry that the Ascend kernels and prefix-caching
         # block tables cannot represent.

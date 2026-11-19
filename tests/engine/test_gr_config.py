@@ -22,6 +22,7 @@ from vllm_gr.config import (
     gr_config_to_mapping,
     resolve_candidate_width,
 )
+from vllm_gr.platforms.legacy import legacy_config_service
 
 ATTENTION_BACKEND_KEY = "vllm_gr_attention_backend"
 CATALOG_PATH_KEY = "vllm_gr_catalog_path"
@@ -102,7 +103,7 @@ def test_parse_preserves_opaque_additional_config() -> None:
 
 def test_write_rejects_opaque_additional_config_when_gr_values_are_stored() -> None:
     with pytest.raises(ValueError, match="must be a mutable mapping"):
-        GRConfig(catalog_path="/models/catalog.json").write_to_vllm_config(
+        GRConfig(catalog_path=str(Path("/models/catalog.json").resolve())).write_to_vllm_config(
             _vllm_config(_OpaqueAdditionalConfig())
         )
 
@@ -264,7 +265,7 @@ def test_candidate_width_follows_the_beam_width_until_it_cannot() -> None:
     table = ConstraintTableSpec(
         max_top_k=MAX_CANDIDATE_WIDTH,
         enabled=True,
-        path="/tmp/catalog.json",
+        path=str(Path("/tmp/catalog.json").resolve()),
         artifact_digest="sha256:" + "0" * 64,
         tokenizer_digest="sha256:" + "0" * 64,
     )
@@ -295,7 +296,7 @@ def test_candidate_width_follows_the_beam_width_until_it_cannot() -> None:
         ConstraintTableSpec(
             max_top_k=MAX_CANDIDATE_WIDTH,
             enabled=False,
-            path="/tmp/catalog.json",
+            path=str(Path("/tmp/catalog.json").resolve()),
             artifact_digest="sha256:" + "0" * 64,
             tokenizer_digest="sha256:" + "0" * 64,
         ),
@@ -317,7 +318,7 @@ def test_wide_beam_is_servable_once_the_candidate_width_is_stated() -> None:
     table = ConstraintTableSpec(
         max_top_k=MAX_CANDIDATE_WIDTH,
         enabled=True,
-        path="/tmp/catalog.json",
+        path=str(Path("/tmp/catalog.json").resolve()),
         artifact_digest="sha256:" + "0" * 64,
         tokenizer_digest="sha256:" + "0" * 64,
         candidate_width=MAX_CANDIDATE_WIDTH,
@@ -340,7 +341,7 @@ def test_explicit_candidate_width_may_differ_from_the_beam_width(
     table = ConstraintTableSpec(
         max_top_k=MAX_CANDIDATE_WIDTH,
         enabled=True,
-        path="/tmp/catalog.json",
+        path=str(Path("/tmp/catalog.json").resolve()),
         artifact_digest="sha256:" + "0" * 64,
         tokenizer_digest="sha256:" + "0" * 64,
     )
@@ -410,8 +411,8 @@ def test_npu_beam_without_catalog_stays_unconstrained(tmp_path: Path) -> None:
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
-            return_value=True,
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("npu"),
         ),
     ):
         result = create_engine_config(
@@ -436,8 +437,10 @@ def test_cuda_beam_enables_worker_decision_by_default(tmp_path: Path) -> None:
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
             return_value=_vllm_config(),
         ),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=True),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("cuda"),
+        ),
     ):
         result = create_engine_config(engine_args)
 
@@ -471,9 +474,9 @@ def test_engine_config_preserves_explicit_decision_controls(
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config", return_value=vllm_config
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=platform == "cuda"
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service(platform),
         ),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=platform == "npu"),
     ):
         result = GRConfig.from_vllm_config(create_engine_config(engine_args))
     expected_worker = worker_decision
@@ -504,3 +507,11 @@ def test_engine_config_merge_keeps_npu_execution_choice(
     assert result.npu_decode_execution is execution
     assert result.beam_graph_batch_size == 4
     assert result.beam_max_width == 32
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _isolate_backend_plan_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise configuration policy independently of a native backend install."""
+    from vllm_gr.platforms import planning
+
+    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)

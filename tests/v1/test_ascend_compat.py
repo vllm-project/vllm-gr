@@ -464,6 +464,14 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
     from copy import deepcopy
 
     from vllm_gr.config.parser import parse_gr_config
+    from vllm_gr.platforms.plan import (
+        BACKEND_PLAN_KEY,
+        BackendPlan,
+        BackendRequest,
+        PlanData,
+        read_backend_plan,
+    )
+    from vllm_gr.platforms.planning import BACKEND_OPTIONS_KEY
 
     seen: list[Any] = []
 
@@ -474,9 +482,16 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
 
     initialize_filtered, _ = _install_fake_ascend_config(monkeypatch, initialize)
     configs = []
+    empty = PlanData({})
     for width in (4, 8):
-        additional: dict[str, Any] = {"refresh": True}
-        additional["vllm_gr"] = {"gr": {"beam_width": [width] * 3, "candidate_width": [width] * 3}}
+        request = BackendRequest(PlanData({"beam_max_width": width}), empty, empty, empty)
+        plan = BackendPlan("ascend", 2, request, empty)
+        additional = {
+            "refresh": True,
+            "vllm_gr": {"gr": {"beam_width": [width] * 3, "candidate_width": [width] * 3}},
+            BACKEND_PLAN_KEY: plan.to_wire(),
+            BACKEND_OPTIONS_KEY: {"test_option": width},
+        }
         config = SimpleNamespace(additional_config=additional)
         before = deepcopy(additional)
         expected = parse_gr_config(config)
@@ -485,6 +500,7 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
         assert config.additional_config is additional
         assert additional == before
         assert parse_gr_config(config) == expected
+        assert read_backend_plan(config) == plan
         assert parse_gr_config(deepcopy(config)) == expected
         configs.append(config)
 

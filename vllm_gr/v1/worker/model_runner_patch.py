@@ -6,13 +6,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
-from importlib import import_module
-from types import ModuleType
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 
 from vllm_gr.config import ConstraintMode, ConstraintTableBackendEnum
+from vllm_gr.platforms.interface import ModelRunnerInstaller, ModelRunnerPatchHooks
 from vllm_gr.v1.worker.gr_context import (
     _get_gr_config,
     get_beam_graph_runtime_stats,
@@ -34,9 +33,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_GPU_PATCH_MODULE = "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch"
-_NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu.npu_model_runner_patch"
-_V2_GPU_PATCH_MODULE = "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch"
 _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 
 
@@ -233,9 +229,7 @@ def make_load_model_with_constraint_backend(
             raise
 
     setattr(load_model_with_constraint_backend, _CONSTRAINT_LOAD_PATCH_MARKER, True)
-    from vllm_gr.platforms.binding import bind_after_model_load
-
-    return bind_after_model_load(load_model_with_constraint_backend)
+    return load_model_with_constraint_backend
 
 
 def make_shutdown_with_constraint_backend(
@@ -273,41 +267,28 @@ def make_shutdown_with_constraint_backend(
     return shutdown_with_constraint_backend
 
 
-def _active_platform_module_name() -> str:
-    """Return the patch module for the platform selected by vLLM."""
-    from vllm.platforms import current_platform
+def get_runner_hooks() -> ModelRunnerInstaller | ModelRunnerPatchHooks:
+    """Use the process-local provider, also for a fresh EngineCore child."""
+    from vllm_gr.platforms.errors import BackendNotActiveError
+    from vllm_gr.platforms.loader import activate_current_backend
+    from vllm_gr.platforms.registry import get_active_backend
 
-    if str(current_platform.device_type).lower() == "npu":
-        return _NPU_PATCH_MODULE
-    return _GPU_PATCH_MODULE
-
-
-def _active_runner_module_name() -> str:
-    """Select the platform first; only CUDA can opt into the V2 patches."""
-    from vllm.platforms import current_platform
-
-    platform_module = _active_platform_module_name()
-    if str(current_platform.device_type).lower() == "cuda" and _use_v2_model_runner():
-        return _V2_GPU_PATCH_MODULE
-    return platform_module
-
-
-def _use_v2_model_runner() -> bool:
-    """Read the V2 opt-in at patch installation, never during execution."""
-    from vllm.envs import VLLM_USE_V2_MODEL_RUNNER
-
-    return bool(VLLM_USE_V2_MODEL_RUNNER)
-
-
-def _get_active_platform_module() -> ModuleType:
-    return import_module(_active_runner_module_name())
+    try:
+        backend = get_active_backend()
+    except BackendNotActiveError:
+        backend = activate_current_backend()
+    return backend.get_model_runner_hooks()
 
 
 def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
-    """Discover ModelRunner targets for only the active platform."""
-    return cast(
-        tuple[tuple[str, type], ...], _get_active_platform_module().discover_worker_runners()
-    )
+    return cast(tuple[tuple[str, type], ...], get_runner_hooks().discover_worker_runners())
+
+
+def is_active_worker_runner_patched(runner_class: type) -> bool:
+    hooks = get_runner_hooks()
+    if isinstance(hooks, ModelRunnerInstaller):
+        return bool(hooks.is_patched(runner_class))
+    return is_worker_runner_patched(runner_class)
 
 
 def install_worker_utility_hooks(worker_cls: type) -> None:
@@ -323,88 +304,42 @@ def install_worker_utility_hooks(worker_cls: type) -> None:
         setattr(worker_cls, _BEAM_GRAPH_STATS_HOOK_MARKER, True)
 
 
-def _install_active_worker_resource_hook() -> None:
-    """Mount named vllm-gr utility RPCs on the active CUDA Worker class."""
-
-    if _active_platform_module_name() != _GPU_PATCH_MODULE:
-        # NPUWorker installs this hook from its delayed init_device wrapper in
-        # ascend_compat, after vllm-ascend has finished resolving its class.
-        return
-    from vllm.v1.worker.gpu_worker import Worker
-
-    install_worker_utility_hooks(Worker)
-
-
-def _install_numpy_token_staging() -> None:
-    """Bulk NumPy token staging is shared by the V1 and V2 GPU runners.
-
-    ``StagedWriteTensor.stage_write`` and ``async_tensor_h2d`` are the same
-    objects on both runners, so the patch is runner-agnostic; installing it
-    from the common entry point gives V1 the bulk ``np.copyto`` path too.
-    NPU workers stage tokens through their own adapter.
-    """
-    if _active_platform_module_name() != _GPU_PATCH_MODULE:
-        return
-    from vllm_gr.v1.worker.cuda.numpy_staging import install_numpy_staging
-
-    install_numpy_staging()
-
-
 def apply_worker_patches() -> None:
-    """Install grouped-Beam hooks on active-platform ModelRunner targets."""
+    """Install the shared async guard and the selected provider's runner hooks."""
     from vllm_gr.v1.worker.gr_async_output import install_async_output_guard
 
     install_async_output_guard()
-    logger.info("vllm-gr: apply_worker_patches called")
-    # collective_rpc targets the Worker, not its ModelRunner.  Install this
-    # even when all runner hooks were already present (idempotent) so canonical
-    # Constraint Tables can be injected in both uniproc and multiproc engines.
-    _install_active_worker_resource_hook()
-    # Runner-agnostic: V1 and V2 both write prompt tokens through the same
-    # StagedWriteTensor, so install the NumPy staging patch before dispatch.
-    _install_numpy_token_staging()
+    hooks = get_runner_hooks()
+    if isinstance(hooks, ModelRunnerInstaller):
+        hooks.install()
+    else:
+        # Existing providers can continue to supply V1 wrapper factories.
+        install_v1_worker_hooks(hooks)
 
-    if _active_runner_module_name() == _V2_GPU_PATCH_MODULE:
-        # V2 runner exposes ``prepare_inputs``/``sample``/``sample_tokens`` and
-        # no ``_prepare_inputs``/``_bookkeeping_sync``; the V1 body below does
-        # unguarded attribute access that V2 lacks, so dispatch to the
-        # V2-specific installer instead.
-        from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
 
-        v2._apply_v2_runner_patches()
-        return
-
+def install_v1_worker_hooks(
+    platform_module: Any,
+    *,
+    cuda_hooks_type: CudaStageHooksType | None = None,
+    workspace_load_patcher: Callable[..., Any] | None = None,
+    constraint_max_batch: int = 1,
+    implementation_id: str | None = None,
+) -> None:
+    """Apply the V1 wrapper factories to the native classes supplied by a provider."""
     from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
 
-    platform_module = _get_active_platform_module()
-    # Bind both execution and startup to the installed runner, not a dispatch-time flag.
-    cuda_hooks_type: CudaStageHooksType | None = None
-    workspace_load_patcher = getattr(
-        platform_module, "make_load_model_with_beam_postprocess_workspace", None
-    )
-    if _active_platform_module_name() == _GPU_PATCH_MODULE:
-        from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
-            make_load_model_with_beam_postprocess_workspace,
+    if workspace_load_patcher is None:
+        workspace_load_patcher = getattr(
+            platform_module, "make_load_model_with_beam_postprocess_workspace", None
         )
-        from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+    from vllm_gr.platforms.binding import bind_after_model_load
+    from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
-        cuda_hooks_type = CudaStageHooksV1
-        workspace_load_patcher = make_load_model_with_beam_postprocess_workspace
-    constraint_max_batch = 1
-    if _active_platform_module_name() == _NPU_PATCH_MODULE:
-        from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
-
-        # A Decode stage contains B*W rows. Let the canonical NPU Backend
-        # process the supported logical batch in one call instead of W-row
-        # chunks; the GPU V1 row bound stays unchanged.
-        constraint_max_batch = max(SUPPORTED_BEAM_BATCH_SIZES)
-    runners_to_patch = [
-        (runner_name, runner_class)
-        for runner_name, runner_class in platform_module.discover_worker_runners()
-        if not is_worker_runner_patched(runner_class)
-    ]
-
-    for runner_name, runner_class in runners_to_patch:
+    for runner_name, runner_class in platform_module.discover_worker_runners():
+        if is_worker_runner_patched(runner_class):
+            if implementation_id is not None:
+                install_runner_lifecycle(runner_class, implementation_id, prepare="_prepare_inputs")
+            continue
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
             runner_class.load_model = make_load_model_with_constraint_backend(
@@ -549,5 +484,9 @@ def apply_worker_patches() -> None:
                     runner_class._determine_batch_execution_and_padding
                 )
 
+        if callable(getattr(runner_class, "load_model", None)):
+            runner_class.load_model = bind_after_model_load(runner_class.load_model)
+        if implementation_id is not None:
+            install_runner_lifecycle(runner_class, implementation_id, prepare="_prepare_inputs")
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)

@@ -9,12 +9,12 @@ from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from ..identity import PlatformIdentity
-from ..plan import BackendPlan, BackendRequest, PlanData
-from ..protocol import (
+from ..interface import (
     PROVIDER_API_VERSION,
     BeamAttentionExecution,
-    ModelRunnerPatchHooks,
+    ModelRunnerInstaller,
 )
+from ..plan import BackendPlan, BackendRequest, PlanData
 from ..services import BoundService, BuiltinPlanSupport, require_provider_plan
 
 if TYPE_CHECKING:
@@ -132,9 +132,9 @@ class NPUBackendProvider(BuiltinPlanSupport):
         worker_count = ascend_compat.patch_npu_worker_init_device()
         return spawn_count + worker_count
 
-    def get_model_runner_hooks(self) -> ModelRunnerPatchHooks:
+    def get_model_runner_hooks(self) -> ModelRunnerInstaller:
         return cast(
-            ModelRunnerPatchHooks,
+            ModelRunnerInstaller,
             import_module("vllm_gr.v1.worker.npu.npu_model_runner_patch"),
         )
 

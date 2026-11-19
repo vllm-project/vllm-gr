@@ -346,7 +346,7 @@ def _validate_scheduler_patch() -> str | None:
 def _validate_model_runner_patch() -> str | None:
     from vllm_gr.v1.worker.model_runner_patch import (
         discover_active_worker_runners,
-        is_worker_runner_patched,
+        is_active_worker_runner_patched,
     )
 
     runners = discover_active_worker_runners()
@@ -356,7 +356,7 @@ def _validate_model_runner_patch() -> str | None:
     failures = [
         f"{runner_name} beam execution hooks are not installed"
         for runner_name, runner_class in runners
-        if not is_worker_runner_patched(runner_class)
+        if not is_active_worker_runner_patched(runner_class)
     ]
     return "; ".join(failures) or None
 
