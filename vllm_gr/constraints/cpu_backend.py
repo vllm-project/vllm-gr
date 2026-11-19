@@ -169,6 +169,17 @@ class CPUConstraintBackend:
             top_k=metadata.top_k,
         )
 
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Host selection reads the full logits, so nothing is attached."""
+        del runner, parallel_config, vocab_size
+        return 0
+
     def prepare_runner(self, model_config: Any) -> None:
         """Host selection runs eagerly, so no compile-ahead is required."""
         del model_config

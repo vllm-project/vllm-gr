@@ -49,6 +49,23 @@ class _Backend:
         )
         self.close_calls = 0
 
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Delegate to the real Ascend integration so the test tracks production."""
+        from vllm_gr.constraints.npu_backend import NPUConstraintBackend
+
+        return NPUConstraintBackend.install_runner_integration(
+            self,
+            runner,
+            parallel_config=parallel_config,
+            vocab_size=vocab_size,
+        )
+
     def close(self) -> None:
         self.close_calls += 1
 

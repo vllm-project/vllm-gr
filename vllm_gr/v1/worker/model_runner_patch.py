@@ -171,40 +171,14 @@ def make_load_model_with_constraint_backend(
 
             model_memory_usage = int(getattr(self, "model_memory_usage", 0))
             self.model_memory_usage = model_memory_usage + backend.info.device_memory_bytes
-
-            if getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.CUDA:
-                # Import GPU layers only after selecting the CUDA backend.
-                from vllm.model_executor.layers.logits_processor import LogitsProcessor
-
-                window = backend.vocab_slice
-                if getattr(parallel, "tensor_parallel_size", 1) != 1:
-                    # All ranks must retain the original full-logits collective path.
-                    window = None
-                    backend.vocab_slice = None
-                    logger.info(
-                        "vllm-gr: canonical CUDA vocabulary slicing disabled for TP>1; "
-                        "using full-vocabulary projection"
-                    )
-                if window == (0, _runner_vocab_size(self)):
-                    window = None  # No benefit from cloning the entire LM head.
-                processors = tuple(
-                    module for module in self.model.modules() if isinstance(module, LogitsProcessor)
-                )
-                for processor in processors:
-                    # Explicit None also overrides unrelated legacy global settings.
-                    processor._gr_vocab_slice = window
-                self._gr_vocab_slice_processors = processors
-            elif (
-                getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.NPU
-                and getattr(backend, "stage_vocab", None) is not None
-            ):
-                # Keep NPU projection imports isolated from CPU/CUDA startup.
-                from vllm_gr.ops.npu_stage_logits import install_npu_stage_projection
-
-                projection = install_npu_stage_projection(self, backend)
-                if projection is not None:
-                    self._gr_npu_stage_projection = projection
-                    self.model_memory_usage += projection.device_memory_bytes
+            # The Backend attaches whatever its selection path needs (a narrowed
+            # LM head, a stage projection, or nothing) and reports the memory it
+            # added. Shared code never asks which implementation this is.
+            self.model_memory_usage += backend.install_runner_integration(
+                self,
+                parallel_config=parallel,
+                vocab_size=_runner_vocab_size(self),
+            )
             from vllm_gr.v1.worker.hot_update import versioned_constraint_table
 
             # Publish only after readiness and runner-specific kernel warmup.

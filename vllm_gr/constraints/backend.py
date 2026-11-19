@@ -90,6 +90,26 @@ class ConstraintBackend(Protocol):
         one that does not is never described by a name in a branch.
         """
 
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Attach this backend's runner-side integration and report added bytes.
+
+        Called once per published Backend, after readiness and before sampling
+        can reach it. A backend whose selection reads the ordinary logits attaches
+        nothing and returns ``0``; one that narrows the LM head or projects a
+        stage vocabulary attaches that here.
+
+        The return value is the device memory the integration adds beyond
+        ``info.device_memory_bytes``, so the caller keeps one accounting site.
+        Shared Runner code therefore never asks which backend this is, and an
+        external backend attaches its own integration without a branch edit.
+        """
+
     def close(self) -> None: ...
 
 

@@ -8,6 +8,7 @@ from enum import Enum, auto
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_gr.constraints.backend import (
     ConstraintBackendInfo,
@@ -22,6 +23,8 @@ from vllm_gr.ops.cuda.rec_constrained_topk import (
     rec_constrained_topk_cuda_out,
     validate_cuda_sort_capacity,
 )
+
+logger = init_logger(__name__)
 
 
 class _BackendState(Enum):
@@ -234,6 +237,41 @@ class CUDAConstraintBackend:
         if self._state is not _BackendState.INITIALIZING:
             raise RuntimeError("only an initializing CUDA constraint backend can become ready")
         self._state = _BackendState.READY
+
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Point the model's LogitsProcessors at this table's vocabulary window.
+
+        Table token ids stay global, so the LM head may emit a narrower logits
+        slice. With more than one rank the full-vocabulary collective must stay
+        in place, so the window is dropped rather than applied per rank.
+        """
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+        window = self.vocab_slice
+        if getattr(parallel_config, "tensor_parallel_size", 1) != 1:
+            # All ranks must retain the original full-logits collective path.
+            window = None
+            self.vocab_slice = None
+            logger.info(
+                "vllm-gr: canonical CUDA vocabulary slicing disabled for TP>1; "
+                "using full-vocabulary projection"
+            )
+        if window == (0, vocab_size):
+            window = None  # No benefit from cloning the entire LM head.
+        processors = tuple(
+            module for module in runner.model.modules() if isinstance(module, LogitsProcessor)
+        )
+        for processor in processors:
+            # Explicit None also overrides unrelated legacy global settings.
+            processor._gr_vocab_slice = window
+        runner._gr_vocab_slice_processors = processors
+        return 0
 
     def prepare_runner(self, model_config: Any) -> None:
         """Warm the device-step variant for each dtype the LM head can emit.
