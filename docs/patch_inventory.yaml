@@ -54,7 +54,7 @@ patches:
 
   - id: GR-PATCH-002
     scope: backend
-    backend_id: npu
+    backend_id: ascend
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.patch_npu_worker_init_device
     activation: the selected NPU provider revalidates early config bindings on every call and wraps NPUWorker.init_device only when needed; unavailable native worker imports are retried on later initialization
@@ -243,7 +243,7 @@ patches:
 
   - id: GR-PATCH-012
     scope: backend
-    backend_id: npu
+    backend_id: ascend
     owner: vllm_gr/v1/worker/npu/npu_model_runner_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/npu/npu_model_runner_inputs.py, vllm_gr/v1/worker/npu/npu_model_runner_bookkeeping.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
@@ -309,7 +309,7 @@ patches:
 
   - id: GR-PATCH-016
     scope: backend
-    backend_id: npu
+    backend_id: ascend
     owner: vllm_gr/npu_spawn_patch.py
     installer: vllm_gr.npu_spawn_patch.apply_npu_spawn_patch
     activation: the selected NPU provider installs or repairs spawn protection before importing the native worker
@@ -325,7 +325,7 @@ patches:
 
   - id: GR-PATCH-018
     scope: backend
-    backend_id: npu
+    backend_id: ascend
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_penalties_warmup_oom_guard
     activation: NPUWorker init_device runs in the child process and the native penalties warmup callable is present
@@ -340,7 +340,7 @@ patches:
 
   - id: GR-PATCH-019
     scope: backend
-    backend_id: npu
+    backend_id: ascend
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer and patch_npu_worker_init_device
     activation: NPU engine configuration and every worker plugin initialization, independently of the device hook; repair native config caller bindings even when the sanitizer is installed; entrypoint re-asserted on every create_engine_config call and initializes the shared EngineCore plan before native construction
@@ -376,7 +376,7 @@ patches:
 
   - id: GR-PATCH-021
     scope: backend
-    backend_id: npu
+    backend_id: ascend
     owner: vllm_gr/v1/npu_kv_layout.py
     installer: vllm_gr.v1.npu_kv_layout.apply_npu_contiguous_kv_cache_patch
     activation: NPUWorker init_device before native runner construction; known Ascend 0.30.0rc2 bindings

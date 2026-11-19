@@ -47,7 +47,7 @@ def test_runtime_patch_order_preserves_ascend_initialization(
     import vllm_gr.patch as runtime_patch
     from vllm_gr import npu_spawn_patch
     from vllm_gr.platforms import loader
-    from vllm_gr.platforms.npu import NPU_BACKEND
+    from vllm_gr.platforms.ascend import NPU_BACKEND
     from vllm_gr.v1 import ascend_compat
 
     monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)

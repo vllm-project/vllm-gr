@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from .protocol import BeamAttentionExecution, ModelRunnerPatchHooks
+from ..identity import PlatformIdentity, platform_identity
+from ..protocol import (
+    PROVIDER_API_VERSION,
+    BeamAttentionExecution,
+    ModelRunnerPatchHooks,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -18,17 +23,34 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class CUDABackendProvider:
+    backend_id: str = "cuda"
+    #: The version-1 identity preserved for diagnostics of legacy providers.
     device_type: str = "cuda"
     # Semantic ownership includes hooks still installed by shared dispatch.
     patch_ids: ClassVar[tuple[str, ...]] = ("GR-PATCH-011",)
+    api_version: ClassVar[int] = PROVIDER_API_VERSION
+    gr_version_range: ClassVar[str | None] = ">=0.30.0,<0.31.0"
+    vllm_version_range: ClassVar[str | None] = "==0.30.0"
+    vendor_version_range: ClassVar[None] = None
+    vendor_distribution: ClassVar[None] = None
+
+    def matches(self, identity: PlatformIdentity) -> bool:
+        """Match the native NVIDIA CUDA platform, not every ``cuda`` placement.
+
+        AMD ROCm also reports ``device_type == "cuda"``; it is a distinct
+        upstream enum value and needs its own provider.
+        """
+        return identity.platform_enum == "CUDA" and identity.device_type == "cuda"
+
+    matches_legacy_identity = matches
 
     def check_environment(self) -> dict[str, str]:
         from vllm.platforms import current_platform
 
         from vllm_gr._env_check import check_runtime_versions
 
-        if str(current_platform.device_type) != "cuda":
-            raise RuntimeError("CUDA provider requires the CUDA platform")
+        if not self.matches(platform_identity(current_platform)):
+            raise RuntimeError("CUDA provider requires the native CUDA platform")
 
         report = check_runtime_versions()
         report["platform"] = "cuda"
