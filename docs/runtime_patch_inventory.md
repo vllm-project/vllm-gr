@@ -189,6 +189,11 @@ requests continue through their existing non-Beam entry points.
 
 ### GR-PATCH-005 — EngineArgs Configuration Override
 
+After GR normalization, `platforms/planning.py` adds the immutable backend plan
+to native configuration transport. Ordinary native engines remain unplanned.
+Coverage: `tests/engine/test_backend_plan_engine_args.py` and
+`tests/platforms/test_backend_plan.py`.
+
 - Scope: `core`; backend ID: `null`
 
 - Targets:
@@ -241,6 +246,11 @@ requests continue through their existing non-Beam entry points.
 - Removal condition: grouped Beam messages can be carried through a stable upstream extension mechanism without mutating Enum internals.
 
 ### GR-PATCH-009 — EngineCore Lifecycle and Socket Processing
+
+The constructor wrapper verifies the expected workers' backend fingerprints
+and bound implementation identities before returning. Missing readiness or
+disagreement shuts down the executor and fails startup. This adds no new
+native patch target. Coverage: `tests/platforms/test_backend_plan.py`.
 
 - Scope: `core`; backend ID: `null`
 
@@ -319,6 +329,12 @@ requests continue through their existing non-Beam entry points.
 ### GR-PATCH-011 — GPU ModelRunner V1/V2 Overrides
 
 - Scope: `backend`; backend ID: `cuda`
+
+The common model-load wrapper also binds the admitted backend plan after a
+successful load. Reload/shutdown release the runner-owned binding with the
+constraint runtime. `platforms/binding.py` owns this shared lifecycle logic;
+`tests/platforms/test_backend_plan.py` covers isolation and failed binding.
+The same lifecycle applies to the Ascend wrapper in GR-PATCH-012.
 
 Cross-batch stage-adapter caching is opt-in through
 `beam.adapter_cache_enabled` (default false). The existing same-batch reuse

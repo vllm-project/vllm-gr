@@ -20,11 +20,15 @@ from .protocol import (
 if TYPE_CHECKING:
     import torch
 
+    from .config import BackendConfigService
+
 logger = logging.getLogger("vllm_gr.platforms.legacy")
 
 
 class _LegacyPlacement(Protocol):
     backend_id: str
+
+    def create_config_service(self) -> BackendConfigService: ...
 
     def matches_legacy_identity(self, identity: PlatformIdentity) -> bool: ...
 
@@ -36,6 +40,14 @@ def _legacy_placement(device_type: str | None) -> _LegacyPlacement | None:
         if entry.name == device_type:
             return cast(_LegacyPlacement, entry.load())
     return None
+
+
+def legacy_config_service(device_type: str | None) -> BackendConfigService:
+    """Preserve native configuration defaults for fixed API-v1 placements."""
+    from .config import BackendConfigService
+
+    placement = _legacy_placement(device_type)
+    return placement.create_config_service() if placement is not None else BackendConfigService()
 
 
 def declared_api_version(provider: Any) -> int:
@@ -84,6 +96,9 @@ class LegacyProviderAdapter:
 
     def check_environment(self) -> dict[str, str]:
         return cast(dict[str, str], self.legacy.check_environment())
+
+    def create_config_service(self) -> BackendConfigService:
+        return legacy_config_service(self.device_type)
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
         return cast(int, self.legacy.apply_runtime_patches(force=force))

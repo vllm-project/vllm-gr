@@ -26,6 +26,7 @@ from vllm_gr.config.parser import (
     read_settings,
 )
 from vllm_gr.engine.startup import resolve_native_settings
+from vllm_gr.platforms.config import BackendConfigService, engine_config_service
 
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
@@ -118,59 +119,6 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     return engine_args
 
 
-def _apply_npu_default_block_size(config) -> None:
-    """Use an Ascend-compatible default without overriding user intent.
-
-    vLLM-Ascend 0.30 sets the block size to 128 itself when prefix caching or
-    chunked prefill is enabled, but leaves the platform default in place
-    otherwise, while the beam attention backends require the 128 kernel
-    geometry. This rule closes that gap; it was validated on the 0.30.0rc2
-    runtime.
-    """
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return
-    if getattr(current_platform, "device_type", None) != "npu":
-        return
-
-    cache_config = getattr(config, "cache_config", None)
-    model_config = getattr(config, "model_config", None)
-    if cache_config is None:
-        return
-    if getattr(cache_config, "user_specified_block_size", False):
-        return
-    # Hybrid attention/state models have model-specific cache sizing rules in
-    # vLLM-Ascend and must not be forced onto the dense-attention default.
-    if model_config is not None and getattr(model_config, "is_hybrid", False):
-        return
-    if cache_config.block_size != 128:
-        logger.info(
-            "Using Ascend-compatible default KV cache block size 128 "
-            "(vLLM resolved the unspecified value to %s).",
-            cache_config.block_size,
-        )
-        cache_config.block_size = 128
-
-
-def _is_npu_platform() -> bool:
-    """Return whether the active platform is an Ascend NPU."""
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return False
-    return getattr(current_platform, "device_type", None) == "npu"
-
-
-def _is_cuda_platform() -> bool:
-    """Return whether the active platform is CUDA."""
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return False
-    return getattr(current_platform, "device_type", None) == "cuda"
-
-
 def _resolve_constraint_backend(config: GRConfig) -> GRConfig:
     """Resolve ``constraint.table.backend='auto'`` to the active device."""
     if (
@@ -185,12 +133,13 @@ def _resolve_constraint_backend(config: GRConfig) -> GRConfig:
 
 
 def _beam_worker_decision_default(
+    service: BackendConfigService,
     *,
     beam_width_configured: bool,
     worker_decision: bool | None,
 ) -> bool | None:
     """Resolve an omitted accelerator control while preserving explicit False."""
-    if beam_width_configured and (_is_cuda_platform() or _is_npu_platform()):
+    if beam_width_configured and service.default_worker_decision:
         if worker_decision is None:
             return True
     return worker_decision
@@ -216,7 +165,8 @@ def create_engine_config(self, usage_context=None, headless=False):
         )
     ):
         return config
-    _apply_npu_default_block_size(config)
+    service = engine_config_service()
+    service.apply_native_defaults(config)
     path = getattr(self, "config", None)
     overrides = getattr(self, "gr", None)
     additional = getattr(config, "additional_config", None)
@@ -234,6 +184,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         overrides,
         startup_document=getattr(self, "_gr_startup_document", None),
         worker_decision_default=_beam_worker_decision_default(
+            service,
             beam_width_configured=True, worker_decision=None
         ),
     )
@@ -254,6 +205,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         if effective_gr_config.attention_backend != resolved_backend:
             effective_gr_config = replace(effective_gr_config, attention_backend=resolved_backend)
     worker_decision = _beam_worker_decision_default(
+        service,
         beam_width_configured=effective_gr_config.beam_max_width is not None,
         worker_decision=effective_gr_config.beam_worker_decision,
     )
@@ -261,14 +213,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         effective_gr_config = replace(effective_gr_config, beam_worker_decision=worker_decision)
     effective_gr_config = _resolve_constraint_backend(effective_gr_config)
 
-    if (
-        effective_gr_config.constrained_generation is False
-        and effective_gr_config.beam_max_width is not None
-        and _is_npu_platform()
-    ):
-        from vllm_gr.v1.engine.beam_search import validate_npu_unconstrained_runner
-
-        validate_npu_unconstrained_runner(config)
+    service.validate_engine(config, effective_gr_config)
 
     if effective_gr_config.constrained_generation is False:
         from vllm_gr.ops.sliced_logits import set_vocab_slice_config
@@ -293,32 +238,12 @@ def create_engine_config(self, usage_context=None, headless=False):
         from vllm_gr.v1.engine.beam_search import validate_gr_execution_config
 
         validate_gr_execution_config(config)
-        compilation = getattr(config, "compilation_config", None)
-        if (
-            _is_cuda_platform()
-            and not getattr(config, "use_v2_model_runner", False)
-            and compilation is not None
-            and compilation.backend == "inductor"
-        ):
-            # Inductor can benchmark an extra, halved reduction block on each
-            # AOT load. Q/K norm rounding then changes across independent
-            # engines, including Beam candidate order and scores. Keep the
-            # compiled reduction geometry; record this in the native config
-            # so the AOT cache key includes it. Explicit overrides still win.
-            compilation.inductor_compile_config.setdefault("dynamic_scale_rblock", False)
 
-    # On Ascend, vllm-ascend wraps EngineCoreProc.run_engine_core and validates
-    # additional_config (pydantic extra="forbid") in the spawned EngineCore
-    # process *before* the vllm-gr plugin loads. Install the GR-key sanitizer
-    # here -- after origin_create_engine_config and every general plugin, and
-    # before EngineCoreClient spawns the process -- so it is the outermost
-    # entrypoint and filters GR keys during vllm-ascend's init_ascend_config.
-    if _is_npu_platform():
-        from vllm.v1.engine.core import EngineCoreProc
+    service.finalize_native_config(config, effective_gr_config)
 
-        from vllm_gr.v1.ascend_compat import apply_engine_core_config_sanitizer
+    from vllm_gr.platforms.planning import admit_backend_plan
 
-        apply_engine_core_config_sanitizer(EngineCoreProc)
+    admit_backend_plan(config)
 
     logger.info(
         "Resolved vLLM-GR configuration: %s",

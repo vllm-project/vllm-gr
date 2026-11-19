@@ -34,7 +34,10 @@ def make_patched_engine_init(original):
     def initialize(self, *args, **kwargs):
         original(self, *args, **kwargs)
         from vllm_gr.config import GRConfig
+        from vllm_gr.platforms.readiness import verify_engine_backend_readiness
         from vllm_gr.v1.engine.core import loaded_constraint_trie_count
+
+        verify_engine_backend_readiness(self)
 
         config = GRConfig.from_vllm_config(self.vllm_config)
         if config.beam_max_width is None:

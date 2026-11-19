@@ -103,6 +103,15 @@ def test_registering_same_provider_object_is_idempotent() -> None:
     assert resolve_backend("fake") is provider
 
 
+@pytest.mark.parametrize("factory", [3, lambda self, required: None])
+def test_invalid_config_factory_fails_registration(
+    monkeypatch: pytest.MonkeyPatch, factory: Any
+) -> None:
+    monkeypatch.setattr(FakeProvider, "create_config_service", factory, raising=False)
+    with pytest.raises(InvalidBackendProviderError, match="create_config_service"):
+        register_backend(FakeProvider(), source="test:malformed")
+
+
 def test_different_provider_for_same_backend_id_is_rejected() -> None:
     register_backend(FakeProvider(), source="first-package")
 

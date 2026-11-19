@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm_gr.platforms.services import constraint_execution_override, planning_provider
+
 
 def _backend_label(provider: Any) -> str:
     """Describe the active provider for a startup diagnostic.
@@ -21,12 +23,22 @@ def _backend_label(provider: Any) -> str:
 def create_constraint_execution(
     *,
     device: str | Any | None = None,
+    plan: Any = None,
 ) -> Any:
     """Create the platform constrained-top-k adapter, failing explicitly."""
+    override = constraint_execution_override(device=device)
+    if override is not None:
+        return override
+
     from vllm_gr.platforms.loader import activate_current_backend
 
     provider = activate_current_backend()
-    adapter = provider.create_constrained_topk_execution(device=device)
+    if plan is None:
+        adapter = provider.create_constrained_topk_execution(device=device)
+    else:
+        adapter = planning_provider(provider).create_constrained_topk_execution(
+            plan=plan, device=device
+        )
     if adapter is None:
         raise RuntimeError(
             "constraint.mode='table' cannot start: the active backend "

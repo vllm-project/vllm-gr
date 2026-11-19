@@ -119,6 +119,7 @@ def _read_settings(path: Path, parents: tuple[Path, ...]) -> dict:
 
 
 GR_CONFIG_KEY: Final = "vllm_gr"
+_BACKEND_TRANSPORT_KEYS: Final = frozenset({"vllm_gr_backend_plan", "vllm_gr_backend_options"})
 GRConfigInput: TypeAlias = str | Path
 CONFIG_ATTRIBUTES = {
     spec.canonical_path[1]: item.name
@@ -355,7 +356,7 @@ def load_engine_gr_config(
     if overrides is not None and not isinstance(overrides, Mapping):
         raise ValueError("gr must be a mapping")
     if isinstance(additional, Mapping) and any(
-        key == GR_CONFIG_KEY or (isinstance(key, str) and key.startswith("vllm_gr_"))
+        key == GR_CONFIG_KEY or (isinstance(key, str) and key.startswith("vllm_gr_") and key not in _BACKEND_TRANSPORT_KEYS)
         for key in additional
     ):
         raise ValueError("Supply GR settings with gr=..., --gr-config, or --config")
@@ -374,7 +375,7 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, Mapping):
         return GRConfig()
-    retired = [key for key in additional if isinstance(key, str) and key.startswith("vllm_gr_")]
+    retired = [key for key in additional if isinstance(key, str) and key.startswith("vllm_gr_") and key not in _BACKEND_TRANSPORT_KEYS]
     if retired:
         raise ValueError(f"Removed vLLM-GR configuration keys: {sorted(retired)}; use gr")
     if GR_CONFIG_KEY not in additional:
@@ -390,7 +391,7 @@ def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, MutableMapping):
         raise ValueError("vLLM-GR additional_config must be a mutable mapping")
-    retired = [key for key in additional if isinstance(key, str) and key.startswith("vllm_gr_")]
+    retired = [key for key in additional if isinstance(key, str) and key.startswith("vllm_gr_") and key not in _BACKEND_TRANSPORT_KEYS]
     known = {spec.legacy_key for _, spec in config_fields(GRConfig)} | {
         "vllm_gr_catalog_path",
         "vllm_gr_constraint_backend",

@@ -5,14 +5,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     import torch
 
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
+    from .config import BackendConfigService
     from .identity import PlatformIdentity
+    from .plan import BackendPlan, BackendRequest
 
 #: Provider API implemented by built-in and external providers in this release.
 PROVIDER_API_VERSION = 2
@@ -120,3 +122,33 @@ class GRBackendProvider(Protocol):
         *,
         device: str | torch.device | None = None,
     ) -> "ConstrainedTopKExecution | None": ...
+
+
+class GRPlanningProvider(GRBackendProvider, Protocol):
+    """Explicit planning extension version 1 to provider API version 2.
+
+    Providers without plan_api_version keep the narrow API-v2 delegation path.
+    New factories receive an immutable engine plan, never provider.current_plan.
+    """
+
+    plan_api_version: int
+    adapter_revision: str
+
+    def resolve(self, request: BackendRequest) -> BackendPlan: ...
+
+    def validate_worker(self, *, plan: BackendPlan, native_runner: Any) -> None: ...
+
+    def create_model_runner_adapter(self, *, plan: BackendPlan, native_runner: Any) -> Any: ...
+
+    def create_attention_executor(self, *, plan: BackendPlan, device: Any) -> Any: ...
+
+    def create_constrained_topk_execution(
+        self, *, plan: BackendPlan | None = None, device: str | torch.device | None = None
+    ) -> "ConstrainedTopKExecution | None": ...
+
+
+@runtime_checkable
+class ConfigProvider(Protocol):
+    """Optional host policy for native defaults and engine admission."""
+
+    def create_config_service(self) -> BackendConfigService: ...

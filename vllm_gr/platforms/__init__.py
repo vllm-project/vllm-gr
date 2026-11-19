@@ -16,7 +16,19 @@ from .errors import (
 from .identity import PlatformIdentity, current_platform_identity, platform_identity
 from .legacy import LegacyProviderAdapter, adapt_legacy_provider, declared_api_version
 from .loader import activate_current_backend
-from .protocol import PROVIDER_API_VERSION, GRBackendProvider
+from .plan import (
+    PLAN_API_VERSION,
+    BackendPlan,
+    BackendRequest,
+    PlanData,
+    ServiceRequirements,
+)
+from .protocol import (
+    PROVIDER_API_VERSION,
+    ConfigProvider,
+    GRBackendProvider,
+    GRPlanningProvider,
+)
 from .registry import (
     activate_backend,
     get_active_backend,
@@ -27,11 +39,18 @@ from .registry import (
 
 __all__ = [
     "PROVIDER_API_VERSION",
+    "PLAN_API_VERSION",
+    "BackendPlan",
+    "BackendRequest",
+    "PlanData",
+    "ServiceRequirements",
+    "GRPlanningProvider",
     "AmbiguousBackendError",
     "BackendAlreadyActiveError",
     "BackendNotActiveError",
     "BackendRegistryError",
     "DuplicateBackendRegistrationError",
+    "ConfigProvider",
     "GRBackendProvider",
     "IncompatibleBackendError",
     "InvalidBackendProviderError",

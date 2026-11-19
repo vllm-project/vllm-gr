@@ -9,16 +9,20 @@ from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from ..identity import PlatformIdentity
+from ..plan import BackendPlan, BackendRequest, PlanData
 from ..protocol import (
     PROVIDER_API_VERSION,
     BeamAttentionExecution,
     ModelRunnerPatchHooks,
 )
+from ..services import BoundService, BuiltinPlanSupport, require_provider_plan
 
 if TYPE_CHECKING:
     import torch
 
     from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
+
+    from ..config import BackendConfigService
 
 #: Qualified name of the vendor platform class this provider supports. The
 #: check is a lineage lookup on the already-selected platform instance, so it
@@ -27,7 +31,7 @@ _ASCEND_PLATFORM_CLASS = "vllm_ascend.platform.NPUPlatform"
 
 
 @dataclass(frozen=True)
-class NPUBackendProvider:
+class NPUBackendProvider(BuiltinPlanSupport):
     backend_id: str = "ascend"
     #: Tensor placement of the platform this provider implements.
     device_type: str = "npu"
@@ -54,9 +58,62 @@ class NPUBackendProvider:
         """
         return identity.device_type == "npu" and identity.has_lineage(_ASCEND_PLATFORM_CLASS)
 
+    def resolve(self, request: BackendRequest) -> BackendPlan:
+        """Keep Ascend's V1 runner and its existing auto-decode policy."""
+        if request.options.to_dict():
+            raise ValueError("Ascend currently accepts no additional backend options")
+        gr = request.config.to_dict()
+        table = gr["constraint_table"] or {}
+        constraint = (
+            "canonical"
+            if table.get("enabled")
+            else ("legacy" if gr["constraint_backend"] == "constraint_table" else "none")
+        )
+        return BackendPlan(
+            self.backend_id,
+            self.api_version,
+            request,
+            PlanData(
+                {
+                    "runner": "vllm_gr.v1.worker.npu.npu_model_runner_patch",
+                    "attention": "vllm_gr.v1.attention.backends.beam_attn_npu",
+                    "prefill_attention": "ascend.cascade",
+                    "decode_attention": gr["npu_decode_execution"] or "auto",
+                    "requires_attention": gr["attention_backend"] == "CUSTOM",
+                    "constraint": constraint,
+                    "constraint_implementation": "npu" if constraint != "none" else None,
+                    "stage": "ascend.v1",
+                    "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
+                }
+            ),
+        )
+
+    def create_attention_executor(self, *, plan: BackendPlan, device: object) -> BoundService:
+        require_provider_plan(self, plan)
+        from vllm_gr.v1.attention.backends import beam_attn
+
+        # Preserve the existing capability-sensitive default until #713 moves
+        # its selection into the executor. Report the actual module to the
+        # engine so workers cannot silently disagree on the auto choice.
+        actual = beam_attn._get_npu_decode_execution()
+        requested = plan.choices.to_dict()["decode_attention"]
+        if requested != "auto" and actual != requested:
+            raise RuntimeError(
+                "Ascend attention mode is already fixed by another engine; use a separate process"
+            )
+        module = beam_attn._get_platform_execution_module()
+        if not module.is_available():
+            raise RuntimeError("Ascend attention implementation is unavailable")
+        return BoundService(plan, module, device=device)
+
     def matches_legacy_identity(self, identity: PlatformIdentity) -> bool:
         """API v1 selected Ascend by its original tensor placement."""
         return identity.device_type == self.device_type
+
+    def create_config_service(self) -> BackendConfigService:
+        from .config import AscendConfigService
+
+        return AscendConfigService()
 
     def check_environment(self) -> dict[str, str]:
         from vllm_gr._env_check import check_ascend_environment
@@ -91,6 +148,7 @@ class NPUBackendProvider:
         self,
         *,
         device: str | torch.device | None = None,
+        plan: BackendPlan | None = None,
     ) -> "NPUConstrainedTopKExecution":
         """Create a fresh NPU constrained top-k execution adapter.
 
@@ -100,6 +158,8 @@ class NPUBackendProvider:
         """
         from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
 
+        if plan is not None:
+            require_provider_plan(self, plan)
         return NPUConstrainedTopKExecution(device=device)
 
 
