@@ -150,11 +150,11 @@ continues to run all tests unless `VLLM_GR_TEST_LEVEL` is explicitly set.
 
 The pre-commit CI job sets `VLLM_GR_TEST_LEVEL=pr` to run L1/L2. The separate
 level workflow selects L3 on pushes to `main`, L4 nightly, and L5 weekly; it
-also supports manual level selection. These level runs require a GPU runner.
-The shared self-hosted pool has no GPU/NPU labels, so it can assign an NPU
-runner: in that case the workflow reports that the level did not run and skips
-the test steps. A scheduled run therefore does not guarantee GPU execution or
-coverage of both platforms. The existing benchmark gates remain separate.
+also supports manual level selection. The workflow declares GPU and NPU lanes
+on a shared self-hosted pool without corresponding device labels. Each lane
+checks the detected accelerator and reports that the level did not run when
+the runner does not match its target. A scheduled run therefore does not
+guarantee execution on both platforms. The existing benchmark gates remain separate.
 Use runners with isolated accelerator access. The level workflow does not
 terminate processes belonging to other jobs. L3/L4 model tests require the
 model and runtime dependencies in their fixtures. The L4 GPU job also prepares
