@@ -118,7 +118,8 @@ def test_selector_routes_custom_marker_and_native_backends(
     ]
 
 
-@pytest.mark.parametrize("from_marker", [False, True])
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("from_marker", [False, True])  # type: ignore[misc]
 def test_custom_selector_rejects_unsupported_geometry(
     monkeypatch: pytest.MonkeyPatch, from_marker: bool
 ) -> None:
@@ -433,12 +434,8 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     assert worker_class().init_device() == "ready"
     assert events == ["re_apply", "kv_layout", "original"]
 
-    from vllm_gr.v1.worker.gr_context import (
-        get_beam_graph_runtime_stats,
-    )
-    from vllm_gr.v1.worker.gr_gc import (
-        freeze_gc_after_warmup,
-    )
+    from vllm_gr.v1.worker.gr_context import get_beam_graph_runtime_stats
+    from vllm_gr.v1.worker.gr_gc import freeze_gc_after_warmup
 
     assert worker_class.__dict__["get_gr_beam_graph_runtime_stats"] is get_beam_graph_runtime_stats
     assert worker_class.__dict__["gr_freeze_gc_after_warmup"] is freeze_gc_after_warmup
@@ -462,8 +459,10 @@ def test_npu_worker_reinstalls_over_replaced_upstream_target(
     monkeypatch.setattr(ascend_compat, "_install_init_ascend_config_sanitizer", lambda: None)
     worker = _install_fake_npu_worker(monkeypatch, lambda _: "native")
     original = worker.init_device
+    assert not ascend_compat.is_npu_worker_patched()
     assert ascend_compat.patch_npu_worker_init_device() == 1
     wrapper = worker.init_device
+    assert ascend_compat.is_npu_worker_patched()
     assert getattr(wrapper, ascend_compat._NPU_WORKER_ORIGINAL_ATTR) is original
     assert ascend_compat.patch_npu_worker_init_device() == 0
     assert worker.init_device is wrapper
@@ -472,6 +471,7 @@ def test_npu_worker_reinstalls_over_replaced_upstream_target(
         return "replacement"
 
     monkeypatch.setattr(worker, "init_device", replacement)
+    assert not ascend_compat.is_npu_worker_patched()
     assert ascend_compat.patch_npu_worker_init_device() == 1
     repaired = worker.init_device
     assert getattr(repaired, ascend_compat._NPU_WORKER_ORIGINAL_ATTR) is replacement

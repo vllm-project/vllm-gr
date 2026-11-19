@@ -61,6 +61,18 @@ for module_name in (
 
 @pytest.mark.l1  # type: ignore[misc]
 def test_cuda_plugin_initialization_does_not_import_ascend() -> None:
+    from importlib import metadata
+
+    from vllm_gr._env_check import _SUPPORTED_VLLM_VERSION, _public_version
+
+    try:
+        version = metadata.version("vllm")
+    except metadata.PackageNotFoundError:
+        pytest.skip("CUDA plugin initialization requires the installed vLLM runtime")
+    if _public_version(version) != _SUPPORTED_VLLM_VERSION:
+        pytest.skip(
+            f"CUDA plugin initialization requires vLLM {_SUPPORTED_VLLM_VERSION}, found {version}"
+        )
     project_root = REPO_ROOT
     code = """
 import sys

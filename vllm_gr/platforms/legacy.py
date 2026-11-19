@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast
 
+from .config import BackendConfigService
 from .errors import InvalidBackendProviderError
 from .identity import PlatformIdentity
 from .interface import (
@@ -23,10 +24,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger("vllm_gr.platforms.legacy")
 
 
+class _UnsupportedPlacement(BackendConfigService):
+    def validate_device(self, config: Any, gr: Any, request: Any) -> None:
+        raise ValueError("Asynchronous scheduling requires a provider with a Beam ModelRunner")
+
+
 class _LegacyPlacement(Protocol):
     backend_id: str
 
     def matches_legacy_identity(self, identity: PlatformIdentity) -> bool: ...
+
+    def create_config_service(self) -> BackendConfigService: ...
 
 
 def _legacy_placement(device_type: str | None) -> _LegacyPlacement | None:
@@ -36,6 +44,24 @@ def _legacy_placement(device_type: str | None) -> _LegacyPlacement | None:
         if entry.name == device_type:
             return cast(_LegacyPlacement, entry.load())
     return None
+
+
+def legacy_config_service(device_type: str | None) -> BackendConfigService:
+    """Reproduce defaults for direct, unplanned configs and fixed API-v1 identities."""
+    placement = _legacy_placement(device_type)
+    if placement is not None:
+        return placement.create_config_service()
+    return BackendConfigService() if device_type is None else _UnsupportedPlacement()
+
+
+def validate_legacy_constraint_placement(config: Any, implementation_id: str) -> None:
+    """Validate the enum-only table used by direct, pre-plan frontend callers."""
+    device = getattr(getattr(config, "device_config", None), "device", "cuda")
+    device_type = str(device).split(":")[0]
+    if implementation_id != device_type:
+        raise ValueError(
+            f"beam_search_v1 requires an enabled canonical {device_type.upper()} constraint table"
+        )
 
 
 def declared_api_version(provider: Any) -> int:
@@ -84,6 +110,9 @@ class LegacyProviderAdapter:
 
     def check_environment(self) -> dict[str, str]:
         return cast(dict[str, str], self.legacy.check_environment())
+
+    def create_config_service(self) -> BackendConfigService:
+        return legacy_config_service(self.device_type)
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
         return cast(int, self.legacy.apply_runtime_patches(force=force))

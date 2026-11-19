@@ -30,8 +30,11 @@ from typing import Any
 
 import torch
 
-from vllm_gr.v1.beam.decision_ops import DecisionOps, reorder_sessions
-from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import _workspace_candidate_width
+from vllm_gr.v1.beam.decision_ops import (
+    DecisionOps,
+    reorder_sessions,
+    workspace_candidate_width,
+)
 from vllm_gr.v1.worker.runner_lifecycle import get_stage_execution
 
 
@@ -70,9 +73,7 @@ def worker_decision_enabled(runner: Any) -> bool:
     remains frontend-side and therefore keeps the frontend NumPy decision path.
     """
     from vllm_gr.config import ConstraintBackend
-    from vllm_gr.v1.worker.gr_context import (
-        _get_gr_config,
-    )
+    from vllm_gr.v1.worker.gr_context import _get_gr_config
 
     gr_cfg = _get_gr_config(runner)
     if not bool(gr_cfg.beam_worker_decision):
@@ -382,7 +383,7 @@ def run_beam_decision(
     width = session.beam_width
     # Candidate width K is independent of the beam width W; the sampler emits
     # one row per beam and K columns per row.
-    candidate_width = _workspace_candidate_width(runner, width)
+    candidate_width = workspace_candidate_width(runner, width)
     candidates = _select_candidates(sampler_output, candidate_width, v2_layout=v2_layout)
     if candidates is None:
         return None

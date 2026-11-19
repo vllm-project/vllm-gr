@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -18,6 +19,7 @@ from ..interface import (
 )
 from ..plan import BackendPlan, BackendRequest, PlanData
 from ..services import BuiltinPlanSupport, require_provider_plan
+from .config import AscendConfigService
 from .graph import AscendGraph
 
 if TYPE_CHECKING:
@@ -46,10 +48,27 @@ class NPUBackendProvider(BuiltinPlanSupport):
         "GR-PATCH-021",
     )
     api_version: ClassVar[int] = PROVIDER_API_VERSION
+    deferred_patch_ids: ClassVar[tuple[str, ...]] = (
+        "GR-PATCH-002",
+        "GR-PATCH-012",
+        "GR-PATCH-018",
+        "GR-PATCH-019",
+        "GR-PATCH-021",
+    )
     gr_version_range: ClassVar[str | None] = ">=0.30.0,<0.31.0"
     vllm_version_range: ClassVar[str | None] = "==0.30.0"
     vendor_version_range: ClassVar[str | None] = "==0.30.0rc2"
     vendor_distribution: ClassVar[str | None] = "vllm-ascend"
+
+    def create_config_service(self) -> AscendConfigService:
+        return AscendConfigService()
+
+    @property
+    def runtime_patch_checks(self) -> dict[str, Callable[[], bool | None]]:
+        from vllm_gr.npu_spawn_patch import is_npu_spawn_patched
+        from vllm_gr.v1.ascend_compat import is_npu_worker_patched
+
+        return {"GR-PATCH-002": is_npu_worker_patched, "GR-PATCH-016": is_npu_spawn_patched}
 
     def matches(self, identity: PlatformIdentity) -> bool:
         """Match the supported Ascend platform identity and ``npu`` placement.
@@ -57,7 +76,13 @@ class NPUBackendProvider(BuiltinPlanSupport):
         The vendor platform enum is ``OOT``, which a future out-of-tree provider
         could share, so the qualified class lineage is required as well.
         """
-        return identity.device_type == "npu" and identity.has_lineage(_ASCEND_PLATFORM_CLASS)
+        return identity.device_type == self.device_type and identity.has_lineage(
+            _ASCEND_PLATFORM_CLASS
+        )
+
+    def matches_legacy_identity(self, identity: PlatformIdentity) -> bool:
+        """API v1 selected Ascend by its original tensor placement."""
+        return identity.device_type == self.device_type
 
     native_graph_factory = AscendGraph
 
@@ -85,7 +110,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
                     "decode_attention": gr["npu_decode_execution"] or "auto",
                     "kv_layout": request.native.to_dict().get("kv_cache_layout"),
                     "requires_attention": gr["attention_backend"] == "CUSTOM",
-                    **constraint_plan_choices(gr, legacy_id="npu"),
+                    **constraint_plan_choices(gr, legacy_id=self.device_type),
                     "operator_policy": "ascend.xllm-with-reference-fallback",
                     "stage": "ascend.v1",
                     "graph_implementation": AscendGraph.implementation_id,
@@ -129,10 +154,6 @@ class NPUBackendProvider(BuiltinPlanSupport):
         if not executor.execution_module().is_available():
             raise RuntimeError("Admitted Ascend attention implementation is unavailable")
         return executor
-
-    def matches_legacy_identity(self, identity: PlatformIdentity) -> bool:
-        """API v1 selected Ascend by its original tensor placement."""
-        return identity.device_type == self.device_type
 
     def check_environment(self) -> dict[str, str]:
         from vllm_gr._env_check import check_ascend_environment

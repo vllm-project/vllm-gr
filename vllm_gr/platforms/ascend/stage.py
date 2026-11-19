@@ -62,12 +62,6 @@ class AscendStageExecutionService:
 
         return bool(capture_beam_decode_graph(worker))
 
-    def admit_unconstrained_beam(self, worker: Any) -> None:
-        """Apply the Ascend-only device admission rules for unconstrained Beam."""
-        from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
-
-        validate_gr_device_config(worker.vllm_config)
-
 
 def _reorder(session: Any, sessions: tuple[Any, ...], indices: Any, counts: Any) -> None:
     from vllm_gr.ops.npu import beam_ops

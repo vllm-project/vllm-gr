@@ -17,12 +17,20 @@ from .plan import BackendPlan, read_backend_plan
 from .planning import normalize_backend_request, resolve_backend_plan
 
 # Compatibility imports for providers written against the original binding API.
+from .readiness import (
+    validate_required_services,
+)
 from .readiness import validate_worker_readiness as validate_worker_readiness
 from .readiness import (
     verify_engine_backend_readiness as verify_engine_backend_readiness,
 )
 from .readiness import worker_backend_readiness as worker_backend_readiness
-from .services import BoundService, constraint_execution_override, planning_provider
+from .services import (
+    BoundService,
+    constraint_execution_override,
+    graph_provider,
+    planning_provider,
+)
 
 logger = logging.getLogger(__name__)
 _BINDING_ATTR = "_gr_backend_binding"
@@ -77,11 +85,12 @@ class BackendBinding:
                 else self.constraint_execution
             ),
         }
-        if self.plan.choices.to_dict().get("operator_policy"):
+        required = self.plan.required_services
+        if "stage" in required:
             stage = self.runner_adapter.stage
-            services.update(
-                stage=stage.implementation_id, operator=stage.decision.implementation_id
-            )
+            services["stage"] = stage.implementation_id
+            if "operator" in required:
+                services["operator"] = stage.decision.implementation_id
         if self.graph is not None:
             services["graph"] = _implementation_id(self.graph)
         return {"ready": True, "fingerprint": self.plan.fingerprint, "services": services}
@@ -156,7 +165,7 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
         )
     selected = planning_provider(provider)
     selected.validate_worker(plan=plan, native_runner=runner)
-    choices = plan.choices.to_dict()
+    required = plan.required_services
     device = getattr(runner, "device", None)
     created: list[Any] = []
     try:
@@ -164,30 +173,40 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
         created.append(adapter)
         if adapter is None:
             raise RuntimeError("Backend did not bind the required runner adapter")
-        for phase in getattr(type(runner), "_gr_runner_methods", ()):
+        phases = set(getattr(type(runner), "_gr_runner_methods", ()))
+        if plan.request.uses_beam_v1:
+            phases.update(("prepare_inputs", "execute_model"))
+            if callable(getattr(runner, "sample_tokens", None)):
+                phases.add("sample_tokens")
+        for phase in sorted(phases):
             if not callable(getattr(adapter, phase, None)):
                 raise RuntimeError(f"Backend runner adapter does not implement {phase}()")
-        if choices.get("operator_policy"):
+        if "stage" in required:
             stage = getattr(adapter, "stage", None)
-            if getattr(stage, "implementation_id", None) != choices.get("stage"):
-                raise RuntimeError("Worker did not bind the admitted stage implementation")
-            for method in (
-                "execute",
-                "retire",
-                "capture_startup_graph",
-                "admit_unconstrained_beam",
-            ):
+            stage_id = getattr(stage, "implementation_id", None)
+            if not isinstance(stage_id, str) or not stage_id.strip():
+                label = "Beam stage" if "operator" in required else "stage"
+                raise RuntimeError(f"Backend did not bind the required {label} execution service")
+            methods = ["execute", "retire"]
+            if "operator" in required:
+                if not isinstance(getattr(stage, "worker_decision", None), bool):
+                    raise RuntimeError("Backend stage must declare its worker_decision policy")
+                methods.append("capture_startup_graph")
+            for method in methods:
                 if not callable(getattr(stage, method, None)):
                     raise RuntimeError(f"Backend stage does not implement {method}()")
-            operators = getattr(stage, "decision", None)
+        if "operator" in required:
+            operators = getattr(adapter.stage, "decision", None)
+            operator_id = getattr(operators, "implementation_id", None)
             if (
-                not getattr(operators, "implementation_id", None)
+                not isinstance(operator_id, str)
+                or not operator_id.strip()
                 or not callable(getattr(operators, "select", None))
                 or not callable(getattr(operators, "reorder", None))
             ):
                 raise RuntimeError("Worker did not bind a Beam decision operator")
         attention = None
-        if choices.get("requires_attention", False) or plan.request.uses_custom_attention:
+        if "attention" in required:
             attention = bind_attention(runner, selected, plan)
             created.append(attention)
             if attention is None:
@@ -196,7 +215,7 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
                 validate_selected_attention(runner, attention, plan)
         constraint = None
         canonical = None
-        if choices.get("constraint") == "legacy":
+        if plan.constraint_mode == "legacy":
             constraint = getattr(runner, "_gr_constraint_execution", None)
             if constraint is not None:
                 if getattr(runner, "_gr_constraint_plan_fingerprint", None) != plan.fingerprint:
@@ -212,7 +231,7 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
             created.append(constraint)
             if constraint is None or not constraint.is_available():
                 raise RuntimeError("Backend constraint execution is unavailable")
-        elif choices.get("constraint") == "canonical":
+        elif plan.constraint_mode == "canonical":
             from vllm_gr.config import GRConfig
 
             from .constraint_plan import canonical_constraint_id
@@ -228,16 +247,13 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
                     "Loaded canonical constraint implementation differs from the admitted plan"
                 )
         graph = None
-        if implementation := choices.get("graph_implementation"):
-            create_graph = getattr(selected, "create_graph_executor", None)
-            if not callable(create_graph):
-                raise RuntimeError("Backend did not provide its admitted graph executor")
+        if implementation := required.get("graph"):
             graph = getattr(runner, "_gr_native_graph", None)
             if (
                 graph is None
                 or getattr(runner, "_gr_native_graph_fingerprint", None) != plan.fingerprint
             ):
-                graph = create_graph(plan=plan, runner=runner)
+                graph = graph_provider(selected).create_graph_executor(plan=plan, runner=runner)
             created.append(graph)
             if _implementation_id(graph) != implementation:
                 raise RuntimeError("Worker graph implementation differs from the admitted plan")
@@ -256,6 +272,7 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
             if plan.prefill_graph_mode == "shared":
                 shared_prefill_runner_class(graph)
         binding = BackendBinding(plan, adapter, attention, constraint, canonical, graph)
+        validate_required_services(plan, required, binding.report()["services"], "Backend worker")
         setattr(runner, _BINDING_ATTR, binding)
         _clear_unplanned_stage(runner, getattr(adapter, "stage", None))
         return binding

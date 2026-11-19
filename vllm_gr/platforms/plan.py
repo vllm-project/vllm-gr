@@ -91,6 +91,41 @@ class BackendRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ServiceRequirements:
+    """Implementation identities a worker must bind before serving the plan."""
+
+    stage: str | None = None
+    attention: str | None = None
+    graph: str | None = None
+    constraint: str | None = None
+
+    def __post_init__(self) -> None:
+        for name, identity in self.to_dict().items():
+            if not isinstance(identity, str) or not identity.strip():
+                raise ValueError(f"Backend {name} requirement needs a non-empty implementation ID")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            name: value
+            for name in ("stage", "attention", "graph", "constraint")
+            if (value := getattr(self, name)) is not None
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ServiceRequirements:
+        if not isinstance(value, Mapping) or set(value) - {
+            "stage",
+            "attention",
+            "graph",
+            "constraint",
+        }:
+            raise ValueError("Invalid backend service requirements")
+        if any(identity is None for identity in value.values()):
+            raise ValueError("Omit optional backend requirements without an implementation ID")
+        return cls(**value)
+
+
+@dataclass(frozen=True, slots=True)
 class BackendPlan:
     """One admitted engine plan, with extensible backend-owned choices."""
 
@@ -100,6 +135,7 @@ class BackendPlan:
     choices: PlanData
     plan_api_version: int = PLAN_API_VERSION
     schema_version: int = PLAN_SCHEMA_VERSION
+    requirements: ServiceRequirements | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend_id, str) or not self.backend_id.strip():
@@ -112,6 +148,8 @@ class BackendPlan:
             raise ValueError("Unsupported BackendPlan schema version")
         if not isinstance(self.request, BackendRequest) or not isinstance(self.choices, PlanData):
             raise TypeError("BackendPlan requires immutable request and choices")
+        if self.requirements is not None and not isinstance(self.requirements, ServiceRequirements):
+            raise TypeError("BackendPlan requirements must be immutable ServiceRequirements")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,7 +159,64 @@ class BackendPlan:
             "backend_id": self.backend_id,
             "request": self.request.to_dict(),
             "choices": self.choices.to_dict(),
+            **(
+                {"requirements": self.requirements.to_dict()}
+                if self.requirements is not None
+                else {}
+            ),
         }
+
+    @property
+    def required_services(self) -> dict[str, str | None]:
+        """Required report keys and pinned IDs. None permits a worker-selected ID."""
+        services: dict[str, str | None] = {"runner": None}
+        if self.requirements is not None:
+            services.update(self.requirements.to_dict())
+        else:
+            # Original schema-1 envelopes carry these decisions in provider choices.
+            choices = self.choices.to_dict()
+            if choices.get("operator_policy") or self.request.uses_beam_v1:
+                services.update(stage=choices.get("stage"), operator=None)
+            if choices.get("requires_attention"):
+                services["attention"] = None
+            if graph := choices.get("graph_implementation"):
+                services["graph"] = graph
+            if choices.get("constraint") in ("legacy", "canonical"):
+                # A legacy factory may select the Torch CI override on the worker.
+                services["constraint"] = (
+                    choices.get("constraint_implementation")
+                    if choices["constraint"] == "canonical"
+                    else None
+                )
+        if self.request.uses_beam_v1:
+            services.setdefault("stage", None)
+            services["operator"] = None
+        if self.request.uses_custom_attention:
+            services.setdefault("attention", None)
+        return services
+
+    @property
+    def constraint_mode(self) -> str | None:
+        if self.requirements is None:
+            return self.choices.to_dict().get("constraint")
+        if self.requirements.constraint is None:
+            return None
+        table = self.request.config.to_dict().get("constraint_table") or {}
+        return "canonical" if table.get("enabled") else "legacy"
+
+    @property
+    def constraint_implementation(self) -> str | None:
+        if self.requirements is not None:
+            return self.requirements.constraint
+        return self.choices.to_dict().get("constraint_implementation")
+
+    @property
+    def requires_stage(self) -> bool:
+        return "stage" in self.required_services
+
+    @property
+    def requires_attention(self) -> bool:
+        return "attention" in self.required_services
 
     @property
     def prefill_graph_mode(self) -> str | None:
@@ -145,14 +240,15 @@ class BackendPlan:
         if not isinstance(value, Mapping) or set(value) != {"plan", "fingerprint"}:
             raise ValueError("Invalid backend plan envelope")
         data = value["plan"]
-        if not isinstance(data, Mapping) or set(data) != {
+        fields = {
             "schema_version",
             "plan_api_version",
             "provider_api_version",
             "backend_id",
             "request",
             "choices",
-        }:
+        }
+        if not isinstance(data, Mapping) or set(data) not in (fields, fields | {"requirements"}):
             raise ValueError("Invalid backend plan fields")
         plan = cls(
             backend_id=data["backend_id"],
@@ -161,6 +257,11 @@ class BackendPlan:
             schema_version=data["schema_version"],
             request=BackendRequest.from_dict(data["request"]),
             choices=PlanData(data["choices"]),
+            requirements=(
+                ServiceRequirements.from_dict(data["requirements"])
+                if "requirements" in data
+                else None
+            ),
         )
         if value["fingerprint"] != plan.fingerprint:
             raise ValueError("Backend plan fingerprint mismatch")

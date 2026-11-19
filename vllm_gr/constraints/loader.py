@@ -28,8 +28,6 @@ from vllm_gr.constraints.backend import (
     ConstraintMetadata,
 )
 from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
-from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab, build_npu_stage_vocab
-from vllm_gr.constraints.npu_tables import npu_trie_arrays
 from vllm_gr.constraints.registry import (
     ConstraintImplementation,
     ConstraintTableRequest,
@@ -37,15 +35,13 @@ from vllm_gr.constraints.registry import (
     register_implementation,
     resolve_constraint_implementation,
 )
-from vllm_gr.constraints.table import (
-    CONSTRAINT_TABLE_TENSOR_NAMES,
-    ConstraintTable,
-)
+from vllm_gr.constraints.table import CONSTRAINT_TABLE_TENSOR_NAMES, ConstraintTable
 
 if TYPE_CHECKING:
     from vllm_gr.config import GRConfig
     from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
     from vllm_gr.constraints.npu_backend import NPUConstraintBackend
+    from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab
     from vllm_gr.ops.npu.rec_constrained_topk import NPUConstraintOp
     from vllm_gr.platforms.plan import BackendPlan
 
@@ -214,6 +210,8 @@ def _upload_npu_backend(
     enable_npu_stage_vocab: bool = False,
 ) -> tuple[NPUConstraintBackend, tuple[_ReadyCase, ...]]:
     from vllm_gr.constraints.npu_backend import NPUConstraintBackend
+    from vllm_gr.constraints.npu_stage_vocab import build_npu_stage_vocab
+    from vllm_gr.constraints.npu_tables import npu_trie_arrays
 
     cases = tuple(
         case

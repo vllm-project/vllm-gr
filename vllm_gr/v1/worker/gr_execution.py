@@ -10,7 +10,7 @@ from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
-from vllm_gr.v1.worker.runner_lifecycle import get_stage_execution
+from vllm_gr.v1.worker.runner_lifecycle import get_runner_stage
 
 
 def _copy_record(value: Any) -> Any:
@@ -93,13 +93,13 @@ def execute_gr_stage(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    return get_stage_execution(worker).execute(
+    return get_runner_stage(worker).execute(
         worker, worker_input(scheduled), original, *args, **kwargs
     )
 
 
 def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
-    return get_stage_execution(worker).retire(worker, worker_input(scheduled))
+    return get_runner_stage(worker).retire(worker, worker_input(scheduled))
 
 
 def _dispatch_retirement_frame(self: Any, scheduler_output: Any) -> Any:

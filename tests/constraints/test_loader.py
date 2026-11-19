@@ -215,7 +215,9 @@ def test_npu_stage_vocab_allocation_requires_explicit_eligible_worker(
     def build_stage_vocab(table: ConstraintTable, *args: object) -> None:
         allocations.append(table)
 
-    monkeypatch.setattr(loader, "build_npu_stage_vocab", build_stage_vocab)
+    monkeypatch.setattr(
+        "vllm_gr.constraints.npu_stage_vocab.build_npu_stage_vocab", build_stage_vocab
+    )
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
     backend, _ = loader._upload_npu_backend(  # noqa: SLF001
         table,
@@ -237,8 +239,7 @@ def test_direct_npu_upload_does_not_allocate_stage_vocab_by_default(
 ) -> None:
     monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
     monkeypatch.setattr(
-        loader,
-        "build_npu_stage_vocab",
+        "vllm_gr.constraints.npu_stage_vocab.build_npu_stage_vocab",
         lambda *args, **kwargs: pytest.fail("Direct backend upload has no eligible runner"),
     )
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)

@@ -4,6 +4,7 @@
 """GR rejection through native EngineCore ADD queues, without a model/GPU."""
 
 from collections import deque
+from dataclasses import replace
 from queue import Queue
 from types import SimpleNamespace
 from typing import Any
@@ -248,6 +249,60 @@ def complete(core, name):
     terminal = [out for out in outputs if out.request_id == name and out.finish_reason is not None]
     assert len(terminal) == 1
     assert terminal[0].finish_reason is not FinishReason.ERROR
+
+
+@pytest.mark.l1
+def test_external_stage_release_reaches_the_native_scheduler(core):
+    from tests.platforms.fixtures.provider.gr_example import ExampleStage
+    from vllm_gr.v1.worker.gr_execution import execute_gr_retirement, execute_gr_stage
+
+    sid = "external"
+    core._handle_submit_gr_session(batch(sid, n=2))
+    core._process_input_queue()
+    scheduler = core.scheduler
+    session = scheduler._gr_v1_sessions[sid]
+    runner = SimpleNamespace()
+    stage = ExampleStage(plan=None, runner=runner)
+    runner._gr_backend_binding = SimpleNamespace(runner_adapter=SimpleNamespace(stage=stage))
+    first, last = scheduler.schedule(), scheduler.schedule()
+    assert len(session._in_flight_dispatches) == 2
+
+    def execute(_, frame):
+        return worker_receipt(scheduler, frame)
+
+    first_output = execute_gr_stage(runner, first, execute)
+    scheduler.update_from_output(first, first_output)
+    assert getattr(scheduler.schedule(), GR_RETIRE_OUTPUT_ATTR, None) is None
+    last_output = execute_gr_stage(runner, last, execute)
+    last_output.gr_worker_results[sid] = replace(
+        last_output.gr_worker_results[sid], resources_released=False
+    )
+    pending = scheduler.update_from_output(last, last_output)
+    assert all(out.finish_reason is None for group in pending.values() for out in group.outputs)
+    assert not session._in_flight_dispatches and session.worker_resources_allocated
+
+    retirement = scheduler.schedule()
+    proof = execute_gr_retirement(runner, retirement)
+    assert not stage.active
+    matching = proof.gr_retire_result
+    proof.gr_retire_result = replace(matching, owner_generation=matching.owner_generation - 1)
+    with pytest.raises(RuntimeError, match="prove release"):
+        scheduler.update_from_output(retirement, proof)
+    assert session.worker_resources_allocated and not session._terminal_emitted
+
+    proof.gr_retire_result = matching
+    completed = scheduler.update_from_output(retirement, proof)
+    duplicate = scheduler.update_from_output(retirement, execute_gr_retirement(runner, retirement))
+    terminal = [
+        out
+        for update in (completed, duplicate)
+        for group in update.values()
+        for out in group.outputs
+        if out.finish_reason is not None
+    ]
+    assert len(terminal) == 1 and terminal[0].finish_reason is FinishReason.LENGTH
+    assert terminal[0].kv_transfer_params["gr_batch_result"] == last_output.gr_batch_results[sid]
+    assert sid not in scheduler._gr_v1_sessions
 
 
 @pytest.mark.parametrize("rejection", ["kv_capacity", "width", "budget"])

@@ -339,9 +339,7 @@ def for_config(config: Any = None, *, layer_names: Any = None) -> Any:
         from .services import planning_provider
 
         plan = read_backend_plan(config)
-        if plan is not None and (
-            plan.choices.to_dict().get("requires_attention") or plan.request.uses_custom_attention
-        ):
+        if plan is not None and plan.requires_attention:
             executor = bind_attention(runner, planning_provider(activate_current_backend()), plan)
             if executor is None:
                 raise RuntimeError("Backend did not bind the required attention executor")

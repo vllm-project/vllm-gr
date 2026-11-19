@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm_gr.v1.beam.decision_ops import workspace_candidate_width
+
 if TYPE_CHECKING:
     from vllm_gr.ops.cuda.beam_state import BeamStateScratch
 
@@ -242,23 +244,6 @@ class BeamPostprocessWorkspacePool:
         return sum(workspace.device_memory_bytes for workspace in self._buckets.values())
 
 
-def _workspace_candidate_width(runner: Any, beam_width: int) -> int:
-    """Resolve K for a workspace lookup, falling back to the legacy K == W."""
-
-    from vllm_gr.config import GRConfig, resolve_candidate_width
-
-    try:
-        config = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
-    except (AttributeError, TypeError, ValueError):
-        return beam_width
-    if config.beam_max_width is None:
-        return beam_width
-    try:
-        return resolve_candidate_width(config)
-    except ValueError:
-        return beam_width
-
-
 def get_beam_postprocess_workspace(
     runner: Any,
     beam_width: int,
@@ -276,7 +261,7 @@ def get_beam_postprocess_workspace(
     if not isinstance(dtype, torch.dtype):
         return None
     if candidate_width is None:
-        candidate_width = _workspace_candidate_width(runner, beam_width)
+        candidate_width = workspace_candidate_width(runner, beam_width)
     key = BeamPostprocessWorkspaceKey(beam_width, candidate_width, dtype)
     try:
         return pool.require(key)

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-gr-conformance-provider"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = ["vllm-gr"]
+
+[project.entry-points."vllm_gr.platform_backends"]
+example = "gr_example:PROVIDER"
+alternate = "gr_example:ALTERNATE"
+incompatible = "gr_example:INCOMPATIBLE"
+
+[project.entry-points."vllm.platform_plugins"]
+gr_conformance = "gr_example:native_platform"

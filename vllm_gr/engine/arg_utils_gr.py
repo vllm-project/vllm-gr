@@ -28,6 +28,7 @@ from vllm_gr.config.parser import (
     normalize_gr_config_input,
 )
 from vllm_gr.config.validation import validate_beam_engine_driven
+from vllm_gr.platforms.config import BackendConfigService, engine_config_service
 
 
 def _catalog_is_triples_document(catalog_path: str) -> bool:
@@ -339,59 +340,6 @@ def _explicit_gr_attention_backend(
     return False, None
 
 
-def _apply_npu_default_block_size(config) -> None:
-    """Use an Ascend-compatible default without overriding user intent.
-
-    vLLM-Ascend 0.30 sets the block size to 128 itself when prefix caching or
-    chunked prefill is enabled, but leaves the platform default in place
-    otherwise, while the beam attention backends require the 128 kernel
-    geometry. This rule closes that gap; it was validated on the 0.30.0rc2
-    runtime.
-    """
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return
-    if getattr(current_platform, "device_type", None) != "npu":
-        return
-
-    cache_config = getattr(config, "cache_config", None)
-    model_config = getattr(config, "model_config", None)
-    if cache_config is None:
-        return
-    if getattr(cache_config, "user_specified_block_size", False):
-        return
-    # Hybrid attention/state models have model-specific cache sizing rules in
-    # vLLM-Ascend and must not be forced onto the dense-attention default.
-    if model_config is not None and getattr(model_config, "is_hybrid", False):
-        return
-    if cache_config.block_size != 128:
-        logger.info(
-            "Using Ascend-compatible default KV cache block size 128 "
-            "(vLLM resolved the unspecified value to %s).",
-            cache_config.block_size,
-        )
-        cache_config.block_size = 128
-
-
-def _is_npu_platform() -> bool:
-    """Return whether the active platform is an Ascend NPU."""
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return False
-    return getattr(current_platform, "device_type", None) == "npu"
-
-
-def _is_cuda_platform() -> bool:
-    """Return whether the active platform is CUDA."""
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return False
-    return getattr(current_platform, "device_type", None) == "cuda"
-
-
 def _constraint_explicitly_configured(
     engine_args: object,
     existing_gr_config: GRConfig,
@@ -414,12 +362,13 @@ def _constraint_explicitly_configured(
 
 
 def _beam_worker_decision_default(
+    service: BackendConfigService,
     *,
     beam_width_configured: bool,
     worker_decision: bool | None,
 ) -> bool | None:
     """Resolve an omitted accelerator control while preserving explicit False."""
-    if beam_width_configured and (_is_cuda_platform() or _is_npu_platform()):
+    if beam_width_configured and service.default_worker_decision:
         if worker_decision is None:
             return True
     return worker_decision
@@ -427,7 +376,8 @@ def _beam_worker_decision_default(
 
 def create_engine_config(self, usage_context=None, headless=False):
     config = origin_create_engine_config(self, usage_context, headless)
-    _apply_npu_default_block_size(config)
+    service = engine_config_service()
+    service.apply_native_defaults(config)
     # Parse unconditionally so invalid raw vllm_gr_* options fail before
     # the EngineConfig is returned and before runtime execution begins.
     additional_config = getattr(config, "additional_config", None)
@@ -510,55 +460,29 @@ def create_engine_config(self, usage_context=None, headless=False):
             else existing_gr_config.beam_worker_decision
         )
         validate_beam_engine_driven(getattr(self, "beam_engine_driven", None))
-        # NPU platform default for beam-serve deployments: when the user
-        # enables beam search (beam_max_width) with a constraint catalog
-        # (a Triples document) and no explicit backend choice, run Constraint
-        # Tables with worker-side beam decision by default.  Promotion requires
-        # a catalog: the tokenizer auto-build sentinel would fail fast on
-        # models whose s_a/s_b/s_c groups exceed max_valid_items (e.g. OneRec
-        # 8192 > 500), so a catalog-free beam deployment stays unconstrained
-        # (legacy) instead.  This only fires on a real NPU device with an
-        # active beam pool, so non-GR / non-beam configs and non-NPU platforms
-        # are untouched.  beam_max_width is read from the parsed config (GRLLM
-        # rides it in additional_config) or the EngineArgs attribute (serve
-        # CLI).
+        # Promote only a triples catalog with an active pool and no explicit backend.
         beam_width_configured = (
             getattr(self, "beam_max_width", None) is not None
             or existing_gr_config.beam_max_width is not None
         )
         if (
             effective_constrained_generation is not False
-            and _is_npu_platform()
+            and service.promote_catalog_tables
             and beam_width_configured
             and not _constraint_explicitly_configured(self, existing_gr_config)
             and effective_catalog_path is not None
             and _catalog_is_triples_document(effective_catalog_path)
         ):
-            # Promote to Constraint Tables on NPU beam deployments.  A user
-            # catalog_path is kept as-is: it is expected to be a
-            # tools/build_constraint_triples.py Triples document (the
-            # constraint data source for the promoted backend); only a triples
-            # document (JSON object) triggers the promotion, so a Trie-list
-            # catalog keeps its Trie semantics.  The sentinel auto-build path is
-            # NOT used here: a tokenizer whose s_a/s_b/s_c groups exceed
-            # max_valid_items fails fast (e.g. OneRec 8192>500), and a
-            # catalog-free GRLLM (no constraint data at all) must stay
-            # unconstrained (legacy) instead of force-building tables.  A
-            # catalog document is therefore required for the promotion.
             effective_constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
         effective_beam_worker_decision = _beam_worker_decision_default(
+            service,
             beam_width_configured=beam_width_configured,
             worker_decision=effective_beam_worker_decision,
         )
         offset, slice_size = None, None
-        # CUDA Constraint Tables support sliced logits while keeping global
-        # table token ids (CUDAConstrainedTopKExecution._vocab_window).  The
-        # slice helper accepts both Trie lists and triples documents, so keep
-        # the old lm_head fast path on CUDA. NPU retains its full-vocabulary
-        # ABI and validate_constraint_table_platform rejects slicing there.
         constraint_slice_supported = (
             effective_constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
-            or _is_cuda_platform()
+            or service.supports_constraint_vocab_slicing
         )
         if (
             effective_constrained_generation is not False
@@ -568,9 +492,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         ):
             model_name = getattr(self, "model", None)
             if model_name is not None:
-                from vllm_gr.utils.catalog import (
-                    compute_catalog_slice_config,
-                )
+                from vllm_gr.utils.catalog import compute_catalog_slice_config
 
                 trust_remote_code = bool(getattr(self, "trust_remote_code", False))
                 offset, slice_size = compute_catalog_slice_config(
@@ -616,6 +538,7 @@ def create_engine_config(self, usage_context=None, headless=False):
 
     if canonical_source:
         worker_decision = _beam_worker_decision_default(
+            service,
             beam_width_configured=effective_gr_config.beam_max_width is not None,
             worker_decision=effective_gr_config.beam_worker_decision,
         )
@@ -623,15 +546,6 @@ def create_engine_config(self, usage_context=None, headless=False):
             effective_gr_config,
             beam_worker_decision=worker_decision,
         )
-
-    if (
-        effective_gr_config.constrained_generation is False
-        and effective_gr_config.beam_max_width is not None
-        and _is_npu_platform()
-    ):
-        from vllm_gr.v1.engine.beam_search_v1 import validate_npu_unconstrained_runner
-
-        validate_npu_unconstrained_runner(config)
 
     if effective_gr_config.constrained_generation is False:
         from vllm_gr.ops.sliced_logits import set_vocab_slice_config
@@ -646,25 +560,7 @@ def create_engine_config(self, usage_context=None, headless=False):
             effective_gr_config, beam_execution_mode=validate_beam_execution_mode(execution_mode)
         )
 
-    # Ascend may retain the V2 opt-in while constructing a V1 runner. Only
-    # CUDA V2 Beam engines require the persistent protocol; ordinary V2
-    # engines and existing V1/NPU defaults remain unchanged.
-    if (
-        _is_cuda_platform()
-        and getattr(config, "use_v2_model_runner", False)
-        and (
-            effective_gr_config.beam_max_width is not None
-            or (
-                effective_gr_config.constraint_table is not None
-                and effective_gr_config.constraint_table.enabled
-            )
-        )
-        and effective_gr_config.beam_execution_mode is not BeamExecutionMode.V1
-    ):
-        raise ValueError(
-            "ModelRunner V2 Beam requires beam.execution_mode='v1'; "
-            "select it explicitly before engine initialization, or use ModelRunner V1"
-        )
+    service.validate_engine(config, effective_gr_config)
 
     max_num_seqs = getattr(getattr(config, "scheduler_config", None), "max_num_seqs", None)
     if (
@@ -695,32 +591,8 @@ def create_engine_config(self, usage_context=None, headless=False):
         from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
 
         validate_gr_execution_config(config)
-        compilation = getattr(config, "compilation_config", None)
-        if (
-            _is_cuda_platform()
-            and not getattr(config, "use_v2_model_runner", False)
-            and compilation is not None
-            and compilation.backend == "inductor"
-        ):
-            # Inductor can benchmark an extra, halved reduction block on each
-            # AOT load. Q/K norm rounding then changes across independent
-            # engines, including Beam candidate order and scores. Keep the
-            # compiled reduction geometry; record this in the native config
-            # so the AOT cache key includes it. Explicit overrides still win.
-            compilation.inductor_compile_config.setdefault("dynamic_scale_rblock", False)
 
-    # On Ascend, vllm-ascend wraps EngineCoreProc.run_engine_core and validates
-    # additional_config (pydantic extra="forbid") in the spawned EngineCore
-    # process *before* the vllm-gr plugin loads. Install the GR-key sanitizer
-    # here -- after origin_create_engine_config and every general plugin, and
-    # before EngineCoreClient spawns the process -- so it is the outermost
-    # entrypoint and filters GR keys during vllm-ascend's init_ascend_config.
-    if _is_npu_platform():
-        from vllm.v1.engine.core import EngineCoreProc
-
-        from vllm_gr.v1.ascend_compat import apply_engine_core_config_sanitizer
-
-        apply_engine_core_config_sanitizer(EngineCoreProc)
+    service.finalize_native_config(config, effective_gr_config)
 
     from vllm_gr.platforms.planning import admit_backend_plan
 

@@ -46,12 +46,16 @@ def test_runtime_patch_order_preserves_ascend_initialization(
 ) -> None:
     import vllm_gr.patch as runtime_patch
     from vllm_gr import npu_spawn_patch
-    from vllm_gr.platforms import loader
+    from vllm_gr.platforms import loader, registry
     from vllm_gr.platforms.ascend import NPU_BACKEND
     from vllm_gr.v1 import ascend_compat
 
+    monkeypatch.setattr(registry, "_BACKENDS", {})
+    registry.register_backend(NPU_BACKEND, source="builtin:ascend")
     monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
     call_order: list[str] = []
+    monkeypatch.setattr(npu_spawn_patch, "is_npu_spawn_patched", lambda: "npu_spawn" in call_order)
+    monkeypatch.setattr(ascend_compat, "is_npu_worker_patched", lambda: "npu_worker" in call_order)
 
     def apply_npu_spawn() -> int:
         call_order.append("npu_spawn")
@@ -681,7 +685,9 @@ def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
     monkeypatch.setattr(system_utils, "_maybe_force_spawn", upstream)
     monkeypatch.setattr(multiproc_executor, "_maybe_force_spawn", upstream)
 
+    assert not npu_spawn_patch.is_npu_spawn_patched()
     assert npu_spawn_patch.apply_npu_spawn_patch() is True
+    assert npu_spawn_patch.is_npu_spawn_patched()
     wrapped = system_utils._maybe_force_spawn
     assert multiproc_executor._maybe_force_spawn is wrapped
     assert hasattr(wrapped, "_vllm_gr_npu_spawn_original")
@@ -698,6 +704,7 @@ def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
 
     # A later native import can restore the directly imported executor alias.
     monkeypatch.setattr(multiproc_executor, "_maybe_force_spawn", upstream)
+    assert not npu_spawn_patch.is_npu_spawn_patched()
     assert npu_spawn_patch.apply_npu_spawn_patch() is True
     assert system_utils._maybe_force_spawn is wrapped
     assert multiproc_executor._maybe_force_spawn is wrapped

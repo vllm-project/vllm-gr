@@ -28,6 +28,7 @@ from vllm_gr.config.parser import (
     CONSTRAINT_BACKEND_KEY,
     NPU_DECODE_EXECUTION_KEY,
 )
+from vllm_gr.platforms.legacy import legacy_config_service
 
 
 def _vllm_config(additional_config: object | None = None) -> SimpleNamespace:
@@ -582,8 +583,8 @@ def test_npu_constraint_table_auto_promotion_respects_capacity(
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
-            return_value=True,
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("npu"),
         ),
         mock.patch(
             "vllm_gr.engine.arg_utils_gr._catalog_is_triples_document",
@@ -789,8 +790,8 @@ def test_npu_beam_without_catalog_stays_unconstrained() -> None:
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
-            return_value=True,
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("npu"),
         ),
     ):
         result = create_engine_config(_npic_engine_args(128))
@@ -819,8 +820,8 @@ def test_npu_trie_list_catalog_is_not_promoted() -> None:
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
-            return_value=True,
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("npu"),
         ),
         mock.patch(
             "vllm_gr.engine.arg_utils_gr._catalog_is_triples_document",
@@ -874,8 +875,8 @@ def test_npu_catalog_path_without_backend_promotes_to_constraint_table(
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
-            return_value=True,
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("npu"),
         ),
         mock.patch(
             "vllm_gr.engine.arg_utils_gr._catalog_is_triples_document",
@@ -916,8 +917,8 @@ def test_gpu_catalog_path_without_backend_keeps_trie_default() -> None:
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
-            return_value=False,
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service(None),
         ),
     ):
         result = create_engine_config(engine_args)
@@ -936,8 +937,10 @@ def test_cuda_beam_enables_worker_decision_by_default() -> None:
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
             return_value=_vllm_config(),
         ),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=True),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("cuda"),
+        ),
     ):
         result = create_engine_config(engine_args)
 
@@ -979,12 +982,8 @@ def test_non_cuda_constraint_table_backend_skips_vocab_slice_computation(
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
-            return_value=False,
-        ),
-        mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_cuda_platform",
-            return_value=False,
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service(None),
         ),
         mock.patch(
             "vllm_gr.utils.catalog.compute_catalog_slice_config",
@@ -1028,8 +1027,10 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
             return_value=_vllm_config(),
         ),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=True),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("cuda"),
+        ),
         mock.patch(
             "vllm_gr.utils.catalog.compute_catalog_slice_config",
             return_value=(151669, 24576),
@@ -1110,9 +1111,9 @@ def test_engine_config_preserves_explicit_decision_controls(
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config", return_value=vllm_config
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=platform == "cuda"
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service(platform),
         ),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=platform == "npu"),
     ):
         result = GRConfig.from_vllm_config(create_engine_config(engine_args))
     expected_worker = worker_decision
@@ -1134,8 +1135,10 @@ def test_engine_config_merge_keeps_npu_execution_choice(execution: NPUDecodeExec
         mock.patch(
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config", return_value=vllm_config
         ),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
-        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=True),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.engine_config_service",
+            return_value=legacy_config_service("npu"),
+        ),
     ):
         result = GRConfig.from_vllm_config(create_engine_config(SimpleNamespace(beam_max_width=32)))
     assert result.npu_decode_execution is execution

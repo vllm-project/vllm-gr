@@ -423,8 +423,12 @@ def test_plan_cannot_drop_or_replace_an_explicit_constraint(
     assert read_backend_plan(native) is None
 
 
+@pytest.mark.parametrize("explicit_services", [False, True])
 def test_canonical_plan_binds_the_registered_factory_and_preserves_runner_ownership(
-    tmp_path: Path, external_implementation: Any, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    external_implementation: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_services: bool,
 ) -> None:
     from vllm_gr.config import BeamExecutionMode, GRConfig, write_canonical_gr_config
     from vllm_gr.platforms import loader as provider_loader
@@ -439,7 +443,7 @@ def test_canonical_plan_binds_the_registered_factory_and_preserves_runner_owners
         constraint_plan_choices,
     )
     from vllm_gr.platforms.interface import ModelRunnerAdapter, StageExecution
-    from vllm_gr.platforms.plan import BackendPlan, PlanData
+    from vllm_gr.platforms.plan import BackendPlan, PlanData, ServiceRequirements
     from vllm_gr.platforms.planning import admit_backend_plan
     from vllm_gr.v1.beam.decision_ops import reference_ops
     from vllm_gr.v1.engine.hot_update import reload_trie as reload_engine
@@ -452,6 +456,14 @@ def test_canonical_plan_binds_the_registered_factory_and_preserves_runner_owners
         adapter_revision = "fixture-v1"
 
         def resolve(self, request: Any) -> BackendPlan:
+            if explicit_services:
+                return BackendPlan(
+                    self.backend_id,
+                    self.api_version,
+                    request,
+                    PlanData({}),
+                    requirements=ServiceRequirements(constraint="acme-tpu"),
+                )
             choices = constraint_plan_choices(request.config.to_dict(), legacy_id="cpu")
             return BackendPlan(self.backend_id, self.api_version, request, PlanData(choices))
 
@@ -491,7 +503,7 @@ def test_canonical_plan_binds_the_registered_factory_and_preserves_runner_owners
     plan = admit_backend_plan(native)
     assert plan is not None
     assert canonical_constraint_id(table, plan) == "acme-tpu"
-    assert plan.choices.to_dict()["constraint_implementation"] == "acme-tpu"
+    assert plan.constraint_implementation == "acme-tpu"
     with pytest.raises(ValueError, match="differs from the admitted request"):
         canonical_constraint_id(replace(table, implementation_id="other"), plan)
 

@@ -174,10 +174,6 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     gr_config = GRConfig.from_vllm_config(vllm_config)
     table = gr_config.constraint_table
     unconstrained = gr_config.constrained_generation is False
-    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
-    device_type = str(device).split(":")[0]
-    if unconstrained and device_type not in ("cuda", "npu"):
-        raise BeamSearchRequestError("unconstrained beam_search_v1 requires CUDA or NPU")
     if not unconstrained:
         plan = read_backend_plan(vllm_config)
         if table is None or not table.enabled:
@@ -186,14 +182,14 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
             )
         try:
             implementation_id = canonical_constraint_id(table, plan)
+            if plan is None and table.implementation_id is None:
+                from vllm_gr.platforms.legacy import (
+                    validate_legacy_constraint_placement,
+                )
+
+                validate_legacy_constraint_placement(vllm_config, implementation_id)
         except ValueError as error:
             raise BeamSearchRequestError(str(error)) from error
-        # Historical callers can supply native config directly before EngineArgs
-        # has admitted a plan. Preserve the old placement check for enum-only input.
-        if plan is None and table.implementation_id is None and implementation_id != device_type:
-            raise BeamSearchRequestError(
-                f"beam_search_v1 requires an enabled canonical {device_type.upper()} constraint table"
-            )
     if not unconstrained and request.beam_params.catalog_strategy is not None:
         raise BeamSearchRequestError(
             "catalog_strategy is not applicable to the constraint_table backend"
@@ -270,13 +266,6 @@ def _create_batch_request(
     dynamic_widths = getattr(params, "dynamic_beam_widths", None)
     per_parent_beam_widths = getattr(params, "per_parent_beam_widths", None)
     result_width = getattr(params, "result_width", None)
-    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
-    if str(device).split(":")[0] not in ("cuda", "npu") and (
-        dynamic_widths is not None or result_width is not None
-    ):
-        raise BeamSearchRequestError(
-            "dynamic_beam_widths and result_width require CUDA or NPU beam_search_v1"
-        )
     if dynamic_widths is not None and (
         not isinstance(dynamic_widths, list)
         or len(dynamic_widths) != sampling_params.max_tokens

@@ -45,9 +45,7 @@ def row_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         stub.__file__ = "/mock/torch_npu/__init__.py"
         monkeypatch.setitem(sys.modules, "torch_npu", stub)
     monkeypatch.setattr(beam_ops, "is_available", lambda: True)
-    source = (
-        REPO_ROOT / "vllm_gr/v1/attention/backends/beam_attn_npu_xllm.py"
-    )
+    source = REPO_ROOT / "vllm_gr/v1/attention/backends/beam_attn_npu_xllm.py"
     spec = importlib.util.spec_from_file_location("_test_npu_beam_row_views_xllm", source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

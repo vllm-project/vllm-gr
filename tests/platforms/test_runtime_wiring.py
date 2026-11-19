@@ -76,6 +76,8 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
     worker = hook("worker", 1)
     monkeypatch.setattr(npu_spawn_patch, "apply_npu_spawn_patch", spawn)
     monkeypatch.setattr(ascend_compat, "patch_npu_worker_init_device", worker)
+    monkeypatch.setattr(npu_spawn_patch, "is_npu_spawn_patched", lambda: spawn.called)
+    monkeypatch.setattr(ascend_compat, "is_npu_worker_patched", lambda: worker.called)
     beam = hook("beam", 1)
     monkeypatch.setattr(patch, "_apply_gr_beam_patches", beam)
     monkeypatch.setattr(patch, "get_last_beam_patch_report", lambda: None)

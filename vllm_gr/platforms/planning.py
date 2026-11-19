@@ -11,6 +11,8 @@ from enum import Enum
 from importlib import metadata
 from typing import Any
 
+from .config import provider_config_service
+from .graph import graph_options
 from .loader import external_provider_entry_points
 from .plan import BACKEND_PLAN_KEY, BackendPlan, BackendRequest, PlanData
 
@@ -101,36 +103,8 @@ def normalize_backend_request(
         if section == "model_config" and values["dtype"] is not None:
             values["dtype"] = str(values["dtype"])
         native[section] = values
-    # These opt-ins are startup inputs. A worker checking the transferred plan
-    # must not replace them with the environment of another co-resident engine.
-    from vllm_gr.v1.attention.backends.beam_dense_prefill import (
-        requested_dense_prefill_mode,
-    )
-
-    if admitted is None:
-        selected_dense = requested_dense_prefill_mode()
-        # Match native vLLM's integer environment option without importing
-        # vLLM or a device module during engine request normalization.
-        batch_invariant = (
-            bool(int(os.environ.get("VLLM_BATCH_INVARIANT", "0"))) if selected_dense else False
-        )
-    else:
-        options = admitted.request.native.to_dict()
-        selected_dense = options.get("dense_prefill_request")
-        batch_invariant = options.get("dense_prefill_batch_invariant", False)
-    from .graph import PREFILL_OPTIONS, graph_options
-
-    native["graph_options"] = (
-        graph_options(
-            getattr(
-                getattr(provider, "native_graph_factory", None), "option_names", PREFILL_OPTIONS
-            )
-        )
-        if admitted is None
-        else admitted.request.native.to_dict().get("graph_options", {})
-    )
-    native["dense_prefill_request"] = selected_dense
-    native["dense_prefill_batch_invariant"] = batch_invariant
+    admitted_inputs = admitted.request.native.to_dict() if admitted is not None else None
+    provider_inputs = provider_config_service(provider).startup_inputs(admitted_inputs)
     native["has_kv_transfer"] = getattr(config, "kv_transfer_config", None) is not None
     native["kv_cache_layout"] = os.environ.get("VLLM_KV_CACHE_LAYOUT")
     native["use_v2_model_runner"] = bool(getattr(config, "use_v2_model_runner", False))
@@ -147,6 +121,13 @@ def normalize_backend_request(
             "vocab_size",
         )
     }
+    if set(native).intersection(provider_inputs):
+        raise ValueError("Provider startup inputs collide with native plan fields")
+    native.update(provider_inputs)
+    if admitted_inputs is not None:
+        native["graph_options"] = admitted_inputs.get("graph_options", {})
+    elif "graph_options" not in native:
+        native["graph_options"] = graph_options()
     additional = getattr(config, "additional_config", None)
     options = additional.get(BACKEND_OPTIONS_KEY, {}) if isinstance(additional, Mapping) else {}
     return BackendRequest(
@@ -159,7 +140,7 @@ def normalize_backend_request(
 
 def resolve_backend_plan(provider: Any, request: BackendRequest) -> BackendPlan:
     from .constraint_plan import admitted_constraint_id
-    from .services import planning_provider
+    from .services import graph_provider, planning_provider
 
     plan = planning_provider(provider).resolve(request)
     if not isinstance(plan, BackendPlan):
@@ -172,8 +153,10 @@ def resolve_backend_plan(provider: Any, request: BackendRequest) -> BackendPlan:
         raise ValueError("Backend resolve() changed request or provider identity")
     if (request.config.to_dict().get("constraint_table") or {}).get("enabled"):
         admitted_constraint_id(plan)
-    if plan.prefill_graph_mode and not plan.choices.to_dict().get("graph_implementation"):
+    if plan.prefill_graph_mode and "graph" not in plan.required_services:
         raise ValueError("An explicit Prefill graph mode requires an admitted graph service")
+    if "graph" in plan.required_services:
+        graph_provider(provider)
     return plan
 
 

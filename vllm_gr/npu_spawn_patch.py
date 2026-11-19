@@ -46,6 +46,14 @@ def _is_npu_spawn_wrapper(function: object) -> bool:
     return hasattr(function, _ORIGINAL_ATTR)
 
 
+def is_npu_spawn_patched() -> bool:
+    import vllm.utils.system_utils as system_utils
+    import vllm.v1.executor.multiproc_executor as multiproc_executor
+
+    target = getattr(system_utils, "_maybe_force_spawn", None)
+    return _is_npu_spawn_wrapper(target) and multiproc_executor._maybe_force_spawn is target
+
+
 def apply_npu_spawn_patch() -> bool:
     """Wrap upstream `_maybe_force_spawn` to also force spawn for NPU.
 

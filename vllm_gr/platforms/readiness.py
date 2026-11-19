@@ -25,21 +25,30 @@ def worker_backend_readiness(worker: Any) -> dict[str, Any]:
     return binding.report()
 
 
+def validate_required_services(
+    plan: BackendPlan, required: dict[str, str | None], reported: dict[str, Any], worker: str
+) -> None:
+    for name, expected in required.items():
+        actual = reported.get(name)
+        if not isinstance(actual, str) or not actual.strip():
+            raise RuntimeError(f"{worker} has no bound {name}")
+        if expected is not None and actual != expected:
+            label = (
+                "canonical constraint"
+                if name == "constraint" and plan.constraint_mode == "canonical"
+                else name
+            )
+            raise RuntimeError(
+                f"{worker} {label} implementation mismatch: expected {expected}, got {actual}"
+            )
+
+
 def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_workers: int) -> None:
     if type(expected_workers) is not int or expected_workers < 1:
         raise ValueError("Backend readiness requires a positive integer worker count")
     if not isinstance(reports, (list, tuple)) or len(reports) != expected_workers or not reports:
         raise RuntimeError(f"Backend readiness requires {expected_workers} worker reports")
-    choices = plan.choices.to_dict()
-    required = ["runner"]
-    if choices.get("graph_implementation"):
-        required.append("graph")
-    if choices.get("operator_policy"):
-        required.extend(("stage", "operator"))
-    if choices.get("requires_attention"):
-        required.append("attention")
-    if choices.get("constraint") in ("legacy", "canonical"):
-        required.append("constraint")
+    required = plan.required_services
     services = None
     for index, report in enumerate(reports):
         if not isinstance(report, dict):
@@ -53,23 +62,7 @@ def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_worke
         reported = report.get("services")
         if not isinstance(reported, dict):
             raise RuntimeError(f"Backend worker {index} has no bound services")
-        for service in required:
-            if not isinstance(reported.get(service), str) or not reported[service].strip():
-                raise RuntimeError(f"Backend worker {index} has no bound {service}")
-        if (
-            choices.get("graph_implementation")
-            and reported["graph"] != choices["graph_implementation"]
-        ):
-            raise RuntimeError(f"Backend worker {index} graph implementation mismatch")
-        expected_constraint = choices.get("constraint_implementation")
-        if (
-            choices.get("constraint") == "canonical"
-            and expected_constraint is not None
-            and reported["constraint"] != expected_constraint
-        ):
-            raise RuntimeError(
-                f"Backend worker {index} canonical constraint implementation mismatch"
-            )
+        validate_required_services(plan, required, reported, f"Backend worker {index}")
         current = PlanData(reported)
         if services is not None and current != services:
             raise RuntimeError("Workers disagree on bound backend service implementations")

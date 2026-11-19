@@ -153,4 +153,7 @@ echo "Running packaging metadata tests"
     tests/packaging/test_install_metadata.py \
     -q
 
+core_sha256="$("$PYTHON" -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' "${wheels[0]}")"
+"$PYTHON" tools/run_provider_conformance.py "${wheels[0]}" --sha256 "$core_sha256"
+
 echo "Wheel smoke test completed successfully."

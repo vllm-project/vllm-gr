@@ -177,7 +177,7 @@ def test_sid_stage_vocab_admits_npu_without_importing_device_runtime(device: str
 
 @_parametrize("device", ["cuda", "cuda:0", None])
 def test_sid_stage_vocab_rejects_other_or_unknown_device(device: str | None) -> None:
-    with pytest.raises(ValueError, match=r"sid_stage_vocab requires NPU"):
+    with pytest.raises(ValueError, match=r"sid_stage_vocab requires a provider"):
         validate_gr_device_config(_device_config(device))
 
 

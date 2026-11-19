@@ -115,9 +115,7 @@ def validate_constraint_table_platform(
     )
 
     table = gr_config.constraint_table
-    implementation_id = (
-        plan.choices.to_dict().get("constraint_implementation") if plan else None
-    ) or device_type
+    implementation_id = (plan.constraint_implementation if plan else None) or device_type
     if table is not None and table.enabled:
         implementation = resolve_constraint_implementation(table, plan)
     elif implementation_id:
@@ -256,7 +254,7 @@ def prepare_constraint_table(
         # Historical resource injection without an engine plan used the
         # native placement. Planned and canonical tables carry their own ID.
         table = gr_config.constraint_table
-        planned_id = plan.choices.to_dict().get("constraint_implementation") if plan else None
+        planned_id = plan.constraint_implementation if plan else None
         legacy_placement = not planned_id and (table is None or not table.enabled)
         validate_constraint_table_platform(
             gr_config,

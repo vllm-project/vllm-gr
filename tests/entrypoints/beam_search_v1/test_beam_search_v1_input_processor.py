@@ -731,7 +731,7 @@ def test_per_parent_beam_widths_reaches_worker_contract(device: str, online: boo
 def test_cpu_per_parent_beam_widths_is_rejected_before_submission(online: bool) -> None:
     engine = _make_engine()
     engine.vllm_config.device_config = SimpleNamespace(device="cpu")
-    with pytest.raises(BeamSearchRequestError, match="requires a CUDA ModelRunner or NPU"):
+    with pytest.raises(BeamSearchRequestError, match="requires a provider with a Beam ModelRunner"):
         _prepare_request(
             engine,
             [1, 2],

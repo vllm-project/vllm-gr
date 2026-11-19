@@ -60,6 +60,7 @@ patches:
     installer: vllm_gr.v1.ascend_compat.patch_npu_worker_init_device
     activation: the selected NPU provider revalidates early config bindings on every call and wraps NPUWorker.init_device only when needed; unavailable native worker imports are retried on later initialization
     validator_or_test:
+      - vllm_gr.v1.ascend_compat.is_npu_worker_patched verifies the live target when the native worker is available
       - tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
       - tests/v1/test_ascend_compat.py::test_npu_worker_reinstalls_over_replaced_upstream_target
       - tests/v1/test_ascend_compat.py::test_worker_rechecks_config_bindings_without_rewrapping_device_hook
@@ -195,6 +196,7 @@ patches:
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the CUDA provider mounts Worker utilities at process startup; Worker.init_device installs and verifies the admitted V1 or V2 generation, which binds the planned runner after model load regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes; the runner adapter owns stage execution, retirement and the selected Beam operators; canonical constraint tables bind by admitted implementation ID
     validator_or_test:
+      - tests/platforms/test_cuda_runner.py
       - tests/constraints/test_registry.py
       - tests/platforms/test_bound_stage_execution.py
       - vllm_gr.patch._validate_model_runner_patch
@@ -304,7 +306,7 @@ patches:
     installer: vllm_gr.npu_spawn_patch.apply_npu_spawn_patch
     activation: the selected NPU provider installs or repairs spawn protection before importing the native worker
     validator_or_test:
-      - vllm_gr.npu_spawn_patch.apply_npu_spawn_patch return value
+      - vllm_gr.npu_spawn_patch.is_npu_spawn_patched verifies both native bindings
       - tests/test_patch_initialization.py::test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings
       - tests/test_patch_initialization.py::test_npu_spawn_patch_forces_spawn_only_when_npu_initialized
     process_roles: [main, engine_core]

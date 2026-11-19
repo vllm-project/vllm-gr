@@ -15,6 +15,7 @@ from vllm_gr.config import (
     gr_config_from_mapping,
     gr_config_to_mapping,
 )
+from vllm_gr.platforms.legacy import legacy_config_service
 from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
 
 
@@ -117,8 +118,7 @@ def test_mode_override_with_canonical_engine_config(monkeypatch: pytest.MonkeyPa
         additional_config={}, scheduler_config=SimpleNamespace(async_scheduling=True)
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
-    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: False)
-    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: False)
+    monkeypatch.setattr(arg_utils_gr, "engine_config_service", lambda: legacy_config_service(None))
     raw = gr_config_to_mapping(GRConfig(constraint_table=ConstraintTableConfig(max_top_k=4)))
     args = SimpleNamespace(_vllm_gr_config_input=raw, beam_execution_mode="v1")
     assert arg_utils_gr.create_engine_config(args) is config
@@ -133,8 +133,7 @@ def test_mode_override_rejects_empty_string(monkeypatch: pytest.MonkeyPatch) -> 
         "origin_create_engine_config",
         lambda *a: SimpleNamespace(additional_config={}),
     )
-    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: False)
-    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: False)
+    monkeypatch.setattr(arg_utils_gr, "engine_config_service", lambda: legacy_config_service(None))
     with pytest.raises(ValueError, match="execution_mode"):
         arg_utils_gr.create_engine_config(SimpleNamespace(beam_execution_mode=""))
 
@@ -177,8 +176,9 @@ def test_v1_reduction_policy_scope_overrides_and_cache_identity(
         compilation_config=compilation,
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
-    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: device_type == "cuda")
-    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: device_type == "npu")
+    monkeypatch.setattr(
+        arg_utils_gr, "engine_config_service", lambda: legacy_config_service(device_type)
+    )
     args = SimpleNamespace(beam_execution_mode=mode)
     assert arg_utils_gr.create_engine_config(args) is config
     expected = override if override is not None else expected_default
@@ -226,8 +226,9 @@ def test_engine_validates_v2_beam_protocol_without_changing_defaults(
         use_v2_model_runner=use_v2,
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
-    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: device_type == "cuda")
-    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: device_type == "npu")
+    monkeypatch.setattr(
+        arg_utils_gr, "engine_config_service", lambda: legacy_config_service(device_type)
+    )
     gr_config = GRConfig(
         beam_max_width=4 if with_beam else None,
         constraint_table=ConstraintTableConfig(max_top_k=4) if encoding == "canonical" else None,

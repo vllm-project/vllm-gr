@@ -163,40 +163,21 @@ def validate_gr_execution_runtime(config: Any) -> None:
 
 
 def validate_npu_unconstrained_runner(config: Any) -> None:
-    """Check the catalog-free NPU adapter before model or request allocation."""
+    """Compatibility entry point for callers of the original Ascend validator."""
     from vllm_gr.v1.engine.npu_admission import (
-        validate_npu_unconstrained_runner as validate_runner,
+        validate_npu_unconstrained_runner as validate,
     )
 
-    validate_runner(config)
+    validate(config)
 
 
 def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
-    """Reject unavailable adapters without importing a device runtime."""
-    from vllm_gr.config import GRConfig
+    """Check the selected provider's deployment and request capabilities."""
+    from vllm_gr.platforms.config import request_config_service
 
-    device = getattr(getattr(config, "device_config", None), "device", None)
-    if device is not None and str(device).split(":")[0] not in ("cuda", "npu"):
-        raise ValueError(
-            "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
-        )
-    gr_config = GRConfig.from_vllm_config(config)
-    if gr_config.beam_sid_stage_vocab and (device is None or str(device).split(":")[0] != "npu"):
-        raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
-    if device is not None and str(device).split(":")[0] == "npu":
-        from vllm_gr.v1.engine.npu_admission import validate_npu_device_config
-
-        validate_npu_device_config(config, gr_config, request)
-    if (
-        request is not None
-        and device is not None
-        and str(device).split(":")[0] not in ("cuda", "npu")
-        and (
-            request.beam_params.dynamic_beam_widths is not None
-            or request.output_options.num_return_sequences != request.beam_params.beam_width
-        )
-    ):
-        raise ValueError("dynamic beam widths and result widths require CUDA or NPU beam_search_v1")
+    request_config_service(config).validate_device(
+        config, GRConfig.from_vllm_config(config), request
+    )
 
 
 def _reject_candidate_width_below_dynamic_schedule(
@@ -233,32 +214,6 @@ def _reject_candidate_width_below_dynamic_schedule(
                 f"dynamic_beam_widths[{index}]={width}: each parent must supply at "
                 "least as many candidates as the stage retains"
             )
-
-
-def _validate_npu_decode_token_budget(request: BeamBatchRequest, config: Any) -> None:
-    """Fit physical Decode rows in the native ModelRunner's token buffers."""
-    device = getattr(getattr(config, "device_config", None), "device", None)
-    if str(device).split(":")[0] != "npu" or request.beam_params.max_tokens == 1:
-        return
-    budget = getattr(getattr(config, "scheduler_config", None), "max_num_batched_tokens", None)
-    if budget is None:
-        return
-    params = request.beam_params
-    # Prefill produces the first winners. Each remaining invocation consumes
-    # the preceding stage's winners; the final output is never a model input.
-    input_width = (
-        params.beam_width
-        if params.dynamic_beam_widths is None
-        else max(params.dynamic_beam_widths[:-1])
-    )
-    physical_tokens = len(request.items) * input_width
-    if physical_tokens > budget:
-        raise ValueError(
-            f"NPU Beam Decode requires {physical_tokens} physical tokens "
-            f"(batch_size={len(request.items)} * peak_input_width={input_width}), "
-            f"exceeding max_num_batched_tokens={budget}; increase the token budget "
-            "or reduce the batch size or Decode input widths"
-        )
 
 
 def validate_gr_generation_budget(gr_config: GRConfig, max_tokens: int) -> None:
@@ -309,7 +264,9 @@ def validate_gr_request(
         gr_config = GRConfig.from_vllm_config(config)
         validate_gr_generation_budget(gr_config, request.beam_params.max_tokens)
         _reject_candidate_width_below_dynamic_schedule(gr_config, request.beam_params)
-        _validate_npu_decode_token_budget(request, config)
+        from vllm_gr.platforms.config import request_config_service
+
+        request_config_service(config).validate_request_budget(config, request)
 
 
 @dataclass(frozen=True, slots=True)

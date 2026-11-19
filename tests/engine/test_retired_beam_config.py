@@ -18,6 +18,7 @@ from vllm_gr.config import (
     gr_config_to_mapping,
 )
 from vllm_gr.config.parser import BEAM_ENGINE_DRIVEN_KEY
+from vllm_gr.platforms.legacy import legacy_config_service
 
 
 def parse_retired(source: str, value: object) -> GRConfig:
@@ -109,8 +110,9 @@ def test_engine_creation_removes_raw_retired_input_without_other_changes(
     host = SimpleNamespace(additional_config=raw)
     with (
         mock.patch.object(arg_utils_gr, "origin_create_engine_config", return_value=host),
-        mock.patch.object(arg_utils_gr, "_is_cuda_platform", return_value=False),
-        mock.patch.object(arg_utils_gr, "_is_npu_platform", return_value=False),
+        mock.patch.object(
+            arg_utils_gr, "engine_config_service", return_value=legacy_config_service(None)
+        ),
         warnings.catch_warnings(record=True) as driver_warnings,
     ):
         warnings.simplefilter("always")

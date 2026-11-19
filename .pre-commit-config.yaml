@@ -162,6 +162,13 @@ repos:
       pass_filenames: false
       additional_dependencies: [regex]
 
+    - id: check-backend-boundaries
+      name: Check shared hardware backend boundaries
+      entry: python tools/pre_commit/check_backend_boundaries.py
+      language: python
+      pass_filenames: false
+      files: ^(vllm_gr/|tools/pre_commit/(check_backend_boundaries.py|backend_boundary_allowlist.json))
+
   # prevent use torch.cuda APIs
     - id: check-torch-cuda-call
       name: "Prevent new 'torch.cuda' APIs call"

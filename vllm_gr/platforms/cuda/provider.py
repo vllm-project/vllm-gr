@@ -18,6 +18,7 @@ from ..interface import (
 )
 from ..plan import BackendPlan, BackendRequest, PlanData
 from ..services import BuiltinPlanSupport, require_provider_plan
+from .config import CudaConfigService
 from .graph import CudaGraph
 from .runner import runner_id
 
@@ -34,11 +35,15 @@ class CUDABackendProvider(BuiltinPlanSupport):
     device_type: str = "cuda"
     # Semantic ownership includes hooks still installed by shared dispatch.
     patch_ids: ClassVar[tuple[str, ...]] = ("GR-PATCH-011",)
+    deferred_patch_ids: ClassVar[tuple[str, ...]] = patch_ids
     api_version: ClassVar[int] = PROVIDER_API_VERSION
     gr_version_range: ClassVar[str | None] = ">=0.30.0,<0.31.0"
     vllm_version_range: ClassVar[str | None] = "==0.30.0"
     vendor_version_range: ClassVar[None] = None
     vendor_distribution: ClassVar[None] = None
+
+    def create_config_service(self) -> CudaConfigService:
+        return CudaConfigService()
 
     def matches(self, identity: PlatformIdentity) -> bool:
         """Match the native NVIDIA CUDA platform, not every ``cuda`` placement.
@@ -46,7 +51,9 @@ class CUDABackendProvider(BuiltinPlanSupport):
         AMD ROCm also reports ``device_type == "cuda"``; it is a distinct
         upstream enum value and needs its own provider.
         """
-        return identity.platform_enum == "CUDA" and identity.device_type == "cuda"
+        return identity.platform_enum == "CUDA" and identity.device_type == self.device_type
+
+    matches_legacy_identity = matches
 
     native_graph_factory = CudaGraph
 
@@ -90,7 +97,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
                     "prefill_flash_attn_version": gr["prefill_flash_attn_version"],
                     "kv_layout": native.get("kv_cache_layout"),
                     "requires_attention": custom_attention,
-                    **constraint_plan_choices(gr, legacy_id="cuda"),
+                    **constraint_plan_choices(gr, legacy_id=self.device_type),
                     "operator_policy": "cuda.onerec",
                     "stage": "cuda.v2" if native["use_v2_model_runner"] else "cuda.v1",
                     "graph_implementation": CudaGraph.implementation_id,
@@ -129,8 +136,6 @@ class CUDABackendProvider(BuiltinPlanSupport):
         if not executor.execution_module().is_available():
             raise RuntimeError("Admitted Cuda attention implementation is unavailable")
         return executor
-
-    matches_legacy_identity = matches
 
     def check_environment(self) -> dict[str, str]:
         from vllm.platforms import current_platform

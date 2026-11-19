@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm_gr.v1.beam.decision_ops import DecisionOps
     from vllm_gr.v1.worker.prefill_graph_common import BasePrefillGraphRunner
 
+    from .config import BackendConfigService
     from .identity import PlatformIdentity
     from .plan import BackendPlan, BackendRequest
 
@@ -75,12 +76,10 @@ class SharedPrefillGraphExecutor(GraphExecutor, Protocol):
     def prefill_runner_class(self) -> type[BasePrefillGraphRunner]: ...
 
 
-class StageExecution(Protocol):
+class RunnerStage(Protocol):
     """A runner-owned physical stage service; native sessions retain lease authority."""
 
     implementation_id: str
-    decision: DecisionOps
-    worker_decision: bool
 
     def execute(
         self, worker: Any, scheduled: Any, original: Callable[..., Any], *args: Any, **kwargs: Any
@@ -90,9 +89,14 @@ class StageExecution(Protocol):
         """Beam retirement returns the matching release receipt on the materialized output."""
         ...
 
-    def capture_startup_graph(self, worker: Any, *, allow_eager_fallback: bool) -> bool: ...
 
-    def admit_unconstrained_beam(self, worker: Any) -> None: ...
+class StageExecution(RunnerStage, Protocol):
+    """Additional stage services required for Beam decisions and startup."""
+
+    decision: DecisionOps
+    worker_decision: bool
+
+    def capture_startup_graph(self, worker: Any, *, allow_eager_fallback: bool) -> bool: ...
 
 
 class ModelRunnerAdapter(Protocol):
@@ -197,6 +201,8 @@ class GRPlanningProvider(GRBackendProvider, Protocol):
 
     Providers without plan_api_version keep the narrow API-v2 delegation path.
     New factories receive an immutable engine plan, never provider.current_plan.
+    Implement GraphProvider when a plan admits a graph implementation and
+    ConfigProvider to supply a host configuration service.
     """
 
     plan_api_version: int
@@ -213,3 +219,17 @@ class GRPlanningProvider(GRBackendProvider, Protocol):
     def create_constrained_topk_execution(
         self, *, plan: BackendPlan | None = None, device: str | torch.device | None = None
     ) -> "ConstrainedTopKExecution | None": ...
+
+
+@runtime_checkable
+class GraphProvider(Protocol):
+    """Required for a planning provider that declares a graph service."""
+
+    def create_graph_executor(self, *, plan: BackendPlan, runner: Any) -> GraphExecutor: ...
+
+
+@runtime_checkable
+class ConfigProvider(Protocol):
+    """Optional host policy for native defaults, admission and startup inputs."""
+
+    def create_config_service(self) -> BackendConfigService: ...

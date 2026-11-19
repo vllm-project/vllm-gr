@@ -36,14 +36,15 @@ def constraint_plan_choices(gr: dict[str, Any], *, legacy_id: str | None) -> dic
 
 def admitted_constraint_id(plan: BackendPlan) -> str:
     """Verify that a provider admitted the enabled table requested by EngineArgs."""
-    choices = plan.choices.to_dict()
-    if choices.get("constraint") != "canonical":
+    if plan.constraint_mode != "canonical":
         raise ValueError("An enabled canonical constraint table requires a canonical backend plan")
     request_table = plan.request.config.to_dict().get("constraint_table") or {}
     explicit = request_table.get("implementation_id")
     # An engine plan from before implementation IDs may carry only the historical enum.
     fallback = request_table.get("backend") if explicit is None else None
-    admitted = choices.get("constraint_implementation", fallback)
+    admitted = plan.constraint_implementation
+    if admitted is None and "constraint_implementation" not in plan.choices.to_dict():
+        admitted = fallback
     if not isinstance(admitted, str) or not admitted.strip():
         raise ValueError("Backend plan requires a non-empty canonical constraint implementation")
     if explicit is not None and admitted != explicit:

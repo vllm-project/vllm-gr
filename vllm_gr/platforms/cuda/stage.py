@@ -63,10 +63,6 @@ class CudaStageExecutionService:
             allow_eager_fallback=allow_eager_fallback,
         )
 
-    def admit_unconstrained_beam(self, worker: Any) -> None:
-        """CUDA serves every unconstrained Beam V1 configuration this release admits."""
-        del worker
-
 
 def _create_stage(
     plan: BackendPlan | None, identity: str, native_hooks: CudaStageHooksType

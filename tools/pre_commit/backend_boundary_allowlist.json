@@ -1,0 +1,207 @@
+[
+  {
+    "file": "v1/engine/beam_search_v1.py",
+    "scope": "validate_npu_unconstrained_runner",
+    "expression": "from vllm_gr.v1.engine.npu_admission import validate_npu_unconstrained_runner",
+    "reason": "Compatibility delegate for the previously exported function. New calls use the provider config service."
+  },
+  {
+    "file": "_env_check.py",
+    "scope": "check_ascend_environment",
+    "expression": "import triton",
+    "reason": "Pinned Ascend compatibility probe invoked only by the selected provider."
+  },
+  {
+    "file": "_env_check.py",
+    "scope": "check_ascend_environment",
+    "expression": "import triton._C.libtriton.ascend",
+    "reason": "Pinned Ascend compatibility probe invoked only by the selected provider."
+  },
+  {
+    "file": "_env_check.py",
+    "scope": "check_ascend_environment",
+    "expression": "device_type != 'npu'",
+    "reason": "Pinned Ascend compatibility probe invoked only by the selected provider."
+  },
+  {
+    "file": "config/models.py",
+    "scope": "ConstraintTableBackendEnum",
+    "expression": "CPU = 'cpu'",
+    "reason": "Existing serialized enum alias. New implementations register IDs."
+  },
+  {
+    "file": "config/models.py",
+    "scope": "ConstraintTableBackendEnum",
+    "expression": "CUDA = 'cuda'",
+    "reason": "Existing serialized enum alias. New implementations register IDs."
+  },
+  {
+    "file": "config/models.py",
+    "scope": "ConstraintTableBackendEnum",
+    "expression": "NPU = 'npu'",
+    "reason": "Existing serialized enum alias. New implementations register IDs."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_upload_npu_backend",
+    "expression": "from vllm_gr.constraints.npu_backend import NPUConstraintBackend",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_upload_npu_backend",
+    "expression": "from vllm_gr.constraints.npu_stage_vocab import build_npu_stage_vocab",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_upload_npu_backend",
+    "expression": "from vllm_gr.constraints.npu_tables import npu_trie_arrays",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_upload_cuda_backend",
+    "expression": "from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_upload_cuda_backend",
+    "expression": "from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_admit_cuda",
+    "expression": "device.type != 'cuda'",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_admit_npu",
+    "expression": "from vllm_gr.ops.npu.rec_constrained_topk import MAX_TOP_K",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_admit_npu",
+    "expression": "from vllm_gr.ops.npu.rec_constrained_topk import resolve_rec_constrained_topk_npu",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_admit_npu",
+    "expression": "device.type != 'npu'",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/loader.py",
+    "scope": "_npu_runner_options",
+    "expression": "from vllm_gr.ops.npu_stage_logits import can_install_npu_stage_projection",
+    "reason": "Existing registered implementation callback. General loaders reach this leaf by implementation ID."
+  },
+  {
+    "file": "constraints/execution.py",
+    "scope": "__getattr__",
+    "expression": "from vllm_gr.constraints.cuda_execution import CUDAConstrainedTopKExecution",
+    "reason": "Lazy re-export of the pre-existing public class and pickle path. Provider factories instantiate the hardware-owned class directly."
+  },
+  {
+    "file": "constraints/execution.py",
+    "scope": "__getattr__",
+    "expression": "from vllm_gr.constraints.npu_execution import NPUConstrainedTopKExecution",
+    "reason": "Lazy re-export of the pre-existing public class and pickle path. Provider factories instantiate the hardware-owned class directly."
+  },
+  {
+    "file": "constraints/execution.py",
+    "scope": "_ConstrainedTopKExecutionBase._default_device",
+    "expression": "predicate torch.cuda.is_available()",
+    "reason": "The standalone Torch adapter historically uploads tables to CUDA when invoked without a device and CUDA is available. The NPU adapter also uses this fallback when its unindexed torch.device cannot be constructed."
+  },
+  {
+    "file": "ops/onerec_decode.py",
+    "scope": "beam_search_rec_final_select",
+    "expression": "log_probs.device.type == 'cuda'",
+    "reason": "Standalone vllm_gr.ops beam selection supports callers without a runner binding. Planned runners receive a specific selection callable."
+  },
+  {
+    "file": "ops/onerec_decode.py",
+    "scope": "beam_search_group",
+    "expression": "log_probs.device.type == 'cuda'",
+    "reason": "Standalone vllm_gr.ops beam grouping supports callers without a runner binding. Planned runners receive a specific grouping callable."
+  },
+  {
+    "file": "ops/onerec_decode.py",
+    "scope": "_beam_search_rec_final_select_cuda_dispatch",
+    "expression": "from vllm_gr.ops.cuda.beam_selection import beam_search_rec_final_select_cuda",
+    "reason": "The registered CUDA torch.library implementation and the CUDA provider share this checked kernel wrapper."
+  },
+  {
+    "file": "ops/onerec_decode.py",
+    "scope": "_beam_search_group_cuda_dispatch",
+    "expression": "from vllm_gr.ops.cuda.beam_selection import _validate_beam_inputs",
+    "reason": "The registered CUDA torch.library implementation and the CUDA provider share this checked kernel wrapper."
+  },
+  {
+    "file": "ops/onerec_decode.py",
+    "scope": "_beam_search_group_cuda_dispatch",
+    "expression": "from vllm_gr.ops.cuda.beam_selection import beam_search_group_cuda",
+    "reason": "The registered CUDA torch.library implementation and the CUDA provider share this checked kernel wrapper."
+  },
+  {
+    "file": "ops/rec_constrained_topk.py",
+    "scope": "_finish_topk",
+    "expression": "candidate_logits.device.type == 'npu'",
+    "reason": "The Torch oracle retains the NPU fallback tie ordering and candidate-only normalization. The CUDA oracle uses stable ties and full-vocabulary normalization.",
+    "count": 2
+  },
+  {
+    "file": "ops/rec_constrained_topk.py",
+    "scope": "rec_constrained_topk",
+    "expression": "logits.device.type == 'cuda'",
+    "reason": "The standalone vllm_gr.ops entry point selects a fused kernel from its input tensor and falls back when the optional NPU kernel is unavailable."
+  },
+  {
+    "file": "ops/rec_constrained_topk.py",
+    "scope": "rec_constrained_topk",
+    "expression": "from vllm_gr.ops.cuda.rec_constrained_topk import rec_constrained_topk_cuda",
+    "reason": "The standalone vllm_gr.ops entry point selects a fused kernel from its input tensor and falls back when the optional NPU kernel is unavailable."
+  },
+  {
+    "file": "ops/rec_constrained_topk.py",
+    "scope": "rec_constrained_topk",
+    "expression": "logits.device.type == 'npu'",
+    "reason": "The standalone vllm_gr.ops entry point selects a fused kernel from its input tensor and falls back when the optional NPU kernel is unavailable."
+  },
+  {
+    "file": "ops/rec_constrained_topk.py",
+    "scope": "rec_constrained_topk",
+    "expression": "from vllm_gr.ops.npu import rec_constrained_topk_npu",
+    "reason": "The standalone vllm_gr.ops entry point selects a fused kernel from its input tensor and falls back when the optional NPU kernel is unavailable."
+  },
+  {
+    "file": "ops/rec_constrained_topk.py",
+    "scope": "rec_constrained_topk",
+    "expression": "from vllm_gr.ops.npu import rec_constrained_topk_npu_available",
+    "reason": "The standalone vllm_gr.ops entry point selects a fused kernel from its input tensor and falls back when the optional NPU kernel is unavailable."
+  },
+  {
+    "file": "ops/sliced_logits_patch.py",
+    "scope": "apply_sliced_logits_patch",
+    "expression": "from vllm.v1.worker.gpu.sample import logprob",
+    "reason": "The vLLM V2 sliced-logits compatibility patch updates the compute_topk_scores binding in its original sampler module."
+  },
+  {
+    "file": "platforms/npu.py",
+    "scope": "<module>",
+    "expression": "from ascend import NPU_BACKEND",
+    "reason": "The original API-v1 Ascend module re-exports its provider and singleton for existing imports."
+  },
+  {
+    "file": "platforms/npu.py",
+    "scope": "<module>",
+    "expression": "from ascend import NPUBackendProvider",
+    "reason": "The original API-v1 Ascend module re-exports its provider and singleton for existing imports."
+  }
+]

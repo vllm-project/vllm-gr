@@ -12,6 +12,23 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def workspace_candidate_width(runner: Any, beam_width: int) -> int:
+    """Resolve K for a workspace lookup, falling back to the legacy K == W."""
+
+    from vllm_gr.config import GRConfig, resolve_candidate_width
+
+    try:
+        config = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+    except (AttributeError, TypeError, ValueError):
+        return beam_width
+    if config.beam_max_width is None:
+        return beam_width
+    try:
+        return resolve_candidate_width(config)
+    except ValueError:
+        return beam_width
+
+
 def reorder_sessions(session: Any, sessions: tuple[Any, ...], indices: Any, counts: Any) -> None:
     for row, item in enumerate(sessions):
         item.step_complete(indices[row], layout_prevalidated=True)

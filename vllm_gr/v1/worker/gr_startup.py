@@ -48,6 +48,11 @@ def _capture_enabled(worker: Any) -> bool:
             "canonical table or constrained_generation=False"
         )
     if unconstrained:
-        get_stage_execution(worker).admit_unconstrained_beam(worker)
+        from vllm_gr.platforms.config import request_config_service
+
+        request_config_service(worker.vllm_config).validate_device(worker.vllm_config, cfg, None)
+        legacy_admission = getattr(get_stage_execution(worker), "admit_unconstrained_beam", None)
+        if callable(legacy_admission):
+            legacy_admission(worker)
     # A one-token session completes in Prefill and never replays a Decode graph.
     return _beam_graph_enabled_for_run(worker) and cfg.beam_max_decode_steps > 1

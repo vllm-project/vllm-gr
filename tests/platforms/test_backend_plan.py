@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from vllm_gr.config import GRConfig
+from vllm_gr.config import BeamExecutionMode, GRAttentionBackend, GRConfig
 from vllm_gr.config.parser import parse_gr_config
 from vllm_gr.platforms import loader
 from vllm_gr.platforms.ascend import NPU_BACKEND
@@ -31,6 +31,7 @@ from vllm_gr.platforms.plan import (
     BackendPlan,
     BackendRequest,
     PlanData,
+    ServiceRequirements,
     read_backend_plan,
 )
 from vllm_gr.platforms.planning import (
@@ -145,6 +146,105 @@ def test_wire_round_trip_and_repeated_admission_preserve_config(provider: Provid
     assert BackendPlan.from_wire(json.loads(json.dumps(plan.to_wire()))) == plan
     assert pickle.loads(pickle.dumps(plan)) == plan
     assert len(plan.fingerprint) == 64
+
+
+def test_service_requirements_extend_existing_wire_plans() -> None:
+    empty = PlanData({})
+    legacy = BackendPlan(
+        "fixture", 2, BackendRequest(empty, empty, empty, empty), PlanData({"stage": "old"})
+    )
+    assert legacy.fingerprint == "3e1fe9147d21e927146995e78cffd1a2559e9fa936dfa13eb23c7b3a86af71d5"
+    assert "requirements" not in legacy.to_dict()
+    assert BackendPlan.from_wire(legacy.to_wire()) == legacy
+    plan = replace(legacy, requirements=ServiceRequirements(stage="external.stage"))
+    wire = plan.to_wire()
+    assert wire["plan"]["requirements"] == {"stage": "external.stage"}
+    assert BackendPlan.from_wire(wire) == plan
+    wire["plan"]["requirements"]["stage"] = "other.stage"
+    with pytest.raises(ValueError, match="fingerprint"):
+        BackendPlan.from_wire(wire)
+    for invalid in ({"stage": " "}, {"unknown": "id"}, {"attention": None}):
+        with pytest.raises(ValueError):
+            ServiceRequirements.from_dict(invalid)
+
+
+def test_explicit_stage_binds_without_beam_operator_policy(
+    provider: Provider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage = SimpleNamespace(
+        implementation_id="external.stage",
+        execute=lambda *args: None,
+        retire=lambda *args: None,
+    )
+    monkeypatch.setattr(
+        provider,
+        "resolve",
+        lambda req: BackendPlan(
+            provider.backend_id,
+            provider.api_version,
+            req,
+            PlanData({}),
+            requirements=ServiceRequirements(stage="external.stage"),
+        ),
+    )
+    monkeypatch.setattr(
+        provider, "create_model_runner_adapter", lambda **kwargs: SimpleNamespace(stage=stage)
+    )
+    native = config()
+    plan = admit_backend_plan(native)
+    report = bind_backend_services(SimpleNamespace(vllm_config=native)).report()
+    assert report["services"]["stage"] == "external.stage"
+    assert "operator" not in report["services"]
+    validate_worker_readiness(plan, [report], expected_workers=1)
+    stage.implementation_id = report["services"]["stage"] = "other.stage"
+    with pytest.raises(RuntimeError, match="stage implementation mismatch"):
+        bind_backend_services(SimpleNamespace(vllm_config=native))
+    with pytest.raises(RuntimeError, match="stage implementation mismatch"):
+        validate_worker_readiness(plan, [report], expected_workers=1)
+
+
+def test_admitting_graph_without_factory_fails_before_worker_startup(
+    provider: Provider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider,
+        "resolve",
+        lambda req: BackendPlan(
+            provider.backend_id,
+            provider.api_version,
+            req,
+            PlanData({}),
+            requirements=ServiceRequirements(graph="external.graph"),
+        ),
+    )
+    native = config()
+    with pytest.raises(ValueError, match="create_graph_executor"):
+        admit_backend_plan(native)
+    assert read_backend_plan(native) is None
+
+
+@pytest.mark.parametrize(
+    "mode, message", [("shared", "admitted graph"), ("other", "prefill_graph")]
+)
+def test_prefill_mode_requires_valid_graph_admission(
+    provider: Provider, monkeypatch: pytest.MonkeyPatch, mode: str, message: str
+) -> None:
+    monkeypatch.setattr(
+        provider,
+        "resolve",
+        lambda request: BackendPlan(
+            provider.backend_id,
+            provider.api_version,
+            request,
+            PlanData({"prefill_graph": mode}),
+            requirements=ServiceRequirements(),
+        ),
+    )
+    native = config()
+    with pytest.raises(ValueError, match=message):
+        admit_backend_plan(native)
+    assert read_backend_plan(native) is None
 
 
 @pytest.mark.parametrize(
@@ -349,6 +449,32 @@ def test_readiness_rejects_missing_required_service(provider: Provider, service:
         validate_worker_readiness(plan, [report], expected_workers=1)
 
 
+@pytest.mark.parametrize("service", ["stage", "operator", "attention"])
+@pytest.mark.parametrize("requirements", [None, ServiceRequirements()])
+def test_beam_v1_custom_requires_services_without_provider_flags(
+    provider: Provider,
+    service: str,
+    requirements: ServiceRequirements | None,
+) -> None:
+    native = config()
+    GRConfig(
+        beam_execution_mode=BeamExecutionMode.V1,
+        attention_backend=GRAttentionBackend.CUSTOM,
+    ).write_to_vllm_config(native)
+    plan = replace(admit_backend_plan(native), choices=PlanData({}), requirements=requirements)
+    implementations = {
+        "runner": "example.runner",
+        "stage": "example.stage",
+        "operator": "example.operator",
+        "attention": "example.attention",
+    }
+    report = {"ready": True, "fingerprint": plan.fingerprint, "services": implementations}
+    validate_worker_readiness(plan, [report], expected_workers=1)
+    del implementations[service]
+    with pytest.raises(RuntimeError, match=f"no bound {service}"):
+        validate_worker_readiness(plan, [report], expected_workers=1)
+
+
 def test_builtin_plans_are_pure_and_preserve_runner_and_decode_policy() -> None:
     native = config()
     request = normalize_backend_request(native, CUDA_BACKEND)
@@ -485,28 +611,6 @@ def test_bound_constraint_honors_explicit_torch_oracle(
     binding = bind_backend_services(SimpleNamespace(vllm_config=native, device="test:0"))
     assert binding.constraint_execution is oracle
     assert len(provider.created) == 2
-
-
-@pytest.mark.parametrize(
-    "mode, message", [("shared", "admitted graph"), ("other", "prefill_graph")]
-)
-def test_prefill_mode_requires_valid_graph_admission(
-    provider: Provider, monkeypatch: pytest.MonkeyPatch, mode: str, message: str
-) -> None:
-    monkeypatch.setattr(
-        provider,
-        "resolve",
-        lambda request: BackendPlan(
-            provider.backend_id,
-            provider.api_version,
-            request,
-            PlanData({"prefill_graph": mode}),
-        ),
-    )
-    native = config()
-    with pytest.raises(ValueError, match=message):
-        admit_backend_plan(native)
-    assert read_backend_plan(native) is None
 
 
 class GraphProvider(Provider):

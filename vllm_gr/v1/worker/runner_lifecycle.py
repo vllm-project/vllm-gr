@@ -10,7 +10,7 @@ from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from vllm_gr.platforms.interface import StageExecution
+    from vllm_gr.platforms.interface import RunnerStage, StageExecution
     from vllm_gr.platforms.plan import BackendPlan
 
 
@@ -21,7 +21,7 @@ class NativeRunnerAdapter:
     execute_model: Callable[..., Any]
     prepare_inputs: Callable[..., Any]
     sample_tokens: Callable[..., Any] | None
-    stage: StageExecution | None = None
+    stage: RunnerStage | None = None
 
     def close(self) -> None:
         # Drop bound callables and their strong references to the native runner.
@@ -114,14 +114,14 @@ def bind_native_runner(
     )
 
 
-def get_stage_execution(runner: Any) -> StageExecution:
+def get_runner_stage(runner: Any) -> RunnerStage:
     """Use the runner's service; unplanned native configs use their installed factory."""
     binding = getattr(runner, "_gr_backend_binding", None)
     if binding is not None:
         stage = getattr(binding.runner_adapter, "stage", None)
         if stage is None:
             raise RuntimeError("Admitted runner has no stage execution service")
-        return cast("StageExecution", stage)
+        return cast("RunnerStage", stage)
     stage = getattr(runner, "_gr_unplanned_stage", None)
     if stage is None:
         factory = getattr(type(runner), "_gr_stage_factory", None)
@@ -129,4 +129,9 @@ def get_stage_execution(runner: Any) -> StageExecution:
             raise RuntimeError("Native runner has no installed GR stage execution service")
         stage = factory(plan=None, runner=runner)
         runner._gr_unplanned_stage = stage
-    return cast("StageExecution", stage)
+    return cast("RunnerStage", stage)
+
+
+def get_stage_execution(runner: Any) -> StageExecution:
+    """Beam admission validates the operator and startup methods on this stage."""
+    return cast("StageExecution", get_runner_stage(runner))
