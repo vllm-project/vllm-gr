@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+from typing import Any
 
 import torch
 
@@ -233,6 +234,19 @@ class CUDAConstraintBackend:
         if self._state is not _BackendState.INITIALIZING:
             raise RuntimeError("only an initializing CUDA constraint backend can become ready")
         self._state = _BackendState.READY
+
+    def prepare_runner(self, model_config: Any) -> None:
+        """Warm the device-step variant for each dtype the LM head can emit.
+
+        The V2 runner consumes a JIT-compiled stage kernel, so the first decoded
+        step would otherwise pay compilation. ``head_dtype`` may differ from the
+        model dtype; both are warmed because either can reach the operator.
+        """
+        dtype = getattr(model_config, "dtype", None)
+        self.warmup_stage_topk(dtype)
+        head_dtype = getattr(model_config, "head_dtype", None)
+        if head_dtype is not None and head_dtype != dtype:
+            self.warmup_stage_topk(head_dtype)
 
     def warmup_stage_topk(self, dtype: torch.dtype) -> None:
         """Warm V2's device-step kernel for every supported candidate-capacity bucket."""

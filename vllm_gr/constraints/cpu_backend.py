@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 from numpy.typing import NDArray
@@ -166,6 +168,10 @@ class CPUConstraintBackend:
             logits=logits,
             top_k=metadata.top_k,
         )
+
+    def prepare_runner(self, model_config: Any) -> None:
+        """Host selection runs eagerly, so no compile-ahead is required."""
+        del model_config
 
     def close(self) -> None:
         if self._closed:

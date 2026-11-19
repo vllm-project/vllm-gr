@@ -57,14 +57,14 @@ from vllm_gr.v1.worker.model_runner_patch import (
 logger = init_logger(__name__)
 
 
-def _warmup_constraint_backend(runner: Any, backend: Any) -> None:
-    from vllm_gr.config import ConstraintTableBackendEnum
+def _prepare_constraint_backend(runner: Any, backend: Any) -> None:
+    """Let the published Backend perform its own runner-side preparation.
 
-    if backend.info.backend is ConstraintTableBackendEnum.CUDA:
-        backend.warmup_stage_topk(runner.model_config.dtype)
-        head_dtype = getattr(runner.model_config, "head_dtype", None)
-        if head_dtype is not None and head_dtype != runner.model_config.dtype:
-            backend.warmup_stage_topk(head_dtype)
+    Shared Runner code does not ask which implementation this is: a backend that
+    compiles ahead implements ``prepare_runner``, and one that does not answers
+    with a no-op.
+    """
+    backend.prepare_runner(runner.model_config)
 
 
 def discover_worker_runners() -> tuple[tuple[str, type], ...]:
@@ -171,7 +171,7 @@ def _apply_v2_runner_patches() -> None:
                 load_model,
                 max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
                 close_runtime=close_v2_runtime,
-                prepare_backend=_warmup_constraint_backend,
+                prepare_backend=_prepare_constraint_backend,
             )
 
         shutdown = getattr(runner_class, "shutdown", None)

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
@@ -76,6 +76,19 @@ class ConstraintBackend(Protocol):
         logits: torch.Tensor,
         metadata: ConstraintMetadata,
     ) -> ConstraintOutput: ...
+
+    def prepare_runner(self, model_config: Any) -> None:
+        """Perform the runner-side preparation this backend needs before selection.
+
+        Shared Runner code calls this once per published Backend, both on the
+        initial load and on every reload. A backend without a compile-ahead
+        requirement answers with a no-op; one whose operator is JIT-compiled
+        warms the variants its first step will use.
+
+        Keeping the decision here means shared code never asks which backend
+        this is: an external backend that needs preparation implements it, and
+        one that does not is never described by a name in a branch.
+        """
 
     def close(self) -> None: ...
 

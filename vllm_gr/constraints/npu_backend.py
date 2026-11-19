@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from enum import Enum, auto
+from typing import Any
 
 import torch
 
@@ -289,6 +290,10 @@ class NPUConstraintBackend:
         if self._state is not _BackendState.READY:
             raise RuntimeError("NPU constraint backend is not ready")
         return self._select_checked(logits, metadata)
+
+    def prepare_runner(self, model_config: Any) -> None:
+        """The Ascend operator is resolved eagerly at load, so nothing is deferred."""
+        del model_config
 
     def close(self) -> None:
         if self._state is _BackendState.CLOSED:
