@@ -18,7 +18,9 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 
-from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import graph_for
+from vllm_gr.v1.worker.graph_capture import is_recoverable_capture_error
 
 
 class BeamDecodeCaptureUnsupported(RuntimeError):
@@ -55,6 +57,7 @@ class BeamDecodeGraph:
 
     def __init__(self, worker: Any, width: int) -> None:
         self.worker = worker
+        self.graph_service = graph_for(worker, CudaGraph)
         self.signature = BeamDecodeGraphSignature(1, width, width)
         self.descriptor = BatchDescriptor(num_tokens=width, uniform=True)
         self.context: Any = None
@@ -143,6 +146,11 @@ class BeamDecodeGraph:
         if self.ready:
             self._check_context()
             return
+        self.graph_service.capture(
+            "decode", self._capture, forward, persistent_install=persistent_install
+        )
+
+    def _capture(self, forward: Callable[[bool], Any], *, persistent_install: bool) -> None:
         # Keep Beam captures separate from vLLM's shared pool. A pool whose
         # last graph was destroyed can remain in the allocator while captured
         # outputs are still alive; attempting to reuse it then fails. Reuse
@@ -221,7 +229,7 @@ class BeamDecodeGraph:
             raise RuntimeError("Beam graph replay requires successful startup capture")
         entry = self.wrapper.concrete_cudagraph_entries[self.descriptor]
         assert entry.cudagraph is not None
-        entry.cudagraph.replay()
+        self.graph_service.replay("decode", entry.cudagraph.replay)
         return cast(torch.Tensor, entry.output)
 
     def model_forward(self, *args: Any, **kwargs: Any) -> Any:
@@ -234,9 +242,12 @@ class BeamDecodeGraph:
         if self.capturing:
             self.capture_inputs = (args, kwargs)
             self.capture_attention = context.attn_metadata
-        elif not self.ready:
+            return CUDAGraphWrapper.__call__(self.wrapper, *args, **kwargs)
+        if not self.ready:
             raise RuntimeError("Beam FULL dispatch requires successful startup capture")
-        return CUDAGraphWrapper.__call__(self.wrapper, *args, **kwargs)
+        return self.graph_service.replay(
+            "decode", CUDAGraphWrapper.__call__, self.wrapper, *args, **kwargs
+        )
 
 
 # Native vLLM stays outside the checked GR boundary.

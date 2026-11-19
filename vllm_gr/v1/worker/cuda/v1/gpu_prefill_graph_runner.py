@@ -4,16 +4,17 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_gr.config import BeamExecutionMode, GRConfig
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.utils.npu_adapter import is_cuda_available
 from vllm_gr.v1.attention.backends.beam_dense_prefill import fresh_prefill_capture
-from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+from vllm_gr.v1.worker.graph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_ENABLE_PREFILL_GRAPH,
     ENV_PREFILL_GRAPH_BUCKETS,
@@ -22,7 +23,6 @@ from vllm_gr.v1.worker.prefill_graph_common import (
     get_kv_capture_bound,
     get_max_context_len,
     get_prefill_graph_capture_num_reqs,
-    is_prefill_graph_enabled,
 )
 
 logger = init_logger(__name__)
@@ -81,6 +81,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         model_runner: Any,
         buckets: list[int] | None = None,
     ) -> None:
+        self.graph_service = graph_for(model_runner, CudaGraph)
         super().__init__(
             model_runner=model_runner,
             buckets=buckets,
@@ -96,7 +97,8 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
 
     def capture_graphs(self, runner: Any) -> None:
         """Capture configured request-count CUDA graphs for each prefill bucket."""
-        if not is_prefill_graph_enabled():
+        service = self.graph_service
+        if not service.prefill_enabled:
             logger.info(
                 "Prefill CUDA Graph capture is disabled via environment variable (%s=0).",
                 ENV_ENABLE_PREFILL_GRAPH,
@@ -121,10 +123,10 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                 getattr(runner, "vllm_config", None), "scheduler_config", None
             )
         configured_num_reqs = get_prefill_graph_capture_num_reqs(
-            getattr(runner, "vllm_config", None)
+            getattr(runner, "vllm_config", None), service.options
         )
         max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", configured_num_reqs[-1]))
-        custom_total_buckets = os.getenv(ENV_PREFILL_GRAPH_BUCKETS) is not None
+        custom_total_buckets = ENV_PREFILL_GRAPH_BUCKETS in service.options
         max_context_len = get_max_context_len(runner)
         # Legacy Beam Search dispatches one request at a time. Keep its
         # original capture footprint; reserve B=4 graphs for V1 sessions.
@@ -237,7 +239,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     # rejected. get_kv_capture_bound widens the bound without
                     # touching buckets that already cover their contexts, so
                     # miss-path graphs stay byte-identical to the default.
-                    bound = self._kv_capture_bound(bucket)
+                    bound = self._kv_capture_bound(bucket, service.options)
                     if custom_total_buckets and max_context_len:
                         bound = min(bound, max_context_len)
                     if bound < max(req_lens):
@@ -345,10 +347,12 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     buf.captured_graphs[num_reqs] = graph
                     buf.output_bufs[num_reqs] = output
                     buf.static_attn_metadatas[num_reqs] = attn_metadata
+                    service.captured("prefill")
 
                 except Exception as e:  # noqa: BLE001
                     if not isinstance(e, RuntimeError) or not is_recoverable_capture_error(e):
                         raise
+                    service.fallback("prefill", "capture_unsupported")
                     torch.accelerator.synchronize()
                     logger.warning(
                         "Failed to capture Prefill CUDA graph for bucket %d (num_reqs=%d): %r.",
@@ -371,7 +375,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         return buf is not None and buf.has_captured_graph(num_reqs)
 
     @staticmethod
-    def _kv_capture_bound(bucket: int) -> int:
+    def _kv_capture_bound(bucket: int, options: dict[str, str] | None = None) -> int:
         """KV bound baked into this bucket's graph.
 
         The returned value feeds both the captured attention scalar
@@ -382,7 +386,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         is what keeps miss-path graphs byte-identical.
         """
         bound = 2 * bucket
-        kv_bound = get_kv_capture_bound()
+        kv_bound = get_kv_capture_bound(options)
         if kv_bound is not None and kv_bound > bound:
             bound = kv_bound
         return bound
@@ -608,7 +612,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
 
         # Replay the captured graph for num_reqs.
         graph = buf.captured_graphs[num_reqs]
-        graph.replay()
+        self.graph_service.replay("prefill", graph.replay)
         self.last_replay_reason = "replay"
 
         return buf.output_bufs[num_reqs]

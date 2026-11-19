@@ -48,7 +48,7 @@ def test_async_scheduling_decode_bypasses_prefill_graph_dispatch(
         assert self is runner and input_ids is tokens
         return hidden
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", forbidden)
+    monkeypatch.setattr(gpu_patch, "graph_for", forbidden)
     assert gpu_patch.make_patched_model_forward(original)(runner, tokens, positions) is hidden
 
 
@@ -97,7 +97,7 @@ def test_async_scheduling_prefill_reuses_existing_padded_graph_without_runtime_c
         calls.append("eager")
         return eager
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_CUDAGRAPH", "1")
     monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
     result = gpu_patch.make_patched_model_forward(original)(runner, tokens, positions)
     assert result is (hidden if replay else eager)
@@ -128,7 +128,7 @@ def test_async_prefill_padding_preserves_input_guards(
             total_num_scheduled_tokens=4,
         ),
     )
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_CUDAGRAPH", "1")
     monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
     monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda _: prefill)
     ids, positions = torch.zeros(4, dtype=torch.int32), torch.arange(4)
@@ -158,7 +158,7 @@ def test_async_scheduling_prefill_never_initializes_a_graph_runner_during_reques
     def forbidden(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("request allocated a graph runner")
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_CUDAGRAPH", "1")
     monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", forbidden)
     assert gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(runner) == "eager"
 
@@ -202,7 +202,7 @@ def test_batch_session_prefill_selects_exact_four_request_graph(
         ),
     )
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_CUDAGRAPH", "1")
     monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
     result = gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(
         runner, tokens, positions
@@ -245,7 +245,7 @@ def test_batch_session_prefill_rejects_partial_or_reordered_requests(
     def forbidden(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("invalid Batch Session reached graph selection")
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_CUDAGRAPH", "1")
     monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
     monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", forbidden)
     result = gpu_patch.make_patched_model_forward(eager)(runner, tokens, positions)
@@ -702,6 +702,7 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     )
     graph = object.__new__(shared.BeamDecodeGraph)
     graph.worker, graph.width = runner, 4
+    graph.graph_service = shared.graph_for(runner, shared.CudaGraph)
     graph.signature = shared.BeamDecodeGraphSignature(1, 4, 4)
     graph._bindings = {}
     graph.capture_inputs = graph.capture_attention = None
@@ -860,10 +861,10 @@ def test_capture_create_dummy_context_creates_session_and_beam_info() -> None:
 def test_beam_full_graph_ready_uses_worker_registry() -> None:
     graph = SimpleNamespace(signature=SimpleNamespace(num_model_rows=8), ready=True)
     runner = SimpleNamespace(_beam_decode_graph=graph)
-    assert _gr_context._beam_full_graph_ready(runner, 8)
-    assert not _gr_context._beam_full_graph_ready(runner, 4)
+    assert gpu_patch._beam_full_graph_ready(runner, 8)
+    assert not gpu_patch._beam_full_graph_ready(runner, 4)
     runner._beam_decode_graph.ready = False
-    assert not _gr_context._beam_full_graph_ready(runner, 8)
+    assert not gpu_patch._beam_full_graph_ready(runner, 8)
 
 
 def test_beam_full_graph_ready_ignores_other_native_graphs() -> None:
@@ -876,7 +877,7 @@ def test_beam_full_graph_ready_ignores_other_native_graphs() -> None:
         concrete_cudagraph_entries={BatchDescriptor(num_tokens=4, uniform=True): MagicMock()},
     )
     with patch("vllm.compilation.cuda_graph.CUDAGraphWrapper._all_instances", [wrapper]):
-        assert not _gr_context._beam_full_graph_ready(SimpleNamespace(), 4)
+        assert not gpu_patch._beam_full_graph_ready(SimpleNamespace(), 4)
 
 
 pytestmark = pytest.mark.cpu_test

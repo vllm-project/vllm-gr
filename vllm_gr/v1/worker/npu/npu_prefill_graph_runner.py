@@ -4,12 +4,13 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.platforms.ascend.graph import AscendGraph
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.utils.npu_adapter import is_npu_available
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_ENABLE_PREFILL_GRAPH,
@@ -17,7 +18,6 @@ from vllm_gr.v1.worker.prefill_graph_common import (
     BasePrefillGraphRunner,
     PrefillBucketBuffers,
     get_max_context_len,
-    is_prefill_graph_enabled,
 )
 
 logger = init_logger(__name__)
@@ -103,6 +103,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         model_runner: Any,
         buckets: list[int] | None = None,
     ) -> None:
+        self.graph_executor = graph_for(model_runner, AscendGraph)
         super().__init__(
             model_runner=model_runner,
             buckets=buckets,
@@ -114,7 +115,8 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         self.entries: dict[int, Any] = {}
         # Opt-in configuration is read once per runner; empty means TND only.
         self._BSND_CAPTURE_SPECS = parse_bsnd_capture_specs(
-            os.getenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", ""), self.buckets
+            self.graph_executor.options.get("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS") or "",
+            self.buckets,
         )
         self.bsnd_entries: dict[tuple[int, int], Any] = {}
         self._replays_by_bucket: dict[int, int] = {}
@@ -332,7 +334,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         A single graph per bucket covers all supported batch sizes because
         the task-group update rewrites the per-request host lists at replay.
         """
-        if not is_prefill_graph_enabled():
+        if not self.graph_executor.prefill_enabled:
             logger.info(
                 "Prefill NPU Graph capture is disabled via environment variable (%s=0).",
                 ENV_ENABLE_PREFILL_GRAPH,
@@ -428,6 +430,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             buf.output_bufs[1] = output
             buf.static_attn_metadatas[1] = meta
             self.entries[bucket] = entry
+            self.graph_executor.captured("prefill")
             if self.shared_workspace is None:
                 self.shared_workspace = entry.workspace
             logger.info(
@@ -597,7 +600,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         torch.npu.current_stream().wait_stream(self._get_update_stream())
 
         graph = buf.captured_graphs[1]
-        graph.replay()
+        self.graph_executor.replay("prefill", graph.replay)
         return buf.output_bufs[1]
 
     def match_bsnd_bucket(self, num_reqs: int, max_len: int) -> tuple[int, int] | None:
@@ -662,7 +665,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         shape-bound, so replay needs no per-layer host update.
         """
         # No allocation/capture when disabled; resources are graph-owned.
-        if not self._BSND_CAPTURE_SPECS or not is_prefill_graph_enabled():
+        if not self._BSND_CAPTURE_SPECS or not self.graph_executor.prefill_enabled:
             return
         if not is_npu_available():
             logger.info("NPU not available; skipping BSND prefill graph capture.")
@@ -726,6 +729,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                 raise RuntimeError(f"BSND capture failed for {(T, B)}; restart required") from e
 
             buf.bsnd_captured_graphs[B] = graph
+            self.graph_executor.captured("prefill")
             buf.bsnd_output_bufs[B] = output
             buf.bsnd_compact_output_bufs[B] = compact_output
             buf.bsnd_static_attn_metadatas[B] = meta
@@ -837,7 +841,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             o += L_i
 
         graph = buf.bsnd_captured_graphs[B]
-        graph.replay()
+        self.graph_executor.replay("prefill", graph.replay)
 
         # Avoid Python-list advanced indexing: it may synchronously upload an
         # index tensor after replay, waiting for the entire preceding graph.

@@ -149,7 +149,7 @@ def startup_expectations(
         batches = [b for b in cfg.beam_online_batch_sizes if b <= max_num_seqs]
     else:
         assert runner == "v1", runner
-        from vllm_gr.v1.worker.gr_startup import _startup_capture_batch_size
+        from vllm_gr.v1.worker.cuda.gpu_startup import _startup_capture_batch_size
 
         max_batch = 1
         batches = [_startup_capture_batch_size()]

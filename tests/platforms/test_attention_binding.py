@@ -219,9 +219,12 @@ def test_default_suffix_writer_is_checked_only_for_incremental_beam(
             pool[session.slot] = (key, value)
 
     validate_beam_attention(CustomSuffixWriter(primitives), beam)
-    prefill = BackendPlan("demo", 2, plain.request, PlanData({"prefill_graph": True}))
-    with pytest.raises(RuntimeError, match="prefill_attention"):
-        validate_beam_attention(primitives, prefill)
+    for mode in (True, "shared"):
+        prefill = BackendPlan("demo", 2, plain.request, PlanData({"prefill_graph": mode}))
+        with pytest.raises(RuntimeError, match="prefill_attention"):
+            validate_beam_attention(primitives, prefill)
+    managed = BackendPlan("demo", 2, plain.request, PlanData({"prefill_graph": "provider"}))
+    validate_beam_attention(primitives, managed)
 
 
 def test_concrete_attention_impl_validates_its_own_executor(

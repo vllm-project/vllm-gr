@@ -29,6 +29,33 @@ from vllm_gr.v1.worker.npu.npu_beam_stage_runner import NPUEagerBeamStageRunner
 from vllm_gr.v1.worker.npu.npu_model_runner_inputs import InputBatchProxy
 
 
+def test_close_graphs_retains_leases_and_restores_native_model(monkeypatch: Any) -> None:
+    context = SimpleNamespace(registry=SimpleNamespace(num_active_sessions=1))
+    wrapper = SimpleNamespace(original_model=object(), concrete_aclgraph_entries={4: object()})
+    runner = SimpleNamespace(
+        device="npu:4",
+        model=wrapper,
+        _gr_npu_graph_model=wrapper,
+        _gr_npu_graph_context=context,
+        _beam_context=context,
+        _prefill_graph_runner=object(),
+        _prefill_graphs_captured=True,
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        npu_patch.torch, "npu", SimpleNamespace(synchronize=calls.append), raising=False
+    )
+    with pytest.raises(RuntimeError, match="active Beam KV leases"):
+        npu_patch.close_graphs(runner)
+    assert not calls and runner.model is wrapper and wrapper.concrete_aclgraph_entries
+    context.registry.num_active_sessions = 0
+    npu_patch.close_graphs(runner)
+    npu_patch.close_graphs(runner)
+    assert calls == ["npu:4"]
+    assert runner.model is wrapper.original_model and not wrapper.concrete_aclgraph_entries
+    assert runner._beam_context is None and runner._prefill_graph_runner is None
+
+
 def _eager_stage_output(
     *,
     kind: str,
@@ -1379,6 +1406,21 @@ def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
     beam = object.__new__(NPUBeamGraphModel)
     beam.original_model = ordinary
     beam.concrete_aclgraph_entries = {}
+    from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
+
+    from vllm_gr.platforms.ascend.graph import AscendGraph
+    from vllm_gr.v1.worker.npu import npu_beam_decode_graph
+
+    beam.runtime_mode = CUDAGraphMode.FULL
+    beam.graph_executor = AscendGraph(SimpleNamespace(), None)
+    beam.graph_executor.decode_enabled = True
+    monkeypatch.setattr(
+        npu_beam_decode_graph,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.FULL, batch_descriptor=descriptor
+        ),
+    )
     runner = SimpleNamespace(model=beam, _gr_npu_graph_model=beam)
 
     def forward(path: str) -> Any:
@@ -1399,6 +1441,8 @@ def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
     assert beam.concrete_aclgraph_entries is not ordinary.concrete_aclgraph_entries
     assert npu_patch._verify_and_record_captured_graph_npu(runner, 4)
     assert not beam.graph_ready(8)
+    assert beam.graph_executor.stats()["captures"] == {"decode": 1}
+    assert beam.graph_executor.stats()["replays"] == {"decode": 1}
 
 
 def test_npu_suffix_bank_storage_count_deduplicates_packed_views() -> None:

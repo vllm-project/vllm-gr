@@ -14,22 +14,35 @@ from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 
 @pytest.fixture(autouse=True)  # type: ignore
 def _force_non_npu(monkeypatch: pytest.MonkeyPatch) -> None:
-    import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.cuda import CUDA_BACKEND
 
-    # Isolate unit-test bucket grids from deployment BSND capture specs.
     monkeypatch.delenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", raising=False)
-    monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: False)
-
-    class MockCUDAProvider:
-        device_type = "cuda"
-
-    monkeypatch.setattr(prefill_graph_runner_mod, "current_platform", MockCUDAProvider())
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: CUDA_BACKEND)
 
 
 class MockModelRunner:
     def __init__(self) -> None:
         self.device = torch.device("cpu")
         self.vllm_config: Any = None
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_worker_graph_stats_only_report_live_prefill_kv_bounds() -> None:
+    from vllm_gr.platforms.cuda.graph import CudaGraph
+    from vllm_gr.v1.worker.gr_context import get_beam_graph_runtime_stats
+
+    runner = MockModelRunner()
+    prefill = BeamPrefillGraphRunner(runner, buckets=[16])
+    buffers = prefill.buffers[16]
+    buffers.captured_graphs[2] = object()
+    buffers.max_seq_len_bounds.update({2: 256, 4: 512})
+    runner._prefill_graph_runner = prefill  # type: ignore[attr-defined]
+    runner._gr_native_graph = CudaGraph(runner, None)  # type: ignore[attr-defined]
+    stats = get_beam_graph_runtime_stats(SimpleNamespace(model_runner=runner))
+    assert stats["gr_prefill_buckets"] == [16]
+    assert stats["gr_prefill_captures"] == [[16, 2]]
+    assert stats["gr_prefill_kv_bounds"] == {"16:2": 256}
 
 
 def test_match_bucket_standard() -> None:
@@ -256,7 +269,6 @@ def test_npu_gates_allow_prefill_graph(
 ) -> None:
     from types import SimpleNamespace
 
-    monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: True)
     from vllm_gr.v1.worker.prefill_graph_runner import (
         is_prefill_graph_enabled,
         is_prefill_phase_batch,
@@ -309,33 +321,25 @@ def test_multi_req_graph_buffers() -> None:
 
 
 def test_platform_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
-    import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.ascend import NPU_BACKEND
+    from vllm_gr.platforms.cuda import CUDA_BACKEND
     from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
     from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_runner import (
-        BeamPrefillGraphRunner,
         get_active_prefill_graph_runner_class,
     )
 
     runner = MockModelRunner()
-
-    # 1. Test NPU platform selection
-    class MockNPUPlatform:
-        device_type = "npu"
-
-    monkeypatch.setattr(prefill_graph_runner_mod, "current_platform", MockNPUPlatform)
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
     assert get_active_prefill_graph_runner_class() is NPUPrefillGraphRunner
-    npu_runner = BeamPrefillGraphRunner(runner, buckets=[512])
-    assert isinstance(npu_runner, NPUPrefillGraphRunner)
-
-    # 2. Test CUDA platform selection
-    class MockCUDAProvider:
-        device_type = "cuda"
-
-    monkeypatch.setattr(prefill_graph_runner_mod, "current_platform", MockCUDAProvider)
+    assert isinstance(BeamPrefillGraphRunner(runner, buckets=[512]), NPUPrefillGraphRunner)
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: CUDA_BACKEND)
     assert get_active_prefill_graph_runner_class() is GPUPrefillGraphRunner
-    gpu_runner = BeamPrefillGraphRunner(runner, buckets=[512])
-    assert isinstance(gpu_runner, GPUPrefillGraphRunner)
+    assert isinstance(
+        BeamPrefillGraphRunner(MockModelRunner(), buckets=[512]), GPUPrefillGraphRunner
+    )
+    assert isinstance(BeamPrefillGraphRunner(runner, buckets=[512]), NPUPrefillGraphRunner)
 
 
 class MockNPUAttnBuilder:
@@ -579,7 +583,6 @@ def test_platform_bucket_config(
     assert get_default_buckets() == DEFAULT_PREFILL_BUCKETS
     assert get_default_buckets() == expected_default_buckets
 
-    monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: True)
     assert get_default_buckets() == NPU_DEFAULT_PREFILL_BUCKETS
     assert get_default_buckets() == expected_default_buckets
 
@@ -589,7 +592,6 @@ def test_platform_bucket_config(
         set(expected_default_buckets) | set(prefill_graph_common.SMALL_PREFILL_BUCKETS)
     )
     monkeypatch.delenv(ENV_PREFILL_GRAPH_KV_BOUND)
-    monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: False)
 
     monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKET_STEP, "256")
     monkeypatch.setenv(ENV_PREFILL_GRAPH_MAX_BUCKET, "1024")
@@ -670,19 +672,24 @@ def test_custom_b4_bucket_limit_uses_total_tokens(monkeypatch: pytest.MonkeyPatc
     from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_BUCKETS
 
-    runner = MockModelRunner()
-    runner.vllm_config = SimpleNamespace(
-        _vllm_gr_parsed_config=SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1)
-    )
-    setattr(runner, "scheduler_config", SimpleNamespace(max_num_batched_tokens=24))
-    setattr(runner, "model_config", SimpleNamespace(max_model_len=8))
+    def make_runner() -> MockModelRunner:
+        runner = MockModelRunner()
+        runner.vllm_config = SimpleNamespace(
+            _vllm_gr_parsed_config=SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1)
+        )
+        setattr(runner, "scheduler_config", SimpleNamespace(max_num_batched_tokens=24))
+        setattr(runner, "model_config", SimpleNamespace(max_model_len=8))
+        return runner
 
     monkeypatch.delenv(ENV_PREFILL_GRAPH_BUCKETS, raising=False)
     monkeypatch.delenv("VLLM_GR_PREFILL_GRAPH_KV_BOUND", raising=False)
-    assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8]
+    first = make_runner()
+    buckets = [4, 8, 12, 24]
+    assert BeamPrefillGraphRunner(first, buckets=buckets).buckets == [4, 8]
     monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKETS, "4,8,12,24")
-    assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8, 12, 24]
-    assert NPUPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8]
+    assert BeamPrefillGraphRunner(first, buckets=buckets).buckets == [4, 8]
+    assert BeamPrefillGraphRunner(make_runner(), buckets=buckets).buckets == buckets
+    assert NPUPrefillGraphRunner(make_runner(), buckets=buckets).buckets == [4, 8]
 
 
 def test_prefill_capture_without_v1_keeps_b1_when_only_b4_configured() -> None:
@@ -1120,7 +1127,7 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
     )
     graph_runner = GPUPrefillGraphRunner(runner, buckets=[1024, 1152])
     runner._prefill_graph_runner = graph_runner
-    monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_CUDAGRAPH", "1")
     monkeypatch.setattr(patch, "get_prefill_graph_runner", lambda _: graph_runner)
     replays: list[int] = []
 
@@ -1232,7 +1239,7 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
 
     stream = SimpleNamespace(wait_stream=lambda _other: None)
-    monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_CUDAGRAPH", "1")
     monkeypatch.setattr(patch.torch.cuda, "Stream", lambda: stream)
     monkeypatch.setattr(patch.torch.cuda, "stream", lambda _side: nullcontext())
     monkeypatch.setattr(patch.torch.accelerator, "current_stream", lambda: stream)

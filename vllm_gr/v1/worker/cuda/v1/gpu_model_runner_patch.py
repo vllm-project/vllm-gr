@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import sys
 from functools import wraps
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.platforms.cuda.graph import CudaGraph
 from vllm_gr.platforms.cuda.runner import V1_RUNNER
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.v1.attention.backends.beam_dense_prefill import (
     requires_fresh_prefill_replay,
 )
@@ -20,7 +23,6 @@ from vllm_gr.v1.beam.execution_batch import (
 )
 from vllm_gr.v1.worker.cuda.v1.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 from vllm_gr.v1.worker.gr_context import (
-    _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
     _create_beam_context,
 )
@@ -37,11 +39,17 @@ from vllm_gr.v1.worker.prefill_graph_common import scheduled_requests_are_fresh
 from vllm_gr.v1.worker.prefill_graph_runner import (
     SUPPORTED_NUM_REQS,
     get_prefill_graph_runner,
-    is_prefill_graph_enabled,
     is_prefill_phase_batch,
 )
 
 logger = init_logger(__name__)
+
+
+def _beam_full_graph_ready(runner: Any, num_tokens: int) -> bool:
+    graph = getattr(runner, "_beam_decode_graph", None)
+    if graph is not None:
+        return bool(graph.ready and num_tokens == graph.signature.num_model_rows)
+    return num_tokens in (getattr(runner, "_beam_graph_keys", None) or ())
 
 
 def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
@@ -254,6 +262,7 @@ def _capture_create_dummy_context(
     session.begin_session(width, prefix_len)
 
     runner._beam_context = context
+    runner._gr_cuda_capture_context = context
     runner._beam_sessions = {_BEAM_DUMMY_REQ_ID: session}
 
     beam_data = {
@@ -408,7 +417,7 @@ def capture_beam_decode_graph(runner) -> bool:
     )
 
     gr_cfg = _get_gr_config(runner)
-    if not gr_cfg.beam_graph_active or runner.model_config.enforce_eager:
+    if not gr_cfg.beam_graph_active or not graph_for(runner, CudaGraph).decode_enabled:
         return False
 
     # ── TP / DP ubatching guard ─────────────────────────────────
@@ -551,14 +560,17 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                 return _orig_model_forward(
                     self, input_ids=input_ids, positions=positions, *args, **kwargs
                 )
-            if is_prefill_graph_enabled() and not hasattr(self, "_prefill_graph_runner"):
+            if graph_for(self, CudaGraph).prefill_enabled and not hasattr(
+                self, "_prefill_graph_runner"
+            ):
+                graph_for(self, CudaGraph).fallback("prefill", "runner_not_initialized")
                 logger.debug("Prefill CUDA graph fallback: runner_not_initialized")
                 return _orig_model_forward(
                     self, input_ids=input_ids, positions=positions, *args, **kwargs
                 )
         if scheduler_output is not None:
             if (
-                is_prefill_graph_enabled()
+                graph_for(self, CudaGraph).prefill_enabled
                 and is_prefill_phase_batch(self, scheduler_output)
                 # Dense-Prefill graphs replay only for fresh prompts.
                 and (
@@ -655,6 +667,8 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                             )
                             return output_buf
                         reason = getattr(p_runner, "last_replay_reason", "runner_rejected")
+                    if batch_view is not None:
+                        graph_for(self, CudaGraph).fallback("prefill", reason or "runner_rejected")
                     dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
                     if dispatches is None:
                         dispatches = self._gr_prefill_graph_dispatches = {}
@@ -681,7 +695,7 @@ def capture_prefill_graphs(runner) -> None:
     only when the prefill graph env gate is enabled. Only explicitly
     recoverable capture failures fall back to eager prefill.
     """
-    if not is_prefill_graph_enabled():
+    if not graph_for(runner, CudaGraph).prefill_enabled:
         return
     if getattr(runner, "_prefill_graphs_captured", False):
         return
@@ -699,7 +713,7 @@ def capture_prefill_graphs(runner) -> None:
         torch.accelerator.synchronize()
         runner._prefill_graphs_captured = True
     except Exception as error:
-        from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+        from vllm_gr.v1.worker.graph_capture import is_recoverable_capture_error
 
         if not isinstance(error, RuntimeError) or not is_recoverable_capture_error(error):
             raise
@@ -720,7 +734,7 @@ def is_patched(runner_class: type) -> bool:
 
 def install() -> None:
     """Install CUDA Worker utilities and the V1 native runner wrappers."""
-    from vllm_gr.platforms.cuda import install_worker_hooks
+    from vllm_gr.platforms.cuda.provider import install_worker_hooks
     from vllm_gr.platforms.cuda.stage import create_v1_stage
     from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
         make_load_model_with_beam_postprocess_workspace,

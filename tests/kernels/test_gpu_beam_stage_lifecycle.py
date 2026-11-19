@@ -19,6 +19,7 @@ from tests.kernels.beam_stage_test_utils import (
     runtime,
 )
 from tests.kernels.v2_input_test_utils import make_native_v2_worker
+from vllm_gr.config import GRConfig
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
@@ -196,6 +197,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
     warm_stage_kernels(dtype)
     owner = runtime(dtype)
     worker = owner.worker
+    worker._vllm_gr_config = GRConfig(beam_max_width=4, beam_graph_enabled=graph)
     pinned = torch.zeros(1, pin_memory=True, dtype=torch.int32)
     copied = torch.empty(1, device="cuda", dtype=torch.int32)
     positions = torch.empty(7, device="cuda", dtype=torch.int64)
@@ -257,7 +259,6 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
         worker.device = owner.beam.state.device
         worker._beam_context = owner.beam.session.context
         worker.vllm_config = SimpleNamespace()
-        worker._vllm_gr_config = SimpleNamespace(beam_max_width=4)
         install_decode_model(worker, lambda ids, pos: decode_logits + ids[:, None].to(dtype))
         owner.prepared = owner.prepare_cpu(metadata(1), 0)
         owner._bind_attention(metadata(1))
@@ -266,10 +267,6 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
     monkeypatch.setattr(
         "vllm.v1.worker.gpu_model_runner.get_pp_group",
         lambda: SimpleNamespace(is_last_rank=True),
-    )
-    monkeypatch.setattr(
-        "vllm_gr.v1.worker.gr_context._get_gr_config",
-        lambda _: SimpleNamespace(beam_graph_enabled=graph),
     )
 
     def update(scheduled):
@@ -348,6 +345,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
     assert positions[: 7 - start].cpu().tolist() == list(range(start, 7))
     assert kv.cpu().tolist() == [1] * 7 + [0] * 9
     assert (owner.graph is not None) == graph
+    assert worker._gr_native_graph.stats()["replays"].get("decode", 0) == (2 if graph else 0)
     release(owner)
 
 

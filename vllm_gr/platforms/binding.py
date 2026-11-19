@@ -12,6 +12,7 @@ from types import ModuleType
 from typing import Any
 
 from .attention import bind_attention, loading_attention, validate_selected_attention
+from .graph import existing_graph, shared_prefill_runner_class
 from .plan import BackendPlan, read_backend_plan
 from .planning import normalize_backend_request, resolve_backend_plan
 
@@ -64,6 +65,8 @@ class BackendBinding:
     constraint_execution: Any
     canonical_constraint: Any = None  # Borrowed; runner shutdown owns this versioned table.
 
+    graph: Any = None
+
     def report(self) -> dict[str, Any]:
         services = {
             "runner": _implementation_id(self.runner_adapter),
@@ -79,6 +82,8 @@ class BackendBinding:
             services.update(
                 stage=stage.implementation_id, operator=stage.decision.implementation_id
             )
+        if self.graph is not None:
+            services["graph"] = _implementation_id(self.graph)
         return {"ready": True, "fingerprint": self.plan.fingerprint, "services": services}
 
 
@@ -99,6 +104,14 @@ def runner_constraint_backend(runner: Any) -> Any:
 
 
 def close_backend_binding(runner: Any) -> None:
+    # A refused drain must leave the entire live generation usable.
+    graph = existing_graph(runner)
+    if graph is not None:
+        graph.check_idle()
+        graph.close()
+        if getattr(runner, "_gr_native_graph", None) is graph:
+            del runner._gr_native_graph
+            runner._gr_native_graph_fingerprint = None
     native_attention = getattr(runner, "_gr_native_attention", None)
     if native_attention is not None:
         del runner._gr_native_attention
@@ -214,11 +227,43 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
                 raise RuntimeError(
                     "Loaded canonical constraint implementation differs from the admitted plan"
                 )
-        binding = BackendBinding(plan, adapter, attention, constraint, canonical)
+        graph = None
+        if implementation := choices.get("graph_implementation"):
+            create_graph = getattr(selected, "create_graph_executor", None)
+            if not callable(create_graph):
+                raise RuntimeError("Backend did not provide its admitted graph executor")
+            graph = getattr(runner, "_gr_native_graph", None)
+            if (
+                graph is None
+                or getattr(runner, "_gr_native_graph_fingerprint", None) != plan.fingerprint
+            ):
+                graph = create_graph(plan=plan, runner=runner)
+            created.append(graph)
+            if _implementation_id(graph) != implementation:
+                raise RuntimeError("Worker graph implementation differs from the admitted plan")
+            for method in (
+                "capture",
+                "captured",
+                "replay",
+                "replayed",
+                "fallback",
+                "stats",
+                "check_idle",
+                "close",
+            ):
+                if not callable(getattr(graph, method, None)):
+                    raise RuntimeError(f"Backend graph does not implement {method}()")
+            if plan.prefill_graph_mode == "shared":
+                shared_prefill_runner_class(graph)
+        binding = BackendBinding(plan, adapter, attention, constraint, canonical, graph)
         setattr(runner, _BINDING_ATTR, binding)
         _clear_unplanned_stage(runner, getattr(adapter, "stage", None))
         return binding
     except BaseException:
+        native_graph = getattr(runner, "_gr_native_graph", None)
+        if native_graph is not None and any(service is native_graph for service in created):
+            del runner._gr_native_graph
+            runner._gr_native_graph_fingerprint = None
         preloaded = getattr(runner, "_gr_constraint_execution", None)
         if preloaded is not None and any(service is preloaded for service in created):
             runner._gr_constraint_execution = None
@@ -235,11 +280,15 @@ def bind_after_model_load(
 
     @wraps(original)
     def load(self: Any, *args: Any, **kwargs: Any) -> Any:
+        graph = existing_graph(self)
+        if graph is not None:
+            graph.check_idle()
         if close_runtime is not None:
             # Reject undrained native work before replacing the current generation.
             close_runtime(self)
         if (
             getattr(self, _BINDING_ATTR, None) is not None
+            or graph is not None
             or getattr(self, "_gr_native_attention", None) is not None
         ):
             # Native layers constructed below must bind to the new model generation.

@@ -43,6 +43,8 @@ from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     unconstrained_topk_mcap_out as unconstrained_topk_out,
 )
 from vllm_gr.platforms.binding import runner_constraint_backend
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     SUPPORTED_BEAM_BATCH_SIZES,
@@ -264,11 +266,9 @@ def should_replay_decode_graph(
     worker: Any, graph: Any, *, capture_failed: bool | None = None
 ) -> bool:
     """Resolve decode graph replay, preserving unexpected-missing invariants."""
-    from vllm_gr.v1.worker.gr_context import (
-        _get_gr_config,
-    )
+    from vllm_gr.v1.worker.gr_context import _beam_graph_enabled_for_run
 
-    requested = not worker.model_config.enforce_eager and _get_gr_config(worker).beam_graph_enabled
+    requested = _beam_graph_enabled_for_run(worker)
     if not requested:
         return False
     if capture_failed is None:
@@ -276,6 +276,7 @@ def should_replay_decode_graph(
     if capture_failed:
         if graph is not None:
             raise RuntimeError("Decode capture failed but a graph is still published")
+        graph_for(worker, CudaGraph).fallback("decode", "capture_unsupported")
         return False
     if graph is not None:
         if not graph.ready:
@@ -1424,8 +1425,7 @@ def get_stage_runner(
     # A new schedule or resource binding invalidates the whole bounded cache.
     cache_enabled = (
         getattr(cfg, "beam_adapter_cache_enabled", False)
-        and not getattr(worker.model_config, "enforce_eager", False)
-        and getattr(cfg, "beam_graph_enabled", False)
+        and graph_for(worker, CudaGraph).decode_enabled
     )
     cache = getattr(worker, "_gr_gpu_stage_runner_cache", {})
     cache_key = (

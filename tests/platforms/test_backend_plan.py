@@ -24,6 +24,8 @@ from vllm_gr.platforms.binding import (
     worker_backend_readiness,
 )
 from vllm_gr.platforms.cuda import CUDA_BACKEND
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import bind_graph, graph_for
 from vllm_gr.platforms.plan import (
     BACKEND_PLAN_KEY,
     BackendPlan,
@@ -483,3 +485,126 @@ def test_bound_constraint_honors_explicit_torch_oracle(
     binding = bind_backend_services(SimpleNamespace(vllm_config=native, device="test:0"))
     assert binding.constraint_execution is oracle
     assert len(provider.created) == 2
+
+
+@pytest.mark.parametrize(
+    "mode, message", [("shared", "admitted graph"), ("other", "prefill_graph")]
+)
+def test_prefill_mode_requires_valid_graph_admission(
+    provider: Provider, monkeypatch: pytest.MonkeyPatch, mode: str, message: str
+) -> None:
+    monkeypatch.setattr(
+        provider,
+        "resolve",
+        lambda request: BackendPlan(
+            provider.backend_id,
+            provider.api_version,
+            request,
+            PlanData({"prefill_graph": mode}),
+        ),
+    )
+    native = config()
+    with pytest.raises(ValueError, match=message):
+        admit_backend_plan(native)
+    assert read_backend_plan(native) is None
+
+
+class GraphProvider(Provider):
+    def resolve(self, request: BackendRequest) -> BackendPlan:
+        plan = super().resolve(request)
+        native = request.native.to_dict()
+        eager = native["model_config"]["enforce_eager"]
+        return replace(
+            plan,
+            choices=PlanData(
+                {
+                    **plan.choices.to_dict(),
+                    "graph": "eager" if eager else "capture-with-eager-fallback",
+                    "prefill_graph": not eager,
+                    "graph_options": native["graph_options"],
+                    "graph_implementation": CudaGraph.implementation_id,
+                }
+            ),
+        )
+
+    def create_graph_executor(self, *, plan: BackendPlan, runner: Any) -> CudaGraph:
+        return bind_graph(plan, runner, CudaGraph)
+
+
+def test_graph_policy_isolation_and_native_operation_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = GraphProvider()
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: provider)
+    runners = [SimpleNamespace(vllm_config=config(), device="fake") for _ in range(2)]
+    plans = []
+    for runner, eager, grid in zip(runners, (False, True), ("16", "32")):
+        runner.vllm_config.model_config = SimpleNamespace(enforce_eager=eager)
+        monkeypatch.setenv("VLLM_GR_PREFILL_GRAPH_BUCKETS", grid)
+        plans.append(admit_backend_plan(runner.vllm_config))
+    monkeypatch.setenv("VLLM_GR_PREFILL_GRAPH_BUCKETS", "64")
+    first, second = (bind_backend_services(runner) for runner in runners)
+    assert first is not None and second is not None
+    graph = first.graph
+    assert graph.options["VLLM_GR_PREFILL_GRAPH_BUCKETS"] == "16"
+    assert second.graph.options["VLLM_GR_PREFILL_GRAPH_BUCKETS"] == "32"
+    assert graph is graph_for(runners[0])
+    calls = []
+
+    def capture() -> None:
+        calls.append("capture")
+        if len(calls) == 1:
+            raise RuntimeError("temporarily unsupported shape")
+
+    with pytest.raises(RuntimeError, match="unsupported shape"):
+        graph.capture("decode", capture)
+    graph.fallback("decode", "capture_unsupported")
+    assert graph.stats()["captures"] == {}
+    graph.capture("decode", capture)
+    token = object()
+    assert graph.replay("decode", lambda: token) is token
+    for phase in ("prefill", "decode"):
+        with pytest.raises(RuntimeError, match="disabled"):
+            second.graph.replay(phase, lambda: pytest.fail("launched disabled graph"))
+    assert graph.stats()["captures"] == {"decode": 1}
+    assert graph.stats()["replays"] == {"decode": 1}
+    assert graph.stats()["fallbacks"] == {"decode": {"capture_unsupported": 1}}
+    assert second.graph.stats()["replays"] == {}
+    report = first.report()
+    validate_worker_readiness(plans[0], [report], expected_workers=1)
+    report["services"]["graph"] = "other"
+    with pytest.raises(RuntimeError, match="graph implementation mismatch"):
+        validate_worker_readiness(plans[0], [report], expected_workers=1)
+
+
+def test_graph_shutdown_preserves_live_lease_then_retires_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: GraphProvider())
+    runner = SimpleNamespace(vllm_config=config(), device="fake")
+    plan = admit_backend_plan(runner.vllm_config)
+    early = graph_for(runner, CudaGraph)
+    binding = bind_backend_services(runner)
+    assert binding is not None and binding.graph is early
+    runner._beam_sessions = {"live": object()}
+    with pytest.raises(RuntimeError, match="released Beam sessions"):
+        close_backend_binding(runner)
+    assert graph_for(runner) is early and not early.closed
+    assert not binding.runner_adapter.closed
+    runner._beam_sessions.clear()
+    runner._prefill_graph_runner = SimpleNamespace(buffers={"shape": object()})
+    buffers = runner._prefill_graph_runner.buffers
+    pool = runner._beam_postprocess_workspaces = SimpleNamespace(keys=())
+    context = runner._beam_context = SimpleNamespace()
+    close_backend_binding(runner)
+    assert runner._beam_postprocess_workspaces is pool and runner._beam_context is context
+    assert not buffers and not hasattr(runner, "_prefill_graph_runner")
+    with pytest.raises(RuntimeError, match="closed model generation"):
+        early.replay("prefill", lambda: pytest.fail("stale generation launched"))
+    assert binding.runner_adapter.closed
+    reloaded = bind_backend_services(runner)
+    assert reloaded is not None and reloaded.plan == plan
+    assert reloaded.graph is not early and reloaded.graph.stats()["captures"] == {}
+    runner._gr_cuda_capture_context = context
+    close_backend_binding(runner)
+    assert runner._beam_context is None and runner._beam_postprocess_workspaces is pool

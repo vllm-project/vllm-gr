@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
     from vllm_gr.v1.beam.decision_ops import DecisionOps
+    from vllm_gr.v1.worker.prefill_graph_common import BasePrefillGraphRunner
 
     from .identity import PlatformIdentity
     from .plan import BackendPlan, BackendRequest
@@ -49,6 +50,29 @@ class ModelRunnerInstaller(Protocol):
     def install(self) -> None: ...
 
     def is_patched(self, runner_class: type[Any]) -> bool: ...
+
+
+class GraphExecutor(Protocol):
+    """Per-runner graph policy, successful native operations and pre-drain cleanup."""
+
+    implementation_id: str
+    prefill_enabled: bool
+    decode_enabled: bool
+
+    def capture(self, phase: str, native: Callable[..., Any], *args: Any, **kwargs: Any) -> Any: ...
+    def replay(self, phase: str, native: Callable[..., Any], *args: Any, **kwargs: Any) -> Any: ...
+    def captured(self, phase: str) -> None: ...
+    def replayed(self, phase: str) -> None: ...
+    def fallback(self, phase: str, reason: str) -> None: ...
+    def stats(self) -> dict[str, Any]: ...
+    def check_idle(self) -> None: ...
+    def close(self) -> None: ...
+
+
+class SharedPrefillGraphExecutor(GraphExecutor, Protocol):
+    """Graph executor for plans selecting GR's public Prefill runner factory."""
+
+    def prefill_runner_class(self) -> type[BasePrefillGraphRunner]: ...
 
 
 class StageExecution(Protocol):

@@ -21,6 +21,7 @@ BACKEND_OPTIONS_KEY = "vllm_gr_backend_options"
 _NATIVE_FIELDS = {
     "model_config": (
         "dtype",
+        "enforce_eager",
         "quantization",
         "max_model_len",
         "is_encoder_decoder",
@@ -117,6 +118,17 @@ def normalize_backend_request(
         options = admitted.request.native.to_dict()
         selected_dense = options.get("dense_prefill_request")
         batch_invariant = options.get("dense_prefill_batch_invariant", False)
+    from .graph import PREFILL_OPTIONS, graph_options
+
+    native["graph_options"] = (
+        graph_options(
+            getattr(
+                getattr(provider, "native_graph_factory", None), "option_names", PREFILL_OPTIONS
+            )
+        )
+        if admitted is None
+        else admitted.request.native.to_dict().get("graph_options", {})
+    )
     native["dense_prefill_request"] = selected_dense
     native["dense_prefill_batch_invariant"] = batch_invariant
     native["has_kv_transfer"] = getattr(config, "kv_transfer_config", None) is not None
@@ -160,6 +172,8 @@ def resolve_backend_plan(provider: Any, request: BackendRequest) -> BackendPlan:
         raise ValueError("Backend resolve() changed request or provider identity")
     if (request.config.to_dict().get("constraint_table") or {}).get("enabled"):
         admitted_constraint_id(plan)
+    if plan.prefill_graph_mode and not plan.choices.to_dict().get("graph_implementation"):
+        raise ValueError("An explicit Prefill graph mode requires an admitted graph service")
     return plan
 
 

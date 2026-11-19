@@ -41,6 +41,7 @@ CUDA_STAGE_FILES = [
     "vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py",
     "vllm_gr/v1/worker/gr_execution.py",
     "vllm_gr/v1/worker/gr_startup.py",
+    "vllm_gr/v1/worker/cuda/gpu_startup.py",
     "vllm_gr/v1/worker/model_runner_common.py",
     "vllm_gr/v1/worker/model_runner_contracts.py",
     "vllm_gr/v1/worker/gr_gc.py",

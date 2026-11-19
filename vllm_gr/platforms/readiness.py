@@ -32,6 +32,8 @@ def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_worke
         raise RuntimeError(f"Backend readiness requires {expected_workers} worker reports")
     choices = plan.choices.to_dict()
     required = ["runner"]
+    if choices.get("graph_implementation"):
+        required.append("graph")
     if choices.get("operator_policy"):
         required.extend(("stage", "operator"))
     if choices.get("requires_attention"):
@@ -54,6 +56,11 @@ def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_worke
         for service in required:
             if not isinstance(reported.get(service), str) or not reported[service].strip():
                 raise RuntimeError(f"Backend worker {index} has no bound {service}")
+        if (
+            choices.get("graph_implementation")
+            and reported["graph"] != choices["graph_implementation"]
+        ):
+            raise RuntimeError(f"Backend worker {index} graph implementation mismatch")
         expected_constraint = choices.get("constraint_implementation")
         if (
             choices.get("constraint") == "canonical"

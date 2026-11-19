@@ -24,18 +24,19 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     ModelCudaGraphManager,
 )
 
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import graph_for, options_for
 from vllm_gr.v1.attention.backends.beam_dense_prefill import (
     fresh_prefill_capture,
     requires_fresh_prefill_replay,
 )
-from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+from vllm_gr.v1.worker.graph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_PREFILL_GRAPH_BUCKET_STEP,
     ENV_PREFILL_GRAPH_MAX_BUCKET,
     get_default_buckets,
     get_max_context_len,
     get_prefill_graph_capture_num_reqs,
-    is_prefill_graph_enabled,
 )
 
 logger = init_logger(__name__)
@@ -49,14 +50,16 @@ def get_gpu_prefill_buckets(runner: Any) -> list[int]:
     capture budget. An empty native list must stay empty. The KV-bound knob
     changes attention coverage, not an explicitly configured native list.
     """
+    options = options_for(runner)
     if any(
-        name in os.environ for name in (ENV_PREFILL_GRAPH_BUCKET_STEP, ENV_PREFILL_GRAPH_MAX_BUCKET)
+        name in (os.environ if options is None else options)
+        for name in (ENV_PREFILL_GRAPH_BUCKET_STEP, ENV_PREFILL_GRAPH_MAX_BUCKET)
     ):
         logger.info(
             "Explicit GR Prefill bucket grid overrides native cudagraph_capture_sizes; "
             "unset the GR bucket step/max variables to use native capture configuration."
         )
-        return get_default_buckets()
+        return get_default_buckets(options)
     compilation = getattr(runner, "compilation_config", None)
     if compilation is None:
         compilation = getattr(getattr(runner, "vllm_config", None), "compilation_config", None)
@@ -65,7 +68,7 @@ def get_gpu_prefill_buckets(runner: Any) -> list[int]:
             getattr(runner, "cudagraph_manager", None), "compilation_config", None
         )
     sizes = getattr(compilation, "cudagraph_capture_sizes", None)
-    return list(sizes) if sizes is not None else get_default_buckets()
+    return list(sizes) if sizes is not None else get_default_buckets(options)
 
 
 def is_prefill_phase_batch_v2(
@@ -129,7 +132,7 @@ class PrefillCapturePlan:
         manager = runner.cudagraph_manager
         batch_sizes = tuple(
             b
-            for b in get_prefill_graph_capture_num_reqs(runner.vllm_config)
+            for b in get_prefill_graph_capture_num_reqs(runner.vllm_config, options_for(runner))
             if b <= runner.scheduler_config.max_num_seqs
         )
         context = get_max_context_len(runner)
@@ -182,6 +185,7 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
         native = runner.cudagraph_manager
         self.plan = plan
         self.runner = runner
+        self.graph_service = graph_for(runner, CudaGraph)
         self._prefill_scope: Any = None
         self._capture_finished = False
         self._successful: set[BatchExecutionDescriptor] = set()
@@ -261,6 +265,7 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
                         raise
                     torch.accelerator.synchronize(self.device)
                     self.full_capture_failures[desc] = str(error)
+                    self.graph_service.fallback("prefill", "full_capture_unsupported")
                     logger.warning(
                         "GR Prefill FULL capture unsupported for %d tokens, %d requests; "
                         "using captured PIECEWISE or NONE: %s",
@@ -270,12 +275,19 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
                     )
                 else:
                     self._successful.add(desc)
+                    if desc in self.graphs:
+                        self.graph_service.captured("prefill")
             self._capture_finished = True
         finally:
             self._capture_descs = plan
             # Native capture sets this after each sub-plan. Publish readiness
             # only when the entire adapter plan has completed successfully.
             self._graphs_captured = self._capture_finished
+
+    def run_fullgraph(self, desc: BatchExecutionDescriptor) -> Any:
+        if self._prefill_scope is None:
+            return super().run_fullgraph(desc)
+        return self.graph_service.replay("prefill", super().run_fullgraph, desc)
 
     def dispatch(
         self,
@@ -320,6 +332,8 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
                 elif piecewise in self._successful:
                     result = piecewise
         if in_prefill:
+            if result.cg_mode == CUDAGraphMode.NONE:
+                self.graph_service.fallback("prefill", "no_eligible_capture")
             self.dispatch_counts[result.cg_mode.name] += 1
         return result
 
@@ -343,9 +357,8 @@ def install_prefill_graph_manager_v2(runner: Any) -> None:
     if isinstance(native, GRPrefillCudaGraphManager):
         return
     if (
-        not is_prefill_graph_enabled()
-        or runner.model_config.enforce_eager
-        or native is None
+        native is None
+        or not graph_for(runner, CudaGraph).prefill_enabled
         or not native.cudagraph_mode
     ):
         return

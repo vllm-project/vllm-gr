@@ -92,6 +92,7 @@ def test_replay_checks_captured_storage_and_model_before_launch(
         _gr_v2_runtime=V2RuntimeState(inputs=graph.input_buffers),
         model=graph.wrapper if installed else graph.original_model,
     )
+    graph.graph_service = shared.graph_for(graph.worker, shared.CudaGraph)
     graph.runtime = get_v2_runtime(graph.worker)
     if replacement is not None:
         setattr(graph.runtime if replacement == "inputs" else graph.worker, replacement, object())
@@ -164,6 +165,7 @@ def capture_graph(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Mock, Mock]:
         concrete_cudagraph_entries=entries, clear_graphs=Mock(side_effect=entries.clear)
     )
     graph.installed = graph.capturing = False
+    graph.graph_service = shared.graph_for(graph.worker, shared.CudaGraph)
     stream, capturing = Mock(), Mock()
     monkeypatch.setattr(shared.torch.cuda, "current_stream", lambda _: stream)
     monkeypatch.setattr(shared.torch.cuda, "Stream", lambda **kw: Mock())

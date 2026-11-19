@@ -6,8 +6,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm.forward_context import get_forward_context
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+from vllm_gr.platforms.ascend.graph import AscendGraph
+from vllm_gr.platforms.graph import graph_for
 
 
 class NPUBeamGraphModel(ACLGraphWrapper):  # type: ignore[misc]
@@ -19,8 +23,9 @@ class NPUBeamGraphModel(ACLGraphWrapper):  # type: ignore[misc]
     original model, including its LM head and logits processor.
     """
 
-    def __init__(self, model: Any, vllm_config: Any) -> None:
+    def __init__(self, model: Any, vllm_config: Any, graph_executor: Any) -> None:
         self.original_model = model
+        self.graph_executor = graph_executor
         runnable = model
         while isinstance(runnable, ACLGraphWrapper) and runnable.runtime_mode == CUDAGraphMode.FULL:
             runnable = runnable.unwrap()
@@ -54,9 +59,21 @@ class NPUBeamGraphModel(ACLGraphWrapper):  # type: ignore[misc]
         return self.original_model.cudagraph_wrapper
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        if self._is_beam_forward():
-            return super().__call__(*args, **kwargs)
-        return self.original_model(*args, **kwargs)
+        if not self._is_beam_forward():
+            return self.original_model(*args, **kwargs)
+        context = get_forward_context()
+        native_forward = super().__call__
+        if context.cudagraph_runtime_mode != self.runtime_mode:
+            return native_forward(*args, **kwargs)
+        descriptor = context.batch_descriptor
+        entry = self.concrete_aclgraph_entries.get(descriptor)
+        if entry is not None and entry.aclgraph is not None:
+            return self.graph_executor.replay("decode", native_forward, *args, **kwargs)
+        result = native_forward(*args, **kwargs)
+        entry = self.concrete_aclgraph_entries.get(descriptor)
+        if entry is not None and entry.aclgraph is not None:
+            self.graph_executor.captured("decode")
+        return result
 
     def graph_ready(self, num_tokens: int) -> bool:
         from vllm.v1.cudagraph_dispatcher import BatchDescriptor
@@ -75,7 +92,7 @@ def install_npu_beam_graph_model(runner: Any) -> NPUBeamGraphModel:
         if runner.model is not current:
             raise RuntimeError("NPU Beam graph model changed after installation")
         return current
-    model = NPUBeamGraphModel(runner.model, runner.vllm_config)
+    model = NPUBeamGraphModel(runner.model, runner.vllm_config, graph_for(runner, AscendGraph))
     runner._gr_npu_graph_model = model
     runner.model = model
     return model
