@@ -38,6 +38,8 @@ class Sidecar:
         root = task.target_dir
         root.mkdir(parents=True, exist_ok=True)
         published = root / version
+        if published.is_symlink():
+            raise UpdateError(f"Published resource must not be a symlink: {published}")
         if published.exists():
             path = trie_file(published) if task.resource_type == "trie" else published
             if not path.resolve().is_relative_to(published.resolve()):
@@ -48,7 +50,10 @@ class Sidecar:
         try:
             await task.filesystem.download(task.address, version, staging)
             path = trie_file(staging) if task.resource_type == "trie" else staging
-            relative = path.resolve().relative_to(staging.resolve())
+            try:
+                relative = path.resolve().relative_to(staging.resolve())
+            except ValueError as exc:
+                raise UpdateError("Resource path is outside the download directory") from exc
             # Keep local publication order even when the downloader preserves mtimes.
             os.utime(staging, None)
             os.rename(staging, published)

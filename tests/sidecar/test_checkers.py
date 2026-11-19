@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from vllm_gr.sidecar import default_ckpt_checker, default_trie_checker
+from vllm_gr.sidecar import UpdateError, default_ckpt_checker, default_trie_checker
+from vllm_gr.sidecar.validation import trie_file
 
 
 def test_checkpoint_same_files_and_sizes_allow_new_weights(tmp_path: Path) -> None:
@@ -46,6 +47,22 @@ def test_trie_compares_names_without_requiring_same_tensor_sizes(tmp_path: Path)
     assert not default_trie_checker(old, new)
     save_file({"first": np.ones(4)}, new)
     assert not default_trie_checker(old, new)
+
+
+def test_trie_file_rejects_artifact_outside_its_directory(tmp_path: Path) -> None:
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    outside = tmp_path / "outside.safetensors"
+    save_file({"first": np.zeros(1)}, outside)
+    resource = tmp_path / "resource"
+    resource.mkdir()
+    artifact = resource / "table.safetensors"
+    artifact.symlink_to(outside)
+    with pytest.raises(UpdateError, match="outside"):
+        trie_file(artifact)
+    with pytest.raises(UpdateError, match="outside"):
+        trie_file(resource)
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
