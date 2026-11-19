@@ -8,9 +8,11 @@ import logging
 import os
 from dataclasses import dataclass
 from importlib import import_module
+from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 from .constraint_plan import constraint_plan_choices
+from .interface import GraphProvider
 from .plan import PLAN_API_VERSION, BackendPlan, BackendRequest, PlanData
 
 if TYPE_CHECKING:
@@ -40,6 +42,32 @@ def constraint_execution_override(*, device: Any) -> Any:
 
     logger.info("vllm-gr: constraint execution overridden to Torch oracle for CI/dev")
     return TorchConstrainedTopKExecution(device=device)
+
+
+def validate_optional_factories(provider: Any) -> None:
+    for name, kwargs in (
+        ("create_config_service", {}),
+        ("create_graph_executor", {"plan": None, "runner": None}),
+    ):
+        factory = getattr(provider, name, None)
+        if factory is None:
+            continue
+        if not callable(factory):
+            raise ValueError(f"Backend provider {name} must be callable")
+        try:
+            parameters = signature(factory)
+        except (ValueError, TypeError):
+            continue  # Some extension callables do not publish a Python signature.
+        try:
+            parameters.bind(**kwargs)
+        except TypeError as exc:
+            raise ValueError(f"Invalid backend factory {name} signature: {exc}") from exc
+
+
+def graph_provider(provider: Any) -> GraphProvider:
+    if not isinstance(provider, GraphProvider) or not callable(provider.create_graph_executor):
+        raise ValueError("Backend admitting a graph must implement create_graph_executor()")
+    return provider
 
 
 def validate_planning_api(provider: Any) -> None:

@@ -25,6 +25,7 @@ from vllm_gr.entrypoints.beam_search_v1.request_params import (
     apply_beam_request_defaults,
 )
 from vllm_gr.entrypoints.beam_search_v1.token_utils import boundary_token_id
+from vllm_gr.platforms.config import request_config_service
 from vllm_gr.platforms.constraint_plan import canonical_constraint_id
 from vllm_gr.platforms.plan import read_backend_plan
 from vllm_gr.v1.beam.batch_contracts import (
@@ -78,14 +79,11 @@ def _configured_candidate_width(vllm_config: Any) -> int | None:
     """Return the explicitly configured K, or ``None`` when K follows W."""
 
     config = GRConfig.from_vllm_config(vllm_config)
-    device = getattr(getattr(vllm_config, "device_config", None), "device", None)
     if (
-        str(device).split(":")[0] == "npu"
-        and config.deployment.candidate_width is not None
+        config.deployment.candidate_width is not None
         and config.deployment.candidate_width == config.deployment.beam_width
+        and getattr(request_config_service(vllm_config), "infer_matching_candidate_widths", False)
     ):
-        # NPU derives K from each stage's retained width. Do not serialize
-        # the workspace capacity as a fixed request override for dynamic W.
         return None
     return configured_candidate_width(config)
 

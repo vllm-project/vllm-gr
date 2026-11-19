@@ -173,6 +173,7 @@ def graph_for(runner: Any, native_factory: Any = None) -> Any:
     if graph is None:
         from .loader import activate_current_backend
         from .plan import read_backend_plan
+        from .services import graph_provider
 
         plan = read_backend_plan(getattr(runner, "vllm_config", None))
         implementation = plan.required_services.get("graph") if plan else None
@@ -182,12 +183,13 @@ def graph_for(runner: Any, native_factory: Any = None) -> Any:
             # Native model initialization may ask for graphs before the full
             # bundle is published. Use the same admitted provider and adopt
             # this exact owner at readiness, including third-party services.
-            factory = getattr(activate_current_backend(), "create_graph_executor", None)
-            if not callable(factory):
-                raise RuntimeError("Backend did not provide its admitted graph executor")
-            graph = factory(plan=plan, runner=runner)
+            graph = graph_provider(activate_current_backend()).create_graph_executor(
+                plan=plan, runner=runner
+            )
             if getattr(graph, "implementation_id", None) != implementation:
-                graph.close()
+                close = getattr(graph, "close", None)
+                if callable(close):
+                    close()
                 raise RuntimeError("Worker graph implementation differs from the admitted plan")
         else:
             factory = native_factory or getattr(

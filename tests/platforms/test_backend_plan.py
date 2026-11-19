@@ -63,6 +63,17 @@ class Service:
         self.closed = True
 
 
+class RunnerService(Service):
+    def prepare_inputs(self, data: Any) -> Any:
+        return data
+
+    def execute_model(self, data: Any) -> Any:
+        return data
+
+    def sample_tokens(self, data: Any) -> Any:
+        return data
+
+
 class Provider:
     backend_id = "test-backend"
     api_version = 2
@@ -92,7 +103,7 @@ class Provider:
             raise RuntimeError("required kernel missing")
 
     def create_model_runner_adapter(self, *, plan: BackendPlan, native_runner: Any) -> Service:
-        service = Service(plan, native_runner)
+        service = RunnerService(plan, native_runner)
         service.stage = Mock(
             implementation_id="test.stage",
             worker_decision=True,
@@ -246,6 +257,26 @@ def test_explicit_service_ids_bind_and_reject_matching_but_wrong_worker_reports(
     assert len(provider.created) == 3 and all(service.closed for service in provider.created)
 
 
+@pytest.mark.parametrize("phase", ["prepare_inputs", "execute_model", "sample_tokens"])
+def test_beam_runner_requires_native_callbacks_without_method_markers(
+    provider: Provider, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    original = provider.create_model_runner_adapter
+
+    def incomplete_adapter(*, plan: BackendPlan, native_runner: Any) -> Service:
+        adapter = original(plan=plan, native_runner=native_runner)
+        monkeypatch.setattr(adapter, phase, None)
+        return adapter
+
+    monkeypatch.setattr(provider, "create_model_runner_adapter", incomplete_adapter)
+    runner = SimpleNamespace(vllm_config=config(), sample_tokens=lambda data: data)
+    admit_backend_plan(runner.vllm_config)
+    with pytest.raises(RuntimeError, match=phase):
+        bind_backend_services(runner)
+    assert getattr(runner, "_gr_backend_binding", None) is None
+    assert provider.created[0].closed
+
+
 @pytest.mark.parametrize("service", ["attention", "stage", "graph"])
 def test_unmet_pinned_requirement_rolls_back_binding(
     provider: Provider, monkeypatch: pytest.MonkeyPatch, service: str
@@ -261,6 +292,14 @@ def test_unmet_pinned_requirement_rolls_back_binding(
             requirements=ServiceRequirements.from_dict({service: "missing.implementation"}),
         ),
     )
+    if service == "graph":
+
+        def wrong_graph(*, plan: BackendPlan, runner: Any) -> Service:
+            graph = Service(plan, runner)
+            provider.created.append(graph)
+            return graph
+
+        monkeypatch.setattr(provider, "create_graph_executor", wrong_graph, raising=False)
     native = config()
     admit_backend_plan(native)
     runner = SimpleNamespace(vllm_config=native)
@@ -857,3 +896,24 @@ def test_graph_shutdown_preserves_live_lease_then_retires_generation(
     runner._gr_cuda_capture_context = context
     close_backend_binding(runner)
     assert runner._beam_context is None and runner._beam_postprocess_workspaces is pool
+
+
+def test_admitting_graph_without_factory_fails_before_worker_startup(
+    provider: Provider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider,
+        "resolve",
+        lambda req: BackendPlan(
+            provider.backend_id,
+            provider.api_version,
+            req,
+            PlanData({}),
+            requirements=ServiceRequirements(graph="external.graph"),
+        ),
+    )
+    native = config()
+    with pytest.raises(ValueError, match="create_graph_executor"):
+        admit_backend_plan(native)
+    assert read_backend_plan(native) is None

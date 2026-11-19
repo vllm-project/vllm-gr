@@ -74,7 +74,8 @@ class Provider(HostOnlyProvider):
         assert device.type == "cpu"
         return Attention(plan)
     def create_model_runner_adapter(self, *, plan, native_runner):
-        return SimpleNamespace(implementation_id="fixture.runner", stage=Stage(plan))
+        return SimpleNamespace(implementation_id="fixture.runner", stage=Stage(plan),
+                               prepare_inputs=lambda data: data, execute_model=lambda data: data)
 
 BACKEND = Provider()
 """

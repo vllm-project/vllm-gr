@@ -36,6 +36,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
     device_type: str = "cuda"
     # Semantic ownership includes hooks still installed by shared dispatch.
     patch_ids: ClassVar[tuple[str, ...]] = ("GR-PATCH-011",)
+    deferred_patch_ids: ClassVar[tuple[str, ...]] = patch_ids
     api_version: ClassVar[int] = PROVIDER_API_VERSION
     gr_version_range: ClassVar[str | None] = ">=0.30.0,<0.31.0"
     vllm_version_range: ClassVar[str | None] = "==0.30.0"

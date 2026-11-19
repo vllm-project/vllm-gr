@@ -35,6 +35,16 @@ def apply_ascend_attention_backend_patch(force: bool = False) -> int:
     return apply_custom_attention_backend_patch(force=force)
 
 
+def is_npu_worker_patched() -> bool | None:
+    """The selected vendor may defer importing its worker until the child starts."""
+    import sys
+
+    worker = getattr(sys.modules.get("vllm_ascend.worker.worker"), "NPUWorker", None)
+    if worker is None:
+        return None
+    return _NPU_WORKER_ORIGINAL_ATTR in getattr(worker.init_device, "__dict__", {})
+
+
 def patch_npu_worker_init_device() -> int:
     """Run vllm-gr patch installation before NPUWorker device initialization."""
     if not is_npu_platform():
@@ -71,9 +81,7 @@ def patch_npu_worker_init_device() -> int:
         apply_penalties_warmup_oom_guard()
         # Mount the V1 worker utilities before native initialization.
         from vllm_gr.ops.npu_stage_logits import install_npu_stage_weight_update_hooks
-        from vllm_gr.v1.worker.model_runner_patch import (
-            install_worker_utility_hooks,
-        )
+        from vllm_gr.v1.worker.model_runner_patch import install_worker_utility_hooks
 
         install_worker_utility_hooks(type(self))
         install_npu_stage_weight_update_hooks(type(self))

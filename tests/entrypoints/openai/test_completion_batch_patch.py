@@ -682,4 +682,37 @@ def test_decode_capacity_is_checked_before_batch_submission(
         assert "NPU Decode" in _declines(logged)[0][2]
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_custom_provider_controls_openai_decode_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    make_serving: Callable[..., _BatchSelf],
+    make_request: Callable[..., Any],
+) -> None:
+    from tests.platforms.test_backend_plan import Provider, config
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.config import BackendConfigService
+    from vllm_gr.platforms.planning import admit_backend_plan
+
+    class Policy(BackendConfigService):
+        def decode_batch_decline_reason(
+            self, config: Any, batch_size: int, beam_width: int
+        ) -> str | None:
+            return f"test provider declined {batch_size} x {beam_width}"
+
+    serving = make_serving(max_num_batched_tokens=512, prompt_lengths=dict.fromkeys(range(4), 16))
+    native = config()
+    native.device_config = SimpleNamespace(device="cuda:0")
+    native.scheduler_config = serving.engine_client.vllm_config.scheduler_config
+    serving.engine_client.vllm_config = native
+    provider = Provider()
+    monkeypatch.setattr(provider, "create_config_service", Policy, raising=False)
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: provider)
+    monkeypatch.setattr("vllm_gr.platforms.config.get_active_backend", lambda: provider)
+    assert admit_backend_plan(native) is not None
+    request = make_request(n=16, max_tokens=3)
+    reasons = patch_module._batch_decline_reason
+    assert reasons(serving, request, list(range(4)), [3] * 4) == "test provider declined 4 x 16"
+    assert reasons(serving, request, list(range(4)), [1] * 4) is None
+
+
 pytestmark = pytest.mark.cpu_test

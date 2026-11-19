@@ -299,6 +299,52 @@ which another out-of-tree platform could also report.
 Provider objects are registered directly. Entry points must not expose a
 provider class or an arbitrary factory.
 
+### Early patch ownership and verification
+
+A v2 provider with process-wide patches declares `patch_ids` and
+`runtime_patch_checks`. Each key names one patch. Each value is a zero-argument
+callable that returns `True` when the live target points to its installed hook.
+For example, an entry point may declare `patch_ids = ("acme.worker",)` and a
+matching `{"acme.worker": verify_worker_wrapper}` mapping. Providers without
+early patches may omit both attributes.
+
+Initialization checks ownership against `CORE_PATCH_IDS` and the selected
+registration before mutating native targets. It invokes the probes after
+`apply_runtime_patches(force=...)`, including retries that inserted zero new
+wrappers. A conflict, missing probe, false result or exception identifies the
+claim and its registration origin. Built-in runner and worker-only hooks retain
+the activation phases listed in the patch inventory. Ascend's early probes
+check the worker initializer and both bindings of the spawn helper.
+
+### Engine configuration and request admission
+
+`create_config_service()` is an optional provider factory. Subclass
+`vllm_gr.platforms.config.BackendConfigService` to supply native defaults,
+validated engine combinations, and frontend/EngineCore request checks. The
+default policy leaves native configuration intact. The selected service
+controls legacy catalog promotion, vocabulary slicing and worker-decision
+defaults. `startup_inputs(gr, admitted)` returns serializable provider inputs. When
+checking a transferred plan, read its original inputs from `admitted`.
+
+The frontend reads the admitted service for two request policies.
+`infer_matching_candidate_widths` lets the worker infer candidate widths
+that match the Beam widths. `decode_batch_decline_reason(config, batch_size, beam_width)` can decline batching when the native runner has too few rows.
+The Ascend implementation applies its Decode row capacity to this decision.
+
+`validate_device(config, gr, request)` receives `request=None` during startup.
+Raise `GRDeviceRequestError` for unsupported requests on an otherwise admitted
+deployment, or `ValueError` for an invalid deployment. Use
+`validate_request_budget(config, request)` for request-level resource limits.
+Native configs created directly without an execution plan retain their legacy
+placement checks. Admitted engines always use their selected provider,
+including third-party providers with the same tensor placement as a built-in.
+
+The pre-commit hook runs `python tools/pre_commit/check_backend_boundaries.py`.
+It checks the RFC's shared runtime modules for native-platform branches,
+literal device dispatch tables and vendor imports. Its allowlist keys each
+transitional exception to the file, owning function and exact expression.
+Removing an exception from the code requires removing its entry from the list.
+
 ## Lazy import boundary
 
 Provider modules and their package initializers must not import `torch`,
@@ -406,7 +452,82 @@ Metadata construction, KV memory management, and the shared execute-model
 wrapper are deliberately outside this contract until their owning migration
 stages define stable boundaries.
 
+### Attention and graph access during migration
+
+| Entry point | Caller and lifetime | When it can be retired |
+| --- | --- | --- |
+| `get_attention_execution()` | Legacy provider ABI and primitive capability queries during selection. Returns a module. | After supported primitive-only providers migrate and both cold selection and binding work without the getter. |
+| `native_attention(config)` | Optional policy for native config selection without an engine plan. A native runner under construction may retain the result. | After supported direct native entry points carry a plan or provide an equivalent policy. |
+| `attention_admission(plan=...)` | Optional early policy for planned CUSTOM selection before any runner or layer exists. | A replacement must handle cold class and capability queries without constructing a device executor. |
+| `get_attn_backend_cls(...)` | Optional policy callback to select the native class and metadata builder. The default is `BeamAttentionBackend`. | Needed while providers can supply a native CUSTOM class. |
+| `create_attention_executor(plan=..., device=...)` | Model load constructs a runner-owned executor. Layers, metadata builders and readiness share that instance. | Execution contract for planned runners. |
+| `native_graph_factory` | Native Prefill class discovery and the fallback for directly created runners or legacy plans without an admitted graph. | After these callers obtain the class and graph through an admitted plan. |
+| `create_graph_executor(plan=..., runner=...)` | Constructs the graph admitted by the engine. Readiness adopts a matching instance created during model load. | Execution contract for planned graphs. |
+| `graph_for(runner, ...)` | Worker access to the bound graph, including early construction and reuse during capture and replay. | Early construction can go when all supported runners publish their binding before their first graph query. |
+
+`supports_combination()` validates a complete selector request. vLLM also
+queries head size, sliding windows and batch invariance individually through
+`BeamAttentionBackend`. Providers that use the common `AttentionExecutor` can
+inherit its defaults and override the capabilities their backend supports.
+The metadata profile describes how the builder packs tensors after selection.
+
 ## External provider entry points
+
+### Build and validate a provider wheel
+
+The independently installable project in
+[`tests/platforms/fixtures/provider`](../tests/platforms/fixtures/provider) shows
+the packaging and lifecycle of a host-only provider. Its entry points declare a
+native vLLM platform and a GR provider. In an integration with an existing
+native platform, match the platform vLLM selected. Keep the entry-point module
+import-light and import vendor executors inside their selected factories.
+
+The example's `resolve(request)` validates its own `tile` option and records
+JSON choices in the plan. Two engines can choose different tiles in one worker.
+Beam V1 requires a runner-bound stage and Beam decision operators. CUSTOM
+attention requires a runner-bound executor with available Beam attention
+primitives. Engine readiness checks these services from the requested modes,
+even if the provider omits optional plan choices. The example installs native
+runner methods, binds one attention executor across model load and runner
+readiness, and releases its resources on shutdown. Keep the engine and worker
+distributions and adapter revisions in sync. A worker recomputes the request
+using its local provider and rejects a
+different fingerprint before the runner can serve a request.
+
+To validate an existing release or candidate wheel, use the SHA-256 from its
+build manifest. Run this from a source checkout with PyTorch, `pip`, `setuptools>=77`,
+`wheel`, `packaging` and `regex` available to the test interpreter.
+
+```sh
+python tools/run_provider_conformance.py /path/to/vllm_gr.whl --sha256 "$CORE_SHA256"
+```
+
+The command verifies and copies the supplied artifact, installs it into a new
+directory, builds the example in a separate temporary project, and installs it
+into another directory. The engine and two fresh workers run outside the
+checkout. The command checks their installed module origins, the immutable
+core files, independent graph and attention ownership, shutdown, agreement on
+the transported plans, and failures for incompatible versions, unsupported or
+ambiguous platforms, changed options, missing stage or attention services,
+and a replaced patch. Each run prints
+both wheel digests. The packaging workflow also runs this check against the
+Python 3.12 CPU wheel.
+
+The default run supplies the fixture's identity at the platform bridge.
+Add `--native-platform` with vLLM 0.30.0 and PyTorch installed to exercise
+vLLM's platform entry point and general-plugin loader. These host checks
+disable PyTorch device-extension autoloading. Some vendor images also probe
+accelerators through Transformers, which can import `torch_npu` during
+model integration discovery. On those images, run the native fixture in an
+isolated environment with the same vLLM and PyTorch versions and without the
+physical accelerator extensions. Run device regressions in the vendor runtime. The
+bootstrap check verifies the selected provider, its installed runner hooks and
+the core patch report before admitting engine plans. The native workers execute
+the shared stage and retirement entry points and run a one-token CPU forward
+through the Beam attention layer and its bound executor. Hardware support
+requires native CUDA V1/V2 or Ascend startup, Beam correctness and score comparisons, graph
+capture/replay and cleanup, and throughput/latency measurements on the
+advertised device.
 
 External packages register provider objects in this entry-point group:
 

@@ -27,6 +27,13 @@ LEGACY_PROVIDER_API_VERSION = 1
 
 
 @runtime_checkable
+class GraphProvider(Protocol):
+    """Required for a planning provider that declares a graph service."""
+
+    def create_graph_executor(self, *, plan: BackendPlan, runner: Any) -> GraphExecutor: ...
+
+
+@runtime_checkable
 class ConfigProvider(Protocol):
     """Optional host policy for native defaults and engine admission."""
 

@@ -1232,6 +1232,36 @@ def _request_defaults_host(**settings: Any) -> Any:
 
 
 @pytest.mark.l1  # type: ignore[misc]
+def test_admitted_provider_controls_derived_candidate_widths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.platforms.test_backend_plan import Provider
+    from vllm_gr.entrypoints.beam_search_v1.request_params import (
+        apply_beam_request_defaults,
+    )
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.config import BackendConfigService
+    from vllm_gr.platforms.planning import admit_backend_plan
+    from vllm_gr.sampling_params import BeamSearchParams
+
+    class Policy(BackendConfigService):
+        infer_matching_candidate_widths = True
+
+    provider = Provider()
+    monkeypatch.setattr(provider, "create_config_service", Policy, raising=False)
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: provider)
+    monkeypatch.setattr("vllm_gr.platforms.config.get_active_backend", lambda: provider)
+    host = _request_defaults_host()
+    host.device_config = SimpleNamespace(device="cuda:0")
+    assert admit_backend_plan(host) is not None
+    params = BeamSearchParams(beam_width=8, max_tokens=3)
+    inferred = apply_beam_request_defaults(host, params)
+    assert inferred.dynamic_beam_widths == [8, 4, 2] and inferred.per_parent_beam_widths is None
+    params.per_parent_beam_widths = [8, 4, 2]
+    assert apply_beam_request_defaults(host, params).per_parent_beam_widths == [8, 4, 2]
+
+
+@pytest.mark.l1  # type: ignore[misc]
 def test_native_params_accept_engine_defaults_without_mutation() -> None:
     from vllm.sampling_params import BeamSearchParams
 

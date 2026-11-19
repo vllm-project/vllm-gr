@@ -9,11 +9,17 @@ from vllm.sampling_params import BeamSearchParams as NativeBeamSearchParams
 
 from vllm_gr.config import GRConfig
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
+from vllm_gr.platforms.config import BackendConfigService, request_config_service
+from vllm_gr.platforms.legacy import legacy_config_service
 from vllm_gr.sampling_params import BeamSearchParams
 
 
 def resolve_request_widths(
-    config: GRConfig, params: NativeBeamSearchParams, *, device: object = None
+    config: GRConfig,
+    params: NativeBeamSearchParams,
+    *,
+    device: object = None,
+    config_service: BackendConfigService | None = None,
 ) -> BeamSearchParams:
     """Keep runtime capacity separate from request length and width schedules."""
     values = asdict(params)
@@ -57,11 +63,15 @@ def resolve_request_widths(
             updates[name] = list(default[:steps])
         else:
             updates[name] = default
-    if str(device).split(":")[0] == "npu" and "per_parent_beam_widths" in updates:
+    if "per_parent_beam_widths" in updates:
         widths = updates.get("dynamic_beam_widths", values.get("dynamic_beam_widths"))
         if updates["per_parent_beam_widths"] == widths and expanded == retained:
-            # NPU derives candidate width from the retained width of each stage.
-            del updates["per_parent_beam_widths"]
+            if config_service is None:
+                config_service = legacy_config_service(
+                    None if device is None else str(device).split(":")[0]
+                )
+            if getattr(config_service, "infer_matching_candidate_widths", False):
+                del updates["per_parent_beam_widths"]
     # Construction validates result_width against this request's final retained
     # width, and validates explicit schedules too. msgspec.replace skips that.
     return BeamSearchParams(**{**values, **updates})
@@ -73,5 +83,5 @@ def apply_beam_request_defaults(
     return resolve_request_widths(
         GRConfig.from_vllm_config(vllm_config),
         params,
-        device=getattr(getattr(vllm_config, "device_config", None), "device", None),
+        config_service=request_config_service(vllm_config),
     )

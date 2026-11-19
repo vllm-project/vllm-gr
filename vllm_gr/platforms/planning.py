@@ -146,7 +146,7 @@ def normalize_backend_request(
 
 def resolve_backend_plan(provider: Any, request: BackendRequest) -> BackendPlan:
     from .constraint_plan import admitted_constraint_id
-    from .services import planning_provider
+    from .services import graph_provider, planning_provider
 
     plan = planning_provider(provider).resolve(request)
     if not isinstance(plan, BackendPlan):
@@ -161,6 +161,8 @@ def resolve_backend_plan(provider: Any, request: BackendRequest) -> BackendPlan:
         admitted_constraint_id(plan)
     if plan.prefill_graph_mode and "graph" not in plan.required_services:
         raise ValueError("An explicit Prefill graph mode requires an admitted graph service")
+    if "graph" in plan.required_services:
+        graph_provider(provider)
     return plan
 
 

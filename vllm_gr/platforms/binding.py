@@ -25,7 +25,12 @@ from .readiness import (
     verify_engine_backend_readiness as verify_engine_backend_readiness,
 )
 from .readiness import worker_backend_readiness as worker_backend_readiness
-from .services import BoundService, constraint_execution_override, planning_provider
+from .services import (
+    BoundService,
+    constraint_execution_override,
+    graph_provider,
+    planning_provider,
+)
 
 logger = logging.getLogger(__name__)
 _BINDING_ATTR = "_gr_backend_binding"
@@ -180,7 +185,12 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
         created.append(adapter)
         if adapter is None:
             raise RuntimeError("Backend did not bind the required runner adapter")
-        for phase in getattr(type(runner), "_gr_runner_methods", ()):
+        phases = set(getattr(type(runner), "_gr_runner_methods", ()))
+        if plan.request.uses_beam_v1:
+            phases.update(("prepare_inputs", "execute_model"))
+            if callable(getattr(runner, "sample_tokens", None)):
+                phases.add("sample_tokens")
+        for phase in sorted(phases):
             if not callable(getattr(adapter, phase, None)):
                 raise RuntimeError(f"Backend runner adapter does not implement {phase}()")
         if "stage" in required:
@@ -251,15 +261,12 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
                 )
         graph = None
         if implementation := required.get("graph"):
-            create_graph = getattr(selected, "create_graph_executor", None)
-            if not callable(create_graph):
-                raise RuntimeError("Backend did not provide its admitted graph executor")
             graph = getattr(runner, "_gr_native_graph", None)
             if (
                 graph is None
                 or getattr(runner, "_gr_native_graph_fingerprint", None) != plan.fingerprint
             ):
-                graph = create_graph(plan=plan, runner=runner)
+                graph = graph_provider(selected).create_graph_executor(plan=plan, runner=runner)
             created.append(graph)
             if _implementation_id(graph) != implementation:
                 raise RuntimeError("Worker graph implementation differs from the admitted plan")

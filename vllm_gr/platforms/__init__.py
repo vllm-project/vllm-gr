@@ -17,6 +17,7 @@ from .identity import PlatformIdentity, current_platform_identity, platform_iden
 from .interface import (
     PROVIDER_API_VERSION,
     ConfigProvider,
+    GraphProvider,
     GRBackendProvider,
     GRPlanningProvider,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "BackendRegistryError",
     "DuplicateBackendRegistrationError",
     "ConfigProvider",
+    "GraphProvider",
     "GRBackendProvider",
     "IncompatibleBackendError",
     "InvalidBackendProviderError",

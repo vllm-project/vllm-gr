@@ -73,6 +73,14 @@ jobs:
           # installed module and distribution versions agree for this target.
           bash tools/run_wheel_smoke_test.sh --python python
 
+      - name: Check external provider against the built core wheel
+        if: matrix.target-device == 'cpu' && matrix.python-version == '3.12'
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          wheel=(dist/*.whl)
+          digest=$(sha256sum "${wheel[0]}" | cut -d ' ' -f 1)
+          python tools/run_provider_conformance.py "${wheel[0]}" --sha256 "$digest"
+
       - name: Upload Wheel Artifact
         if: ${{ !env.ACT }}
         uses: actions/upload-artifact@v4

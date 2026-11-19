@@ -480,8 +480,10 @@ def test_npu_worker_reinstalls_over_replaced_upstream_target(
     monkeypatch.setattr(ascend_compat, "_install_init_ascend_config_sanitizer", lambda: None)
     worker = _install_fake_npu_worker(monkeypatch, lambda _: "native")
     original = worker.init_device
+    assert not ascend_compat.is_npu_worker_patched()
     assert ascend_compat.patch_npu_worker_init_device() == 1
     wrapper = worker.init_device
+    assert ascend_compat.is_npu_worker_patched()
     assert getattr(wrapper, ascend_compat._NPU_WORKER_ORIGINAL_ATTR) is original
     assert ascend_compat.patch_npu_worker_init_device() == 0
     assert worker.init_device is wrapper
@@ -490,6 +492,7 @@ def test_npu_worker_reinstalls_over_replaced_upstream_target(
         return "replacement"
 
     monkeypatch.setattr(worker, "init_device", replacement)
+    assert not ascend_compat.is_npu_worker_patched()
     assert ascend_compat.patch_npu_worker_init_device() == 1
     repaired = worker.init_device
     assert getattr(repaired, ascend_compat._NPU_WORKER_ORIGINAL_ATTR) is replacement

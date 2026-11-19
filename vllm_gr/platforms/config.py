@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 from .errors import BackendNotActiveError, UnsupportedBackendError
@@ -24,6 +23,7 @@ class BackendConfigService:
     promote_catalog_tables = False
     supports_constraint_vocab_slicing = False
     supports_sid_stage_vocab = False
+    infer_matching_candidate_widths = False
 
     def startup_inputs(self, gr: GRConfig, admitted: Mapping[str, Any] | None) -> dict[str, Any]:
         """Return provider-owned host options used when constructing the backend plan."""
@@ -44,24 +44,14 @@ class BackendConfigService:
                 "beam.sid_stage_vocab requires a provider with stage vocabulary support"
             )
 
+    def decode_batch_decline_reason(
+        self, config: Any, batch_size: int, beam_width: int
+    ) -> str | None:
+        """Return the backend's reason to run a Decode batch as separate requests."""
+        return None
+
     def validate_request_budget(self, config: Any, request: Any) -> None:
         pass
-
-
-def validate_config_factory(provider: Any) -> None:
-    factory = getattr(provider, "create_config_service", None)
-    if factory is None:
-        return
-    if not callable(factory):
-        raise ValueError("Backend provider create_config_service must be callable")
-    try:
-        parameters = signature(factory)
-    except (ValueError, TypeError):
-        return  # Some native extension callables do not publish a signature.
-    try:
-        parameters.bind()
-    except TypeError as exc:
-        raise ValueError(f"Invalid backend factory create_config_service signature: {exc}") from exc
 
 
 def provider_config_service(provider: Any) -> BackendConfigService:

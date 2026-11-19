@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 class AscendConfigService(BackendConfigService):
     supports_sid_stage_vocab = True
+    infer_matching_candidate_widths = True
     default_worker_decision = True
     promote_catalog_tables = True
 
@@ -50,6 +51,17 @@ class AscendConfigService(BackendConfigService):
         from vllm_gr.v1.engine.npu_admission import validate_npu_device_config
 
         validate_npu_device_config(config, gr, request)
+
+    def decode_batch_decline_reason(
+        self, config: Any, batch_size: int, beam_width: int
+    ) -> str | None:
+        capacity = config.scheduler_config.max_num_batched_tokens // beam_width
+        if batch_size > capacity:
+            return (
+                f"NPU Decode batch size {batch_size} exceeds the physical input "
+                f"capacity of {capacity} prompts at the requested beam width"
+            )
+        return None
 
     def validate_request_budget(self, config: Any, request: Any) -> None:
         from vllm_gr.v1.engine.npu_admission import validate_decode_token_budget

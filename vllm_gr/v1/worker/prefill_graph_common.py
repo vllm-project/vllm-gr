@@ -4,11 +4,11 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 import torch
-from vllm.logger import init_logger
 
 from vllm_gr.config import (
     GRConfig,
@@ -20,7 +20,7 @@ from vllm_gr.config.models import (
 )
 from vllm_gr.v1.worker.graph_capture import is_recoverable_capture_error
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Default capture policy is deliberately narrower than engine capability.
 # Static buffer capacity remains independent of the selected capture grid.

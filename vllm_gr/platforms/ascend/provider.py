@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -43,6 +44,13 @@ class NPUBackendProvider(BuiltinPlanSupport):
         "GR-PATCH-002",
         "GR-PATCH-012",
         "GR-PATCH-016",
+        "GR-PATCH-018",
+        "GR-PATCH-019",
+        "GR-PATCH-021",
+    )
+    deferred_patch_ids: ClassVar[tuple[str, ...]] = (
+        "GR-PATCH-002",
+        "GR-PATCH-012",
         "GR-PATCH-018",
         "GR-PATCH-019",
         "GR-PATCH-021",
@@ -139,6 +147,13 @@ class NPUBackendProvider(BuiltinPlanSupport):
         from .config import AscendConfigService
 
         return AscendConfigService()
+
+    @property
+    def runtime_patch_checks(self) -> dict[str, Callable[[], bool | None]]:
+        from vllm_gr.npu_spawn_patch import is_npu_spawn_patched
+        from vllm_gr.v1.ascend_compat import is_npu_worker_patched
+
+        return {"GR-PATCH-002": is_npu_worker_patched, "GR-PATCH-016": is_npu_spawn_patched}
 
     def check_environment(self) -> dict[str, str]:
         from vllm_gr._env_check import check_ascend_environment

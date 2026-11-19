@@ -121,11 +121,10 @@ def _validate_backend_provider(provider: Any, *, source: str) -> str:
             f"{_registry_context(requested=normalized)}"
         )
     validate_provider_metadata(provider, _origin(normalized, source))
-    from .config import validate_config_factory
-    from .services import validate_planning_api
+    from .services import validate_optional_factories, validate_planning_api
 
     try:
-        validate_config_factory(provider)
+        validate_optional_factories(provider)
         validate_planning_api(provider)
     except ValueError as exc:
         raise InvalidBackendProviderError(f"{exc}; {_origin(normalized, source)}") from exc

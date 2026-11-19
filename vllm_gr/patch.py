@@ -15,29 +15,10 @@ from enum import Enum
 
 from vllm_gr import pangu_compat
 from vllm_gr.ops import sliced_logits_patch
+from vllm_gr.platforms.patches import CORE_PATCH_IDS, SelectedPatchClaims
 from vllm_gr.v1.attention import selector_patch
 
 logger = logging.getLogger("vllm_gr.patch")
-
-# Semantic ownership, independent of which process orchestrates an installer.
-# Built-in providers declare their hardware-owned IDs in ``patch_ids``.
-# These independent architectural assertions are checked against the authoritative
-# docs/patch_inventory.yaml; they do not drive installation. See the ownership
-# rationale in docs/runtime_patch_inventory.md.
-CORE_PATCH_IDS = (
-    "GR-PATCH-000",
-    "GR-PATCH-001",
-    "GR-PATCH-003",
-    "GR-PATCH-004",
-    "GR-PATCH-005",
-    "GR-PATCH-007",
-    "GR-PATCH-008",
-    "GR-PATCH-009",
-    "GR-PATCH-010",
-    "GR-PATCH-013",
-    "GR-PATCH-015",
-    "GR-PATCH-020",
-)
 
 
 class BeamPatchStatus(str, Enum):
@@ -78,10 +59,18 @@ class BeamPatchReport:
 
 class BeamPatchInitializationError(RuntimeError):
     def __init__(self, report: BeamPatchReport):
+        from vllm_gr.platforms.errors import BackendNotActiveError
+        from vllm_gr.platforms.registry import get_active_backend, resolve_backend_id
+
         self.report = report
         failure = report.results[-1]
+        try:
+            origin = resolve_backend_id(get_active_backend().backend_id).origin
+        except BackendNotActiveError:
+            origin = "no active provider"
         super().__init__(
-            f"required Beam patch {failure.name!r} failed: {failure.detail or 'unknown error'}"
+            f"required Beam patch {failure.name!r} failed: {failure.detail or 'unknown error'} "
+            f"({origin})"
         )
 
 
@@ -566,21 +555,14 @@ def _apply_patches(force: bool = False) -> int:
 
     # re_apply_patches is also called directly by fresh worker processes.
     provider = activate_current_backend()
+    claims = SelectedPatchClaims.from_provider(provider, CORE_PATCH_IDS)
     # ModelConfig construction happens before model loading, so preserve the
     # official Pangu tied-weight layout at the earliest runtime boundary.
     pangu_count = int(pangu_compat.apply_pangu_tied_embeddings_patch())
     # CUSTOM selection is shared by CUDA and Ascend. Install it before a
     # provider imports its native worker; it must not become an NPU-only hook.
     attention_count = selector_patch.apply_custom_attention_backend_patch(force=force)
-    try:
-        # The selected provider installs its early hooks before the Beam
-        # plan can discover ModelRunner classes or create worker processes.
-        backend_count: int = provider.apply_runtime_patches(force=force)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Runtime patches for backend {provider.backend_id!r} failed; "
-            "initialization may be partial, restart the process"
-        ) from exc
+    backend_count = claims.install(force=force)
     beam_count = _apply_gr_beam_patches(force=force)
     return pangu_count + attention_count + backend_count + beam_count
 
