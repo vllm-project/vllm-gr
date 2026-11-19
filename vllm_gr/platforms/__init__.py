@@ -14,10 +14,10 @@ from .errors import (
     UnsupportedBackendError,
 )
 from .identity import PlatformIdentity, current_platform_identity, platform_identity
+from .interface import PROVIDER_API_VERSION, GRBackendProvider, GRPlanningProvider
 from .legacy import LegacyProviderAdapter, adapt_legacy_provider, declared_api_version
 from .loader import activate_current_backend
 from .plan import PLAN_API_VERSION, BackendPlan, BackendRequest, PlanData
-from .protocol import PROVIDER_API_VERSION, GRBackendProvider, GRPlanningProvider
 from .registry import (
     activate_backend,
     get_active_backend,

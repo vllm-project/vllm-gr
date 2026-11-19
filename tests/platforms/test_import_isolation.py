@@ -147,21 +147,37 @@ class RejectInactiveIntegration(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, RejectInactiveIntegration())
 module_name = sys.argv[1]
 if module_name == "vllm_gr.v1.worker.model_runner_patch":
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     import vllm.platforms
     from vllm.platforms.interface import Platform
 
     platform = Platform()
+    platform._enum = "CUDA"
     platform.device_type = "cuda"
+    platform.device_name = "cuda"
     vllm.platforms.current_platform = platform
 
+    from vllm_gr.platforms import loader
+    from vllm_gr.platforms.cuda import provider as cuda, runner
     from vllm_gr.v1.worker import model_runner_patch
-    from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch
+    class Worker:
+        vllm_config = None
+        use_v2_model_runner = True
+        def init_device(self):
+            pass
 
-    install_v2 = Mock()
-    gpu_model_runner_v2_patch._apply_v2_runner_patches = install_v2
-    model_runner_patch._install_active_worker_resource_hook = Mock()
+    runner.discover_worker_runners = lambda: (("CUDA Worker.init_device", Worker),)
+    from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
+    native_class = type("V2", (), {})
+    v2.discover_worker_runners = lambda: (("V2", native_class),)
+    v2.is_patched = lambda cls: bool(getattr(cls, "_installed", False))
+    install_v2 = Mock(side_effect=lambda: setattr(native_class, "_installed", True))
+    v2._apply_v2_runner_patches = install_v2
+    loader.entry_points = lambda **kwargs: ()
+    cuda.install_worker_hooks = Mock()
     model_runner_patch.apply_worker_patches()
+    install_v2.assert_not_called()
+    Worker().init_device()
     install_v2.assert_called_once_with()
 else:
     importlib.import_module(module_name)

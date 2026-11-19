@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
 from types import ModuleType
@@ -118,6 +119,9 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
         created.append(adapter)
         if adapter is None:
             raise RuntimeError("Backend did not bind the required runner adapter")
+        for phase in getattr(type(runner), "_gr_runner_methods", ()):
+            if not callable(getattr(adapter, phase, None)):
+                raise RuntimeError(f"Backend runner adapter does not implement {phase}()")
         attention = None
         if choices.get("requires_attention", False):
             attention = selected.create_attention_executor(plan=plan, device=device)
@@ -158,17 +162,34 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
         raise
 
 
-def bind_after_model_load(original: Any) -> Any:
+def bind_after_model_load(
+    original: Any, *, close_runtime: Callable[[Any], None] | None = None
+) -> Any:
+    if getattr(original, "_gr_binds_backend_after_load", False):
+        return original
+
     @wraps(original)
     def load(self: Any, *args: Any, **kwargs: Any) -> Any:
-        result = original(self, *args, **kwargs)
+        if close_runtime is not None:
+            # Reject undrained native work before replacing the current generation.
+            close_runtime(self)
         try:
+            result = original(self, *args, **kwargs)
             bind_backend_services(self)
         except BaseException:
             from vllm_gr.v1.worker.model_runner_patch import close_constraint_backend
 
-            close_constraint_backend(self)
+            if close_runtime is not None:
+                try:
+                    close_runtime(self)
+                except Exception:
+                    logger.exception("Failed to release native runtime after model-load failure")
+            try:
+                close_constraint_backend(self)
+            except Exception:
+                logger.exception("Failed to release backend resources after model-load failure")
             raise
         return result
 
+    setattr(load, "_gr_binds_backend_after_load", True)
     return load

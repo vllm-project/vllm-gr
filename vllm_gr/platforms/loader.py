@@ -22,7 +22,7 @@ from packaging.utils import canonicalize_name
 
 from .errors import InvalidBackendProviderError
 from .identity import current_platform_identity
-from .protocol import GRBackendProvider
+from .interface import GRBackendProvider
 from .registry import (
     RegisteredBackend,
     _registry_context,

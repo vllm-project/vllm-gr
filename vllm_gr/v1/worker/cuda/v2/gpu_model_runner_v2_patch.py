@@ -36,6 +36,7 @@ from typing import Any, cast
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.platforms.cuda.runner import V2_RUNNER
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.v1.worker import gr_execution, gr_gc
 from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
@@ -354,15 +355,14 @@ def _apply_v2_runner_patches() -> None:
     Backend load wrapper last, so the final ``load_model`` carries the
     constraint marker that the V2 validation gate checks.
     """
-    runners_to_patch = [
-        (runner_name, runner_class)
-        for runner_name, runner_class in discover_worker_runners()
-        if not is_worker_runner_v2_patched(runner_class)
-    ]
+    from vllm_gr.platforms.binding import bind_after_model_load
+    from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
-    for runner_name, runner_type in runners_to_patch:
-        # Native classes expose dynamically patched methods outside this boundary.
+    for runner_name, runner_type in discover_worker_runners():
         runner_class = cast(Any, runner_type)
+        if is_worker_runner_v2_patched(runner_class):
+            install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
+            continue
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(
             load_model, _BEAM_POSTPROCESS_LOAD_PATCH_MARKER, False
@@ -374,7 +374,6 @@ def _apply_v2_runner_patches() -> None:
             runner_class.load_model = make_load_model_with_constraint_backend(
                 load_model,
                 max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
-                close_runtime=v2_resources.close_v2_runtime,
                 prepare_backend=_warmup_constraint_backend,
             )
 
@@ -408,11 +407,33 @@ def _apply_v2_runner_patches() -> None:
                 profile_cudagraph_memory
             )
 
+        runner_class.load_model = bind_after_model_load(
+            runner_class.load_model, close_runtime=v2_resources.close_v2_runtime
+        )
+        install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
         logger.info("%s V2 hooks patched successfully.", runner_name)
+
+
+def install() -> None:
+    """Install shared CUDA Worker utilities before patching the V2 runner."""
+    from vllm_gr.platforms.cuda import install_worker_hooks
+
+    install_worker_hooks()
+    _apply_v2_runner_patches()
+
+
+def is_patched(runner_class: type) -> bool:
+    from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle
+
+    return is_worker_runner_v2_patched(runner_class) and has_runner_lifecycle(
+        runner_class, V2_RUNNER
+    )
 
 
 __all__ = [
     "_apply_v2_runner_patches",
+    "install",
+    "is_patched",
     "discover_worker_runners",
     "make_patched_execute_model_v2",
     "make_patched_add_requests_v2",

@@ -9,13 +9,14 @@ from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from ..identity import PlatformIdentity, platform_identity
-from ..plan import BackendPlan, BackendRequest, PlanData
-from ..protocol import (
+from ..interface import (
     PROVIDER_API_VERSION,
     BeamAttentionExecution,
-    ModelRunnerPatchHooks,
+    ModelRunnerInstaller,
 )
+from ..plan import BackendPlan, BackendRequest, PlanData
 from ..services import BuiltinPlanSupport, require_provider_plan
+from .runner import runner_id
 
 if TYPE_CHECKING:
     import torch
@@ -52,11 +53,6 @@ class CUDABackendProvider(BuiltinPlanSupport):
         native = request.native.to_dict()
         if gr["npu_decode_execution"] == "xllm":
             raise ValueError("CUDA does not support npu_decode_execution='xllm'")
-        runner = (
-            "gpu_model_runner_v2_patch"
-            if native["use_v2_model_runner"]
-            else "gpu_model_runner_patch"
-        )
         table = gr["constraint_table"] or {}
         constraint = (
             "canonical"
@@ -69,7 +65,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
             request,
             PlanData(
                 {
-                    "runner": f"vllm_gr.v1.worker.{runner}",
+                    "runner": runner_id(native["use_v2_model_runner"]),
                     "attention": "vllm_gr.v1.attention.backends.beam_attn_gpu",
                     "prefill_attention": "cuda.cascade",
                     "decode_attention": "cuda.cascade",
@@ -101,11 +97,10 @@ class CUDABackendProvider(BuiltinPlanSupport):
         del force
         return 0
 
-    def get_model_runner_hooks(self) -> ModelRunnerPatchHooks:
-        return cast(
-            ModelRunnerPatchHooks,
-            import_module("vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch"),
-        )
+    def get_model_runner_hooks(self) -> ModelRunnerInstaller:
+        from . import runner
+
+        return runner
 
     def get_attention_execution(self) -> BeamAttentionExecution:
         return cast(
@@ -125,6 +120,22 @@ class CUDABackendProvider(BuiltinPlanSupport):
         if plan is not None:
             require_provider_plan(self, plan)
         return CUDAConstrainedTopKExecution(device=device)
+
+
+def install_worker_utilities() -> None:
+    from vllm.v1.worker.gpu_worker import Worker
+
+    from vllm_gr.v1.worker.model_runner_patch import install_worker_utility_hooks
+
+    install_worker_utility_hooks(Worker)
+
+
+def install_worker_hooks() -> None:
+    """Both CUDA runner generations use the same Worker and NumPy staging."""
+    from vllm_gr.v1.worker.cuda.numpy_staging import install_numpy_staging
+
+    install_worker_utilities()
+    install_numpy_staging()
 
 
 CUDA_BACKEND = CUDABackendProvider()

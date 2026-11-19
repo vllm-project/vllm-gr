@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import sys
 from functools import wraps
 
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.platforms.cuda.runner import V1_RUNNER
 from vllm_gr.v1.attention.backends.beam_dense_prefill import (
     requires_fresh_prefill_replay,
 )
@@ -29,6 +31,7 @@ from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
+    is_worker_runner_patched,
 )
 from vllm_gr.v1.worker.prefill_graph_common import scheduled_requests_are_fresh
 from vllm_gr.v1.worker.prefill_graph_runner import (
@@ -707,3 +710,27 @@ def capture_prefill_graphs(runner) -> None:
 
 
 make_patched_model_forward = make_patched_model_forward_gpu
+
+
+def is_patched(runner_class: type) -> bool:
+    from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle
+
+    return is_worker_runner_patched(runner_class) and has_runner_lifecycle(runner_class, V1_RUNNER)
+
+
+def install() -> None:
+    """Install CUDA Worker utilities and the V1 native runner wrappers."""
+    from vllm_gr.platforms.cuda import install_worker_hooks
+    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+        make_load_model_with_beam_postprocess_workspace,
+    )
+    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+    from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
+
+    install_worker_hooks()
+    install_v1_worker_hooks(
+        sys.modules[__name__],
+        cuda_hooks_type=CudaStageHooksV1,
+        workspace_load_patcher=make_load_model_with_beam_postprocess_workspace,
+        implementation_id=V1_RUNNER,
+    )

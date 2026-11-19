@@ -77,8 +77,8 @@ installers run or their ordering.
 | GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
 | GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py`, `hot_update.py` | `apply_engine_core_request_patches` | Shared EngineCore plan, including NPU child entry, finds request dispatch or Trie-capacity initialization incomplete; utilities do not depend on the management listener | request validators; V1 admission, NPU multi-Trie routing, hot-update utility contracts and management tests | EngineCore |
 | GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `gr_async_scheduler.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
-| GR-PATCH-011 | GPU V1/V2 runner patches; `worker/hot_update.py` | `model_runner_patch.apply_worker_patches` | selected CUDA runner hooks are incomplete; common installer mounts Worker utilities | runner validator; GPU, utility contract, reload and lifecycle tests | GPU worker |
-| GR-PATCH-012 | NPU runner patch; `worker/hot_update.py`, `ascend_compat.py` | `model_runner_patch.apply_worker_patches`; delayed `NPUWorker.init_device` | active NPU runner hooks are incomplete; delayed initialization mounts Worker utilities | NPU runner, delayed-install and unsupported-reload guard tests | NPU worker |
+| GR-PATCH-011 | GPU V1/V2 runner patches; `worker/hot_update.py` | `model_runner_patch.apply_worker_patches` | the CUDA provider selects V1 or V2 hooks and mounts Worker utilities | runner validator; GPU, utility contract, reload and lifecycle tests | GPU worker |
+| GR-PATCH-012 | NPU runner patch; `worker/hot_update.py`, `ascend_compat.py` | `model_runner_patch.apply_worker_patches`; delayed `NPUWorker.init_device` | the Ascend provider supplies runner hooks and delayed initialization mounts Worker utilities | NPU runner, delayed-install and unsupported-reload guard tests | NPU worker |
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
 | GR-PATCH-016 | `vllm_gr/npu_spawn_patch.py` | `vllm_gr.npu_spawn_patch.apply_npu_spawn_patch` | selected NPU provider, before native worker import | installer result; spawn patch tests | main, EngineCore |
@@ -312,6 +312,10 @@ native patch target. Coverage: `tests/platforms/test_backend_plan.py`.
 
 - Scope: `backend`; backend ID: `cuda`
 
+The CUDA provider patches `Worker.init_device` at process startup. Each worker
+installs and verifies the runner generation selected by its vLLM configuration
+before constructing the native runner.
+
 The common model-load wrapper also binds the admitted backend plan after a
 successful load. Reload/shutdown release the runner-owned binding with the
 constraint runtime. `platforms/binding.py` owns this shared lifecycle logic;
@@ -343,8 +347,8 @@ and Decode capture policy remain active when this cache is disabled.
   `gr_gc.py` owns Worker-side process flags, locks, depth and freeze entrypoints.
   `gr_context.py` owns config/context and graph diagnostics;
   `model_runner_contracts.py` owns markers/checks without hardware imports.
-  The public installer selects V1 before importing its wrapper and installs
-  NumPy staging once for either CUDA version. Public RPC names, async sampling
+  The CUDA provider loads its selected V1 or V2 installer. Both install NumPy
+  staging, and each planned runner binds its own native lifecycle methods. Public RPC names, async sampling
   context lifetime, freeze policy and cleanup ordering retain existing behavior.
   Coverage: `tests/v1/worker/test_model_runner_common.py`,
   `tests/v1/worker/test_model_runner_stage_binding.py`, `tests/v1/worker/test_model_runner_patch.py`,

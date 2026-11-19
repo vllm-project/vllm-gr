@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast
 
 from .errors import InvalidBackendProviderError
 from .identity import PlatformIdentity
-from .protocol import (
+from .interface import (
     LEGACY_PROVIDER_API_VERSION,
     PROVIDER_API_VERSION,
     BeamAttentionExecution,

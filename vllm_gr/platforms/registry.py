@@ -19,7 +19,7 @@ from .errors import (
     UnsupportedBackendError,
 )
 from .identity import PlatformIdentity
-from .protocol import PROVIDER_API_VERSION, GRBackendProvider
+from .interface import PROVIDER_API_VERSION, GRBackendProvider
 
 _REQUIRED_PROVIDER_METHODS = (
     "check_environment",
