@@ -445,7 +445,15 @@ def get_or_create_execution_adapter(runner: Any) -> Any:
 
     from vllm_gr.constraints.startup import create_constraint_execution
 
-    adapter = create_constraint_execution(device=getattr(runner, "device", None))
+    binding = getattr(runner, "_gr_backend_binding", None)
+    adapter = binding.constraint_execution if binding is not None else None
+    if adapter is None:
+        from vllm_gr.platforms.plan import read_backend_plan
+
+        plan = read_backend_plan(getattr(runner, "vllm_config", None))
+        plan_kwargs = {"plan": plan} if plan is not None else {}
+        adapter = create_constraint_execution(device=getattr(runner, "device", None), **plan_kwargs)
+        runner._gr_constraint_plan_fingerprint = plan.fingerprint if plan is not None else None
     adapter.load_tables(manager.require(digest))
     runner._gr_constraint_execution = adapter
     return adapter

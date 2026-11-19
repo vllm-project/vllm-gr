@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any
 
 from vllm_gr.config import GRConfig
@@ -34,14 +33,9 @@ from vllm_gr.constraints.compiler import (
     ConstraintTableCompiler,
     ConstraintTableResource,
 )
+from vllm_gr.platforms.services import constraint_execution_override
 
 logger = logging.getLogger(__name__)
-
-# Test-only override that forces the Torch oracle adapter regardless of the
-# active platform.  Used by CI / development only; production always goes
-# through the platform provider and fails fast when it cannot run the operator.
-_CONSTRAINT_EXECUTION_ENV = "VLLM_GR_CONSTRAINT_EXECUTION"
-_TORCH_OVERRIDE = "torch"
 
 
 def _backend_label(provider: Any) -> str:
@@ -57,6 +51,7 @@ def _backend_label(provider: Any) -> str:
 def create_constraint_execution(
     *,
     device: str | Any | None = None,
+    plan: Any = None,
 ) -> Any:
     """Create the platform constrained-top-k adapter, failing explicitly.
 
@@ -66,26 +61,21 @@ def create_constraint_execution(
     (NPU custom op missing) is a hard failure — Constraint Tables never silently
     degrades to Trie.
     """
-    override = os.environ.get(_CONSTRAINT_EXECUTION_ENV)
+    override = constraint_execution_override(device=device)
     if override is not None:
-        if override != _TORCH_OVERRIDE:
-            raise ValueError(
-                f"unsupported {_CONSTRAINT_EXECUTION_ENV}={override!r}; "
-                f"expected {_TORCH_OVERRIDE!r} or unset"
-            )
-        from vllm_gr.constraints.execution import TorchConstrainedTopKExecution
-
-        logger.info(
-            "vllm-gr: constraint execution overridden to Torch oracle (%s=%s); CI/dev only",
-            _CONSTRAINT_EXECUTION_ENV,
-            override,
-        )
-        return TorchConstrainedTopKExecution(device=device)
+        return override
 
     from vllm_gr.platforms.loader import activate_current_backend
 
     provider = activate_current_backend()
-    adapter = provider.create_constrained_topk_execution(device=device)
+    if plan is None:
+        adapter = provider.create_constrained_topk_execution(device=device)
+    else:
+        from vllm_gr.platforms.services import planning_provider
+
+        adapter = planning_provider(provider).create_constrained_topk_execution(
+            plan=plan, device=device
+        )
     if adapter is None:
         raise RuntimeError(
             "constraint_backend='constraint_table' cannot start: the active "

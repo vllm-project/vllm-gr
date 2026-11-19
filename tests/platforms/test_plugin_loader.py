@@ -253,6 +253,20 @@ def test_core_distribution_is_discovered_once_and_disabled_before_import(
         resolve_backend("other")
 
 
+def test_core_wheel_metadata_keeps_source_checkout_plan_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.platforms.cuda import CUDA_BACKEND
+    from vllm_gr.platforms.planning import provider_compatibility
+
+    _install_entry_points(monkeypatch)
+    source = provider_compatibility(CUDA_BACKEND)
+    core = SimpleNamespace(metadata={"Name": "vllm_gr"}, version="0.30.0")
+    _install_entry_points(monkeypatch, FakeEntryPoint("cuda", CUDA_BACKEND, dist=core))
+
+    assert provider_compatibility(CUDA_BACKEND) == source
+
+
 def test_duplicate_ids_are_still_rejected_after_a_disable_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

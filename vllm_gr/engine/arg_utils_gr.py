@@ -722,6 +722,9 @@ def create_engine_config(self, usage_context=None, headless=False):
 
         apply_engine_core_config_sanitizer(EngineCoreProc)
 
+    from vllm_gr.platforms.planning import admit_backend_plan
+
+    admit_backend_plan(config)
     return config
 
 

@@ -284,3 +284,90 @@ except DuplicateBackendRegistrationError as error:
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_installed_provider_plan_round_trip_and_factory_binding(tmp_path: Path) -> None:
+    """An external planning extension adds options without a core serializer edit."""
+    source = _PROVIDER_MODULE.replace(
+        "BACKEND = HostOnlyProvider()",
+        """
+from types import SimpleNamespace
+from vllm_gr.platforms.plan import BackendPlan, PlanData
+
+class PlannedProvider(HostOnlyProvider):
+    plan_api_version = 1
+    adapter_revision = "host-only-v1"
+
+    def resolve(self, request):
+        tile = request.options.to_dict().get("tile", 16)
+        if type(tile) is not int or tile not in (16, 32):
+            raise ValueError("tile must be 16 or 32")
+        return BackendPlan(self.backend_id, self.api_version, request,
+                           PlanData({"tile": tile, "requires_attention": True}))
+
+    def validate_worker(self, *, plan, native_runner):
+        assert native_runner.device.startswith("cpu")
+
+    def create_model_runner_adapter(self, *, plan, native_runner):
+        return SimpleNamespace(plan=plan, owner=native_runner,
+                               implementation_id="host.runner.v1")
+
+    def create_attention_executor(self, *, plan, device):
+        return SimpleNamespace(plan=plan, device=device,
+                               implementation_id="host.attention.v1")
+
+    def create_constrained_topk_execution(self, *, plan=None, device=None):
+        return None
+
+BACKEND = PlannedProvider()
+""",
+    )
+    site_packages = _install_provider(
+        tmp_path,
+        distribution="vllm-gr-host-planned",
+        module="host_planned",
+        backend_id="host_only",
+        source=source,
+    )
+    code = """
+import json
+import sys
+from types import SimpleNamespace
+from vllm_gr.config import GRConfig
+from vllm_gr.platforms import loader
+from vllm_gr.platforms.identity import PlatformIdentity
+from vllm_gr.platforms.plan import BackendPlan
+from vllm_gr.platforms.planning import admit_backend_plan
+from vllm_gr.platforms.binding import bind_backend_services
+
+loader.current_platform_identity = lambda: PlatformIdentity("CPU", "cpu", "cpu", "test.CPU", ())
+provider = loader.activate_current_backend()
+engines = []
+for tile in (16, 32):
+    config = SimpleNamespace(additional_config={"vllm_gr_backend_options": {"tile": tile}})
+    GRConfig(beam_max_width=tile).write_to_vllm_config(config)
+    plan = admit_backend_plan(config)
+    assert plan == BackendPlan.from_wire(json.loads(json.dumps(plan.to_wire())))
+    assert ["vllm-gr-host-planned", "1.0.0"] in plan.request.compatibility.to_dict()["provider_distributions"]
+    runner = SimpleNamespace(vllm_config=config, device="cpu:0")
+    services = bind_backend_services(runner)
+    assert services.runner_adapter.owner is runner
+    assert services.runner_adapter.plan == services.attention_executor.plan == plan
+    assert services.attention_executor.device == "cpu:0"
+    assert plan.choices.to_dict()["tile"] == tile
+    engines.append(services)
+assert engines[0].plan != engines[1].plan
+assert not hasattr(provider, "current_plan")
+assert not any(name in sys.modules for name in ("torch", "torch_npu", "vllm", "vllm_ascend"))
+print("planned")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(site_packages)!r})\n" + code],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "planned" in result.stdout

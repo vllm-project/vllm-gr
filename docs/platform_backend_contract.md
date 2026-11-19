@@ -11,6 +11,9 @@ compatibility patches.
 
 Production startup already uses provider activation, environment validation,
 runtime compatibility patches, and the constrained TopK execution factory.
+GR EngineArgs also publishes an immutable backend plan. Model load binds its
+services to the native runner, and EngineCore checks every worker's readiness
+before its constructor returns. See [Engine plans](#engine-plans-and-service-binding).
 The worker and attention dispatchers still select their implementations
 directly; the two provider getters describe available modules but do not
 replace those dispatchers.
@@ -75,6 +78,93 @@ built-in Ascend provider's ID is `ascend`, not the `npu` tensor device type.
 An unknown backend is always an error in the registry APIs and never falls
 back to CUDA. This registry guarantee does not describe every independent
 worker or attention dispatch branch.
+
+## Engine plans and service binding
+
+`BackendRequest`, `BackendPlan`, and `PlanData` are import-light values in
+`platforms/plan.py`. A request contains normalized GR settings, common native
+configuration, compatibility versions, and backend-owned JSON options. Plans
+encode their schema and planning API versions separately from the provider
+identity API. SHA-256 covers the canonical JSON encoding, including the
+provider/adapter versions and admitted choices. Device ordinals, native
+objects, handles, and unordered containers are excluded. Nested inputs are
+copied into immutable canonical data; decoded views cannot mutate the plan.
+
+EngineArgs writes the envelope to
+`additional_config["vllm_gr_backend_plan"]` after normalizing configuration.
+The ordinary native configuration transport carries this JSON/pickle-safe
+data to workers. Canonical and legacy GR parsing both reserve this key; it is
+not a legacy option and does not create a canonical/legacy conflict. Backend
+options use the separate `vllm_gr_backend_options` object. The provider validates
+its own option schema. Built-ins currently retain their typed `GRConfig`
+options and reject additional options; an external provider can add its own
+option names and choice values without changing the core encoder.
+
+Provider identity API version 2 remains compatible. Providers opt into the
+planning extension by declaring `plan_api_version = 1` and an
+`adapter_revision` compatibility string, then implementing:
+
+```python
+def resolve(request: BackendRequest) -> BackendPlan: ...
+def validate_worker(*, plan: BackendPlan, native_runner): ...
+def create_model_runner_adapter(*, plan: BackendPlan, native_runner): ...
+def create_attention_executor(*, plan: BackendPlan, device): ...
+def create_constrained_topk_execution(*, plan=None, device=None): ...
+```
+
+`resolve()` uses only its request. Runtime and installed distribution metadata
+are collected before calling it. Factories receive the same engine plan and
+the actual owner/device explicitly. A provider never holds `current_plan` or
+runner resources. Unknown declared planning versions and missing methods fail
+registration. API-v1/v2 providers without this declaration use narrow legacy
+delegation: existing getters and the device-only constraint factory are
+preserved, extra backend options are rejected, and incidental methods never
+count as planning capabilities.
+
+The built-in plan records CUDA V1/V2 or Ascend V1, Prefill/Decode policy,
+constraint implementation, stage path, and graph/eager policy. Native defaults
+and existing configuration validation remain authoritative during migration.
+Ascend's unset Decode mode retains its capability-sensitive `auto` behavior;
+readiness also compares the actual bound implementation so workers cannot
+choose different modes silently. An explicitly requested mode conflicting
+with the existing process-global attention mode requires a separate process.
+
+The runner owns `BackendBinding`. Binding verifies the received plan against
+local configuration and runtime versions, runs provider capability validation,
+then constructs required services. After model load, the readiness RPC reports
+the bound services and their admitted plan. Native KV-cache profiling can
+adjust the maximum model length before this RPC. Partial construction releases services
+already created. Reload/shutdown detach the binding, release owned services,
+and clear the legacy execution alias. Stateless module bindings do not close
+process-wide modules. Canonical constraint artifacts retain their current
+loader and lifecycle owner; readiness requires successful load before binding.
+
+EngineCore calls `worker_backend_readiness` through the native executor and
+requires its expected number of worker reports, an identical plan
+fingerprint, and matching implementation identities. A failed or missing
+report shuts down the executor and aborts startup. This gate runs before
+request acceptance. With vLLM's external launcher, each executor owns one
+worker. The engines gather those local reports using the native world
+CPU group so every participating rank verifies the same result.
+
+This is the plan/binding migration for RFC #706, following #748. Actual native
+Runner dispatch (#711), stage/operator routing (#712), attention admissibility
+and per-layer ownership (#713), constraint identity migration (#714), and
+graph/resource integration (#715) remain separate changes. The compatibility
+bindings preserve those current implementations; they do not claim those
+later migrations are complete.
+
+Host-only contract coverage can run without Torch or vLLM:
+
+```bash
+python -m pytest --confcutdir=tests/platforms -q \
+  tests/platforms/test_backend_plan.py \
+  tests/platforms/test_external_provider_fixture.py::test_installed_provider_plan_round_trip_and_factory_binding
+```
+
+`tests/engine/test_backend_plan_engine_args.py` additionally covers the real EngineArgs
+wrapper under the normal Torch/vLLM test fixtures. CUDA V1/V2 and Ascend startup,
+graph replay, inference accuracy, and performance still require device runs.
 
 ## Platform identity and deterministic selection
 

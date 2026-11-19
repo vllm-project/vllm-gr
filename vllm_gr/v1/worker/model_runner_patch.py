@@ -42,6 +42,9 @@ _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 def close_constraint_backend(runner: object) -> None:
     """Detach and idempotently close the runner-owned canonical Backend."""
 
+    from vllm_gr.platforms.binding import close_backend_binding
+
+    close_backend_binding(runner)
     backend = getattr(runner, "constraint_backend", None)
     # Detach first so no concurrent observer can discover a Backend while it is
     # being closed, and so repeated shutdown/load calls are naturally idempotent.
@@ -228,7 +231,9 @@ def make_load_model_with_constraint_backend(
             raise
 
     setattr(load_model_with_constraint_backend, _CONSTRAINT_LOAD_PATCH_MARKER, True)
-    return load_model_with_constraint_backend
+    from vllm_gr.platforms.binding import bind_after_model_load
+
+    return bind_after_model_load(load_model_with_constraint_backend)
 
 
 def make_shutdown_with_constraint_backend(

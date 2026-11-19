@@ -41,6 +41,9 @@ BEAM_EXECUTION_MODE_KEY: Final = legacy_key(GRConfig, "beam_execution_mode")
 BEAM_SID_STAGE_VOCAB_KEY: Final = legacy_key(GRConfig, "beam_sid_stage_vocab")
 CONSTRAINED_GENERATION_KEY: Final = legacy_key(GRConfig, "constrained_generation")
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
+# Internal plan transport and backend-owned options are not legacy GR fields.
+# In particular, they must not trigger canonical/legacy conflict detection.
+_BACKEND_TRANSPORT_KEYS: Final = frozenset({"vllm_gr_backend_plan", "vllm_gr_backend_options"})
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     spec.legacy_key for _, spec in config_fields(GRConfig) if spec.legacy_key is not None
 )
@@ -56,6 +59,7 @@ def _reject_unknown_gr_keys(additional_config: Mapping[object, object]) -> None:
         if isinstance(key, str)
         and key.startswith(GR_CONFIG_KEY_PREFIX)
         and key not in KNOWN_GR_CONFIG_KEYS
+        and key not in _BACKEND_TRANSPORT_KEYS
     )
     if unknown_keys:
         unknown = ", ".join(repr(key) for key in unknown_keys)

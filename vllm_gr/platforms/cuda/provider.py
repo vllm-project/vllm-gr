@@ -9,11 +9,13 @@ from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from ..identity import PlatformIdentity, platform_identity
+from ..plan import BackendPlan, BackendRequest, PlanData
 from ..protocol import (
     PROVIDER_API_VERSION,
     BeamAttentionExecution,
     ModelRunnerPatchHooks,
 )
+from ..services import BuiltinPlanSupport, require_provider_plan
 
 if TYPE_CHECKING:
     import torch
@@ -22,7 +24,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class CUDABackendProvider:
+class CUDABackendProvider(BuiltinPlanSupport):
     backend_id: str = "cuda"
     #: The version-1 identity preserved for diagnostics of legacy providers.
     device_type: str = "cuda"
@@ -41,6 +43,45 @@ class CUDABackendProvider:
         upstream enum value and needs its own provider.
         """
         return identity.platform_enum == "CUDA" and identity.device_type == "cuda"
+
+    def resolve(self, request: BackendRequest) -> BackendPlan:
+        """Admit the existing CUDA paths without importing a device runtime."""
+        if request.options.to_dict():
+            raise ValueError("CUDA currently accepts no additional backend options")
+        gr = request.config.to_dict()
+        native = request.native.to_dict()
+        if gr["npu_decode_execution"] == "xllm":
+            raise ValueError("CUDA does not support npu_decode_execution='xllm'")
+        runner = (
+            "gpu_model_runner_v2_patch"
+            if native["use_v2_model_runner"]
+            else "gpu_model_runner_patch"
+        )
+        table = gr["constraint_table"] or {}
+        constraint = (
+            "canonical"
+            if table.get("enabled")
+            else ("legacy" if gr["constraint_backend"] == "constraint_table" else "none")
+        )
+        return BackendPlan(
+            self.backend_id,
+            self.api_version,
+            request,
+            PlanData(
+                {
+                    "runner": f"vllm_gr.v1.worker.{runner}",
+                    "attention": "vllm_gr.v1.attention.backends.beam_attn_gpu",
+                    "prefill_attention": "cuda.cascade",
+                    "decode_attention": "cuda.cascade",
+                    "prefill_flash_attn_version": gr["prefill_flash_attn_version"],
+                    "requires_attention": gr["attention_backend"] == "CUSTOM",
+                    "constraint": constraint,
+                    "constraint_implementation": "cuda" if constraint != "none" else None,
+                    "stage": "cuda.v2" if native["use_v2_model_runner"] else "cuda.v1",
+                    "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
+                }
+            ),
+        )
 
     matches_legacy_identity = matches
 
@@ -76,10 +117,13 @@ class CUDABackendProvider:
         self,
         *,
         device: str | torch.device | None = None,
+        plan: BackendPlan | None = None,
     ) -> "ConstrainedTopKExecution | None":
         """Create the production CUDA Constraint Table execution adapter."""
         from vllm_gr.constraints.execution import CUDAConstrainedTopKExecution
 
+        if plan is not None:
+            require_provider_plan(self, plan)
         return CUDAConstrainedTopKExecution(device=device)
 
 
