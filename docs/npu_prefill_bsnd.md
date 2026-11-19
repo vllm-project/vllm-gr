@@ -75,9 +75,14 @@ In the supported vLLM/Ascend environment:
 ```bash
 python -m pytest -q tests/test_beam_attention_platform_execution.py \
   tests/test_prefill_graph_runner.py tests/test_npu_model_runner_patch.py \
+  tests/test_npu_model_runner_patch_capture.py tests/test_npu_model_runner_patch_determine.py \
+  tests/test_npu_model_runner_patch_stage.py tests/test_npu_model_runner_patch_terminal.py \
   tests/test_npu_prefill_bsnd.py
 python -m ruff check vllm_gr/v1/worker/npu_prefill_graph_runner.py \
   vllm_gr/v1/worker/npu_model_runner_patch.py \
+  vllm_gr/v1/worker/npu_model_runner_capture.py \
+  vllm_gr/v1/worker/npu_model_runner_prefill.py \
+  vllm_gr/v1/worker/npu_model_runner_sid.py \
   vllm_gr/v1/attention/backends/beam_attn_metadata.py \
   vllm_gr/v1/attention/backends/beam_attn.py \
   vllm_gr/v1/attention/backends/beam_attn_npu.py \

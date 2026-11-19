@@ -229,6 +229,10 @@ python -m pytest tests/test_npu_unconstrained_beam.py \
   tests/test_npu_stage_logits.py \
   tests/test_beam_search_v1_input_processor.py \
   tests/test_npu_model_runner_patch.py \
+  tests/test_npu_model_runner_patch_capture.py \
+  tests/test_npu_model_runner_patch_determine.py \
+  tests/test_npu_model_runner_patch_stage.py \
+  tests/test_npu_model_runner_patch_terminal.py \
   tests/kernels/test_unconstrained_topk_npu.py \
   tests/kernels/test_sid_stage_topk_npu.py
 ```

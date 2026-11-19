@@ -143,7 +143,7 @@ def test_npu_case_specification_partitions_full_parameter_matrix() -> None:
 
 
 def test_cpu_npu_and_gpu_parameters_have_exclusive_levels() -> None:
-    key = "tests/test_npu_model_runner_patch.py::test_npu_single_step_filters_candidates_before_return_limit"
+    key = "tests/test_npu_model_runner_patch_terminal.py::test_npu_single_step_filters_candidates_before_return_limit"
     for device, batch, width, case in product(["cpu", "npu"], [1, 4], [1, 2], ["nan", "finite"]):
         expected = "l1" if device == "cpu" else "l2" if batch == width == 1 else "l4"
         assert (
