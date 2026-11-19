@@ -10,88 +10,12 @@ import torch
 from vllm import envs
 
 from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
-
-
-def build_async_batch_layout(
-    *,
-    width: int,
-    prompt_lengths: list[int],
-    decode_step: int,
-    block_ids_by_request: list[list[int]],
-    max_blocks: int,
-) -> dict[str, list[int]]:
-    """Build request-major metadata for B logical requests and B*W rows."""
-    batch = len(prompt_lengths)
-    if (
-        type(width) is not int
-        or width < 1
-        or type(decode_step) is not int
-        or decode_step < 0
-        or not batch
-        or len(block_ids_by_request) != batch
-        or any(type(length) is not int or length < 1 for length in prompt_lengths)
-    ):
-        raise ValueError("Asynchronous scheduling batch geometry is invalid")
-    query = [item * width for item in range(batch + 1)]
-    rows = batch * width
-    blocks: list[int] = []
-    for request_blocks in block_ids_by_request:
-        if len(request_blocks) > max_blocks:
-            raise ValueError("Asynchronous scheduling prefix block table exceeds capacity")
-        blocks.extend(request_blocks)
-        blocks.extend([0] * (max_blocks - len(request_blocks)))
-    suffix_length = decode_step + 1
-    return {
-        "positions": [prompt + decode_step for prompt in prompt_lengths for _ in range(width)],
-        "query": query,
-        "sequence": [prompt + suffix_length for prompt in prompt_lengths],
-        "prefix_lengths": list(prompt_lengths),
-        "blocks": blocks,
-        "logits": list(range(rows)),
-        "suffix_query": list(range(rows + 1)),
-        "suffix_lengths": [suffix_length] * rows,
-        "suffix_offsets": [item * suffix_length for item in range(rows + 1)],
-    }
-
-
-def build_async_layout(
-    *,
-    width: int,
-    prompt_len: int,
-    decode_step: int,
-    block_ids: list[int],
-    max_blocks: int,
-    query_start_loc_cpu: list[int] | tuple[int, ...],
-    seq_lens_cpu: list[int] | tuple[int, ...],
-) -> dict[str, list[int]]:
-    """Complete CPU layout for B=1 incremental Decode, with no cache lookup.
-
-    CPU mirrors are mandatory. This entry never falls back to device reads,
-    geometry caches, cached views, cached schedules or the legacy uploader.
-    Common attention has one packed request; suffix attention has W beams.
-    """
-    if any(
-        not isinstance(values, (list, tuple)) or any(type(value) is not int for value in values)
-        for values in (query_start_loc_cpu, seq_lens_cpu)
-    ):
-        raise ValueError(
-            "Asynchronous scheduling attention requires explicit CPU query/sequence mirrors"
-        )
-    if list(query_start_loc_cpu) != [0, width] or list(seq_lens_cpu) != [
-        prompt_len + decode_step + 1
-    ]:
-        raise ValueError(
-            "Asynchronous scheduling common CPU mirrors disagree with the planned Decode"
-        )
-    if len(block_ids) > max_blocks:
-        raise ValueError("Asynchronous scheduling prefix block table exceeds model capacity")
-    return build_async_batch_layout(
-        width=width,
-        prompt_lengths=[prompt_len],
-        decode_step=decode_step,
-        block_ids_by_request=[block_ids],
-        max_blocks=max_blocks,
-    )
+from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
+    build_async_batch_layout as build_async_batch_layout,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
+    build_async_layout as build_async_layout,
+)
 
 
 def build_async(

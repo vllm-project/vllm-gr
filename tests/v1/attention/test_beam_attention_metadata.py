@@ -43,6 +43,95 @@ def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
 
 
 @pytest.mark.l1  # type: ignore[misc]
+def test_async_layout_legacy_exports() -> None:
+    from vllm_gr.v1.attention.backends import beam_attn_metadata_async as legacy
+
+    assert legacy.build_async_batch_layout is layout.build_async_batch_layout
+    assert legacy.build_async_layout is layout.build_async_layout
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_async_batch_layout_preserves_request_order() -> None:
+    result = layout.build_async_batch_layout(
+        width=2,
+        prompt_lengths=[5, 9],
+        decode_step=1,
+        block_ids_by_request=[[7], [3, 4]],
+        max_blocks=2,
+    )
+    assert result == {
+        "query": [0, 2, 4],
+        "positions": [6, 6, 10, 10],
+        "sequence": [7, 11],
+        "prefix_lengths": [5, 9],
+        "blocks": [7, 0, 3, 4],
+        "logits": [0, 1, 2, 3],
+        "suffix_query": [0, 1, 2, 3, 4],
+        "suffix_lengths": [2, 2, 2, 2],
+        "suffix_offsets": [0, 2, 4, 6, 8],
+    }
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_async_single_request_layout_matches_batch() -> None:
+    single = layout.build_async_layout(
+        width=2,
+        prompt_len=5,
+        decode_step=1,
+        block_ids=[7],
+        max_blocks=2,
+        query_start_loc_cpu=[0, 2],
+        seq_lens_cpu=[7],
+    )
+    assert single == layout.build_async_batch_layout(
+        width=2,
+        prompt_lengths=[5],
+        decode_step=1,
+        block_ids_by_request=[[7]],
+        max_blocks=2,
+    )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(("query", "lengths"), [([0, 1], [7]), ([0, 2], [6])])  # type: ignore[misc]
+def test_async_single_request_rejects_inconsistent_cpu_mirrors(
+    query: list[int], lengths: list[int]
+) -> None:
+    with pytest.raises(ValueError, match="CPU mirrors disagree"):
+        layout.build_async_layout(
+            width=2,
+            prompt_len=5,
+            decode_step=1,
+            block_ids=[7],
+            max_blocks=2,
+            query_start_loc_cpu=query,
+            seq_lens_cpu=lengths,
+        )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_async_layout_rejects_over_capacity_block_table() -> None:
+    with pytest.raises(ValueError, match="prefix block table exceeds capacity"):
+        layout.build_async_batch_layout(
+            width=2,
+            prompt_lengths=[5, 9],
+            decode_step=1,
+            block_ids_by_request=[[7], [3, 4]],
+            max_blocks=1,
+        )
+    with pytest.raises(ValueError, match="prefix block table exceeds model capacity"):
+        layout.build_async_layout(
+            width=2,
+            prompt_len=9,
+            decode_step=1,
+            block_ids=[3, 4],
+            max_blocks=1,
+            query_start_loc_cpu=[0, 2],
+            seq_lens_cpu=[11],
+        )
+
+
+@pytest.mark.l1  # type: ignore[misc]
 def test_builder_init_allocates_fixed_tensor_buffers(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm.v1.attention.backend import AttentionMetadataBuilder
 
