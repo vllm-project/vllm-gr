@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from ..constraint_plan import constraint_plan_choices
 from ..identity import PlatformIdentity
 from ..interface import (
     PROVIDER_API_VERSION,
@@ -20,7 +21,7 @@ from ..services import BuiltinPlanSupport, require_provider_plan
 if TYPE_CHECKING:
     import torch
 
-    from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
+    from vllm_gr.constraints.npu_execution import NPUConstrainedTopKExecution
 
 #: Qualified name of the vendor platform class this provider supports. The
 #: check is a lineage lookup on the already-selected platform instance, so it
@@ -61,12 +62,6 @@ class NPUBackendProvider(BuiltinPlanSupport):
         if request.options.to_dict():
             raise ValueError("Ascend currently accepts no additional backend options")
         gr = request.config.to_dict()
-        table = gr["constraint_table"] or {}
-        constraint = (
-            "canonical"
-            if table.get("enabled")
-            else ("legacy" if gr["constraint_backend"] == "constraint_table" else "none")
-        )
         return BackendPlan(
             self.backend_id,
             self.api_version,
@@ -79,8 +74,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
                     "decode_attention": gr["npu_decode_execution"] or "auto",
                     "kv_layout": request.native.to_dict().get("kv_cache_layout"),
                     "requires_attention": gr["attention_backend"] == "CUSTOM",
-                    "constraint": constraint,
-                    "constraint_implementation": "npu" if constraint != "none" else None,
+                    **constraint_plan_choices(gr, legacy_id="npu"),
                     "operator_policy": "ascend.xllm-with-reference-fallback",
                     "stage": "ascend.v1",
                     "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
@@ -141,6 +135,18 @@ class NPUBackendProvider(BuiltinPlanSupport):
         worker_count = ascend_compat.patch_npu_worker_init_device()
         return spawn_count + worker_count
 
+    def validate_worker(self, *, plan: BackendPlan, native_runner: Any) -> None:
+        super().validate_worker(plan=plan, native_runner=native_runner)
+        if (
+            plan.choices.to_dict().get("constraint") == "canonical"
+            and plan.request.config.to_dict()["beam_execution_mode"] == "v1"
+        ):
+            backend = native_runner.constraint_backend
+            if backend.info.table_metadata.trie_count > 1 and not callable(
+                getattr(backend, "select_for_rows", None)
+            ):
+                raise RuntimeError("Ascend multi-trie selection requires host-row routing")
+
     def get_model_runner_hooks(self) -> ModelRunnerInstaller:
         return cast(
             ModelRunnerInstaller,
@@ -165,7 +171,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
         instance is created per call; the ModelRunner owns it for one
         lifetime and creates another after a reset.
         """
-        from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
+        from vllm_gr.constraints.npu_execution import NPUConstrainedTopKExecution
 
         if plan is not None:
             require_provider_plan(self, plan)

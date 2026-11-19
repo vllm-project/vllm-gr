@@ -54,6 +54,10 @@ class VersionedConstraintTable:
         candidate = self._loader(path)
         try:
             current = self.get()
+            if getattr(candidate, "implementation_id", None) != getattr(
+                current, "implementation_id", None
+            ):
+                raise ValueError("Online Trie reload cannot change the constraint implementation")
             if candidate.info.table_metadata.trie_count != current.info.table_metadata.trie_count:
                 raise ValueError("Online Trie reload cannot change the loaded Trie count")
             if getattr(candidate, "vocab_slice", None) != getattr(current, "vocab_slice", None):

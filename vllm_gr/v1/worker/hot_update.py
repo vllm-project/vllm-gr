@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
+from vllm_gr.platforms.binding import runner_constraint_backend
 
 
 def _sync(runner: Any) -> None:
@@ -24,22 +25,27 @@ def _sync(runner: Any) -> None:
 
 def _load_trie(runner: Any, path: str) -> Any:
     from vllm_gr.config import GRConfig
-    from vllm_gr.constraints.loader import load_constraint_backend
+    from vllm_gr.constraints.loader import load_runner_constraint_backend
+    from vllm_gr.platforms.plan import read_backend_plan
 
-    config = GRConfig.from_vllm_config(runner.vllm_config).constraint_table
+    gr_config = GRConfig.from_vllm_config(runner.vllm_config)
+    if gr_config.constraint_table is None or not gr_config.constraint_table.enabled:
+        raise ValueError("Cannot reload a disabled constraint table")
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
-    config = replace(config, path=path, artifact_digest="sha256:" + digest.hexdigest())
-    backend = load_constraint_backend(
-        config,
-        device=torch.device(runner.device),
-        vocab_size=runner.model_config.get_vocab_size(),
-        dtype=runner.model_config.dtype,
-        max_rows=runner.constraint_backend.info.max_rows,
+    table = replace(
+        gr_config.constraint_table, path=path, artifact_digest="sha256:" + digest.hexdigest()
     )
-    return backend
+    binding = getattr(runner, "_gr_backend_binding", None)
+    return load_runner_constraint_backend(
+        runner,
+        replace(gr_config, constraint_table=table),
+        plan=binding.plan if binding is not None else read_backend_plan(runner.vllm_config),
+        vocab_size=runner.model_config.get_vocab_size(),
+        max_rows=runner_constraint_backend(runner).info.max_rows,
+    )
 
 
 def versioned_constraint_table(
@@ -71,7 +77,7 @@ def versioned_constraint_table(
 
 
 def reload_trie(self: Any, path: str, version: str) -> dict[str, Any]:
-    self.model_runner.constraint_backend.reload(path, version)
+    runner_constraint_backend(self.model_runner).reload(path, version)
     return {"version": version, "ready": True}
 
 

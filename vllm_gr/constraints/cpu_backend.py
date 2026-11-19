@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 from numpy.typing import NDArray
@@ -26,6 +28,8 @@ class CPUConstraintBackend:
     """Keep canonical constraint tables on Host for the Backend lifetime."""
 
     __slots__ = ("_closed", "_info", "_table")
+
+    implementation_id = "cpu"
 
     def __init__(self, table: ConstraintTable, info: ConstraintBackendInfo) -> None:
         self._table: ConstraintTable | None = table
@@ -166,6 +170,21 @@ class CPUConstraintBackend:
             logits=logits,
             top_k=metadata.top_k,
         )
+
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Host selection reads the full logits, so nothing is attached."""
+        del runner, parallel_config, vocab_size
+        return 0
+
+    def prepare_runner(self, model_config: Any) -> None:
+        """Host selection runs eagerly, so no compile-ahead is required."""
+        del model_config
 
     def close(self) -> None:
         if self._closed:

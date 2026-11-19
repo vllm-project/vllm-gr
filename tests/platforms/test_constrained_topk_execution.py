@@ -17,6 +17,9 @@ def test_npu_provider_creates_adapter() -> None:
     execution = npu.NPU_BACKEND.create_constrained_topk_execution()
 
     assert isinstance(execution, NPUConstrainedTopKExecution)
+    assert (
+        execution.implementation_id == "vllm_gr.constraints.execution.NPUConstrainedTopKExecution"
+    )
 
 
 def test_npu_provider_passes_device() -> None:
@@ -61,6 +64,10 @@ def test_cuda_provider_returns_cuda_execution_and_preserves_device() -> None:
     explicit_execution = cuda.CUDA_BACKEND.create_constrained_topk_execution(device="cuda")
 
     assert isinstance(default_execution, CUDAConstrainedTopKExecution)
+    assert (
+        default_execution.implementation_id
+        == "vllm_gr.constraints.execution.CUDAConstrainedTopKExecution"
+    )
     assert isinstance(explicit_execution, CUDAConstrainedTopKExecution)
     assert explicit_execution._device == "cuda"  # noqa: SLF001
 

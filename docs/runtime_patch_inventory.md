@@ -324,6 +324,8 @@ constraint runtime. `platforms/binding.py` owns this shared lifecycle logic;
 `tests/platforms/test_backend_plan.py` covers isolation and failed binding.
 The same lifecycle applies to the Ascend wrapper in GR-PATCH-012.
 The adapter also owns its stage service and selected Beam decision operators.
+Startup readiness also reports the implementation ID of the canonical constraint
+table owned by each runner. Hot updates use the same admitted implementation.
 Startup readiness reports their implementation IDs. Stage execution and
 retirement take these services from the runner that received the frame.
 

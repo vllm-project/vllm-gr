@@ -72,14 +72,8 @@ _WORKER_V2_KV_PATCH_MARKER = "_vllm_gr_beam_kv_v2_patch"
 _WORKER_V2_PROFILE_PATCH_MARKER = "_vllm_gr_beam_profile_v2_patch"
 
 
-def _warmup_constraint_backend(runner: Any, backend: Any) -> None:
-    from vllm_gr.config import ConstraintTableBackendEnum
-
-    if backend.info.backend is ConstraintTableBackendEnum.CUDA:
-        backend.warmup_stage_topk(runner.model_config.dtype)
-        head_dtype = getattr(runner.model_config, "head_dtype", None)
-        if head_dtype is not None and head_dtype != runner.model_config.dtype:
-            backend.warmup_stage_topk(head_dtype)
+def _prepare_constraint_backend(runner: Any, backend: Any) -> None:
+    backend.prepare_runner(runner.model_config)
 
 
 def discover_worker_runners() -> tuple[tuple[str, type[Any]], ...]:
@@ -374,7 +368,7 @@ def _apply_v2_runner_patches() -> None:
             runner_class.load_model = make_load_model_with_constraint_backend(
                 load_model,
                 max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
-                prepare_backend=_warmup_constraint_backend,
+                prepare_backend=_prepare_constraint_backend,
             )
 
         shutdown = getattr(runner_class, "shutdown", None)

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
-from vllm_gr.config import BeamExecutionMode
+from vllm_gr.config import BeamExecutionMode, ConstraintTableBackendEnum
 from vllm_gr.constraints.versioned_table import (
     INITIAL_CONSTRAINT_VERSION,
     VersionedConstraintTable,
@@ -33,7 +33,7 @@ class Core:
         self.vllm_config._vllm_gr_parsed_config = SimpleNamespace(
             beam_execution_mode=BeamExecutionMode.V1,
             constraint_table=SimpleNamespace(
-                enabled=True, path="/tries/v1/table", backend=SimpleNamespace(value="cuda")
+                enabled=True, path="/tries/v1/table", backend=ConstraintTableBackendEnum.CUDA
             ),
         )
         self.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True)
@@ -138,6 +138,7 @@ def test_trie_worker_failure_does_not_report_a_new_version() -> None:
 
 def _backend() -> Any:
     return Mock(
+        implementation_id="fixture.table",
         info=SimpleNamespace(table_metadata=SimpleNamespace(trie_count=1, artifact_digest="same")),
         vocab_slice=None,
     )
@@ -331,14 +332,16 @@ def test_pause_returns_upstream_drain_future_without_custom_polling() -> None:
 
 
 @pytest.mark.l1
-@pytest.mark.parametrize("unsupported", ["disabled", "npu", "sync"])
+@pytest.mark.parametrize("unsupported", ["disabled", "npu", "explicit-cpu", "sync"])
 def test_trie_rejects_unsupported_execution_before_worker_rpc(unsupported: str) -> None:
     core = Core()
     config = core.vllm_config._vllm_gr_parsed_config
     if unsupported == "disabled":
         config.constraint_table.enabled = False
     elif unsupported == "npu":
-        config.constraint_table.backend.value = "npu"
+        config.constraint_table.backend = ConstraintTableBackendEnum.NPU
+    elif unsupported == "explicit-cpu":
+        config.constraint_table.implementation_id = "cpu"
     else:
         core.vllm_config.scheduler_config.async_scheduling = False
     result = reload_trie(core, "/v2", "v2")

@@ -10,7 +10,6 @@ from typing import Any, cast
 
 from vllm.logger import init_logger
 
-from vllm_gr.config import ConstraintTableBackendEnum
 from vllm_gr.platforms.interface import ModelRunnerInstaller, ModelRunnerPatchHooks
 from vllm_gr.v1.worker.gr_context import (
     get_beam_graph_runtime_stats,
@@ -99,7 +98,7 @@ def make_load_model_with_constraint_backend(
 
     @wraps(original)
     def load_model_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
-        from vllm_gr.config import BeamExecutionMode, GRConfig
+        from vllm_gr.config import GRConfig
 
         # A complete load replaces the model runtime. Release the previous
         # Backend before loading weights so a failed reload cannot leave stale
@@ -143,69 +142,33 @@ def make_load_model_with_constraint_backend(
                     f"{table_config.max_top_k}"
                 )
 
-            from vllm_gr.constraints.loader import load_constraint_backend
+            from vllm_gr.constraints.loader import load_runner_constraint_backend
+            from vllm_gr.constraints.startup import validate_constraint_table_platform
+            from vllm_gr.platforms.plan import read_backend_plan
 
-            stage_options = {}
-            if (
-                table_config.backend is ConstraintTableBackendEnum.NPU
-                and gr_config.beam_execution_mode is BeamExecutionMode.V1
-                and gr_config.beam_max_decode_steps <= 3
-            ):
-                from vllm_gr.ops.npu_stage_logits import (
-                    can_install_npu_stage_projection,
-                )
-
-                # Check the loaded model before allocating compact tables.
-                if can_install_npu_stage_projection(self):
-                    stage_options["enable_npu_stage_vocab"] = True
-            backend = load_constraint_backend(
-                config=table_config,
-                device=getattr(self, "device", None),
+            plan = read_backend_plan(getattr(self, "vllm_config", None))
+            validate_constraint_table_platform(gr_config, plan=plan)
+            backend = load_runner_constraint_backend(
+                self,
+                gr_config,
+                plan=plan,
                 vocab_size=_runner_vocab_size(self),
-                dtype=getattr(getattr(self, "model_config", None), "dtype", None),
                 # NPU V1 and CUDA V2 opt into batched sampling.
                 max_rows=max_batch * max_rows,
-                **stage_options,
             )
             if backend is None:
                 raise RuntimeError("enabled canonical constraint table loader returned no Backend")
 
             model_memory_usage = int(getattr(self, "model_memory_usage", 0))
             self.model_memory_usage = model_memory_usage + backend.info.device_memory_bytes
-
-            if getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.CUDA:
-                # Import GPU layers only after selecting the CUDA backend.
-                from vllm.model_executor.layers.logits_processor import LogitsProcessor
-
-                window = backend.vocab_slice
-                if getattr(parallel, "tensor_parallel_size", 1) != 1:
-                    # All ranks must retain the original full-logits collective path.
-                    window = None
-                    backend.vocab_slice = None
-                    logger.info(
-                        "vllm-gr: canonical CUDA vocabulary slicing disabled for TP>1; "
-                        "using full-vocabulary projection"
-                    )
-                if window == (0, _runner_vocab_size(self)):
-                    window = None  # No benefit from cloning the entire LM head.
-                processors = tuple(
-                    module for module in self.model.modules() if isinstance(module, LogitsProcessor)
-                )
-                for processor in processors:
-                    # Explicit None also overrides unrelated legacy global settings.
-                    processor._gr_vocab_slice = window
-                self._gr_vocab_slice_processors = processors
-            elif (
-                getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.NPU
-                and getattr(backend, "stage_vocab", None) is not None
-            ):
-                # Keep NPU projection imports isolated from CPU/CUDA startup.
-                from vllm_gr.ops.npu_stage_logits import install_npu_stage_projection
-
-                projection = install_npu_stage_projection(self, backend)
-                if projection is not None:
-                    self._gr_npu_stage_projection = projection
-                    self.model_memory_usage += projection.device_memory_bytes
+            # The Backend attaches whatever its selection path needs (a narrowed
+            # LM head, a stage projection, or nothing) and reports the memory it
+            # added. Shared code never asks which implementation this is.
+            self.model_memory_usage += backend.install_runner_integration(
+                self,
+                parallel_config=parallel,
+                vocab_size=_runner_vocab_size(self),
+            )
             from vllm_gr.v1.worker.hot_update import versioned_constraint_table
 
             # Publish only after readiness and runner-specific kernel warmup.

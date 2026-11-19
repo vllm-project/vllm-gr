@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from enum import Enum, auto
+from typing import Any
 
 import torch
 
@@ -47,6 +48,8 @@ class NPUConstraintBackend:
         "_state",
         "_trie_tables",
     )
+
+    implementation_id = "npu"
 
     def __init__(
         self,
@@ -289,6 +292,34 @@ class NPUConstraintBackend:
         if self._state is not _BackendState.READY:
             raise RuntimeError("NPU constraint backend is not ready")
         return self._select_checked(logits, metadata)
+
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Project the LM head onto this Backend's stage vocabulary, if it has one.
+
+        The projection is a property of the loaded stage tables, not of Ascend:
+        a Backend without ``stage_vocab`` attaches nothing. The added device
+        memory is reported so the Runner keeps a single accounting site.
+        """
+        del parallel_config, vocab_size
+        if self.stage_vocab is None:
+            return 0
+        from vllm_gr.ops.npu_stage_logits import install_npu_stage_projection
+
+        projection = install_npu_stage_projection(runner, self)
+        if projection is None:
+            return 0
+        runner._gr_npu_stage_projection = projection
+        return int(projection.device_memory_bytes)
+
+    def prepare_runner(self, model_config: Any) -> None:
+        """The Ascend operator is resolved eagerly at load, so nothing is deferred."""
+        del model_config
 
     def close(self) -> None:
         if self._state is _BackendState.CLOSED:

@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
+from vllm_gr.platforms.binding import runner_constraint_backend
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
@@ -473,7 +474,7 @@ class NPUEagerBeamStageRunner:
                 current_step=plan.execution.stage_index,
                 top_k=plan.execution.candidate_top_k,
             )
-            backend = getattr(self.worker, "constraint_backend", None)
+            backend = runner_constraint_backend(self.worker)
             if backend is None or not callable(getattr(backend, "select", None)):
                 raise RuntimeError("NPU GR requires a loaded canonical constraint backend")
             candidates = self._select_constraint_candidates(
@@ -906,7 +907,7 @@ class NPUEagerBeamStageRunner:
         self, plan: NPUEagerStagePlan, request: BeamBatchRequest | None
     ) -> tuple[int, ...] | None:
         """Validate immutable request selectors before retaining session state."""
-        backend = getattr(self.worker, "constraint_backend", None)
+        backend = runner_constraint_backend(self.worker)
         trie_count = backend.info.table_metadata.trie_count if backend is not None else 1
         if type(trie_count) is not int or trie_count < 1:
             raise RuntimeError("NPU constraint backend has an invalid live Trie count")

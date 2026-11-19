@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
+from .constraint_plan import constraint_plan_choices
 from .plan import PLAN_API_VERSION, BackendPlan, BackendRequest, PlanData
 
 if TYPE_CHECKING:
@@ -130,9 +131,10 @@ class LegacyPlanningProvider:
                 {
                     "runner": "legacy-provider-hooks",
                     "attention": "legacy-provider-execution",
-                    "constraint": "canonical"
-                    if (gr["constraint_table"] or {}).get("enabled")
-                    else ("legacy" if gr["constraint_backend"] == "constraint_table" else "none"),
+                    **constraint_plan_choices(
+                        gr,
+                        legacy_id=getattr(self.provider, "device_type", None),
+                    ),
                     "requires_attention": gr["attention_backend"] == "CUSTOM",
                     "compatibility": "provider-api-v2-delegation",
                 }

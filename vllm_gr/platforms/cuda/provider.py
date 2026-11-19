@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from ..constraint_plan import constraint_plan_choices
 from ..identity import PlatformIdentity, platform_identity
 from ..interface import (
     PROVIDER_API_VERSION,
@@ -65,12 +66,6 @@ class CUDABackendProvider(BuiltinPlanSupport):
             prefix_caching=bool(native.get("cache_config", {}).get("enable_prefix_caching")),
             chunked_prefill=bool(native.get("scheduler_config", {}).get("enable_chunked_prefill")),
         )
-        table = gr["constraint_table"] or {}
-        constraint = (
-            "canonical"
-            if table.get("enabled")
-            else ("legacy" if gr["constraint_backend"] == "constraint_table" else "none")
-        )
         return BackendPlan(
             self.backend_id,
             self.api_version,
@@ -85,8 +80,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
                     "prefill_flash_attn_version": gr["prefill_flash_attn_version"],
                     "kv_layout": native.get("kv_cache_layout"),
                     "requires_attention": custom_attention,
-                    "constraint": constraint,
-                    "constraint_implementation": "cuda" if constraint != "none" else None,
+                    **constraint_plan_choices(gr, legacy_id="cuda"),
                     "operator_policy": "cuda.onerec",
                     "stage": "cuda.v2" if native["use_v2_model_runner"] else "cuda.v1",
                     "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
@@ -139,6 +133,20 @@ class CUDABackendProvider(BuiltinPlanSupport):
         del force
         return 0
 
+    def validate_worker(self, *, plan: BackendPlan, native_runner: Any) -> None:
+        super().validate_worker(plan=plan, native_runner=native_runner)
+        if (
+            plan.choices.to_dict().get("constraint") == "canonical"
+            and plan.request.config.to_dict()["beam_execution_mode"] == "v1"
+        ):
+            from vllm_gr.constraints.backend import validate_device_stage_backend
+
+            validate_device_stage_backend(
+                native_runner.constraint_backend,
+                native_runner.device,
+                native_runner.model_config.get_vocab_size(),
+            )
+
     def get_model_runner_hooks(self) -> ModelRunnerInstaller:
         from . import runner
 
@@ -157,7 +165,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
         plan: BackendPlan | None = None,
     ) -> ConstrainedTopKExecution | None:
         """Create the production CUDA Constraint Table execution adapter."""
-        from vllm_gr.constraints.execution import CUDAConstrainedTopKExecution
+        from vllm_gr.constraints.cuda_execution import CUDAConstrainedTopKExecution
 
         if plan is not None:
             require_provider_plan(self, plan)

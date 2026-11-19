@@ -805,7 +805,7 @@ def test_direct_path_rejects_empty_legal_candidate_row() -> None:
         backend,
     )
 
-    with pytest.raises(RuntimeError, match="no legal candidate"):
+    with pytest.raises(RuntimeError, match="without a legal candidate"):
         try_sample_with_constraint_backend(runner, torch.zeros((1, 8)))
     assert events == ["async"]
 

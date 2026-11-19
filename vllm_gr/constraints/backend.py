@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
@@ -22,7 +22,7 @@ class ConstraintBackendInfo:
     """Immutable construction and ownership diagnostics for one Backend."""
 
     table_metadata: ConstraintTableMetadata
-    backend: ConstraintTableBackendEnum
+    backend: ConstraintTableBackendEnum | None
     max_top_k: int
     max_rows: int
     host_memory_bytes: int
@@ -69,6 +69,9 @@ class ConstraintOutput:
 @runtime_checkable
 class ConstraintBackend(Protocol):
     @property
+    def implementation_id(self) -> str: ...
+
+    @property
     def info(self) -> ConstraintBackendInfo: ...
 
     def select(
@@ -77,7 +80,76 @@ class ConstraintBackend(Protocol):
         metadata: ConstraintMetadata,
     ) -> ConstraintOutput: ...
 
+    def prepare_runner(self, model_config: Any) -> None:
+        """Perform the runner-side preparation this backend needs before selection.
+
+        Shared Runner code calls this once per published Backend, both on the
+        initial load and on every reload. A backend without a compile-ahead
+        requirement answers with a no-op; one whose operator is JIT-compiled
+        warms the variants its first step will use.
+
+        Keeping the decision here means shared code never asks which backend
+        this is: an external backend that needs preparation implements it, and
+        one that does not is never described by a name in a branch.
+        """
+
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Attach this backend's runner-side integration and report added bytes.
+
+        Called once per published Backend, after readiness and before sampling
+        can reach it. A backend whose selection reads the ordinary logits attaches
+        nothing and returns ``0``; one that narrows the LM head or projects a
+        stage vocabulary attaches that here.
+
+        The return value is the device memory the integration adds beyond
+        ``info.device_memory_bytes``, so the caller keeps one accounting site.
+        Shared Runner code therefore never asks which backend this is, and an
+        external backend attaches its own integration without a branch edit.
+        """
+
     def close(self) -> None: ...
+
+
+class DeviceStageConstraintBackend(ConstraintBackend, Protocol):
+    """A persistent stage can write candidates directly into reusable device buffers."""
+
+    @property
+    def is_ready(self) -> bool: ...
+
+    def validate_stage_device(self, device: torch.device) -> None: ...
+
+    def select_out_unchecked(
+        self,
+        logits: torch.Tensor,
+        metadata: ConstraintMetadata,
+        *,
+        out_token_ids: torch.Tensor,
+        out_logprobs: torch.Tensor,
+        out_valid_mask: torch.Tensor,
+        out_valid_counts: torch.Tensor,
+        device_step: torch.Tensor,
+        specialize_steps: bool,
+    ) -> None: ...
+
+
+def validate_device_stage_backend(backend: Any, device: torch.device, vocab_size: int) -> None:
+    """Validate the persistent stage's callable, readiness, model and device contract."""
+    if not callable(getattr(backend, "select_out_unchecked", None)) or not callable(
+        getattr(backend, "validate_stage_device", None)
+    ):
+        raise ValueError("Persistent constraint stages require device workspace selection support")
+    if (
+        not getattr(backend, "is_ready", False)
+        or backend.info.table_metadata.vocab_size != vocab_size
+    ):
+        raise ValueError("constraint backend is not ready or its model/device binding differs")
+    backend.validate_stage_device(device)
 
 
 def validate_select_inputs(
@@ -223,4 +295,6 @@ __all__ = [
     "ConstraintBackendInfo",
     "ConstraintMetadata",
     "ConstraintOutput",
+    "DeviceStageConstraintBackend",
+    "validate_device_stage_backend",
 ]

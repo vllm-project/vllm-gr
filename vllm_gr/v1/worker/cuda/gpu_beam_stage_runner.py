@@ -21,8 +21,11 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gr.config import resolve_candidate_width
-from vllm_gr.constraints.backend import ConstraintMetadata
-from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
+from vllm_gr.constraints.backend import (
+    ConstraintMetadata,
+    DeviceStageConstraintBackend,
+    validate_device_stage_backend,
+)
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     LOCAL_TILE_SIZE,
 )
@@ -39,6 +42,7 @@ from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     unconstrained_topk_mcap_out as unconstrained_topk_out,
 )
+from vllm_gr.platforms.binding import runner_constraint_backend
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     SUPPORTED_BEAM_BATCH_SIZES,
@@ -518,7 +522,7 @@ class GPUBeamStageRunner:
         worker: Any,
         beam: BeamBatchSearchRunner,
         bindings: tuple[BeamRequestBinding, ...],
-        backend: CUDAConstraintBackend | None,
+        backend: DeviceStageConstraintBackend | None,
         hooks: CudaStageHooks,
         trie_ids: tuple[int, ...] | None = None,
     ):
@@ -1254,7 +1258,7 @@ def get_stage_runner(
     if existing is not None:
         validate_stage_hooks_type(existing.hooks, hooks_type)
     if existing is not None and not existing.closed:
-        if getattr(worker, "constraint_backend", None) is not existing.backend:
+        if runner_constraint_backend(worker) is not existing.backend:
             raise ValueError("GR constraint backend binding changed before session release")
         return cast(GPUBeamStageRunner, existing)
     dispatch_session = validate_dispatch_session(scheduler_output)
@@ -1287,14 +1291,12 @@ def get_stage_runner(
         raise ValueError(
             "persistent GR requires CUDA async, TP/PP/DP=1, FP16/BF16 and matching capacity"
         )
-    backend = getattr(worker, "constraint_backend", None)
+    backend = runner_constraint_backend(worker)
     # A GRConfig without the switch (or a partial config object) keeps the
     # constrained default: only an explicit ``False`` selects full vocabulary.
     unconstrained = getattr(cfg, "constrained_generation", None) is False
-    if not unconstrained and (
-        backend is None or not isinstance(backend.get(), CUDAConstraintBackend)
-    ):
-        raise ValueError("persistent GR requires a loaded canonical CUDA Constraint Table")
+    if not unconstrained and backend is None:
+        raise ValueError("persistent GR requires a loaded canonical Constraint Table")
     if (
         existing is not None
         and existing.graph is not None
@@ -1304,12 +1306,8 @@ def get_stage_runner(
         raise ValueError(
             "Asynchronous scheduling captured constraint/model binding cannot change after startup"
         )
-    if backend is not None and (
-        not backend.is_ready
-        or backend.info.table_metadata.vocab_size != worker.model_config.get_vocab_size()
-        or any(table.device != worker.device for table in backend._tables())
-    ):
-        raise ValueError("constraint backend is not ready or its model/device binding differs")
+    if backend is not None:
+        validate_device_stage_backend(backend, worker.device, worker.model_config.get_vocab_size())
     candidate_width = resolve_candidate_width(cfg)
     # A request-level per-stage K schedule overrides the configured scalar K.
     required_top_k = max(m.beam_params.per_parent_beam_widths or (candidate_width,))

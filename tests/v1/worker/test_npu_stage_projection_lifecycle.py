@@ -49,6 +49,25 @@ class _Backend:
         )
         self.close_calls = 0
 
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Delegate to the real Ascend integration so the test tracks production."""
+        from vllm_gr.constraints.npu_backend import NPUConstraintBackend
+
+        added = NPUConstraintBackend.install_runner_integration(
+            self,
+            runner,
+            parallel_config=parallel_config,
+            vocab_size=vocab_size,
+        )
+        assert isinstance(added, int)
+        return added
+
     def close(self) -> None:
         self.close_calls += 1
 
@@ -117,7 +136,7 @@ def lifecycle(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         assert kwargs["vocab_size"] == 384
         assert runner.constraint_backend is None
         backend = _Backend()
-        if not kwargs.get("enable_npu_stage_vocab", False):
+        if not kwargs["implementation_options"].get("enable_npu_stage_vocab", False):
             backend.stage_vocab = None
         created.append(backend)
         return backend

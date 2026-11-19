@@ -24,10 +24,34 @@ _TOKENIZER_DIGEST = "sha256:" + "2" * 64
 
 
 class _Backend:
+    """A Backend whose runner integration delegates to the real CUDA one.
+
+    Delegating keeps these lifecycle tests exercising the production
+    integration path instead of a replica that could drift from it.
+    """
+
     def __init__(self, *, device_memory_bytes: int = 32) -> None:
         self.info = SimpleNamespace(device_memory_bytes=device_memory_bytes)
         self.close_calls = 0
         self.vocab_slice: tuple[int, int] | None = None
+
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
+
+        added = CUDAConstraintBackend.install_runner_integration(
+            self,
+            runner,
+            parallel_config=parallel_config,
+            vocab_size=vocab_size,
+        )
+        assert isinstance(added, int)
+        return added
 
     def close(self) -> None:
         self.close_calls += 1

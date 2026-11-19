@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_gr.constraints.backend import (
     ConstraintBackendInfo,
@@ -21,6 +23,8 @@ from vllm_gr.ops.cuda.rec_constrained_topk import (
     rec_constrained_topk_cuda_out,
     validate_cuda_sort_capacity,
 )
+
+logger = init_logger(__name__)
 
 
 class _BackendState(Enum):
@@ -45,6 +49,8 @@ class CUDAConstraintBackend:
         "_state",
         "vocab_slice",
     )
+
+    implementation_id = "cuda"
 
     def __init__(
         self,
@@ -89,6 +95,10 @@ class CUDAConstraintBackend:
     def is_ready(self) -> bool:
         """Whether admission can use this backend without initialization work."""
         return self._state is _BackendState.READY
+
+    def validate_stage_device(self, device: torch.device) -> None:
+        if any(table.device != device for table in self._tables()):
+            raise ValueError("constraint backend is not ready or its model/device binding differs")
 
     def _tables(self) -> tuple[torch.Tensor, ...]:
         tables = (
@@ -233,6 +243,54 @@ class CUDAConstraintBackend:
         if self._state is not _BackendState.INITIALIZING:
             raise RuntimeError("only an initializing CUDA constraint backend can become ready")
         self._state = _BackendState.READY
+
+    def install_runner_integration(
+        self,
+        runner: Any,
+        *,
+        parallel_config: Any,
+        vocab_size: int,
+    ) -> int:
+        """Point the model's LogitsProcessors at this table's vocabulary window.
+
+        Table token ids stay global, so the LM head may emit a narrower logits
+        slice. With more than one rank the full-vocabulary collective must stay
+        in place, so the window is dropped rather than applied per rank.
+        """
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+        window = self.vocab_slice
+        if getattr(parallel_config, "tensor_parallel_size", 1) != 1:
+            # All ranks must retain the original full-logits collective path.
+            window = None
+            self.vocab_slice = None
+            logger.info(
+                "vllm-gr: canonical CUDA vocabulary slicing disabled for TP>1; "
+                "using full-vocabulary projection"
+            )
+        if window == (0, vocab_size):
+            window = None  # No benefit from cloning the entire LM head.
+        processors = tuple(
+            module for module in runner.model.modules() if isinstance(module, LogitsProcessor)
+        )
+        for processor in processors:
+            # Explicit None also overrides unrelated legacy global settings.
+            processor._gr_vocab_slice = window
+        runner._gr_vocab_slice_processors = processors
+        return 0
+
+    def prepare_runner(self, model_config: Any) -> None:
+        """Warm the device-step variant for each dtype the LM head can emit.
+
+        The V2 runner consumes a JIT-compiled stage kernel, so the first decoded
+        step would otherwise pay compilation. ``head_dtype`` may differ from the
+        model dtype; both are warmed because either can reach the operator.
+        """
+        dtype = getattr(model_config, "dtype", None)
+        self.warmup_stage_topk(dtype)
+        head_dtype = getattr(model_config, "head_dtype", None)
+        if head_dtype is not None and head_dtype != dtype:
+            self.warmup_stage_topk(head_dtype)
 
     def warmup_stage_topk(self, dtype: torch.dtype) -> None:
         """Warm V2's device-step kernel for every supported candidate-capacity bucket."""

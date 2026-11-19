@@ -15,13 +15,14 @@ from vllm.utils import random_uuid
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import GRConfig, resolve_candidate_width
-from vllm_gr.config.models import ConstraintTableBackendEnum
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
 from vllm_gr.entrypoints.beam_search_v1.token_utils import boundary_token_id
+from vllm_gr.platforms.constraint_plan import canonical_constraint_id
+from vllm_gr.platforms.plan import read_backend_plan
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
@@ -177,16 +178,22 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     device_type = str(device).split(":")[0]
     if unconstrained and device_type not in ("cuda", "npu"):
         raise BeamSearchRequestError("unconstrained beam_search_v1 requires CUDA or NPU")
-    required_backend = (
-        ConstraintTableBackendEnum.NPU if device_type == "npu" else ConstraintTableBackendEnum.CUDA
-    )
-    if not unconstrained and (
-        table is None or not table.enabled or table.backend is not required_backend
-    ):
-        raise BeamSearchRequestError(
-            "beam_search_v1 requires an enabled canonical "
-            f"{required_backend.value.upper()} constraint table"
-        )
+    if not unconstrained:
+        plan = read_backend_plan(vllm_config)
+        if table is None or not table.enabled:
+            raise BeamSearchRequestError(
+                "beam_search_v1 requires an enabled canonical constraint table"
+            )
+        try:
+            implementation_id = canonical_constraint_id(table, plan)
+        except ValueError as error:
+            raise BeamSearchRequestError(str(error)) from error
+        # Historical callers can supply native config directly before EngineArgs
+        # has admitted a plan. Preserve the old placement check for enum-only input.
+        if plan is None and table.implementation_id is None and implementation_id != device_type:
+            raise BeamSearchRequestError(
+                f"beam_search_v1 requires an enabled canonical {device_type.upper()} constraint table"
+            )
     if not unconstrained and request.beam_params.catalog_strategy is not None:
         raise BeamSearchRequestError(
             "catalog_strategy is not applicable to the constraint_table backend"

@@ -329,24 +329,14 @@ def test_npu_default_device_falls_back_without_crash(
         raise
 
 
-def test_npu_default_device_prefers_npu(
-    tokenizer: MagicMock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """NPUConstrainedTopKExecution must request prefer='npu' when no device given."""
-    from vllm_gr.constraints import execution as execution_module
+def test_npu_default_device_prefers_npu(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr.constraints import npu_execution
 
-    resource = _build_resource(tokenizer)
-    captured: dict[str, Any] = {}
-
-    def fake_default_device(prefer: str | None = None) -> torch.device:
-        captured["prefer"] = prefer
-        return torch.device("cpu")
-
-    monkeypatch.setattr(execution_module, "_default_device", fake_default_device)
-    execution = NPUConstrainedTopKExecution()  # no device passed
-    execution.load_tables(resource)
-
-    assert captured.get("prefer") == "npu"
+    native = MagicMock(spec=torch)
+    monkeypatch.setattr(npu_execution, "torch", native)
+    execution = NPUConstrainedTopKExecution()
+    assert execution._default_device() is native.device.return_value
+    native.device.assert_called_once_with("npu")
 
 
 def test_npu_adapter_passes_arguments_and_normalizes_dtype(

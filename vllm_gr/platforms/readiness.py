@@ -36,7 +36,7 @@ def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_worke
         required.extend(("stage", "operator"))
     if choices.get("requires_attention"):
         required.append("attention")
-    if choices.get("constraint") == "legacy":
+    if choices.get("constraint") in ("legacy", "canonical"):
         required.append("constraint")
     services = None
     for index, report in enumerate(reports):
@@ -54,6 +54,15 @@ def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_worke
         for service in required:
             if not isinstance(reported.get(service), str) or not reported[service].strip():
                 raise RuntimeError(f"Backend worker {index} has no bound {service}")
+        expected_constraint = choices.get("constraint_implementation")
+        if (
+            choices.get("constraint") == "canonical"
+            and expected_constraint is not None
+            and reported["constraint"] != expected_constraint
+        ):
+            raise RuntimeError(
+                f"Backend worker {index} canonical constraint implementation mismatch"
+            )
         current = PlanData(reported)
         if services is not None and current != services:
             raise RuntimeError("Workers disagree on bound backend service implementations")

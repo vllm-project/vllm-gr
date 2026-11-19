@@ -78,6 +78,7 @@ def test_reload_trie_switches_then_releases_old_table_on_expiry(
     from tests.constraints.test_cpu_backend import _select
     from tests.constraints.test_loader import _config
     from tests.constraints.test_table import make_table
+    from vllm_gr.config import GRConfig, write_canonical_gr_config
     from vllm_gr.constraints import versioned_table
     from vllm_gr.constraints.artifact import save_constraint_table_artifact
     from vllm_gr.constraints.loader import load_constraint_backend
@@ -97,13 +98,13 @@ def test_reload_trie_switches_then_releases_old_table_on_expiry(
         config, device=torch.device("cpu"), vocab_size=6, dtype=torch.float32, max_rows=2
     )
     assert old is not None
+    native = SimpleNamespace(additional_config={})
+    write_canonical_gr_config(native, GRConfig(beam_max_width=4, constraint_table=config))
     runner = SimpleNamespace(
         device="cpu",
         constraint_backend=old,
         model_config=SimpleNamespace(get_vocab_size=lambda: 6, dtype=torch.float32),
-        vllm_config=SimpleNamespace(
-            _vllm_gr_parsed_config=SimpleNamespace(constraint_table=config)
-        ),
+        vllm_config=native,
     )
     runner.constraint_backend = versioned_constraint_table(runner, old)
     table = runner.constraint_backend

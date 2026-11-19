@@ -137,8 +137,8 @@ the bound services and their admitted plan. Native KV-cache profiling can
 adjust the maximum model length before this RPC. Partial construction releases services
 already created. Reload/shutdown detach the binding, release owned services,
 and clear the legacy execution alias. Stateless module bindings do not close
-process-wide modules. Canonical constraint artifacts retain their current
-loader and lifecycle owner; readiness requires successful load before binding.
+process-wide modules. Each runner owns its canonical constraint artifacts and
+lends its versioned table to the binding for readiness and execution.
 
 EngineCore calls `worker_backend_readiness` through the native executor and
 requires its expected number of worker reports, an identical plan
@@ -148,8 +148,44 @@ request acceptance. With vLLM's external launcher, each executor owns one
 worker. The engines gather those local reports using the native world
 CPU group so every participating rank verifies the same result.
 
-Stage and operator routing, attention admissibility, constraint identity and
-graph resource ownership have separate implementation slices in RFC #706.
+### Canonical constraint implementations
+
+Set `constraint_table.implementation_id` to select a registered implementation.
+Payloads that only specify `constraint_table.backend` retain the historical
+`cpu`, `cuda`, or `npu` interpretation. An explicit ID takes precedence.
+The provider records the selected ID in `choices.constraint_implementation`.
+Frontend validation, worker loading, and worker readiness use that identity.
+
+A provider registers its artifact implementation in every process where it is
+used via `vllm_gr.constraints.registry.register_implementation`. Pass a
+`ConstraintImplementation` with its stable ID, `legacy_enum=None`, an `admit`
+callback and a `build` callback. Admission checks device placement, capacity,
+and required operators before artifact I/O. The factory receives the admission
+result, validated table, native device, dtype, row and Top-K bounds, and the
+engine plan on `ConstraintTableRequest`. An implementation can define
+`runner_load_options(runner, gr_config)` to return a mapping for its factory.
+Initial load and hot reload both pass the mapping as `request.options`; on
+reload, `gr_config.constraint_table` identifies the replacement artifact.
+The factory returns a fresh backend reporting
+the selected ID. An unknown ID, unavailable operator, or mismatched factory
+result aborts startup before EngineCore accepts requests.
+
+Persistent CUDA stages require the `DeviceStageConstraintBackend` contract.
+The implementation validates its table device and writes candidates into
+preallocated token, score, validity and count buffers. Ascend multi-trie
+stages require `select_for_rows` for request-local root selection. The worker
+verifies the capabilities its admitted stage will use before reporting ready.
+
+The backend owns selection and any runner-specific model integration.
+Implementations that support sliced logits opt in via `supports_vocab_slicing`.
+Selection returns global token IDs, normalized scores and the validity mask
+specified by `ConstraintOutput`. The runner prepares CUDA V2 variants before
+publication, including replacements. A registered implementation that supports
+worker-side online replacement sets `supports_hot_reload=True`. The EngineCore
+management RPC checks this capability using the admitted ID. Hot reload uses the bound engine plan,
+rejects a changed implementation, and retains old artifact versions for
+in-flight requests. The versioned table releases these resources on expiry
+or runner shutdown.
 
 Host-only contract coverage can run without Torch or vLLM:
 

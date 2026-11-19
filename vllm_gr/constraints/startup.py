@@ -33,6 +33,7 @@ from vllm_gr.constraints.compiler import (
     ConstraintTableCompiler,
     ConstraintTableResource,
 )
+from vllm_gr.platforms.plan import BackendPlan, read_backend_plan
 from vllm_gr.platforms.services import constraint_execution_override
 
 logger = logging.getLogger(__name__)
@@ -98,20 +99,37 @@ def validate_constraint_table_platform(
     gr_config: GRConfig,
     *,
     device_type: str | None = None,
+    plan: BackendPlan | None = None,
 ) -> None:
     """Reject configurations Constraint Tables cannot support in this release.
 
-    CUDA carries full-vocabulary table ids alongside a sliced logits window
-    and translates ids to local logits columns inside the fused kernel. Other
-    platforms still use the original full-vocabulary ABI and reject slicing.
+    The selected implementation declares whether it handles full-vocabulary
+    token IDs against a sliced logits window.
     """
     slicing_enabled = gr_config.vocab_offset is not None or gr_config.vocab_slice_size is not None
-    if slicing_enabled and device_type != "cuda":
+    if not slicing_enabled:
+        return
+    from vllm_gr.constraints.registry import (
+        implementation_by_id,
+        resolve_constraint_implementation,
+    )
+
+    table = gr_config.constraint_table
+    implementation_id = (
+        plan.choices.to_dict().get("constraint_implementation") if plan else None
+    ) or device_type
+    if table is not None and table.enabled:
+        implementation = resolve_constraint_implementation(table, plan)
+    elif implementation_id:
+        implementation = implementation_by_id(implementation_id)
+    else:
+        implementation = None
+    if implementation is None or not implementation.supports_vocab_slicing:
         raise ValueError(
             "constraint_backend='constraint_table' cannot be combined with "
             f"vocab slicing (vocab_offset={gr_config.vocab_offset!r}, "
             f"vocab_slice_size={gr_config.vocab_slice_size!r}) on platform "
-            f"{device_type or 'unknown'!r}"
+            f"{device_type or implementation_id or 'unknown'!r}"
         )
 
 
@@ -206,6 +224,7 @@ def prepare_constraint_table(
     tokenizer: Any,
     vocab_size: int,
     gr_config: GRConfig | None = None,
+    plan: BackendPlan | None = None,
 ) -> ConstraintTableResource:
     """Activate the platform backend, validate, and compile the resource.
 
@@ -231,14 +250,25 @@ def prepare_constraint_table(
     # Activate the provider before validation so an unsupported platform fails
     # here rather than at the first constrained step.
     activate_current_backend()
-    if gr_config is not None:
+    if gr_config is not None and (
+        gr_config.vocab_offset is not None or gr_config.vocab_slice_size is not None
+    ):
+        # Historical resource injection without an engine plan used the
+        # native placement. Planned and canonical tables carry their own ID.
+        table = gr_config.constraint_table
+        planned_id = plan.choices.to_dict().get("constraint_implementation") if plan else None
+        legacy_placement = not planned_id and (table is None or not table.enabled)
         validate_constraint_table_platform(
             gr_config,
-            device_type=current_platform_identity().device_type,
+            device_type=current_platform_identity().device_type if legacy_placement else None,
+            plan=plan,
         )
     # Startup-time fail-fast (issue #246 §7): the probe adapter is discarded;
     # the Worker lazily creates its own with the runner device (N3).
-    create_constraint_execution()
+    if plan is None:
+        create_constraint_execution()
+    else:
+        create_constraint_execution(plan=plan)
     if catalog_path is None or catalog_path == AUTO_CONSTRAINT_TABLE_PATH:
         return compile_constraint_table_resource_from_tokenizer(tokenizer, vocab_size)
     return compile_constraint_table_resource(catalog_path, tokenizer, vocab_size)
@@ -276,6 +306,7 @@ def install_constraint_table(
         tokenizer=tokenizer,
         vocab_size=vocab_size,
         gr_config=gr_config,
+        plan=read_backend_plan(getattr(engine, "vllm_config", None)),
     )
     from vllm_gr.constraints.driver_inject import inject_constraint_resources
 
