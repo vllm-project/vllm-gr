@@ -22,6 +22,7 @@ BACKEND_OPTIONS_KEY = "vllm_gr_backend_options"
 _NATIVE_FIELDS = {
     "model_config": (
         "dtype",
+        "enforce_eager",
         "quantization",
         "max_model_len",
         "is_encoder_decoder",
@@ -158,6 +159,8 @@ def resolve_backend_plan(provider: Any, request: BackendRequest) -> BackendPlan:
         raise ValueError("Backend resolve() changed request or provider identity")
     if (request.config.to_dict().get("constraint_table") or {}).get("enabled"):
         admitted_constraint_id(plan)
+    if plan.prefill_graph_mode and "graph" not in plan.required_services:
+        raise ValueError("An explicit Prefill graph mode requires an admitted graph service")
     return plan
 
 

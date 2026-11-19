@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tests.helpers.gr_config import make_gr_config
+from vllm_gr.config import GRConfig
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker import gr_context as _gr_context
 from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as gpu_patch
@@ -48,7 +49,7 @@ def test_async_scheduling_decode_bypasses_prefill_graph_dispatch(
         assert self is runner and input_ids is tokens
         return hidden
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", forbidden)
+    monkeypatch.setattr(gpu_patch, "graph_for", forbidden)
     assert gpu_patch.make_patched_model_forward(original)(runner, tokens, positions) is hidden
 
 
@@ -97,7 +98,6 @@ def test_async_scheduling_prefill_reuses_existing_padded_graph_without_runtime_c
         calls.append("eager")
         return eager
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda runner=None: True)
     monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
     result = gpu_patch.make_patched_model_forward(original)(runner, tokens, positions)
     assert result is (hidden if replay else eager)
@@ -128,7 +128,6 @@ def test_async_prefill_padding_preserves_input_guards(
             total_num_scheduled_tokens=4,
         ),
     )
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda runner=None: True)
     monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
     monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda _: prefill)
     ids, positions = torch.zeros(4, dtype=torch.int32), torch.arange(4)
@@ -158,7 +157,6 @@ def test_async_scheduling_prefill_never_initializes_a_graph_runner_during_reques
     def forbidden(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("request allocated a graph runner")
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda runner=None: True)
     monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", forbidden)
     assert gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(runner) == "eager"
 
@@ -202,7 +200,6 @@ def test_batch_session_prefill_selects_exact_four_request_graph(
         ),
     )
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda runner=None: True)
     monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
     result = gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(
         runner, tokens, positions
@@ -245,7 +242,6 @@ def test_batch_session_prefill_rejects_partial_or_reordered_requests(
     def forbidden(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("invalid Batch Session reached graph selection")
 
-    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda runner=None: True)
     monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
     monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", forbidden)
     result = gpu_patch.make_patched_model_forward(eager)(runner, tokens, positions)
@@ -588,76 +584,36 @@ def test_patched_determine_width_mismatch_no_full() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _capture_vllm_config(*, enabled: bool = True) -> SimpleNamespace:
+    config = SimpleNamespace(additional_config={})
+    GRConfig(beam_max_width=4, beam_graph_enabled=enabled).write_to_vllm_config(config)
+    return config
+
+
 def test_capture_beam_decode_graph_disabled_returns_false() -> None:
-    """When beam_graph_active is False, capture returns False immediately."""
-    gr_cfg = SimpleNamespace(beam_graph_active=False)
-
-    original_fn = _gr_context._get_gr_config
-
-    def _stub_config(r: Any) -> Any:
-        return gr_cfg
-
-    _gr_context._get_gr_config = _stub_config
-    try:
-        runner = SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False)
-        )
-        result = gpu_patch.capture_beam_decode_graph(runner)
-        assert result is False
-    finally:
-        _gr_context._get_gr_config = original_fn
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        vllm_config=_capture_vllm_config(enabled=False),
+    )
+    assert gpu_patch.capture_beam_decode_graph(runner) is False
 
 
 def test_capture_beam_decode_graph_tp_gt1_returns_false() -> None:
-    """With TP > 1, capture must refuse and return False."""
-    gr_cfg = SimpleNamespace(
-        beam_graph_active=True,
-        beam_max_width=4,
-        beam_max_decode_steps=3,
-        deployment=SimpleNamespace(beam_batch_sizes=(1,)),
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        vllm_config=_capture_vllm_config(),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2, use_ubatching=False),
     )
-
-    original_fn = _gr_context._get_gr_config
-
-    def _stub_config(r: Any) -> Any:
-        return gr_cfg
-
-    _gr_context._get_gr_config = _stub_config
-    try:
-        runner = SimpleNamespace(
-            model_config=SimpleNamespace(enforce_eager=False),
-            parallel_config=SimpleNamespace(tensor_parallel_size=2, use_ubatching=False),
-        )
-        result = gpu_patch.capture_beam_decode_graph(runner)
-        assert result is False
-    finally:
-        _gr_context._get_gr_config = original_fn
+    assert gpu_patch.capture_beam_decode_graph(runner) is False
 
 
 def test_capture_beam_decode_graph_ubatching_returns_false() -> None:
-    """With DP ubatching, capture must refuse and return False."""
-    gr_cfg = SimpleNamespace(
-        beam_graph_active=True,
-        beam_max_width=4,
-        beam_max_decode_steps=3,
-        deployment=SimpleNamespace(beam_batch_sizes=(1,)),
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        vllm_config=_capture_vllm_config(),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=True),
     )
-
-    original_fn = _gr_context._get_gr_config
-
-    def _stub_config(r: Any) -> Any:
-        return gr_cfg
-
-    _gr_context._get_gr_config = _stub_config
-    try:
-        runner = SimpleNamespace(
-            model_config=SimpleNamespace(enforce_eager=False),
-            parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=True),
-        )
-        result = gpu_patch.capture_beam_decode_graph(runner)
-        assert result is False
-    finally:
-        _gr_context._get_gr_config = original_fn
+    assert gpu_patch.capture_beam_decode_graph(runner) is False
 
 
 def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
@@ -669,16 +625,6 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
 
     from vllm_gr.v1.worker.cuda import beam_decode_graph as shared
 
-    monkeypatch.setattr(
-        _gr_context,
-        "_get_gr_config",
-        lambda _: SimpleNamespace(
-            beam_graph_active=True,
-            beam_max_width=4,
-            beam_max_decode_steps=3,
-            deployment=SimpleNamespace(beam_batch_sizes=(1,)),
-        ),
-    )
     monkeypatch.setattr(shared, "set_cudagraph_capturing_enabled", lambda _: None)
     stream = SimpleNamespace(wait_stream=lambda _: None, synchronize=lambda: None)
     monkeypatch.setattr(torch.cuda, "Stream", lambda **kw: stream)
@@ -689,6 +635,7 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     native_model = object()
     runner = SimpleNamespace(
         device="cuda",
+        vllm_config=_capture_vllm_config(),
         model_config=SimpleNamespace(enforce_eager=False),
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False),
         _beam_sessions={},
@@ -703,6 +650,7 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     )
     graph = object.__new__(shared.BeamDecodeGraph)
     graph.worker, graph.width = runner, 4
+    graph.graph_service = shared.graph_for(runner, shared.CudaGraph)
     graph.signature = shared.BeamDecodeGraphSignature(1, 4, 4)
     graph._bindings = {}
     graph.capture_inputs = graph.capture_attention = None
@@ -861,10 +809,10 @@ def test_capture_create_dummy_context_creates_session_and_beam_info() -> None:
 def test_beam_full_graph_ready_uses_worker_registry() -> None:
     graph = SimpleNamespace(signature=SimpleNamespace(num_model_rows=8), ready=True)
     runner = SimpleNamespace(_beam_decode_graph=graph)
-    assert _gr_context._beam_full_graph_ready(runner, 8)
-    assert not _gr_context._beam_full_graph_ready(runner, 4)
+    assert gpu_patch._beam_full_graph_ready(runner, 8)
+    assert not gpu_patch._beam_full_graph_ready(runner, 4)
     runner._beam_decode_graph.ready = False
-    assert not _gr_context._beam_full_graph_ready(runner, 8)
+    assert not gpu_patch._beam_full_graph_ready(runner, 8)
 
 
 def test_beam_full_graph_ready_ignores_other_native_graphs() -> None:
@@ -877,7 +825,7 @@ def test_beam_full_graph_ready_ignores_other_native_graphs() -> None:
         concrete_cudagraph_entries={BatchDescriptor(num_tokens=4, uniform=True): MagicMock()},
     )
     with patch("vllm.compilation.cuda_graph.CUDAGraphWrapper._all_instances", [wrapper]):
-        assert not _gr_context._beam_full_graph_ready(SimpleNamespace(), 4)
+        assert not gpu_patch._beam_full_graph_ready(SimpleNamespace(), 4)
 
 
 pytestmark = pytest.mark.cpu_test

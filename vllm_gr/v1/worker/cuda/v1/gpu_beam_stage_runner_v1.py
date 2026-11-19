@@ -9,6 +9,8 @@ from typing import Any, ClassVar
 
 import torch
 
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     BeamRequestBinding,
@@ -17,6 +19,7 @@ from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     should_replay_decode_graph,
 )
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.gr_context import _get_gr_config
 
 
 class CudaStageHooksV1(CudaStageHooks):
@@ -117,21 +120,19 @@ class CudaStageHooksV1(CudaStageHooks):
         """V1 can capture a missing graph against a new stage's buffers."""
         assert owner.inputs is not None
         worker = self.worker
-        from vllm_gr.v1.worker.gr_context import (
-            _get_gr_config,
-        )
 
         batch_size = len(owner.bindings)
         cfg = _get_gr_config(worker)
-        if batch_size not in cfg.deployment.beam_batch_sizes or batch_size in getattr(
-            worker, "_gr_decode_capture_failures", {}
-        ):
+        service = graph_for(worker, CudaGraph)
+        unconfigured = batch_size not in cfg.deployment.beam_batch_sizes
+        if unconfigured or batch_size in getattr(worker, "_gr_decode_capture_failures", {}):
+            if service.decode_enabled:
+                reason = "unconfigured_batch" if unconfigured else "startup_capture_unsupported"
+                service.fallback("decode", reason)
             owner.graph = None
             return owner._forward()
-        graph_enabled = (
-            not worker.model_config.enforce_eager
-            and cfg.beam_graph_enabled
-            and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+        graph_enabled = service.decode_enabled and not getattr(
+            worker, "_gr_async_decode_graph_capture_failed", False
         )
         if graph_enabled:
             graph = self.decode_graph(len(owner.bindings), owner.inputs.width)

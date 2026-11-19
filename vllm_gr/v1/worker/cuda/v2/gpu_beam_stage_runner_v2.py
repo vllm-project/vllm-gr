@@ -33,6 +33,8 @@ from typing import Any, ClassVar
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
@@ -122,11 +124,11 @@ class CudaStageHooksV2(CudaStageHooks):
             (batch_size, owner.inputs.width, bucket) if bucket else (batch_size, owner.inputs.width)
         )
         if geometry in runtime.runtime_failures:
+            graph_for(worker, CudaGraph).fallback("decode", "runtime_capture_unsupported")
             owner.graph = None
             return owner._forward()
         enabled = (
-            not worker.model_config.enforce_eager
-            and cfg.beam_graph_enabled
+            graph_for(worker, CudaGraph).decode_enabled
             and batch_size in cfg.deployment.beam_batch_sizes
             and not runtime.capture_failed
             and batch_size not in (runtime.startup_failures or {})
@@ -150,6 +152,7 @@ class CudaStageHooksV2(CudaStageHooks):
                     raise RuntimeError("Decode capture did not leave capture mode") from error
                 torch.accelerator.synchronize(worker.device)
                 owner.graph.discard_selected()
+                graph_for(worker, CudaGraph).fallback("decode", "runtime_capture_unsupported")
                 runtime.runtime_failures[geometry] = str(error)
                 owner.graph = None
                 logger.warning(
@@ -316,14 +319,16 @@ def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -
     )
 
     cfg = _get_gr_config(worker)
-    requested = not worker.model_config.enforce_eager and cfg.beam_graph_enabled
+    requested = graph_for(worker, CudaGraph).decode_enabled
     if requested and batch_size not in cfg.deployment.beam_batch_sizes:
         if graph is not None:
             raise RuntimeError("Unconfigured Decode shape has a published graph")
+        graph_for(worker, CudaGraph).fallback("decode", "unconfigured_batch")
         return False
     runtime = get_v2_runtime(worker)
     if requested and batch_size in (runtime.startup_failures or {}):
         if graph is not None:
             raise RuntimeError("Decode capture failed but a graph is still published")
+        graph_for(worker, CudaGraph).fallback("decode", "startup_capture_unsupported")
         return False
     return should_replay_decode_graph(worker, graph, capture_failed=runtime.capture_failed)

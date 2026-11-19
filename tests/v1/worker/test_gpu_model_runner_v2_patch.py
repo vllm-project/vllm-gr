@@ -236,6 +236,7 @@ def test_repeated_capture_preserves_published_decode_failure(
 ) -> None:
     from vllm_gr.v1.attention.backends import beam_prefix_calibrate
     from vllm_gr.v1.worker import gr_startup
+    from vllm_gr.v1.worker.cuda import gpu_startup
     from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
     from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
@@ -256,7 +257,7 @@ def test_repeated_capture_preserves_published_decode_failure(
 
     capture = Mock(side_effect=refuse)
     monkeypatch.setattr(gr_startup, "_capture_enabled", Mock(return_value=True))
-    monkeypatch.setattr(gr_startup, "_capture_batch", capture)
+    monkeypatch.setattr(gpu_startup, "_capture_batch", capture)
     monkeypatch.setattr(beam_prefix_calibrate, "ensure_prefix_calibration", Mock())
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", Mock())
     monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", Mock())

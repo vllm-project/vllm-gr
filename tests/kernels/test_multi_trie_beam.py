@@ -144,7 +144,7 @@ def test_multi_trie_expansion_capacity_is_checked_before_allocation():
 
 
 def test_multi_trie_startup_capture_and_request_reuse():
-    from vllm_gr.v1.worker.gr_startup import _capture_batch
+    from vllm_gr.v1.worker.cuda.gpu_startup import _capture_batch
 
     gc.collect()
     worker = admission_worker(max_rows=8)

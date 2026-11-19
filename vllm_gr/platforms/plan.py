@@ -176,6 +176,8 @@ class BackendPlan:
             choices = self.choices.to_dict()
             if choices.get("operator_policy") or self.request.uses_beam_v1:
                 services.update(stage=choices.get("stage"), operator=None)
+            if graph_id := choices.get("graph_implementation"):
+                services["graph"] = graph_id
             if choices.get("requires_attention"):
                 services["attention"] = None
             if choices.get("constraint") in ("legacy", "canonical"):
@@ -210,6 +212,16 @@ class BackendPlan:
             if table.get("enabled") and table.get("implementation_id") is None:
                 return table.get("backend")
         return choices.get("constraint_implementation")
+
+    @property
+    def prefill_graph_mode(self) -> str | None:
+        """Explicit capture owner. Boolean plans predate a choice of owner."""
+        mode = self.choices.to_dict().get("prefill_graph")
+        if mode is None or isinstance(mode, bool):
+            return None
+        if not isinstance(mode, str) or mode not in ("shared", "provider"):
+            raise ValueError("prefill_graph must be a boolean, 'shared' or 'provider'")
+        return mode
 
     @property
     def fingerprint(self) -> str:

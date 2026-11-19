@@ -349,6 +349,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
     assert positions[: 7 - start].cpu().tolist() == list(range(start, 7))
     assert kv.cpu().tolist() == [1] * 7 + [0] * 9
     assert (owner.graph is not None) == graph
+    assert worker._gr_native_graph.stats()["replays"].get("decode", 0) == (2 if graph else 0)
     release(owner)
 
 

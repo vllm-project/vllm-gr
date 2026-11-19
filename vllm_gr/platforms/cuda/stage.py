@@ -55,7 +55,7 @@ class CudaStageExecutionService:
         *,
         allow_eager_fallback: bool = False,
     ) -> bool:
-        from vllm_gr.v1.worker.gr_startup import capture_cuda_startup_graph
+        from vllm_gr.v1.worker.cuda.gpu_startup import capture_cuda_startup_graph
 
         return capture_cuda_startup_graph(
             worker,

@@ -13,6 +13,7 @@ import pytest
 import torch
 from vllm.v1.core.sched.output import NewRequestData
 
+from vllm_gr.config import GRConfig
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
 from vllm_gr.platforms.ascend.stage import AscendStageExecutionService, create_stage
 from vllm_gr.v1.beam.decision_ops import reference_ops
@@ -34,6 +35,33 @@ from vllm_gr.v1.worker.npu.npu_model_runner_inputs import InputBatchProxy
 
 class AscendRunner(SimpleNamespace):
     _gr_stage_factory = staticmethod(create_stage)
+
+
+def test_close_graphs_retains_leases_and_restores_native_model(monkeypatch: Any) -> None:
+    context = SimpleNamespace(registry=SimpleNamespace(num_active_sessions=1))
+    wrapper = SimpleNamespace(original_model=object(), concrete_aclgraph_entries={4: object()})
+    runner = SimpleNamespace(
+        device="npu:4",
+        model=wrapper,
+        _gr_npu_graph_model=wrapper,
+        _gr_npu_graph_context=context,
+        _beam_context=context,
+        _prefill_graph_runner=object(),
+        _prefill_graphs_captured=True,
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        npu_patch.torch, "npu", SimpleNamespace(synchronize=calls.append), raising=False
+    )
+    with pytest.raises(RuntimeError, match="active Beam KV leases"):
+        npu_patch.close_graphs(runner)
+    assert not calls and runner.model is wrapper and wrapper.concrete_aclgraph_entries
+    context.registry.num_active_sessions = 0
+    npu_patch.close_graphs(runner)
+    npu_patch.close_graphs(runner)
+    assert calls == ["npu:4"]
+    assert runner.model is wrapper.original_model and not wrapper.concrete_aclgraph_entries
+    assert runner._beam_context is None and runner._prefill_graph_runner is None
 
 
 def _eager_stage_output(
@@ -664,12 +692,12 @@ def test_npu_determine_width_mismatch_no_full() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _stub_gr_config(monkeypatch: pytest.MonkeyPatch, gr_cfg: Any) -> None:
+def _stub_gr_config(monkeypatch: pytest.MonkeyPatch, gr_cfg: GRConfig) -> None:
     monkeypatch.setattr(_gr_context, "_get_gr_config", lambda r: gr_cfg)
 
 
 def test_npu_capture_disabled_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_gr_config(monkeypatch, SimpleNamespace(beam_graph_active=False))
+    _stub_gr_config(monkeypatch, GRConfig(beam_graph_enabled=False))
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False)
     )
@@ -680,7 +708,7 @@ def test_npu_capture_cascade_mode_returns_false(monkeypatch: pytest.MonkeyPatch)
     """Without the graph-safe xllm execution mode, capture must refuse."""
     _stub_gr_config(
         monkeypatch,
-        SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
+        GRConfig(beam_graph_enabled=True, beam_max_width=4, beam_max_decode_steps=3),
     )
     monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: False)
     runner = SimpleNamespace(
@@ -692,7 +720,7 @@ def test_npu_capture_cascade_mode_returns_false(monkeypatch: pytest.MonkeyPatch)
 def test_npu_capture_tp_gt1_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_gr_config(
         monkeypatch,
-        SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
+        GRConfig(beam_graph_enabled=True, beam_max_width=4, beam_max_decode_steps=3),
     )
     monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     runner = SimpleNamespace(
@@ -704,7 +732,7 @@ def test_npu_capture_tp_gt1_returns_false(monkeypatch: pytest.MonkeyPatch) -> No
 def test_npu_capture_ubatching_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_gr_config(
         monkeypatch,
-        SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
+        GRConfig(beam_graph_enabled=True, beam_max_width=4, beam_max_decode_steps=3),
     )
     monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda runner: True)
     runner = SimpleNamespace(
@@ -740,8 +768,8 @@ def test_npu_capture_reentry_returns_true(
     """If a graph for the width is already recorded, capture short-circuits True."""
     _stub_gr_config(
         monkeypatch,
-        SimpleNamespace(
-            beam_graph_active=True,
+        GRConfig(
+            beam_graph_enabled=True,
             beam_max_width=4,
             beam_max_decode_steps=3,
             beam_graph_widths=graph_widths,
@@ -777,8 +805,8 @@ def test_npu_capture_forwards_run_under_inference_mode(
 
     _stub_gr_config(
         monkeypatch,
-        SimpleNamespace(
-            beam_graph_active=True,
+        GRConfig(
+            beam_graph_enabled=True,
             beam_graph_batch_size=2,
             beam_max_width=4,
             beam_max_decode_steps=3,
@@ -899,7 +927,10 @@ def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
 
     monkeypatch.setattr(acl_graph.ACLGraphWrapper, "__init__", native_init)
     monkeypatch.setattr(acl_graph.ACLGraphWrapper, "__call__", native_forward)
-    config = object()
+    from vllm_gr.v1.worker.npu import npu_beam_decode_graph
+
+    config = SimpleNamespace(additional_config={})
+    GRConfig(beam_max_width=4, beam_graph_enabled=True).write_to_vllm_config(config)
     stream = object()
     ordinary = acl_graph.ACLGraphWrapper(
         lambda: None, config, CUDAGraphMode.FULL, update_stream=stream, enable_enpu=True
@@ -910,6 +941,13 @@ def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
     beam = install_npu_beam_graph_model(runner)
     assert beam.update_stream is stream and beam.enable_enpu
     assert install_npu_beam_graph_model(runner) is beam
+    monkeypatch.setattr(
+        npu_beam_decode_graph,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.FULL, batch_descriptor=descriptor
+        ),
+    )
 
     def forward(path: str) -> Any:
         token = BEAM_DATA_VAR.set({"beam_session": object()} if path == "beam" else None)
@@ -929,6 +967,8 @@ def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
     assert beam.concrete_aclgraph_entries is not ordinary.concrete_aclgraph_entries
     assert npu_patch._verify_and_record_captured_graph_npu(runner, 4)
     assert not beam.graph_ready(8)
+    assert beam.graph_executor.stats()["captures"] == {"decode": 1}
+    assert beam.graph_executor.stats()["replays"] == {"decode": 1}
 
 
 def test_npu_suffix_bank_storage_count_deduplicates_packed_views() -> None:
@@ -951,7 +991,7 @@ def test_npu_capture_logs_requested_and_retained_resources(
 
     _stub_gr_config(
         monkeypatch,
-        SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_graph_widths=(2,)),
+        GRConfig(beam_graph_enabled=True, beam_max_width=4, beam_graph_widths=(2,)),
     )
     worker = SimpleNamespace(_gr_npu_beam_graph_shapes={(1, 4)})
     capture = Mock(side_effect=[True, False])

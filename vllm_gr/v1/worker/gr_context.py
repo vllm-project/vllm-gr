@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Shared GR configuration, context construction and graph diagnostics."""
 
-from typing import Any, cast
+from typing import Any
+
+from vllm_gr.platforms.graph import existing_graph, native_graph_counters
 
 
 def _get_gr_config(runner: Any) -> Any:
@@ -22,18 +24,14 @@ def _get_gr_config(runner: Any) -> Any:
     return cfg
 
 
-def _beam_full_graph_ready(runner: Any, num_tokens: int) -> bool:
-    """Query the GPU Beam component; retain the device-neutral NPU key contract."""
-    graph = getattr(runner, "_beam_decode_graph", None)
-    if graph is not None:
-        return bool(graph.ready and num_tokens == graph.signature.num_model_rows)
-    beam_keys = getattr(runner, "_beam_graph_keys", None)
-    return beam_keys is not None and num_tokens in beam_keys
-
-
 def _beam_graph_enabled_for_run(runner: Any) -> bool:
     """Beam graphs are only used when the config enables them (GRConfig)."""
-    return cast(bool, _get_gr_config(runner).beam_graph_enabled)
+    graph = existing_graph(runner)
+    if graph is not None:
+        return bool(graph.decode_enabled)
+    return not getattr(getattr(runner, "model_config", None), "enforce_eager", False) and bool(
+        _get_gr_config(runner).beam_graph_enabled
+    )
 
 
 def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
@@ -49,63 +47,18 @@ def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
     if runner is None:
         raise RuntimeError("worker has no model_runner for Beam graph diagnostics")
     config = _get_gr_config(runner)
-    stats: dict[str, Any] = {
-        "runner": type(runner).__name__,
-        "beam_graph_enabled": bool(config.beam_graph_enabled),
-        "beam_max_width": config.beam_max_width,
-        "captured_widths": sorted(int(width) for width in getattr(runner, "_beam_graph_keys", ())),
-        "full_dispatches": int(getattr(runner, "_beam_graph_full_dispatch_count", 0)),
-    }
-    prefill = getattr(runner, "_prefill_graph_runner", None)
-    if prefill is not None:
-        stats["gr_prefill_buckets"] = list(prefill.buckets)
-        stats["gr_prefill_captures"] = sorted(
-            [int(bucket), int(num_reqs)]
-            for bucket, buffers in prefill.buffers.items()
-            for num_reqs in buffers.captured_graphs
-        )
-        stats["gr_prefill_kv_bounds"] = {
-            f"{bucket}:{num_reqs}": int(bound)
-            for bucket, buffers in prefill.buffers.items()
-            for num_reqs, bound in buffers.max_seq_len_bounds.items()
-            if num_reqs in buffers.captured_graphs
-        }
-    stats["gr_prefill_dispatches"] = dict(getattr(runner, "_gr_prefill_graph_dispatches", {}))
-    manager = getattr(runner, "cudagraph_manager", None)
-    counts = getattr(manager, "dispatch_counts", None)
-    if counts is not None:
-        assert manager is not None
-        stats["prefill_graph_captured_buckets"] = sorted(
-            {desc.num_tokens for desc in manager._successful if desc.cg_mode.name == "FULL"}
-        )
-        stats["prefill_graph_captured_shapes"] = sorted(
-            (desc.num_reqs, desc.num_tokens)
-            for desc in manager._successful
-            if desc.cg_mode.name == "FULL"
-        )
-        stats["prefill_graph_piecewise_buckets"] = sorted(
-            desc.num_tokens for desc in manager._successful if desc.cg_mode.name == "PIECEWISE"
-        )
-        stats["prefill_graph_full_capture_failures"] = {
-            f"{desc.cg_mode.name}:T={desc.num_tokens}:B={desc.num_reqs}": reason
-            for desc, reason in manager.full_capture_failures.items()
-        }
-        stats["prefill_graph_full_dispatches"] = counts["FULL"]
-        stats["prefill_graph_piecewise_dispatches"] = counts["PIECEWISE"]
-        stats["prefill_graph_none_dispatches"] = counts["NONE"]
-    device_type = str(getattr(runner, "device", "")).split(":", 1)[0].lower()
-    if device_type == "npu" or hasattr(runner, "_gr_npu_beam_graph_shapes"):
-        stats.update(
-            {
-                "beam_graph_batch_size": int(getattr(config, "beam_graph_batch_size", 1)),
-                "captured_shapes": sorted(
-                    tuple(int(value) for value in shape)
-                    for shape in getattr(runner, "_gr_npu_beam_graph_shapes", ())
-                ),
-                "fallbacks": int(getattr(runner, "_beam_graph_fallback_count", 0)),
-                "fallback_reasons": dict(getattr(runner, "_beam_graph_fallback_reasons", {})),
-            }
-        )
+    graph = existing_graph(runner)
+    service_stats = graph.stats() if graph is not None else None
+    fields = service_stats.get("runtime_fields") if service_stats is not None else None
+    if isinstance(fields, dict):
+        stats = {"captured_widths": [], "full_dispatches": 0, "gr_prefill_dispatches": {}, **fields}
+    else:
+        stats = native_graph_counters(runner)
+    if service_stats is not None:
+        stats["graph_service"] = service_stats
+    stats["runner"] = type(runner).__name__
+    stats["beam_graph_enabled"] = bool(config.beam_graph_enabled)
+    stats["beam_max_width"] = config.beam_max_width
     return stats
 
 
@@ -157,6 +110,7 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
         device=runner.device,
         dtype=model_config.dtype,
         enable_short_suffix_attention=(
-            executor.supports_short_suffix_attention() and gr_cfg.enable_short_suffix_attention
+            executor.supports_short_suffix_device(runner.device)
+            and gr_cfg.enable_short_suffix_attention
         ),
     )

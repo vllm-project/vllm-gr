@@ -7,8 +7,12 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from vllm.forward_context import get_forward_context
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+from vllm_gr.platforms.ascend.graph import AscendGraph
+from vllm_gr.platforms.graph import graph_for
 
 
 class NPUBeamGraphModel(ACLGraphWrapper):  # type: ignore[misc]
@@ -21,9 +25,16 @@ class NPUBeamGraphModel(ACLGraphWrapper):  # type: ignore[misc]
     """
 
     def __init__(
-        self, model: Any, vllm_config: Any, *, update_stream: Any, enable_enpu: bool
+        self,
+        model: Any,
+        vllm_config: Any,
+        graph_executor: Any,
+        *,
+        update_stream: Any,
+        enable_enpu: bool,
     ) -> None:
         self.original_model = model
+        self.graph_executor = graph_executor
         runnable = model
         while isinstance(runnable, ACLGraphWrapper) and runnable.runtime_mode == CUDAGraphMode.FULL:
             runnable = runnable.unwrap()
@@ -63,9 +74,21 @@ class NPUBeamGraphModel(ACLGraphWrapper):  # type: ignore[misc]
         return self.original_model.cudagraph_wrapper
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        if self._is_beam_forward():
-            return super().__call__(*args, **kwargs)
-        return self.original_model(*args, **kwargs)
+        if not self._is_beam_forward():
+            return self.original_model(*args, **kwargs)
+        context = get_forward_context()
+        native_forward = super().__call__
+        if context.cudagraph_runtime_mode != self.runtime_mode:
+            return native_forward(*args, **kwargs)
+        descriptor = context.batch_descriptor
+        entry = self.concrete_aclgraph_entries.get(descriptor)
+        if entry is not None and entry.aclgraph is not None:
+            return self.graph_executor.replay("decode", native_forward, *args, **kwargs)
+        result = native_forward(*args, **kwargs)
+        entry = self.concrete_aclgraph_entries.get(descriptor)
+        if entry is not None and entry.aclgraph is not None:
+            self.graph_executor.captured("decode")
+        return result
 
     def graph_ready(self, num_tokens: int) -> bool:
         from vllm.v1.cudagraph_dispatcher import BatchDescriptor
@@ -92,6 +115,7 @@ def install_npu_beam_graph_model(runner: Any) -> NPUBeamGraphModel:
     model = NPUBeamGraphModel(
         runner.model,
         runner.vllm_config,
+        graph_for(runner, AscendGraph),
         update_stream=update_stream,
         enable_enpu=getattr(runner, "enable_enpu", False),
     )

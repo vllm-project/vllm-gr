@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableSpec, GRConfig
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.config.parser import parse_gr_config, write_canonical_gr_config
 from vllm_gr.platforms import loader
 from vllm_gr.platforms.ascend import NPU_BACKEND
@@ -26,6 +27,8 @@ from vllm_gr.platforms.binding import (
     worker_backend_readiness,
 )
 from vllm_gr.platforms.cuda import CUDA_BACKEND
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import bind_graph, graph_for
 from vllm_gr.platforms.plan import (
     BACKEND_PLAN_KEY,
     BackendPlan,
@@ -698,3 +701,159 @@ def test_bound_constraint_honors_explicit_torch_oracle(
     binding = bind_backend_services(SimpleNamespace(vllm_config=native, device="test:0"))
     assert binding.constraint_execution is oracle
     assert len(provider.created) == 2
+
+
+@pytest.mark.parametrize(
+    "mode, message", [("shared", "admitted graph"), ("other", "prefill_graph")]
+)
+def test_prefill_mode_requires_valid_graph_admission(
+    provider: Provider, monkeypatch: pytest.MonkeyPatch, mode: str, message: str
+) -> None:
+    monkeypatch.setattr(
+        provider,
+        "resolve",
+        lambda request: BackendPlan(
+            provider.backend_id,
+            provider.api_version,
+            request,
+            PlanData({"prefill_graph": mode}),
+        ),
+    )
+    native = config()
+    with pytest.raises(ValueError, match=message):
+        admit_backend_plan(native)
+    assert read_backend_plan(native) is None
+
+
+def test_explicit_eager_runner_does_not_allocate_a_native_graph(
+    provider: Provider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolve = provider.resolve
+    monkeypatch.setattr(
+        provider,
+        "resolve",
+        lambda request: replace(resolve(request), requirements=ServiceRequirements()),
+    )
+    native = config()
+    admit_backend_plan(native)
+    runner = SimpleNamespace(vllm_config=native)
+    with pytest.raises(RuntimeError, match="did not admit a graph"):
+        graph_for(runner, lambda *_: pytest.fail("unrequested native factory ran"))
+    assert not hasattr(runner, "_gr_native_graph")
+
+
+class GraphProvider(Provider):
+    def resolve(self, request: BackendRequest) -> BackendPlan:
+        plan = super().resolve(request)
+        native = request.native.to_dict()
+        eager = native["model_config"]["enforce_eager"]
+        return replace(
+            plan,
+            choices=PlanData(
+                {
+                    **plan.choices.to_dict(),
+                    "graph": "eager" if eager else "capture-with-eager-fallback",
+                    "prefill_graph": False if eager else "shared",
+                }
+            ),
+            requirements=ServiceRequirements(graph=CudaGraph.implementation_id),
+        )
+
+    def create_graph_executor(self, *, plan: BackendPlan, runner: Any) -> CudaGraph:
+        return bind_graph(plan, runner, CudaGraph)
+
+
+def test_graph_policy_isolation_and_native_operation_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = GraphProvider()
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: provider)
+    runners = [SimpleNamespace(vllm_config=config(), device="fake") for _ in range(2)]
+    plans = []
+    for runner, eager, bucket in zip(runners, (False, True), (16, 32), strict=True):
+        runner.vllm_config.model_config = SimpleNamespace(enforce_eager=eager)
+        GRConfig(
+            beam_max_width=16, deployment=DeploymentOptions(prefill_token_buckets=(bucket,))
+        ).write_to_vllm_config(runner.vllm_config)
+        plans.append(admit_backend_plan(runner.vllm_config))
+    first, second = (bind_backend_services(runner) for runner in runners)
+    assert first is not None and second is not None
+    graph = first.graph
+    assert graph.plan.request.config.to_dict()["deployment"]["prefill_token_buckets"] == [16]
+    assert second.graph.plan.request.config.to_dict()["deployment"]["prefill_token_buckets"] == [32]
+    assert graph is graph_for(runners[0])
+    calls = []
+
+    def capture() -> None:
+        calls.append("capture")
+        if len(calls) == 1:
+            raise RuntimeError("temporarily unsupported shape")
+
+    with pytest.raises(RuntimeError, match="unsupported shape"):
+        graph.capture("decode", capture)
+    graph.fallback("decode", "capture_unsupported")
+    assert graph.stats()["captures"] == {}
+    graph.capture("decode", capture)
+    token = object()
+    assert graph.replay("decode", lambda: token) is token
+    for phase in ("prefill", "decode"):
+        with pytest.raises(RuntimeError, match="disabled"):
+            second.graph.replay(phase, lambda: pytest.fail("launched disabled graph"))
+    assert graph.stats()["captures"] == {"decode": 1}
+    assert graph.stats()["replays"] == {"decode": 1}
+    assert graph.stats()["fallbacks"] == {"decode": {"capture_unsupported": 1}}
+    assert second.graph.stats()["replays"] == {}
+    report = first.report()
+    validate_worker_readiness(plans[0], [report], expected_workers=1)
+    report["services"]["graph"] = "other"
+    with pytest.raises(RuntimeError, match="graph implementation mismatch"):
+        validate_worker_readiness(plans[0], [report], expected_workers=1)
+
+
+def test_provisional_graph_is_closed_after_an_unrelated_binding_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = GraphProvider()
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: provider)
+    native = config()
+    admit_backend_plan(native)
+    runner = SimpleNamespace(vllm_config=native, device="fake")
+    graph = graph_for(runner)
+    monkeypatch.setattr(provider, "create_model_runner_adapter", lambda **_: None)
+    with pytest.raises(RuntimeError, match="required runner adapter"):
+        bind_backend_services(runner)
+    assert graph.closed
+    assert not hasattr(runner, "_gr_native_graph")
+
+
+def test_graph_shutdown_preserves_live_lease_then_retires_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: GraphProvider())
+    runner = SimpleNamespace(vllm_config=config(), device="fake")
+    plan = admit_backend_plan(runner.vllm_config)
+    early = graph_for(runner, CudaGraph)
+    binding = bind_backend_services(runner)
+    assert binding is not None and binding.graph is early
+    runner._beam_sessions = {"live": object()}
+    with pytest.raises(RuntimeError, match="released Beam sessions"):
+        close_backend_binding(runner)
+    assert graph_for(runner) is early and not early.closed
+    assert not binding.runner_adapter.closed
+    runner._beam_sessions.clear()
+    runner._prefill_graph_runner = SimpleNamespace(buffers={"shape": object()})
+    buffers = runner._prefill_graph_runner.buffers
+    pool = runner._beam_postprocess_workspaces = SimpleNamespace(keys=())
+    context = runner._beam_context = SimpleNamespace()
+    close_backend_binding(runner)
+    assert runner._beam_postprocess_workspaces is pool and runner._beam_context is context
+    assert not buffers and not hasattr(runner, "_prefill_graph_runner")
+    with pytest.raises(RuntimeError, match="closed model generation"):
+        early.replay("prefill", lambda: pytest.fail("stale generation launched"))
+    assert binding.runner_adapter.closed
+    reloaded = bind_backend_services(runner)
+    assert reloaded is not None and reloaded.plan == plan
+    assert reloaded.graph is not early and reloaded.graph.stats()["captures"] == {}
+    runner._gr_cuda_capture_context = context
+    close_backend_binding(runner)
+    assert runner._beam_context is None and runner._beam_postprocess_workspaces is pool

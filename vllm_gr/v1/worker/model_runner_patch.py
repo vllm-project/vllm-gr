@@ -200,23 +200,28 @@ def make_shutdown_with_constraint_backend(
     if original is not None and getattr(original, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
         return original
 
+    def release(runner: Any) -> None:
+        from vllm_gr.platforms.graph import existing_graph
+
+        graph = existing_graph(runner)
+        if graph is not None:
+            graph.check_idle()
+        if close_runtime is not None:
+            close_runtime(runner)
+        _remove_model_bytecode_hooks(runner)
+        close_constraint_backend(runner)
+
     if original is None:
 
         def shutdown_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
             del args, kwargs
-            if close_runtime is not None:
-                close_runtime(self)
-            _remove_model_bytecode_hooks(self)
-            close_constraint_backend(self)
+            release(self)
 
     else:
 
         @wraps(original)
         def shutdown_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if close_runtime is not None:
-                close_runtime(self)
-            _remove_model_bytecode_hooks(self)
-            close_constraint_backend(self)
+            release(self)
             return original(self, *args, **kwargs)
 
     setattr(
@@ -385,7 +390,7 @@ def install_v1_worker_hooks(
                         try:
                             _beam_capture(self)
                         except Exception as error:
-                            from vllm_gr.v1.worker.cudagraph_capture import (
+                            from vllm_gr.v1.worker.graph_capture import (
                                 is_recoverable_capture_error,
                             )
 
@@ -401,7 +406,7 @@ def install_v1_worker_hooks(
                         try:
                             _prefill_capture(self)
                         except Exception as error:
-                            from vllm_gr.v1.worker.cudagraph_capture import (
+                            from vllm_gr.v1.worker.graph_capture import (
                                 is_recoverable_capture_error,
                             )
 

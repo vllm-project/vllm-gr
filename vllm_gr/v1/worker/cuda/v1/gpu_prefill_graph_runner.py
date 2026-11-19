@@ -9,14 +9,15 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.utils.npu_adapter import is_cuda_available
 from vllm_gr.v1.attention.backends.beam_dense_prefill import fresh_prefill_capture
-from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+from vllm_gr.v1.worker.graph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
     SUPPORTED_NUM_REQS,
     BasePrefillGraphRunner,
     get_max_context_len,
-    is_prefill_graph_enabled,
 )
 
 logger = init_logger(__name__)
@@ -71,6 +72,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         model_runner: Any,
         buckets: list[int] | None = None,
     ) -> None:
+        self.graph_service = graph_for(model_runner, CudaGraph)
         super().__init__(
             model_runner=model_runner,
             buckets=buckets,
@@ -86,7 +88,8 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
 
     def capture_graphs(self, runner: Any) -> None:
         """Capture configured request-count CUDA graphs for each prefill bucket."""
-        if not is_prefill_graph_enabled(runner):
+        service = self.graph_service
+        if not service.prefill_enabled:
             logger.info(
                 "Prefill CUDA Graph capture is disabled by gr.prefill_graph_enabled.",
             )
@@ -322,10 +325,12 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     buf.captured_graphs[num_reqs] = graph
                     buf.output_bufs[num_reqs] = output
                     buf.static_attn_metadatas[num_reqs] = attn_metadata
+                    service.captured("prefill")
 
                 except Exception as e:  # noqa: BLE001
                     if not isinstance(e, RuntimeError) or not is_recoverable_capture_error(e):
                         raise
+                    service.fallback("prefill", "capture_unsupported")
                     torch.accelerator.synchronize()
                     logger.warning(
                         "Failed to capture Prefill CUDA graph for bucket %d (num_reqs=%d): %r.",
@@ -584,7 +589,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
 
         # Replay the captured graph for num_reqs.
         graph = buf.captured_graphs[num_reqs]
-        graph.replay()
+        self.graph_service.replay("prefill", graph.replay)
         self.last_replay_reason = "replay"
 
         return buf.output_bufs[num_reqs]

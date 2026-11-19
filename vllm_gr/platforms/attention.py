@@ -234,7 +234,7 @@ def validate_beam_attention(executor: Any, plan: BackendPlan | None = None) -> N
             raise RuntimeError(
                 "Backend Beam Decode attention does not implement cache_unshared_kv()"
             )
-    if plan is not None and plan.choices.to_dict().get("prefill_graph"):
+    if plan is not None and plan.choices.to_dict().get("prefill_graph") in (True, "shared"):
         get_prefill = getattr(surface, "prefill_module", None)
         if not callable(get_prefill) or not callable(
             getattr(get_prefill(), "prefill_attention", None)

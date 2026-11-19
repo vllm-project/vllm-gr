@@ -540,6 +540,8 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
     ):
         stats = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
         assert [2, _BEAM_WIDTH] in [list(shape) for shape in stats["captured_shapes"]]
+        assert stats["graph_service"]["implementation"] == "ascend.graph"
+        assert stats["graph_service"]["captures"].get("decode", 0) > 0
         signature = llm.collective_rpc("onerec_npu_graph_context_signature")[0]
         for index, batch_size in enumerate((2, 1, 2)):
             prompts = comparison_prompts[:batch_size]
@@ -574,6 +576,9 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
                 )
             expected_full = 2 if batch_size == 2 else 0
             assert current["full_dispatches"] - stats["full_dispatches"] == expected_full
+            completed = current["graph_service"]["replays"].get("decode", 0)
+            previous = stats["graph_service"]["replays"].get("decode", 0)
+            assert completed - previous == expected_full
             assert current["fallbacks"] - stats["fallbacks"] == (0 if batch_size == 2 else 2)
             if batch_size == 1:
                 assert (

@@ -13,6 +13,8 @@ from vllm.v1.worker.gpu import cudagraph_utils as native
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from tests.helpers.gr_config import set_deployment
+from vllm_gr.platforms.cuda.graph import CudaGraph
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.v1.worker import prefill_graph_common as common
 from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as pg2
 from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import close_v2_runtime
@@ -229,6 +231,7 @@ def test_v2_native_capture_sizes_do_not_change_v1_grid(
     runner.model_config.max_model_len = 1000
     runner.scheduler_config.max_num_batched_tokens = 4096
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = sizes
+    graph_for(runner, CudaGraph)
     v1 = get_prefill_graph_runner(runner)
     v2 = pg2.PrefillCapturePlan.for_runner(runner)
     assert v1.buckets == [128, 256, 384, 512, 640, 768, 896, 1000]
@@ -335,8 +338,10 @@ def test_prefill_cleanup_precedes_failed_native_lifecycle(
 
     def native_operation(self: Any) -> None:
         # Invalidation must happen before native loading/shutdown can fail.
-        assert (self.cudagraph_manager is manager) is not v2
-        assert manager._capture_finished is not v2
+        # A manager created on this runner belongs to its graph service even
+        # when a legacy lifecycle wrapper omits the explicit V2 closer.
+        assert self.cudagraph_manager is not manager
+        assert not manager._capture_finished
         raise RuntimeError("native failure")
 
     options = {"close_runtime": close_v2_runtime} if v2 else {}
@@ -347,12 +352,6 @@ def test_prefill_cleanup_precedes_failed_native_lifecycle(
     )
     with pytest.raises(RuntimeError, match="native failure"):
         wrapped(runner)
-    if not v2:
-        assert manager.hidden_states is storage
-        assert manager.graphs and manager._graphs_captured and manager._successful
-        assert manager.full_capture_failures and manager.dispatch_counts["PIECEWISE"] == 1
-        return
-
     assert not manager.graphs and manager.hidden_states is None
     assert not manager.aux_hidden_states and manager.intermediate_tensors is None
     assert not manager.use_aux_hidden_state_outputs

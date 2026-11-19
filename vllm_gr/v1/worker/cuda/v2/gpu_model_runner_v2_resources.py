@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import torch
 
+from vllm_gr.platforms.cuda.graph import check_cuda_graphs_idle
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
 from vllm_gr.v1.worker.cuda.gr_inputs import GRInputBuffers
 
@@ -89,45 +90,6 @@ class V2BeamDecodeGraph(BeamDecodeGraph):
         super().capture(forward, persistent_install=persistent_install)
 
 
-def _require_released_v2_runtime(runner: Any) -> None:
-    """Check the lifecycle caller's drain proof without waiting or cancelling.
-
-    Worker RPC serialization prevents new dispatch admission during teardown.
-    GPUBeamStageRunner.release closes only after Beam end_session synchronizes
-    its last work and final consumer event. Host output slots must also be free.
-    Fused terminal release keeps its drain proof incomplete through native
-    request cleanup, even after the GPU owner has closed.
-    """
-    owners = [getattr(runner, "_gr_gpu_stage_runner", None)]
-    owners.extend(getattr(runner, "_gr_gpu_stage_runner_cache", {}).values())
-    retirement = getattr(runner, "_gr_retirement_output", None)
-    if retirement is not None:
-        owners.append(retirement.owner)
-        if retirement._output is None:
-            raise RuntimeError("V2 runtime cleanup requires retirement output-consumer drain")
-    seen: set[int] = set()
-    for owner in owners:
-        if owner is None or id(owner) in seen:
-            continue
-        seen.add(id(owner))
-        with owner.control_lock:
-            if not owner.closed or owner.pending is not None or any(owner.control_busy):
-                raise RuntimeError("V2 runtime cleanup requires dispatch and output-consumer drain")
-            if owner.terminal_cleanup_pending:
-                raise RuntimeError("V2 runtime cleanup requires completed terminal native cleanup")
-    context = getattr(runner, "_beam_context", None)
-    pool = getattr(runner, "_beam_postprocess_workspaces", None)
-    if (
-        getattr(context, "_gr_execution_owner", None) is not None
-        or bool(getattr(getattr(context, "registry", None), "num_active_sessions", 0))
-        or (
-            pool is not None
-            and any(pool.require(key).execution_owner is not None for key in pool.keys)
-        )
-    ):
-        raise RuntimeError("V2 runtime cleanup requires released Beam context and workspace")
-
-
 def close_v2_runtime(runner: Any) -> None:
     """Invalidate a drained generation before full model load or shutdown.
 
@@ -140,7 +102,7 @@ def close_v2_runtime(runner: Any) -> None:
         uninstall_prefill_graph_manager_v2,
     )
 
-    _require_released_v2_runtime(runner)
+    check_cuda_graphs_idle(runner)
     uninstall_prefill_graph_manager_v2(runner)
     graph = getattr(runner, "_beam_decode_graph", None)
     if graph is not None:
@@ -161,9 +123,10 @@ def close_v2_runtime(runner: Any) -> None:
 def capture_multibatch_forward(worker: Any, *, allow_eager_fallback: bool = True) -> bool:
     """Publish configured V2 Decode shapes, with shape-local fallback."""
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
+    from vllm_gr.v1.worker.cuda.gpu_startup import _capture_batch
     from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
     from vllm_gr.v1.worker.gr_context import _get_gr_config
-    from vllm_gr.v1.worker.gr_startup import _capture_batch, _capture_enabled
+    from vllm_gr.v1.worker.gr_startup import _capture_enabled
 
     with torch.inference_mode():
         if not _capture_enabled(worker) or str(worker.device).split(":")[0] != "cuda":

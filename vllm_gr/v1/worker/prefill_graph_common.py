@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import Any
 
 import torch
@@ -17,7 +18,7 @@ from vllm_gr.config.models import (
     DEFAULT_PREFILL_TOKEN_BUCKETS,
     deployment_for,
 )
-from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+from vllm_gr.v1.worker.graph_capture import is_recoverable_capture_error
 
 logger = init_logger(__name__)
 
@@ -110,13 +111,6 @@ def _get_block_table_cols(runner: Any) -> int | None:
     if not block_size:
         return None
     return int((max_model_len + block_size - 1) // block_size)
-
-
-def is_npu_platform() -> bool:
-    """Return True when the active vLLM platform is Ascend NPU."""
-    from vllm.platforms import current_platform
-
-    return str(current_platform.device_type).lower() == "npu"
 
 
 def is_prefill_graph_enabled(runner: Any = None) -> bool:
@@ -272,7 +266,7 @@ class PrefillBucketBuffers:
             del self.static_attn_metadatas[1]
 
 
-class BasePrefillGraphRunner:
+class BasePrefillGraphRunner(ABC):
     """Base class for bucket matching and buffer management across hardware backends."""
 
     supports_multi_request_total_buckets = False
@@ -286,9 +280,7 @@ class BasePrefillGraphRunner:
         self.gr_settings = GRConfig.from_vllm_config(
             getattr(model_runner, "vllm_config", None)
         ).deployment
-        self.device = getattr(
-            model_runner, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        self.device = getattr(model_runner, "device", torch.device("cpu"))
         self.buckets = sorted(
             buckets or get_default_buckets(getattr(model_runner, "vllm_config", None))
         )
@@ -374,6 +366,23 @@ class BasePrefillGraphRunner:
             for t in range(1, self.buckets[-1] + 1):
                 self._bucket_lut[t] = self._compute_match_bucket(t)
 
+    def capture_stats(self) -> dict[str, Any]:
+        """Describe live bucket captures and their KV bounds for the worker RPC."""
+        return {
+            "gr_prefill_buckets": list(self.buckets),
+            "gr_prefill_captures": sorted(
+                [int(bucket), int(num_reqs)]
+                for bucket, buffers in self.buffers.items()
+                for num_reqs in buffers.captured_graphs
+            ),
+            "gr_prefill_kv_bounds": {
+                f"{bucket}:{num_reqs}": int(bound)
+                for bucket, buffers in self.buffers.items()
+                for num_reqs, bound in buffers.max_seq_len_bounds.items()
+                if num_reqs in buffers.captured_graphs
+            },
+        }
+
     def _compute_match_bucket(self, total_tokens: int) -> int | None:
         """Return the smallest captured bucket that can hold the request."""
         for bucket in self.buckets:
@@ -421,10 +430,12 @@ class BasePrefillGraphRunner:
         buf = self.buffers.get(bucket)
         return buf is not None and buf.has_captured_graph(num_reqs)
 
+    @abstractmethod
     def capture_graphs(self, runner: Any) -> None:
         """Subclasses implement device-specific graph capture."""
         raise NotImplementedError
 
+    @abstractmethod
     def execute_model_prefill(
         self,
         bucket: int,

@@ -563,3 +563,48 @@ Ascend 0.30.0rc2 probes the native attention backend before loading layers with
 a zero head size and unspecified KV dtype. For that runner probe the Ascend
 policy supplies the configured model head size and validates the complete
 selector request. Layer construction always validates the layer's own geometry.
+
+### Graph execution
+
+A provider that declares `ServiceRequirements.graph` in its plan supplies
+`create_graph_executor(plan=..., runner=...)`. Each worker reports the bound
+implementation alongside its plan fingerprint. The runner owns the service
+until the next full model load or shutdown. The engine captures the Prefill
+switch, bucket grid, request counts and KV bound when it admits the plan.
+Eager mode disables both Prefill and Decode capture. The GR Decode switch
+can be disabled independently of Prefill.
+
+Providers select how to run Prefill capture in the plan's `choices.prefill_graph`.
+
+- `"shared"` selects GR's `BeamPrefillGraphRunner(model_runner, buckets=...)`
+  factory. The graph implements `SharedPrefillGraphExecutor.prefill_runner_class()`.
+  Each worker resolves the concrete class before reporting readiness. GR constructs
+  it with `model_runner`, `buckets` and any caller-supplied keyword arguments.
+- `"provider"` delegates capture to the provider's own runner. Its graph service
+  can record the native Prefill operations through `capture` and `replay`.
+
+Existing boolean choices retain their enabled/disabled behavior and fingerprints.
+The built-in V1 runners provide their native classes through the shared factory.
+Beam Decode startup uses the selected graph's Decode policy and calls
+`RunnerStage.capture_startup_graph` for the physical operation.
+
+The built-in services keep the native vLLM CUDA and Ascend graph runners.
+Their capture and replay paths check the admitted policy and maintain
+per-runner counters. `get_gr_beam_graph_runtime_stats` exposes them under
+`graph_service`, grouped by Prefill and Decode. Successful physical captures
+and replays are counted after the native operation returns. Native V2
+PIECEWISE dispatch counts remain separate because compiled pieces can take
+their own eager paths. A recoverable shape or capture miss preserves native
+fallback and records its reason. Unexpected native errors propagate.
+
+The CUDA and Ascend graph services own their native cleanup and diagnostic
+fields. A provider can include a `runtime_fields` dictionary in its
+`graph.stats()` result. The worker RPC publishes these fields at the top
+level alongside the shared counters and returns the complete provider report
+under `graph_service`. This lets an external provider report native capture
+shapes or fallback counters without extending the shared worker RPC.
+
+Graph teardown first checks for live Beam sessions, workspace owners and
+outstanding outputs. After the caller drains them, teardown invalidates this
+runner's captures and drops static buffers. Reload builds fresh bindings.
+Weight-only updates continue through their existing native lifecycle.

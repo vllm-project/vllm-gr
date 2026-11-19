@@ -9,6 +9,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from ..constraint_plan import constraint_plan_choices
+from ..graph import bind_graph
 from ..identity import PlatformIdentity, platform_identity
 from ..interface import (
     PROVIDER_API_VERSION,
@@ -17,6 +18,7 @@ from ..interface import (
 )
 from ..plan import BackendPlan, BackendRequest, PlanData
 from ..services import BuiltinPlanSupport, require_provider_plan
+from .graph import CudaGraph
 from .runner import runner_id
 
 if TYPE_CHECKING:
@@ -48,12 +50,19 @@ class CUDABackendProvider(BuiltinPlanSupport):
         """
         return identity.platform_enum == "CUDA" and identity.device_type == "cuda"
 
+    native_graph_factory = CudaGraph
+
+    def create_graph_executor(self, *, plan: BackendPlan, runner: Any) -> Any:
+        require_provider_plan(self, plan)
+        return bind_graph(plan, runner, CudaGraph)
+
     def resolve(self, request: BackendRequest) -> BackendPlan:
         """Admit the existing CUDA paths without importing a device runtime."""
         if request.options.to_dict():
             raise ValueError("CUDA currently accepts no additional backend options")
         gr = request.config.to_dict()
         native = request.native.to_dict()
+        eager = (native.get("model_config") or {}).get("enforce_eager", False)
         if gr["npu_decode_execution"] == "xllm":
             raise ValueError("CUDA does not support npu_decode_execution='xllm'")
         from vllm_gr.v1.attention.backends.beam_dense_prefill import (
@@ -85,7 +94,12 @@ class CUDABackendProvider(BuiltinPlanSupport):
                     **constraint_plan_choices(gr, legacy_id=self.device_type),
                     "operator_policy": "cuda.onerec",
                     "stage": "cuda.v2" if native["use_v2_model_runner"] else "cuda.v1",
-                    "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
+                    "graph_implementation": CudaGraph.implementation_id,
+                    "prefill_graph": not eager
+                    and gr.get("deployment", {}).get("prefill_graph_enabled", True),
+                    "graph": "capture-with-eager-fallback"
+                    if gr["beam_graph_enabled"] and not eager
+                    else "eager",
                 }
             ),
         )

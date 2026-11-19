@@ -18,8 +18,9 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.config.models import deployment_for
+from vllm_gr.platforms.ascend.graph import AscendGraph
+from vllm_gr.platforms.graph import graph_for
 from vllm_gr.v1.worker.gr_context import (
-    _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
     _create_beam_context,
 )
@@ -36,11 +37,14 @@ from vllm_gr.v1.worker.npu.npu_model_runner_inputs import (
 from vllm_gr.v1.worker.prefill_graph_runner import (
     SUPPORTED_NUM_REQS,
     get_prefill_graph_runner,
-    is_prefill_graph_enabled,
     is_prefill_phase_batch,
 )
 
 logger = init_logger(__name__)
+
+
+def _beam_full_graph_ready(runner: Any, num_tokens: int) -> bool:
+    return num_tokens in (getattr(runner, "_beam_graph_keys", None) or ())
 
 
 def make_patched_load_model(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -229,6 +233,7 @@ def _downgrade_to_none(result):
 def _npu_graph_fallback(runner, result, reason: str):
     """Count Beam FULL misses, not necessarily whole-forward eager execution."""
 
+    graph_for(runner, AscendGraph).fallback("decode", reason)
     runner._beam_graph_fallback_count = int(getattr(runner, "_beam_graph_fallback_count", 0)) + 1
     reasons = getattr(runner, "_beam_graph_fallback_reasons", None)
     if reasons is None:
@@ -832,6 +837,55 @@ def _retained_npu_suffix_kv_bytes(runner: Any) -> int:
     return sum(storages.values())
 
 
+def check_graphs_idle(runner: Any) -> None:
+    stage = getattr(runner, "_gr_npu_stage_runner", None)
+    if stage is not None and (not stage.closed or stage.pending_plan is not None):
+        raise RuntimeError("Cannot release Ascend graphs before Beam stage retirement")
+    contexts = list(getattr(runner, "_gr_npu_graph_contexts", {}).values())
+    contexts.append(getattr(runner, "_gr_npu_graph_context", None))
+    contexts.append(getattr(runner, "_gr_npu_eager_context", None))
+    if any(ctx is not None and ctx.registry.num_active_sessions for ctx in contexts):
+        raise RuntimeError("Cannot release Ascend graphs with active Beam KV leases")
+
+
+def close_graphs(runner: Any) -> None:
+    """Drain submitted device work and drop this model's private ACL captures."""
+    check_graphs_idle(runner)
+    model = getattr(runner, "_gr_npu_graph_model", None)
+    prefill = getattr(runner, "_prefill_graph_runner", None)
+    contexts = list(getattr(runner, "_gr_npu_graph_contexts", {}).values())
+    context = getattr(runner, "_gr_npu_graph_context", None)
+    if context is not None:
+        contexts.append(context)
+    eager_context = getattr(runner, "_gr_npu_eager_context", None)
+    if eager_context is not None:
+        contexts.append(eager_context)
+    if model is not None or prefill is not None or contexts:
+        # The update stream may still reference captured attention/constraint buffers.
+        # A failed drain must leave those objects reachable for a later teardown.
+        torch.npu.synchronize(runner.device)
+    if model is not None:
+        if getattr(runner, "model", None) is model:
+            runner.model = model.original_model
+        model.concrete_aclgraph_entries.clear()
+    if any(getattr(runner, "_beam_context", None) is ctx for ctx in contexts):
+        runner._beam_context = None
+    runner._gr_npu_graph_model = None
+    runner._gr_npu_graph_context = None
+    runner._gr_npu_graph_contexts = {}
+    runner._gr_npu_eager_context = None
+    runner._gr_npu_stage_runner = None
+    runner._gr_npu_retirement_metadata = None
+    runner._gr_npu_retirement_output = None
+    runner._gr_npu_beam_graph_shapes = set()
+    runner._beam_graph_full_dispatch_count = 0
+    runner._beam_graph_fallback_count = 0
+    runner._beam_graph_fallback_reasons = {}
+    runner._beam_graph_keys = set()
+    runner._prefill_graph_runner = None
+    runner._prefill_graphs_captured = False
+
+
 def capture_beam_decode_graph(runner: Any) -> bool:
     """Capture configured widths over private graphs and stable suffix banks."""
     from vllm_gr.v1.worker.gr_context import (
@@ -839,7 +893,7 @@ def capture_beam_decode_graph(runner: Any) -> bool:
     )
 
     config = _get_gr_config(runner)
-    if not config.beam_graph_active:
+    if not _beam_graph_enabled_for_run(runner) or not config.beam_graph_active:
         return False
     widths = set(getattr(config, "beam_graph_widths", None) or ())
     widths.add(int(config.beam_max_width))
@@ -942,6 +996,10 @@ def _select_bsnd_spec(runner, scheduler_output, p_runner, num_reqs):
     if not p_runner.has_bsnd_captured_graph(T, B):
         return None
     return (T, B, token_counts)
+
+
+def is_prefill_graph_enabled(runner: Any) -> bool:
+    return graph_for(runner, AscendGraph).prefill_enabled
 
 
 def make_patched_model_forward_npu(_orig_model_forward):
@@ -1060,6 +1118,7 @@ def make_patched_model_forward_npu(_orig_model_forward):
                             total_tokens,
                         )
                         return output_buf
+            graph_for(self, AscendGraph).fallback("prefill", "shape_or_metadata_miss")
         return _orig_model_forward(
             self,
             num_tokens_padded,
@@ -1100,11 +1159,13 @@ def capture_prefill_graphs(runner) -> None:
         runner._prefill_graphs_captured = True
     except Exception:
         # Propagate startup/capture failures when BSND is enabled.
+        graph = graph_for(runner, AscendGraph)
 
         settings = deployment_for(getattr(runner, "vllm_config", None))
         specs = settings.npu_bsnd_capture_specs
         if specs.strip():
             raise
+        graph.fallback("prefill", "capture_failed")
         logger.exception(
             "vllm-gr: prefill NPU graph capture failed; prefill will fall back to eager"
         )

@@ -9,6 +9,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from ..constraint_plan import constraint_plan_choices
+from ..graph import bind_graph
 from ..identity import PlatformIdentity
 from ..interface import (
     PROVIDER_API_VERSION,
@@ -17,6 +18,7 @@ from ..interface import (
 )
 from ..plan import BackendPlan, BackendRequest, PlanData
 from ..services import BuiltinPlanSupport, require_provider_plan
+from .graph import AscendGraph
 
 if TYPE_CHECKING:
     import torch
@@ -59,11 +61,19 @@ class NPUBackendProvider(BuiltinPlanSupport):
         """
         return identity.device_type == "npu" and identity.has_lineage(_ASCEND_PLATFORM_CLASS)
 
+    native_graph_factory = AscendGraph
+
+    def create_graph_executor(self, *, plan: BackendPlan, runner: Any) -> Any:
+        require_provider_plan(self, plan)
+        return bind_graph(plan, runner, AscendGraph)
+
     def resolve(self, request: BackendRequest) -> BackendPlan:
         """Keep Ascend's V1 runner and its existing auto-decode policy."""
         if request.options.to_dict():
             raise ValueError("Ascend currently accepts no additional backend options")
         gr = request.config.to_dict()
+        native = request.native.to_dict()
+        eager = (native.get("model_config") or {}).get("enforce_eager", False)
         return BackendPlan(
             self.backend_id,
             self.api_version,
@@ -79,7 +89,12 @@ class NPUBackendProvider(BuiltinPlanSupport):
                     **constraint_plan_choices(gr, legacy_id=self.device_type),
                     "operator_policy": "ascend.xllm-with-reference-fallback",
                     "stage": "ascend.v1",
-                    "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
+                    "graph_implementation": AscendGraph.implementation_id,
+                    "prefill_graph": not eager
+                    and gr.get("deployment", {}).get("prefill_graph_enabled", True),
+                    "graph": "capture-with-eager-fallback"
+                    if gr["beam_graph_enabled"] and not eager
+                    else "eager",
                 }
             ),
         )
