@@ -9,7 +9,7 @@ import math
 import struct
 from typing import TYPE_CHECKING, Any
 
-from vllm_gr.v1.engine.beam_search_v1 import GRDeviceRequestError
+from vllm_gr.platforms.errors import GRDeviceRequestError
 
 if TYPE_CHECKING:
     from vllm_gr.config import GRConfig
@@ -19,6 +19,22 @@ if TYPE_CHECKING:
 # Full-vocabulary Beam has its own validated horizon. SID projection and
 # Constraint Table generation retain their independent three-stage contract.
 NPU_UNCONSTRAINED_MAX_GENERATED_TOKENS = 6
+
+
+def uses_dynamic_decision(params: Any, result_width: int) -> bool:
+    """Match the native Ascend decision path for this request's complete schedule."""
+    capacity = params.beam_width
+    widths = params.dynamic_beam_widths
+    native_schedule = widths is None or (
+        all(width == capacity for width in widths) and (len(widths) == 1 or capacity % 32 == 0)
+    )
+    return (
+        getattr(params, "per_parent_beam_widths", None) is not None
+        or not native_schedule
+        or result_width != capacity
+    )
+
+
 _NPU_KV_REORDER_BUFFER_BYTES = 95 * 1024
 
 
@@ -63,6 +79,20 @@ def validate_npu_device_config(
     config: Any, gr_config: GRConfig, request: BeamBatchRequest | None = None
 ) -> None:
     """Validate NPU deployment and request capabilities before allocation."""
+    services = getattr(config, "_gr_ready_services", {})
+    if (
+        request is not None
+        and services.get("stage") == "ascend.v1"
+        and services.get("operator") == "torch.reference"
+        and request.beam_params.max_tokens > 1
+        and not uses_dynamic_decision(
+            request.beam_params, request.output_options.num_return_sequences
+        )
+    ):
+        raise GRDeviceRequestError(
+            "Fixed-width Ascend Beam Decode requires the fused decision operators "
+            "beam_search_group and beam_search_rec_final_select"
+        )
     if gr_config.constrained_generation is False:
         validate_npu_unconstrained_runner(config)
         # Keep admission bounded to the validated decision/KV/graph horizon;

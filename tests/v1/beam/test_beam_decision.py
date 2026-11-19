@@ -15,7 +15,7 @@ Covers the five correctness gaps fixed in the NPU post-processing port:
   the session's decode state.
 
 All tests run on CPU against the PyTorch reference decision path
-(``_run_torch_decision``); NPU fused-operator parity is covered by the
+(``reference_ops``); NPU fused-operator parity is covered by the
 ``tests/kernels`` suite on device.
 """
 
@@ -53,6 +53,15 @@ def _make_context(
 def _make_session(context: BeamAttentionContext, session_id: str = "s") -> BeamSearchSession:
     slot = context.registry.allocate(session_id, beam_width=0, prefix_len=0)
     return BeamSearchSession(session_id=session_id, slot=slot, context=context)
+
+
+def _reference_runner(**kwargs: Any) -> SimpleNamespace:
+    from vllm_gr.v1.beam.decision_ops import reference_ops
+
+    return SimpleNamespace(
+        _gr_unplanned_stage=SimpleNamespace(decision=reference_ops(), worker_decision=False),
+        **kwargs,
+    )
 
 
 def _sampler_output(candidates: torch.Tensor, probs: torch.Tensor) -> SimpleNamespace:
@@ -110,7 +119,7 @@ def test_first_decode_inherits_parent_cumulative_scores() -> None:
         torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
         torch.tensor([[-4.0, -6.0], [-0.1, -1.0]], dtype=torch.float32),
     )
-    runner = SimpleNamespace(
+    runner = _reference_runner(
         device=torch.device("cpu"),
         _current_beam_info={
             "beam_data": {"s": {"is_beam_decode": True, "parent_beam_ids": [0, 1]}}
@@ -139,7 +148,7 @@ def test_unseeded_first_decode_falls_back_instead_of_double_counting() -> None:
         torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
         torch.tensor([[-4.0, -6.0], [-0.1, -1.0]], dtype=torch.float32),
     )
-    runner = SimpleNamespace(
+    runner = _reference_runner(
         device=torch.device("cpu"),
         _current_beam_info={"beam_data": {}},
     )
@@ -181,13 +190,11 @@ def test_result_width_falls_back_to_beam_width() -> None:
     # The dispatch inside run_beam_decision must pick beam_search_group (not
     # rec_final_select) even though max_decode_steps == 32 == 32-aligned:
     # final select requires is_last_step AND width alignment; width here is 4.
-    assert not (
-        session._state.is_last_step and result_width % beam_decision._FINAL_SELECT_ALIGNMENT == 0
-    )
+    assert not (session._state.is_last_step and result_width % 32 == 0)
 
     sampler_output = _sampler_output(top_tokens, top_probs)
     decision = beam_decision.run_beam_decision(
-        SimpleNamespace(_current_beam_info={"beam_data": {}}),
+        _reference_runner(_current_beam_info={"beam_data": {}}),
         session,
         sampler_output,
         is_last_step=False,
@@ -214,15 +221,21 @@ def test_npu_n2_group_receives_two_slot_history(monkeypatch: pytest.MonkeyPatch)
         seen_shape = tuple(args[3].shape)
         raise RuntimeError("captured group input")
 
+    from vllm_gr.platforms.ascend.stage import create_stage
+
+    monkeypatch.setattr(beam_ops, "is_available", lambda: True)
+    monkeypatch.setattr(beam_ops, "decision_ops_available", lambda: True)
     monkeypatch.setattr(beam_ops, "beam_search_group", capture_group)
     candidates = torch.arange(width * width, dtype=torch.int32).reshape(width, width)
     with pytest.raises(RuntimeError, match="captured group input"):
-        beam_decision._run_npu_decision(
+        beam_decision._run_decision(
+            create_stage(plan=None, runner=SimpleNamespace()).decision,
             session,
             candidates,
             torch.zeros_like(candidates, dtype=torch.float32),
-            is_last_step=True,
+            last=True,
             result_width=width,
+            strict=True,
         )
     assert seen_shape == (1, width, 2)
 
@@ -249,12 +262,15 @@ def test_result_width_decouples_from_max_decode_steps() -> None:
 
 def _gate_runner(
     context: BeamAttentionContext,
-    device_type: str = "npu",
+    mode: str = "cascade",
     beam_width: int = 4,
 ) -> SimpleNamespace:
+    from vllm_gr.platforms.ascend.stage import create_stage as ascend_stage
+    from vllm_gr.platforms.cuda.stage import _create_stage as cuda_stage
+
     session = _make_session(context)
     session.begin_session(beam_width=beam_width, prefix_len=8)
-    return SimpleNamespace(
+    runner = _reference_runner(
         _vllm_gr_config=SimpleNamespace(
             beam_worker_decision=True,
             catalog_path=None,
@@ -271,51 +287,46 @@ def _gate_runner(
             },
             "beam_session": session,
         },
-        device=SimpleNamespace(type=device_type),
     )
+    if mode in ("cascade", "xllm"):
+        runner.vllm_config = SimpleNamespace(
+            additional_config={"vllm_gr_npu_decode_execution": mode}
+        )
+        runner._gr_unplanned_stage = ascend_stage(plan=None, runner=runner)
+    elif mode == "cuda":
+        runner._gr_unplanned_stage = cuda_stage(None, "cuda.v1", SimpleNamespace)
+    return runner
 
 
-def test_worker_decision_disabled_in_cascade_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_decision_disabled_in_cascade_mode() -> None:
     """Cascade decode execution must keep the frontend decision path."""
-    from vllm_gr.v1.attention.backends import beam_attn
-
     context = _make_context()
     runner = _gate_runner(context)
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "cascade")
     assert beam_decision.worker_decision_enabled(runner) is False
 
 
-def test_worker_decision_enabled_in_xllm_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.attention.backends import beam_attn
-
+def test_worker_decision_enabled_in_xllm_mode() -> None:
     context = _make_context()
-    runner = _gate_runner(context)
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "xllm")
+    runner = _gate_runner(context, mode="xllm")
     assert beam_decision.worker_decision_enabled(runner) is True
 
 
 def test_worker_decision_disabled_on_cuda() -> None:
     context = _make_context()
-    runner = _gate_runner(context, device_type="cuda")
+    runner = _gate_runner(context, mode="cuda")
     assert beam_decision.worker_decision_enabled(runner) is False
 
 
-def test_worker_decision_disabled_on_cpu_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.attention.backends import beam_attn
-
+def test_worker_decision_disabled_on_cpu_host() -> None:
     context = _make_context()
-    runner = _gate_runner(context, device_type="cpu")
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "xllm")
+    runner = _gate_runner(context, mode="cpu")
     assert beam_decision.worker_decision_enabled(runner) is False
 
 
-def test_worker_decision_disabled_without_option(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.attention.backends import beam_attn
-
+def test_worker_decision_disabled_without_option() -> None:
     context = _make_context()
-    runner = _gate_runner(context)
+    runner = _gate_runner(context, mode="xllm")
     runner._vllm_gr_config.beam_worker_decision = False
-    monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "xllm")
     assert beam_decision.worker_decision_enabled(runner) is False
 
 
@@ -344,7 +355,7 @@ def test_prefix_sums_converted_to_request_local() -> None:
     sampler_output = _sampler_output(top_tokens, probs)
 
     decision = beam_decision.run_beam_decision(
-        SimpleNamespace(_current_beam_info={"beam_data": {}}),
+        _reference_runner(_current_beam_info={"beam_data": {}}),
         session,
         sampler_output,
         is_last_step=False,
@@ -446,7 +457,7 @@ def test_same_step_reorder_applied_and_decode_step_advanced() -> None:
     decode_step_before = session.decode_step
     sampler_output = _sampler_output(top_tokens, probs)
     decision = beam_decision.run_beam_decision(
-        SimpleNamespace(_current_beam_info={"beam_data": {}}),
+        _reference_runner(_current_beam_info={"beam_data": {}}),
         session,
         sampler_output,
         is_last_step=False,
@@ -489,7 +500,7 @@ def test_intermediate_step_omits_out_sequence() -> None:
     beam_decision.init_beam_decision_state(session, top_tokens, probs)
 
     decision = beam_decision.run_beam_decision(
-        SimpleNamespace(_current_beam_info={"beam_data": {}}),
+        _reference_runner(_current_beam_info={"beam_data": {}}),
         session,
         _sampler_output(top_tokens, probs),
         is_last_step=False,
@@ -634,3 +645,36 @@ def test_select_candidates_v2_layout_rejects_narrow_payload() -> None:
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_canonical_operator_dispatch_preserves_ties_masks_and_member_order() -> None:
+    """One member has tied valid candidates and the second has no valid candidate."""
+    runner = _reference_runner()
+    context = _make_context(max_batch=2, max_beams=2, max_decode_steps=2)
+    context.decision.worker_decode_steps = 1
+    context.decision.beam_scores[:2, :2].copy_(torch.tensor([[-0.5, -1.0], [0.0, 0.0]]))
+    context.decision.sequence[:2, :2, 0].copy_(torch.tensor([[8, 9], [6, 7]]))
+    session = SimpleNamespace(
+        beam_width=2,
+        context=context,
+        sessions=(
+            SimpleNamespace(_state=SimpleNamespace(is_last_step=True)),
+            SimpleNamespace(_state=SimpleNamespace(is_last_step=True)),
+        ),
+    )
+    tokens = torch.tensor([[202, 105], [307, 401], [907, 502], [555, 776]], dtype=torch.int32)
+    scores = torch.tensor(
+        [
+            [-1.0, -float("inf")],
+            [-0.5, -float("inf")],
+            [-float("inf"), -float("inf")],
+            [-float("inf"), -float("inf")],
+        ]
+    )
+    result = beam_decision.run_beam_decision_candidates(
+        runner, session, tokens, scores, is_last_step=True
+    )
+    assert result["out_token_ids"].tolist() == [[202, 307], [907, 502]]
+    assert result["out_token_index"].tolist() == [[0, 1], [2, 2]]
+    assert result["out_log_probs"].tolist() == [[-1.5, -1.5], [-float("inf"), -float("inf")]]
+    assert result["out_sequence"].tolist() == [[[8, 202], [9, 307]], [[6, 907], [6, 502]]]

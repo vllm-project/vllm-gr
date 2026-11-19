@@ -306,6 +306,7 @@ def test_constrained_prefill_keeps_backend_scores_and_prefix_metadata(batch_size
 def test_unconstrained_startup_selects_the_existing_npu_graph_adapter(
     eager: bool, steps: int, expected: bool
 ) -> None:
+    from vllm_gr.platforms.ascend.stage import create_stage
     from vllm_gr.v1.worker.gr_startup import _capture_enabled
 
     worker = SimpleNamespace(
@@ -321,6 +322,7 @@ def test_unconstrained_startup_selects_the_existing_npu_graph_adapter(
             constraint_table=None,
         ),
     )
+    worker._gr_unplanned_stage = create_stage(plan=None, runner=worker)
     assert _capture_enabled(worker) is expected
 
 

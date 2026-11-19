@@ -120,7 +120,8 @@ def test_final_select_compacts_history_from_configured_capacity(
 ) -> None:
     """Final selection retains the active prefix and leaves its tail unused."""
     from vllm_gr.ops.npu import beam_ops
-    from vllm_gr.v1.beam.beam_decision import _run_npu_decision
+    from vllm_gr.platforms.ascend.stage import create_stage
+    from vllm_gr.v1.beam.beam_decision import _run_decision
 
     beam_width = 32
     sentinel = -1234567
@@ -158,8 +159,15 @@ def test_final_select_compacts_history_from_configured_capacity(
         return out_tokens, out_index, out_scores, out_sequence
 
     monkeypatch.setattr(beam_ops, "beam_search_rec_final_select", checked_select)
-    actual = _run_npu_decision(
-        session, top_tokens.to(DEVICE), top_probs.to(DEVICE), True, beam_width
+    operators = create_stage(plan=None, runner=session).decision
+    actual = _run_decision(
+        operators,
+        session,
+        top_tokens.to(DEVICE),
+        top_probs.to(DEVICE),
+        True,
+        beam_width,
+        strict=True,
     )
     torch.npu.synchronize()
     assert actual is not None

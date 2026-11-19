@@ -42,6 +42,11 @@ def is_available() -> bool:
     return all(_has_op(name) for name in _EXECUTION_OPS)
 
 
+def decision_ops_available() -> bool:
+    """Check the two auxiliary selection operators independently of attention."""
+    return _has_op("beam_search_group") and _has_op("beam_search_rec_final_select")
+
+
 def unavailable_reason() -> str:
     """Describe why the execution-path fused operators cannot be called."""
     if _custom_ops() is None:

@@ -80,6 +80,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
                     "requires_attention": gr["attention_backend"] == "CUSTOM",
                     "constraint": constraint,
                     "constraint_implementation": "npu" if constraint != "none" else None,
+                    "operator_policy": "ascend.xllm-with-reference-fallback",
                     "stage": "ascend.v1",
                     "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
                 }

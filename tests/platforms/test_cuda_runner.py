@@ -49,6 +49,9 @@ def workers(monkeypatch: pytest.MonkeyPatch) -> Any:
                     native,
                     identity,
                     prepare="prepare_inputs",
+                    stage_factory=lambda **kwargs: SimpleNamespace(
+                        implementation_id="cuda." + name
+                    ),
                 )
             ),
         )
@@ -90,8 +93,9 @@ def test_each_worker_uses_its_admitted_runner_and_stage(workers: Any) -> None:
         plan = admit(config)
         native = Worker(config).init_device()
         adapter = CUDA_BACKEND.create_model_runner_adapter(plan=plan, native_runner=native)
-        assert isinstance(adapter, NativeRunnerAdapter)
+        assert isinstance(adapter, NativeRunnerAdapter) and adapter.stage is not None
         assert adapter.implementation_id == plan.choices.to_dict()["runner"]
+        assert adapter.stage.implementation_id == plan.choices.to_dict()["stage"]
         assert adapter.execute_model() == "executed"
     assert all(hooks.install.call_count == 1 for hooks in installers.values())
 
@@ -116,9 +120,10 @@ def test_watermark_override_selects_v2_with_the_v1_environment(
     Worker, installers = workers
     native = Worker(config).init_device()
     adapter = CUDA_BACKEND.create_model_runner_adapter(plan=plan, native_runner=native)
-    assert isinstance(adapter, NativeRunnerAdapter)
+    assert isinstance(adapter, NativeRunnerAdapter) and adapter.stage is not None
     assert plan.request.native.to_dict()["use_v2_model_runner"] is True
     assert adapter.implementation_id == runner.V2_RUNNER
+    assert adapter.stage.implementation_id == plan.choices.to_dict()["stage"] == "cuda.v2"
     installers[runner.V1_RUNNER].install.assert_not_called()
 
 
@@ -165,6 +170,7 @@ def test_installer_module_can_move_without_changing_a_plan_or_readiness(
     monkeypatch.setitem(runner._INSTALLER_MODULES, runner.V2_RUNNER, new_path)
     native = Worker(config).init_device()
     adapter = CUDA_BACKEND.create_model_runner_adapter(plan=plan, native_runner=native)
-    assert isinstance(adapter, NativeRunnerAdapter)
+    assert isinstance(adapter, NativeRunnerAdapter) and adapter.stage is not None
     assert runner.is_patched(type(native))
     assert adapter.implementation_id == plan.choices.to_dict()["runner"] == runner.V2_RUNNER
+    assert adapter.stage.implementation_id == "cuda.v2"

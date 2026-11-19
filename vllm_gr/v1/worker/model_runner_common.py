@@ -11,20 +11,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.worker import gr_execution, gr_gc
 from vllm_gr.v1.worker import model_runner_contracts as contracts
 
-if TYPE_CHECKING:
-    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
-
 
 def make_patched_execute_model(
     _orig_execute_model: Callable[..., Any],
-    *,
-    hooks_type: CudaStageHooksType | None = None,
 ) -> Callable[..., Any]:
     """Wrap execute_model to publish beam-request context for the run.
 
@@ -55,7 +50,7 @@ def make_patched_execute_model(
             return retirement
 
         stage = gr_execution._dispatch_stage_frame(
-            self, scheduler_output, _orig_execute_model, *args, hooks_type=hooks_type, **kwargs
+            self, scheduler_output, _orig_execute_model, *args, **kwargs
         )
         if stage is not gr_execution._NOT_A_STAGE_FRAME:
             return stage

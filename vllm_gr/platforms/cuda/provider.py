@@ -73,6 +73,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
                     "requires_attention": gr["attention_backend"] == "CUSTOM",
                     "constraint": constraint,
                     "constraint_implementation": "cuda" if constraint != "none" else None,
+                    "operator_policy": "cuda.onerec",
                     "stage": "cuda.v2" if native["use_v2_model_runner"] else "cuda.v1",
                     "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
                 }

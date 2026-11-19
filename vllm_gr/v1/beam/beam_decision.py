@@ -20,9 +20,7 @@ The result dict (``out_token_ids`` / ``out_token_index`` /
 ``out_log_probs`` / ``out_sequence``) is attached to
 ``ModelRunnerOutput.beam_search_result`` and consumed by the serving frontend.
 
-The public ``onerec_decode`` operators dispatch to the active accelerator:
-CUDA uses the fused CUDA kernels, NPU uses the xllm operators, and CPU keeps a
-PyTorch reference path for parity tests.
+The runner's stage service binds the group and final selection operators before dispatch.
 """
 
 from __future__ import annotations
@@ -31,15 +29,10 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-from vllm.logger import init_logger
 
+from vllm_gr.v1.beam.decision_ops import DecisionOps, reorder_sessions
 from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import _workspace_candidate_width
-
-logger = init_logger(__name__)
-
-# Kernel tiling constraint: beam_search_rec_final_select requires result_width
-# to be a multiple of 32 (verified on device; see ops/npu/beam_ops.py ABI notes).
-_FINAL_SELECT_ALIGNMENT = 32
+from vllm_gr.v1.worker.runner_lifecycle import get_stage_execution
 
 
 def _decision_buffers(runner: Any):
@@ -67,24 +60,6 @@ def _is_beam_decode_step(runner: Any) -> bool:
     return False
 
 
-def _xllm_decode_mode_active() -> bool:
-    """True iff the NPU decode execution mode resolves to the fused xllm path.
-
-    The worker-side beam decision is the post-processing half of the xllm
-    pipeline: its same-step ``select_unshared_kv`` reorder assumes the fused
-    pool layout, and running it under ``cascade`` mode would mix the two
-    execution paths.  Resolved lazily through the same per-process cache the
-    attention backend uses (``_get_npu_decode_execution``; unset config
-    defaults to ``cascade``, NPU-with-library defaults to ``xllm``).
-    """
-    try:
-        from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
-
-        return _get_npu_decode_execution() == "xllm"
-    except Exception:
-        return False
-
-
 def worker_decision_enabled(runner: Any) -> bool:
     """Return whether worker-side beam decision is active for this run.
 
@@ -106,12 +81,7 @@ def worker_decision_enabled(runner: Any) -> bool:
         return False
     if _decision_buffers(runner) is None:
         return False
-    device = getattr(runner, "device", None)
-    device_type = str(getattr(device, "type", ""))
-    if device_type != "npu":
-        return False
-    # NPU same-step KV selection is defined only for fused xllm mode.
-    if not _xllm_decode_mode_active():
+    if not get_stage_execution(runner).worker_decision:
         return False
     # Trie-catalog filtering runs frontend-side; Constraint Table candidates
     # are already filtered by the worker's rec_constrained_topk.  Only decide
@@ -289,129 +259,6 @@ def _select_candidates(
     return top_tokens, top_probs
 
 
-def _reorder_kv_same_step(
-    session: Any,
-    beam_index: torch.Tensor,
-    group_token_num: torch.Tensor,
-) -> None:
-    """Apply the beam decision's KV reorder inside the SAME step.
-
-    Asynchronous scheduling runs ``select_unshared_kv`` immediately after
-    ``beam_search_group`` — the next step's attention
-    then reads an already-reordered pool with no frontend round-trip in the
-    critical path.  ``beam_search_group`` output is grouped by source beam
-    ascending (the torch reference's stable ``argsort(parent)`` locks the
-    contract), so at full pool width the fused kernel's prefix-sum mapping
-    applies directly — bypassing ``reorder_unshared_kv``'s per-step D2H
-    sortedness check + bincount round-trip.  Sub-width pools, CPU hosts and
-    unavailable ops fall back to the standard dispatcher.
-    """
-    context = session.context
-    pools = context.pools
-    state = session._state
-    step = state.decode_step  # 0-based; the reorder covers [0, step]
-    pool_beam_width = pools[0].unshared_key.shape[1]
-
-    # The fused operator only executes on NPU tensors; CPU hosts (unit tests,
-    # GPU-debug parity runs) go straight to the dispatcher fallback instead of
-    # raising through the ACL layer first.
-    if beam_index.numel() == pool_beam_width and str(beam_index.device.type) == "npu":
-        try:
-            from vllm_gr.ops.npu import beam_ops
-
-            if beam_ops.is_available():
-                # Reuse the persistent block-table buffer filled by this
-                # step's execute_model (fixed address, slot already current).
-                block_table = getattr(context, "xllm_block_table_buf", None)
-                if block_table is None:
-                    block_table = torch.tensor(
-                        [session.slot], dtype=torch.int32, device=beam_index.device
-                    )
-                else:
-                    block_table = block_table[session.slot : session.slot + 1]
-                beam_ops.select_unshared_kv(
-                    beam_index.contiguous(),
-                    [p.unshared_key for p in pools],
-                    [p.unshared_value for p in pools],
-                    block_table,
-                    group_token_num.contiguous(),
-                    step + 1,
-                    pool_beam_width,
-                    len(pools),
-                )
-                state.decode_step += 1
-                return
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            logger.warning("vllm-gr fused same-step KV reorder failed: %s; fallback", exc)
-
-    # Sub-width pools / CPU hosts / op-unavailable: the dispatcher picks the
-    # cascade kernel (arbitrary widths) and step_complete advances decode_step.
-    # Runner-owned pools, aux buffers, and device pointer tables were created
-    # and validated together with this persistent context.  Avoid rescanning
-    # every K/V layer between BeamSearchGroup and SelectUnsharedKV.
-    session.step_complete(beam_index, layout_prevalidated=True)
-
-
-def _reorder_kv_batch_same_step(
-    session: Any,
-    sessions: tuple[Any, ...],
-    beam_index: torch.Tensor,
-    group_token_num: torch.Tensor,
-) -> None:
-    """Apply one request-major B*W KV reorder for an NPU Beam batch."""
-
-    context = session.context
-    pools = context.pools
-    batch = len(sessions)
-    beam_width = session.beam_width
-    steps = {item._state.decode_step for item in sessions}
-    if len(steps) != 1:
-        raise RuntimeError("NPU Beam batch sessions left the same KV reorder step")
-    step = steps.pop()
-    expected = (batch, beam_width)
-    if tuple(beam_index.shape) != expected or tuple(group_token_num.shape) != expected:
-        raise RuntimeError("NPU Beam batch reorder tensors have an invalid shape")
-
-    if str(beam_index.device.type) == "npu":
-        try:
-            from vllm_gr.ops.npu import beam_ops
-
-            if beam_ops.is_available():
-                block_table = getattr(context, "xllm_block_table_buf", None)
-                if block_table is None:
-                    block_table = torch.tensor(
-                        [item.slot for item in sessions],
-                        dtype=torch.int32,
-                        device=beam_index.device,
-                    )
-                else:
-                    block_table = block_table[:batch]
-                # xllm consumes all B*W local parents and B pool slots in one
-                # call. Per-request calls do not preserve its batch geometry
-                # for a non-zero pool slot.
-                beam_ops.select_unshared_kv(
-                    beam_index.reshape(-1).contiguous(),
-                    [pool.unshared_key for pool in pools],
-                    [pool.unshared_value for pool in pools],
-                    block_table,
-                    group_token_num.reshape(-1).contiguous(),
-                    step + 1,
-                    beam_width,
-                    len(pools),
-                )
-                for item in sessions:
-                    item._state.decode_step += 1
-                return
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            logger.warning(
-                "vllm-gr fused batch same-step KV reorder failed: %s; fallback",
-                exc,
-            )
-
-    for row, item in enumerate(sessions):
-        _reorder_kv_same_step(item, beam_index[row], group_token_num[row])
-
-
 def _finalize_decision(
     session: Any,
     bufs: Any,
@@ -423,6 +270,8 @@ def _finalize_decision(
     batch: int,
     beam_width: int,
     result_width: int,
+    *,
+    reorder: Any = reorder_sessions,
 ) -> dict[str, torch.Tensor]:
     """Persist cumulative state and apply the asynchronous Beam decision.
 
@@ -458,13 +307,7 @@ def _finalize_decision(
     if len(sessions) != batch:
         raise RuntimeError("Beam decision batch does not match its request sessions")
     if not all(item._state.is_last_step for item in sessions):
-        # NPU B>1 keeps the complete request-major geometry in one operator call.
-        # Other devices and B=1 retain the established per-session path.
-        if batch > 1 and local_idx.device.type == "npu":
-            _reorder_kv_batch_same_step(session, sessions, local_idx, local_prefix)
-        else:
-            for row, item in enumerate(sessions):
-                _reorder_kv_same_step(item, local_idx[row], local_prefix[row])
+        reorder(session, sessions, local_idx, local_prefix)
         # The applied mapping is NOT materialized here: reading
         # ``local_idx[0].tolist()`` is a device→host sync that stalls the
         # pipeline every step (~30ms on NPU, profiling bw128_1k_t3).  The
@@ -475,99 +318,38 @@ def _finalize_decision(
     return decision
 
 
-def _run_npu_decision(
+def _run_decision(
+    ops: DecisionOps,
     session: Any,
-    top_tokens: torch.Tensor,
-    top_probs: torch.Tensor,
-    is_last_step: bool,
+    tokens: torch.Tensor,
+    probs: torch.Tensor,
+    last: bool,
     result_width: int,
-) -> dict[str, torch.Tensor] | None:
-    """Run the fused xllm decision operators."""
-    from vllm_gr.ops.npu import beam_ops
-
+    *,
+    strict: bool,
+) -> dict[str, torch.Tensor]:
     bufs = session.context.decision
-    width = bufs.worker_decode_steps
-    beam_width = session.beam_width
-    batch = top_tokens.shape[0] // beam_width
-    step = width  # worker-side token count == next sequence slot to write
-
-    log_probs = bufs.beam_scores[:batch, :beam_width].reshape(batch * beam_width, 1)
-    # xllm derives the history stride from the physical last dimension and
-    # requires exactly current_step + 1 slots. Passing the runtime N=3
-    # capacity to an N=2 terminal group step misreads the second SID token.
-    seq = bufs.sequence[:batch, :beam_width, : step + 1].contiguous()
-
-    prefix: torch.Tensor | None = None
-    if is_last_step and result_width % _FINAL_SELECT_ALIGNMENT == 0:
-        out_ids, out_idx, out_lp, out_seq = beam_ops.beam_search_rec_final_select(
-            log_probs,
-            top_tokens,
-            top_probs,
-            seq,
-            step,
-            result_width,
-        )
-    else:
-        out_ids, out_idx, out_lp, prefix, out_seq = beam_ops.beam_search_group(
-            log_probs,
-            top_tokens,
-            top_probs,
-            seq,
-            step,
-            beam_width,
-        )
-        result_width = beam_width
-
-    out_ids = out_ids.reshape(batch, result_width)
-    out_idx = out_idx.reshape(batch, result_width)
-    out_lp = out_lp.reshape(batch, result_width)
+    width = session.beam_width
+    batch = tokens.shape[0] // width
+    step = bufs.worker_decode_steps
+    scores = bufs.beam_scores[:batch, :width].reshape(batch * width, 1)
+    history = bufs.sequence[:batch, :width, : step + 1].contiguous()
+    ids, parents, log_probs, prefix, sequence, result_width = ops.select(
+        scores, tokens, probs, history, step, width, result_width, last, strict
+    )
     bufs.worker_decode_steps = step + 1
     return _finalize_decision(
-        session, bufs, out_ids, out_idx, out_lp, out_seq, prefix, batch, beam_width, result_width
-    )
-
-
-def _run_torch_decision(
-    session: Any,
-    top_tokens: torch.Tensor,
-    top_probs: torch.Tensor,
-    is_last_step: bool,
-    result_width: int,
-) -> dict[str, torch.Tensor] | None:
-    """PyTorch reference decision (GPU/host parity oracle for the NPU path)."""
-    from vllm_gr.ops.onerec_decode import (
-        beam_search_group,
-        beam_search_rec_final_select,
-    )
-
-    bufs = session.context.decision
-    width = bufs.worker_decode_steps
-    beam_width = session.beam_width
-    batch = top_tokens.shape[0] // beam_width
-    step = width
-
-    log_probs = bufs.beam_scores[:batch, :beam_width].reshape(batch * beam_width, 1)
-    seq = bufs.sequence[:batch, :beam_width, : step + 1].contiguous()
-
-    prefix: torch.Tensor | None = None
-    if is_last_step and (
-        top_tokens.device.type == "cuda" or result_width % _FINAL_SELECT_ALIGNMENT == 0
-    ):
-        out_ids, out_idx, out_lp, out_seq = beam_search_rec_final_select(
-            log_probs, top_tokens, top_probs, seq, step, result_width
-        )
-    else:
-        out_ids, out_idx, out_lp, prefix, out_seq = beam_search_group(
-            log_probs, top_tokens, top_probs, seq, step, beam_width
-        )
-        result_width = beam_width
-
-    out_ids = out_ids.reshape(batch, result_width)
-    out_idx = out_idx.reshape(batch, result_width)
-    out_lp = out_lp.reshape(batch, result_width)
-    bufs.worker_decode_steps = step + 1
-    return _finalize_decision(
-        session, bufs, out_ids, out_idx, out_lp, out_seq, prefix, batch, beam_width, result_width
+        session,
+        bufs,
+        ids.reshape(batch, result_width),
+        parents.reshape(batch, result_width),
+        log_probs.reshape(batch, result_width),
+        sequence,
+        prefix,
+        batch,
+        width,
+        result_width,
+        reorder=ops.reorder,
     )
 
 
@@ -598,8 +380,6 @@ def run_beam_decision(
     cannot be decided worker-side (caller keeps the frontend path).
     """
     width = session.beam_width
-    run_device = getattr(runner, "device", None)
-    device_type = str(run_device.type) if run_device is not None else ""
     # Candidate width K is independent of the beam width W; the sampler emits
     # one row per beam and K columns per row.
     candidate_width = _workspace_candidate_width(runner, width)
@@ -631,32 +411,16 @@ def run_beam_decision(
         # twice. Normal engine paths seed from request metadata at creation.
         return None
 
-    # The fused xllm decision operators hard-code K == W. Raise here, outside
-    # the defensive fallback below, so an unsupported geometry cannot be
-    # silently absorbed by the PyTorch reference.
-    if device_type.startswith("npu") and candidate_width != width:
-        raise NotImplementedError(
-            "NPU beam decision requires candidate_width == beam_width, got "
-            f"candidate_width={candidate_width}, beam_width={width}"
-        )
-
-    try:
-        from vllm_gr.ops.npu import beam_ops
-
-        # The fused xllm operators execute on NPU tensors; on CPU/CUDA hosts
-        # (unit-test / GPU-debug environments) always take the PyTorch
-        # reference so the decision logic stays verifiable off-device.
-        if beam_ops.is_available() and device_type.startswith("npu"):
-            decision = _run_npu_decision(session, top_tokens, top_probs, is_last_step, result_width)
-            if decision is not None:
-                decision["probs"] = session.context.decision.beam_scores[:1, :width].clone()
-                return decision
-    except Exception as exc:  # pragma: no cover - defensive fallback
-        logger.warning("vllm-gr worker beam decision (NPU) failed: %s; fallback", exc)
-
-    decision = _run_torch_decision(session, top_tokens, top_probs, is_last_step, result_width)
-    if decision is not None:
-        decision["probs"] = session.context.decision.beam_scores[:1, :width].clone()
+    decision = _run_decision(
+        get_stage_execution(runner).decision,
+        session,
+        top_tokens,
+        top_probs,
+        is_last_step,
+        result_width,
+        strict=False,
+    )
+    decision["probs"] = session.context.decision.beam_scores[:1, :width].clone()
     return decision
 
 
@@ -694,22 +458,15 @@ def run_beam_decision_candidates(
     result_width = result_width or width
     if not 1 <= result_width <= width:
         raise ValueError("result_width must be in [1, beam_width]")
-    device_type = str(getattr(getattr(runner, "device", None), "type", ""))
-    if device_type.startswith("npu"):
-        from vllm_gr.ops.npu import beam_ops
-
-        if not beam_ops.is_available():
-            raise RuntimeError("NPU Beam decision operators are unavailable")
-        if top_tokens.shape[1] != width:
-            raise NotImplementedError(
-                "NPU beam decision requires candidate_width == beam_width, got "
-                f"candidate_width={top_tokens.shape[1]}, beam_width={width}"
-            )
-        decision = _run_npu_decision(session, top_tokens, top_probs, is_last_step, result_width)
-    else:
-        decision = _run_torch_decision(session, top_tokens, top_probs, is_last_step, result_width)
-    if decision is None:
-        raise RuntimeError("Beam decision did not produce a result")
+    decision = _run_decision(
+        get_stage_execution(runner).decision,
+        session,
+        top_tokens,
+        top_probs,
+        is_last_step,
+        result_width,
+        strict=True,
+    )
     batch = top_tokens.shape[0] // width
     decision["probs"] = session.context.decision.beam_scores[:batch, :width].clone()
     return decision

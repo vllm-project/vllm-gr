@@ -18,6 +18,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_gr.config import MAX_BEAM_WIDTH, GRConfig
 from vllm_gr.config.models import CONSTRAINT_TABLE_MAX_DECODE_STEPS
+from vllm_gr.platforms.errors import GRDeviceRequestError
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
@@ -54,10 +55,6 @@ class GRResourceStatus(str, Enum):
     DRAINING = "draining"
     RETIRING = "retiring"
     CLOSED = "closed"
-
-
-class GRDeviceRequestError(ValueError):
-    """A request cannot run on an otherwise supported device configuration."""
 
 
 def _validate_gr_generation_params(params: BeamBatchParams) -> None:

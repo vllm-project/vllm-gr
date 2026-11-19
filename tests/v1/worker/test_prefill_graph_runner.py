@@ -1230,7 +1230,6 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.worker import gr_startup, model_runner_patch
     from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
-    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     stream = SimpleNamespace(wait_stream=lambda _other: None)
     monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
@@ -1283,11 +1282,11 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
         lambda _runner: events.append("freeze"),
     )
 
-    model_runner_patch.install_v1_worker_hooks(platform, cuda_hooks_type=CudaStageHooksV1)
+    model_runner_patch.install_v1_worker_hooks(platform)
     worker = Runner()
     with pytest.raises(RuntimeError) as raised:
         worker.capture_model()
-    capture_async.assert_called_once_with(worker, hooks_type=CudaStageHooksV1)
+    capture_async.assert_called_once_with(worker)
     assert raised.value is error
     assert events == ["native"]
 

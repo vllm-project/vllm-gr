@@ -86,6 +86,9 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
         ),
     )
 
+    from vllm_gr.platforms.ascend.stage import create_stage
+
+    worker._gr_unplanned_stage = create_stage(plan=None, runner=worker)
     assert gr_startup.capture_async_forward(worker)
     capture.assert_called_once_with(worker)
 

@@ -32,6 +32,8 @@ def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_worke
         raise RuntimeError(f"Backend readiness requires {expected_workers} worker reports")
     choices = plan.choices.to_dict()
     required = ["runner"]
+    if choices.get("operator_policy"):
+        required.extend(("stage", "operator"))
     if choices.get("requires_attention"):
         required.append("attention")
     if choices.get("constraint") == "legacy":
@@ -107,3 +109,6 @@ def verify_engine_backend_readiness(engine: Any) -> None:
             logger.exception("Failed to shut down executor after backend readiness failure")
         raise
     engine._gr_backend_fingerprint = plan.fingerprint
+    # The Core admits request-specific geometry after every worker has reported
+    # the same services. Keep this local to the native Core configuration.
+    engine.vllm_config._gr_ready_services = dict(reports[0]["services"])

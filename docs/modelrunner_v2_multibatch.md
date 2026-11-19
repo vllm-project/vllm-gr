@@ -250,9 +250,8 @@ flags at construction. The class-side `CudaStageHooksType` Protocol additionally
 checks constructor compatibility at binding sites; mypy checks operation signatures
 and policy types. Hooks are constructed before session admission or graph-cache
 invalidation, so construction failure leaves those resources available for retry.
-The installed CUDA entrypoints explicitly bind
-hooks for both execution and startup capture; the shared stage core has no V1
-default. A Worker cannot switch its concrete hooks type after releasing a stage
+The CUDA stage factory binds one hooks class to the runner for execution and
+startup capture. A Worker cannot switch its concrete hooks type after releasing a stage
 owner, including during repeated startup: `validate_stage_hooks_type` compares
 the bound class with the requested class. NPU dispatch retains its separate
 adapter and does not import either CUDA implementation.

@@ -265,6 +265,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         admission_worker,
         install_decode_model,
     )
+    from vllm_gr.platforms.cuda.stage import create_v1_stage
     from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
     from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
         GPUBeamStageRunner,
@@ -303,7 +304,8 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         worker,
         lambda ids, positions: ids[:, None].to(torch.float16).expand(-1, 6) + positions[:, None],
     )
-    assert capture_async_forward(worker, hooks_type=CudaStageHooksV1)
+    worker._gr_unplanned_stage = create_v1_stage(plan=None, runner=worker)
+    assert capture_async_forward(worker)
     assert freezes == []
     owner = worker._gr_gpu_stage_runner
     graph = owner.graph

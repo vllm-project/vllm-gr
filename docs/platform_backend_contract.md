@@ -434,3 +434,35 @@ inject an external `ascend` entry point and rerun the same contract tests:
    modules.
 6. An NPU process without the external package fails with an explicit
    unsupported-backend error and never falls back to CUDA.
+
+### Stage execution and Beam operators
+
+A provider can declare a stage identity in `stage` and a selection policy in
+`operator_policy` when resolving the backend plan. Its per-runner adapter owns
+a `StageExecution` service. The worker validates this service at bind time and
+reports both the stage identity and the chosen operator implementation. Every
+worker serving the same engine must agree on those identities.
+
+The service receives the worker's copy of the scheduled frame for execution and
+retirement. The native stage owner still owns its leases, cancellation state,
+sampling receipts and retirement acknowledgments. A failed execute retains the
+original exception for its associated sample. A service with extra resources
+can implement `close()` to release them when its runner adapter closes.
+
+For a Beam retirement frame the worker returns a native `ModelRunnerOutput`
+or an asynchronous output whose `get_output()` yields it. After releasing the
+physical resources, set `gr_retire_result` on that output to a `GRRetireResult`
+with the frame's session ID, owner generation, retire ID and `released=True`.
+The scheduler waits for outstanding dispatches to drain, checks the receipt
+and publishes the buffered terminal result once.
+
+The service supplies the group and final selection operators, their supported
+geometry, KV reorder and optional fallback. Shared decision code owns score
+accumulation, global token IDs, parent offsets and sequence history. CUDA binds
+the operators for its V1 or V2 runner. Ascend binds the available xllm kernels
+and preserves its reference fallback for legacy sampling. Fixed-width Ascend
+multi-step Decode uses the native decision operators. EngineCore checks their
+agreed availability when it admits a request's width schedule, before reserving
+session or KV state. Prefill-only requests and requests handled by the dynamic
+decision path can run without these operators. Configurations without
+an admitted plan retain a runner-local service from the installed native class.

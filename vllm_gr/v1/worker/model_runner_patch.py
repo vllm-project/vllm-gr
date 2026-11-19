@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from vllm.logger import init_logger
 
@@ -26,9 +26,6 @@ from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_DETERMINE_PATCH_MARKER,
     is_worker_runner_patched,
 )
-
-if TYPE_CHECKING:
-    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
 
 logger = init_logger(__name__)
 
@@ -320,10 +317,10 @@ def apply_worker_patches() -> None:
 def install_v1_worker_hooks(
     platform_module: Any,
     *,
-    cuda_hooks_type: CudaStageHooksType | None = None,
     workspace_load_patcher: Callable[..., Any] | None = None,
     constraint_max_batch: int = 1,
     implementation_id: str | None = None,
+    stage_factory: Any = None,
 ) -> None:
     """Apply the V1 wrapper factories to the native classes supplied by a provider."""
     from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
@@ -338,7 +335,12 @@ def install_v1_worker_hooks(
     for runner_name, runner_class in platform_module.discover_worker_runners():
         if is_worker_runner_patched(runner_class):
             if implementation_id is not None:
-                install_runner_lifecycle(runner_class, implementation_id, prepare="_prepare_inputs")
+                install_runner_lifecycle(
+                    runner_class,
+                    implementation_id,
+                    prepare="_prepare_inputs",
+                    stage_factory=stage_factory,
+                )
             continue
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
@@ -372,9 +374,7 @@ def install_v1_worker_hooks(
         if platform_shutdown_patcher is not None:
             runner_class.shutdown = platform_shutdown_patcher(runner_class.shutdown)
 
-        runner_class.execute_model = make_patched_execute_model(
-            runner_class.execute_model, hooks_type=cuda_hooks_type
-        )
+        runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
         update_states_patch = getattr(platform_module, "make_patched_update_states", None)
         if update_states_patch is not None:
             runner_class._update_states = update_states_patch(runner_class._update_states)
@@ -419,7 +419,6 @@ def install_v1_worker_hooks(
                 _orig: Callable[..., Any],
                 _beam_capture: Callable[..., Any] | None,
                 _prefill_capture: Callable[..., Any] | None,
-                hooks_type: CudaStageHooksType | None,
             ) -> Callable[..., Any]:
                 @wraps(_orig)
                 def patched_capture_model(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -431,7 +430,7 @@ def install_v1_worker_hooks(
                     from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
                     if _get_gr_config(self).beam_execution_mode is BeamExecutionMode.V1:
-                        capture_async_forward(self, hooks_type=hooks_type)
+                        capture_async_forward(self)
                     elif _beam_capture is not None:
                         try:
                             _beam_capture(self)
@@ -474,9 +473,7 @@ def install_v1_worker_hooks(
 
                 return patched_capture_model
 
-            patched = make_patched_capture_model(
-                _orig_capture_model, beam_capture, prefill_capture, cuda_hooks_type
-            )
+            patched = make_patched_capture_model(_orig_capture_model, beam_capture, prefill_capture)
             setattr(patched, _WORKER_CAPTURE_PATCH_MARKER, True)
             runner_class.capture_model = patched
 
@@ -500,6 +497,11 @@ def install_v1_worker_hooks(
         if callable(getattr(runner_class, "load_model", None)):
             runner_class.load_model = bind_after_model_load(runner_class.load_model)
         if implementation_id is not None:
-            install_runner_lifecycle(runner_class, implementation_id, prepare="_prepare_inputs")
+            install_runner_lifecycle(
+                runner_class,
+                implementation_id,
+                prepare="_prepare_inputs",
+                stage_factory=stage_factory,
+            )
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)

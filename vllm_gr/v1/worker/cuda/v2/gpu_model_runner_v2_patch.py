@@ -119,8 +119,6 @@ def make_patched_execute_model_v2(
     if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
         return _orig_execute_model
 
-    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-
     @wraps(_orig_execute_model)
     def _patched_execute_model_step_v2(
         self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
@@ -134,7 +132,6 @@ def make_patched_execute_model_v2(
             scheduler_output,
             _orig_execute_model,
             *args,
-            hooks_type=CudaStageHooksV2,
             **kwargs,
         )
         if stage is not gr_execution._NOT_A_STAGE_FRAME:
@@ -356,12 +353,15 @@ def _apply_v2_runner_patches() -> None:
     constraint marker that the V2 validation gate checks.
     """
     from vllm_gr.platforms.binding import bind_after_model_load
+    from vllm_gr.platforms.cuda.stage import create_v2_stage
     from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
     for runner_name, runner_type in discover_worker_runners():
         runner_class = cast(Any, runner_type)
         if is_worker_runner_v2_patched(runner_class):
-            install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
+            install_runner_lifecycle(
+                runner_class, V2_RUNNER, prepare="prepare_inputs", stage_factory=create_v2_stage
+            )
             continue
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(
@@ -410,13 +410,15 @@ def _apply_v2_runner_patches() -> None:
         runner_class.load_model = bind_after_model_load(
             runner_class.load_model, close_runtime=v2_resources.close_v2_runtime
         )
-        install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
+        install_runner_lifecycle(
+            runner_class, V2_RUNNER, prepare="prepare_inputs", stage_factory=create_v2_stage
+        )
         logger.info("%s V2 hooks patched successfully.", runner_name)
 
 
 def install() -> None:
     """Install shared CUDA Worker utilities before patching the V2 runner."""
-    from vllm_gr.platforms.cuda import install_worker_hooks
+    from vllm_gr.platforms.cuda.provider import install_worker_hooks
 
     install_worker_hooks()
     _apply_v2_runner_patches()

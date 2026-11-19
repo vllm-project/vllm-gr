@@ -171,7 +171,13 @@ def test_execute_failure_is_propagated_to_sampling(
     from vllm_gr.v1.worker.gr_execution import execute_gr_stage
 
     owner = sample_owner
+    from vllm_gr.platforms.cuda.stage import CudaStageExecutionService
+    from vllm_gr.v1.beam.decision_ops import reference_ops
+
     owner.worker.device = "cuda"
+    owner.worker._gr_unplanned_stage = CudaStageExecutionService(
+        "cuda.v1", reference_ops(), False, type(owner.hooks)
+    )
     error = RuntimeError("native execution failed")
     owner.execute = Mock(side_effect=error)
     monkeypatch.setattr(stages, "get_stage_runner", Mock(return_value=owner))

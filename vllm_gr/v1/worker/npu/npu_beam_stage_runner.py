@@ -81,19 +81,13 @@ class NPUEagerBeamStageRunner:
         return next(iter(mapping.values()))
 
     def _uses_dynamic_state(self, plan: NPUEagerStagePlan) -> bool:
+        from vllm_gr.v1.engine.npu_admission import uses_dynamic_decision
+
         metadata = self._metadata(self.worker._current_scheduler_output)
         output_options = getattr(metadata, "output_options", None)
-        capacity = plan.execution.beam_width
-        widths = plan.execution.dynamic_beam_widths
-        # Preserve native fixed-width execution and its tie ordering. The
-        # fused multi-step final selector requires a multiple of 32 results.
-        native_schedule = widths is None or (
-            all(width == capacity for width in widths) and (len(widths) == 1 or capacity % 32 == 0)
-        )
-        return (
-            getattr(plan.execution, "per_parent_beam_widths", None) is not None
-            or not native_schedule
-            or getattr(output_options, "num_return_sequences", capacity) != capacity
+        return uses_dynamic_decision(
+            plan.execution,
+            getattr(output_options, "num_return_sequences", plan.execution.beam_width),
         )
 
     def _needs_parent_history(self) -> bool:

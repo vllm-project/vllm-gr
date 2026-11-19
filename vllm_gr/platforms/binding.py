@@ -63,20 +63,32 @@ class BackendBinding:
     constraint_execution: Any
 
     def report(self) -> dict[str, Any]:
-        return {
-            "ready": True,
-            "fingerprint": self.plan.fingerprint,
-            "services": {
-                "runner": _implementation_id(self.runner_adapter),
-                "attention": _implementation_id(self.attention_executor),
-                "constraint": _implementation_id(self.constraint_execution),
-            },
+        services = {
+            "runner": _implementation_id(self.runner_adapter),
+            "attention": _implementation_id(self.attention_executor),
+            "constraint": _implementation_id(self.constraint_execution),
         }
+        if self.plan.choices.to_dict().get("operator_policy"):
+            stage = self.runner_adapter.stage
+            services.update(
+                stage=stage.implementation_id, operator=stage.decision.implementation_id
+            )
+        return {"ready": True, "fingerprint": self.plan.fingerprint, "services": services}
+
+
+def _clear_unplanned_stage(runner: Any, keep: Any = None) -> None:
+    unplanned = getattr(runner, "_gr_unplanned_stage", None)
+    if unplanned is not None:
+        runner._gr_unplanned_stage = None
+        if unplanned is not keep:
+            _close_services([unplanned])
 
 
 def close_backend_binding(runner: Any) -> None:
     binding = getattr(runner, _BINDING_ATTR, None)
     setattr(runner, _BINDING_ATTR, None)
+    adapter = binding.runner_adapter if binding is not None else None
+    _clear_unplanned_stage(runner, getattr(adapter, "stage", None))
     if binding is not None:
         if getattr(runner, "_gr_constraint_execution", None) is binding.constraint_execution:
             runner._gr_constraint_execution = None
@@ -122,6 +134,25 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
         for phase in getattr(type(runner), "_gr_runner_methods", ()):
             if not callable(getattr(adapter, phase, None)):
                 raise RuntimeError(f"Backend runner adapter does not implement {phase}()")
+        if choices.get("operator_policy"):
+            stage = getattr(adapter, "stage", None)
+            if getattr(stage, "implementation_id", None) != choices.get("stage"):
+                raise RuntimeError("Worker did not bind the admitted stage implementation")
+            for method in (
+                "execute",
+                "retire",
+                "capture_startup_graph",
+                "admit_unconstrained_beam",
+            ):
+                if not callable(getattr(stage, method, None)):
+                    raise RuntimeError(f"Backend stage does not implement {method}()")
+            operators = getattr(stage, "decision", None)
+            if (
+                not getattr(operators, "implementation_id", None)
+                or not callable(getattr(operators, "select", None))
+                or not callable(getattr(operators, "reorder", None))
+            ):
+                raise RuntimeError("Worker did not bind a Beam decision operator")
         attention = None
         if choices.get("requires_attention", False):
             attention = selected.create_attention_executor(plan=plan, device=device)
@@ -152,6 +183,7 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
                 raise RuntimeError("Required canonical constraint backend was not loaded")
         binding = BackendBinding(plan, adapter, attention, constraint)
         setattr(runner, _BINDING_ATTR, binding)
+        _clear_unplanned_stage(runner, getattr(adapter, "stage", None))
         return binding
     except BaseException:
         preloaded = getattr(runner, "_gr_constraint_execution", None)

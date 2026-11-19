@@ -7,9 +7,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial, wraps
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    from vllm_gr.platforms.interface import StageExecution
     from vllm_gr.platforms.plan import BackendPlan
 
 
@@ -20,10 +21,14 @@ class NativeRunnerAdapter:
     execute_model: Callable[..., Any]
     prepare_inputs: Callable[..., Any]
     sample_tokens: Callable[..., Any] | None
+    stage: StageExecution | None = None
 
     def close(self) -> None:
         # Drop bound callables and their strong references to the native runner.
         self.execute_model = self.prepare_inputs = self.sample_tokens = _closed
+        stage, self.stage = self.stage, None
+        if stage is not None and callable(close := getattr(stage, "close", None)):
+            close()
 
 
 def _closed(*args: Any, **kwargs: Any) -> Any:
@@ -43,7 +48,9 @@ def _route_method(original: Any, phase: str) -> Any:
     return routed
 
 
-def install_runner_lifecycle(runner_class: Any, implementation_id: str, *, prepare: str) -> None:
+def install_runner_lifecycle(
+    runner_class: Any, implementation_id: str, *, prepare: str, stage_factory: Any = None
+) -> None:
     """Keep native signatures and the execute/sample completion boundaries separate."""
     marker = runner_class.__dict__.get("_gr_runner_implementation_id")
     if marker == implementation_id:
@@ -65,6 +72,9 @@ def install_runner_lifecycle(runner_class: Any, implementation_id: str, *, prepa
         wrappers[name] = _route_method(original, phase)
     for name, wrapper in wrappers.items():
         setattr(runner_class, name, wrapper)
+    runner_class._gr_stage_factory = (
+        staticmethod(stage_factory) if stage_factory is not None else None
+    )
     runner_class._gr_runner_methods = methods
     runner_class._gr_runner_implementation_id = implementation_id
 
@@ -92,6 +102,31 @@ def bind_native_runner(
         if implementation is None:
             raise RuntimeError(f"Worker is missing the installed {phase} entry point")
         bound[phase] = partial(implementation, runner)
+    factory = getattr(type(runner), "_gr_stage_factory", None)
+    stage = factory(plan=plan, runner=runner) if factory is not None else None
     return NativeRunnerAdapter(
-        plan, expected, bound["execute_model"], bound["prepare_inputs"], bound.get("sample_tokens")
+        plan,
+        expected,
+        bound["execute_model"],
+        bound["prepare_inputs"],
+        bound.get("sample_tokens"),
+        stage,
     )
+
+
+def get_stage_execution(runner: Any) -> StageExecution:
+    """Use the runner's service; unplanned native configs use their installed factory."""
+    binding = getattr(runner, "_gr_backend_binding", None)
+    if binding is not None:
+        stage = getattr(binding.runner_adapter, "stage", None)
+        if stage is None:
+            raise RuntimeError("Admitted runner has no stage execution service")
+        return cast("StageExecution", stage)
+    stage = getattr(runner, "_gr_unplanned_stage", None)
+    if stage is None:
+        factory = getattr(type(runner), "_gr_stage_factory", None)
+        if factory is None:
+            raise RuntimeError("Native runner has no installed GR stage execution service")
+        stage = factory(plan=None, runner=runner)
+        runner._gr_unplanned_stage = stage
+    return cast("StageExecution", stage)

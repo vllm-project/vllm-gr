@@ -1912,21 +1912,25 @@ def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, d
     npu = Mock(return_value=stage)
     monkeypatch.setattr(gpu_beam_stage_runner, "get_stage_runner", cuda)
     monkeypatch.setattr(npu_beam_stage_runner, "get_npu_stage_runner", npu)
-    hooks = object()
-    worker = SimpleNamespace(device=device)
+    from vllm_gr.platforms.ascend.stage import create_stage
+    from vllm_gr.platforms.cuda.stage import create_v1_stage
+    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+
+    worker = SimpleNamespace(device=device, vllm_config=SimpleNamespace(additional_config={}))
+    if device == "cuda":
+        worker._gr_unplanned_stage = create_v1_stage(plan=None, runner=worker)
+    elif device == "npu":
+        worker._gr_unplanned_stage = create_stage(plan=None, runner=worker)
     scheduled = _eager_stage_output(kind="prefill")
     if device == "cpu":
-        with pytest.raises(ValueError, match="no execution adapter"):
-            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
+        with pytest.raises(RuntimeError, match="no installed GR stage execution service"):
+            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object())
         cuda.assert_not_called()
         npu.assert_not_called()
     else:
-        assert (
-            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
-            is output
-        )
+        assert _gr_dispatch._dispatch_stage_frame(worker, scheduled, object()) is output
         if device == "cuda":
-            assert cuda.call_args.kwargs["hooks_type"] is hooks
+            assert cuda.call_args.kwargs["hooks_type"] is CudaStageHooksV1
             npu.assert_not_called()
         else:
             npu.assert_called_once()

@@ -129,7 +129,7 @@ def test_native_output_completion_preserves_async_receipt(monkeypatch, hooks_cls
         execute = make_patched_execute_model_v2(native_execute)
         sample = make_patched_sample_tokens_v2(native_sample)
     else:
-        execute = make_patched_execute_model(native_execute, hooks_type=hooks_cls)
+        execute = make_patched_execute_model(native_execute)
         sample = make_patched_sample_tokens_gpu(native_sample)
     assert execute(worker, scheduled) is None
     assert sample(worker, None) is output
@@ -148,6 +148,10 @@ def test_partial_gr_prefill_rejected_without_native_side_effects(monkeypatch, ho
     worker = SimpleNamespace(
         device="cuda", execute_model_state=state, kv_connector_output=connector
     )
+    from vllm_gr.platforms.cuda.stage import create_v1_stage, create_v2_stage
+
+    factory = create_v2_stage if hooks_cls is CudaStageHooksV2 else create_v1_stage
+    worker._gr_unplanned_stage = factory(plan=None, runner=worker)
     before = vars(worker).copy()
     scheduled = SchedulerOutput.make_empty()
     m = metadata(output=fault != "no_output")
@@ -161,7 +165,7 @@ def test_partial_gr_prefill_rejected_without_native_side_effects(monkeypatch, ho
     monkeypatch.setattr(hooks_cls, "finish_native_output", finish)
     message = "complete, output-producing Prefill" if fault == "no_output" else "partial Prefill"
     with pytest.raises(ValueError, match=message):
-        execute_gr_stage(worker, scheduled, native, hooks_type=hooks_cls)
+        execute_gr_stage(worker, scheduled, native)
     native.assert_not_called()
     finish.assert_not_called()
     assert vars(worker) == before

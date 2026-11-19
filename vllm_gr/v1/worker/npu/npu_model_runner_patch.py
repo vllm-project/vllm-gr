@@ -1364,6 +1364,7 @@ def is_patched(runner_class: type) -> bool:
 
 def install() -> None:
     """Install the Ascend runner after its native worker initializes device ops."""
+    from vllm_gr.platforms.ascend.stage import create_stage
     from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
     from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
 
@@ -1371,4 +1372,5 @@ def install() -> None:
         sys.modules[__name__],
         constraint_max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
         implementation_id=__name__,
+        stage_factory=create_stage,
     )
