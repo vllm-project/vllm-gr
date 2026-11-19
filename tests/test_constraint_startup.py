@@ -31,6 +31,14 @@ from vllm_gr.constraints.startup import (
 )
 
 
+def _config_service(*, backend_id: str, supports_constraint_vocab_slicing: bool) -> Any:
+    """A backend configuration policy answering the vocabulary-slicing question."""
+    return SimpleNamespace(
+        backend_id=backend_id,
+        supports_constraint_vocab_slicing=lambda: supports_constraint_vocab_slicing,
+    )
+
+
 def _make_tokenizer() -> MagicMock:
     result = MagicMock()
     result.convert_tokens_to_ids.side_effect = lambda values: [int(value) for value in values]
@@ -74,9 +82,14 @@ def _fake_activate_provider(
     """Route activate_current_backend to a fake provider without importing vLLM."""
 
     def fake_activate() -> Any:
+        backend_id = "cuda" if device_type == "cuda" else "ascend"
         return SimpleNamespace(
-            backend_id="cuda" if device_type == "cuda" else "ascend",
+            backend_id=backend_id,
             device_type=device_type,
+            create_config_service=lambda: _config_service(
+                backend_id=backend_id,
+                supports_constraint_vocab_slicing=device_type == "cuda",
+            ),
             create_constrained_topk_execution=lambda device=None: adapter,
         )
 
@@ -130,26 +143,53 @@ class TestValidateConstraintTablePlatform:
     def test_accepts_default_config(self) -> None:
         validate_constraint_table_platform(GRConfig())  # must not raise
 
-    def test_rejects_vocab_offset(self) -> None:
-        with pytest.raises(ValueError, match="vocab slicing"):
+    def test_rejects_vocab_offset_without_a_policy(self) -> None:
+        """An absent backend policy fails closed rather than permitting slicing."""
+        with pytest.raises(RuntimeError, match="no configuration service"):
             validate_constraint_table_platform(GRConfig(vocab_offset=1024))
+
+    def test_a_service_missing_the_contract_is_reported_not_read_as_denial(self) -> None:
+        """A backend that cannot answer is a distinct failure from one that says no."""
+        with pytest.raises(RuntimeError, match="supports_constraint_vocab_slicing"):
+            validate_constraint_table_platform(
+                GRConfig(vocab_offset=1024),
+                service=SimpleNamespace(backend_id="acme-tpu"),
+            )
 
     def test_rejects_vocab_slice_size(self) -> None:
         with pytest.raises(ValueError, match="vocab slicing"):
-            validate_constraint_table_platform(GRConfig(vocab_slice_size=1024))
+            validate_constraint_table_platform(
+                GRConfig(vocab_slice_size=1024),
+                service=_config_service(
+                    backend_id="ascend", supports_constraint_vocab_slicing=False
+                ),
+            )
 
-    def test_cuda_accepts_complete_vocab_slice(self) -> None:
+    def test_backend_that_supports_slicing_accepts_it(self) -> None:
         validate_constraint_table_platform(
             GRConfig(vocab_offset=1000, vocab_slice_size=1024),
-            backend_id="cuda",
+            service=_config_service(backend_id="cuda", supports_constraint_vocab_slicing=True),
         )
 
     def test_npu_still_rejects_vocab_slice(self) -> None:
         with pytest.raises(ValueError, match="platform 'ascend'"):
             validate_constraint_table_platform(
                 GRConfig(vocab_offset=1000, vocab_slice_size=1024),
-                backend_id="ascend",
+                service=_config_service(
+                    backend_id="ascend", supports_constraint_vocab_slicing=False
+                ),
             )
+
+    def test_an_unknown_backend_can_enable_slicing_without_editing_this_check(self) -> None:
+        """A provider ID this module has never heard of is accepted on its own answer.
+
+        This is the #714 extension guarantee: the decision comes from the
+        registered service, not from a backend-ID allowlist here.
+        """
+        validate_constraint_table_platform(
+            GRConfig(vocab_offset=1000, vocab_slice_size=1024),
+            service=_config_service(backend_id="acme-tpu", supports_constraint_vocab_slicing=True),
+        )
 
 
 class TestCompileConstraintTableResource:

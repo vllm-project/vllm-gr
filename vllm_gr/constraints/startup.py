@@ -107,23 +107,43 @@ def create_constraint_execution(
 def validate_constraint_table_platform(
     gr_config: GRConfig,
     *,
-    backend_id: str | None = None,
+    service: Any | None = None,
 ) -> None:
     """Reject configurations the selected Constraint Table backend cannot run.
 
     A backend that carries global table token ids alongside a sliced logits
     window accepts vocabulary slicing; one that keeps the full-vocabulary ABI
-    rejects it. The answer is backend identity, so shared code never compares a
-    device name.
+    rejects it. The answer belongs to the backend's configuration service, so
+    shared code never compares a device name or a backend-ID allowlist: an
+    external backend that answers ``True`` is accepted without editing this
+    function.
+
+    ``service`` is the selected provider's ``BackendConfigService``. A caller
+    that cannot supply one fails closed — an absent policy is not permission.
+    A service that does not implement the contract is reported as such rather
+    than read as ``False``: "this backend answered no" and "this backend did not
+    answer" are different failures.
     """
     slicing_enabled = gr_config.vocab_offset is not None or gr_config.vocab_slice_size is not None
-    if slicing_enabled and backend_id != "cuda":
-        raise ValueError(
-            "constraint_backend='constraint_table' cannot be combined with "
-            f"vocab slicing (vocab_offset={gr_config.vocab_offset!r}, "
-            f"vocab_slice_size={gr_config.vocab_slice_size!r}) on platform "
-            f"{backend_id or 'unknown'!r}"
+    if not slicing_enabled:
+        return
+    backend_id = getattr(service, "backend_id", None)
+    supports = getattr(service, "supports_constraint_vocab_slicing", None)
+    if not callable(supports):
+        raise RuntimeError(
+            "constraint_backend='constraint_table' cannot be validated: the selected "
+            f"backend {backend_id or 'unknown'!r} has no configuration service that "
+            "answers supports_constraint_vocab_slicing(); "
+            "implement BackendConfigService before enabling Constraint Tables"
         )
+    if supports():
+        return
+    raise ValueError(
+        "constraint_backend='constraint_table' cannot be combined with "
+        f"vocab slicing (vocab_offset={gr_config.vocab_offset!r}, "
+        f"vocab_slice_size={gr_config.vocab_slice_size!r}) on platform "
+        f"{backend_id or 'unknown'!r}"
+    )
 
 
 def compile_constraint_table_resource(
@@ -242,7 +262,7 @@ def prepare_constraint_table(
     # here rather than at the first constrained step.
     provider = activate_current_backend()
     if gr_config is not None:
-        validate_constraint_table_platform(gr_config, backend_id=provider.backend_id)
+        validate_constraint_table_platform(gr_config, service=provider.create_config_service())
     # Startup-time fail-fast (issue #246 §7): the probe adapter is discarded;
     # the Worker lazily creates its own with the runner device (N3).
     create_constraint_execution()

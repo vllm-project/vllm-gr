@@ -270,6 +270,27 @@ Metadata construction, KV memory management, and the shared execute-model
 wrapper are deliberately outside this contract until their owning migration
 stages define stable boundaries.
 
+## Constraint Table admission
+
+Constraint Tables are not a separate provider surface. The selected provider
+answers the two questions that would otherwise be a backend-name allowlist:
+
+| Call | Question it answers |
+| --- | --- |
+| `create_config_service().supports_constraint_vocab_slicing()` | Whether this backend's table ABI accepts a sliced logits window |
+| `create_constrained_topk_execution(device=...)` | Which operator executes constrained selection, or `None` when this backend has none |
+
+`vllm_gr/constraints/startup.py` asks the first through the provider's
+configuration service, so a backend ID this module has never seen is admitted on
+its own answer. An absent policy fails closed: missing configuration service
+data is not permission to slice. The second is a hard requirement — a provider
+that returns `None`, or an adapter whose `is_available()` is `False`, aborts
+startup rather than degrading to Trie.
+
+The per-adapter table classes, artifact identity and payload compatibility stay
+in `vllm_gr/constraints/` and remain backend-owned; the provider selects which
+implementation runs, it does not define the canonical selection semantics.
+
 ## External provider entry points
 
 External packages register provider objects in this entry-point group:
