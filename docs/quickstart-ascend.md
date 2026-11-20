@@ -62,6 +62,14 @@ See the [vllm-ascend v0.30.0rc2 installation reference](https://github.com/vllm-
 
 3. **Install xllm-ops**
 
+The `-n` flag in the `bash build.sh` command below selects only regular aclnn
+operators. Upstream xllm-ops always depends on the `inner/` and `exc/` descriptor
+files, but this subset never generates them, so the build stops with
+`No rule to make target '.../inner/aic-<soc>-ops-info.ini'`. Until the fix lands
+upstream, patch the xllm-ops checkout: in `cmake/func.cmake`, add those files to
+the `parse_ini_to_json.py` arguments and the `DEPENDS` list only when
+`generate_aclnn_inner_srcs` or `generate_exclude_proto_srcs` is set.
+
 ```bash
 # Clone the xllm-ops repository
 git clone https://github.com/xLLM-AI/xllm-ops.git
