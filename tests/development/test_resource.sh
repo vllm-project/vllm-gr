@@ -61,20 +61,20 @@ rc=$?
 set -e
 
 if [ $rc -ne 0 ] || [ -z "$GPU_ID" ]; then
-    echo "SKIP (Timeout or no GPU available matching criteria within 15 seconds - GPUs are likely busy)"
+    echo "SKIP (No device selected within 15 seconds; inspect the backend diagnostics above)"
     exit 0
 fi
-echo "PASSED (Got GPU ID: $GPU_ID)"
+echo "PASSED (Got device ID: $GPU_ID)"
 
 # 2. Test lock_gpu & unlock_gpu
-echo -n "Testing lock_gpu on GPU $GPU_ID... "
+echo -n "Testing lock_gpu on device $GPU_ID... "
 set +e
 LOCK_PID=$(lock_gpu "$GPU_ID")
 rc=$?
 set -e
 
 if [ $rc -ne 0 ] || [ -z "$LOCK_PID" ]; then
-    echo "FAILED (lock_gpu did not return a PID. Check for missing EGL/GL/CUDA dependencies in Python)"
+    echo "FAILED (lock_gpu did not return a PID; inspect the backend diagnostics above)"
     exit 1
 fi
 
@@ -92,12 +92,12 @@ if ps -p "$LOCK_PID" > /dev/null; then
     kill -9 "$LOCK_PID" 2>/dev/null || true # Cleanup
     exit 1
 fi
-echo "PASSED (GPU unlocked)"
+echo "PASSED (Device unlocked)"
 
 # 3. Test get_gpus
-echo -n "Testing get_gpus (requesting 2 GPUs)... "
+echo -n "Testing get_gpus (requesting 2 devices)... "
 if [ "$GPU_COUNT" -lt 2 ]; then
-    echo "SKIP (System has less than 2 GPUs)"
+    echo "SKIP (System has fewer than 2 devices)"
     exit 0
 fi
 
@@ -107,19 +107,19 @@ rc=$?
 set -e
 
 if [ $rc -ne 0 ] || [ -z "$GPU_IDS" ]; then
-    echo "SKIP (Timeout or no 2 GPUs available within 15 seconds - GPUs are likely busy)"
+    echo "SKIP (Two devices were not selected within 15 seconds; inspect the backend diagnostics above)"
     exit 0
 fi
 
 IFS=',' read -ra ID_ARRAY <<< "$GPU_IDS"
 if [ "${#ID_ARRAY[@]}" -ne 2 ]; then
-    echo "FAILED (Expected 2 GPUs, got ${#ID_ARRAY[@]}: $GPU_IDS)"
+    echo "FAILED (Expected 2 devices, got ${#ID_ARRAY[@]}: $GPU_IDS)"
     exit 1
 fi
-echo "PASSED (Got GPU IDs: $GPU_IDS)"
+echo "PASSED (Got device IDs: $GPU_IDS)"
 
 # 4. Test lock_gpus & unlock_gpus
-echo -n "Testing lock_gpus on GPUs '$GPU_IDS'... "
+echo -n "Testing lock_gpus on devices '$GPU_IDS'... "
 set +e
 LOCK_PIDS=$(lock_gpus "$GPU_IDS")
 rc=$?
@@ -143,7 +143,7 @@ sleep 1
 if pgrep -P "$$" -f "import ctypes" > /dev/null; then
     echo "WARNING (Some Python lock processes might still be lingering)"
 fi
-echo "PASSED (GPUs unlocked)"
+echo "PASSED (Devices unlocked)"
 
 # 5. Selection + lock under a nonzero single-device mask (CUDA, needs >=2 GPUs).
 if ! command -v npu-smi > /dev/null && [ "$GPU_COUNT" -ge 2 ]; then
