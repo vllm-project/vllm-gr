@@ -391,7 +391,9 @@ def _repair_row_kernel(
                     tile_top = tl.min(packed, axis=0, keep_dims=True)
                     running = tl.minimum(running, tile_top)
                 else:
-                    tile_top = ~tl.topk(~packed, TOPK_BLOCK)
+                    # The final Top-K accepts unordered keys. When every key
+                    # in this tile survives local selection, merge them as-is.
+                    tile_top = packed if TOPK_BLOCK == BLOCK else ~tl.topk(~packed, TOPK_BLOCK)
                     both = tl.cat(running, tile_top, can_reorder=True)
                     running = ~tl.topk(~both, TOPK_BLOCK)
         key = running

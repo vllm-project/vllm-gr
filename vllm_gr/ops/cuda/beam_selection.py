@@ -254,6 +254,7 @@ def _bootstrap_beam_outputs_kernel(
     COMPACT_INPUT: tl.constexpr,
     WRITE_FLAT_INDICES: tl.constexpr,
     BLOCK: tl.constexpr,
+    REUSE_ORDERED_CANDIDATES: tl.constexpr = False,
 ):
     """Expand the first live parent of every request from one beam to W."""
 
@@ -280,7 +281,16 @@ def _bootstrap_beam_outputs_kernel(
         other=-float("inf"),
     )
     packed = _pack_score_flat(score, rank, candidate_valid)
-    selected = tl.sort(packed, descending=False)
+    if REUSE_ORDERED_CANDIDATES:
+        # Compare the same packed keys as the fallback sort. Unordered
+        # candidates or valid lanes following a stop/masked lane still sort.
+        previous = tl.gather(packed, tl.maximum(rank - 1, 0), axis=0)
+        if tl.sum(((rank > 0) & (packed < previous)).to(tl.int32), axis=0) != 0:
+            selected = tl.sort(packed, descending=False)
+        else:
+            selected = packed
+    else:
+        selected = tl.sort(packed, descending=False)
     selected_flat = (selected & 0x00000000FFFFFFFF).to(tl.int32)
     selected_valid = (selected_flat >= 0) & (selected_flat < candidate_width)
     token = tl.load(
@@ -693,6 +703,44 @@ def _hierarchical_topk_out(
     return input_scores, input_indices, scratch_stride
 
 
+def bootstrap_beam_outputs_out(
+    cumulative_logprobs: torch.Tensor,
+    top_tokens: torch.Tensor,
+    top_logprobs: torch.Tensor,
+    candidate_valid_mask: torch.Tensor | None,
+    out_token_ids: torch.Tensor,
+    out_parent_indices: torch.Tensor,
+    out_scores: torch.Tensor,
+    out_grouped_flat_indices: torch.Tensor | None,
+    *,
+    batch_size: int,
+    beam_width: int,
+    candidate_width: int,
+    compact_input: bool,
+    reuse_ordered_candidates: bool = False,
+    num_warps: int = 4,
+) -> None:
+    """Expand the first parent of each request into caller-owned Beam outputs."""
+    _bootstrap_beam_outputs_kernel[(batch_size,)](
+        cumulative_logprobs,
+        top_tokens,
+        top_logprobs,
+        candidate_valid_mask if candidate_valid_mask is not None else top_logprobs,
+        out_token_ids,
+        out_parent_indices,
+        out_scores,
+        out_grouped_flat_indices if out_grouped_flat_indices is not None else out_parent_indices,
+        beam_width,
+        candidate_width,
+        HAS_VALID_MASK=candidate_valid_mask is not None,
+        COMPACT_INPUT=compact_input,
+        WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
+        BLOCK=triton.next_power_of_2(max(beam_width, candidate_width)),
+        REUSE_ORDERED_CANDIDATES=reuse_ordered_candidates,
+        num_warps=num_warps,
+    )
+
+
 def beam_search_group_cuda_out(
     cumulative_logprobs: torch.Tensor,
     top_tokens: torch.Tensor,
@@ -783,26 +831,19 @@ def beam_search_group_cuda_out(
             batch_size=batch_size,
             required_slots=required_slots,
         )
-        validity = candidate_valid_mask if candidate_valid_mask is not None else top_logprobs
-        _bootstrap_beam_outputs_kernel[(batch_size,)](
+        bootstrap_beam_outputs_out(
             cumulative_logprobs,
             top_tokens,
             top_logprobs,
-            validity,
+            candidate_valid_mask,
             out_token_ids,
             out_parent_indices,
             out_scores,
-            (
-                out_grouped_flat_indices
-                if out_grouped_flat_indices is not None
-                else out_parent_indices
-            ),
-            beam_width,
-            candidate_width,
-            HAS_VALID_MASK=candidate_valid_mask is not None,
-            COMPACT_INPUT=cumulative_logprobs.shape[0] == batch_size,
-            WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
-            BLOCK=triton.next_power_of_2(max(beam_width, candidate_width)),
+            out_grouped_flat_indices,
+            batch_size=batch_size,
+            beam_width=beam_width,
+            candidate_width=candidate_width,
+            compact_input=cumulative_logprobs.shape[0] == batch_size,
             num_warps=8 if block >= 128 else 4,
         )
         _parent_count_prefix_kernel[(batch_size, beam_width)](

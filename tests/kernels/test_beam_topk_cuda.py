@@ -155,6 +155,40 @@ def test_mcap_repair_path_is_exact_and_actually_taken() -> None:
     assert int(counts[0].item()) == top_k
 
 
+@pytest.mark.l2  # type: ignore[misc]
+@pytest.mark.parametrize("top_k", [769, 1024])  # type: ignore[misc]
+def test_mcap_wide_repair_keeps_exact_order(top_k: int) -> None:
+    """Exercise full-tile repair with ties, a partial tile, and short rows."""
+    vocab_size = 3 * 1024 + 513
+    logits = torch.full((3, vocab_size), -float("inf"), device="cuda")
+    logits[0, :2048] = 5
+    logits[1, :1024] = torch.linspace(0, 2, 1024, device="cuda")
+    logits[1, -513:] = 4
+    logits[2, :65] = -0.5
+    logits[2, 65] = float("nan")
+    logits[2, 66] = float("inf")
+    temperatures = torch.ones(3, device="cuda")
+    scratch = allocate_mcap_topk_scratch(3, vocab_size, top_k, logits.device, select="i64")
+    token_ids = torch.empty((3, top_k), dtype=torch.int32, device=logits.device)
+    logprobs = torch.empty((3, top_k), dtype=torch.float32, device=logits.device)
+    valid = torch.empty((3, top_k), dtype=torch.bool, device=logits.device)
+    counts = torch.empty(3, dtype=torch.int32, device=logits.device)
+    unconstrained_topk_mcap_out(
+        logits, temperatures, top_k, scratch, token_ids, logprobs, valid, counts
+    )
+    assert scratch.repair_flag[:2].tolist() == [1, 1]
+    assert scratch.tile_flag[1, -1].item() == 1
+
+    finite = torch.where(torch.isfinite(logits), logits, -float("inf"))
+    ids, scores, lengths = _oracle(finite.cpu(), temperatures.cpu(), top_k)
+    assert counts.tolist() == lengths
+    for row, length in enumerate(lengths):
+        torch.testing.assert_close(token_ids[row, :length].cpu(), ids[row], rtol=0, atol=0)
+        torch.testing.assert_close(logprobs[row, :length].cpu(), scores[row], rtol=1e-5, atol=1e-5)
+        assert valid[row, :length].all().item()
+        assert not valid[row, length:].any().item()
+
+
 def test_mcap_accepts_padded_rows_empty_tiles_and_nan() -> None:
     storage = torch.empty((2, 2112), dtype=torch.float32, device="cuda")
     logits = storage[:, :2048]
