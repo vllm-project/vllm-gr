@@ -18,12 +18,12 @@ Correctness guard (behavior probe): merely having a ``_tokenizer`` backend is
 not proof that bypassing the HuggingFace wrapper is byte-safe.  Since
 transformers v5 even legacy tokenizers (e.g. ``Qwen2Tokenizer``) subclass the
 tokenizers backend and report ``is_fast=True``, an ``isinstance`` check cannot
-distinguish them.  Such a legacy tokenizer's wrapper still augments
-added-token decoding: special ids such as ``<|im_start|>`` decode to their
-marker text through the wrapper but to an **empty string** through the raw
-Rust backend.  Skipping the wrapper there drops ChatML markers from the
-prompt prefix and silently corrupts downstream text slicing (evaluators slice
-``text[len(prompt):]``).  ``_rust_decode_verified`` therefore probes every
+distinguish them.  The raw Rust decoder defaults to skipping special tokens,
+while a wrapper can retain them by default. Both the probe and the selected
+backend call must pass the same explicit ``skip_special_tokens`` value;
+otherwise a compatible backend is rejected or prompt markers can disappear.
+Wrapper-specific added-token behavior can still differ with matching flags.
+``_rust_decode_verified`` therefore probes every
 *special* added token (plus a sample of regular ones) once per tokenizer and
 enables the Rust path only when both decoders agree.  ``skip_special_tokens``
 defaults to ``False``, matching the no-kwarg call sites (and transformers v5's
@@ -85,7 +85,9 @@ def _rust_decode_verified(tokenizer, backend) -> bool:
         ok = True
         for token_id in probe_ids:
             ids = [token_id]
-            if backend.decode(ids) != tokenizer.decode(ids, skip_special_tokens=False):
+            if backend.decode(ids, skip_special_tokens=False) != tokenizer.decode(
+                ids, skip_special_tokens=False
+            ):
                 ok = False
                 break
             if backend.decode(ids, skip_special_tokens=True) != tokenizer.decode(
@@ -133,7 +135,7 @@ def fast_decode(tokenizer, token_ids: Sequence[int], skip_special_tokens: bool =
     ):
         if skip_special_tokens:
             return backend.decode(ids, skip_special_tokens=True)
-        return backend.decode(ids)
+        return backend.decode(ids, skip_special_tokens=False)
     # Fast-tokenizer shortcut: ``PreTrainedTokenizerFast._decode`` is the
     # terminal implementation that ``decode`` dispatches to after its
     # ``to_py_obj`` conversion.  The inputs here are already plain Python
@@ -175,7 +177,7 @@ def fast_batch_decode(
     ):
         if skip_special_tokens:
             return backend.decode_batch(seqs, skip_special_tokens=True)
-        return backend.decode_batch(seqs)
+        return backend.decode_batch(seqs, skip_special_tokens=False)
     # Fast-tokenizer shortcut: ``batch_decode`` forwards to ``decode``'s
     # batched branch, which runs the recursive ``to_py_obj`` conversion over
     # the already-plain-``int`` sequences and then loops ``_decode`` per
