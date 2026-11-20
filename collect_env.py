@@ -516,6 +516,10 @@ def is_xnnpack_available():
         return "N/A"
 
 
+# GR settings that may be shared in public issue reports.
+PUBLIC_GR_ENV_VARS = {"VLLM_GR_TARGET_DEVICE"}
+
+
 def get_env_vars():
     try:
         from vllm.envs import environment_variables
@@ -523,7 +527,7 @@ def get_env_vars():
         # Partial installations may raise loader or initialization errors on import.
         environment_variables = {}
 
-    env_vars = ""
+    entries = []
     secret_terms = ("secret", "token", "api", "access", "password")
     report_prefix = (
         "TORCH",
@@ -536,15 +540,16 @@ def get_env_vars():
         "MKL_",
         "NVIDIA",
     )
-    for k, v in os.environ.items():
-        if any(term in k.lower() for term in secret_terms):
+    for name, value in sorted(os.environ.items()):
+        if any(term in name.lower() for term in secret_terms):
             continue
-        if k in environment_variables:
-            env_vars = env_vars + "{}={}".format(k, v) + "\n"
-        if k.startswith(report_prefix):
-            env_vars = env_vars + "{}={}".format(k, v) + "\n"
-
-    return env_vars
+        if name.startswith("VLLM_GR_"):
+            if name not in PUBLIC_GR_ENV_VARS:
+                continue
+        elif name not in environment_variables and not name.startswith(report_prefix):
+            continue
+        entries.append(f"{name}={value}")
+    return "\n".join(entries)
 
 
 def get_env_info():

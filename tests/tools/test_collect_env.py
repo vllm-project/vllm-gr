@@ -76,3 +76,23 @@ def test_empty_crash_directory_preserves_report(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(collect_env, "get_pretty_env_info", lambda: "report")
     collect_env.main()
     assert "report" in capsys.readouterr().out
+
+
+def test_public_gr_environment_is_sorted_and_filtered(monkeypatch):
+    # A plugin registration must not make a private GR variable reportable.
+    registry = SimpleNamespace(environment_variables={"CUDA_VISIBLE_DEVICES", "VLLM_GR_PRIVATE"})
+    monkeypatch.setitem(sys.modules, "vllm.envs", registry)
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "VLLM_GR_TARGET_DEVICE": "npu",
+            "VLLM_GR_PRIVATE": "internal",
+            "CUDA_VISIBLE_DEVICES": "0",
+            "NCCL_SECRET": "sensitive",
+        },
+    )
+    assert collect_env.get_env_vars().splitlines() == [
+        "CUDA_VISIBLE_DEVICES=0",
+        "VLLM_GR_TARGET_DEVICE=npu",
+    ]
