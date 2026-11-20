@@ -8,14 +8,15 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
+
 from ..identity import PlatformIdentity
 from ..interface import (
     PROVIDER_API_VERSION,
     BeamAttentionExecution,
     ModelRunnerInstaller,
 )
-from ..plan import BackendPlan, BackendRequest, PlanData
-from ..services import BoundService, BuiltinPlanSupport, require_provider_plan
+from ..services import BuiltinPlanSupport, require_provider_plan
 
 if TYPE_CHECKING:
     import torch
@@ -88,7 +89,9 @@ class NPUBackendProvider(BuiltinPlanSupport):
             ),
         )
 
-    def create_attention_executor(self, *, plan: BackendPlan, device: object) -> BoundService:
+    def create_attention_executor(
+        self, *, plan: BackendPlan, device: object
+    ) -> BeamAttentionExecution:
         require_provider_plan(self, plan)
         from vllm_gr.v1.attention.backends import beam_attn
 
@@ -101,10 +104,10 @@ class NPUBackendProvider(BuiltinPlanSupport):
             raise RuntimeError(
                 "Ascend attention mode is already fixed by another engine; use a separate process"
             )
-        module = beam_attn._get_platform_execution_module()
+        module = self.get_attention_execution()
         if not module.is_available():
             raise RuntimeError("Ascend attention implementation is unavailable")
-        return BoundService(plan, module, device=device)
+        return module
 
     def matches_legacy_identity(self, identity: PlatformIdentity) -> bool:
         """API v1 selected Ascend by its original tensor placement."""
@@ -139,17 +142,19 @@ class NPUBackendProvider(BuiltinPlanSupport):
         )
 
     def get_attention_execution(self) -> BeamAttentionExecution:
-        return cast(
-            BeamAttentionExecution,
-            import_module("vllm_gr.v1.attention.backends.beam_attn_npu"),
-        )
+        from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
+
+        path = "vllm_gr.v1.attention.backends.beam_attn_npu"
+        if _get_npu_decode_execution() == "xllm":
+            path += "_xllm"
+        return cast(BeamAttentionExecution, import_module(path))
 
     def create_constrained_topk_execution(
         self,
         *,
         device: str | torch.device | None = None,
         plan: BackendPlan | None = None,
-    ) -> "NPUConstrainedTopKExecution":
+    ) -> NPUConstrainedTopKExecution:
         """Create a fresh NPU constrained top-k execution adapter.
 
         The adapter is stateful (holds loaded tables + digest), so a new

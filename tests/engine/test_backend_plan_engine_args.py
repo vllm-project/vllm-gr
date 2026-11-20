@@ -10,13 +10,7 @@ import pytest
 
 from tests.platforms.test_backend_plan import Provider
 from vllm_gr.config import GRConfig
-from vllm_gr.engine import arg_utils_gr
-from vllm_gr.platforms import config as platform_config
-from vllm_gr.platforms import loader
-from vllm_gr.platforms.config import BackendConfigService
-from vllm_gr.platforms.cuda import CUDA_BACKEND
-from vllm_gr.platforms.legacy import legacy_config_service
-from vllm_gr.platforms.plan import (
+from vllm_gr.config.backend_plan import (
     BACKEND_PLAN_KEY,
     BackendPlan,
     BackendRequest,
@@ -24,6 +18,12 @@ from vllm_gr.platforms.plan import (
     ServiceRequirements,
     read_backend_plan,
 )
+from vllm_gr.engine import arg_utils_gr
+from vllm_gr.platforms import config as platform_config
+from vllm_gr.platforms import loader
+from vllm_gr.platforms.config import BackendConfigService
+from vllm_gr.platforms.cuda import CUDA_BACKEND
+from vllm_gr.platforms.legacy import legacy_config_service
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 

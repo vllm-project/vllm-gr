@@ -111,7 +111,7 @@ installers run or their ordering.
 
 - Scope: `core`; backend ID: `null`
 
-- Source: `vllm_gr/logprobs_patch.py`
+- Source: `vllm_gr/logprobs.py`
 - Target: `vllm.logprobs.FlatLogprobs.append_fast`
 - Mutation: existing method replacement
 - Platforms: GPU and NPU
@@ -289,13 +289,13 @@ native patch target. Coverage: `tests/platforms/test_backend_plan.py`.
 
 - Scope: `backend`; backend ID: `cuda`
 
-The CUDA provider patches `Worker.init_device` at process startup. Each worker
+The CUDA installer in `v1/worker/cuda/runner_installer.py` patches `Worker.init_device` at process startup. Each worker
 installs and verifies the runner generation selected by its vLLM configuration
 before constructing the native runner.
 
 The common model-load wrapper also binds the admitted backend plan after a
 successful load. Reload/shutdown release the runner-owned binding with the
-constraint runtime. `platforms/binding.py` owns this shared lifecycle logic;
+constraint runtime. `v1/worker/runner_binding.py` owns this shared lifecycle logic;
 `tests/platforms/test_backend_plan.py` covers isolation and failed binding.
 First binding and full reload compare the admitted plan while allowing a
 positive native `max_model_len` reduction within its admitted limit. Capability
@@ -369,6 +369,7 @@ and Decode capture policy remain active when this cache is disabled.
     - `GPUModelRunner.capture_model`
 - Common Worker target: `vllm.v1.worker.gpu_worker.Worker.reload_trie`, installed
   by `install_worker_utility_hooks` through the active CUDA Worker installer.
+  Each loaded Beam attention layer uses the executor identified by its runner readiness report.
   It delegates to `model_runner.constraint_backend.reload(path, version)` and
   leaves native `reload_weights` unchanged.
 - Model-load lifecycle: the common `load_model` wrapper publishes a
@@ -508,11 +509,11 @@ and Decode capture policy remain active when this cache is disabled.
 - Scope: `core`; backend ID: `null`
 
 - Source: `vllm_gr/ops/sliced_logits.py`
-- Reload helper: `vllm_gr/ops/lm_head_cache.py` installs post-load hooks for dense
+- Reload helper: `vllm_gr/v1/worker/lm_head_cache.py` installs post-load hooks for dense
   `ParallelLMHead` instances by type, including heads named `output` and aliases.
   Shared-weight owners retain their hooks; existing caches refresh in place.
   Coverage: `tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload`.
-- Installer: `vllm_gr/ops/sliced_logits_patch.py`
+- Installer: `vllm_gr/v1/worker/sliced_logits_patch.py`
 - Orchestration: `vllm_gr/patch.py`
 - Targets:
     - `LogitsProcessor.__init__`

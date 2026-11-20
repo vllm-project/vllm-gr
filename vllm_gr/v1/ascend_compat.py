@@ -70,9 +70,11 @@ def patch_npu_worker_init_device() -> int:
         # compile_or_warm_up_model runs in this child process.
         apply_penalties_warmup_oom_guard()
         # Mount the V1 worker utilities before native initialization.
-        from vllm_gr.ops.npu_stage_logits import install_npu_stage_weight_update_hooks
         from vllm_gr.v1.worker.model_runner_patch import (
             install_worker_utility_hooks,
+        )
+        from vllm_gr.v1.worker.npu.stage_projection import (
+            install_npu_stage_weight_update_hooks,
         )
 
         install_worker_utility_hooks(type(self))

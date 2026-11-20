@@ -232,7 +232,7 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-    from vllm_gr.ops.sliced_logits_patch import apply_sliced_logits_patch
+    from vllm_gr.v1.worker.sliced_logits_patch import apply_sliced_logits_patch
 
     apply_sliced_logits_patch()
 

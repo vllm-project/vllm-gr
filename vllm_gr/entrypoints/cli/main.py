@@ -78,7 +78,7 @@ def _gr_main(argv: list[str]) -> None:
     # Workload-owned arguments must not undergo serve-specific normalization.
     parser_type = FlexibleArgumentParser
     if command == "serve":
-        from vllm_gr.entrypoints.utils import patch_banner
+        from vllm_gr.entrypoints.cli.serve_banner import patch_banner
 
         patch_banner()
         parser_type = _serving_parser_type()

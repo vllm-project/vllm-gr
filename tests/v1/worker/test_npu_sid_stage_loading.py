@@ -57,8 +57,8 @@ def test_sid_maps_load_without_catalog_and_close(
 ) -> None:
     import vllm.tokenizers
 
-    from vllm_gr.ops import npu_stage_logits
     from vllm_gr.ops.npu import sid_stage_vocab
+    from vllm_gr.v1.worker.npu import stage_projection as npu_stage_logits
 
     runner = _runner()
     tokenizer = object()
@@ -108,8 +108,8 @@ def test_sid_load_failure_does_not_publish_partial_runtime(
 ) -> None:
     import vllm.tokenizers
 
-    from vllm_gr.ops import npu_stage_logits
     from vllm_gr.ops.npu import sid_stage_vocab
+    from vllm_gr.v1.worker.npu import stage_projection as npu_stage_logits
 
     runner = _runner()
     monkeypatch.setattr(

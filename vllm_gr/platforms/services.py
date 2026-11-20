@@ -7,10 +7,14 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-from .plan import PLAN_API_VERSION, BackendPlan, BackendRequest, PlanData
+from vllm_gr.config.backend_plan import (
+    PLAN_API_VERSION,
+    BackendPlan,
+    BackendRequest,
+    PlanData,
+)
 
 if TYPE_CHECKING:
     from .interface import ModelRunnerAdapter
@@ -39,6 +43,24 @@ def constraint_execution_override(*, device: Any) -> Any:
 
     logger.info("vllm-gr: constraint execution overridden to Torch oracle for CI/dev")
     return TorchConstrainedTopKExecution(device=device)
+
+
+def validate_required_services(
+    plan: BackendPlan, required: dict[str, str | None], reported: dict[str, Any], worker: str
+) -> None:
+    for name, expected in required.items():
+        actual = reported.get(name)
+        if not isinstance(actual, str) or not actual.strip():
+            raise RuntimeError(f"{worker} has no bound {name}")
+        if expected is not None and actual != expected:
+            label = (
+                "canonical constraint"
+                if name == "constraint" and plan.constraint_mode == "canonical"
+                else name
+            )
+            raise RuntimeError(
+                f"{worker} {label} implementation mismatch: expected {expected}, got {actual}"
+            )
 
 
 def validate_planning_api(provider: Any) -> None:
@@ -86,15 +108,6 @@ class BuiltinPlanSupport:
 
         require_provider_plan(self, plan)
         return bind_native_runner(plan, native_runner)
-
-    def create_attention_executor(self, *, plan: BackendPlan, device: Any) -> BoundService:
-        require_provider_plan(self, plan)
-        implementation = import_module(plan.choices.to_dict()["attention"])
-        if not implementation.is_available():
-            raise RuntimeError(
-                f"Backend {plan.backend_id!r} attention implementation is unavailable"
-            )
-        return BoundService(plan, implementation, device=device)
 
     def validate_worker(self, *, plan: BackendPlan, native_runner: Any) -> None:
         require_provider_plan(self, plan)

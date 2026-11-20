@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 from vllm_gr import pangu_compat
-from vllm_gr.ops import sliced_logits_patch
 from vllm_gr.v1.attention import selector_patch
+from vllm_gr.v1.worker import sliced_logits_patch
 
 logger = logging.getLogger("vllm_gr.patch")
 
@@ -434,7 +434,7 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
     return (
         patch(
             "flat_logprobs",
-            "vllm_gr.logprobs_patch",
+            "vllm_gr.logprobs",
             "patch_flat_logprobs",
             _validate_flat_logprobs_patch,
         ),

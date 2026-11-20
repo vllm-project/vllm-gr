@@ -470,7 +470,7 @@ def test_worker_graph_stats_hook_is_named_and_idempotent(
 ) -> None:
     import vllm.v1.worker.gpu_worker as gpu_worker
 
-    from vllm_gr.platforms.cuda import provider as cuda
+    from vllm_gr.v1.worker.cuda import runner_installer as cuda
 
     class FakeWorker:
         pass

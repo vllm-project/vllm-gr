@@ -179,9 +179,9 @@ def test_new_attention_batch_preparation_rolls_back_all_owned_slots(
     elif failure_point == "batch":
         monkeypatch.setattr(stage_module, "NPUBeamExecutionBatch", Mock(side_effect=failure))
     elif failure_point == "dynamic":
-        from vllm_gr.v1.beam.npu_dynamic_beam import NPUDynamicBeamState
+        from vllm_gr.v1.beam.dynamic_beam import DynamicBeamState
 
-        monkeypatch.setattr(NPUDynamicBeamState, "initialize", Mock(side_effect=failure))
+        monkeypatch.setattr(DynamicBeamState, "initialize", Mock(side_effect=failure))
     elif failure_point == "parent_history":
         monkeypatch.setattr(torch, "zeros_like", Mock(side_effect=failure))
 

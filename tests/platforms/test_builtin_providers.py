@@ -41,7 +41,7 @@ def test_cuda_provider_lazily_returns_platform_modules(
     envs = ModuleType("vllm.envs")
     setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
     monkeypatch.setitem(sys.modules, "vllm.envs", envs)
-    from vllm_gr.platforms.cuda import runner
+    from vllm_gr.v1.worker.cuda import runner_installer as runner
 
     gpu_attention = object()
     imported: list[str] = []
@@ -83,6 +83,42 @@ def test_npu_provider_lazily_returns_platform_modules(
         "vllm_gr.v1.worker.npu.npu_model_runner_patch",
         "vllm_gr.v1.attention.backends.beam_attn_npu",
     ]
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("mode", ["cascade", "xllm"])  # type: ignore[misc]
+def test_ascend_binding_uses_resolved_decode_implementation(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    from dataclasses import replace
+
+    from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
+    from vllm_gr.v1.attention.backends import beam_attn
+
+    module = ModuleType("beam_attn_npu" if mode == "cascade" else "beam_attn_npu_xllm")
+    monkeypatch.setattr(module, "is_available", lambda: True, raising=False)
+    monkeypatch.setattr(beam_attn, "_get_npu_decode_execution", lambda: mode)
+
+    def load(name: str) -> ModuleType:
+        assert name.rsplit(".", 1)[-1] == module.__name__
+        return module
+
+    monkeypatch.setattr(npu, "import_module", load)
+    provider = npu.NPU_BACKEND
+    empty = PlanData({})
+    plan = BackendPlan(
+        provider.backend_id,
+        provider.api_version,
+        BackendRequest(empty, empty, empty, empty),
+        PlanData({"decode_attention": "auto"}),
+    )
+    assert provider.create_attention_executor(plan=plan, device="npu") is module
+    assert provider.get_attention_execution() is module
+    plan = replace(
+        plan, choices=PlanData({"decode_attention": "xllm" if mode == "cascade" else "cascade"})
+    )
+    with pytest.raises(RuntimeError, match="Ascend attention mode"):
+        provider.create_attention_executor(plan=plan, device="npu")
 
 
 def test_cuda_runtime_patch_is_noop() -> None:

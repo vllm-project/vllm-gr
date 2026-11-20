@@ -10,16 +10,17 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_gr.config import GRConfig
-from vllm_gr.platforms import binding, loader
-from vllm_gr.platforms.binding import (
+from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
+from vllm_gr.platforms import loader
+from vllm_gr.platforms.planning import admit_backend_plan
+from vllm_gr.platforms.services import LegacyPlanningProvider
+from vllm_gr.v1.engine.worker_readiness import worker_backend_readiness
+from vllm_gr.v1.worker import runner_binding as binding
+from vllm_gr.v1.worker.runner_binding import (
     BackendBinding,
     bind_after_model_load,
     close_backend_binding,
 )
-from vllm_gr.platforms.plan import BackendPlan, BackendRequest, PlanData
-from vllm_gr.platforms.planning import admit_backend_plan
-from vllm_gr.platforms.readiness import worker_backend_readiness
-from vllm_gr.platforms.services import LegacyPlanningProvider
 from vllm_gr.v1.worker.runner_lifecycle import (
     bind_native_runner,
     has_runner_lifecycle,

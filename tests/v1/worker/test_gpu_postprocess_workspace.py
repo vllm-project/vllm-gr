@@ -102,7 +102,7 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
     from unittest.mock import Mock
 
     from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, GRConfig
-    from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
+    from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
     )
@@ -156,7 +156,9 @@ def test_cuda_admission_fixture_supports_unconstrained_head_selection(
     import torch
 
     from tests.kernels import beam_stage_test_utils as builders
-    from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
+    from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import (
+        BeamPostprocessWorkspace,
+    )
     from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
         _get_unconstrained_head_layout,
     )

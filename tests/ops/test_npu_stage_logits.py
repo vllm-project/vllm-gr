@@ -20,8 +20,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from tests.helpers.gr_config import set_deployment
-from vllm_gr.ops.npu_stage_logits import (
-    NPUStageProjection,
+from vllm_gr.ops.npu.stage_projection import NPUStageProjection
+from vllm_gr.v1.worker.npu.stage_projection import (
     can_install_npu_stage_projection,
     install_npu_sid_stage_projection,
     install_npu_stage_projection,
@@ -507,7 +507,7 @@ def test_ineligible_runner_is_rejected_before_projection_allocation(
     def forbidden(*args: Any, **kwargs: Any) -> None:
         pytest.fail("An unsupported runner must not allocate compact projection weights")
 
-    monkeypatch.setattr("vllm_gr.ops.npu_stage_logits.NPUStageProjection", forbidden)
+    monkeypatch.setattr("vllm_gr.v1.worker.npu.stage_projection.NPUStageProjection", forbidden)
     original = ctx.processor._get_logits
     assert not can_install_npu_stage_projection(ctx.runner)
     assert install_npu_stage_projection(ctx.runner, ctx.backend) is None

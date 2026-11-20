@@ -53,7 +53,9 @@ from vllm_gr.v1.beam import (  # noqa: E402
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR  # noqa: E402
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView  # noqa: E402
-from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch  # noqa: E402
+from vllm_gr.v1.worker.npu.beam_execution_batch import (  # noqa: E402
+    NPUBeamExecutionBatch,
+)
 
 DEVICE = torch.device("npu")
 DTYPE = torch.bfloat16

@@ -103,8 +103,8 @@ def test_cuda_dispatch_requires_explicit_hooks(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.l1  # type: ignore[misc]
 def test_v1_installer_binds_execution_and_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.platforms.cuda import provider as cuda
     from vllm_gr.v1.worker import gr_startup, model_runner_patch
+    from vllm_gr.v1.worker.cuda import runner_installer as cuda
     from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
 
     class Runner:

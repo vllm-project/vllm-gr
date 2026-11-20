@@ -47,9 +47,9 @@ class NPUBeamExecutionBatch:
 
         sources = self.context.pools
         if execution.dynamic_beam_widths is not None:
-            from vllm_gr.v1.beam.npu_dynamic_beam import get_npu_stage_pools
+            from vllm_gr.v1.beam.dynamic_beam import get_stage_pools
 
-            sources = get_npu_stage_pools(self.context, self.request_width)
+            sources = get_stage_pools(self.context, self.request_width)
 
         self.pools = []
         for source in sources:
@@ -94,19 +94,3 @@ class NPUBeamExecutionBatch:
         for session in self.sessions:
             if session.is_active:
                 session.end_session()
-
-
-def restore_npu_cache_pool_layout(tensor: Any, request_width: int) -> Any:
-    """Restore ``[B, W, ...]`` before the xllm cache-write operator."""
-
-    if request_width < 1:
-        raise ValueError("request_width must be positive")
-    if tensor.shape[0] != 1 or tensor.shape[1] == request_width:
-        return tensor
-    if tensor.shape[1] % request_width:
-        raise RuntimeError("flattened NPU pool width is not divisible by Beam width")
-    batch = tensor.shape[1] // request_width
-    return tensor.view(batch, request_width, *tensor.shape[2:])
-
-
-__all__ = ["NPUBeamExecutionBatch", "restore_npu_cache_pool_layout"]

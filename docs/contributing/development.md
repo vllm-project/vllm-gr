@@ -33,6 +33,33 @@ flow and state ownership. Detailed contracts are grouped in the
 [feature guides](../features/README.md). Use those before changing shared runtime
 behavior; keep this document focused on code navigation and change workflow.
 
+### Package ownership
+
+Paths are relative to `vllm_gr/`. Internal imports use the implementation's
+owning package. External providers and old plan pickles use `platforms/plan.py`
+and the provider binding imports. Worker RPCs resolve `platforms/readiness.py`;
+persisted Beam results resolve their sequence class in `entrypoints/beam_output.py`.
+A package initializer may also define public entry points, including
+the Beam submit/wait/close functions.
+
+| Packages | Implementation owners |
+| --- | --- |
+| Package root, `config/` | Root holds public API, plugin bootstrap, version and process-wide patch orchestration. Configuration owns its parser, validation, default YAML and import-light backend plan codec. The general-plugin entry point and root exports remain stable. |
+| `benchmarks/`, `engine/` | The installed benchmark registry serves the CLI. EngineArgs helpers configure native engine startup. |
+| `entrypoints/`, `entrypoints/beam_search/` | Offline and online frontends share request/heap lifetime and detokenization. Beam request preparation, session transport adapters and lazy result fields live together. The standalone detokenizer can load without importing the Beam engine protocol. |
+| `entrypoints/cli/`, `entrypoints/openai/` | CLI owns command dispatch, serve parser and banner. OpenAI owns HTTP request conversion and completion batching. |
+| `entrypoints/grpc/`, `grpc/proto/` and `grpc/generated/` under `entrypoints/` | Server startup and request dispatch use the packaged schemas and generated bindings. The generator owns module names and private protobuf descriptors. |
+| `constraints/` | Keep catalog-to-triples, triples-to-table and artifact serialization separate. The loader, device backends and versioned tables own different lifetimes. |
+| `ops/`, `ops/cuda/`, `ops/npu/` | Public operator registrations and implementations, CUDA selection kernels and Ascend primitives. CUDA kernels share the packed score/index ordering. NPU projection owns its fixed tensors; worker hooks install and refresh it. |
+| `platforms/`, `platforms/cuda/`, `platforms/ascend/` | Provider identity, discovery, admission, compatibility and startup installation. The CUDA provider exposes the worker-owned installer. |
+| `sidecar/`, `sidecar/filesystems/`, `utils/` | Sidecar coordinates updates and storage adapters. Shared update status is importable from the package root. Device probes and memory cleanup retain their utility exports. |
+| `v1/`, `v1/core/`, `v1/core/sched/` | Native V1 compatibility, core prefix hashes, and scheduler-owned session dispatch/retirement. Existing Ascend bootstrap hooks span several native initialization sites. |
+| `v1/engine/` | EngineCore admission, wire protocol, client transport and cross-worker startup agreement. Readiness calls the worker to report its actual runner binding. |
+| `v1/beam/`, `v1/metrics/` | Shared Beam contracts, execution geometry and session/pool primitives. Keep the CPU selection oracle for numerical parity and the metrics namespace for import compatibility. |
+| `v1/attention/`, `v1/attention/backends/` | Backend selection, metadata builders, layout and execution. Cascade KV writes are shared across devices. Ascend layout restoration belongs to the consuming attention backend. CPU layout and device tensor construction have separate owners. |
+| `v1/worker/`, `v1/worker/cuda/`, `v1/worker/npu/` | Worker owns service binding, the CUDA runner installer, model reload hooks and device execution. The Ascend runner constructs its batch views. CUDA workspace types share a directory with the loader that prewarms and accounts for them. |
+| `v1/worker/cuda/v1/`, `v1/worker/cuda/v2/` | Generation-specific native inputs, hooks and graph lifetimes. The shared Prefill base still invokes the capture planner and error classifier. |
+
 ### Worker packages
 
 The public installer is `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`.

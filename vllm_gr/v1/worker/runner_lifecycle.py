@@ -10,7 +10,7 @@ from functools import partial, wraps
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from vllm_gr.platforms.plan import BackendPlan
+    from vllm_gr.config.backend_plan import BackendPlan
 
 
 @dataclass

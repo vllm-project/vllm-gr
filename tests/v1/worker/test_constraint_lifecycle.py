@@ -376,7 +376,7 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
 
     from vllm_gr.config import ConstraintTableBackendEnum
     from vllm_gr.ops.sliced_logits import get_vocab_slice_config, set_vocab_slice_config
-    from vllm_gr.ops.sliced_logits_patch import apply_sliced_logits_patch
+    from vllm_gr.v1.worker.sliced_logits_patch import apply_sliced_logits_patch
 
     apply_sliced_logits_patch()
     runner = _runner()
@@ -437,7 +437,7 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
     from vllm_gr.config import ConstraintTableBackendEnum
     from vllm_gr.constraints import loader
     from vllm_gr.ops.sliced_logits import get_vocab_slice_config, set_vocab_slice_config
-    from vllm_gr.ops.sliced_logits_patch import apply_sliced_logits_patch
+    from vllm_gr.v1.worker.sliced_logits_patch import apply_sliced_logits_patch
 
     apply_sliced_logits_patch()
     backends = []

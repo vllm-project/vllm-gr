@@ -24,12 +24,10 @@ from .errors import InvalidBackendProviderError
 from .identity import current_platform_identity
 from .interface import GRBackendProvider
 from .registry import (
-    RegisteredBackend,
+    _register_backend_batch,
     _registry_context,
-    _validate_backend_registration,
     activate_backend,
     get_active_backend,
-    register_backend,
     select_backend,
 )
 
@@ -106,7 +104,6 @@ def load_backend_plugins() -> None:
     from .legacy import adapt_legacy_provider
 
     pending: list[tuple[GRBackendProvider, str]] = []
-    pending_backends: dict[str, RegisteredBackend] = {}
 
     disabled = disabled_builtin_backend_ids()
     entries = []
@@ -138,16 +135,9 @@ def load_backend_plugins() -> None:
                 f"provider_backend_id={declared_name!r}; "
                 f"source={source!r}; {_registry_context()}"
             )
-        registration = _validate_backend_registration(
-            candidate_provider,
-            source=source,
-            pending_backends=pending_backends,
-        )
         pending.append((candidate_provider, source))
-        pending_backends[registration.backend_id] = registration
 
-    for provider, source in pending:
-        register_backend(provider, source=source)
+    _register_backend_batch(pending)
     _PLUGINS_LOADED = True
 
 

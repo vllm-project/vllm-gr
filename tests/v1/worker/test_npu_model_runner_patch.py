@@ -14,14 +14,12 @@ import torch
 from vllm.v1.core.sched.output import NewRequestData
 
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
+from vllm_gr.v1.attention.backends.npu_cache_layout import restore_npu_cache_pool_layout
 from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
-from vllm_gr.v1.beam.npu_execution_batch import (
-    NPUBeamExecutionBatch,
-    restore_npu_cache_pool_layout,
-)
 from vllm_gr.v1.worker import gr_context as _gr_context
 from vllm_gr.v1.worker import gr_execution as _gr_dispatch
 from vllm_gr.v1.worker.npu import npu_model_runner_patch as npu_patch
+from vllm_gr.v1.worker.npu.beam_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,

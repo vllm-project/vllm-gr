@@ -9,12 +9,11 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_gr.config import GRConfig
+from vllm_gr.config.backend_plan import BACKEND_PLAN_KEY
 from vllm_gr.platforms.cuda import CUDA_BACKEND
-from vllm_gr.platforms.cuda import provider as cuda
-from vllm_gr.platforms.cuda import runner
-from vllm_gr.platforms.plan import BACKEND_PLAN_KEY
 from vllm_gr.platforms.planning import normalize_backend_request
 from vllm_gr.platforms.services import LegacyPlanningProvider
+from vllm_gr.v1.worker.cuda import runner_installer as runner
 from vllm_gr.v1.worker.runner_lifecycle import (
     NativeRunnerAdapter,
     has_runner_lifecycle,
@@ -66,7 +65,7 @@ def workers(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(
         runner, "discover_worker_runners", lambda: (("CUDA Worker.init_device", Worker),)
     )
-    monkeypatch.setattr(cuda, "install_worker_hooks", Mock())
+    monkeypatch.setattr(runner, "install_worker_hooks", Mock())
     hooks = CUDA_BACKEND.get_model_runner_hooks()
     hooks.install()
     patched = Worker.init_device

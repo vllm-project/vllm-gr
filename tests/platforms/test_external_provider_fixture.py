@@ -287,13 +287,42 @@ pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.l1  # type: ignore[misc]
-def test_installed_provider_plan_round_trip_and_factory_binding(tmp_path: Path) -> None:
+@pytest.mark.parametrize("with_layers", [False, True])  # type: ignore[misc]
+def test_installed_provider_plan_round_trip_and_factory_binding(
+    tmp_path: Path, with_layers: bool
+) -> None:
     """An external planning extension adds options without a core serializer edit."""
     source = _PROVIDER_MODULE.replace(
         "BACKEND = HostOnlyProvider()",
         """
 from types import SimpleNamespace
 from vllm_gr.platforms.plan import BackendPlan, PlanData
+
+class Attention:
+    def __init__(self, plan=None, device=None):
+        self.plan = plan
+        self.device = device
+        self.width = plan.choices.to_dict()["tile"] if plan else 0
+        self.implementation_id = f"host.attention.{self.width}"
+        self.closed = False
+
+    def get_flash_attn_version(self, **kwargs):
+        return 2
+
+    def cascade_attention(self, *, output, **kwargs):
+        assert self.plan is not None and not self.closed
+        output.fill_(self.width)
+
+    prefill_attention = cascade_attention
+
+    def reshape_and_cache(self, *args):
+        pass
+
+    def cache_unshared_kv(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        self.closed = True
 
 class PlannedProvider(HostOnlyProvider):
     plan_api_version = 1
@@ -314,8 +343,10 @@ class PlannedProvider(HostOnlyProvider):
                                implementation_id="host.runner.v1")
 
     def create_attention_executor(self, *, plan, device):
-        return SimpleNamespace(plan=plan, device=device,
-                               implementation_id="host.attention.v1")
+        return Attention(plan, device)
+
+    def get_attention_execution(self):
+        return Attention()
 
     def create_constrained_topk_execution(self, *, plan=None, device=None):
         return None
@@ -361,6 +392,56 @@ assert engines[0].plan != engines[1].plan
 assert not hasattr(provider, "current_plan")
 assert not any(name in sys.modules for name in ("torch", "torch_npu", "vllm", "vllm_ascend"))
 print("planned")
+"""
+    if with_layers:
+        pytest.importorskip("torch")
+        pytest.importorskip("vllm")
+        code += """
+import torch
+from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+from vllm_gr.v1.engine.worker_readiness import worker_backend_readiness
+from vllm_gr.v1.worker.runner_binding import close_backend_binding
+
+def run(layer, prefill):
+    metadata = SimpleNamespace(slot_mapping=torch.tensor([0]), is_prefill_graph_exec=prefill)
+    x = torch.zeros(1, 1, 8)
+    return layer.impl.forward(layer, x, x, x, torch.zeros(2, 1, 16, 16), metadata,
+                              output=torch.empty_like(x))
+
+live = []
+for services in engines:
+    runner = services.runner_adapter.owner
+    close_backend_binding(runner)
+    layer = torch.nn.Module()
+    layer.impl = BeamAttentionImpl(1, 8, 1., 1, None, None, "auto",
+                                   kv_sharing_target_layer_name="shared")
+    runner.model = layer
+    binding = bind_backend_services(runner)
+    report = worker_backend_readiness(SimpleNamespace(model_runner=runner))
+    assert report["services"]["attention"] == layer.impl.execution.implementation_id
+    assert binding.attention_executor is layer.impl.execution
+    live.append((runner, layer, binding.attention_executor))
+for runner, layer, executor in live:
+    for prefill in (False, True):
+        assert torch.all(run(layer, prefill) == executor.width)
+    close_backend_binding(runner)
+    assert executor.closed
+    assert "execution" not in vars(layer.impl)
+
+# A provider which cannot execute the already-loaded layer must fail atomically.
+from unittest.mock import patch
+bad = provider.create_attention_executor(plan=plan, device="cpu:0")
+bad.get_flash_attn_version = lambda **kwargs: 3
+with patch.object(provider, "create_attention_executor", return_value=bad):
+    try:
+        bind_backend_services(runner)
+    except RuntimeError as error:
+        assert "FlashAttention version" in str(error)
+    else:
+        raise AssertionError("incompatible attention executor was published")
+assert bad.closed
+assert runner._gr_backend_binding is None
+assert layer.impl.execution is not bad
 """
     result = subprocess.run(
         [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(site_packages)!r})\n" + code],

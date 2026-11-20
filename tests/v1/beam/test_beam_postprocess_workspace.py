@@ -11,7 +11,7 @@ from tests.beam_postprocess_workspace_utils import (
     candidate_rows,
     result_count,
 )
-from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
+from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import (
     BeamPostprocessWorkspace,
     BeamPostprocessWorkspaceKey,
     BeamPostprocessWorkspacePool,

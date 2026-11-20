@@ -16,7 +16,7 @@ from vllm_gr.entrypoints.beam_search.protocol import (
     OnlineBeamSearchRequest,
 )
 from vllm_gr.entrypoints.beam_search.token_utils import boundary_token_id
-from vllm_gr.tokenizer_fast import fast_batch_decode, fast_decode
+from vllm_gr.entrypoints.detokenization import fast_batch_decode, fast_decode
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchOutput,
@@ -216,7 +216,9 @@ class BeamSearchOutputProcessor:
 
             from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
 
-            from vllm_gr.entrypoints.beam_output import _LazyMaterializedBeamSequence
+            from vllm_gr.entrypoints.beam_search.lazy_output import (
+                _LazyMaterializedBeamSequence,
+            )
 
             prepared_prompts = _prepared_prompt_lists(request)
             original_prompts = _original_prompt_lists(prepared_prompts, begin_token_id)

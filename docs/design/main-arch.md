@@ -188,7 +188,7 @@ An unsupported platform fails provider selection before worker hook discovery.
 ## Engine plans and service binding
 
 `BackendRequest`, `BackendPlan`, and `PlanData` are import-light values in
-`platforms/plan.py`. A request contains normalized GR settings, common native
+`config/backend_plan.py`. A request contains normalized GR settings, common native
 configuration, compatibility versions, and backend-owned JSON options. Plans
 encode their schema and planning API versions separately from the provider
 identity API. SHA-256 covers the canonical JSON encoding, including the
@@ -438,7 +438,7 @@ selection. V2 owns its execute wrapper in `cuda/v2/gpu_model_runner_v2_patch.py`
 use shared dispatch in `gr_execution.py`. Installation markers/checks live in
 the hardware-free `model_runner_contracts.py` rather than in V1 adaptation.
 
-The CUDA provider chooses the V1 or V2 hook module at patch installation.
+The CUDA worker installer reads the native generation at Worker initialization.
 The Ascend provider supplies its V1 hooks and preserves deferred worker
 initialization. Built-in adapters bind the installed prepare, execute and
 sample entry points to one native runner after model load. The installed
@@ -457,26 +457,21 @@ installation, worker readiness and dispatch for two different engine plans.
 
 ### Beam Attention execution
 
-Platform Attention execution provides:
+During model construction, Beam attention reads the active provider's
+`get_attention_execution()` for capability checks. Standalone probes can use
+the built-in implementation before plugin activation. After model load the
+worker validates the plan-bound executor against its model's Beam layers.
+Those layers use that executor for cache writes, cascade attention and Prefill.
+The readiness RPC reports its implementation ID. Reload and shutdown detach
+the executor from the old layers before releasing its resources.
 
-- `is_available()`;
-- `get_flash_attn_version()`;
-- `supports_sinks()`;
-- `reshape_and_cache()`;
-- `cascade_attention()`.
-
-The complete call signatures are defined by
-`vllm_gr.platforms.interface.BeamAttentionExecution`. The current
-`beam_attn_gpu.py` and `beam_attn_npu.py` modules satisfy the contract directly;
-providers return those modules rather than copying or wrapping their kernels.
-
-Production attention dispatch also selects the NPU xllm or cascade execution
-path. Returning the base `beam_attn_npu` module from a provider must not bypass
-that selection. Getter unification is a separate migration.
-
-Metadata construction, KV memory management, and the shared execute-model
-wrapper are deliberately outside this contract until their owning migration
-stages define stable boundaries.
+Implementations supply availability, FlashAttention version and sink support,
+plus `reshape_and_cache`, `cache_unshared_kv`, `cascade_attention` and
+`prefill_attention`. CUDA graph slot writes use the shared fixed-address kernel.
+The Ascend provider resolves the configured cascade or xllm decode mode. The
+xllm implementation delegates TND and BSND Prefill to the cascade primitives.
+See `vllm_gr.platforms.interface.BeamAttentionExecution` and the installed
+external provider test for the contract and two-runner dispatch coverage.
 
 ### External provider entry points
 

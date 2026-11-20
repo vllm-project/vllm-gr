@@ -10,8 +10,9 @@ import pytest
 
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.platforms.ascend import provider as npu
-from vllm_gr.platforms.cuda import provider as cuda
+from vllm_gr.platforms.cuda import CUDA_BACKEND
 from vllm_gr.v1.worker import model_runner_patch
+from vllm_gr.v1.worker.cuda import runner_installer as cuda
 from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
 
 
@@ -292,8 +293,8 @@ def test_dispatcher_routes_platform_before_v2_flag(
     if device_type == "cuda":
         setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", use_v2)
     monkeypatch.setitem(sys.modules, "vllm.envs", envs)
-    provider = cuda.CUDA_BACKEND if device_type == "cuda" else npu.NPU_BACKEND
-    from vllm_gr.platforms.cuda import runner
+    provider = CUDA_BACKEND if device_type == "cuda" else npu.NPU_BACKEND
+    from vllm_gr.v1.worker.cuda import runner_installer as runner
 
     target = (("selected", object),)
     monkeypatch.setattr(runner, "discover_worker_runners", lambda: target)

@@ -15,13 +15,13 @@ from vllm.exceptions import VLLMValidationError
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.sampling_params import BeamSearchParams
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
-from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.beam.npu_dynamic_beam import (
-    NPUDynamicBeamState,
-    get_npu_stage_pools,
-    initialize_npu_packed_stage_pools,
-    prune_npu_stage_pools,
+from vllm_gr.v1.beam.dynamic_beam import (
+    DynamicBeamState,
+    get_stage_pools,
+    initialize_packed_stage_pools,
+    prune_stage_pools,
 )
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 
 
 @pytest.mark.parametrize(
@@ -187,7 +187,7 @@ def _context(packed: bool) -> Any:
         ],
     )
     if packed:
-        initialize_npu_packed_stage_pools(context)
+        initialize_packed_stage_pools(context)
     return context
 
 
@@ -203,8 +203,8 @@ def _candidates(scores: list[list[float]], *, first_token: int = 11) -> Constrai
 @pytest.mark.parametrize("packed", [False, True])
 def test_idle_pruning_releases_unused_banks_and_retains_captured_addresses(packed: bool) -> None:
     context = _context(packed)
-    get_npu_stage_pools(context, 1)
-    captured = get_npu_stage_pools(context, 2)
+    get_stage_pools(context, 1)
+    captured = get_stage_pools(context, 2)
     context._npu_beam_graph_captured = True
     retained = [*captured, *context.pools]
     addresses = [
@@ -217,12 +217,12 @@ def test_idle_pruning_releases_unused_banks_and_retains_captured_addresses(packe
             )
 
     # The caller keeps width 2 because a captured graph references its bank.
-    assert prune_npu_stage_pools(context, keep_widths=(2,)) == (1,)
+    assert prune_stage_pools(context, keep_widths=(2,)) == (1,)
     assert set(context._npu_beam_width_pools) == {2}
-    assert get_npu_stage_pools(context, 2) is captured
+    assert get_stage_pools(context, 2) is captured
     assert addresses == [
         (pool.unshared_key.data_ptr(), pool.unshared_value.data_ptr())
-        for pool in [*get_npu_stage_pools(context, 2), *context.pools]
+        for pool in [*get_stage_pools(context, 2), *context.pools]
     ]
     if packed:
         assert set(context._npu_packed_width_pools) == {2, 4}
@@ -231,13 +231,13 @@ def test_idle_pruning_releases_unused_banks_and_retains_captured_addresses(packe
 
 def test_stage_banks_cannot_be_pruned_during_active_session() -> None:
     context = _context(True)
-    bank = get_npu_stage_pools(context, 1)
+    bank = get_stage_pools(context, 1)
     context.registry.num_active_sessions = 1
 
     with pytest.raises(RuntimeError, match="while Beam sessions are active"):
-        prune_npu_stage_pools(context, keep_widths=())
+        prune_stage_pools(context, keep_widths=())
 
-    assert get_npu_stage_pools(context, 1) is bank
+    assert get_stage_pools(context, 1) is bank
     assert 1 in context._npu_packed_width_pools
 
 
@@ -249,7 +249,7 @@ def test_late_packing_is_rejected_after_graph_capture() -> None:
     context._npu_beam_graph_captured = True
 
     with pytest.raises(RuntimeError, match="after Beam graph capture"):
-        initialize_npu_packed_stage_pools(context)
+        initialize_packed_stage_pools(context)
 
     assert not hasattr(context, "_npu_packed_width_pools")
     assert addresses == [
@@ -259,7 +259,7 @@ def test_late_packing_is_rejected_after_graph_capture() -> None:
 
 @pytest.mark.parametrize("invalid_score", [float("nan"), float("inf"), -float("inf")])
 def test_prefill_nonfinite_scores_and_masked_candidates_are_invalid(invalid_score: float) -> None:
-    state = NPUDynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
+    state = DynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
     prefill = _candidates([[invalid_score, -2.0, 99.0]])
     prefill.valid_mask[0, 2] = False
     state.initialize(prefill, width=3)
@@ -271,7 +271,7 @@ def test_prefill_nonfinite_scores_and_masked_candidates_are_invalid(invalid_scor
 
 @pytest.mark.parametrize("invalid_score", [float("nan"), float("inf"), -float("inf")])
 def test_nonfinite_candidate_cannot_displace_finite_winner(invalid_score: float) -> None:
-    state = NPUDynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
+    state = DynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
     state.initialize(_candidates([[-1.0, -2.0]]), width=2)
     actual = state.select(
         _candidates([[invalid_score], [-0.5]], first_token=21),
@@ -288,7 +288,7 @@ def test_nonfinite_candidate_cannot_displace_finite_winner(invalid_score: float)
 
 @pytest.mark.parametrize("invalid_score", [float("nan"), float("inf"), -float("inf")])
 def test_nonfinite_parent_is_rejected_even_after_initialization(invalid_score: float) -> None:
-    state = NPUDynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
+    state = DynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
     state.initialize(_candidates([[-1.0, -2.0]]), width=2)
     assert state.scores is not None
     # Exercise select's own guard independently of Prefill sanitization.
@@ -309,7 +309,7 @@ def test_nonfinite_parent_is_rejected_even_after_initialization(invalid_score: f
 def test_finite_fp32_accumulation_overflow_cannot_displace_finite_winner(
     large_score: float,
 ) -> None:
-    state = NPUDynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
+    state = DynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
     state.initialize(_candidates([[large_score, -2.0]]), width=2)
     actual = state.select(
         _candidates([[large_score], [-0.5]], first_token=21),
@@ -325,7 +325,7 @@ def test_finite_fp32_accumulation_overflow_cannot_displace_finite_winner(
 
 @pytest.mark.parametrize("is_last", [False, True])
 def test_all_invalid_candidates_produce_negative_infinity_and_zero_tokens(is_last: bool) -> None:
-    state = NPUDynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
+    state = DynamicBeamState(_context(False), batch_size=1, max_decode_steps=3)
     state.initialize(_candidates([[-1.0, -2.0]]), width=2)
     candidates = _candidates([[float("nan"), float("inf")], [-float("inf"), 99.0]])
     candidates.valid_mask[1, 1] = False
@@ -343,7 +343,7 @@ def test_all_invalid_candidates_produce_negative_infinity_and_zero_tokens(is_las
 
 
 def test_nonfinite_selection_remains_request_local() -> None:
-    state = NPUDynamicBeamState(_context(False), batch_size=2, max_decode_steps=3)
+    state = DynamicBeamState(_context(False), batch_size=2, max_decode_steps=3)
     state.initialize(_candidates([[-1.0, -2.0], [-3.0, -4.0]]), width=2)
     actual = state.select(
         _candidates([[float("nan")], [-0.5], [-0.25], [float("inf")]], first_token=21),
@@ -364,7 +364,7 @@ def test_stage_selection_matches_independent_beam_reference_and_preserves_reques
     packed: bool, widths: tuple[int, int, int]
 ) -> None:
     context = _context(packed)
-    state = NPUDynamicBeamState(context, batch_size=2, max_decode_steps=3)
+    state = DynamicBeamState(context, batch_size=2, max_decode_steps=3)
     ids = torch.arange(2 * widths[0], dtype=torch.int32).reshape(2, widths[0])
     scores = -torch.arange(widths[0], dtype=torch.float32).expand(2, -1) * 0.7
     valid = torch.ones_like(ids, dtype=torch.bool)
@@ -381,8 +381,8 @@ def test_stage_selection_matches_independent_beam_reference_and_preserves_reques
     ]
     for stage, output_width in enumerate(widths[1:], start=1):
         input_width = widths[stage - 1]
-        source = get_npu_stage_pools(context, input_width)
-        target = get_npu_stage_pools(context, output_width)
+        source = get_stage_pools(context, input_width)
+        target = get_stage_pools(context, output_width)
         for layer, pool in enumerate(source):
             for row in range(3):
                 for beam in range(input_width):

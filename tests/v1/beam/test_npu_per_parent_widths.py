@@ -14,10 +14,10 @@ import torch
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
 from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
-from vllm_gr.v1.beam.npu_dynamic_beam import (
-    NPUDynamicBeamState,
-    get_npu_stage_pools,
-    initialize_npu_packed_stage_pools,
+from vllm_gr.v1.beam.dynamic_beam import (
+    DynamicBeamState,
+    get_stage_pools,
+    initialize_packed_stage_pools,
 )
 from vllm_gr.v1.worker.npu import npu_beam_stage_runner as npu_runner
 
@@ -159,7 +159,7 @@ def _context(batch: int, packed: bool) -> Any:
         ],
     )
     if packed:
-        initialize_npu_packed_stage_pools(context)
+        initialize_packed_stage_pools(context)
     return context
 
 
@@ -243,7 +243,7 @@ def test_independent_k_selection_and_parent_kv_match_scalar_reference(
     batch: int, packed: bool, widths: tuple[int, ...], ks: tuple[int, ...]
 ) -> None:
     context = _context(batch, packed)
-    state = NPUDynamicBeamState(context, batch, 3)
+    state = DynamicBeamState(context, batch, 3)
     prefill_tokens = [
         [1000 * request + beam for beam in range(widths[0])] for request in range(batch)
     ]
@@ -261,8 +261,8 @@ def test_independent_k_selection_and_parent_kv_match_scalar_reference(
         input_width, output_width = widths[stage - 1], widths[stage]
         last = stage == 2
         candidates = _stage_candidates(batch, input_width, ks[stage], stage)
-        old_pools = get_npu_stage_pools(context, input_width)
-        target_pools = get_npu_stage_pools(context, output_width)
+        old_pools = get_stage_pools(context, input_width)
+        target_pools = get_stage_pools(context, output_width)
         for pool in target_pools:
             pool.unshared_key[batch:].fill_(-123)
             pool.unshared_value[batch:].fill_(-123)

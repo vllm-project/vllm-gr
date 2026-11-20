@@ -72,7 +72,7 @@ patches:
     scope: core
     backend_id: null
     owner: vllm_gr/logprobs.py
-    installer: vllm_gr.logprobs_patch.patch_flat_logprobs
+    installer: vllm_gr.logprobs.patch_flat_logprobs
     activation: the required frontend patch plan detects the method is not installed
     validator_or_test:
       - vllm_gr.patch._validate_flat_logprobs_patch
@@ -209,7 +209,7 @@ patches:
   - id: GR-PATCH-011
     scope: backend
     backend_id: cuda
-    owner: vllm_gr/platforms/cuda/runner.py, vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py and vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py
+    owner: vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py and vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/cuda/gpu_postprocess_workspace.py, vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/cuda/v1/gpu_prefill_inputs.py, vllm_gr/v1/worker/cuda/v2/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/cuda/gpu_stage_hooks.py, vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py, vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the CUDA provider mounts Worker utilities at process startup; Worker.init_device installs and verifies the admitted V1 or V2 generation, which binds the planned runner after model load regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
@@ -278,6 +278,7 @@ patches:
     scope: core
     backend_id: null
     owner: vllm_gr/v1/attention/backends/beam_attn.py
+    execution: Beam attention layers use the executor published by their runner binding
     installer: vllm_gr.v1.attention.backends.beam_attn register_backend decorator
     activation: the facade module is imported and CUSTOM is selected for GR Beam Attention
     validator_or_test:
@@ -303,11 +304,11 @@ patches:
     scope: core
     backend_id: null
     owner: vllm_gr/ops/sliced_logits.py
-    shared_helpers: vllm_gr/ops/lm_head_cache.py
-    installer: vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch
+    shared_helpers: vllm_gr/v1/worker/lm_head_cache.py
+    installer: vllm_gr.v1.worker.sliced_logits_patch.apply_sliced_logits_patch
     activation: projection hooks execute with a valid slice; cache reload hooks install after model load by ParallelLMHead type, independent of module names
     validator_or_test:
-      - vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch return value
+      - vllm_gr.v1.worker.sliced_logits_patch.apply_sliced_logits_patch return value
       - tests/ops/test_sliced_logits.py
       - tests/platforms/test_import_isolation.py::test_cuda_plugin_initialization_does_not_import_ascend
       - tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload

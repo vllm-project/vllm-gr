@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 if TYPE_CHECKING:
     import torch
 
+    from vllm_gr.config.backend_plan import BackendPlan, BackendRequest
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
     from .config import BackendConfigService
     from .identity import PlatformIdentity
-    from .plan import BackendPlan, BackendRequest
 
 #: Provider API implemented by built-in and external providers in this release.
 PROVIDER_API_VERSION = 2
@@ -95,6 +95,32 @@ class BeamAttentionExecution(Protocol):
         v_scale: Any,
     ) -> None: ...
 
+    def cache_unshared_kv(
+        self,
+        unshared_key: Any,
+        unshared_value: Any,
+        curr_key: Any,
+        curr_value: Any,
+        slot: int,
+        decode_step: int,
+        beam_session: Any = None,
+    ) -> None: ...
+
+    def prefill_attention(
+        self,
+        output: Any,
+        query: Any,
+        key_cache: Any,
+        value_cache: Any,
+        attn_metadata: Any,
+        sliding_window_size: list[int] | tuple[int, int] | None,
+        scale: float,
+        logits_soft_cap: float,
+        vllm_flash_attn_version: int,
+        s_aux: Any = None,
+        alibi_slopes: Any = None,
+    ) -> None: ...
+
     def cascade_attention(
         self,
         output: Any,
@@ -151,7 +177,7 @@ class GRBackendProvider(Protocol):
         self,
         *,
         device: str | torch.device | None = None,
-    ) -> "ConstrainedTopKExecution | None": ...
+    ) -> ConstrainedTopKExecution | None: ...
 
 
 class GRPlanningProvider(GRBackendProvider, Protocol):
@@ -174,4 +200,4 @@ class GRPlanningProvider(GRBackendProvider, Protocol):
 
     def create_constrained_topk_execution(
         self, *, plan: BackendPlan | None = None, device: str | torch.device | None = None
-    ) -> "ConstrainedTopKExecution | None": ...
+    ) -> ConstrainedTopKExecution | None: ...

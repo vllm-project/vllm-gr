@@ -39,7 +39,7 @@ _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 def close_constraint_backend(runner: object) -> None:
     """Detach and idempotently close the runner-owned canonical Backend."""
 
-    from vllm_gr.platforms.binding import close_backend_binding
+    from vllm_gr.v1.worker.runner_binding import close_backend_binding
 
     close_backend_binding(runner)
     backend = getattr(runner, "constraint_backend", None)
@@ -116,7 +116,7 @@ def make_load_model_with_constraint_backend(
         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
         result = original(self, *args, **kwargs)
 
-        from vllm_gr.ops.lm_head_cache import install_lm_head_cache_reload_hooks
+        from vllm_gr.v1.worker.lm_head_cache import install_lm_head_cache_reload_hooks
 
         install_lm_head_cache_reload_hooks(self.model)
         backend = None
@@ -155,7 +155,7 @@ def make_load_model_with_constraint_backend(
                 and gr_config.beam_max_width is not None
                 and gr_config.beam_max_decode_steps <= 3
             ):
-                from vllm_gr.ops.npu_stage_logits import (
+                from vllm_gr.v1.worker.npu.stage_projection import (
                     can_install_npu_stage_projection,
                 )
 
@@ -205,7 +205,9 @@ def make_load_model_with_constraint_backend(
                 and getattr(backend, "stage_vocab", None) is not None
             ):
                 # Keep NPU projection imports isolated from CPU/CUDA startup.
-                from vllm_gr.ops.npu_stage_logits import install_npu_stage_projection
+                from vllm_gr.v1.worker.npu.stage_projection import (
+                    install_npu_stage_projection,
+                )
 
                 projection = install_npu_stage_projection(self, backend)
                 if projection is not None:
@@ -332,7 +334,7 @@ def install_v1_worker_hooks(
         workspace_load_patcher = getattr(
             platform_module, "make_load_model_with_beam_postprocess_workspace", None
         )
-    from vllm_gr.platforms.binding import bind_after_model_load
+    from vllm_gr.v1.worker.runner_binding import bind_after_model_load
     from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
     for runner_name, runner_class in platform_module.discover_worker_runners():

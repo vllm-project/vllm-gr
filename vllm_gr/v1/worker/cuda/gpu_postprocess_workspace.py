@@ -32,7 +32,7 @@ def initialize_beam_postprocess_workspaces(
         return None
 
     from vllm_gr.config import resolve_candidate_width
-    from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
+    from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
         BeamPostprocessWorkspacePool,

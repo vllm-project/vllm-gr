@@ -169,8 +169,8 @@ def test_v1_heap_is_prepared_before_serving_and_released_on_close(
 ) -> None:
     from vllm.entrypoints.llm import LLM
 
+    from vllm_gr.entrypoints import frontend_lifecycle as engine_lifecycle
     from vllm_gr.entrypoints.gr import GRLLM
-    from vllm_gr.utils import engine_lifecycle
 
     events: list[str] = []
 
@@ -225,7 +225,7 @@ def test_v1_startup_heap_keeps_dynamic_cycles_collectible_and_releases_owners() 
         """
         import gc
         import weakref
-        from vllm_gr.utils.engine_lifecycle import (
+        from vllm_gr.entrypoints.frontend_lifecycle import (
             acquire_frontend_startup_heap, release_frontend_startup_heap,
         )
 

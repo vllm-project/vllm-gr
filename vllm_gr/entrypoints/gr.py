@@ -118,7 +118,9 @@ class GRLLM(LLM):
 
         resolved_gr = GRConfig.from_vllm_config(getattr(self.llm_engine, "vllm_config", None))
         if resolved_gr.beam_max_width is not None:
-            from vllm_gr.utils.engine_lifecycle import acquire_frontend_startup_heap
+            from vllm_gr.entrypoints.frontend_lifecycle import (
+                acquire_frontend_startup_heap,
+            )
 
             try:
                 acquire_frontend_startup_heap()
@@ -207,7 +209,7 @@ class GRLLM(LLM):
             return
         self._shutdown_complete = True
 
-        from vllm_gr.utils.engine_lifecycle import shutdown_sync_engine
+        from vllm_gr.entrypoints.frontend_lifecycle import shutdown_sync_engine
 
         try:
             if hasattr(self, "llm_engine") and self.llm_engine is not None:
@@ -215,7 +217,9 @@ class GRLLM(LLM):
                 self.llm_engine = None
         finally:
             if getattr(self, "_frontend_gc_registered", False):
-                from vllm_gr.utils.engine_lifecycle import release_frontend_startup_heap
+                from vllm_gr.entrypoints.frontend_lifecycle import (
+                    release_frontend_startup_heap,
+                )
 
                 self._frontend_gc_registered = False
                 release_frontend_startup_heap()

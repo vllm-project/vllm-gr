@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from vllm_gr.utils.engine_lifecycle import shutdown_sync_engine
+from vllm_gr.entrypoints.frontend_lifecycle import shutdown_sync_engine
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]

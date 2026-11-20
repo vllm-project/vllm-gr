@@ -270,7 +270,7 @@ def _native_processor(vocab_size: int, head_dtype: torch.dtype | None = None) ->
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-    from vllm_gr.ops.sliced_logits_patch import apply_sliced_logits_patch
+    from vllm_gr.v1.worker.sliced_logits_patch import apply_sliced_logits_patch
 
     apply_sliced_logits_patch()
     with set_current_vllm_config(VllmConfig()):
@@ -443,7 +443,7 @@ def test_native_quantized_head_dtype_rejection() -> None:
 
 
 def test_v2_topk_clamp_reuses_an_already_wrapped_import() -> None:
-    from vllm_gr.ops.sliced_logits_patch import _make_clamped_v2_topk
+    from vllm_gr.v1.worker.sliced_logits_patch import _make_clamped_v2_topk
 
     calls = []
 
@@ -472,7 +472,7 @@ def test_v2_compute_topk_scores_clamped_to_sliced_width(
     """Check all 0.30 importer bindings and score modes against dense results."""
     import importlib
 
-    from vllm_gr.ops import sliced_logits_patch
+    from vllm_gr.v1.worker import sliced_logits_patch
 
     if not is_cuda_available():
         pytest.skip("V2 score helper uses a Triton kernel (CUDA only)")

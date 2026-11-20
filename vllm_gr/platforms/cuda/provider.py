@@ -8,15 +8,15 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
+
 from ..identity import PlatformIdentity, platform_identity
 from ..interface import (
     PROVIDER_API_VERSION,
     BeamAttentionExecution,
     ModelRunnerInstaller,
 )
-from ..plan import BackendPlan, BackendRequest, PlanData
 from ..services import BuiltinPlanSupport, require_provider_plan
-from .runner import runner_id
 
 if TYPE_CHECKING:
     import torch
@@ -49,6 +49,8 @@ class CUDABackendProvider(BuiltinPlanSupport):
 
     def resolve(self, request: BackendRequest) -> BackendPlan:
         """Admit the existing CUDA paths without importing a device runtime."""
+        from vllm_gr.v1.worker.cuda.runner_installer import runner_id
+
         if request.options.to_dict():
             raise ValueError("CUDA currently accepts no additional backend options")
         gr = request.config.to_dict()
@@ -105,9 +107,9 @@ class CUDABackendProvider(BuiltinPlanSupport):
         return 0
 
     def get_model_runner_hooks(self) -> ModelRunnerInstaller:
-        from . import runner
+        from vllm_gr.v1.worker.cuda import runner_installer
 
-        return runner
+        return runner_installer
 
     def get_attention_execution(self) -> BeamAttentionExecution:
         return cast(
@@ -115,34 +117,29 @@ class CUDABackendProvider(BuiltinPlanSupport):
             import_module("vllm_gr.v1.attention.backends.beam_attn_gpu"),
         )
 
+    def create_attention_executor(
+        self, *, plan: BackendPlan, device: object
+    ) -> BeamAttentionExecution:
+        require_provider_plan(self, plan)
+        implementation = self.get_attention_execution()
+        if not implementation.is_available():
+            raise RuntimeError(
+                f"Backend {plan.backend_id!r} attention implementation is unavailable"
+            )
+        return implementation
+
     def create_constrained_topk_execution(
         self,
         *,
         device: str | torch.device | None = None,
         plan: BackendPlan | None = None,
-    ) -> "ConstrainedTopKExecution | None":
+    ) -> ConstrainedTopKExecution | None:
         """Create the production CUDA Constraint Table execution adapter."""
         from vllm_gr.constraints.execution import CUDAConstrainedTopKExecution
 
         if plan is not None:
             require_provider_plan(self, plan)
         return CUDAConstrainedTopKExecution(device=device)
-
-
-def install_worker_utilities() -> None:
-    from vllm.v1.worker.gpu_worker import Worker
-
-    from vllm_gr.v1.worker.model_runner_patch import install_worker_utility_hooks
-
-    install_worker_utility_hooks(Worker)
-
-
-def install_worker_hooks() -> None:
-    """Both CUDA runner generations use the same Worker and NumPy staging."""
-    from vllm_gr.v1.worker.cuda.numpy_staging import install_numpy_staging
-
-    install_worker_utilities()
-    install_numpy_staging()
 
 
 CUDA_BACKEND = CUDABackendProvider()

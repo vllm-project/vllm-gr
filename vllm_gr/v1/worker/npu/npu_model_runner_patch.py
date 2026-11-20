@@ -70,8 +70,10 @@ def make_patched_load_model(original: Callable[..., Any]) -> Callable[..., Any]:
             from vllm.tokenizers import cached_tokenizer_from_config
 
             from vllm_gr.ops.npu.sid_stage_vocab import build_sid_stage_vocab
-            from vllm_gr.ops.npu_stage_logits import install_npu_sid_stage_projection
             from vllm_gr.v1.worker.model_runner_patch import _runner_vocab_size
+            from vllm_gr.v1.worker.npu.stage_projection import (
+                install_npu_sid_stage_projection,
+            )
 
             base_memory_usage = int(getattr(self, "model_memory_usage", 0))
             tokenizer = cached_tokenizer_from_config(self.model_config)
@@ -132,7 +134,7 @@ def make_patched_shutdown(original: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def make_patched_reload_weights(original):
-    from vllm_gr.ops.npu_stage_logits import make_npu_stage_reload_weights
+    from vllm_gr.v1.worker.npu.stage_projection import make_npu_stage_reload_weights
 
     return make_npu_stage_reload_weights(original)
 
@@ -445,7 +447,7 @@ def _capture_create_dummy_context_npu(
 
     from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
     from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-    from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch
+    from vllm_gr.v1.worker.npu.beam_execution_batch import NPUBeamExecutionBatch
 
     request_ids = tuple(
         _BEAM_DUMMY_REQ_ID if batch_size == 1 else f"{_BEAM_DUMMY_REQ_ID}-{index}"
@@ -467,11 +469,11 @@ def _capture_create_dummy_context_npu(
     if context is None:
         context = _create_beam_context(runner, gr_cfg, max_batch=batch_size)
         if getattr(gr_cfg, "beam_graph_widths", None) is not None:
-            from vllm_gr.v1.beam.npu_dynamic_beam import (
-                initialize_npu_packed_stage_pools,
+            from vllm_gr.v1.beam.dynamic_beam import (
+                initialize_packed_stage_pools,
             )
 
-            initialize_npu_packed_stage_pools(context)
+            initialize_packed_stage_pools(context)
     sessions = []
     for request_id in request_ids:
         slot = context.registry.allocate(

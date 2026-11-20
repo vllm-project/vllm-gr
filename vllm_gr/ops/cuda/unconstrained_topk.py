@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from vllm_gr.ops.cuda.topk_sort_key import pack_score_index, unpack_score
+
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
 
@@ -28,28 +30,6 @@ class UnconstrainedTopKScratch:
     merge_indices: torch.Tensor
     vocab_size: int
     top_k: int
-
-
-@triton.jit
-def _pack_score_index(score, index, valid):
-    min_i32: tl.constexpr = -2147483648
-    score = tl.where(valid & (score == score), score, -float("inf"))
-    score = tl.where(score == 0.0, 0.0, score)
-    score_bits = score.to(tl.int32, bitcast=True)
-    sign = score_bits >> 31
-    sort_key = tl.where(sign == 0, score_bits ^ -1, score_bits ^ min_i32)
-    high = sort_key.to(tl.int64) & 0x00000000FFFFFFFF
-    low = tl.where(valid, index.to(tl.int64), 0x00000000FFFFFFFF)
-    return (high << 32) | low
-
-
-@triton.jit
-def _unpack_score(packed):
-    min_i32: tl.constexpr = -2147483648
-    sort_key = ((packed >> 32) & 0x00000000FFFFFFFF).to(tl.int32)
-    sign = sort_key >> 31
-    score_bits = tl.where(sign < 0, sort_key ^ -1, sort_key ^ min_i32)
-    return score_bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -89,7 +69,7 @@ def _local_topk_kernel(
     tile_sum = tl.sum(tl.exp(values - tl.where(tile_max == -float("inf"), 0.0, tile_max)), axis=0)
     tl.store(partial_max + row * partial_stride + tile, tile_max)
     tl.store(partial_sum + row * partial_stride + tile, tile_sum)
-    packed = _pack_score_index(values, flat, valid)
+    packed = pack_score_index(values, flat, valid)
     # topk selects only the candidates we retain.  Complementing the packed
     # key reverses its signed ordering without changing score or index ties.
     if SELECT_BLOCK == 1:
@@ -101,7 +81,7 @@ def _local_topk_kernel(
     output = row * scratch_stride + tile * select_width + selected_offsets
     tl.store(
         local_scores + output,
-        _unpack_score(sorted_pairs),
+        unpack_score(sorted_pairs),
         mask=selected_offsets < select_width,
     )
     tl.store(
@@ -134,7 +114,7 @@ def _merge_topk_kernel(
     scores = tl.load(input_scores + source, mask=valid, other=-float("inf"))
     indices = tl.load(input_indices + source, mask=valid, other=-1)
     valid = valid & (indices >= 0)
-    packed = _pack_score_index(scores, indices, valid)
+    packed = pack_score_index(scores, indices, valid)
     if SELECT_BLOCK == 1:
         sorted_pairs = tl.min(packed, axis=0)
     else:
@@ -143,7 +123,7 @@ def _merge_topk_kernel(
     output = row * scratch_stride + output_list * select_width + selected_offsets
     tl.store(
         output_scores + output,
-        _unpack_score(sorted_pairs),
+        unpack_score(sorted_pairs),
         mask=selected_offsets < select_width,
     )
     tl.store(

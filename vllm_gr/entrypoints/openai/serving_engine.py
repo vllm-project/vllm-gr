@@ -14,7 +14,7 @@ from vllm.outputs import RequestOutput
 from vllm.renderers.inputs.preprocess import prompt_to_seq
 from vllm.sampling_params import BeamSearchParams
 
-from vllm_gr.utils.engine_lifecycle import (
+from vllm_gr.entrypoints.frontend_lifecycle import (
     frontend_request_scope,
     schedule_frontend_gc_freeze,
 )

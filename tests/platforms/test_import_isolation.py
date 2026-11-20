@@ -19,6 +19,9 @@ import sys
 
 import vllm_gr.platforms
 
+assert "vllm_gr.config.parser" not in sys.modules
+assert "vllm_gr.config.models" not in sys.modules
+
 for module_name in (
     "torch",
     "torch_npu",
@@ -158,7 +161,7 @@ if module_name == "vllm_gr.v1.worker.model_runner_patch":
     vllm.platforms.current_platform = platform
 
     from vllm_gr.platforms import loader
-    from vllm_gr.platforms.cuda import provider as cuda, runner
+    from vllm_gr.v1.worker.cuda import runner_installer as runner
     from vllm_gr.v1.worker import model_runner_patch
     class Worker:
         vllm_config = None
@@ -174,7 +177,7 @@ if module_name == "vllm_gr.v1.worker.model_runner_patch":
     install_v2 = Mock(side_effect=lambda: setattr(native_class, "_installed", True))
     v2._apply_v2_runner_patches = install_v2
     loader.entry_points = lambda **kwargs: ()
-    cuda.install_worker_hooks = Mock()
+    runner.install_worker_hooks = Mock()
     model_runner_patch.apply_worker_patches()
     install_v2.assert_not_called()
     Worker().init_device()

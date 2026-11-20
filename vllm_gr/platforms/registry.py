@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 from .compat import validate_provider_metadata
@@ -40,6 +42,7 @@ class RegisteredBackend:
     origin: str
 
 
+_REGISTRATION_LOCK = RLock()
 _BACKENDS: dict[str, RegisteredBackend] = {}
 _ACTIVE_BACKEND: RegisteredBackend | None = None
 
@@ -132,46 +135,28 @@ def _validate_backend_provider(provider: Any, *, source: str) -> str:
     return normalized
 
 
-def _validate_backend_registration(
-    provider: Any,
-    *,
-    source: str,
-    pending_backends: dict[str, RegisteredBackend] | None = None,
-) -> RegisteredBackend:
-    """Validate one registration without mutating process-global state."""
-    normalized = _validate_backend_provider(provider, source=source)
-    candidate = RegisteredBackend(
-        provider=provider,
-        backend_id=normalized,
-        source=source,
-        origin=_origin(normalized, source),
-    )
-
-    existing = _BACKENDS.get(normalized)
-    if existing is None and pending_backends is not None:
-        existing = pending_backends.get(normalized)
-
-    if existing is not None and existing.provider is not provider:
-        raise DuplicateBackendRegistrationError(
-            "A different vllm-gr backend is already registered for this ID; "
-            f"existing_origin={existing.origin!r}; "
-            f"attempted_origin={candidate.origin!r}; "
-            f"{_registry_context(requested=normalized)}"
-        )
-    return candidate
+def _register_backend_batch(entries: Iterable[tuple[GRBackendProvider, str]]) -> None:
+    """Validate a complete discovery batch before publishing any new provider."""
+    pending: dict[str, RegisteredBackend] = {}
+    with _REGISTRATION_LOCK:
+        for provider, source in entries:
+            backend_id = _validate_backend_provider(provider, source=source)
+            origin = _origin(backend_id, source)
+            existing = _BACKENDS.get(backend_id) or pending.get(backend_id)
+            if existing is None:
+                pending[backend_id] = RegisteredBackend(provider, backend_id, source, origin)
+            elif existing.provider is not provider:
+                raise DuplicateBackendRegistrationError(
+                    "A different vllm-gr backend is already registered for this ID; "
+                    f"existing_origin={existing.origin!r}; attempted_origin={origin!r}; "
+                    f"{_registry_context(requested=backend_id)}"
+                )
+        _BACKENDS.update(pending)
 
 
-def register_backend(
-    provider: GRBackendProvider,
-    *,
-    source: str = "manual",
-) -> None:
-    """Register a provider without loading any of its hardware modules."""
-    candidate = _validate_backend_registration(provider, source=source)
-    existing = _BACKENDS.get(candidate.backend_id)
-    if existing is not None and existing.provider is provider:
-        return
-    _BACKENDS[candidate.backend_id] = candidate
+def register_backend(provider: GRBackendProvider, *, source: str = "manual") -> None:
+    """Register one manually supplied provider under the same discovery rules."""
+    _register_backend_batch(((provider, source),))
 
 
 def resolve_backend(backend_id: str) -> GRBackendProvider:
@@ -275,29 +260,6 @@ def activate_backend(
         f"active_origin={_ACTIVE_BACKEND.origin!r}; "
         f"requested_origin={registration.origin!r}; "
         f"{_registry_context(requested=normalized)}"
-    )
-
-
-def activate_selected_backend(
-    identity: PlatformIdentity,
-    *,
-    requested: str | None = None,
-) -> GRBackendProvider:
-    """Select and activate the provider for a native platform identity."""
-    global _ACTIVE_BACKEND
-
-    registration = select_backend(identity, requested=requested)
-    if _ACTIVE_BACKEND is None:
-        _ACTIVE_BACKEND = registration
-        return registration.provider
-    if _ACTIVE_BACKEND.provider is registration.provider:
-        return registration.provider
-
-    raise BackendAlreadyActiveError(
-        "A different vllm-gr backend is already active; "
-        f"active_origin={_ACTIVE_BACKEND.origin!r}; "
-        f"requested_origin={registration.origin!r}; "
-        f"platform={identity.describe()}; {_registry_context()}"
     )
 
 

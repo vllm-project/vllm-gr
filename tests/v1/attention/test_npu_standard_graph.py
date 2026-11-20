@@ -594,11 +594,6 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
     monkeypatch.setattr(context_module, "get_forward_context", lambda: context)
     monkeypatch.setattr(beam_attn, "NPU_DEVICE", True)
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)
-    monkeypatch.setattr(
-        beam_attn,
-        "_get_platform_execution_module",
-        lambda: SimpleNamespace(reshape_and_cache=unexpected_cache_write),
-    )
     implementation = SimpleNamespace(
         kv_sharing_target_layer_name="shared-cache",
         kv_cache_dtype="auto",
@@ -609,7 +604,11 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
         prefill_flash_attn_version=None,
         sinks=None,
         alibi_slopes=None,
-        prefill_attention=fallback,
+        execution=SimpleNamespace(
+            reshape_and_cache=unexpected_cache_write,
+            prefill_attention=fallback,
+            _GRAPH_CAPTURE_STATE=getattr(npu_module, "_GRAPH_CAPTURE_STATE"),
+        ),
     )
     implementation._kv_cache_views = beam_attn.BeamAttentionImpl._kv_cache_views.__get__(
         implementation

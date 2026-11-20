@@ -13,18 +13,7 @@ from typing import Any
 import pytest
 
 from vllm_gr.config import GRConfig
-from vllm_gr.config.parser import parse_gr_config
-from vllm_gr.platforms import loader
-from vllm_gr.platforms.ascend import NPU_BACKEND
-from vllm_gr.platforms.binding import (
-    bind_backend_services,
-    close_backend_binding,
-    validate_worker_readiness,
-    verify_engine_backend_readiness,
-    worker_backend_readiness,
-)
-from vllm_gr.platforms.cuda import CUDA_BACKEND
-from vllm_gr.platforms.plan import (
+from vllm_gr.config.backend_plan import (
     BACKEND_PLAN_KEY,
     BackendPlan,
     BackendRequest,
@@ -32,14 +21,49 @@ from vllm_gr.platforms.plan import (
     ServiceRequirements,
     read_backend_plan,
 )
+from vllm_gr.config.parser import parse_gr_config
+from vllm_gr.platforms import loader
+from vllm_gr.platforms.ascend import NPU_BACKEND
+from vllm_gr.platforms.cuda import CUDA_BACKEND
 from vllm_gr.platforms.planning import (
     admit_backend_plan,
     normalize_backend_request,
     resolve_backend_plan,
 )
 from vllm_gr.platforms.services import planning_provider, validate_planning_api
+from vllm_gr.v1.engine.worker_readiness import (
+    validate_worker_readiness,
+    verify_engine_backend_readiness,
+    worker_backend_readiness,
+)
+from vllm_gr.v1.worker.runner_binding import (
+    bind_backend_services,
+    close_backend_binding,
+)
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
+
+
+def test_historical_backend_paths_resolve_the_same_wire_and_rpc_objects() -> None:
+    from vllm_gr.platforms import binding, plan, readiness
+
+    assert plan.BackendPlan is BackendPlan
+    assert binding.bind_backend_services is bind_backend_services
+    assert binding.worker_backend_readiness is worker_backend_readiness
+    assert readiness.verify_engine_backend_readiness is verify_engine_backend_readiness
+    # Captured from the pre-migration codec. A self-round-trip alone can hide a wire change.
+    envelope = {
+        "plan": {
+            "schema_version": 1,
+            "plan_api_version": 1,
+            "provider_api_version": 2,
+            "backend_id": "cuda",
+            "request": {"config": {}, "native": {}, "compatibility": {}, "options": {}},
+            "choices": {"stage": "cuda.v2"},
+        },
+        "fingerprint": "60b287d597511794960c55988945c2f3c4451fd733075503432e1694fffadfa7",
+    }
+    assert BackendPlan.from_wire(envelope).to_wire() == envelope
 
 
 class Service:

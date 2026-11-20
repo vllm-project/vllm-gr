@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """xLLM fused-operator execution primitives for the Beam Attention backend.
 
-NPU-only execution module selected by ``_get_platform_execution_module`` when
+NPU-only execution module selected by the Ascend provider when
 ``vllm_gr_npu_decode_execution == "xllm"``.  It replaces the cascade
 per-operator path only for the incremental beam decode branch; every other
 branch (std requests, prefill) forwards to
@@ -33,7 +33,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     interleaved_pool_base,
 )
-from vllm_gr.v1.beam.npu_execution_batch import restore_npu_cache_pool_layout
+from vllm_gr.v1.attention.backends.npu_cache_layout import restore_npu_cache_pool_layout
 
 logger = init_logger(__name__)
 
@@ -54,6 +54,10 @@ is_available = beam_attn_npu.is_available
 get_flash_attn_version = beam_attn_npu.get_flash_attn_version
 supports_sinks = beam_attn_npu.supports_sinks
 reshape_and_cache = beam_attn_npu.reshape_and_cache
+# xllm owns decode. Prefill uses the native Ascend cascade primitives.
+prefill_attention = beam_attn_npu.prefill_attention
+prefill_attention_bsnd = beam_attn_npu.prefill_attention_bsnd
+_GRAPH_CAPTURE_STATE = beam_attn_npu._GRAPH_CAPTURE_STATE
 
 
 def select_beam_rows(tensor: torch.Tensor, attn_metadata: BeamAttentionMetadata) -> torch.Tensor:
@@ -77,32 +81,6 @@ def select_beam_rows(tensor: torch.Tensor, attn_metadata: BeamAttentionMetadata)
     ):
         return tensor[:rows]
     return tensor[attn_metadata.prefix_indices]
-
-
-def prefill_attention(
-    output: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    attn_metadata: BeamAttentionMetadata,
-    sliding_window_size: list | tuple | None,
-    scale: float,
-    logits_soft_cap: float,
-    vllm_flash_attn_version: int,
-    s_aux: torch.Tensor | None = None,
-    alibi_slopes: torch.Tensor | None = None,
-) -> None:
-    """Validation guard: the prefill path must never execute through xllm.
-
-    The xllm module is decode-only by design; BeamAttentionImpl routes the
-    prefill branch to ``beam_attn_npu`` directly on NPU. Reaching this
-    function means a routing regression, so fail loudly.
-    """
-    raise RuntimeError(
-        "prefill attention reached the xllm execution module — prefill must "
-        "route to the cascade module (beam_attn_npu), not the decode-only "
-        "xllm path"
-    )
 
 
 def cache_unshared_kv(

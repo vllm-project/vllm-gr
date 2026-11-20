@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
+from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import BeamPostprocessWorkspace
 
 
 def validate_batch_size(workspace: BeamPostprocessWorkspace, batch_size: int) -> None:

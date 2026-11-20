@@ -28,11 +28,11 @@ from vllm_gr.config import (
     GRConfig,
 )
 from vllm_gr.config.parser import gr_config_to_mapping
-from vllm_gr.ops.npu_stage_logits import make_npu_stage_reload_weights
 from vllm_gr.v1.worker.model_runner_patch import (
     make_load_model_with_constraint_backend,
     make_shutdown_with_constraint_backend,
 )
+from vllm_gr.v1.worker.npu.stage_projection import make_npu_stage_reload_weights
 
 
 class _Backend:
@@ -224,7 +224,7 @@ def test_failed_reload_restores_old_hook_and_does_not_publish_partial_owner(
             raise RuntimeError("install failed")
 
         monkeypatch.setattr(
-            "vllm_gr.ops.npu_stage_logits.install_npu_stage_projection", fail_install
+            "vllm_gr.v1.worker.npu.stage_projection.install_npu_stage_projection", fail_install
         )
     with pytest.raises(RuntimeError, match=f"{failure} failed"):
         load(runner)

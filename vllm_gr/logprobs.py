@@ -8,6 +8,7 @@ from collections.abc import Iterable
 
 __all__ = [
     "append_fast",
+    "patch_flat_logprobs",
 ]
 
 
@@ -40,3 +41,9 @@ def append_fast(
     else:
         self.decoded_tokens.extend(itertools.islice(decoded_tokens, len(token_ids)))
     self.end_indices.append(len(self.logprobs))
+
+
+def patch_flat_logprobs() -> None:
+    from vllm.logprobs import FlatLogprobs
+
+    FlatLogprobs.append_fast = append_fast

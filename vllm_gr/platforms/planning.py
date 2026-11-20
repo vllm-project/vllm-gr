@@ -10,8 +10,14 @@ from enum import Enum
 from importlib import metadata
 from typing import Any
 
+from vllm_gr.config.backend_plan import (
+    BACKEND_PLAN_KEY,
+    BackendPlan,
+    BackendRequest,
+    PlanData,
+)
+
 from .loader import external_provider_entry_points
-from .plan import BACKEND_PLAN_KEY, BackendPlan, BackendRequest, PlanData
 
 BACKEND_OPTIONS_KEY = "vllm_gr_backend_options"
 

@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from vllm_gr.config.models import MAX_BEAM_WIDTH, MAX_CANDIDATE_WIDTH
+from vllm_gr.ops.cuda.topk_sort_key import unpack_score
 
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
@@ -37,15 +38,6 @@ def _pack_score_flat(score, flat_index, valid):
     # is represented in i64 instead of overflowing the inferred i32 branch.
     tie_key = tl.where(valid, flat_index.to(tl.int64), 0x00000000FFFFFFFF)
     return (key64 << 32) | tie_key
-
-
-@triton.jit
-def _unpack_score(packed):
-    min_i32: tl.constexpr = -2147483648
-    sort_key = ((packed >> 32) & 0x00000000FFFFFFFF).to(tl.int32)
-    sign = sort_key >> 31
-    score_bits = tl.where(sign < 0, sort_key ^ -1, sort_key ^ min_i32)
-    return score_bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit(
@@ -113,7 +105,7 @@ def _local_beam_topk_kernel(
             ranked = ~tl.topk(~packed, SELECT_BLOCK)
         output_mask = retained < select_width
         output = request * scratch_stride + tile * select_width + retained
-        tl.store(local_scores + output, _unpack_score(ranked), mask=output_mask)
+        tl.store(local_scores + output, unpack_score(ranked), mask=output_mask)
         tl.store(
             local_flat_indices + output,
             (ranked & 0x00000000FFFFFFFF).to(tl.int32),
@@ -123,7 +115,7 @@ def _local_beam_topk_kernel(
         sorted_pairs = tl.sort(packed, descending=False)
         output_mask = offsets < select_width
         output = request * scratch_stride + tile * select_width + offsets
-        tl.store(local_scores + output, _unpack_score(sorted_pairs), mask=output_mask)
+        tl.store(local_scores + output, unpack_score(sorted_pairs), mask=output_mask)
         tl.store(
             local_flat_indices + output,
             (sorted_pairs & 0x00000000FFFFFFFF).to(tl.int32),
@@ -161,7 +153,7 @@ def _merge_beam_topk_kernel(
     valid = valid & (flat >= 0)
     packed = _pack_score_flat(score, flat, valid)
     sorted_pairs = tl.sort(packed, descending=False)
-    selected_scores = _unpack_score(sorted_pairs)
+    selected_scores = unpack_score(sorted_pairs)
     selected_flat = (sorted_pairs & 0x00000000FFFFFFFF).to(tl.int32)
     output_mask = offsets < select_width
     output = request * scratch_stride + output_list * select_width + offsets
@@ -295,7 +287,7 @@ def _bootstrap_beam_outputs_kernel(
         tl.where(selected_valid, request * beam_width, -1),
         mask=rank < beam_width,
     )
-    tl.store(out_scores + output, _unpack_score(selected), mask=rank < beam_width)
+    tl.store(out_scores + output, unpack_score(selected), mask=rank < beam_width)
     if WRITE_FLAT_INDICES:
         tl.store(
             out_flat_indices + output,

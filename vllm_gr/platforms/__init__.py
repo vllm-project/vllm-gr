@@ -2,6 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Stable public API for vllm-gr backend providers."""
 
+from vllm_gr.config.backend_plan import (
+    PLAN_API_VERSION,
+    BackendPlan,
+    BackendRequest,
+    PlanData,
+    ServiceRequirements,
+)
+
 from .errors import (
     AmbiguousBackendError,
     BackendAlreadyActiveError,
@@ -22,13 +30,6 @@ from .interface import (
 )
 from .legacy import LegacyProviderAdapter, adapt_legacy_provider, declared_api_version
 from .loader import activate_current_backend
-from .plan import (
-    PLAN_API_VERSION,
-    BackendPlan,
-    BackendRequest,
-    PlanData,
-    ServiceRequirements,
-)
 from .registry import (
     activate_backend,
     get_active_backend,

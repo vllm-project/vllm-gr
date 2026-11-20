@@ -144,14 +144,17 @@ class BSNDRegressions(unittest.TestCase):
         self,
     ) -> tuple[Callable[..., Any], tuple[Any, ...], list[tuple[str, Any]]]:
         calls: list[tuple[str, Any]] = []
-        platform = SimpleNamespace(reshape_and_cache=lambda *args: calls.append(("cache", args)))
+        platform = SimpleNamespace(
+            reshape_and_cache=lambda *args: calls.append(("cache", args)),
+            prefill_attention=lambda **kw: calls.append(("tnd", kw)),
+            prefill_attention_bsnd=lambda **kw: calls.append(("bsnd", kw)),
+        )
         fn = extract(
             BACKEND,
             "prefill_forward",
             {
                 "NPU_DEVICE": True,
                 "CUDA_DEVICE": False,
-                "_get_platform_execution_module": lambda: platform,
             },
         )
         owner = SimpleNamespace(
@@ -164,7 +167,7 @@ class BSNDRegressions(unittest.TestCase):
             alibi_slopes=None,
             vllm_flash_attn_version=None,
             prefill_flash_attn_version=None,
-            prefill_attention=lambda **kw: calls.append(("tnd", kw)),
+            execution=platform,
         )
         owner._kv_cache_views = MethodType(extract(BACKEND, "_kv_cache_views", {}), owner)
         meta = SimpleNamespace(
@@ -189,12 +192,8 @@ class BSNDRegressions(unittest.TestCase):
 
     def test_backend_writes_cache_but_fia_reads_current_layer_kv(self) -> None:
         fn, args, calls = self.backend_fixture()
-        helper = SimpleNamespace(prefill_attention_bsnd=lambda **kw: calls.append(("bsnd", kw)))
-        with patch.dict(
-            "sys.modules", {"vllm_gr.v1.attention.backends": SimpleNamespace(beam_attn_npu=helper)}
-        ):
-            for _ in range(2):  # same dispatch in warmup and capture
-                self.assertIs(fn(*args), args[-1])
+        for _ in range(2):  # same dispatch in warmup and capture
+            self.assertIs(fn(*args), args[-1])
         self.assertEqual([kind for kind, _ in calls], ["cache", "bsnd"] * 2)
         self.assertIs(calls[0][1][2], args[5][0])
         self.assertIs(calls[0][1][4], args[6].slot_mapping)
@@ -222,23 +221,7 @@ class BSNDRegressions(unittest.TestCase):
                 self.assertEqual(calls, [])
         fn, args, calls = self.backend_fixture()
         args[6].prefill_fia_layout = "TND"
-        # Exercise the real NPU guard without importing the accelerator runtime.
-        # This is ordinary eager TND, not standard FULL graph capture.
-        modes = SimpleNamespace(NONE="NONE", FULL="FULL")
-        context = SimpleNamespace(cudagraph_runtime_mode=modes.NONE, capturing=False)
-        helper = SimpleNamespace(_GRAPH_CAPTURE_STATE={"capturing": False})
-        with patch.dict(
-            "sys.modules",
-            {
-                "vllm.config": SimpleNamespace(CUDAGraphMode=modes),
-                "vllm.forward_context": SimpleNamespace(get_forward_context=lambda: context),
-                "vllm_gr.v1.attention.backends": SimpleNamespace(beam_attn_npu=helper),
-                "vllm_gr.v1.beam.context": SimpleNamespace(
-                    BEAM_DATA_VAR=SimpleNamespace(get=lambda: None)
-                ),
-            },
-        ):
-            self.assertIs(fn(*args), args[-1])
+        self.assertIs(fn(*args), args[-1])
         self.assertEqual([kind for kind, _ in calls], ["cache", "tnd"])
         self.assertIs(calls[1][1]["key_cache"], args[5][0])
         self.assertIs(calls[1][1]["value_cache"], args[5][1])

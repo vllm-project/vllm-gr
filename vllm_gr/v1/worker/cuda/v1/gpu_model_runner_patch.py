@@ -10,12 +10,12 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.platforms.cuda.runner import V1_RUNNER
 from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
 )
+from vllm_gr.v1.worker.cuda.runner_installer import V1_RUNNER
 from vllm_gr.v1.worker.cuda.v1.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 from vllm_gr.v1.worker.gr_context import (
     _beam_full_graph_ready,
@@ -723,10 +723,10 @@ def is_patched(runner_class: type) -> bool:
 
 def install() -> None:
     """Install CUDA Worker utilities and the V1 native runner wrappers."""
-    from vllm_gr.platforms.cuda.provider import install_worker_hooks
     from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
         make_load_model_with_beam_postprocess_workspace,
     )
+    from vllm_gr.v1.worker.cuda.runner_installer import install_worker_hooks
     from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
     from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
 

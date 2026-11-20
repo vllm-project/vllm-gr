@@ -17,8 +17,8 @@ from vllm.inputs import tokens_input
 from vllm.lora.request import LoRARequest
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_gr.entrypoints.beam_output import _LazyMaterializedBeamSequence
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchEngineError
+from vllm_gr.entrypoints.beam_search.lazy_output import _LazyMaterializedBeamSequence
 from vllm_gr.entrypoints.beam_search.output_processor import (
     BeamSearchOutputProcessor,
 )
@@ -38,6 +38,13 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputSequence,
     BeamRequestOutput,
 )
+
+
+def test_old_beam_sequence_class_path_resolves_for_unpickling() -> None:
+    from vllm_gr.entrypoints import beam_output as legacy
+    from vllm_gr.entrypoints.beam_search import lazy_output
+
+    assert legacy._LazyMaterializedBeamSequence is lazy_output._LazyMaterializedBeamSequence
 
 
 class _Tokenizer:

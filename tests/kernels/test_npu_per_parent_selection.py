@@ -40,10 +40,10 @@ from vllm_gr.constraints.table import (
 )
 from vllm_gr.ops.npu.rec_constrained_topk import is_available, unavailable_reason
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
-from vllm_gr.v1.beam.npu_dynamic_beam import (
-    NPUDynamicBeamState,
-    get_npu_stage_pools,
-    initialize_npu_packed_stage_pools,
+from vllm_gr.v1.beam.dynamic_beam import (
+    DynamicBeamState,
+    get_stage_pools,
+    initialize_packed_stage_pools,
 )
 
 pytestmark = [pytest.mark.npu_test, pytest.mark.l2]
@@ -196,7 +196,7 @@ def _context(batch: int, packed: bool) -> Any:
         pools=[BeamAttentionPool(batch + 1, 4, 1, 3, 2, DEVICE, torch.float16) for _ in range(2)],
     )
     if packed:
-        initialize_npu_packed_stage_pools(context)
+        initialize_packed_stage_pools(context)
     return context
 
 
@@ -260,7 +260,7 @@ def test_real_npu_independent_k_selection_and_kv_match_scalar_oracle(
     batch: int, packed: bool, widths: tuple[int, ...], ks: tuple[int, ...]
 ) -> None:
     context = _context(batch, packed)
-    state = NPUDynamicBeamState(context, batch, 3)
+    state = DynamicBeamState(context, batch, 3)
     prefill_tokens = [
         [1000 * request + beam for beam in range(widths[0])] for request in range(batch)
     ]
@@ -280,8 +280,8 @@ def test_real_npu_independent_k_selection_and_kv_match_scalar_oracle(
         candidates = ConstraintOutput(
             *(tensor.to(DEVICE) for tensor in _output_tensors(host_candidates))
         )
-        old_pools = get_npu_stage_pools(context, input_width)
-        target_pools = get_npu_stage_pools(context, output_width)
+        old_pools = get_stage_pools(context, input_width)
+        target_pools = get_stage_pools(context, output_width)
         for pool in target_pools:
             pool.unshared_key[batch:].fill_(-123)
             pool.unshared_value[batch:].fill_(-123)

@@ -17,37 +17,15 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     require_beam_decode_session,
     resolve_beam_pool,
 )
+from vllm_gr.v1.attention.backends.cascade_kv import (
+    cache_unshared_kv as cache_unshared_kv,
+)
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     merge_tnd_attention_outputs,
 )
 from vllm_gr.v1.worker.prefill_graph_common import SUPPORTED_NUM_REQS
 
 logger = init_logger(__name__)
-
-
-def cache_unshared_kv(
-    unshared_key: torch.Tensor,
-    unshared_value: torch.Tensor,
-    curr_key: torch.Tensor,
-    curr_value: torch.Tensor,
-    slot: int,
-    decode_step: int,
-    beam_session: object = None,  # unused on cascade; xllm-only contract
-) -> None:
-    """Cascade-mode pool write: slot/0-based semantics, unchanged behavior."""
-    from vllm_gr.v1.attention.backends.beam_kernels import (
-        cache_unshared_kv as _cache_unshared_kv,
-    )
-
-    del beam_session
-    _cache_unshared_kv(
-        unshared_key,
-        unshared_value,
-        curr_key,
-        curr_value,
-        slot,
-        decode_step,
-    )
 
 
 def is_available() -> bool:

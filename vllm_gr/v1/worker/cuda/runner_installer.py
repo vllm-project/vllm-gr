@@ -9,8 +9,8 @@ from importlib import import_module
 from threading import RLock
 from typing import Any, cast
 
-from ..interface import ModelRunnerInstaller
-from ..plan import read_backend_plan
+from vllm_gr.config.backend_plan import read_backend_plan
+from vllm_gr.platforms.interface import ModelRunnerInstaller
 
 # These IDs are already serialized in admitted plans and reported in readiness.
 V1_RUNNER = "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch"
@@ -48,8 +48,6 @@ def is_patched(worker_class: type[Any]) -> bool:
 
 
 def install() -> None:
-    from .provider import install_worker_hooks
-
     with _INSTALL_LOCK:
         install_worker_hooks()
         ((_, worker_class),) = discover_worker_runners()
@@ -88,3 +86,19 @@ def install() -> None:
 
         setattr(init_device, _WORKER_MARKER, True)
         worker_class.init_device = init_device
+
+
+def install_worker_utilities() -> None:
+    from vllm.v1.worker.gpu_worker import Worker
+
+    from vllm_gr.v1.worker.model_runner_patch import install_worker_utility_hooks
+
+    install_worker_utility_hooks(Worker)
+
+
+def install_worker_hooks() -> None:
+    """Both CUDA runner generations use the same Worker and NumPy staging."""
+    from vllm_gr.v1.worker.cuda.numpy_staging import install_numpy_staging
+
+    install_worker_utilities()
+    install_numpy_staging()

@@ -463,14 +463,14 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
 ) -> None:
     from copy import deepcopy
 
-    from vllm_gr.config.parser import parse_gr_config
-    from vllm_gr.platforms.plan import (
+    from vllm_gr.config.backend_plan import (
         BACKEND_PLAN_KEY,
         BackendPlan,
         BackendRequest,
         PlanData,
         read_backend_plan,
     )
+    from vllm_gr.config.parser import parse_gr_config
     from vllm_gr.platforms.planning import BACKEND_OPTIONS_KEY
 
     seen: list[Any] = []

@@ -36,13 +36,13 @@ from typing import Any, cast
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.platforms.cuda.runner import V2_RUNNER
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.v1.worker import gr_execution, gr_gc
 from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
     _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
     make_load_model_with_beam_postprocess_workspace,
 )
+from vllm_gr.v1.worker.cuda.runner_installer import V2_RUNNER
 from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_resources as v2_resources
 from vllm_gr.v1.worker.cuda.v2.gpu_prefill_v2 import (
     try_add_gr_prefill_requests,
@@ -355,7 +355,7 @@ def _apply_v2_runner_patches() -> None:
     Backend load wrapper last, so the final ``load_model`` carries the
     constraint marker that the V2 validation gate checks.
     """
-    from vllm_gr.platforms.binding import bind_after_model_load
+    from vllm_gr.v1.worker.runner_binding import bind_after_model_load
     from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
     for runner_name, runner_type in discover_worker_runners():
@@ -416,7 +416,7 @@ def _apply_v2_runner_patches() -> None:
 
 def install() -> None:
     """Install shared CUDA Worker utilities before patching the V2 runner."""
-    from vllm_gr.platforms.cuda.provider import install_worker_hooks
+    from vllm_gr.v1.worker.cuda.runner_installer import install_worker_hooks
 
     install_worker_hooks()
     _apply_v2_runner_patches()

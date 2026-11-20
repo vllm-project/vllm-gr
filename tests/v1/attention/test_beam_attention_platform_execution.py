@@ -134,6 +134,10 @@ def test_platform_dispatch_selects_exactly_one_execution_module(
     npu_available: bool,
     expected: str | None,
 ) -> None:
+    # Standalone probes run before a GR provider is selected.
+    from vllm_gr.platforms import registry
+
+    monkeypatch.setattr(registry, "_ACTIVE_BACKEND", None)
     gpu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_gpu")
     npu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_npu")
     monkeypatch.setitem(sys.modules, gpu_module.__name__, gpu_module)
@@ -530,51 +534,6 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
     # Verify pool KV was written by cache_unshared_kv
     torch.testing.assert_close(pool.unshared_key[0, :2, :, 0, :], key)
     torch.testing.assert_close(pool.unshared_value[0, :2, :, 0, :], value)
-
-
-def test_cascade_attention_static_method_delegates_to_platform() -> None:
-    """Test that BeamAttentionImpl.cascade_attention forwards all arguments
-    to the platform execution module's cascade_attention."""
-    calls: dict[str, Any] = {}
-
-    def cascade_attention(**kwargs: Any) -> None:
-        calls.update(kwargs)
-
-    execution = SimpleNamespace(cascade_attention=cascade_attention)
-    from unittest.mock import patch
-
-    with patch.object(beam_attn, "_get_platform_execution_module", return_value=execution):
-        tensors = [torch.empty(1) for _ in range(9)]
-        metadata = SimpleNamespace(is_beam_decode=True)
-        pool = SimpleNamespace()
-
-        beam_attn.BeamAttentionImpl.cascade_attention(
-            output=tensors[0],
-            query=tensors[1],
-            key_cache=tensors[2],
-            value_cache=tensors[3],
-            attn_metadata=metadata,
-            sliding_window_size=(-1, 0),
-            scale=0.25,
-            logits_soft_cap=3.0,
-            vllm_flash_attn_version=3,
-            s_aux=tensors[8],
-            alibi_slopes=None,
-            beam_pool=pool,
-        )
-
-    assert calls["output"] is tensors[0]
-    assert calls["query"] is tensors[1]
-    assert calls["key_cache"] is tensors[2]
-    assert calls["value_cache"] is tensors[3]
-    assert calls["attn_metadata"] is metadata
-    assert calls["sliding_window_size"] == (-1, 0)
-    assert calls["scale"] == 0.25
-    assert calls["logits_soft_cap"] == 3.0
-    assert calls["vllm_flash_attn_version"] == 3
-    assert calls["s_aux"] is tensors[8]
-    assert calls["alibi_slopes"] is None
-    assert calls["beam_pool"] is pool
 
 
 def test_npu_prefill_attention_consumes_common_metadata(

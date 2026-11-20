@@ -20,6 +20,7 @@ import triton
 import triton.language as tl
 
 from vllm_gr.config.models import DEFAULT_DEPLOYMENT
+from vllm_gr.ops.cuda.topk_sort_key import pack_score_index, unpack_score
 
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
@@ -57,29 +58,6 @@ class MCarryTopKScratch:
     keep: int
     keep_limit: int = LOCAL_KEEP_MAX
     select: str = DEFAULT_DEPLOYMENT.topk_select
-
-
-@triton.jit
-def _pack_score_index(score, index, valid):
-    min_i32: tl.constexpr = -2147483648
-    score = tl.where(valid & (score == score), score, -float("inf"))
-    # Collapse -0.0 onto +0.0 so the packed order is a total order.
-    score = tl.where(score == 0.0, 0.0, score)
-    score_bits = score.to(tl.int32, bitcast=True)
-    sign = score_bits >> 31
-    sort_key = tl.where(sign == 0, score_bits ^ -1, score_bits ^ min_i32)
-    high = sort_key.to(tl.int64) & 0x00000000FFFFFFFF
-    low = tl.where(valid, index.to(tl.int64), 0x00000000FFFFFFFF)
-    return (high << 32) | low
-
-
-@triton.jit
-def _unpack_score(packed):
-    min_i32: tl.constexpr = -2147483648
-    sort_key = ((packed >> 32) & 0x00000000FFFFFFFF).to(tl.int32)
-    sign = sort_key >> 31
-    score_bits = tl.where(sign < 0, sort_key ^ -1, sort_key ^ min_i32)
-    return score_bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -131,7 +109,7 @@ def _local_keys_kernel(
     tl.store(partial_max + row * partial_stride + tile, tile_max)
     tl.store(partial_sum + row * partial_stride + tile, tile_sum)
 
-    packed = _pack_score_index(values, flat, valid)
+    packed = pack_score_index(values, flat, valid)
     retained = tl.arange(0, KEEP_BLOCK)
     if KEEP_BLOCK == 1:
         # Smallest packed key wins: highest score, then lowest token index.
@@ -166,7 +144,7 @@ def _local_keys_kernel(
             selected_values,
             -float("inf"),
         )
-        exact = _pack_score_index(selected_values, selected_flat, selected_valid)
+        exact = pack_score_index(selected_values, selected_flat, selected_valid)
         tl.store(
             local_keys + row * keep_stride + tile * keep_width + retained,
             exact,
@@ -280,7 +258,7 @@ def _finalize_kernel(
     selected = ranks < top_k
     key = tl.load(keys + row * key_stride + ranks, mask=selected, other=_MAX_I64)
     tokens = (key & 0x00000000FFFFFFFF).to(tl.int32)
-    scores = _unpack_score(key)
+    scores = unpack_score(key)
     valid = selected & has_mass & (tokens >= 0) & (scores > -float("inf")) & (scores < float("inf"))
     output_offset = row * output_stride + ranks
     tl.store(output_ids + output_offset, tokens, mask=selected)
@@ -384,7 +362,7 @@ def _repair_row_kernel(
                 values = tl.where(
                     (values > -float("inf")) & (values < float("inf")), values, -float("inf")
                 )
-                packed = _pack_score_index(values, flat, valid)
+                packed = pack_score_index(values, flat, valid)
                 if TOPK_BLOCK == 1:
                     # The i32 cutoff can require exact repair even for K=1.
                     # Avoid Triton's scalar reshape in tl.topk(..., 1).
@@ -416,7 +394,7 @@ def _repair_row_kernel(
         ranks = tl.arange(0, OUTPUT_BLOCK)
         selected = ranks < top_k
         tokens = (key & 0x00000000FFFFFFFF).to(tl.int32)
-        scores = _unpack_score(key)
+        scores = unpack_score(key)
         valid_out = (
             selected & has_mass & (tokens >= 0) & (scores > -float("inf")) & (scores < float("inf"))
         )
@@ -499,7 +477,7 @@ def _repair_fold_kernel(
                     values,
                     -float("inf"),
                 )
-                packed = _pack_score_index(values, global_flat, valid)
+                packed = pack_score_index(values, global_flat, valid)
                 tile_top = ~tl.topk(~packed, TOPK_BLOCK)
                 both = tl.cat(current, tile_top, can_reorder=True)
                 current = ~tl.topk(~both, TOPK_BLOCK)
@@ -604,7 +582,7 @@ def _stream_slice_kernel(
             values = tl.where(
                 (values > -float("inf")) & (values < float("inf")), values, -float("inf")
             )
-            packed = _pack_score_index(values, flat, valid)
+            packed = pack_score_index(values, flat, valid)
             if TOPK_BLOCK == 1:
                 tile_top = tl.min(packed, axis=0, keep_dims=True)
             else:
@@ -661,7 +639,7 @@ def _repair_emit_kernel(
         safe_max = tl.where(has_mass, global_max, 0.0)
         denominator = safe_max + tl.log(tl.sum(tile_sums * tl.exp(tile_maxes - safe_max), axis=0))
         tokens = (key & 0x00000000FFFFFFFF).to(tl.int32)
-        scores = _unpack_score(key)
+        scores = unpack_score(key)
         valid = (
             selected & has_mass & (tokens >= 0) & (scores > -float("inf")) & (scores < float("inf"))
         )
