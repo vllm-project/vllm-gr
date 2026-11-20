@@ -239,6 +239,9 @@ def _capture_batch(
                 # the dummy session; a device error here aborts startup.
                 torch.accelerator.synchronize(worker.device)
                 fallback_error = error
+            if graph is not None and graph.ready and owner.beam.workspace.radix_scratch is not None:
+                for runner in owner.beam.runners:
+                    runner.capture_radix_selection()
         finally:
             done = torch.Event()
             done.record()

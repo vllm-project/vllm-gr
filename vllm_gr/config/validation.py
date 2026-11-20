@@ -313,6 +313,12 @@ def validate_prefill_flash_attn_version(value: object) -> int | str | None:
     raise ValueError("beam.prefill_flash_attn_version must be null, 'auto', 2 or 3")
 
 
+def validate_enable_radix_topk(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError("gr.enable_radix_topk must be a boolean")
+    return value
+
+
 def validate_enable_short_suffix_attention(value: object) -> bool:
     if not isinstance(value, bool):
         raise TypeError("beam.enable_short_suffix_attention must be a boolean")

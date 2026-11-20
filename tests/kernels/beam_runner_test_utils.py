@@ -16,17 +16,17 @@ from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
 
 
 def make_request_runner(
-    width=4,
-    steps=7,
+    width: int = 4,
+    steps: int = 7,
     *,
-    dtype=torch.float16,
-    stops=(),
-    ignore=False,
-    batch=1,
-    state_index=0,
-    physical_steps=None,
-    candidate_width=None,
-):
+    dtype: torch.dtype = torch.float16,
+    stops: tuple[int, ...] = (),
+    ignore: bool = False,
+    batch: int = 1,
+    state_index: int = 0,
+    physical_steps: int | None = None,
+    candidate_width: int | None = None,
+) -> BeamSearchRunner:
     context = BeamAttentionContext(
         batch, width, 1, physical_steps or steps, 8, 2, torch.device("cuda"), dtype
     )

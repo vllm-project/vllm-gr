@@ -381,9 +381,16 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
 ) -> None:
     from contextlib import nullcontext
 
+    import torch
     from vllm.config import CUDAGraphMode as Mode
     from vllm.v1.worker.gpu import cudagraph_utils as native
 
+    from vllm_gr.ops.cuda.beam_radix_topk import BeamRadixSelectionGraph
+    from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import (
+        BeamPostprocessWorkspaceKey,
+        BeamPostprocessWorkspacePool,
+    )
+    from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
     from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
 
     mib = 1 << 20
@@ -399,6 +406,28 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
     )
     graph = Mock()
     events: list[str] = []
+    scores = torch.empty(1, 128, 128)
+    scratch = object()
+    workspace = SimpleNamespace(
+        key=BeamPostprocessWorkspaceKey(128, 128, torch.float16),
+        radix_scratch=scratch,
+        radix_graphs={},
+        topk_scores=scores,
+        execution_owner=None,
+    )
+    pool_workspaces = BeamPostprocessWorkspacePool()
+    pool_workspaces.add(workspace)
+    worker._beam_postprocess_workspaces = pool_workspaces
+    selection = cast(Any, BeamSearchRunner.__new__(BeamSearchRunner))
+    selection.workspace = workspace
+    selection.workspace_index = 0
+    selection._scratch = {
+        "parent_scores": torch.empty(1, 128),
+        "selection_mask": torch.empty(1, 128 * 128, dtype=torch.bool),
+    }
+    profiling_graph, serving_graph = object(), object()
+    capture_selection = Mock(side_effect=[profiling_graph, serving_graph])
+    monkeypatch.setattr(BeamRadixSelectionGraph, "capture", capture_selection)
 
     def install(runner: Any) -> None:
         assert runner.cudagraph_manager is not manager
@@ -414,6 +443,8 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
         assert manager.pool == native.current_platform.get_global_graph_pool()
         manager._capture_mem_samples.extend([10 * mib, 2 * mib])
         worker._beam_decode_graph = graph
+        selection.capture_radix_selection()
+        assert workspace.radix_graphs[0] is profiling_graph
         from threading import Lock
 
         worker._gr_gpu_stage_runner = SimpleNamespace(
@@ -466,6 +497,13 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
     )
     graph.uninstall.assert_called_once()
     graph.clear.assert_called_once()
+    assert workspace.radix_graphs == {}
+    assert workspace.topk_scores is scores and workspace.radix_scratch is scratch
+    assert worker._beam_postprocess_workspaces is pool_workspaces
+    capture_selection.assert_called_once()
+    selection.capture_radix_selection()
+    assert capture_selection.call_count == 2
+    assert workspace.radix_graphs[0] is serving_graph
 
 
 def test_profile_rejects_bound_runtime_and_preserves_non_beam(

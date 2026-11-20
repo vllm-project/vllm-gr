@@ -46,6 +46,7 @@ def initialize_beam_postprocess_workspaces(
     if not bool(gr_cfg.beam_worker_decision) or width is None:
         return None
     candidate_width = resolve_candidate_width(gr_cfg)
+    enable_radix_topk = getattr(gr_cfg, "enable_radix_topk", False)
 
     context = getattr(runner, "_beam_context", None)
     # The Beam context is created later, on the first admitted batch, with
@@ -67,8 +68,10 @@ def initialize_beam_postprocess_workspaces(
     existing = getattr(runner, "_beam_postprocess_workspaces", None)
     if existing is not None:
         workspace = existing.require(key)
-        if workspace.max_batch != resolved_max_batch or workspace.max_decode_steps != int(
-            gr_cfg.beam_max_decode_steps
+        if (
+            workspace.max_batch != resolved_max_batch
+            or workspace.max_decode_steps != int(gr_cfg.beam_max_decode_steps)
+            or (workspace.radix_scratch is not None) != enable_radix_topk
         ):
             raise RuntimeError(
                 "prewarmed Beam postprocess workspace geometry changed after "
@@ -84,6 +87,7 @@ def initialize_beam_postprocess_workspaces(
         device=device,
         logits_dtype=dtype,
         pin_host=True,
+        enable_radix_topk=enable_radix_topk,
     )
     pool = BeamPostprocessWorkspacePool()
     pool.add(workspace)

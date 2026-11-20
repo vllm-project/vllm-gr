@@ -147,6 +147,10 @@ def close_v2_runtime(runner: Any) -> None:
         graph.uninstall()
         graph.clear()
         runner._beam_decode_graph = None
+    pool = getattr(runner, "_beam_postprocess_workspaces", None)
+    if pool is not None:
+        for key in pool.keys:
+            pool.require(key).radix_graphs.clear()
     for name in (
         "_gr_v2_runtime",
         "_gr_gpu_stage_runner",

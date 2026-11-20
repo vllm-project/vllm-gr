@@ -119,7 +119,8 @@ def test_terminal_native_cleanup_must_finish_before_teardown(
     owner = object.__new__(GPUBeamStageRunner)
     binding = SimpleNamespace(native_request_id="request-0")
     context = SimpleNamespace(_gr_execution_owner=owner)
-    workspace = SimpleNamespace(execution_owner=owner)
+    selection_graph = object()
+    workspace = SimpleNamespace(execution_owner=owner, radix_graphs={0: selection_graph})
     owner.worker = worker
     owner.bindings = (binding,)
     owner.binding = binding
@@ -165,6 +166,7 @@ def test_terminal_native_cleanup_must_finish_before_teardown(
             with pytest.raises(RuntimeError, match="terminal native cleanup"):
                 close_v2_runtime(worker)
             graph.clear.assert_not_called()
+            assert workspace.radix_graphs == {0: selection_graph}
             assert worker._gr_gpu_stage_runner is owner
         finally:
             resume.set()
@@ -178,9 +180,11 @@ def test_terminal_native_cleanup_must_finish_before_teardown(
         with pytest.raises(RuntimeError, match="terminal native cleanup"):
             close_v2_runtime(worker)
         graph.clear.assert_not_called()
+        assert workspace.radix_graphs == {0: selection_graph}
     else:
         close_v2_runtime(worker)
         graph.clear.assert_called_once_with()
+        assert workspace.radix_graphs == {}
 
 
 def test_cleanup_releases_generation_and_receipt_without_releasing_model_resources() -> None:
