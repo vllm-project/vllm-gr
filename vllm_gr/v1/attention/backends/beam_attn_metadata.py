@@ -75,7 +75,6 @@ class BeamAttentionMetadata:
     std_seqlens_q_cpu: list | None = None
     std_cu_seqlens_q_cpu: list | None = None
     std_seqlens_kv_cpu: list | None = None
-    std_cu_seqlens_kv_cpu: list | None = None
 
     # Shared prefix context arrays
     prefix_indices: torch.Tensor | None = None
@@ -88,7 +87,6 @@ class BeamAttentionMetadata:
     prefix_seqlens_q_cpu: list | None = None
     prefix_cu_seqlens_q_cpu: list | None = None
     prefix_seqlens_kv_cpu: list | None = None
-    prefix_cu_seqlens_kv_cpu: list | None = None
 
     # Per-beam incremental suffix lengths
     suffix_cu_seqlens_q_device: torch.Tensor | None = None
@@ -140,7 +138,7 @@ class BeamAttentionMetadata:
     # parameter to ``cascade_attention``.  This field is kept only for
     # backward compatibility with callers that have not yet migrated.
     beam_layer_idx: int = 0
-    beam_pool_slots: list = None  # Per beam-request slot index (for max_batch>1)
+    beam_pool_slots: list[int] | None = None  # Per-request slot IDs in the Beam partition.
     incremental_suffix_kv_len: int = 0  # decode_step + 1
     # Host proof that the current NPU batch routes every row in order. Graph
     # dispatch must preserve this layout: replay does not re-run Python guards.
@@ -171,6 +169,122 @@ def resolve_beam_pool(metadata: BeamAttentionMetadata, beam_pool: Any = None) ->
     if not 0 <= layer_idx < len(pools) or pools[layer_idx] is None:
         raise RuntimeError("Beam decode requires a KV pool for the attention layer")
     return pools[layer_idx]
+
+
+def build_async(
+    *,
+    layout: dict[str, list[int]],
+    views: dict[str, torch.Tensor],
+    session: Any,
+    mask: torch.Tensor,
+    slots: torch.Tensor,
+    block_size: int,
+    max_model_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    prefix_policy: str = DEFAULT_DEPLOYMENT.prefix_policy,
+    prefix_min_chain_us: float = DEFAULT_DEPLOYMENT.prefix_min_chain_us,
+    prefix_calibrations: dict | None = None,
+    explicit_fa_version: int | None = None,
+) -> BeamAttentionMetadata:
+    """Build a fresh metadata description over stable device storage each step.
+
+    Native execution uses block-aligned model/pool bounds. A matching
+    measured profile enables bounded prefix-length graph buckets.
+    """
+    if session is None or not session.is_active:
+        raise RuntimeError("Beam decode requires an active beam session and KV pool")
+    rows = len(layout["positions"])
+    batch = len(layout["prefix_lengths"])
+    width = rows // batch
+    blocks = views["blocks"].view(batch, -1)
+    from vllm_gr.v1.attention.backends.beam_prefix_policy import (
+        PrefixShape,
+        available_prefix_versions,
+        device_fingerprint,
+        multi_processor_count,
+        prefix_bucket,
+        resolve_prefix_plan,
+    )
+
+    bucket = 0
+    if not envs.VLLM_BATCH_INVARIANT and prefix_policy != "off":
+        candidate = prefix_bucket(max(layout["prefix_lengths"]), block_size, max_model_len)
+        versions = available_prefix_versions(blocks.device.index)
+        explicit = explicit_fa_version
+        plan = None
+        if versions:
+            plan = resolve_prefix_plan(
+                PrefixShape(
+                    batch=batch,
+                    width=width,
+                    length=candidate,
+                    heads=num_heads,
+                    kv_heads=num_kv_heads,
+                    dim=session.context.pools[0].unshared_key.shape[-1],
+                    dtype=str(session.context.dtype),
+                    block_size=block_size,
+                ),
+                # An explicit choice decides the backend; otherwise the best
+                # supported one (FA3/FA4) keeps its own split-K heuristic and
+                # does not need a length-scoped graph bound.
+                default_version=explicit if explicit is not None else max(versions),
+                fingerprint=device_fingerprint(blocks.device.index),
+                supported_versions=versions,
+                sm_count=multi_processor_count(blocks.device.index),
+                explicit_version=explicit,
+                policy=prefix_policy,
+                min_chain_us=prefix_min_chain_us,
+                calibrations=prefix_calibrations,
+            )
+        if plan is not None and plan.segments > 1:
+            pages = (candidate + block_size - 1) // block_size
+            chunk = max(1, (pages + plan.segments - 1) // plan.segments)
+            if chunk * plan.segments <= blocks.shape[1]:
+                bucket = candidate
+    return BeamAttentionMetadata(
+        num_actual_tokens=rows,
+        prefix_policy=prefix_policy,
+        prefix_min_chain_us=prefix_min_chain_us,
+        explicit_fa_version=explicit_fa_version,
+        prefix_calibrations=prefix_calibrations,
+        num_reqs=batch,
+        max_query_len=width,
+        query_start_loc=views["query"],
+        query_start_loc_cpu=list(layout["query"]),
+        max_seq_len=max_model_len,
+        seq_lens=views["sequence"],
+        seq_lens_cpu=list(layout["sequence"]),
+        block_table=blocks,
+        slot_mapping=slots,
+        is_beam_decode=True,
+        beam_session=session,
+        beam_active_mask=mask,
+        prefix_indices=views["logits"],
+        num_prefix_indices=rows,
+        prefix_cu_seqlens_q_device=views["query"],
+        prefix_seqlens_kv_device=views["prefix_lengths"],
+        prefix_max_q_len=width,
+        prefix_max_seq_len=bucket or ((max_model_len + block_size - 1) // block_size) * block_size,
+        prefix_length_bucket=bucket,
+        prefix_block_table=blocks,
+        prefix_seqlens_q_cpu=[width] * batch,
+        prefix_cu_seqlens_q_cpu=list(layout["query"]),
+        prefix_seqlens_kv_cpu=list(layout["prefix_lengths"]),
+        suffix_cu_seqlens_q_device=views["suffix_query"],
+        suffix_cu_seqlens_k_device=views["suffix_offsets"],
+        suffix_seqlens_kv_device=views["suffix_lengths"],
+        suffix_max_q_len=1,
+        suffix_max_seq_len=session.context.max_decode_steps,
+        suffix_seqlens_q_cpu=[1] * rows,
+        suffix_cu_seqlens_q_cpu=list(layout["suffix_query"]),
+        suffix_seqlens_kv_cpu=list(layout["suffix_lengths"]),
+        suffix_cu_seqlens_kv_cpu=list(layout["suffix_offsets"]),
+        incremental_suffix_kv_len=layout["suffix_lengths"][0],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+    )
 
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
@@ -366,8 +480,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             num_reqs,
             req_ids,
             beam_data,
-            q_starts,
-            seq_lens_cpu_list,
             is_incremental,
             self.block_size,
         )
@@ -411,7 +523,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 suffix_seqlens_q_cpu,
                 prefix_req_idxs_cpu,
                 prefix_cu_seqlens_q_cpu,
-                prefix_cu_seqlens_kv_cpu,
                 suffix_cu_seqlens_q_cpu,
                 max_prefix_blocks_count,
                 prefix_indices_contiguous,
@@ -444,7 +555,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_seqlens_kv_cpu = []
             std_req_idxs = []
             std_cu_seqlens_q_cpu = None
-            std_cu_seqlens_kv_cpu = None
         else:
             (
                 std_reqs,
@@ -497,7 +607,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 std_seqlens_kv_cpu,
                 std_req_idxs,
                 std_cu_seqlens_q_cpu,
-                std_cu_seqlens_kv_cpu,
             ) = _build_std_mappings(std_reqs, q_starts)
 
             mappings = _build_beam_mappings(
@@ -518,7 +627,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_seqlens_kv_cpu = mappings.suffix_seqlens_kv
             prefix_req_idxs_cpu = mappings.prefix_req_idxs
             prefix_cu_seqlens_q_cpu = mappings.prefix_cu_seqlens_q
-            prefix_cu_seqlens_kv_cpu = mappings.prefix_cu_seqlens_kv
             suffix_cu_seqlens_q_cpu = mappings.suffix_cu_seqlens_q
             suffix_cu_seqlens_kv_cpu = mappings.suffix_cu_seqlens_kv
             max_prefix_blocks_count = mappings.max_prefix_blocks_count
@@ -542,7 +650,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     suffix_seqlens_q_cpu,
                     prefix_req_idxs_cpu,
                     prefix_cu_seqlens_q_cpu,
-                    prefix_cu_seqlens_kv_cpu,
                     suffix_cu_seqlens_q_cpu,
                     max_prefix_blocks_count,
                     prefix_indices_contiguous,
@@ -649,7 +756,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_seqlens_q_cpu=std_seqlens_q_cpu,
             std_cu_seqlens_q_cpu=std_cu_seqlens_q_cpu,
             std_seqlens_kv_cpu=std_seqlens_kv_cpu,
-            std_cu_seqlens_kv_cpu=std_cu_seqlens_kv_cpu,
             std_req_idxs_cpu=std_req_idxs,
             prefix_req_idxs_cpu=prefix_req_idxs_cpu,
             max_prefix_blocks_count=max_prefix_blocks_count,
@@ -662,7 +768,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_seqlens_q_cpu=prefix_seqlens_q_cpu,
             prefix_cu_seqlens_q_cpu=prefix_cu_seqlens_q_cpu,
             prefix_seqlens_kv_cpu=prefix_seqlens_kv_cpu,
-            prefix_cu_seqlens_kv_cpu=prefix_cu_seqlens_kv_cpu,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             suffix_cu_seqlens_q_device=suffix_cu_seqlens_q_device,
             suffix_cu_seqlens_k_device=suffix_cu_seqlens_k_device,

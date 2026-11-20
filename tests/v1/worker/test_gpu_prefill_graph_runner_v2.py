@@ -559,12 +559,12 @@ def test_failed_cuda_health_check_aborts(
 def test_dense_prefill_capture_scope_and_fresh_replay(
     runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from vllm_gr.v1.attention.backends import beam_dense_prefill as dense
+    from vllm_gr.v1 import forward_context
 
     scopes: list[bool] = []
 
     def capture(manager: Any, *args: Any, **kwargs: Any) -> None:
-        scopes.append(dense.in_fresh_prefill_capture())
+        scopes.append(forward_context.in_fresh_prefill_capture())
         for desc in next(iter(manager._capture_descs.values())):
             if desc.cg_mode == Mode.FULL:
                 manager.graphs[desc] = object()
@@ -577,7 +577,7 @@ def test_dense_prefill_capture_scope_and_fresh_replay(
     manager.capture()
     # Every GR Prefill sub-plan captures inside the fresh-Prefill scope.
     assert scopes and all(scopes)
-    assert not dense.in_fresh_prefill_capture()
+    assert not forward_context.in_fresh_prefill_capture()
     with manager.prefill_scope(scheduled()):
         runner.req_states.num_computed_tokens_np[0] = 512  # cached Prefill suffix
         assert manager.dispatch(1, 127, None).cg_mode == Mode.FULL

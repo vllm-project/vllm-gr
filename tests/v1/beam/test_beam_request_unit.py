@@ -80,10 +80,8 @@ class TestBeamKernelsDynamicBeamCount:
     def test_cache_and_select_shrinking_beam_count(self) -> None:
         import torch
 
-        from vllm_gr.v1.attention.backends.beam_kernels import (
-            cache_unshared_kv,
-            select_unshared_kv,
-        )
+        from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
+        from vllm_gr.v1.beam.reorder import select_unshared_kv
 
         max_batch, W, H, steps, D = 2, 4, 2, 3, 2
         key_cache = torch.zeros(max_batch, W, H, steps, D)
@@ -93,7 +91,7 @@ class TestBeamKernelsDynamicBeamCount:
         # Step 0: 4 beams write their KV into pool slot 0.
         curr_key0 = torch.arange(W * H * D, dtype=torch.float32).reshape(W, H, D)
         curr_value0 = curr_key0 + 100
-        cache_unshared_kv(
+        write_eager_step(
             key_cache,
             value_cache,
             curr_key0,
@@ -123,7 +121,7 @@ class TestBeamKernelsDynamicBeamCount:
         # Step 1: only the 2 survivors write KV into pool slot 1.
         curr_key1 = curr_key0[[1, 3]] + 10
         curr_value1 = curr_value0[[1, 3]] + 10
-        cache_unshared_kv(
+        write_eager_step(
             key_cache,
             value_cache,
             curr_key1,
@@ -153,10 +151,8 @@ class TestBeamKernelsDynamicBeamCount:
         """Regression guard: n == W must behave exactly as before the fix."""
         import torch
 
-        from vllm_gr.v1.attention.backends.beam_kernels import (
-            cache_unshared_kv,
-            select_unshared_kv,
-        )
+        from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
+        from vllm_gr.v1.beam.reorder import select_unshared_kv
 
         max_batch, W, H, steps, D = 2, 4, 2, 3, 2
         key_cache = torch.zeros(max_batch, W, H, steps, D)
@@ -164,7 +160,7 @@ class TestBeamKernelsDynamicBeamCount:
         slot = 0
         curr_key = torch.arange(W * H * D, dtype=torch.float32).reshape(W, H, D)
         curr_value = curr_key + 50
-        cache_unshared_kv(
+        write_eager_step(
             key_cache,
             value_cache,
             curr_key,

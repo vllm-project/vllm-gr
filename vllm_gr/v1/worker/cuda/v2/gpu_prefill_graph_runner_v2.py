@@ -24,7 +24,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 
 from vllm_gr.config.models import deployment_for
-from vllm_gr.v1.attention.backends.beam_dense_prefill import fresh_prefill_capture
+from vllm_gr.v1.forward_context import fresh_prefill_capture
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
     get_default_buckets,

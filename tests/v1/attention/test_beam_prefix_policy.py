@@ -93,8 +93,8 @@ def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
 def test_metadata_buckets_only_when_a_segmented_plan_is_selected(monkeypatch):
     import torch
 
-    from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
-        build_async,
+    from vllm_gr.v1.attention.backends.beam_attn_metadata import build_async
+    from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
         build_async_batch_layout,
     )
 

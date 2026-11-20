@@ -30,10 +30,10 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     require_beam_decode_session,
 )
-from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
+from vllm_gr.v1.attention.backends.npu_cache_layout import (
     interleaved_pool_base,
+    restore_npu_cache_pool_layout,
 )
-from vllm_gr.v1.attention.backends.npu_cache_layout import restore_npu_cache_pool_layout
 
 logger = init_logger(__name__)
 

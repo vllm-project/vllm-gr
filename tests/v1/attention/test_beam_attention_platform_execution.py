@@ -435,20 +435,12 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
     def cascade_attention(**kwargs: Any) -> None:
         calls.update(kwargs)
 
-    from vllm_gr.v1.attention.backends.beam_kernels import (
-        cache_unshared_kv as _kernel_cache_unshared_kv,
-    )
-
-    def cache_unshared_kv(*args: Any, **kwargs: Any) -> Any:
-        # beam_attn.forward passes beam_session= (ignored by the cascade
-        # kernels; kept for the xllm platform module contract).
-        kwargs.pop("beam_session", None)
-        return _kernel_cache_unshared_kv(*args, **kwargs)
+    from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
 
     execution = SimpleNamespace(
         reshape_and_cache=unexpected_reshape,
         cascade_attention=cascade_attention,
-        cache_unshared_kv=cache_unshared_kv,
+        cache_unshared_kv=write_eager_step,
     )
     monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)

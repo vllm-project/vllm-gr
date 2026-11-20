@@ -82,15 +82,15 @@ def test_dense_prefill_kwargs_forward_fresh_kv_only(changes, forwards):
 
 
 def test_fresh_prefill_capture_scope():
-    from vllm_gr.v1.attention.backends import beam_dense_prefill as dense
+    from vllm_gr.v1 import forward_context
 
-    assert not dense.in_fresh_prefill_capture()
-    with dense.fresh_prefill_capture():
-        assert dense.in_fresh_prefill_capture()
-        with pytest.raises(RuntimeError), dense.fresh_prefill_capture():
+    assert not forward_context.in_fresh_prefill_capture()
+    with forward_context.fresh_prefill_capture():
+        assert forward_context.in_fresh_prefill_capture()
+        with pytest.raises(RuntimeError), forward_context.fresh_prefill_capture():
             raise RuntimeError
-        assert dense.in_fresh_prefill_capture()
-    assert not dense.in_fresh_prefill_capture()
+        assert forward_context.in_fresh_prefill_capture()
+    assert not forward_context.in_fresh_prefill_capture()
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

@@ -28,12 +28,12 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     require_beam_decode_session,
     resolve_beam_pool,
 )
-from vllm_gr.v1.attention.backends.beam_dense_prefill import in_fresh_prefill_capture
-from vllm_gr.v1.attention.backends.cascade_kv import (
-    cache_unshared_kv as cache_unshared_kv,
-)
+from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
+from vllm_gr.v1.forward_context import in_fresh_prefill_capture
 
 logger = init_logger(__name__)
+
+cache_unshared_kv = write_eager_step
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -567,7 +567,7 @@ def prefix_attention(
         # an AOT schedule built for the layer's original plan.
         scheduler = None
         if plan.segments > 1:
-            from vllm_gr.v1.attention.backends.beam_prefix_segmented import (
+            from vllm_gr.v1.attention.backends.beam_prefix_kernels import (
                 segmented_prefix,
             )
 

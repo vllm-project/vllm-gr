@@ -10,12 +10,10 @@ import torch
 
 from vllm_gr.ops import beam_search_group
 from vllm_gr.ops import select_unshared_kv as ops_select_unshared_kv
-from vllm_gr.v1.attention.backends.beam_kernels import (
-    cache_unshared_kv,
-    select_unshared_kv,
-)
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.reorder import select_unshared_kv
 
 
 def _devices() -> list[pytest.ParameterSet]:
@@ -60,7 +58,7 @@ def _make_session(
 @pytest.mark.parametrize("device", _devices())  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
 def test_beam_kernels_cache_writes_to_pool_slot(device: torch.device, dtype: torch.dtype) -> None:
-    """Test beam_kernels.cache_unshared_kv writes to the correct pool slot."""
+    """Test write_eager_step writes to the correct pool slot."""
     session = _make_session(device, dtype, num_layers=1, max_beams=4)
     session.begin_session(beam_width=2, prefix_len=51)
     pool = session.pools[0]
@@ -70,7 +68,7 @@ def test_beam_kernels_cache_writes_to_pool_slot(device: torch.device, dtype: tor
     curr_key = torch.arange(16, dtype=dtype, device=device).reshape(curr_shape)
     curr_value = curr_key + 100
 
-    cache_unshared_kv(
+    write_eager_step(
         pool.unshared_key,
         pool.unshared_value,
         curr_key,
@@ -107,7 +105,7 @@ def test_beam_kernels_cache_rejects_pool_activation_dtype_mismatch_before_write(
         TypeError,
         match="pool dtype must match the current attention K/V dtype",
     ):
-        cache_unshared_kv(
+        write_eager_step(
             pool.unshared_key,
             pool.unshared_value,
             current_key,
@@ -131,7 +129,7 @@ def test_beam_kernels_cache_rejects_current_key_value_dtype_mismatch() -> None:
     pool = session.pools[0]
 
     with pytest.raises(TypeError, match="Current attention key/value dtype mismatch"):
-        cache_unshared_kv(
+        write_eager_step(
             pool.unshared_key,
             pool.unshared_value,
             torch.zeros((2, 2, 4), dtype=torch.float16),
@@ -359,13 +357,13 @@ def test_ops_select_rejects_layer_list_length_before_first_write() -> None:
 
 
 def test_beam_kernels_cache_returns_none() -> None:
-    """beam_kernels.cache_unshared_kv returns None (in-place write)."""
+    """write_eager_step returns None (in-place write)."""
     session = _make_session(torch.device("cpu"), torch.bfloat16, num_layers=1, max_beams=2)
     session.begin_session(2, 5)
     pool = session.pools[0]
     current = torch.zeros((2, 2, 4), dtype=torch.bfloat16)
 
-    result = cache_unshared_kv(
+    result = write_eager_step(
         pool.unshared_key,
         pool.unshared_value,
         current,

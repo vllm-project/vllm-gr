@@ -10,10 +10,10 @@ Covers ``vllm_gr.v1.beam.reorder``:
   the xllm kernel) for every *sorted* parent — the ordering the fused kernel
   requires.  Unsorted parents round-trip to their sorted grouping, which is
   exactly why the dispatcher falls back for them.
-- cascade-mode parity with the original ``beam_kernels`` kernel for
+- cascade-mode parity with the Torch reference for
   arbitrary parent orderings (permutation, duplicated source, shrink).
 - xllm-mode parity on NPU: the fused ``select_unshared_kv`` vs the
-  ``beam_kernels`` reference vs the package's ``_select_unshared_kv_torch``
+  cascade reference vs the package's ``_select_unshared_kv_torch``
   golden for full-width sorted parents, and fallback correctness for
   unsorted / shrunk parents.
 """
@@ -101,8 +101,8 @@ def _make_pools(
 def _reference_reorder(
     parent: torch.Tensor, pools: list[_Pool], slot: int, decode_step: int
 ) -> None:
-    """The original beam_kernels semantics, replayed directly on CPU."""
-    from vllm_gr.v1.attention.backends.beam_kernels import select_unshared_kv
+    """Replay the cascade reference on CPU."""
+    from vllm_gr.v1.beam.reorder import select_unshared_kv
 
     select_unshared_kv(
         parent.cpu(),
@@ -176,7 +176,7 @@ def test_reorder_xllm_mode_fused_matches_references_on_npu(
     monkeypatch: pytest.MonkeyPatch,
     parent: torch.Tensor,
 ) -> None:
-    """Full-width sorted parents: fused op == beam_kernels == torch golden."""
+    """Full-width sorted parents: fused op == cascade reference == torch golden."""
     from vllm_gr.v1.beam import reorder as reorder_mod
 
     monkeypatch.setattr(reorder_mod, "_resolve_mode", lambda: "xllm")

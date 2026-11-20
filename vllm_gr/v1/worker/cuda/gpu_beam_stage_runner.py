@@ -714,7 +714,7 @@ class GPUBeamStageRunner:
         from vllm_gr.v1.attention.backends.beam_attn_gpu import (
             GPUBeamAttentionBatch,
         )
-        from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+        from vllm_gr.v1.attention.backends.beam_attn_metadata import (
             build_async,
         )
 

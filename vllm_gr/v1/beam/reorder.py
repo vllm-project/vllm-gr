@@ -6,9 +6,9 @@
 beam decision.  The mode follows ``vllm_gr_npu_decode_execution``:
 
 - ``cascade`` (default, any device): the Triton fused fast path
-  ``beam_kernels.select_unshared_kv_fused`` (one gather + one scatter launch
+  ``ops.cuda.beam_kv_reorder.select_unshared_kv_fused`` (one gather + one scatter launch
   across all layers, CUDA only), falling back to the per-layer reference
-  ``beam_kernels.select_unshared_kv`` indexed by ``slot`` with 0-based
+  ``select_unshared_kv`` indexed by ``slot`` with 0-based
   ``decode_step`` semantics when the fused path declines (non-CUDA,
   non-Triton, or unexpected pool/aux layouts).
 - ``xllm`` (NPU only): the fused ``beam_ops.select_unshared_kv`` operator,
@@ -66,6 +66,65 @@ def _fused_reorder_applies(parent: torch.Tensor, pool_beam_width: int) -> bool:
     if parent_cpu.numel() < 2:
         return True
     return bool((parent_cpu[1:] >= parent_cpu[:-1]).all().item())
+
+
+def select_unshared_kv(
+    beam_index: torch.Tensor,  # [W_cur] int32, source beam index for each beam
+    slot: int,  # batch slot index
+    unshared_key_caches: list[torch.Tensor],  # per-layer pool key
+    unshared_value_caches: list[torch.Tensor],  # per-layer pool value
+    decode_step: int,  # 0-indexed, reorder range [0:decode_step+1]
+    aux_key_bufs: list[torch.Tensor] | None = None,  # pre-allocated [W, H, max_steps, D]
+    aux_value_bufs: list[torch.Tensor] | None = None,  # pre-allocated [W, H, max_steps, D]
+) -> None:
+    """In-place reorder pool KV according to beam_index for a specific slot.
+
+    ``beam_index[i] = j`` means: new beam i's KV history should come from
+    old beam j.
+
+    Only the first ``n = len(beam_index)`` pool slots are reordered; the
+    trailing slots (leftover from a larger beam count on an earlier step) are
+    left stale and unreferenced.  ``beam_index`` values index into the *full*
+    previous pool, so a shrinking beam count correctly rescues the surviving
+    beams' histories into the front slots.  When the beam count stays constant
+    (the fixed-width case) ``n`` equals the pool width and this is a full
+    reorder.
+
+    When aux_key_bufs/aux_value_bufs are provided, they are used instead of
+    .clone() to avoid per-step new allocations (CUDA Graph compatibility).
+    Otherwise, the original .clone() path is used (NPU or non-Graph).
+
+    Note: select_unshared_kv is called outside the CUDA Graph (after beam
+    decision), so decode_step remains a host int.
+    """
+    n = beam_index.shape[0]
+    for layer_idx, (key_cache, value_cache) in enumerate(
+        zip(unshared_key_caches, unshared_value_caches)
+    ):
+        # key_cache: [max_batch, W, H, max_steps, D]
+        # Only reorder [0:decode_step+1] range for the given slot
+        if aux_key_bufs is not None and aux_value_bufs is not None:
+            # Graph-compatible path: use pre-allocated aux_buf instead of .clone()
+            aux_key = aux_key_bufs[layer_idx]
+            aux_value = aux_value_bufs[layer_idx]
+            # Copy only the [0:decode_step+1] range into aux_buf
+            aux_key[:, :, : decode_step + 1, :].copy_(key_cache[slot, :, :, : decode_step + 1, :])
+            aux_value[:, :, : decode_step + 1, :].copy_(
+                value_cache[slot, :, :, : decode_step + 1, :]
+            )
+            # Reorder by beam_index and write back (only first n beams, only valid steps)
+            key_cache[slot, :n, :, : decode_step + 1, :] = aux_key[
+                beam_index, :, : decode_step + 1, :
+            ]
+            value_cache[slot, :n, :, : decode_step + 1, :] = aux_value[
+                beam_index, :, : decode_step + 1, :
+            ]
+        else:
+            # Original path: .clone() creates new allocation (not Graph-compatible)
+            old_key = key_cache[slot, :, :, : decode_step + 1, :].clone()
+            old_value = value_cache[slot, :, :, : decode_step + 1, :].clone()
+            key_cache[slot, :n, :, : decode_step + 1, :] = old_key[beam_index]
+            value_cache[slot, :n, :, : decode_step + 1, :] = old_value[beam_index]
 
 
 def reorder_unshared_kv(
@@ -136,14 +195,11 @@ def reorder_unshared_kv(
     # one gather + one scatter launch covering every layer at once.  It
     # declines (returns False) on non-CUDA / non-Triton / unexpected pool or
     # aux layouts, falling through to the per-layer reference below.
-    from vllm_gr.v1.attention.backends.beam_kernels import (
-        select_unshared_kv,
-        select_unshared_kv_fused,
-    )
-
     key_caches = [p.unshared_key for p in pools]
     value_caches = [p.unshared_value for p in pools]
     if aux_key is not None and aux_value is not None:
+        from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_fused
+
         if select_unshared_kv_fused(
             parent,
             slot,
@@ -175,4 +231,4 @@ def reorder_unshared_kv(
     )
 
 
-__all__ = ["reorder_unshared_kv"]
+__all__ = ["reorder_unshared_kv", "select_unshared_kv"]

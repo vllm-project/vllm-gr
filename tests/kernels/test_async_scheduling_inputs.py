@@ -24,11 +24,9 @@ from vllm_gr.v1.attention.backends import beam_attn_metadata_layout as layout
 from vllm_gr.v1.attention.backends import beam_attn_metadata_tensors as tensors
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
-)
-from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
     build_async,
-    build_async_layout,
 )
+from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import build_async_layout
 from vllm_gr.v1.beam.dispatch import (
     GR_RETIRE_RESULT_ATTR,
     GR_WORKER_RESULT_ATTR,

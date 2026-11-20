@@ -263,7 +263,7 @@ def test_step_complete_reorders_pool_kv_via_select_unshared_kv(
         )
 
     monkeypatch.setattr(
-        "vllm_gr.v1.attention.backends.beam_kernels.select_unshared_kv",
+        "vllm_gr.v1.beam.reorder.select_unshared_kv",
         mock_select,
     )
 
@@ -291,15 +291,15 @@ def test_step_complete_skips_select_on_last_step() -> None:
     def mock_select(*args: object, **kwargs: object) -> None:
         select_calls.append(True)
 
-    import vllm_gr.v1.attention.backends.beam_kernels as beam_kernels_mod
+    import vllm_gr.v1.beam.reorder as reorder_mod
 
-    original_select = beam_kernels_mod.select_unshared_kv
-    beam_kernels_mod.select_unshared_kv = mock_select
+    original_select = reorder_mod.select_unshared_kv
+    reorder_mod.select_unshared_kv = mock_select
     try:
         parent = torch.arange(3, dtype=torch.int32)
         session.step_complete(parent)
     finally:
-        beam_kernels_mod.select_unshared_kv = original_select
+        reorder_mod.select_unshared_kv = original_select
 
     assert len(select_calls) == 0
     assert session.decode_step == 1

@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
     build_async_batch_layout,
 )
 from vllm_gr.v1.beam.dispatch import GRStageMetadata

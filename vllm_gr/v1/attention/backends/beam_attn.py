@@ -471,10 +471,6 @@ class BeamAttentionImpl(AttentionImpl):
             # Use Graph-compatible Triton kernel when decode_step_buf is
             # available on CUDA (reads decode_step from device buffer instead
             # of host Python int, enabling CUDA Graph capture/replay).
-            # Non-CUDA (NPU xllm/cascade, CPU unit tests) dispatches through
-            # the platform module so the xllm execution mode can swap in the
-            # fused NPU operator; cascade modules forward to the original
-            # beam_kernels implementation.
             decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
             if decode_step_buf is not None and decode_step_buf.is_cuda:
                 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
@@ -492,11 +488,9 @@ class BeamAttentionImpl(AttentionImpl):
                 )
             else:
                 # Non-CUDA (NPU xllm/cascade, CPU unit tests) dispatches through
-                # the platform module so the xllm execution mode can swap in the
-                # fused NPU operator; cascade modules forward to the original
-                # beam_kernels implementation.  The beam_session gives the xllm
-                # module access to the context's fixed-address device buffers
-                # (ACL graph capture/replay); cascade/gpu modules ignore it.
+                # the platform module. Cascade uses the shared pool writer.
+                # xLLM needs the session's fixed-address device buffers for
+                # ACL graph capture/replay.
                 platform_execution.cache_unshared_kv(
                     pool.unshared_key,
                     pool.unshared_value,

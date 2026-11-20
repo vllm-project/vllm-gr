@@ -16,8 +16,8 @@ from vllm_gr.v1.attention.backends import beam_attn_metadata_tensors as tensors
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
+    build_async,
 )
-from vllm_gr.v1.attention.backends.beam_attn_metadata_async import build_async
 from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import BeamTensorBuffers
 from vllm_gr.v1.beam import BEAM_DATA_VAR
 
@@ -40,6 +40,87 @@ def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
     builder._tensor_buffers = BeamTensorBuffers()
     builder.npu_causal_atten_mask = None
     return builder
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_async_batch_layout_preserves_request_order() -> None:
+    result = layout.build_async_batch_layout(
+        width=2,
+        prompt_lengths=[5, 9],
+        decode_step=1,
+        block_ids_by_request=[[7], [3, 4]],
+        max_blocks=2,
+    )
+    assert result == {
+        "query": [0, 2, 4],
+        "positions": [6, 6, 10, 10],
+        "sequence": [7, 11],
+        "prefix_lengths": [5, 9],
+        "blocks": [7, 0, 3, 4],
+        "logits": [0, 1, 2, 3],
+        "suffix_query": [0, 1, 2, 3, 4],
+        "suffix_lengths": [2, 2, 2, 2],
+        "suffix_offsets": [0, 2, 4, 6, 8],
+    }
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_async_single_request_layout_matches_batch() -> None:
+    single = layout.build_async_layout(
+        width=2,
+        prompt_len=5,
+        decode_step=1,
+        block_ids=[7],
+        max_blocks=2,
+        query_start_loc_cpu=[0, 2],
+        seq_lens_cpu=[7],
+    )
+    assert single == layout.build_async_batch_layout(
+        width=2,
+        prompt_lengths=[5],
+        decode_step=1,
+        block_ids_by_request=[[7]],
+        max_blocks=2,
+    )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(("query", "lengths"), [([0, 1], [7]), ([0, 2], [6])])  # type: ignore[misc]
+def test_async_single_request_rejects_inconsistent_cpu_mirrors(
+    query: list[int], lengths: list[int]
+) -> None:
+    with pytest.raises(ValueError, match="CPU mirrors disagree"):
+        layout.build_async_layout(
+            width=2,
+            prompt_len=5,
+            decode_step=1,
+            block_ids=[7],
+            max_blocks=2,
+            query_start_loc_cpu=query,
+            seq_lens_cpu=lengths,
+        )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_async_layout_rejects_over_capacity_block_table() -> None:
+    with pytest.raises(ValueError, match="prefix block table exceeds capacity"):
+        layout.build_async_batch_layout(
+            width=2,
+            prompt_lengths=[5, 9],
+            decode_step=1,
+            block_ids_by_request=[[7], [3, 4]],
+            max_blocks=1,
+        )
+    with pytest.raises(ValueError, match="prefix block table exceeds model capacity"):
+        layout.build_async_layout(
+            width=2,
+            prompt_len=9,
+            decode_step=1,
+            block_ids=[3, 4],
+            max_blocks=1,
+            query_start_loc_cpu=[0, 2],
+            seq_lens_cpu=[11],
+        )
 
 
 @pytest.mark.l1  # type: ignore[misc]
@@ -947,40 +1028,29 @@ def test_geom_cache_key_stable_without_decode_step() -> None:
             "beam_width": 4,
             "prefix_len": 8,
             "cache_len": 8,
-            "beam_decode_steps": 3,  # grows per decode step; must not be keyed
+            "decode_step": 3,  # grows per decode step; must not be keyed
         }
     }
     req_ids = ["beam"]
-    k1 = layout._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], True, builder.block_size)
-    k2 = layout._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], True, builder.block_size)
+    k1 = layout._geom_cache_key(1, req_ids, beam_data, True, builder.block_size)
+    k2 = layout._geom_cache_key(1, req_ids, beam_data, True, builder.block_size)
     assert k1 is not None
     assert k1 == k2
     # key[0] is the beam_view; only width/prefix_len/cache_len (not the
-    # growing beam_decode_steps) participate.
+    # growing decode_step) participate.
     assert k1[0] == (("beam", 4, 8, 8),)
-    # A later decode frame reports a grown beam_decode_steps but the same
+    # A later decode frame reports a grown decode_step but the same
     # geometry -> identical key (cache hits).
     grown = dict(beam_data)
-    grown["beam"] = dict(grown["beam"], beam_decode_steps=5)
-    k3 = layout._geom_cache_key(1, req_ids, grown, [0, 4], [5], True, builder.block_size)
+    grown["beam"] = dict(grown["beam"], decode_step=5)
+    k3 = layout._geom_cache_key(1, req_ids, grown, True, builder.block_size)
     assert k3 == k1
-    # q_starts / seq_lens do not affect the key (per-step-varying, excluded).
-    k4 = layout._geom_cache_key(1, req_ids, beam_data, [0, 8], [8], True, builder.block_size)
-    assert k4 == k1
     # Non-incremental falls back.
-    assert (
-        layout._geom_cache_key(1, req_ids, beam_data, [0, 4], [4], False, builder.block_size)
-        is None
-    )
+    assert layout._geom_cache_key(1, req_ids, beam_data, False, builder.block_size) is None
     # Mixed batch (non-beam request) falls back.
     mixed = dict(beam_data)
     mixed["other"] = {"is_beam_decode": False, "beam_width": 1}
-    assert (
-        layout._geom_cache_key(
-            2, ["beam", "other"], mixed, [0, 4, 6], [4, 2], True, builder.block_size
-        )
-        is None
-    )
+    assert layout._geom_cache_key(2, ["beam", "other"], mixed, True, builder.block_size) is None
 
 
 def test_incremental_seqlens_through_create_beam_tensors() -> None:
@@ -1134,7 +1204,7 @@ def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
     """Fixed cu_seqlens lists are cached per geom_key, not recomputed per step.
 
     Incremental decode only varies ``suffix_seqlens_kv`` (and its cumsum) with
-    ``decode_step``; the prefix cumsums and ``suffix_cu_seqlens_q`` are fixed
+    ``decode_step``; the prefix query offsets and ``suffix_cu_seqlens_q`` are fixed
     per geometry.  A geom_key hit reuses those lists instead of paying a numpy
     cumsum + tolist on every decode step, while the step-dependent suffix
     cumsum is still recomputed."""
@@ -1156,7 +1226,7 @@ def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
 
     m0 = run(0)
     assert m0.prefix_cu_seqlens_q == [4]  # cumsum([4])
-    assert m0.prefix_cu_seqlens_kv == [8]  # cumsum([8])
+    assert m0.prefix_seqlens_kv == [8]
     assert m0.suffix_cu_seqlens_q == [1, 2, 3, 4]  # cumsum([1]*4)
     assert m0.suffix_cu_seqlens_kv == [1, 2, 3, 4]  # step 0 -> s=1
 
@@ -1165,7 +1235,6 @@ def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
     m1 = run(2)
     assert (
         m1.prefix_cu_seqlens_q is m0.prefix_cu_seqlens_q
-        and m1.prefix_cu_seqlens_kv is m0.prefix_cu_seqlens_kv
         and m1.suffix_cu_seqlens_q is m0.suffix_cu_seqlens_q
     )
     assert m1.suffix_cu_seqlens_kv == [3, 6, 9, 12]  # step 2 -> s=3, recomputed
@@ -1184,7 +1253,7 @@ def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
         cache=builder._geometry_cache(),
     )
     assert m2.prefix_cu_seqlens_q is not m0.prefix_cu_seqlens_q
-    assert m2.prefix_cu_seqlens_kv == [16]
+    assert m2.prefix_seqlens_kv == [16]
     assert m2.suffix_cu_seqlens_q == [1, 2]
 
 
@@ -1200,7 +1269,8 @@ def test_build_geometry_hit_fast_path_replays_layout() -> None:
 
     class _Registry:
         def get_slot(self, req_id: str) -> int:
-            return 0
+            assert req_id == "beam"
+            return 2
 
     session = SimpleNamespace(is_active=True, context=SimpleNamespace(registry=_Registry()))
     builder = _make_builder()
@@ -1231,6 +1301,7 @@ def test_build_geometry_hit_fast_path_replays_layout() -> None:
     assert m1.suffix_cu_seqlens_kv_cpu == [1, 2, 3, 4]
     assert m1.is_beam_decode is True
     assert m1.incremental_suffix_kv_len == 1
+    assert m1.beam_pool_slots == [2]
 
     # Frame 2 (decode_step=2): geometry hit — the cached layout is replayed
     # with THIS frame's step; suffix lists and scalars step forward.
@@ -1239,6 +1310,7 @@ def test_build_geometry_hit_fast_path_replays_layout() -> None:
     assert m2.suffix_cu_seqlens_kv_cpu == [3, 6, 9, 12]
     assert m2.incremental_suffix_kv_len == 3
     # Fixed geometry did not drift.
+    assert m2.beam_pool_slots == [2]
     assert m2.prefix_seqlens_kv_cpu == m1.prefix_seqlens_kv_cpu
     assert m2.suffix_cu_seqlens_q_cpu == m1.suffix_cu_seqlens_q_cpu
 

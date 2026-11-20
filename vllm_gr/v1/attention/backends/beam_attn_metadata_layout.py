@@ -13,8 +13,6 @@ def _geom_cache_key(
     num_reqs: int,
     req_ids: list,
     beam_data: dict,
-    q_starts: list,
-    seq_lens_cpu_list: list[int],
     is_incremental: bool,
     block_size: int,
 ):
@@ -184,10 +182,8 @@ def _build_std_mappings(std_reqs: list, q_starts: list):
         std_req_idxs.append(req_idx)
 
     std_cu_seqlens_q_cpu = None
-    std_cu_seqlens_kv_cpu = None
     if std_seqlens_q_cpu:
         std_cu_seqlens_q_cpu = np.cumsum(std_seqlens_q_cpu).tolist()
-        std_cu_seqlens_kv_cpu = np.cumsum(std_seqlens_kv_cpu).tolist()
 
     return (
         std_indices,
@@ -195,7 +191,6 @@ def _build_std_mappings(std_reqs: list, q_starts: list):
         std_seqlens_kv_cpu,
         std_req_idxs,
         std_cu_seqlens_q_cpu,
-        std_cu_seqlens_kv_cpu,
     )
 
 
@@ -209,7 +204,6 @@ class BeamMappings(NamedTuple):
     suffix_seqlens_kv: list[int]
     prefix_req_idxs: list[int]
     prefix_cu_seqlens_q: list[int] | None
-    prefix_cu_seqlens_kv: list[int] | None
     suffix_cu_seqlens_q: list[int] | None
     suffix_cu_seqlens_kv: list[int] | None
     max_prefix_blocks_count: int
@@ -269,7 +263,6 @@ def _build_beam_mappings(
     if fixed is None:
         fixed = (
             np.cumsum(prefix_q).tolist() if prefix_q else None,
-            np.cumsum(prefix_kv).tolist() if prefix_kv else None,
             list(range(1, len(suffix_q) + 1)) if suffix_q else None,
         )
         if geom_key is not None and suffix_q:
@@ -291,12 +284,94 @@ def _build_beam_mappings(
         suffix_seqlens_kv=suffix_kv,
         prefix_req_idxs=prefix_req_idxs,
         prefix_cu_seqlens_q=fixed[0],
-        prefix_cu_seqlens_kv=fixed[1],
-        suffix_cu_seqlens_q=fixed[2],
+        suffix_cu_seqlens_q=fixed[1],
         suffix_cu_seqlens_kv=suffix_cu_kv,
         max_prefix_blocks_count=(max_prefix_len + block_size - 1) // block_size,
         prefix_indices_contiguous=contiguous,
         prefix_max_q_len=max(prefix_q, default=0),
         suffix_max_q_len=1 if suffix_q else 0,
         suffix_max_seq_len=max(suffix_kv, default=0),
+    )
+
+
+def build_async_batch_layout(
+    *,
+    width: int,
+    prompt_lengths: list[int],
+    decode_step: int,
+    block_ids_by_request: list[list[int]],
+    max_blocks: int,
+) -> dict[str, list[int]]:
+    """Build request-major metadata for B logical requests and B*W rows."""
+    batch = len(prompt_lengths)
+    if (
+        type(width) is not int
+        or width < 1
+        or type(decode_step) is not int
+        or decode_step < 0
+        or not batch
+        or len(block_ids_by_request) != batch
+        or any(type(length) is not int or length < 1 for length in prompt_lengths)
+    ):
+        raise ValueError("Asynchronous scheduling batch geometry is invalid")
+    rows = batch * width
+    positions: list[int] = []
+    blocks: list[int] = []
+    for prompt, request_blocks in zip(prompt_lengths, block_ids_by_request):
+        if len(request_blocks) > max_blocks:
+            raise ValueError("Asynchronous scheduling prefix block table exceeds capacity")
+        positions.extend([prompt + decode_step] * width)
+        blocks.extend(request_blocks)
+        blocks.extend([0] * (max_blocks - len(request_blocks)))
+    suffix_length = decode_step + 1
+    return {
+        "positions": positions,
+        "query": list(range(0, rows + 1, width)),
+        "sequence": [prompt + suffix_length for prompt in prompt_lengths],
+        "prefix_lengths": list(prompt_lengths),
+        "blocks": blocks,
+        "logits": list(range(rows)),
+        "suffix_query": list(range(rows + 1)),
+        "suffix_lengths": [suffix_length] * rows,
+        "suffix_offsets": list(range(0, rows * suffix_length + 1, suffix_length)),
+    }
+
+
+def build_async_layout(
+    *,
+    width: int,
+    prompt_len: int,
+    decode_step: int,
+    block_ids: list[int],
+    max_blocks: int,
+    query_start_loc_cpu: list[int] | tuple[int, ...],
+    seq_lens_cpu: list[int] | tuple[int, ...],
+) -> dict[str, list[int]]:
+    """Complete CPU layout for B=1 incremental Decode, with no cache lookup.
+
+    CPU mirrors are mandatory. This entry never falls back to device reads,
+    geometry caches, cached views, cached schedules or the legacy uploader.
+    Common attention has one packed request; suffix attention has W beams.
+    """
+    if any(
+        not isinstance(values, (list, tuple)) or any(type(value) is not int for value in values)
+        for values in (query_start_loc_cpu, seq_lens_cpu)
+    ):
+        raise ValueError(
+            "Asynchronous scheduling attention requires explicit CPU query/sequence mirrors"
+        )
+    if list(query_start_loc_cpu) != [0, width] or list(seq_lens_cpu) != [
+        prompt_len + decode_step + 1
+    ]:
+        raise ValueError(
+            "Asynchronous scheduling common CPU mirrors disagree with the planned Decode"
+        )
+    if len(block_ids) > max_blocks:
+        raise ValueError("Asynchronous scheduling prefix block table exceeds model capacity")
+    return build_async_batch_layout(
+        width=width,
+        prompt_lengths=[prompt_len],
+        decode_step=decode_step,
+        block_ids_by_request=[block_ids],
+        max_blocks=max_blocks,
     )
