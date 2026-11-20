@@ -14,7 +14,8 @@ from vllm_gr.v1.attention.backends.beam_kernels import (
     cache_unshared_kv,
     select_unshared_kv,
 )
-from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
+from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
 
 def _devices() -> list[pytest.ParameterSet]:

@@ -29,7 +29,6 @@ from vllm_gr.v1.beam.dispatch import (
     GRStageMetadata,
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.worker.cuda.beam_search_runner import (
     BeamBatchSearchRunner,
     BeamSearchRunner,
@@ -38,6 +37,7 @@ from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
 )
+from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.worker.cuda.gr_inputs import GRInputBuffers
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 

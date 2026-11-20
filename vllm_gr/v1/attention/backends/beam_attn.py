@@ -228,7 +228,7 @@ class BeamAttentionImpl(AttentionImpl):
         in ``NPUPrefillGraphRunner`` and does not use this shared hook.
         """
         if NPU_DEVICE and not CUDA_DEVICE:
-            from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+            from vllm_gr.v1.beam import BEAM_DATA_VAR
 
             info = BEAM_DATA_VAR.get()
             if not isinstance(info, dict) or info.get("beam_session") is None:
@@ -662,7 +662,7 @@ class BeamAttentionImpl(AttentionImpl):
             from vllm.config import CUDAGraphMode
             from vllm.forward_context import get_forward_context
 
-            from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+            from vllm_gr.v1.beam import BEAM_DATA_VAR
 
             context = get_forward_context()
             beam_info = BEAM_DATA_VAR.get()

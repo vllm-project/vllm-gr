@@ -555,7 +555,7 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
 
     from vllm_gr.v1.attention import backends
     from vllm_gr.v1.attention.backends import beam_attn
-    from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+    from vllm_gr.v1.beam import BEAM_DATA_VAR
 
     config_module = importlib.import_module("vllm.config")
     context_module = importlib.import_module("vllm.forward_context")

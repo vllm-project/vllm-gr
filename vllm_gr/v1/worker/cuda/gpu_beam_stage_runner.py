@@ -65,14 +65,12 @@ from vllm_gr.v1.beam.dispatch import (
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.worker.cuda.beam_final_output import GPUBeamFinalOutput
-from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import (
-    BeamPostprocessWorkspaceKey,
-)
 from vllm_gr.v1.worker.cuda.beam_search_runner import (
     BeamBatchSearchRunner,
     BeamCandidateBatch,
     BeamSearchRunner,
 )
+from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import (
     CudaStageHooks,
     CudaStageHooksType,

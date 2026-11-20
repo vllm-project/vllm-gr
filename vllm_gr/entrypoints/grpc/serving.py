@@ -30,6 +30,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamEngineCoreRequest,
     BeamOutputOptions,
     BeamSequenceColumns,
+    sequence_columns,
 )
 from vllm_gr.v1.engine.beam_search import (
     validate_gr_generation_budget,
@@ -234,8 +235,6 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                     if sequences.parent_beam_indices is not None:
                         beams.parent_beam_indices_i32_le = sequences.parent_beam_indices
                     continue
-                from vllm_gr.v1.beam.output_columns import sequence_columns
-
                 if not compact:
                     raise TypeError("non-compact replies require materialized Beam sequences")
                 tokens, scores, parents = sequence_columns(sequences)

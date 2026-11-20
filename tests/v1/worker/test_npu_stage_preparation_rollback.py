@@ -10,9 +10,9 @@ import pytest
 import torch
 
 from vllm_gr.constraints.backend import ConstraintOutput
+from vllm_gr.v1.beam import BEAM_DATA_VAR
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.dispatch import GR_RETIRE_RESULT_ATTR, GRRetireMetadata
 from vllm_gr.v1.worker.npu import npu_beam_stage_runner as stage_module
 from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import NPUEagerStagePlan

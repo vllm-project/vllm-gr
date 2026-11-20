@@ -20,6 +20,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputSequence,
     BeamRequestOutput,
     BeamSequenceColumns,
+    validate_complete_sequences,
 )
 
 
@@ -119,10 +120,6 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
                 ):
                     raise ValueError("terminal Beam result item identity changed")
                 if isinstance(item.sequences, BeamSequenceColumns):
-                    from vllm_gr.v1.beam.output_columns import (
-                        validate_complete_sequences,
-                    )
-
                     validate_complete_sequences(item.sequences, request)
                     continue
                 if not item.sequences or len(item.sequences) > options.num_return_sequences:

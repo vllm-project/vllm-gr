@@ -418,8 +418,9 @@ and Decode capture policy remain active when this cache is disabled.
   cached/chunked inputs, padding, pending-write fallback and failed submission
   without queue loss. `cuda/v2/gpu_prefill_v2.py` owns registration, input preparation and the
   packed native-state write contract, separate from stage execution hooks.
-  `cuda/gpu_postprocess_workspace.py` owns workspace initialization, the load-wrapper
-  marker and load-time device-memory accounting shared by CUDA V1/V2. V1 input
+  `cuda/gpu_postprocess_workspace.py` owns the fixed-address workspace pool,
+  initialization, the load-wrapper marker and load-time device-memory accounting
+  shared by CUDA V1/V2. V1 input
   preparation remains in `cuda/v1/gpu_prefill_inputs.py`; V2 does not import the V1
   integration module.
 - Shared workspace coverage: `tests/v1/worker/test_gpu_postprocess_workspace.py` checks

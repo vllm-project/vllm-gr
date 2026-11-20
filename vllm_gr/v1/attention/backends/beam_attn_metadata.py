@@ -36,7 +36,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import (
     create_std_tensors,
 )
 from vllm_gr.v1.attention.backends.beam_prefix_policy import configured_fa_version
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam import BEAM_DATA_VAR
 
 logger = init_logger(__name__)
 

@@ -32,6 +32,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchRequest,
     BeamBatchResult,
     GRAdmissionError,
+    materialize_beam_result,
 )
 
 logger = init_logger(__name__)
@@ -168,8 +169,6 @@ class BeamSearchClient:
                 raise TypeError("EngineCore returned a non-BeamBatchResult terminal value")
             session.terminal = True
             session.failed = result.failure is not None
-            from vllm_gr.v1.beam.output_columns import materialize_beam_result
-
             return materialize_beam_result(result)
         except EngineDeadError:
             raise
@@ -303,8 +302,6 @@ class AsyncBeamSearchClient:
             session.terminal = True
             session.failed = result.failure is not None
             if materialize:
-                from vllm_gr.v1.beam.output_columns import materialize_beam_result
-
                 return materialize_beam_result(result)
             return result
         except EngineDeadError:

@@ -1,19 +1,209 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Shared CUDA Beam workspace initialization and model-load accounting."""
+"""Fixed-address CUDA Beam workspaces, prewarming, and model-load accounting."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import wraps
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 
+if TYPE_CHECKING:
+    from vllm_gr.ops.cuda.beam_state import BeamStateScratch
+
 logger = init_logger(__name__)
 
 _BEAM_POSTPROCESS_LOAD_PATCH_MARKER = "_vllm_gr_beam_postprocess_load_patched"
+
+
+def _validate_positive_int(name: str, value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class BeamPostprocessWorkspaceKey:
+    """Shape/dtype identity for one fixed-address postprocess workspace.
+
+    The CUDA kernels have exact contiguous shape contracts.  In particular, a
+    top-left ``[:width, :top_k]`` slice of a larger two-dimensional bucket is
+    not contiguous, so a request may only use a workspace whose width/top-k
+    exactly match its operator geometry.  ``logits_dtype`` is part of the key
+    even though the operator outputs are int32/fp32; this prevents an fp16
+    warmup from silently standing in for a bf16 deployment.
+    """
+
+    beam_width: int
+    top_k: int
+    logits_dtype: torch.dtype
+
+
+@dataclass(slots=True)
+class BeamPostprocessWorkspace:
+    """Runner-owned fixed storage for one CUDA Beam postprocess geometry.
+
+    This object is scratch/output storage only.  It deliberately owns no
+    decode-step counter, request identity, or continuation state; the existing
+    ``BeamDecisionBuffers`` remain the source of cumulative cross-step state.
+    Keeping this distinction explicit prevents an allocation optimization from
+    growing into a second Beam lifecycle protocol.
+
+    The first dimension is always ``max_batch``.  Runtime code takes leading
+    batch slices, while tests can construct ``max_batch=2`` even though the
+    current Worker-level Beam context accepts one active session.
+    """
+
+    key: BeamPostprocessWorkspaceKey
+    max_batch: int
+    max_decode_steps: int
+    device: torch.device
+
+    # Constrained Top-K outputs: [Bmax, W, K] / [Bmax, W].
+    topk_token_ids: torch.Tensor
+    topk_scores: torch.Tensor
+    topk_valid_mask: torch.Tensor
+    topk_valid_counts: torch.Tensor
+
+    # Device inputs for constrained Top-K.
+    prefix_token_ids: torch.Tensor
+    temperatures: torch.Tensor
+
+    # BeamSearchGroup outputs: [Bmax, W] and fixed sequence extent.
+    selected_token_ids: torch.Tensor
+    selected_parent_ids: torch.Tensor
+    selected_scores: torch.Tensor
+    selected_flat_indices: torch.Tensor
+    next_sequence: torch.Tensor
+
+    # Caller-owned hierarchical selection ping-pong buffers.
+    selection_scratch: Any
+
+    # Optional persistent-runner scratch, allocated once when the runner binds.
+    # Ordinary postprocess callers retain their existing allocations and ABI.
+    state_scratch: BeamStateScratch | None = None
+    execution_owner: Any = None
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        max_batch: int,
+        beam_width: int,
+        top_k: int,
+        max_decode_steps: int,
+        device: torch.device | str,
+        logits_dtype: torch.dtype,
+    ) -> BeamPostprocessWorkspace:
+        """Allocate every tensor once; callers retain the returned object."""
+
+        _validate_positive_int("max_batch", max_batch)
+        _validate_positive_int("beam_width", beam_width)
+        _validate_positive_int("top_k", top_k)
+        _validate_positive_int("max_decode_steps", max_decode_steps)
+
+        resolved_device = torch.device(device)
+        from vllm_gr.ops.cuda.beam_selection import allocate_beam_selection_scratch
+
+        key = BeamPostprocessWorkspaceKey(beam_width, top_k, logits_dtype)
+        candidate_shape = (max_batch, beam_width, top_k)
+        beam_shape = (max_batch, beam_width)
+        sequence_shape = (max_batch, beam_width, max_decode_steps)
+
+        def device_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            return torch.empty(shape, dtype=dtype, device=resolved_device)
+
+        # Group selects W winners from W*K candidates.  Its scratch is the
+        # largest selection scratch needed by the worker-specific terminal
+        # reorder as well, so no second final-step allocation is necessary.
+        selection_scratch = allocate_beam_selection_scratch(
+            max_batch,
+            beam_width,
+            top_k,
+            beam_width,
+            resolved_device,
+        )
+
+        return cls(
+            key=key,
+            max_batch=max_batch,
+            max_decode_steps=max_decode_steps,
+            device=resolved_device,
+            topk_token_ids=device_empty(candidate_shape, torch.int32),
+            topk_scores=device_empty(candidate_shape, torch.float32),
+            topk_valid_mask=device_empty(candidate_shape, torch.bool),
+            topk_valid_counts=device_empty(beam_shape, torch.int32),
+            prefix_token_ids=device_empty((max_batch, beam_width, 3), torch.int32),
+            temperatures=device_empty(beam_shape, torch.float32),
+            selected_token_ids=device_empty(beam_shape, torch.int32),
+            selected_parent_ids=device_empty(beam_shape, torch.int32),
+            selected_scores=device_empty(beam_shape, torch.float32),
+            selected_flat_indices=device_empty(beam_shape, torch.int32),
+            next_sequence=device_empty(sequence_shape, torch.int32),
+            selection_scratch=selection_scratch,
+        )
+
+    def device_tensors(self) -> tuple[torch.Tensor, ...]:
+        scratch = self.selection_scratch
+        tensors = (
+            self.topk_token_ids,
+            self.topk_scores,
+            self.topk_valid_mask,
+            self.topk_valid_counts,
+            self.prefix_token_ids,
+            self.temperatures,
+            self.selected_token_ids,
+            self.selected_parent_ids,
+            self.selected_scores,
+            self.selected_flat_indices,
+            self.next_sequence,
+            scratch.local_scores,
+            scratch.local_flat_indices,
+            scratch.merge_scores,
+            scratch.merge_flat_indices,
+        )
+        if self.state_scratch is not None:
+            tensors += self.state_scratch.device_tensors()
+        return tensors
+
+    @property
+    def device_memory_bytes(self) -> int:
+        return sum(tensor.numel() * tensor.element_size() for tensor in self.device_tensors())
+
+
+class BeamPostprocessWorkspacePool:
+    """Prewarmed workspace buckets; request-time creation is intentionally absent."""
+
+    def __init__(self) -> None:
+        self._buckets: dict[BeamPostprocessWorkspaceKey, BeamPostprocessWorkspace] = {}
+
+    def add(self, workspace: BeamPostprocessWorkspace) -> None:
+        if workspace.key in self._buckets:
+            raise ValueError(f"duplicate Beam postprocess workspace bucket {workspace.key}")
+        self._buckets[workspace.key] = workspace
+
+    def require(self, key: BeamPostprocessWorkspaceKey) -> BeamPostprocessWorkspace:
+        try:
+            return self._buckets[key]
+        except KeyError as exc:
+            raise KeyError(
+                f"Beam postprocess workspace {key} was not prewarmed; "
+                "the hot path is not allowed to allocate a bucket"
+            ) from exc
+
+    @property
+    def keys(self) -> tuple[BeamPostprocessWorkspaceKey, ...]:
+        return tuple(self._buckets)
+
+    @property
+    def device_memory_bytes(self) -> int:
+        """Return the device storage owned by all prewarmed buckets."""
+
+        return sum(workspace.device_memory_bytes for workspace in self._buckets.values())
 
 
 def initialize_beam_postprocess_workspaces(
@@ -32,11 +222,6 @@ def initialize_beam_postprocess_workspaces(
         return None
 
     from vllm_gr.config import resolve_candidate_width
-    from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import (
-        BeamPostprocessWorkspace,
-        BeamPostprocessWorkspaceKey,
-        BeamPostprocessWorkspacePool,
-    )
     from vllm_gr.v1.worker.gr_context import (
         _get_gr_config,
     )
@@ -83,20 +268,18 @@ def initialize_beam_postprocess_workspaces(
         max_decode_steps=int(gr_cfg.beam_max_decode_steps),
         device=device,
         logits_dtype=dtype,
-        pin_host=True,
     )
     pool = BeamPostprocessWorkspacePool()
     pool.add(workspace)
     runner._beam_postprocess_workspaces = pool
     logger.info(
         "vllm-gr: prewarmed CUDA Beam postprocess workspace "
-        "(batch=%d, width=%d, top_k=%d, dtype=%s, device_bytes=%d, pinned_bytes=%d)",
+        "(batch=%d, width=%d, top_k=%d, dtype=%s, device_bytes=%d)",
         resolved_max_batch,
         width,
         candidate_width,
         dtype,
         workspace.device_memory_bytes,
-        workspace.pinned_memory_bytes,
     )
     return pool
 

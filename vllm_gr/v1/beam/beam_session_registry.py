@@ -30,17 +30,6 @@ class SessionSlotState:
     prefix_len: int = 0
     is_last_step: bool = False
     is_active: bool = False
-    # Worker-side same-step KV reorder record.
-    # ``kv_reorder`` holds the request-local parent mapping the worker's beam
-    # decision already applied to the KV pool inside the *same* execute_model
-    # step (``beam_decision.run_beam_decision`` → ``select_unshared_kv``).
-    # It is derived in ``_maybe_run_worker_beam_decision`` from the return
-    # channel's host copy of ``out_token_index`` (its request-0 row IS the
-    # request-local mapping), so no extra device→host sync is spent on it.
-    # Retained for the NPU compatibility sampler's host result bookkeeping.
-    # V1 stage execution owns KV progression and does not round-trip this
-    # mapping through the frontend.
-    kv_reorder: list[int] | None = None
 
 
 class BeamSessionRegistry:

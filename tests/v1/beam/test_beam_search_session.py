@@ -10,10 +10,8 @@ from typing import Generator
 import pytest
 import torch
 
-from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
-from vllm_gr.v1.beam.beam_search_session import (
-    BeamSearchSession as SessionImplementation,
-)
+from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
 
 def _make_context(
@@ -322,10 +320,6 @@ def test_suffix_buf_returns_slice_for_slot() -> None:
 def test_slot_property_matches_registry() -> None:
     session = _make_session()
     assert session.slot == session.context.registry.get_slot("test_session")
-
-
-def test_public_export_is_stable() -> None:
-    assert BeamSearchSession is SessionImplementation
 
 
 def test_begin_session_preserves_slot_kv() -> None:

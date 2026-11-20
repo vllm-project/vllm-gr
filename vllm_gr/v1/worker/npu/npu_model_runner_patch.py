@@ -543,7 +543,7 @@ def _dummy_beam_forward_npu(
     from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
     from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 
-    from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+    from vllm_gr.v1.beam import BEAM_DATA_VAR
 
     num_tokens = batch_size * width
     # 1. Refresh the per-step device buffers (same as the runtime path).

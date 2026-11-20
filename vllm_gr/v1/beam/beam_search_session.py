@@ -65,13 +65,7 @@ class BeamSearchSession:
         state.prefix_len = prefix_len
         state.is_last_step = False
         state.is_active = True
-        state.kv_reorder = None
-        # Reset the device-resident Beam decision state. Otherwise a second
-        # session reusing the slot inherits the previous session's
-        # ``sequence`` / ``beam_scores`` / ``worker_decode_steps``, and
-        # ``init_beam_decision_state`` is silently skipped because
-        # ``worker_decode_steps != 0`` — every subsequent decision then reads
-        # a corrupted cumulative state.
+        # Clear the previous session's scores and sequence history before Prefill.
         decision = getattr(self.context, "decision", None)
         if decision is not None:
             if decision_index is None:

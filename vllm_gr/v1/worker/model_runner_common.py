@@ -13,7 +13,7 @@ from collections.abc import Callable
 from functools import wraps
 from typing import TYPE_CHECKING, Any
 
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam import BEAM_DATA_VAR
 from vllm_gr.v1.worker import gr_execution, gr_gc
 from vllm_gr.v1.worker import model_runner_contracts as contracts
 

@@ -10,8 +10,12 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession, beam_decision
-from vllm_gr.v1.beam.beam_attention_context import BeamDecisionBuffers
+from vllm_gr.v1.beam import beam_decision
+from vllm_gr.v1.beam.beam_attention_context import (
+    BeamAttentionContext,
+    BeamDecisionBuffers,
+)
+from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
 
 def _make_context(
@@ -44,12 +48,7 @@ def _make_session(context: BeamAttentionContext, session_id: str = "s") -> BeamS
 
 
 def test_begin_session_resets_decision_buffers() -> None:
-    """A second session must not inherit the previous session's state.
-
-    Without the reset, ``worker_decode_steps`` stays non-zero and
-    ``init_beam_decision_state`` is silently skipped for every subsequent
-    session — the decision then reads a corrupted cumulative state.
-    """
+    """Reusing a slot clears scores, history, and the Decode step counter."""
     context = _make_context()
     session = _make_session(context)
     session.begin_session(beam_width=4, prefix_len=8)
@@ -128,8 +127,8 @@ def test_result_width_decouples_from_max_decode_steps() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_kv_reorder_record_matches_global_index_minus_offset() -> None:
-    """Multi-request offset arithmetic: recorded[i] = global_idx[i] - i*W."""
+def test_kv_reorder_applies_request_local_parents_to_each_slot() -> None:
+    """Global parent indices must reorder KV within the owning request slot."""
     context = _make_context(max_batch=2, max_beams=4, max_decode_steps=4)
     first = _make_session(context, "first")
     second = _make_session(context, "second")
@@ -146,33 +145,30 @@ def test_kv_reorder_record_matches_global_index_minus_offset() -> None:
     bufs.worker_decode_steps = 2
 
     out_ids = torch.zeros(2, beam_width, dtype=torch.int32)
-    # Global parent indices: request 0 → parents {0,1}, request 1 → parents
-    # {0,1} + the request-1 offset (1 * beam_width = 4).
-    out_idx = torch.tensor([[0, 1, 0, 1], [4, 5, 4, 5]], dtype=torch.int32)
+    # beam_search_group emits sorted parents and cumulative child counts.
+    # Apply an offset of 4 to both outputs for the second request.
+    out_idx = torch.tensor([[0, 0, 1, 1], [4, 6, 6, 7]], dtype=torch.int32)
     out_lp = torch.zeros(2, beam_width, dtype=torch.float32)
     out_seq = torch.zeros(2, beam_width, 2, dtype=torch.int32)
-    # Global prefix sums (Asynchronous scheduling kernel contract): request-offset included.
-    prefix = torch.tensor([[1, 2, 2, 2], [5, 6, 6, 6]], dtype=torch.int32)
+    prefix = torch.tensor([[2, 4, 4, 4], [5, 5, 7, 8]], dtype=torch.int32)
+
+    pool = context.pools[0]
+    keys = pool.unshared_key[:, :, 0, 0, 0]
+    values = pool.unshared_value[:, :, 0, 0, 0]
+    keys.copy_(torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]]))
+    values.copy_(torch.tensor([[30, 31, 32, 33], [40, 41, 42, 43]]))
 
     beam_decision._finalize_decision(
         session, bufs, out_ids, out_idx, out_lp, out_seq, prefix, 2, beam_width, beam_width
     )
 
-    # request 0 local prefix: [1, 2, 2, 2] - 0*4; request 1: [5,6,6,6] - 4.
     assert bufs.group_token_num[:2, :beam_width].tolist() == [
-        [1, 2, 2, 2],
-        [1, 2, 2, 2],
+        [2, 4, 4, 4],
+        [1, 1, 3, 4],
     ]
-    # The decision no longer materializes kv_reorder (no device→host sync);
-    # each request row is applied to its own pool slot without a host-side
-    # kv_reorder record. Row 0's
-    # global offset is 0, so row 0 already equals the request-local mapping;
-    # row 1 must shed its 1*beam_width offset to match.
-    assert first._state.kv_reorder is None
-    assert second._state.kv_reorder is None
+    assert keys.tolist() == [[10, 10, 11, 11], [20, 22, 22, 23]]
+    assert values.tolist() == [[30, 30, 31, 31], [40, 42, 42, 43]]
     assert (first.decode_step, second.decode_step) == (1, 1)
-    assert out_idx[0].tolist() == [0, 1, 0, 1]
-    assert (out_idx[1] - beam_width).tolist() == [0, 1, 0, 1]
 
 
 # ---------------------------------------------------------------------------

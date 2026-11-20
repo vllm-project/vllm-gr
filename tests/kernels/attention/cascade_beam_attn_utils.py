@@ -14,8 +14,9 @@ import torch
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
 )
-from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam import BEAM_DATA_VAR
+from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 # (queries per beam, complete KV length, suffix KV length).

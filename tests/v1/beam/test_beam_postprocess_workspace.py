@@ -11,7 +11,7 @@ from tests.beam_postprocess_workspace_utils import (
     candidate_rows,
     result_count,
 )
-from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import (
+from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
     BeamPostprocessWorkspace,
     BeamPostprocessWorkspaceKey,
     BeamPostprocessWorkspacePool,
@@ -29,7 +29,6 @@ def _workspace(max_batch: int = 2) -> BeamPostprocessWorkspace:
         max_decode_steps=3,
         device="cpu",
         logits_dtype=torch.float16,
-        pin_host=False,
     )
 
 
@@ -121,7 +120,6 @@ def test_workspace_rejects_invalid_geometry(kwargs: dict[str, int], match: str) 
         "max_decode_steps": 3,
         "device": "cpu",
         "logits_dtype": torch.float16,
-        "pin_host": False,
     }
     params.update(kwargs)
     with pytest.raises(ValueError, match=match):

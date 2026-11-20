@@ -875,7 +875,7 @@ def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
     )
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
 
-    from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+    from vllm_gr.v1.beam import BEAM_DATA_VAR
     from vllm_gr.v1.worker.npu.npu_beam_decode_graph import install_npu_beam_graph_model
 
     descriptor = BatchDescriptor(num_tokens=4, uniform=True)
@@ -2058,8 +2058,8 @@ def _terminal_result_runner(
 def test_npu_cpu_columns_materialize_identically_to_stop_aware_rows(
     batch: int, width: int, steps: int, include_score: bool, include_parents: bool, penalty: float
 ) -> None:
-    from vllm_gr.v1.beam.batch_contracts import BeamSequenceColumns
-    from vllm_gr.v1.beam.output_columns import (
+    from vllm_gr.v1.beam.batch_contracts import (
+        BeamSequenceColumns,
         materialize_beam_result,
         validate_complete_sequences,
     )

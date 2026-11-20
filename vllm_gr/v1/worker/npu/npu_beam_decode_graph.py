@@ -48,7 +48,7 @@ class NPUBeamGraphModel(ACLGraphWrapper):  # type: ignore[misc]
 
     @staticmethod
     def _is_beam_forward() -> bool:
-        from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+        from vllm_gr.v1.beam import BEAM_DATA_VAR
 
         info = BEAM_DATA_VAR.get()
         return isinstance(info, dict) and info.get("beam_session") is not None

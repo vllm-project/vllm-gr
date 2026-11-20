@@ -9,8 +9,8 @@ import torch
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
-from vllm_gr.v1.worker.cuda.beam_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
+from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspace
 
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 

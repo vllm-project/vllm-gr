@@ -13,9 +13,10 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
 )
-from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
+from vllm_gr.v1.beam import BEAM_DATA_VAR
+from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
 
 def _make_session(

@@ -360,7 +360,7 @@ class NPUEagerBeamStageRunner:
                         device=self.worker.device,
                     )
                 )
-                from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+                from vllm_gr.v1.beam import BEAM_DATA_VAR
 
                 token = BEAM_DATA_VAR.set(beam_info)
             else:
@@ -383,7 +383,7 @@ class NPUEagerBeamStageRunner:
             raise
         finally:
             if token is not None:
-                from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+                from vllm_gr.v1.beam import BEAM_DATA_VAR
 
                 BEAM_DATA_VAR.reset(token)
 

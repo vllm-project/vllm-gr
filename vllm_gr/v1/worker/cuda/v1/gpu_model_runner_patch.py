@@ -315,7 +315,7 @@ def _dummy_beam_forward(
     from vllm.forward_context import set_forward_context
     from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
-    from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+    from vllm_gr.v1.beam import BEAM_DATA_VAR
 
     # 1. Refresh the per-step device buffer (same as runtime path).
     context.decode_step_buf.fill_(0)

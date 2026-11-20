@@ -8,8 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_gr.v1.beam import BeamAttentionPool
-from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool as PoolImplementation
+from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
 
 
 def _make_pool(
@@ -170,10 +169,6 @@ def test_allocation_shape_matches_parameters(
             pool.unshared_key.numel() * element_size + pool.unshared_value.numel() * element_size
             == 1_572_864
         )
-
-
-def test_public_export_is_stable() -> None:
-    assert BeamAttentionPool is PoolImplementation
 
 
 def test_pool_attributes_stored_correctly() -> None:

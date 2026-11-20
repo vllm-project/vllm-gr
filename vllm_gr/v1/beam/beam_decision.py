@@ -15,7 +15,6 @@ PyTorch reference path for parity tests.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -26,101 +25,6 @@ logger = init_logger(__name__)
 # Kernel tiling constraint: beam_search_rec_final_select requires result_width
 # to be a multiple of 32 (verified on device; see ops/npu/beam_ops.py ABI notes).
 _FINAL_SELECT_ALIGNMENT = 32
-
-
-def init_beam_decision_state(
-    session: Any,
-    top_tokens: torch.Tensor,
-    top_logprobs: torch.Tensor,
-) -> None:
-    """Seed the persistent decision buffers from the first candidate round.
-
-    At the first
-    decision step each beam (one row of ``[B*W, W]`` candidates) contributes
-    its top candidate token and score to ``sequence[..., 0]`` and
-    ``beam_scores``, so the subsequent ``beam_search_group`` steps read
-    cumulative state entirely from device-resident buffers.  Runs once per
-    session before any ``decode_select``-style step.
-
-    Args:
-        session: the active BeamSearchSession (its ``context.decision`` buffers).
-        top_tokens / top_logprobs: ``[B * W, W]`` candidate token ids / probs.
-    """
-    bufs = getattr(session.context, "decision", None)
-    if bufs is None:
-        return
-    width = session.beam_width
-    n_rows = top_tokens.shape[0]
-    if width == 0 or n_rows == 0 or n_rows % width != 0:
-        return
-    batch = n_rows // width
-    # [B, W, K]: the last dim holds the top-candidate ordering per beam, and K
-    # is the candidate width, which is independent of the beam width.
-    # Column-0 views are already contiguous per-row, and the dtype guards
-    # keep the constrained path (int32 ids / float32 probs straight from
-    # rec_constrained_topk) copy-free — the profiled ~12ms-per-copy host
-    # stalls (aclnnInplaceCopyGetWorkspaceSize) came from casting first and
-    # copying the cast result; matching dtypes lets copy_ take the
-    # contiguous fast path directly.
-    candidate_width = top_tokens.shape[1]
-    if candidate_width < 1:
-        return
-    best_token = top_tokens.reshape(batch, width, candidate_width)[:, :, 0]
-    best_score = top_logprobs.reshape(batch, width, candidate_width)[:, :, 0]
-    if best_token.dtype is not bufs.sequence.dtype:
-        best_token = best_token.to(bufs.sequence.dtype)
-    if best_score.dtype is not bufs.beam_scores.dtype:
-        best_score = best_score.to(bufs.beam_scores.dtype)
-    n = min(width, bufs.sequence.shape[1])
-    bufs.sequence[:batch, :n, 0].copy_(best_token[:, :n])
-    bufs.beam_scores[:batch, :n].copy_(best_score[:, :n])
-    # Worker-side token-count for the decision: one committed token per beam.
-    bufs.worker_decode_steps = 1
-
-
-def init_beam_decision_from_parents(
-    session: Any,
-    parent_sequences: Sequence[Sequence[int]],
-    parent_cumulative_logprobs: Sequence[float],
-) -> None:
-    """Restore persistent decision state from already-selected parents.
-
-    The first grouped decode evaluates candidates after the prefill winner
-    (for OneRec, ``s_b`` after ``s_a``).  Seeding from the current candidate
-    matrix would lose the prefill score and count the current local score
-    twice, changing beam rank order.
-    """
-    import math
-
-    width = session.beam_width
-    if len(parent_sequences) != width or len(parent_cumulative_logprobs) != width:
-        raise RuntimeError(
-            f"worker beam decision parent state must contain exactly beam_width={width} rows"
-        )
-    lengths = {len(sequence) for sequence in parent_sequences}
-    if len(lengths) != 1:
-        raise RuntimeError("worker beam decision parent sequences must have equal lengths")
-    steps = next(iter(lengths), 0)
-    bufs = session.context.decision
-    if steps < 1 or steps > bufs.sequence.shape[2]:
-        raise RuntimeError(
-            f"worker beam decision parent sequence length {steps} is outside "
-            f"[1, {bufs.sequence.shape[2]}]"
-        )
-    scores = [float(score) for score in parent_cumulative_logprobs]
-    # -inf is a legitimate parent-score sentinel at the EOS-mask protocol
-    # boundary. Only NaN/+inf are protocol errors.
-    if any(math.isnan(score) or score == math.inf for score in scores):
-        raise RuntimeError(
-            "worker beam decision parent scores must not be NaN or +inf; "
-            "-inf marks an EOS-masked beam and is a valid score"
-        )
-    device = bufs.sequence.device
-    sequence_tensor = torch.tensor(parent_sequences, dtype=torch.int32, device=device)
-    score_tensor = torch.tensor(scores, dtype=torch.float32, device=device)
-    bufs.sequence[0, :width, :steps].copy_(sequence_tensor)
-    bufs.beam_scores[0, :width].copy_(score_tensor)
-    bufs.worker_decode_steps = steps
 
 
 def _reorder_kv_same_step(
@@ -299,13 +203,6 @@ def _finalize_decision(
         else:
             for row, item in enumerate(sessions):
                 _reorder_kv_same_step(item, local_idx[row], local_prefix[row])
-        # The applied mapping is NOT materialized here: reading
-        # ``local_idx[0].tolist()`` is a device→host sync that stalls the
-        # pipeline every step (~30ms on NPU, profiling bw128_1k_t3).  The
-        # return channel (``_maybe_run_worker_beam_decision``) already copies
-        # ``out_token_index`` to host for the frontend, and its request-0 row
-        # equals this request-local mapping (global offset 0), so the record
-        # is derived there from that copy — no second D2H.
     return decision
 
 
@@ -460,8 +357,4 @@ def run_beam_decision_candidates(
     return decision
 
 
-__all__ = [
-    "init_beam_decision_from_parents",
-    "init_beam_decision_state",
-    "run_beam_decision_candidates",
-]
+__all__ = ["run_beam_decision_candidates"]

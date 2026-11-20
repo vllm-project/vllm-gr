@@ -19,7 +19,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
 )
 from vllm_gr.v1.attention.backends.beam_attn_metadata_async import build_async
 from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import BeamTensorBuffers
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam import BEAM_DATA_VAR
 
 
 def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
