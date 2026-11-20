@@ -57,7 +57,8 @@ def main() -> int:
         if not Path(filepath).exists():
             continue
 
-        if filepath == "setup.py":
+        # Both scripts must also work before runtime dependencies are installed.
+        if filepath in {"setup.py", "collect_env.py"}:
             continue
 
         violations = check_file(filepath)

@@ -8,22 +8,23 @@
 import datetime
 import locale
 import os
+import re
+import signal
 import subprocess
 import sys
-
-# This script outputs relevant system environment info
-# Run it with `python collect_env.py` or `python -m torch.utils.collect_env`
 from collections import namedtuple
+from importlib import metadata
+from pathlib import Path
 
-import regex as re
-from vllm.envs import environment_variables
-
+TORCH_IMPORT_ERROR = None
 try:
     import torch
 
     TORCH_AVAILABLE = True
-except (ImportError, NameError, AttributeError, OSError):
+except Exception as exc:
+    # Vendor extensions can fail while torch initializes on a broken installation.
     TORCH_AVAILABLE = False
+    TORCH_IMPORT_ERROR = type(exc).__name__
 
 # System Environment Information
 SystemEnv = namedtuple(
@@ -97,30 +98,51 @@ DEFAULT_PIP_PATTERNS = {
 }
 
 
+PROBE_TIMEOUT_SECONDS = 15
+
+
 def run(command):
     """Return (return-code, stdout, stderr)."""
-    shell = True if type(command) is str else False
     try:
-        p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=shell)
-        raw_output, raw_err = p.communicate()
-        rc = p.returncode
+        with subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=isinstance(command, str),
+            start_new_session=os.name == "posix",
+        ) as proc:
+            try:
+                raw_output, raw_err = proc.communicate(timeout=PROBE_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                # Some probes run shell pipelines. Stop their children as well.
+                if os.name == "posix":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    proc.kill()
+                return 124, "", f"Probe timed out after {PROBE_TIMEOUT_SECONDS}s"
+            rc = proc.returncode
         if get_platform() == "win32":
             enc = "oem"
         else:
             enc = locale.getpreferredencoding()
-        output = raw_output.decode(enc)
+        output = raw_output.decode(enc, errors="replace")
         if command == "nvidia-smi topo -m":
             # don't remove the leading whitespace of `nvidia-smi topo -m`
             #   because they are meaningful
             output = output.rstrip()
         else:
             output = output.strip()
-        err = raw_err.decode(enc)
+        err = raw_err.decode(enc, errors="replace")
         return rc, output, err.strip()
 
     except FileNotFoundError:
         cmd_str = command if isinstance(command, str) else command[0]
         return 127, "", f"Command not found: {cmd_str}"
+    except OSError as exc:
+        return 1, "", str(exc)
 
 
 def run_and_read_all(run_lambda, command):
@@ -271,49 +293,36 @@ def get_rocm_version(run_lambda):
     return run_and_parse_first_match(run_lambda, "hipcc --version", r"HIP version: (\S+)")
 
 
-def get_vllm_version():
-    from vllm import __version__, __version_tuple__
-
-    if __version__ == "dev":
-        return "N/A (dev)"
-    version_str = __version_tuple__[-1]
-    if isinstance(version_str, str) and version_str.startswith("g"):
-        # it's a dev build
-        if "." in version_str:
-            # it's a dev build containing local changes
-            git_sha = version_str.split(".")[0][1:]
-            date = version_str.split(".")[-1][1:]
-            return f"{__version__} (git sha: {git_sha}, date: {date})"
-        else:
-            # it's a dev build without local changes
-            git_sha = version_str[1:]  # type: ignore
-            return f"{__version__} (git sha: {git_sha})"
-    return __version__
+def distribution_version(name):
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
 
 
 def get_vllm_gr_version(run_lambda):
+    installed = distribution_version("vllm-gr")
+    if installed is not None:
+        return installed
+
+    # Only associate a checkout revision with a version read from that checkout.
+    checkout = Path(__file__).resolve().parent
+    source = checkout / "vllm_gr" / "version.py"
+    if not source.is_file():
+        return "Not installed"
     try:
-        import vllm_gr
-        from vllm_gr import __version__, __version_tuple__
-
-        version_str = __version_tuple__[-1]
-        if isinstance(version_str, str) and version_str.startswith("g"):
-            if "." in version_str:
-                git_sha = version_str.split(".")[0][1:]
-                date = version_str.split(".")[-1][1:]
-                return f"{__version__} (git sha: {git_sha}, date: {date})"
-            else:
-                git_sha = version_str[1:]
-                return f"{__version__} (git sha: {git_sha})"
-
-        package_dir = os.path.dirname(os.path.abspath(vllm_gr.__file__))
-        git_sha = run_and_read_all(run_lambda, f"git -C {package_dir} rev-parse --short HEAD")
-        if git_sha:
-            return f"{__version__} (git sha: {git_sha})"
-
-        return __version__
-    except ImportError:
-        return "N/A (vllm_gr not installed)"
+        from vllm_gr import version
+    except Exception as exc:
+        return f"Source version unavailable ({type(exc).__name__})"
+    if Path(version.__file__).resolve() != source:
+        return "No installed distribution metadata"
+    sha = None
+    if (checkout / ".git").exists():
+        sha = run_and_read_all(
+            run_lambda, ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"]
+        )
+    origin = f"source checkout, git sha: {sha}" if sha else "source checkout"
+    return f"{version.__version__} ({origin})"
 
 
 def summarize_vllm_build_flags():
@@ -485,7 +494,10 @@ def get_cachingallocator_config():
 
 def get_cuda_module_loading_config():
     if TORCH_AVAILABLE and torch.cuda.is_available():
-        torch.cuda.init()
+        try:
+            torch.cuda.init()
+        except (RuntimeError, OSError, AssertionError) as exc:
+            return f"Could not initialize CUDA ({type(exc).__name__})"
         config = os.environ.get("CUDA_MODULE_LOADING", "")
         return config
     else:
@@ -494,14 +506,23 @@ def get_cuda_module_loading_config():
 
 def is_xnnpack_available():
     if TORCH_AVAILABLE:
-        import torch.backends.xnnpack
+        try:
+            from torch.backends import xnnpack
 
-        return str(torch.backends.xnnpack.enabled)  # type: ignore[attr-defined]
+            return str(xnnpack.enabled)
+        except (ImportError, AttributeError, OSError, RuntimeError):
+            return "Could not collect"
     else:
         return "N/A"
 
 
 def get_env_vars():
+    try:
+        from vllm.envs import environment_variables
+    except Exception:
+        # Partial installations may raise loader or initialization errors on import.
+        environment_variables = {}
+
     env_vars = ""
     secret_terms = ("secret", "token", "api", "access", "password")
     report_prefix = (
@@ -549,7 +570,9 @@ def get_env_info():
             cuda_version_str = "N/A"
             hip_compiled_version = torch.version.hip
     else:
-        version_str = debug_mode_str = cuda_available_str = cuda_version_str = "N/A"
+        installed = distribution_version("torch")
+        version_str = f"{installed} (import failed: {TORCH_IMPORT_ERROR})" if installed else "N/A"
+        debug_mode_str = cuda_available_str = cuda_version_str = "N/A"
         hip_compiled_version = hip_runtime_version = miopen_runtime_version = "N/A"
 
     sys_version = sys.version.replace("\n", " ")
@@ -557,7 +580,7 @@ def get_env_info():
     conda_packages = get_conda_packages(run_lambda)
 
     rocm_version = get_rocm_version(run_lambda)
-    vllm_version = get_vllm_version()
+    vllm_version = distribution_version("vllm") or "Not installed"
     vllm_gr_version = get_vllm_gr_version(run_lambda)
     vllm_build_flags = summarize_vllm_build_flags()
     gpu_topo = get_gpu_topo(run_lambda)
@@ -758,7 +781,9 @@ def main():
         minidump_dir = torch.utils._crash_handler.DEFAULT_MINIDUMP_DIR
         if sys.platform == "linux" and os.path.exists(minidump_dir):
             dumps = [os.path.join(minidump_dir, dump) for dump in os.listdir(minidump_dir)]
-            latest = max(dumps, key=os.path.getctime)
+            latest = max(dumps, key=os.path.getctime, default=None)
+            if latest is None:
+                return
             ctime = os.path.getctime(latest)
             creation_time = datetime.datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M:%S")
             msg = (
