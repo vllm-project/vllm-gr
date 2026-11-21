@@ -28,6 +28,8 @@ case "${VLLM_GR_TARGET_DEVICE:-}" in
 esac
 
 pytest_args=(-x --run-slow --strict-test-levels --durations=10 -s -m "$expression")
+# The dedicated resource gate owns these probes and their device locks.
+pytest_args+=(--ignore=tests/development/test_resource_probe.py)
 
 # The opt-in tiny-model tests inspect the in-process vLLM engine directly.
 # Isolate them from tests that exercise the multiprocess engine, preserving
