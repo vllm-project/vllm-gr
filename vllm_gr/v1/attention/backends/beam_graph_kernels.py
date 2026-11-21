@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """CUDA Graph-compatible KV operators for incremental beam decode.
 
-cache_unshared_kv_kernel: Triton JIT kernel that writes the current step's
-    beam KV into the pool's ``[slot, beam, head, decode_step, :]`` slice,
-    reading ``decode_step`` from a device-side buffer (not a host Python int).
+cache_unshared_kv_kernel: Triton JIT kernel that gathers the current step's
+    beam rows and writes K and V directly into the pool's
+    ``[slot, beam, head, decode_step, :]`` slice.
 
 This makes the kernel compatible with CUDA Graph capture/replay: the
 ``decode_step`` value can change between replays via ``decode_step_buf.fill_()``
@@ -128,118 +128,113 @@ def copy_suffix_kv_graph(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["slot"])
 def cache_unshared_kv_kernel(
-    pool_ptr,  # pool base pointer (unshared_key or unshared_value)
-    curr_ptr,  # current step KV [W, H, D]
-    W: tl.constexpr,  # beam width
-    H: tl.constexpr,  # num_kv_heads
-    D: tl.constexpr,  # head_dim
-    max_steps: tl.constexpr,  # max_decode_steps (pool dim 3)
-    slot: tl.constexpr,  # fixed int: which session slot in pool
-    decode_step_buf,  # device tensor [1] int32: decode_step_buf
-    stride_b,  # pool stride for batch dim
-    stride_w,  # pool stride for beam dim
-    stride_h,  # pool stride for head dim
-    stride_s,  # pool stride for step dim
+    pool_key,
+    pool_value,
+    curr_key,
+    curr_value,
+    row_indices,
+    slot,
+    decode_step_buf,
     active_mask,
+    key_strides: tl.constexpr,
+    value_strides: tl.constexpr,
+    pool_key_strides: tl.constexpr,
+    pool_value_strides: tl.constexpr,
+    index_stride: tl.constexpr,
+    mask_stride: tl.constexpr,
+    WIDTH: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    SOURCE_ROWS: tl.constexpr,
+    MAX_STEPS: tl.constexpr,
+    INDEXED: tl.constexpr,
     MASKED: tl.constexpr,
-    # NOTE: the last (head_dim) pool dimension is assumed contiguous
-    # (stride == 1); the pool is allocated as one contiguous 5D tensor.
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
-    """Write current step's beam KV into the pool at [slot, beam, head, decode_step, :].
-
-    Each program instance handles one (beam, head) pair, writing D elements.
-    Grid size = W * H.
-    """
-    pid = tl.program_id(0)
-    total = W * H
-    if pid >= total:
+    step = tl.load(decode_step_buf).to(tl.int32)
+    if step < 0 or step >= MAX_STEPS:
         return
 
-    beam = pid // H
-    head = pid % H
-
-    # Device-side read of decode_step (key enabler for CUDA Graph replay)
-    decode_step = tl.load(decode_step_buf).to(tl.int32)
-    # Defense-in-depth: a stale decode_step_buf under CUDA Graph replay
-    # could exceed max_steps; skip to avoid OOB pool writes.
-    if decode_step < 0 or decode_step >= max_steps:
-        return
-
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    beam, head = row // HEADS, row % HEADS
+    live = beam < WIDTH
     if MASKED:
-        if not tl.load(active_mask + beam):
-            return
+        live = live & tl.load(active_mask + beam * mask_stride, live, other=False)
+    source_row = beam
+    if INDEXED:
+        source_row = tl.load(row_indices + beam * index_stride, live, other=0)
+        live = live & (source_row >= 0) & (source_row < SOURCE_ROWS)
+    source_row = source_row.to(tl.int64)
+    slot = slot.to(tl.int64)
+    d = tl.arange(0, BLOCK_D)
+    valid = live[:, None] & (d[None, :] < DIM)
 
-    # Source: curr[beam, head, :] — [D] contiguous
-    src_off = beam * H * D + head * D + tl.arange(0, D)
-    src = tl.load(curr_ptr + src_off)
+    key_offset = source_row * key_strides[0] + head * key_strides[1]
+    value_offset = source_row * value_strides[0] + head * value_strides[1]
+    key = tl.load(curr_key + key_offset[:, None] + d[None, :] * key_strides[2], valid)
+    value = tl.load(curr_value + value_offset[:, None] + d[None, :] * value_strides[2], valid)
 
-    # Destination: pool[slot, beam, head, decode_step, :]
-    dst_off = (
-        slot * stride_b
-        + beam * stride_w
-        + head * stride_h
-        + decode_step * stride_s
-        + tl.arange(0, D)
+    dst_key = (
+        slot * pool_key_strides[0]
+        + beam * pool_key_strides[1]
+        + head * pool_key_strides[2]
+        + step * pool_key_strides[3]
     )
-    tl.store(pool_ptr + dst_off, src)
+    dst_value = (
+        slot * pool_value_strides[0]
+        + beam * pool_value_strides[1]
+        + head * pool_value_strides[2]
+        + step * pool_value_strides[3]
+    )
+    tl.store(pool_key + dst_key[:, None] + d[None, :] * pool_key_strides[4], key, valid)
+    tl.store(pool_value + dst_value[:, None] + d[None, :] * pool_value_strides[4], value, valid)
 
 
 def cache_unshared_kv_graph(
-    pool_key: torch.Tensor,  # [max_batch, W, H, max_steps, D]
-    pool_value: torch.Tensor,  # [max_batch, W, H, max_steps, D]
-    curr_key: torch.Tensor,  # [W, H, D]
-    curr_value: torch.Tensor,  # [W, H, D]
-    slot: int,  # session slot index
-    decode_step_buf: torch.Tensor,  # [1] int32 device tensor
+    pool_key: torch.Tensor,
+    pool_value: torch.Tensor,
+    curr_key: torch.Tensor,
+    curr_value: torch.Tensor,
+    slot: int,
+    decode_step_buf: torch.Tensor,
     active_mask: torch.Tensor | None = None,
+    *,
+    row_indices: torch.Tensor | None = None,
 ) -> None:
-    """Graph-compatible cache_unshared_kv using Triton kernels.
+    """Gather the beam rows of K and V and write both to the private pool.
 
-    Writes current step's beam KV into the pool at [slot, :, :, decode_step, :],
-    where decode_step is read from the device buffer at replay time.
-
-    This function is safe to call both in eager mode and during CUDA Graph
-    capture/replay — no host-side Python ints are baked into kernel args
-    (except `slot`, which is constant across all steps of a session).
+    Source K/V are [rows, heads, dim]. Row indices, when provided, map each
+    destination beam to a source row. Step, row indices and active mask are
+    read on device so their values can change between graph replays.
     """
-    W, H, D = curr_key.shape
-
-    grid = (W * H,)
-
-    # Launch key write
-    cache_unshared_kv_kernel[grid](
+    source_rows, heads, dim = curr_key.shape
+    width = row_indices.numel() if row_indices is not None else source_rows
+    block_rows = 4
+    cache_unshared_kv_kernel[(triton.cdiv(width * heads, block_rows),)](
         pool_key,
-        curr_key,
-        W=W,
-        H=H,
-        D=D,
-        max_steps=pool_key.shape[3],
-        slot=slot,
-        decode_step_buf=decode_step_buf,
-        stride_b=pool_key.stride(0),
-        stride_w=pool_key.stride(1),
-        stride_h=pool_key.stride(2),
-        stride_s=pool_key.stride(3),
-        active_mask=active_mask,
-        MASKED=active_mask is not None,
-    )
-
-    # Launch value write
-    cache_unshared_kv_kernel[grid](
         pool_value,
+        curr_key,
         curr_value,
-        W=W,
-        H=H,
-        D=D,
-        max_steps=pool_value.shape[3],
-        slot=slot,
-        decode_step_buf=decode_step_buf,
-        stride_b=pool_value.stride(0),
-        stride_w=pool_value.stride(1),
-        stride_h=pool_value.stride(2),
-        stride_s=pool_value.stride(3),
-        active_mask=active_mask,
-        MASKED=active_mask is not None,
+        row_indices,
+        slot,
+        decode_step_buf,
+        active_mask,
+        curr_key.stride(),
+        curr_value.stride(),
+        pool_key.stride(),
+        pool_value.stride(),
+        row_indices.stride(0) if row_indices is not None else 0,
+        active_mask.stride(0) if active_mask is not None else 0,
+        width,
+        heads,
+        dim,
+        source_rows,
+        pool_key.shape[3],
+        row_indices is not None,
+        active_mask is not None,
+        block_rows,
+        triton.next_power_of_2(dim),
     )
