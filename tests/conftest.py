@@ -3,7 +3,7 @@
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import pytest
 
-pytest_plugins = ("tests.level_plugin",)
+pytest_plugins = ("tests.level_plugin", "tests.hardware_plugin")
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
