@@ -15,15 +15,6 @@ MIN_ACCURACY="${PANGU1B_ONLINE_ACCURACY_THRESHOLD:-}"
 FAILURE_MODE="${PANGU1B_ONLINE_ACCURACY_FAILURE_MODE:-}"
 DEVICE="${BENCHMARK_DEVICE:-unknown}"
 
-if [[ -z "$MODEL_PATH" || ! -d "$MODEL_PATH" ]]; then
-  echo "Error: PANGU1B_MODEL_PATH must point to a local Pangu checkpoint." >&2
-  exit 2
-fi
-if ! compgen -G "$MODEL_PATH/*.safetensors" > /dev/null && \
-   ! compgen -G "$MODEL_PATH/*.bin" > /dev/null; then
-  echo "Error: Pangu checkpoint has no .safetensors or .bin weights: $MODEL_PATH" >&2
-  exit 2
-fi
 if [[ -z "$MIN_ACCURACY" || -z "$FAILURE_MODE" ]]; then
   echo "Error: the online Pangu accuracy policy was not resolved." >&2
   exit 2
@@ -31,11 +22,10 @@ fi
 validate_failure_mode "PANGU1B_ONLINE_ACCURACY_FAILURE_MODE" \
   "$FAILURE_MODE" || exit $?
 
-result_json=$(mktemp "${TMPDIR:-/tmp}/pangu1b-online.XXXXXX.json")
-cleanup() {
-  rm -f -- "$result_json"
-}
-trap cleanup EXIT
+destination="${PANGU1B_ONLINE_RESULT_JSON:-}"
+template="${destination:-${TMPDIR:-/tmp}/pangu1b}.XXXXXX"
+result_json=$(mktemp -- "$template") || exit 1
+trap 'rm -f -- "$result_json"' EXIT
 
 echo "Running Pangu 1B online service/API contract and accuracy measurement"
 echo "  model: $MODEL_PATH"
@@ -44,7 +34,8 @@ echo "  threshold: $MIN_ACCURACY ($FAILURE_MODE)"
 PANGU1B_REQUIRE_RUNTIME=1 \
 PANGU1B_MEASURE_ONLY=1 \
 PANGU1B_ONLINE_RESULT_JSON="$result_json" \
-python -m unittest tests.st.test_pangu1b_online_st
+python -m pytest --run-slow --strict-test-levels -m model_test \
+  tests/st/test_pangu1b_online_st.py
 execution_status=$?
 if [[ "$execution_status" -ne 0 ]]; then
   echo "Pangu online service/API execution failed with exit code $execution_status." >&2
@@ -66,4 +57,5 @@ fi
 
 validate_accuracy_metric "Pangu online accuracy" "$accuracy" "$MIN_ACCURACY" \
   "$FAILURE_MODE" "$DEVICE" 91 || exit $?
+if [[ -n "$destination" ]]; then mv -fT -- "$result_json" "$destination" || exit 1; fi
 echo "Pangu 1B online service/API and accuracy check completed."
