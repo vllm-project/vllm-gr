@@ -7,9 +7,9 @@
 
 Requires:
 - vLLM + GPU/NPU runtime
-- ``PANGU1B_MODEL_PATH`` / ``PANGU_MODEL_PATH`` or ``--model`` with weights
+- Prepared vLLM runtime; the pangu_model fixture prepares weights on demand.
 
-Skip when the model path is unavailable (CI without weights).
+Explicit local overrides remain supported. Input preparation failures are errors.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from tests.helpers.paths import REPO_ROOT
 from tests.st import pangu_generate
 from tests.st.pangu1b_st_common import (
     GSM8K_MINI,
-    get_model_path,
     require_pangu_st_runtime,
     score_answer,
 )
@@ -63,11 +62,13 @@ def _parse_cli_summary(stdout: str) -> dict:
 class TestPangu1bAccuracyST(unittest.TestCase):
     """End-to-end accuracy ST for the Pangu offline evaluation CLI."""
 
-    def setUp(self) -> None:
-        require_pangu_st_runtime()
+    @pytest.fixture(autouse=True)
+    def _prepared_inputs(self, pangu_model: Path, gsm8k_mini: Path) -> None:
+        self.model_path = pangu_model
+        self.dataset_path = gsm8k_mini
 
     def test_gsm8k_mini_accuracy_cli(self) -> None:
-        model_path = get_model_path()
+        model_path = str(self.model_path)
         with tempfile.NamedTemporaryFile(
             suffix=".json",
             delete=False,
@@ -80,7 +81,7 @@ class TestPangu1bAccuracyST(unittest.TestCase):
             "--model",
             model_path,
             "--dataset-path",
-            str(DEFAULT_DATASET),
+            str(self.dataset_path),
             "--num-prompts",
             "8",
             "--min-accuracy",
@@ -183,4 +184,4 @@ class TestPangu1bAccuracyUnitHooks(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

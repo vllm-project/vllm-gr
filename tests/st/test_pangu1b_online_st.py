@@ -7,9 +7,9 @@
 
 Requires:
 - vLLM + GPU/NPU runtime
-- ``PANGU1B_MODEL_PATH`` or ``PANGU_MODEL_PATH`` with weights
+- Prepared vLLM runtime; the pangu_model fixture prepares weights on demand.
 
-Skip when the model path is unavailable (CI without weights).
+Explicit local overrides remain supported. Input preparation failures are errors.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any, Iterator
 from unittest import mock
@@ -35,9 +35,7 @@ from tests.st.pangu1b_st_common import (
     GSM8K_MINI,
     PANGU_CONFIG,
     build_prompt,
-    get_model_path,
     load_dataset,
-    require_pangu_st_runtime,
     score_answer,
 )
 
@@ -222,21 +220,21 @@ def _chat_completion(
 @pytest.mark.gpu_test
 @pytest.mark.npu_test
 @pytest.mark.model_test
+@pytest.mark.timeout(DEFAULT_SERVE_TIMEOUT + 8 * 120 + 120)
 class TestPangu1bOnlineServeST(unittest.TestCase):
     """End-to-end online ST for Pangu LLM passthrough via ``vllm serve MODEL --gr``."""
 
     base_url: str
-    _server_ctx: AbstractContextManager[str]
+    dataset_path: Path
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        require_pangu_st_runtime()
-        cls._server_ctx = _pangu_serve_server(get_model_path())
-        cls.base_url = cls._server_ctx.__enter__()
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls._server_ctx.__exit__(None, None, None)
+    @pytest.fixture(scope="class", autouse=True)
+    def _prepared_server(
+        self, request: pytest.FixtureRequest, pangu_model: Path, gsm8k_mini: Path
+    ) -> Iterator[None]:
+        request.cls.dataset_path = gsm8k_mini
+        with _pangu_serve_server(str(pangu_model)) as base_url:
+            request.cls.base_url = base_url
+            yield
 
     def test_health_endpoint(self) -> None:
         response = requests.get(f"{self.base_url}/health", timeout=10)
@@ -279,7 +277,8 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_gsm8k_mini_online_accuracy(self) -> None:
-        records = load_dataset(DEFAULT_DATASET, num_prompts=8)
+        records = load_dataset(self.dataset_path, num_prompts=8)
+        self.assertEqual(len(records), 8, "Online accuracy requires eight prompts")
         correct = 0
         for row in records:
             body = _chat_completion(
@@ -360,4 +359,4 @@ class TestPangu1bOnlineUnitHooks(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
