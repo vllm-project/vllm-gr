@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum, auto
+from typing import TypedDict, cast
 
 import torch
 
@@ -27,6 +29,17 @@ class _BackendState(Enum):
     INITIALIZING = auto()
     READY = auto()
     CLOSED = auto()
+
+
+_ConstraintTables = tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]
+
+
+class _TrieArguments(TypedDict, total=False):
+    trie_ids: torch.Tensor
+    first_token_offsets: torch.Tensor | None
+    max_first_degree: int
 
 
 class CUDAConstraintBackend:
@@ -90,7 +103,7 @@ class CUDAConstraintBackend:
         """Whether admission can use this backend without initialization work."""
         return self._state is _BackendState.READY
 
-    def _tables(self) -> tuple[torch.Tensor, ...]:
+    def _tables(self) -> _ConstraintTables:
         tables = (
             self._first_token_ids,
             self._prefix1_offsets,
@@ -101,7 +114,7 @@ class CUDAConstraintBackend:
         )
         if self._state is _BackendState.CLOSED or any(table is None for table in tables):
             raise RuntimeError("CUDA constraint backend is closed")
-        return tuple(table for table in tables if table is not None)
+        return cast(_ConstraintTables, tables)
 
     def _invoke(
         self,
@@ -143,7 +156,7 @@ class CUDAConstraintBackend:
                     f"CUDA constraint backend requires CUDA logits, got {logits.device}"
                 )
         tables = self._tables()
-        trie_kwargs = {}
+        trie_kwargs: _TrieArguments = {}
         if self._info.table_metadata.trie_count > 1:
             if metadata.trie_ids is None:
                 raise ValueError("multi-trie CUDA selection requires trie_ids")
@@ -183,11 +196,11 @@ class CUDAConstraintBackend:
             )
         else:
             token_ids, logprobs, valid_mask, valid_counts = outputs
-            launch_out = (
-                rec_constrained_topk_cuda_out
-                if validate
-                else _rec_constrained_topk_cuda_out_unchecked
-            )
+            launch_out: Callable[..., tuple[torch.Tensor, ...]]
+            if validate:
+                launch_out = rec_constrained_topk_cuda_out
+            else:
+                launch_out = _rec_constrained_topk_cuda_out_unchecked
             launch_kwargs = {
                 "vocab_offset": vocab_offset,
                 "table_vocab_size": table_vocab_size,

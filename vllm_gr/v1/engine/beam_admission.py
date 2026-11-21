@@ -19,6 +19,7 @@ from vllm_gr.config.execution import (
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_MAX_DECODE_STEPS,
     configured_candidate_width,
+    runtime_constraint_table,
 )
 from vllm_gr.platforms.ascend.admission import (
     validate_decode_token_budget,
@@ -117,7 +118,7 @@ def _reject_candidate_width_below_dynamic_schedule(
 
 def validate_gr_generation_budget(gr_config: GRConfig, max_tokens: int) -> None:
     """Fix constrained SID length to table depth; otherwise bound it by capacity."""
-    table = gr_config.constraint_table
+    table = runtime_constraint_table(gr_config)
     if table is not None and table.enabled and max_tokens != CONSTRAINT_TABLE_MAX_DECODE_STEPS:
         raise ValueError(
             f"effective generation length {max_tokens} must equal {table.format} depth "

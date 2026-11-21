@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING, Any
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
 if TYPE_CHECKING:
+    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import GPUBeamStageRunner
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
+    from vllm_gr.v1.worker.npu.npu_beam_stage_runner import NPUEagerBeamStageRunner
 
 
 def _copy_record(value: Any) -> Any:
@@ -97,6 +99,7 @@ def execute_gr_stage(
 ) -> Any:
     local = worker_input(scheduled)
     device_type = str(worker.device).split(":")[0]
+    stage_runner: GPUBeamStageRunner | NPUEagerBeamStageRunner
     if device_type == "cuda":
         from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
             get_stage_runner,

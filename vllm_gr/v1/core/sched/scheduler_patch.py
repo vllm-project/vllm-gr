@@ -133,7 +133,7 @@ def apply_scheduler_patch():
         def has_requests(self):
             return original_has_requests(self) or has_gr_cleanup_work(self)
 
-        has_requests._gr_retirement_work = True
+        setattr(has_requests, "_gr_retirement_work", True)
         Scheduler.has_requests = has_requests
 
     if not getattr(Scheduler.add_request, "_vllm_gr_v1_add_request", False):

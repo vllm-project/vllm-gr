@@ -15,7 +15,11 @@ from vllm.utils import random_uuid
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import GRConfig, resolve_candidate_width
-from vllm_gr.config.models import ConstraintTableBackendEnum, configured_candidate_width
+from vllm_gr.config.models import (
+    ConstraintTableBackendEnum,
+    configured_candidate_width,
+    runtime_constraint_table,
+)
 from vllm_gr.entrypoints.beam_search.boundary_tokens import boundary_token_id
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search.protocol import (
@@ -185,7 +189,7 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
 
     gr_config = GRConfig.from_vllm_config(vllm_config)
-    table = gr_config.constraint_table
+    table = runtime_constraint_table(gr_config)
     unconstrained = configured_constraint_mode(gr_config) is ConstraintMode.NONE
     device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
     device_type = str(device).split(":")[0]

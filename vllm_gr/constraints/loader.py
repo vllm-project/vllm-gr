@@ -601,22 +601,22 @@ def load_constraint_backend(
     if config.path is None or config.artifact_digest is None or config.tokenizer_digest is None:
         raise ValueError("enabled constraint table configuration is incomplete")
 
+    max_top_k = config.max_top_k
+    assert max_top_k is not None
     op: NPUConstraintOp | None = None
     if backend_kind is ConstraintTableBackendEnum.CUDA:
-        if config.max_top_k > MAX_CONSTRAINT_CANDIDATE_WIDTH:
+        if max_top_k > MAX_CONSTRAINT_CANDIDATE_WIDTH:
             raise ValueError(
                 f"CUDA constraint max_top_k must be <= {MAX_CONSTRAINT_CANDIDATE_WIDTH}, "
-                f"got {config.max_top_k}"
+                f"got {max_top_k}"
             )
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(f"CUDA constraint logits must be fp16/bf16, got {dtype}")
         if device.type != "cuda":
             raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
     if backend_kind is ConstraintTableBackendEnum.NPU:
-        if config.max_top_k > MAX_TOP_K:
-            raise ValueError(
-                f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {config.max_top_k}"
-            )
+        if max_top_k > MAX_TOP_K:
+            raise ValueError(f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {max_top_k}")
         if device.type != "npu":
             raise RuntimeError(f"NPU constraint backend requires an NPU device, got {device}")
         op = resolve_rec_constrained_topk_npu()
@@ -632,7 +632,7 @@ def load_constraint_backend(
         info = _backend_info(
             table,
             backend=ConstraintTableBackendEnum.CPU,
-            max_top_k=config.max_top_k,
+            max_top_k=max_top_k,
             max_rows=max_rows,
             host_memory_bytes=table.total_bytes,
             device_memory_bytes=0,
@@ -642,7 +642,7 @@ def load_constraint_backend(
         backend, cases = _upload_cuda_backend(
             table,
             device=device,
-            max_top_k=config.max_top_k,
+            max_top_k=max_top_k,
             max_rows=max_rows,
         )
         del table
@@ -663,11 +663,11 @@ def load_constraint_backend(
         raise RuntimeError(f"unsupported constraint table backend {backend_kind!r}")
 
     _reject_unsupported_last_vocab_prefix(table)
-    backend, cases = _upload_npu_backend(
+    npu_backend, cases = _upload_npu_backend(
         table,
         device=device,
         op=op,
-        max_top_k=config.max_top_k,
+        max_top_k=max_top_k,
         max_rows=max_rows,
         enable_npu_stage_vocab=enable_npu_stage_vocab,
         stage_lm_head=stage_lm_head,
@@ -677,16 +677,16 @@ def load_constraint_backend(
     del table
     try:
         _run_npu_readiness(
-            backend,
+            npu_backend,
             cases=cases,
             device=device,
             dtype=dtype,
             max_rows=max_rows,
         )
-        backend._mark_ready()  # noqa: SLF001
-        return backend
+        npu_backend._mark_ready()  # noqa: SLF001
+        return npu_backend
     except BaseException:
-        backend.close()
+        npu_backend.close()
         raise
 
 

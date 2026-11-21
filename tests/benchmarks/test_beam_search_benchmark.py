@@ -478,7 +478,7 @@ def test_direct_benchmark_help_imports_shared_metrics(tmp_path: Path) -> None:
 def _run_qwen_shell(checkout: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
     bash = os.environ.get("TEST_BASH") or shutil.which("bash")
     if bash is None:
-        pytest.skip("Bash is required to test the Qwen launcher")
+        raise pytest.skip.Exception("Bash is required to test the Qwen launcher")
     env = {
         **os.environ,
         "MODEL": "Qwen/model-id",

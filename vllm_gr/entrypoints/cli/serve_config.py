@@ -29,7 +29,7 @@ class GRArgumentParser(FlexibleArgumentParser):
             option = token.split("=", 1)[0].split(".", 1)[0].replace("_", "-")
             if option in option_actions:
                 explicit.add(option_actions[option].dest)
-        self._gr_yaml_fields = set()
+        self._gr_yaml_fields: set[str] = set()
         try:
             result = super().parse_args(argv, namespace)
             result._gr_explicit_native_fields = explicit | self._gr_yaml_fields

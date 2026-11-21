@@ -93,6 +93,8 @@ class BeamAttentionContext:
     - context.get_suffix_buf(...) → cascade_attn
     """
 
+    _gr_execution_owner: object | None
+
     def __init__(
         self,
         max_batch: int,

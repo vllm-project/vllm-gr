@@ -38,6 +38,13 @@ hardware requirements, and the platform-specific behavior of `tools/run_test.sh`
 
 ## Documentation checks
 
+When running the standalone `markdownlint` CLI from the repository root, pass the
+repository configuration explicitly.
+
+```bash
+markdownlint --config tools/pre_commit/.markdownlint.yaml README.md
+```
+
 For a Markdown edit, run the relevant hooks on the changed files. This example
 checks one file; pass the complete changed Markdown file list for a real change:
 
@@ -63,6 +70,17 @@ project-specific checks; formatting settings live in `pyproject.toml`. New
 shared documentation must pass the character check. Generated gRPC bindings
 are excluded by the hook configuration. The commit-message hook supplies DCO
 sign-off using the configured Git identity.
+
+## Mypy coverage
+
+The default group checks Python source and stubs under `vllm_gr/` with
+`check_untyped_defs` and `follow_imports = "silent"`, following vLLM 0.30.0.
+The checker uses annotations from imports while reporting diagnostics for
+its explicit inputs. Generated gRPC bindings are excluded from this check
+and validated by the regeneration hook. Test helpers and the CUDA and NPU
+worker contracts use the repository's strict checks with `follow_imports = "skip"`
+to isolate their imported runtime dependencies. The hook prints the number
+of files in each group.
 
 ## CUDA stage hooks contract
 
@@ -92,8 +110,9 @@ make a weakened contract fail the same checker run.
 The group disables both cache reads and writes to avoid a mypy 1.11.1 placeholder
 serialization failure in these cyclic imports.
 
-Runtime and checker-routing regressions live in `tests/tools/test_cuda_stage_typing.py`.
-They remain CPU-only and do not launch checker subprocesses. The ordinary test
+Runtime regressions live in `tests/tools/test_cuda_stage_typing.py`. Wrapper
+routing and checker flag regressions live in `tests/tools/test_mypy_hook.py`.
+Both suites are CPU-only and avoid checker subprocesses. The ordinary test
 group skips production imports, so runtime test subclass declarations use local
 `type: ignore[misc]` annotations for the inherited-`Any` diagnostic. The production
 boundary is checked separately by each Python-version mypy pre-commit hook.

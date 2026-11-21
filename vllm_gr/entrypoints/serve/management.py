@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from vllm_gr.update_status import ResourceType, ServiceState, ServiceStatus
 
 router = APIRouter()
-_STATUS_ADAPTER = TypeAdapter(ServiceStatus)
+_STATUS_ADAPTER: TypeAdapter[ServiceStatus] = TypeAdapter(ServiceStatus)
 
 
 class Target(BaseModel):

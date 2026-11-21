@@ -563,7 +563,9 @@ class GPUBeamStageRunner:
         settings = self.gr_settings
         slice_request = 0
         if backend is None and self.hooks.supports_transposed_head:
-            slice_request = SLICE_AUTO if settings.head_slice == "auto" else settings.head_slice
+            slice_request = (
+                SLICE_AUTO if settings.head_slice == "auto" else cast(int, settings.head_slice)
+            )
         # The transposed copy is only consumed by the opt-in sliced-head path.
         # Gate before creating it: the worker cache retains this allocation.
         self._head_layout = _get_unconstrained_head_layout(worker) if slice_request else None

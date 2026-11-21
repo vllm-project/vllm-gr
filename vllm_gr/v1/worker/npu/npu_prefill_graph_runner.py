@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -83,6 +83,15 @@ def build_update_lists_from_metadata(
     return build_update_lists(token_counts, bucket)
 
 
+if TYPE_CHECKING:
+
+    class _BSNDPrefillBuffers(PrefillBucketBuffers):
+        bsnd_captured_graphs: dict[int, Any]
+        bsnd_output_bufs: dict[int, torch.Tensor]
+        bsnd_compact_output_bufs: dict[int, torch.Tensor]
+        bsnd_static_attn_metadatas: dict[int, Any]
+
+
 class NPUPrefillGraphRunner(BasePrefillGraphRunner):
     """Manages Ascend Graph capture and execution on Huawei Ascend NPUs.
 
@@ -116,7 +125,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             self.buckets,
         )
         self.bsnd_entries: dict[tuple[int, int], Any] = {}
-        self._replays_by_bucket: dict[int, int] = {}
+        self._replays_by_bucket: dict[int | tuple[int, int], int] = {}
         # FIA workspace shared across every layer AND every bucket: only one
         # prefill graph executes at a time (sequential batches, sequential
         # layers, update stream ordered before replay), and the workspace
@@ -124,7 +133,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         # largest-first, so the first successful capture establishes the max
         # size and smaller buckets reuse it.
         self.shared_workspace: Any = None
-        self._logged_first_replay: set[int] = set()
+        self._logged_first_replay: set[int | tuple[int, int]] = set()
         logger.info(
             "NPUPrefillGraphRunner initialized on device %s with buckets %s",
             self.device,
@@ -229,6 +238,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         # Allocate int32 NPU slots once before any BSND/TND capture.
         # Allocate once: replacing these tensors invalidates the earlier graph's inputs.
         if not getattr(buf, "_npu_capture_inputs_prepared", False):
+            position_shape: tuple[int, ...]
             if getattr(runner, "uses_mrope", False):
                 position_shape = (3, bucket)
             elif getattr(runner, "uses_xdrope_dim", 0) > 0:
@@ -237,7 +247,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                 position_shape = (bucket,)
             buf.positions_buf = torch.empty(position_shape, dtype=torch.int64, device=self.device)
             buf.slot_mapping_buf = torch.empty((bucket,), dtype=torch.int32, device=self.device)
-            buf._npu_capture_inputs_prepared = True
+            setattr(buf, "_npu_capture_inputs_prepared", True)
         buf.positions_buf.copy_(torch.arange(bucket, dtype=torch.int64, device=self.device))
         buf.input_ids_buf.fill_(buf.pad_token_id)
         # NPU's ATB ReshapeAndCache op requires int32 slot mappings (the GPU
@@ -692,12 +702,12 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                         B,
                     )
                     continue
-                buf = self.buffers[T]
+                buf = cast("_BSNDPrefillBuffers", self.buffers[T])
                 if not hasattr(buf, "bsnd_captured_graphs"):
-                    buf.bsnd_captured_graphs: dict[int, Any] = {}
-                    buf.bsnd_output_bufs: dict[int, Any] = {}
-                    buf.bsnd_compact_output_bufs: dict[int, Any] = {}
-                    buf.bsnd_static_attn_metadatas: dict[int, Any] = {}
+                    buf.bsnd_captured_graphs = {}
+                    buf.bsnd_output_bufs = {}
+                    buf.bsnd_compact_output_bufs = {}
+                    buf.bsnd_static_attn_metadatas = {}
                 self._prepare_capture_buffers(buf, T, runner)
                 meta = self._build_bsnd_dummy_metadata(T, B, builder, buf)
                 meta_dict = {name: meta for name in layer_names}
@@ -834,6 +844,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             buf.slot_mapping_buf[s : s + L_i].copy_(slot_mapping[o : o + L_i], non_blocking=True)
             o += L_i
 
+        buf = cast("_BSNDPrefillBuffers", buf)
         graph = buf.bsnd_captured_graphs[B]
         graph.replay()
 

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 from vllm.inputs import tokens_input
 
@@ -23,6 +23,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchRequest,
     BeamBatchResult,
     BeamOutputSequence,
+    BeamRequestOutput,
 )
 
 
@@ -34,6 +35,13 @@ def _result_output(result: BeamBatchResult) -> BeamBatchOutput:
     if result.failure is not None:
         raise BeamSearchEngineError(result.failure)
     return result.output  # type: ignore[return-value]
+
+
+def _materialized_sequences(item: BeamRequestOutput) -> tuple[BeamOutputSequence, ...]:
+    sequences = item.sequences
+    if not isinstance(sequences, tuple):
+        raise TypeError("public Beam output conversion requires materialized sequences")
+    return sequences
 
 
 def _token_id(tokenizer: Any, token: str | None, name: str) -> int | None:
@@ -201,11 +209,11 @@ class BeamSearchOutputProcessor:
                                 token_ids=begin
                                 + sequence.token_ids
                                 + (end if sequence.finish_reason == "length" else ()),
-                                cumulative_logprob=float(sequence.cumulative_logprob),
+                                cumulative_logprob=float(cast(float, sequence.cumulative_logprob)),
                                 finish_reason=sequence.finish_reason,
                                 stop_reason=sequence.stop_token_id,
                             )
-                            for sequence in item.sequences
+                            for sequence in _materialized_sequences(item)
                         ),
                         prompt_token_ids=self._accepted_prompt(
                             request, item.item_index, begin_token_id
@@ -236,7 +244,7 @@ class BeamSearchOutputProcessor:
                 )
                 lora_request = request.items[item.item_index].request.lora_request
                 sequences = []
-                for sequence in item.sequences:
+                for sequence in _materialized_sequences(item):
                     # Initialize the final lazy type in one pass. Its generated
                     # __init__ would invoke three Python descriptor setters per
                     # beam; constructing the base first also needs a class swap.
@@ -247,7 +255,7 @@ class BeamSearchOutputProcessor:
                         "tokens": [],
                         "logprobs": [],
                         "lora_request": lora_request,
-                        "cum_logprob": float(sequence.cumulative_logprob),
+                        "cum_logprob": float(cast(float, sequence.cumulative_logprob)),
                         "text": None,
                         "finish_reason": sequence.finish_reason,
                         "stop_reason": sequence.stop_token_id,
@@ -285,10 +293,11 @@ class BeamSearchOutputProcessor:
             results = []
             for item in output.items:
                 item_index = item.item_index
+                sequences = _materialized_sequences(item)
                 completion_token_ids = [
                     ([] if begin_token_id is None else [begin_token_id])
                     + _output_suffix(sequence, end_token_id)
-                    for sequence in item.sequences
+                    for sequence in sequences
                 ]
                 texts = fast_batch_decode(self.tokenizer, completion_token_ids)
                 lora_request = request.items[item_index].request.lora_request
@@ -304,7 +313,7 @@ class BeamSearchOutputProcessor:
                         lora_request=lora_request,
                     )
                     for choice_index, (sequence, token_ids, text) in enumerate(
-                        zip(item.sequences, completion_token_ids, texts, strict=True)
+                        zip(sequences, completion_token_ids, texts, strict=True)
                     )
                 ]
                 prompt_token_ids = original_prompts[item_index]

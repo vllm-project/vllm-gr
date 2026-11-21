@@ -24,6 +24,7 @@ from vllm_gr.config.models import (
     ConstraintTableSpec,
     DeploymentOptions,
     GRConfig,
+    runtime_constraint_table,
 )
 from vllm_gr.config.schema import config_fields
 from vllm_gr.config.validation import validate_constraint_mode
@@ -159,6 +160,7 @@ def _step_widths(settings: Mapping) -> tuple[tuple[int, ...] | None, tuple[int, 
             or any(type(v) is not int or not 1 <= v <= ceiling for v in value)
         ):
             raise ValueError(f"gr.{key} requires a nonempty list of integers in 1..{ceiling}")
+    assert candidates is not None
     if len(widths) != len(candidates):
         raise ValueError("gr.candidate_width must have one entry for each gr.beam_width entry")
     if widths[0] != candidates[0]:
@@ -285,8 +287,9 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         gr["beam_width"] = [config.beam_max_width] * config.beam_max_decode_steps
     if options.candidate_width is None and config.beam_max_width is not None:
         width = config.beam_candidate_width
-        if width is None and config.constraint_table is not None:
-            width = config.constraint_table.candidate_width
+        table_config = runtime_constraint_table(config)
+        if width is None and table_config is not None:
+            width = table_config.candidate_width
         gr["candidate_width"] = [width or config.beam_max_width] * config.beam_max_decode_steps
     constraint = config.constraint_config
     gr["constraint_mode"] = constraint.mode.value
@@ -302,7 +305,7 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
             "digests": {"artifact": table.artifact_digest, "tokenizer": table.tokenizer_digest},
         }
     )
-    result = {"gr": gr}
+    result: dict[str, object] = {"gr": gr}
     if config.attention_backend is not None:
         result["attention-config"] = {"backend": config.attention_backend.value}
     return result
@@ -330,7 +333,7 @@ def _load_document(
     effective = merge_gr_settings(merge_gr_settings(base, document.get("gr", {})), overrides or {})
     if effective.get("worker_decision") is None and worker_decision_default is not None:
         effective["worker_decision"] = worker_decision_default
-    payload = {"gr": effective}
+    payload: dict[str, object] = {"gr": effective}
     attention = document.get("attention-config")
     if isinstance(attention, Mapping) and attention.get("backend") == "CUSTOM":
         payload["attention-config"] = attention

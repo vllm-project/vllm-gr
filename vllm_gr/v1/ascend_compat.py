@@ -124,7 +124,7 @@ def apply_penalties_warmup_oom_guard() -> int:
             model_config = getattr(worker, "model_config", None)
             num_seqs = getattr(scheduler_config, "max_num_seqs", None)
             try:
-                vocab_size = model_config.get_vocab_size()
+                vocab_size = model_config.get_vocab_size() if model_config is not None else None
             except Exception:
                 vocab_size = None
             logger.warning(
@@ -138,7 +138,7 @@ def apply_penalties_warmup_oom_guard() -> int:
             torch.npu.empty_cache()
 
     _guarded_penalties_triton_warmup._vllm_gr_oom_guarded = True  # type: ignore[attr-defined]
-    warmup_mod.penalties_triton_warmup = _guarded_penalties_triton_warmup
+    setattr(warmup_mod, "penalties_triton_warmup", _guarded_penalties_triton_warmup)
     _PENALTY_WARMUP_GUARD_APPLIED = True
     return 1
 
@@ -196,7 +196,7 @@ def _install_init_ascend_config_sanitizer() -> None:
     ):
         mod = sys.modules.get(module_name)
         if mod is not None and getattr(mod, "init_ascend_config", None) is original:
-            mod.init_ascend_config = sanitized
+            setattr(mod, "init_ascend_config", sanitized)
 
 
 def _sanitize_engine_core_entry(
@@ -227,7 +227,7 @@ def _sanitize_engine_core_entry(
     return ascend_entry(*args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
 
 
-def apply_engine_core_config_sanitizer(engine_core_proc_cls: type) -> int:
+def apply_engine_core_config_sanitizer(engine_core_proc_cls: Any) -> int:
     """Wrap the EngineCore entrypoint to strip GR keys before Ascend init.
 
     Re-asserted on every create_engine_config: each EngineArgs round-trip

@@ -25,5 +25,5 @@ def install_async_output_guard() -> None:
                 output = error
         return original(self, output)
 
-    enqueue_output._gr_async_output_guard = True
+    setattr(enqueue_output, "_gr_async_output_guard", True)
     WorkerProc.enqueue_output = enqueue_output

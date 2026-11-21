@@ -124,7 +124,7 @@ async def _next_data_parallel_rank(engine_client) -> int | None:
     data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
     if data_parallel_size is None or data_parallel_size <= 1:
         return None
-    if getattr(parallel_config, "local_engines_only", False):
+    if parallel_config is not None and getattr(parallel_config, "local_engines_only", False):
         data_parallel_size = parallel_config.data_parallel_size_local
 
     async with _dp_rank_lock:

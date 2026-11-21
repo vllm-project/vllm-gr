@@ -15,7 +15,7 @@ import math
 import sys
 from dataclasses import dataclass
 from itertools import repeat
-from typing import Annotated, Literal, NoReturn, TypeGuard
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, TypeGuard
 
 import msgspec
 import numpy as np
@@ -52,6 +52,9 @@ class BeamEngineCoreRequest(EngineCoreRequest):
     """GR native request with one canonical ndarray prompt wire field."""
 
     prompt_token_ids: np.ndarray  # type: ignore[assignment,type-arg]
+
+    if TYPE_CHECKING:
+        external_req_id: str | None
 
     def __post_init__(self) -> None:
         if self.external_req_id is None:

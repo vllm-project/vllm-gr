@@ -45,8 +45,6 @@ INVALID_LOGIT = _INVALID_LOGIT
 if TYPE_CHECKING:
     from vllm_gr.constraints.compiler import ConstraintTableResource
 
-    _DEVICE = torch.device
-
 
 @dataclass(frozen=True)
 class ConstrainedTopKTensorResult:
@@ -121,7 +119,7 @@ class ConstrainedTopKExecution(Protocol):
 
 def _tables_to_device(
     resource: "ConstraintTableResource",
-    device: "_DEVICE",
+    device: torch.device,
 ) -> dict[str, torch.Tensor]:
     """Copy the resource's NumPy tables to device tensors.
 

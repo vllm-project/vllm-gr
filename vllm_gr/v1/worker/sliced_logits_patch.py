@@ -30,7 +30,7 @@ def _make_clamped_v2_topk(original):
             num_logprobs = min(num_logprobs, logits.size(-1))
         return original(logits, num_logprobs, *args, **kwargs)
 
-    compute_topk_scores._vllm_gr_clamped_topk = True
+    setattr(compute_topk_scores, "_vllm_gr_clamped_topk", True)
     return compute_topk_scores
 
 
@@ -105,13 +105,12 @@ def apply_sliced_logits_patch() -> bool:
         try:
             original_gather = Sampler.gather_logprobs
 
-            @staticmethod
             def patched_gather_logprobs(logprobs, num_logprobs, token_ids, *args, **kwargs):
                 if logprobs is not None and logprobs.numel() > 0:
                     num_logprobs = min(num_logprobs, logprobs.size(-1))
                 return original_gather(logprobs, num_logprobs, token_ids, *args, **kwargs)
 
-            Sampler.gather_logprobs = patched_gather_logprobs
+            Sampler.gather_logprobs = staticmethod(patched_gather_logprobs)
         except Exception as exc:
             logger.debug("vllm_gr: Could not patch Sampler.gather_logprobs: %s", exc)
 
@@ -142,7 +141,7 @@ def apply_sliced_logits_patch() -> bool:
                 _v2_module = importlib.import_module(_v2_module_name)
                 _bound = getattr(_v2_module, "compute_topk_scores", None)
                 if callable(_bound):
-                    _v2_module.compute_topk_scores = _make_clamped_v2_topk(_bound)
+                    setattr(_v2_module, "compute_topk_scores", _make_clamped_v2_topk(_bound))
             except Exception as exc:
                 logger.debug(
                     "vllm_gr: Could not patch %s.compute_topk_scores: %s",

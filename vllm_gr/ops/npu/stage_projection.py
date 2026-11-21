@@ -191,7 +191,9 @@ class NPUStageProjection:
                 for stage, values in enumerate(weights):
                     self.stage_weights[stage][: values.shape[0]].copy_(values)
                 for stage, values in enumerate(biases):
-                    self._stage_biases[stage][: values.shape[0]].copy_(values)
+                    stage_bias = self._stage_biases[stage]
+                    assert stage_bias is not None
+                    stage_bias[: values.shape[0]].copy_(values)
                 if weight.device.type == "npu":
                     torch.npu.synchronize(weight.device)
         except BaseException:

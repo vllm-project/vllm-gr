@@ -514,7 +514,7 @@ def prefix_attention(
         plan is None
         and plain
         and attn_metadata.max_num_splits == 0
-        and getattr(attn_metadata, "prefix_length_bucket", 0)
+        and getattr(attn_metadata, "prefix_length_bucket", False)
     ):
         from vllm_gr.v1.attention.backends.beam_prefix_policy import (
             PrefixShape,
@@ -550,7 +550,9 @@ def prefix_attention(
                 # allocate; drop the plan instead of raising inside capture.
                 pages = -(-attn_metadata.prefix_max_seq_len // key_cache.shape[1])
                 chunk = max(1, -(-pages // plan.segments))
-                columns = attn_metadata.prefix_block_table.shape[1]
+                block_table = attn_metadata.prefix_block_table
+                assert block_table is not None
+                columns = block_table.shape[1]
                 if chunk * plan.segments > columns:
                     plan = None
     scheduler = attn_metadata.prefix_scheduler_metadata

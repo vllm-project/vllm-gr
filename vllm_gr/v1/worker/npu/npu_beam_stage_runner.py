@@ -43,7 +43,10 @@ from vllm_gr.v1.beam.dispatch import (
     GRStageMetadata,
     GRWorkerResult,
 )
-from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
+from vllm_gr.v1.beam.execution_batch import (
+    BeamBatchExecutionView,
+    BeamExecutionContractError,
+)
 from vllm_gr.v1.beam.session import BeamSearchSession
 from vllm_gr.v1.worker.npu.beam_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
@@ -58,7 +61,7 @@ class NPUEagerBeamStageRunner:
     def __init__(self, worker: Any) -> None:
         validate_npu_eager_capabilities(worker)
         self.worker = worker
-        self.previous = None
+        self.previous: BeamBatchExecutionView | None = None
         self.pending_plan: NPUEagerStagePlan | None = None
         self.execution_error: Exception | None = None
         self.logical_scheduler_output: Any = None

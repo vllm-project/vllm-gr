@@ -111,8 +111,8 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # vllm_gr.sampling_params subclasses the upstream BeamSearchParams, which is
     # a msgspec Struct (``dict=True, omit_defaults=True`` subclass kwargs).
-    class BeamSearchParams(  # type: ignore[call-arg]
-        msgspec.Struct,  # type: ignore[misc]
+    class BeamSearchParams(
+        msgspec.Struct,
         dict=True,
         omit_defaults=True,
     ):

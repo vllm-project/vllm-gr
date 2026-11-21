@@ -204,6 +204,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
             )
         if len(set(identities)) != len(identities):
             raise ValueError("request_id must be unique within a batch")
+        assert params_key is not None
         request = BeamBatchRequest(
             protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
             batch_id=batch_id,

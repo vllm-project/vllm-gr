@@ -238,6 +238,3 @@ vllm_gr/_version.py
 # AI coding assistants
 .claude/
 .codex/
-
-# Local documentation build output.
-/site/

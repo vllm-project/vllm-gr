@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 from vllm.logger import init_logger
 
 from vllm_gr.config import ConstraintMode, ConstraintTableBackendEnum
+from vllm_gr.config.models import runtime_constraint_table
 from vllm_gr.platforms.interface import ModelRunnerInstaller, ModelRunnerPatchHooks
 from vllm_gr.v1.worker.gr_context import (
     _get_gr_config,
@@ -29,6 +30,7 @@ from vllm_gr.v1.worker.model_runner_contracts import (
 )
 
 if TYPE_CHECKING:
+    from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
 
 logger = init_logger(__name__)
@@ -112,7 +114,7 @@ def make_load_model_with_constraint_backend(
             close_runtime(self)
         close_constraint_backend(self)
         gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
-        table_config = gr_config.constraint_table
+        table_config = runtime_constraint_table(gr_config)
         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
         result = original(self, *args, **kwargs)
 
@@ -124,7 +126,7 @@ def make_load_model_with_constraint_backend(
             gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
             if gr_config.constraint_config.mode is ConstraintMode.NONE:
                 return result
-            table_config = gr_config.constraint_table
+            table_config = runtime_constraint_table(gr_config)
             if table_config is None or not table_config.enabled:
                 return result
 
@@ -140,7 +142,9 @@ def make_load_model_with_constraint_backend(
             from vllm_gr.config import resolve_candidate_width
 
             candidate_width = resolve_candidate_width(gr_config)
-            if candidate_width > table_config.max_top_k:
+            max_top_k = table_config.max_top_k
+            assert max_top_k is not None
+            if candidate_width > max_top_k:
                 raise ValueError(
                     "candidate_width must be <= constraint_table.max_top_k "
                     f"for canonical constraint sampling, got {candidate_width} > "
@@ -182,11 +186,12 @@ def make_load_model_with_constraint_backend(
                 # Import GPU layers only after selecting the CUDA backend.
                 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-                window = backend.vocab_slice
+                cuda_backend = cast("CUDAConstraintBackend", backend)
+                window = cuda_backend.vocab_slice
                 if getattr(parallel, "tensor_parallel_size", 1) != 1:
                     # All ranks must retain the original full-logits collective path.
                     window = None
-                    backend.vocab_slice = None
+                    cuda_backend.vocab_slice = None
                     logger.info(
                         "vllm-gr: canonical CUDA vocabulary slicing disabled for TP>1; "
                         "using full-vocabulary projection"

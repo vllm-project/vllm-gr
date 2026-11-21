@@ -75,7 +75,7 @@ def test_recall_rejects_malformed_or_truncated_beam_after_rank_32() -> None:
 def test_recall_shell_checks_baseline_before_data(tmp_path: Path, kind: str) -> None:
     bash = os.environ.get("TEST_BASH") or shutil.which("bash")
     if bash is None:
-        pytest.skip("Bash is required to test the Recall launcher")
+        raise pytest.skip.Exception("Bash is required to test the Recall launcher")
 
     data = tmp_path / "missing-data"
     output = tmp_path / "output"

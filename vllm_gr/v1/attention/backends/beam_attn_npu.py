@@ -343,6 +343,7 @@ def prefill_attention(
         return
     qsl = attn_metadata.query_start_loc_cpu
     sl = attn_metadata.seq_lens_cpu
+    assert qsl is not None and sl is not None
     num_actual_tokens = attn_metadata.num_actual_tokens
     # vllm-ascend pads the batch to num_tokens_padded; the FIA-v2 TND layout
     # requires queryT == last(actual_seq_qlen), so compute only the real rows.
@@ -428,6 +429,7 @@ def _prefill_attention_graph(
     num_reqs = attn_metadata.num_reqs
     qsl = attn_metadata.query_start_loc_cpu
     sl = attn_metadata.seq_lens_cpu
+    assert qsl is not None and sl is not None
     qlen_list = qsl[1 : num_reqs + 1]
     kvlen_list = sl[:num_reqs]
     key = key_cache.view(*key_cache.shape[:-2], -1)

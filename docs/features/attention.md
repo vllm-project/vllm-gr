@@ -251,7 +251,7 @@ explicitly set their own specs. Production bucket validation remains strict.
 Run the repository strict type-check wrapper on the host regressions:
 
 ```bash
-python tools/pre_commit/mypy.py 1 3.12 tests/v1/worker/test_npu_prefill_bsnd.py
+python tools/pre_commit/mypy.py 3.12 tests/v1/worker/test_npu_prefill_bsnd.py
 ```
 
 When collecting replay evidence, ensure the EngineCore logging configuration

@@ -196,7 +196,8 @@ def _release_owner(scheduler: Any, session: GRSessionState) -> None:
 
 
 def attach_gr_retirement(scheduler: Any, output: Any) -> None:
-    owner = _sessions(scheduler).get(getattr(scheduler, "_gr_owner", None))
+    owner_id = getattr(scheduler, "_gr_owner", None)
+    owner = None if owner_id is None else _sessions(scheduler).get(owner_id)
     if (
         owner is None
         or owner.resource_status is not GRResourceStatus.DRAINING
@@ -333,6 +334,7 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
         scheduling_token_budget = getattr(
             scheduler_config, "max_num_batched_tokens", total_prompt_tokens
         )
+    assert scheduling_token_budget is not None
     if total_prompt_tokens > scheduling_token_budget:
         raise GRAdmissionError(
             "Beam batch Prefill exceeds the effective native scheduling token "

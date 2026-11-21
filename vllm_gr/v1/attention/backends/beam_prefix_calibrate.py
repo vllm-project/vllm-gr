@@ -238,7 +238,7 @@ def _initialize_prefix_calibration(worker: Any) -> PrefixCalibration | None:
     from vllm_gr.config.models import deployment_for
 
     settings = deployment_for(getattr(worker, "vllm_config", None))
-    calibrations = {}
+    calibrations: dict[str, PrefixCalibration] = {}
     worker._gr_prefix_calibrations = calibrations
     host = getattr(worker, "vllm_config", None)
     if host is not None:

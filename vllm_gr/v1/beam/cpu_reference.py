@@ -543,6 +543,8 @@ def select_final_sequences(
             raise TypeError(f"{name} must be a bool")
     stops = _stop_ids(stop_token_ids)
 
+    parent_beams_by_item: list[tuple[BeamReferenceBeam, ...]]
+    completed_by_item: list[tuple[BeamReferenceCompletedBeam, ...]]
     if state is None:
         _validate_candidate_batch(candidate_items)
         generation_step = 0

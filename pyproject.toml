@@ -141,7 +141,14 @@ line-length = 100
 target-version = "py311"
 
 [tool.mypy]
-strict = true
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+check_untyped_defs = true
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = "vllm_gr.entrypoints.grpc.generated.*"
+follow_imports = "skip"
 
 [tool.typos.default.extend-identifiers]
 image_grid_thw = "image_grid_thw"

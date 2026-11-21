@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from vllm.inputs import TextPrompt, TokensPrompt
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
+    from vllm.v1.engine.llm_engine import LLMEngine
 
     from vllm_gr.entrypoints.beam_search.protocol import BeamSearchFrontend
     from vllm_gr.outputs import CompactBeamSearchOutput
@@ -70,6 +71,9 @@ def _install_renderer_eos_token_id_cache() -> None:
 
 class GRLLM(LLM):
     """LLM subclass exposing persistent Beam Search through beam_search."""
+
+    if TYPE_CHECKING:
+        llm_engine: LLMEngine
 
     def __init__(
         self,

@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields, replace
 from enum import Enum
+from typing import cast
 
 from vllm_gr.config.schema import ConfigFieldSpec
 
@@ -693,7 +694,7 @@ class GRConfig:
             )
         if (
             self.beam_candidate_width is None
-            and (self.constraint_table is None or self.constraint_table.candidate_width is None)
+            and (self._runtime_table is None or self._runtime_table.candidate_width is None)
             and self.beam_max_width is not None
             and self.beam_max_width > MAX_CANDIDATE_WIDTH
         ):
@@ -738,7 +739,7 @@ class GRConfig:
 
     def __getattr__(self, name: str) -> object:
         if name == "catalog_path":
-            table = self.constraint_table
+            table = self._runtime_table
             return table.path if table is not None else None
         if name == "constraint_backend":
             if self.constraint is not None and self.constraint.mode is ConstraintMode.TABLE:
@@ -812,6 +813,11 @@ def configured_candidate_width(config: GRConfig) -> int | None:
     if width is None:
         width = getattr(getattr(config, "constraint_table", None), "candidate_width", None)
     return int(width) if width is not None else None
+
+
+def runtime_constraint_table(config: GRConfig) -> ConstraintTableSpec | None:
+    """Read the resolved table behind the legacy constraint_table InitVar."""
+    return cast(ConstraintTableSpec | None, config.constraint_table)
 
 
 def configured_constraint_mode(config: GRConfig) -> ConstraintMode | None:

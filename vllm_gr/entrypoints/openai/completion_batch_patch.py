@@ -280,6 +280,7 @@ async def _delegate_completion(serving, request, raw_request):
     trie_ids = (getattr(request, "vllm_xargs", None) or {}).get("trie_ids")
     token = _COMPLETION_TRIE_IDS.set(None if trie_ids is None else iter(trie_ids))
     try:
+        assert _original_create_completion is not None
         return await _original_create_completion(serving, request, raw_request)
     finally:
         _COMPLETION_TRIE_IDS.reset(token)

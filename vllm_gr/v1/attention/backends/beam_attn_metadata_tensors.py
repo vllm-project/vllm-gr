@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -115,7 +115,7 @@ def cached_seqlens_views(
 def upload_incremental_seqlens(
     ctx: BeamTensorContext,
     geom_key,
-    decode_step: int,
+    decode_step: int | None,
     *,
     prefix_seqlens_kv_view,
     prefix_cu_seqlens_q_view,
@@ -183,7 +183,7 @@ def get_schedule(
     max_seq_len: int,
     causal: bool,
     max_num_splits: int,
-    scheduler: Callable[..., dict | None],
+    scheduler: Callable[..., dict | None] | None,
 ) -> dict | None:
     if not ctx.aot_schedule:
         return None
@@ -193,6 +193,7 @@ def get_schedule(
     else:
         qkv_dtype = ctx.kv_cache_dtype
 
+    assert scheduler is not None
     return scheduler(
         batch_size=batch_size,
         max_seqlen_q=max_query_len,
@@ -428,7 +429,7 @@ def create_beam_tensors(
         suffix_max_seq_len = max(suffix_seqlens_kv_cpu) if suffix_seqlens_kv_cpu else 0
 
     if ctx.fixed_buffers:
-        prefix_indices_tensor = ctx.buffers.prefix_indices[:num_prefix]
+        prefix_indices_tensor = cast(torch.Tensor, ctx.buffers.prefix_indices)[:num_prefix]
         # Incremental decode produces a contiguous prefix index range
         # (q_start .. q_start+w).  Emit it on device with a strided arange
         # instead of converting the Python list every step (no host list,
@@ -462,8 +463,12 @@ def create_beam_tensors(
         # so the over-set bound and the never-read tail columns are
         # harmless (verified: a graph captured at prefix_len=1024
         # replays bit-identically for prefix_len=5120).
-        prefix_max_seq_len = ctx.buffers.prefix_block_table.shape[1] * ctx.block_size
-        prefix_block_table = ctx.buffers.prefix_block_table[: len(prefix_req_idxs_cpu)]
+        prefix_max_seq_len = (
+            cast(torch.Tensor, ctx.buffers.prefix_block_table).shape[1] * ctx.block_size
+        )
+        prefix_block_table = cast(torch.Tensor, ctx.buffers.prefix_block_table)[
+            : len(prefix_req_idxs_cpu)
+        ]
         # The prefix block rows are frozen for the lifetime of an
         # incremental beam session (decode KV goes to the beam pool, not
         # the paged cache), so on a geometry hit the staged copy is
@@ -520,11 +525,21 @@ def create_beam_tensors(
                 suffix_cu_seqlens_k_device,
             ) = cached_views
         else:
-            prefix_seqlens_kv_device = ctx.buffers.prefix_seqlens_kv[:num_prefix_groups]
-            prefix_cu_seqlens_q_device = ctx.buffers.prefix_cu_seqlens_q[:num_prefix_cu]
-            suffix_seqlens_kv_device = ctx.buffers.suffix_seqlens_kv[:num_suffix_beams]
-            suffix_cu_seqlens_q_device = ctx.buffers.suffix_cu_seqlens_q[:num_suffix_cu_q]
-            suffix_cu_seqlens_k_device = ctx.buffers.suffix_cu_seqlens_k[:num_suffix_cu_k]
+            prefix_seqlens_kv_device = cast(torch.Tensor, ctx.buffers.prefix_seqlens_kv)[
+                :num_prefix_groups
+            ]
+            prefix_cu_seqlens_q_device = cast(torch.Tensor, ctx.buffers.prefix_cu_seqlens_q)[
+                :num_prefix_cu
+            ]
+            suffix_seqlens_kv_device = cast(torch.Tensor, ctx.buffers.suffix_seqlens_kv)[
+                :num_suffix_beams
+            ]
+            suffix_cu_seqlens_q_device = cast(torch.Tensor, ctx.buffers.suffix_cu_seqlens_q)[
+                :num_suffix_cu_q
+            ]
+            suffix_cu_seqlens_k_device = cast(torch.Tensor, ctx.buffers.suffix_cu_seqlens_k)[
+                :num_suffix_cu_k
+            ]
 
         # Incremental decode admits the fixed-geometry cache: write the three
         # step-invariant payloads once per geometry, then refresh the

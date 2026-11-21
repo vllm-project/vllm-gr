@@ -541,10 +541,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # Step-derived suffix lists (analytic; no numpy, no per-beam loop).
             s = decode_step + 1 if decode_step is not None else 1
             suffix_seqlens_kv_cpu = [s] * w_total
-            suffix_cu_seqlens_kv_cpu = list(range(s, (w_total + 1) * s, s))
+            suffix_cu_seqlens_kv_cpu: list[int] | None = list(range(s, (w_total + 1) * s, s))
             suffix_max_seq_len = s if w_total else 0
             # Query-start-dependent prefix indices (one range per request).
-            prefix_indices = []
+            prefix_indices: list[int] = []
             for _b_idx, _req_idx in enumerate(beam_req_idxs):
                 q_offset = beam_q_start_offsets[_b_idx]
                 w = beam_widths[_b_idx]
@@ -842,7 +842,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 num_std_blocks = (
                     metadata.std_block_table.shape[1] if metadata.std_block_table is not None else 0
                 )
-                std_block_table = self._tensor_buffers.std_block_table[:num_std, :num_std_blocks]
+                std_buffer = self._tensor_buffers.std_block_table
+                assert std_buffer is not None
+                std_block_table = std_buffer[:num_std, :num_std_blocks]
                 std_block_table.copy_(blk_table[metadata.std_req_idxs_cpu, :num_std_blocks])
                 new_metadata.std_block_table = std_block_table
             else:
@@ -852,7 +854,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 num_prefix = len(metadata.prefix_req_idxs_cpu)
                 # G1: full-width view (must match the view used at capture time
                 # so the replayed graph reads the same tensor geometry).
-                prefix_block_table = self._tensor_buffers.prefix_block_table[:num_prefix]
+                prefix_buffer = self._tensor_buffers.prefix_block_table
+                assert prefix_buffer is not None
+                prefix_block_table = prefix_buffer[:num_prefix]
                 prefix_block_table[:, : metadata.max_prefix_blocks_count].copy_(
                     blk_table[metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count]
                 )

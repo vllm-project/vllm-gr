@@ -166,7 +166,7 @@ def _segment_requests(
 
 
 def _build_std_mappings(std_reqs: list, q_starts: list):
-    std_indices = []
+    std_indices: list[int] = []
     std_seqlens_q_cpu = []
     std_seqlens_kv_cpu = []
     std_req_idxs = []
@@ -226,7 +226,7 @@ def _build_beam_mappings(
     cache: dict,
 ) -> BeamMappings:
     """Build one query per beam, sharing prefix KV and reading suffix KV from pools."""
-    prefix_indices = []
+    prefix_indices: list[int] = []
     prefix_q = []
     prefix_kv = []
     suffix_q = []

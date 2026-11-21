@@ -47,7 +47,7 @@ def make_patched_engine_init(original):
             raise RuntimeError("Workers disagree on the loaded constraint table Trie count")
         self._gr_trie_count = self.scheduler._gr_trie_count = counts[0]
 
-    initialize._gr_trie_capacity_patch = True
+    setattr(initialize, "_gr_trie_capacity_patch", True)
     return initialize
 
 
@@ -243,7 +243,7 @@ def patch_engine_core_process_entrypoint() -> None:
     )
     if original_run_engine_core is run_engine_core:
         original_run_engine_core = current_run_engine_core
-    run_engine_core._original_run_engine_core = original_run_engine_core
+    setattr(run_engine_core, "_original_run_engine_core", original_run_engine_core)
     EngineCoreProc.run_engine_core = run_engine_core
 
 

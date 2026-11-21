@@ -16,6 +16,7 @@ from vllm_gr.config.backend_plan import (
     BackendRequest,
     PlanData,
 )
+from vllm_gr.config.models import runtime_constraint_table
 
 from .loader import external_provider_entry_points
 
@@ -120,7 +121,7 @@ def normalize_backend_request(config: Any, provider: Any) -> BackendRequest:
     additional = getattr(config, "additional_config", None)
     options = additional.get(BACKEND_OPTIONS_KEY, {}) if isinstance(additional, Mapping) else {}
     gr = GRConfig.from_vllm_config(config)
-    table = gr.constraint_table
+    table = runtime_constraint_table(gr)
     gr_fields = asdict(gr)
     # Retain the plan API fields while GR derives them from its canonical settings.
     gr_fields["beam_execution_mode"] = "v1" if gr.beam_max_width is not None else None
