@@ -11,8 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.hardware import PLATFORM_MARKERS
+
 # Any declared tier wins, including an explicit cpu_test for host-side cases.
-_TIER_MARKERS = ("cpu_test", "gpu_test", "npu_test")
+_TIER_MARKERS = PLATFORM_MARKERS
 _DIRECTORY = Path(__file__).resolve().parent
 
 
@@ -22,5 +24,6 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if not item.path.resolve().is_relative_to(_DIRECTORY):
             continue
-        if not any(marker in item.keywords for marker in _TIER_MARKERS):
+        if not any(item.get_closest_marker(marker) is not None for marker in _TIER_MARKERS):
             item.add_marker(pytest.mark.gpu_test)
+            item.add_marker(pytest.mark.cuda)
