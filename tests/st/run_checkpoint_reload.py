@@ -11,9 +11,7 @@ import argparse
 import contextlib
 import json
 import os
-import signal
 import socket
-import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -24,6 +22,7 @@ import grpc
 import httpx
 import numpy as np
 
+from tests.helpers.beam_server import beam_server_process
 from vllm_gr.entrypoints.grpc.generated import vllm_engine_pb2 as pb
 from vllm_gr.entrypoints.grpc.generated import vllm_engine_pb2_grpc as rpc
 from vllm_gr.sidecar import default_ckpt_checker
@@ -209,10 +208,10 @@ def server(
     if launcher is not None:
         command = [sys.executable, str(launcher), "--serve", *command[3:]]
     (output / f"{label}-command.json").write_text(json.dumps(command, indent=2))
-    with (output / f"{label}-server.log").open("w") as log:
-        process = subprocess.Popen(
-            command, env=env, cwd=ROOT, stdout=log, stderr=log, start_new_session=True
-        )
+    with (
+        (output / f"{label}-server.log").open("w") as log,
+        beam_server_process(command, env=env, cwd=ROOT, log=log) as process,
+    ):
         channel = grpc.insecure_channel(f"127.0.0.1:{port}")
         try:
             ready = grpc.channel_ready_future(channel)
@@ -230,13 +229,6 @@ def server(
                 yield rpc.VllmEngineStub(channel), control
         finally:
             channel.close()
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
 
 
 def main() -> None:
