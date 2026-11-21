@@ -30,8 +30,11 @@ from vllm_gr.constraints.backend import (
 from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
-from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab, build_npu_stage_vocab
-from vllm_gr.constraints.npu_tables import npu_trie_arrays
+from vllm_gr.constraints.npu_tables import (
+    NPUStageVocab,
+    build_npu_stage_vocab,
+    npu_trie_arrays,
+)
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
