@@ -15,9 +15,9 @@ from tests.kernels.beam_stage_test_utils import (
     metadata,
     runtime,
 )
-from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.dispatch import GRDeviceStateRef
+from vllm_gr.v1.beam.session import BeamSearchSession
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
 from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspace
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1

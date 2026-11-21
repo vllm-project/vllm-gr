@@ -46,8 +46,6 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchResult,
 )
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
-from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.beam.dispatch import (
     GR_RETIRE_OUTPUT_ATTR,
     GR_RETIRE_RESULT_ATTR,
@@ -64,6 +62,8 @@ from vllm_gr.v1.beam.dispatch import (
     validate_dispatch_session,
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.beam.session import BeamSearchSession
+from vllm_gr.v1.beam.state import BeamSearchState
 from vllm_gr.v1.worker.cuda.beam_final_output import GPUBeamFinalOutput
 from vllm_gr.v1.worker.cuda.beam_search_runner import (
     BeamBatchSearchRunner,

@@ -47,7 +47,7 @@ class NPUBeamExecutionBatch:
 
         sources = self.context.pools
         if execution.dynamic_beam_widths is not None:
-            from vllm_gr.v1.beam.dynamic_beam import get_stage_pools
+            from vllm_gr.v1.beam.dynamic_width import get_stage_pools
 
             sources = get_stage_pools(self.context, self.request_width)
 

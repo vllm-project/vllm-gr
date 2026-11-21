@@ -129,7 +129,8 @@ def test_cuda_runtime_patch_is_noop() -> None:
 def test_npu_runtime_patches_preserve_order_and_sum_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import npu_spawn_patch, v1
+    from vllm_gr import v1
+    from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
 
     events: list[tuple[str, bool | None]] = []
 

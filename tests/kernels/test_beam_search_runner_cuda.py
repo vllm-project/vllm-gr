@@ -35,12 +35,12 @@ from vllm_gr.ops.cuda.beam_state import (
     _pack_final_beams_kernel,
     _validate_step_kernel,
 )
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.cpu_reference import (
     normalize_constraint_candidates,
     select_initial_beams,
     select_next_beams,
 )
+from vllm_gr.v1.beam.session import BeamSearchSession
 from vllm_gr.v1.worker.cuda.beam_final_output import _PayloadLayout
 from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
 

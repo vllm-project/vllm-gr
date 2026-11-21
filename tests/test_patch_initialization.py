@@ -45,9 +45,9 @@ def test_runtime_patch_order_preserves_ascend_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
-    from vllm_gr import npu_spawn_patch
     from vllm_gr.platforms import loader
     from vllm_gr.platforms.ascend import NPU_BACKEND
+    from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
     from vllm_gr.v1 import ascend_compat
 
     monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
@@ -748,7 +748,7 @@ def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
     import vllm.utils.system_utils as system_utils
     import vllm.v1.executor.multiproc_executor as multiproc_executor
 
-    from vllm_gr import npu_spawn_patch
+    from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
 
     upstream_calls: list[str] = []
 
@@ -784,7 +784,7 @@ def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
 def test_npu_spawn_patch_forces_spawn_only_when_npu_initialized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import npu_spawn_patch
+    from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
 
     monkeypatch.setattr(npu_spawn_patch, "_npu_is_initialized", lambda: True)
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)

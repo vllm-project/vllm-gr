@@ -16,7 +16,7 @@ from vllm_gr.constraints.versioned_table import (
     INITIAL_CONSTRAINT_VERSION,
     VersionedConstraintTable,
 )
-from vllm_gr.entrypoints.management import control_app
+from vllm_gr.entrypoints.serve.management import control_app
 from vllm_gr.update_status import ServiceState, ServiceStatus
 from vllm_gr.v1.engine.hot_update import (
     pause,
@@ -236,7 +236,7 @@ def test_runner_keeps_the_same_wrapper_across_reload() -> None:
 def test_sidecar_calls_production_admin_listener(tmp_path: Any, drain: str) -> None:
     import socket
 
-    from vllm_gr.entrypoints.management import AdminServer
+    from vllm_gr.entrypoints.serve.management import AdminServer
     from vllm_gr.sidecar import (
         ControlClient,
         Instance,

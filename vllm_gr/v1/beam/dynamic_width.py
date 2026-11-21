@@ -17,7 +17,7 @@ from typing import Any
 import torch
 
 from vllm_gr.constraints.backend import ConstraintOutput
-from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
+from vllm_gr.v1.beam.attention_pool import BeamAttentionPool
 
 
 def _positive_int(name: str, value: object) -> int:

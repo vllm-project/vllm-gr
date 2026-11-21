@@ -20,7 +20,7 @@ from vllm_gr.config import (
     write_canonical_gr_config,
 )
 from vllm_gr.platforms.legacy import legacy_config_service
-from vllm_gr.v1.engine.beam_search import validate_gr_device_config
+from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
 _V1_REQUIRED = "NPU unconstrained.*ModelRunner V1.*VLLM_USE_V2_MODEL_RUNNER=0"
 
@@ -204,7 +204,7 @@ def test_npu_v2_request_rejected_before_native_preprocessing(mode: str) -> None:
 def test_native_npu_admission_rejects_candidate_width_before_preprocessing(
     mode: str, candidate_width: int, dynamic_beam_widths: tuple[int, ...] | None
 ) -> None:
-    from vllm_gr.v1.engine.beam_search import validate_gr_request
+    from vllm_gr.v1.engine.beam_admission import validate_gr_request
     from vllm_gr.v1.engine.core import _admit_gr_session
 
     config = _host("npu", False)

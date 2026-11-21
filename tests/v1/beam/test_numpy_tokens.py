@@ -15,7 +15,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchItem,
     BeamEngineCoreRequest,
 )
-from vllm_gr.v1.beam.token_buffer import (
+from vllm_gr.v1.token_buffer import (
     NumpyTokenBuffer,
     initialize_numpy_request,
     install_numpy_request_factory,

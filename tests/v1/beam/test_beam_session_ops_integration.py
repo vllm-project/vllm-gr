@@ -10,10 +10,10 @@ import torch
 
 from vllm_gr.ops import beam_search_group
 from vllm_gr.ops import select_unshared_kv as ops_select_unshared_kv
-from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.attention_pool import write_eager_step
 from vllm_gr.v1.beam.reorder import select_unshared_kv
+from vllm_gr.v1.beam.session import BeamSearchSession
 
 
 def _devices() -> list[pytest.ParameterSet]:

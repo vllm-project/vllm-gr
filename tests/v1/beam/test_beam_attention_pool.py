@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
+from vllm_gr.v1.beam.attention_pool import BeamAttentionPool
 
 
 def _make_pool(

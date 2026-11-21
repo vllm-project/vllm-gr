@@ -167,7 +167,7 @@ def apply_engine_core_request_patches() -> None:
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
     register_engine_core_request_types()
-    from vllm_gr.v1.beam.token_buffer import (
+    from vllm_gr.v1.token_buffer import (
         install_numpy_request_factory,
         install_numpy_scheduler_data,
     )

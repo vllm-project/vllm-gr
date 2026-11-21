@@ -121,7 +121,7 @@ patches:
   - id: GR-PATCH-007
     scope: core
     backend_id: null
-    owner: vllm_gr/v1/engine/core_client.py, core_client_patch.py, gr_session_client.py, and output_processor.py
+    owner: vllm_gr/v1/engine/core_client.py, core_client_patch.py, beam_session_client.py, and output_processor.py
     installer: vllm_gr.patch.install_engine_session_hooks
     activation: the required frontend patch plan detects grouped Beam client methods are incomplete
     validator_or_test:
@@ -176,8 +176,8 @@ patches:
   - id: GR-PATCH-010
     scope: core
     backend_id: null
-    owner: vllm_gr/v1/core/sched/scheduler_patch.py and gr_async_scheduler.py
-    shared_helpers: vllm_gr/v1/core/sched/session.py, vllm_gr/v1/beam/dispatch.py
+    owner: vllm_gr/v1/core/sched/scheduler_patch.py and beam_async_scheduler.py
+    shared_helpers: vllm_gr/v1/core/sched/beam_session.py, vllm_gr/v1/beam/dispatch.py
     installer: vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch
     activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper
     validator_or_test:
@@ -323,11 +323,11 @@ patches:
   - id: GR-PATCH-016
     scope: backend
     backend_id: ascend
-    owner: vllm_gr/npu_spawn_patch.py
-    installer: vllm_gr.npu_spawn_patch.apply_npu_spawn_patch
+    owner: vllm_gr/platforms/ascend/spawn_patch.py
+    installer: vllm_gr.platforms.ascend.spawn_patch.apply_npu_spawn_patch
     activation: the selected NPU provider installs or repairs spawn protection before importing the native worker
     validator_or_test:
-      - vllm_gr.npu_spawn_patch.apply_npu_spawn_patch return value
+      - vllm_gr.platforms.ascend.spawn_patch.apply_npu_spawn_patch return value
       - tests/test_patch_initialization.py::test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings
       - tests/test_patch_initialization.py::test_npu_spawn_patch_forces_spawn_only_when_npu_initialized
     process_roles: [main, engine_core]
@@ -375,8 +375,8 @@ patches:
   - id: GR-PATCH-020
     scope: core
     backend_id: null
-    owner: vllm_gr/pangu_compat.py
-    installer: vllm_gr.pangu_compat.apply_pangu_tied_embeddings_patch
+    owner: vllm_gr/config/pangu_patch.py
+    installer: vllm_gr.config.pangu_patch.apply_pangu_tied_embeddings_patch
     activation: runtime initialization; wrapper preserves ties only for PanguEmbeddedForCausalLM with tie_word_embeddings enabled
     validator_or_test:
       - tests/test_pangu_compat.py

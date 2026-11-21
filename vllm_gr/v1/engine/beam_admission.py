@@ -20,11 +20,11 @@ from vllm_gr.config.models import (
     CONSTRAINT_TABLE_MAX_DECODE_STEPS,
     configured_candidate_width,
 )
-from vllm_gr.platforms.errors import GRDeviceRequestError
-from vllm_gr.platforms.npu_admission import (
+from vllm_gr.platforms.ascend.admission import (
     validate_decode_token_budget,
     validate_npu_unconstrained_runner,
 )
+from vllm_gr.platforms.errors import GRDeviceRequestError
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchParams,
     BeamBatchRequest,
@@ -43,7 +43,7 @@ from vllm_gr.v1.beam.dispatch import (
     validate_dispatch_request,
     validate_dispatch_session,
 )
-from vllm_gr.v1.core.sched.session import (
+from vllm_gr.v1.core.sched.beam_session import (
     GRAsyncSchedulerInterface,
     GRResourceStatus,
     GRSessionState,
@@ -65,7 +65,7 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
     if gr_config.beam_sid_stage_vocab and (device is None or str(device).split(":")[0] != "npu"):
         raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
     if device is not None and str(device).split(":")[0] == "npu":
-        from vllm_gr.platforms.npu_admission import validate_npu_device_config
+        from vllm_gr.platforms.ascend.admission import validate_npu_device_config
 
         validate_npu_device_config(config, gr_config, request)
     if (

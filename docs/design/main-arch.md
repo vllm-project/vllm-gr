@@ -53,7 +53,7 @@ protocol names do not choose the native ModelRunner implementation.
 | Attention and operators | Backend-specific computation and KV operations | `vllm_gr/v1/attention/backends/`, `vllm_gr/ops/` |
 | Platform integration | Provider activation, environment checks and compatibility hooks | `vllm_gr/platforms/`, `vllm_gr/plugin.py`, `vllm_gr/patch.py` |
 
-Within `vllm_gr/v1/engine/`, `gr_session_client.py` owns the frontend session lifecycle.
+Within `vllm_gr/v1/engine/`, `beam_session_client.py` owns the frontend session lifecycle.
 `core_client.py` submits batches, `core_socket.py` receives them across the process
 boundary, and `core.py` handles admission. `engine_core_patch.py` installs the
 Core hooks and the spawned process entry point. Prefix hashing lives in

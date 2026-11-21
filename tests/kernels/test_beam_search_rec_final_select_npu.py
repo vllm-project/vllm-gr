@@ -120,7 +120,7 @@ def test_final_select_compacts_history_from_configured_capacity(
 ) -> None:
     """Final selection retains the active prefix and leaves its tail unused."""
     from vllm_gr.ops.npu import beam_ops
-    from vllm_gr.v1.beam.beam_decision import _run_npu_decision
+    from vllm_gr.v1.beam.decision import _run_npu_decision
 
     beam_width = 32
     sentinel = -1234567

@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Install atomic GR session transport and frontend lifecycle adapters."""
 
+from vllm_gr.v1.engine.beam_session_client import (
+    _FRONTEND_NATIVE,
+    async_llm_add_request,
+    llm_engine_add_request,
+)
 from vllm_gr.v1.engine.core_client import (
     _INPROC_NATIVE,
     inproc_abort_requests,
@@ -14,11 +19,6 @@ from vllm_gr.v1.engine.core_client import (
     inproc_submit_gr_session,
     submit_gr_session_async,
     sync_mp_submit_gr_session,
-)
-from vllm_gr.v1.engine.gr_session_client import (
-    _FRONTEND_NATIVE,
-    async_llm_add_request,
-    llm_engine_add_request,
 )
 from vllm_gr.v1.engine.output_processor import make_patched_process_outputs
 
@@ -53,7 +53,7 @@ def apply_async_llm_patches() -> None:
     from vllm.v1.engine.llm_engine import LLMEngine
     from vllm.v1.engine.output_processor import OutputProcessor
 
-    from vllm_gr.v1.engine.gr_session_client import install_gr_frontend_methods
+    from vllm_gr.v1.engine.beam_session_client import install_gr_frontend_methods
 
     OutputProcessor.process_outputs = make_patched_process_outputs(OutputProcessor.process_outputs)
     install_gr_frontend_methods(LLMEngine, AsyncLLM)

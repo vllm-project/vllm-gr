@@ -47,10 +47,10 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (  # noqa: E402
     BeamAttentionMetadataBuilder,
 )
 from vllm_gr.v1.beam import BEAM_DATA_VAR  # noqa: E402
-from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext  # noqa: E402
-from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool  # noqa: E402
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession  # noqa: E402
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext  # noqa: E402
+from vllm_gr.v1.beam.attention_pool import BeamAttentionPool  # noqa: E402
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView  # noqa: E402
+from vllm_gr.v1.beam.session import BeamSearchSession  # noqa: E402
 from vllm_gr.v1.worker.npu.beam_execution_batch import (  # noqa: E402
     NPUBeamExecutionBatch,
 )

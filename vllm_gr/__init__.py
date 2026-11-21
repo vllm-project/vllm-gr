@@ -24,7 +24,7 @@ from typing import Any
 from vllm_gr.version import __version__
 
 _PUBLIC_EXPORTS: dict[str, tuple[str, str, bool]] = {
-    "GRLLM": ("vllm_gr.entrypoints.gr", "GRLLM", True),
+    "GRLLM": ("vllm_gr.entrypoints.llm", "GRLLM", True),
 }
 
 _LAZY_EXPORTS = dict(_PUBLIC_EXPORTS)

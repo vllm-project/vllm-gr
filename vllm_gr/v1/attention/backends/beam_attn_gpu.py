@@ -28,7 +28,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     require_beam_decode_session,
     resolve_beam_pool,
 )
-from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
+from vllm_gr.v1.beam.attention_pool import write_eager_step
 from vllm_gr.v1.forward_context import in_fresh_prefill_capture
 
 logger = init_logger(__name__)
@@ -81,7 +81,7 @@ class GPUBeamAttentionBatch:
             raise RuntimeError("GPU Beam batch requires the configured exact Beam width")
 
         self.pools = []
-        from vllm_gr.v1.beam.dynamic_beam import get_stage_pools
+        from vllm_gr.v1.beam.dynamic_width import get_stage_pools
 
         for source in get_stage_pools(self.context, self.request_width):
             pool = copy(source)

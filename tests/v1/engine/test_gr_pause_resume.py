@@ -18,7 +18,7 @@ from tests.v1.engine.test_gr_admission_queue import core as _core_fixture
 from tests.v1.engine.test_gr_admission_queue import scheduler as _scheduler_fixture
 from tests.v1.engine.test_gr_admission_queue import worker_receipt
 from vllm_gr.v1.beam.dispatch import GR_RETIRE_OUTPUT_ATTR, GR_STAGE_OUTPUT_ATTR
-from vllm_gr.v1.core.sched.session import GRResourceStatus, GRSessionStatus
+from vllm_gr.v1.core.sched.beam_session import GRResourceStatus, GRSessionStatus
 
 admission_core = _core_fixture
 scheduler = _scheduler_fixture

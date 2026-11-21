@@ -43,7 +43,7 @@ def _expand_gr_abort_request_ids(scheduler, request_ids, finished_status):
 
 def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished_status) -> None:
     """Mirror the native finished Request objects into GR session state."""
-    from vllm_gr.v1.core.sched.session import GRSessionStatus
+    from vllm_gr.v1.core.sched.beam_session import GRSessionStatus
 
     status_name = getattr(finished_status, "name", "")
     sessions = getattr(scheduler, "_gr_v1_sessions", {})
@@ -75,7 +75,7 @@ def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished
             session.status = GRSessionStatus.FINISHING
         session.terminal_result_pending = False
 
-        from vllm_gr.v1.core.sched.gr_async_scheduler import _drain_resources
+        from vllm_gr.v1.core.sched.beam_async_scheduler import _drain_resources
 
         _drain_resources(scheduler, session)
 
@@ -88,7 +88,7 @@ def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
     @wraps(original_reset)
     def patched_reset_prefix_cache(self, *args, **kwargs):
         reset_running_requests = kwargs.get("reset_running_requests", args[0] if args else False)
-        from vllm_gr.v1.core.sched.session import GRResourceStatus, GRSessionStatus
+        from vllm_gr.v1.core.sched.beam_session import GRResourceStatus, GRSessionStatus
 
         # Native forced reset cannot safely preempt active GR resources. Weight
         # updates may leave unstarted sessions queued after pause/drain, so allow
@@ -117,7 +117,7 @@ def apply_scheduler_patch():
 
     from vllm_gr.v1.beam.batch_contracts import GRAdmissionError
     from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
-    from vllm_gr.v1.core.sched.gr_async_scheduler import (
+    from vllm_gr.v1.core.sched.beam_async_scheduler import (
         _prepare_gr_session,
         _register_gr_session,
         has_gr_cleanup_work,
@@ -242,7 +242,7 @@ def apply_scheduler_patch():
             cached_patch = (original_cache_blocks, cache_prompt_blocks)
             self._gr_cache_blocks_patch = cached_patch
         self.kv_cache_manager.coordinator.cache_blocks = cached_patch[1]
-        from vllm_gr.v1.core.sched.gr_async_scheduler import (
+        from vllm_gr.v1.core.sched.beam_async_scheduler import (
             attach_gr_retirement,
             gr_admission,
         )
@@ -304,8 +304,10 @@ def _native_request_terminated(scheduler, result, request_id) -> bool:
 
 
 def _reconcile_native_gr_termination(scheduler, result, session) -> None:
-    from vllm_gr.v1.core.sched.gr_async_scheduler import finish_after_native_termination
-    from vllm_gr.v1.core.sched.session import GRSessionStatus
+    from vllm_gr.v1.core.sched.beam_async_scheduler import (
+        finish_after_native_termination,
+    )
+    from vllm_gr.v1.core.sched.beam_session import GRSessionStatus
 
     if session.status not in (GRSessionStatus.WAITING, GRSessionStatus.RUNNING):
         return
@@ -390,12 +392,12 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
     from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
     from vllm.v1.request import RequestStatus
 
-    from vllm_gr.v1.core.sched.gr_async_scheduler import (
+    from vllm_gr.v1.core.sched.beam_async_scheduler import (
         _close_gr_session,
         _gr_session_ready_to_finalize,
         _gr_terminal_result,
     )
-    from vllm_gr.v1.core.sched.session import GRSessionStatus
+    from vllm_gr.v1.core.sched.beam_session import GRSessionStatus
 
     request_id = session.session_id
     target_outputs, target_output = _find_gr_output(result, request_id)
@@ -482,7 +484,7 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
     @wraps(_original_update)
     def patched_update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
         from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
-        from vllm_gr.v1.core.sched.gr_async_scheduler import consume_gr_retirement
+        from vllm_gr.v1.core.sched.beam_async_scheduler import consume_gr_retirement
 
         retired_session = consume_gr_retirement(self, scheduler_output, model_runner_output)
         gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {})

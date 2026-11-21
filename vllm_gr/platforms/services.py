@@ -114,7 +114,7 @@ class BuiltinPlanSupport:
         # Keep the existing device and execution validators as the capability
         # authority until their owning adapter migrations. No second policy.
         if plan.request.config.to_dict()["beam_execution_mode"] == "v1":
-            from vllm_gr.v1.engine.beam_search import (
+            from vllm_gr.v1.engine.beam_admission import (
                 validate_gr_device_config,
                 validate_gr_execution_runtime,
             )

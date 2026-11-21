@@ -125,7 +125,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
         del force  # Installers inspect their current targets on every call.
-        from vllm_gr import npu_spawn_patch
+        from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
         from vllm_gr.v1 import ascend_compat
 
         # Preserve spawn protection before native worker imports or process

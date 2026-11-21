@@ -757,7 +757,7 @@ def test_create_beam_context_uses_grconfig_params(device: str, enabled: bool | N
         device=torch.device(device),
     )
 
-    with patch("vllm_gr.v1.beam.beam_attention_context.BeamAttentionContext") as MockCtx:
+    with patch("vllm_gr.v1.beam.attention_context.BeamAttentionContext") as MockCtx:
         mock_instance = MagicMock()
         MockCtx.return_value = mock_instance
         gpu_patch._create_beam_context(runner, gr_cfg, max_batch=1)
@@ -789,7 +789,7 @@ def test_create_beam_context_dtype_from_model_config() -> None:
         device=torch.device("cpu"),
     )
 
-    with patch("vllm_gr.v1.beam.beam_attention_context.BeamAttentionContext") as MockCtx:
+    with patch("vllm_gr.v1.beam.attention_context.BeamAttentionContext") as MockCtx:
         MockCtx.return_value = MagicMock()
         gpu_patch._create_beam_context(runner, gr_cfg)
         call_kwargs = MockCtx.call_args[1]
@@ -815,7 +815,7 @@ def test_capture_create_dummy_context_creates_session_and_beam_info() -> None:
         mock_context.registry.allocate.return_value = 0
         mock_create.return_value = mock_context
 
-        with patch("vllm_gr.v1.beam.beam_search_session.BeamSearchSession") as MockSession:
+        with patch("vllm_gr.v1.beam.session.BeamSearchSession") as MockSession:
             mock_session = MagicMock()
             MockSession.return_value = mock_session
 

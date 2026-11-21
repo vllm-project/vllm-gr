@@ -190,7 +190,7 @@ def validate_npu_eager_capabilities(worker: object) -> None:
         raise ValueError("NPU eager Beam execution requires an NPU worker")
     config = getattr(worker, "vllm_config", None)
     if config is not None:
-        from vllm_gr.v1.engine.beam_search import validate_gr_device_config
+        from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
         validate_gr_device_config(config)
     if not bool(getattr(worker, "use_async_scheduling", False)):

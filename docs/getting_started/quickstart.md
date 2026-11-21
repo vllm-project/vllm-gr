@@ -17,7 +17,7 @@ From the repository root, verify the environment:
 ```bash
 nvidia-smi
 python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); print("vllm-gr", m.version("vllm-gr"))'
-python -c 'from vllm_gr.entrypoints.gr import GRLLM; print("v1 import OK")'
+python -c 'from vllm_gr.entrypoints.llm import GRLLM; print("v1 import OK")'
 ```
 
 Set local paths for the model, dataset, and generated files:

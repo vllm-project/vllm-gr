@@ -853,7 +853,7 @@ def test_constrained_length_is_checked_before_native_input_processing(
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("length", [1, 2, 4, 7])  # type: ignore[misc]
 def test_core_rechecks_constrained_length_without_frontend_validation(length: int) -> None:
-    from vllm_gr.v1.engine.beam_search import validate_gr_request
+    from vllm_gr.v1.engine.beam_admission import validate_gr_request
 
     config = _canonical_gr_config()
     config["gr"]["max_decode_steps"] = 7
@@ -1170,7 +1170,7 @@ pytestmark = pytest.mark.cpu_test
 @pytest.mark.l1  # type: ignore[misc]
 def test_enginecore_rejects_unconstrained_candidate_width_below_stage_width() -> None:
     from vllm_gr.config import gr_config_from_mapping
-    from vllm_gr.v1.engine.beam_search import (
+    from vllm_gr.v1.engine.beam_admission import (
         _reject_candidate_width_below_dynamic_schedule,
     )
 

@@ -245,7 +245,7 @@ def _capture_create_dummy_context(
     """
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 
-    from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+    from vllm_gr.v1.beam.session import BeamSearchSession
 
     context = _create_beam_context(runner, gr_cfg, max_batch=1)
     slot = context.registry.allocate(_BEAM_DUMMY_REQ_ID, beam_width=width, prefix_len=prefix_len)

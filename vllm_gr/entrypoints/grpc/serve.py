@@ -52,7 +52,7 @@ def patch_grpc_server():
             settings = deployment_for(getattr(servicer.engine, "vllm_config", None))
             port = settings.admin_port
             if port is not None:
-                from vllm_gr.entrypoints.management import AdminServer
+                from vllm_gr.entrypoints.serve.management import AdminServer
 
                 admin = AdminServer(
                     servicer.engine,

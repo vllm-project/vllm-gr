@@ -11,7 +11,7 @@ from vllm_gr.config import (
     GRConfig,
 )
 from vllm_gr.platforms.legacy import legacy_config_service
-from vllm_gr.v1.engine.beam_search import validate_gr_execution_config
+from vllm_gr.v1.engine.beam_admission import validate_gr_execution_config
 
 
 def test_native_async_does_not_select_v1() -> None:

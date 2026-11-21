@@ -21,7 +21,7 @@ from vllm_gr.config.models import deployment_for
 def install_control_trace() -> None:
     from fastapi.responses import JSONResponse
 
-    from vllm_gr.entrypoints import management
+    from vllm_gr.entrypoints.serve import management
 
     original = management.control_app
 

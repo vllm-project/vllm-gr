@@ -75,7 +75,7 @@ import sys
 # selection, so they cannot be forbidden here. The enforceable isolation
 # contract is that vllm-gr's own Ascend integration stays unloaded while the
 # CUDA provider initializes.
-blocked = ("vllm_gr.v1.ascend_compat", "vllm_gr.npu_spawn_patch")
+blocked = ("vllm_gr.v1.ascend_compat", "vllm_gr.platforms.ascend.spawn_patch")
 
 def reject_ascend(event, args):
     # Metadata probes (find_spec) are allowed; importing the GR Ascend

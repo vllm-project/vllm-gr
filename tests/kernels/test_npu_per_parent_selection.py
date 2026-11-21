@@ -39,8 +39,8 @@ from vllm_gr.constraints.table import (
     validate_constraint_table,
 )
 from vllm_gr.ops.npu.rec_constrained_topk import is_available, unavailable_reason
-from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
-from vllm_gr.v1.beam.dynamic_beam import (
+from vllm_gr.v1.beam.attention_pool import BeamAttentionPool
+from vllm_gr.v1.beam.dynamic_width import (
     DynamicBeamState,
     get_stage_pools,
     initialize_packed_stage_pools,

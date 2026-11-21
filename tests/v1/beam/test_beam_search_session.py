@@ -10,8 +10,8 @@ from typing import Generator
 import pytest
 import torch
 
-from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.session import BeamSearchSession
 
 
 def _make_context(

@@ -714,7 +714,7 @@ def test_mixed_batch_queue_rejection_is_atomic_and_service_recovers(
 
     from tests.v1.engine.test_gr_admission_queue import worker_receipt
     from vllm_gr.v1.beam.dispatch import GR_BATCH_RESULT_ATTR
-    from vllm_gr.v1.engine.gr_session_client import (
+    from vllm_gr.v1.engine.beam_session_client import (
         submit_gr_session_async,
         wait_gr_session_async,
     )

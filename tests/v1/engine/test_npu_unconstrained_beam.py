@@ -405,7 +405,7 @@ def test_generation_horizon_checks_actual_request_and_capacity(
     device: str, capacity: int, steps: int, error: str | None
 ) -> None:
     from vllm_gr.config import GRConfig
-    from vllm_gr.v1.engine.beam_search import (
+    from vllm_gr.v1.engine.beam_admission import (
         validate_gr_device_config,
         validate_gr_request,
     )
@@ -460,7 +460,7 @@ def test_extended_generation_fits_native_kv_reorder_buffer(
     entry: str, capacity: int, heads: int, head_size: int, accepted: bool
 ) -> None:
     from vllm_gr.config import GRConfig
-    from vllm_gr.v1.engine.beam_search import validate_gr_device_config
+    from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
     parallel = SimpleNamespace()
     get_heads = Mock(return_value=heads)
@@ -510,7 +510,7 @@ def test_extended_generation_fits_native_kv_reorder_buffer(
 )
 def test_extended_generation_rejects_invalid_model_geometry(heads: Any, head_size: Any) -> None:
     from vllm_gr.config import GRConfig
-    from vllm_gr.v1.engine.beam_search import validate_gr_device_config
+    from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
     config = SimpleNamespace(
         additional_config={},
@@ -533,7 +533,7 @@ def test_extended_generation_fails_closed_without_model_geometry(
     device: str, capacity: int, rejected: bool, missing_model: bool
 ) -> None:
     from vllm_gr.config import GRConfig
-    from vllm_gr.v1.engine.beam_search import validate_gr_device_config
+    from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
     config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device=device))
     if not missing_model:
@@ -552,7 +552,7 @@ def test_extended_generation_fails_closed_without_model_geometry(
 @pytest.mark.parametrize("steps", [4, 5, 6])
 def test_bounded_generic_support_preserves_sid_stage_capacity(steps: int) -> None:
     from vllm_gr.config import GRConfig
-    from vllm_gr.v1.engine.beam_search import (
+    from vllm_gr.v1.engine.beam_admission import (
         validate_gr_device_config,
         validate_gr_request,
     )
@@ -588,7 +588,7 @@ def test_bounded_generic_support_preserves_catalog_depth(steps: int) -> None:
         GRConfig,
         write_canonical_gr_config,
     )
-    from vllm_gr.v1.engine.beam_search import validate_gr_request
+    from vllm_gr.v1.engine.beam_admission import validate_gr_request
 
     config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device="npu"))
     gr_config = GRConfig(
@@ -627,7 +627,7 @@ def test_bounded_generic_support_preserves_dynamic_schedule_contract(
     from vllm.exceptions import VLLMValidationError
 
     from vllm_gr.sampling_params import BeamSearchParams
-    from vllm_gr.v1.engine.beam_search import validate_gr_request
+    from vllm_gr.v1.engine.beam_admission import validate_gr_request
 
     error_type = VLLMValidationError if entry == "public" else ValueError
     with pytest.raises(error_type, match="dynamic_beam_widths"):
@@ -643,7 +643,7 @@ def test_bounded_generic_support_preserves_dynamic_schedule_contract(
 def test_native_request_candidate_width_is_checked_at_device_admission(
     device: str, candidate_width: int | None, widths: tuple[int, ...] | None
 ) -> None:
-    from vllm_gr.v1.engine.beam_search import (
+    from vllm_gr.v1.engine.beam_admission import (
         validate_gr_device_config,
         validate_gr_request,
     )
@@ -690,7 +690,7 @@ def test_native_request_candidate_width_is_checked_at_device_admission(
 
 
 def test_npu_device_validation_accepts_partial_non_beam_config() -> None:
-    from vllm_gr.v1.engine.beam_search import validate_gr_device_config
+    from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
     validate_gr_device_config(SimpleNamespace(device_config=SimpleNamespace(device="npu")))
 

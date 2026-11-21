@@ -24,7 +24,7 @@ from vllm_gr.config.parser import (
     GR_CONFIG_KEY,
     parse_gr_config,
 )
-from vllm_gr.v1.engine.beam_search import validate_gr_device_config
+from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
 BEAM_SID_STAGE_VOCAB_KEY = "vllm_gr_beam_sid_stage_vocab"
 

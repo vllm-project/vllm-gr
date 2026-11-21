@@ -60,7 +60,7 @@ def _handle_submit_gr_session(self, batch_request) -> None:
         logger.error("Rejecting an empty beam_search batch")
         return
     try:
-        from vllm_gr.v1.engine.beam_search import validate_gr_request
+        from vllm_gr.v1.engine.beam_admission import validate_gr_request
 
         validate_gr_request(
             batch_request,
@@ -92,7 +92,7 @@ def _admit_gr_session(self, batch_request) -> None:
         return
     engine_requests = tuple(item.request for item in batch_request.items)
     try:
-        from vllm_gr.v1.engine.beam_search import (
+        from vllm_gr.v1.engine.beam_admission import (
             GRDeviceRequestError,
             validate_gr_device_config,
             validate_gr_execution_config,

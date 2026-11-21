@@ -32,7 +32,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamSequenceColumns,
     sequence_columns,
 )
-from vllm_gr.v1.engine.beam_search import (
+from vllm_gr.v1.engine.beam_admission import (
     validate_gr_generation_budget,
     validate_gr_request,
 )

@@ -29,8 +29,8 @@ from vllm_gr.v1.attention.backends.beam_attn import (
 )
 from vllm_gr.v1.attention.backends.beam_attn_gpu import reshape_and_cache
 from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
-from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.session import BeamSearchSession
 
 try:
     from tests.kernels.attention.cascade_beam_attn_utils import (

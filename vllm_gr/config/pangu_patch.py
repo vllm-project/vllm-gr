@@ -10,7 +10,7 @@ from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
-logger = logging.getLogger("vllm_gr.pangu_compat")
+logger = logging.getLogger("vllm_gr.config.pangu_patch")
 
 _PATCH_MARKER = "_vllm_gr_pangu_tied_embeddings_patch"
 _PANGU_CAUSAL_LM_ARCHITECTURE = "PanguEmbeddedForCausalLM"

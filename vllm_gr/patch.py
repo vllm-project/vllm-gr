@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm_gr import pangu_compat
+from vllm_gr.config import pangu_patch as pangu_compat
 from vllm_gr.v1.attention import selector_patch
 from vllm_gr.v1.worker import sliced_logits_patch
 
@@ -267,8 +267,8 @@ def _validate_async_llm_patch() -> str | None:
     from vllm.v1.engine.llm_engine import LLMEngine
     from vllm.v1.engine.output_processor import OutputProcessor
 
-    from vllm_gr.v1.engine import gr_session_client
-    from vllm_gr.v1.engine.gr_session_client import (
+    from vllm_gr.v1.engine import beam_session_client as gr_session_client
+    from vllm_gr.v1.engine.beam_session_client import (
         async_llm_add_request,
         llm_engine_add_request,
     )

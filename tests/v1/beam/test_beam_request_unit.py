@@ -80,7 +80,7 @@ class TestBeamKernelsDynamicBeamCount:
     def test_cache_and_select_shrinking_beam_count(self) -> None:
         import torch
 
-        from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
+        from vllm_gr.v1.beam.attention_pool import write_eager_step
         from vllm_gr.v1.beam.reorder import select_unshared_kv
 
         max_batch, W, H, steps, D = 2, 4, 2, 3, 2
@@ -151,7 +151,7 @@ class TestBeamKernelsDynamicBeamCount:
         """Regression guard: n == W must behave exactly as before the fix."""
         import torch
 
-        from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
+        from vllm_gr.v1.beam.attention_pool import write_eager_step
         from vllm_gr.v1.beam.reorder import select_unshared_kv
 
         max_batch, W, H, steps, D = 2, 4, 2, 3, 2

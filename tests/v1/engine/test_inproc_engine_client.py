@@ -208,7 +208,7 @@ def _dead_mp_client() -> Any:
 @pytest.mark.parametrize("make_core", [_dead_inproc_client, _dead_mp_client])  # type: ignore[misc]
 def test_a_rejected_submission_leaves_no_frontend_state(make_core: Any) -> None:
     from tests.helpers.beam_requests import make_batch_request
-    from vllm_gr.v1.engine.gr_session_client import submit_gr_session_sync
+    from vllm_gr.v1.engine.beam_session_client import submit_gr_session_sync
 
     engine, states = _frontend_engine(make_core())
     for _ in range(3):
@@ -219,7 +219,7 @@ def test_a_rejected_submission_leaves_no_frontend_state(make_core: Any) -> None:
 
 def test_a_rejected_async_submission_leaves_no_frontend_state() -> None:
     from tests.helpers.beam_requests import make_batch_request
-    from vllm_gr.v1.engine.gr_session_client import submit_gr_session_async
+    from vllm_gr.v1.engine.beam_session_client import submit_gr_session_async
 
     async def dead(batch_request: Any) -> None:
         raise EngineDeadError()

@@ -35,10 +35,10 @@ from vllm_gr.entrypoints.beam_search.protocol import (
 )
 from vllm_gr.sampling_params import BeamSearchParams
 from vllm_gr.v1.beam.batch_contracts import BeamBatchItem, GRAdmissionError
-from vllm_gr.v1.core.sched.gr_async_scheduler import (
+from vllm_gr.v1.core.sched.beam_async_scheduler import (
     _prepare_gr_session,
 )
-from vllm_gr.v1.engine.beam_search import validate_gr_request
+from vllm_gr.v1.engine.beam_admission import validate_gr_request
 from vllm_gr.v1.engine.core import _handle_submit_gr_session
 
 core = _core_fixture

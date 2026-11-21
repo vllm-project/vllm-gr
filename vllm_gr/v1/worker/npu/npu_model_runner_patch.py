@@ -445,8 +445,8 @@ def _capture_create_dummy_context_npu(
     """
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 
-    from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
     from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+    from vllm_gr.v1.beam.session import BeamSearchSession
     from vllm_gr.v1.worker.npu.beam_execution_batch import NPUBeamExecutionBatch
 
     request_ids = tuple(
@@ -469,7 +469,7 @@ def _capture_create_dummy_context_npu(
     if context is None:
         context = _create_beam_context(runner, gr_cfg, max_batch=batch_size)
         if getattr(gr_cfg, "beam_graph_widths", None) is not None:
-            from vllm_gr.v1.beam.dynamic_beam import (
+            from vllm_gr.v1.beam.dynamic_width import (
                 initialize_packed_stage_pools,
             )
 

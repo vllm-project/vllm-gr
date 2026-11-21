@@ -42,8 +42,8 @@ from vllm_gr.v1.beam.dispatch import (
     GRRetireResult,
     GRWorkerResult,
 )
-from vllm_gr.v1.core.sched.gr_async_scheduler import consume_gr_retirement
-from vllm_gr.v1.core.sched.session import GRResourceStatus
+from vllm_gr.v1.core.sched.beam_async_scheduler import consume_gr_retirement
+from vllm_gr.v1.core.sched.beam_session import GRResourceStatus
 
 pytestmark = [
     pytest.mark.cpu_test,
@@ -62,7 +62,7 @@ def scheduler(tmp_path, request):
     from vllm_gr.v1.core.sched.scheduler_patch import apply_scheduler_patch
 
     apply_scheduler_patch()
-    from vllm_gr.v1.beam.token_buffer import (
+    from vllm_gr.v1.token_buffer import (
         install_numpy_request_factory,
         install_numpy_scheduler_data,
     )
@@ -566,7 +566,7 @@ def test_duplicate_and_old_generation_do_not_consume_new_placeholders(scheduler)
 def test_active_receipt_failure_requires_retirement_and_preserves_cancel(
     scheduler, fault, cancelled
 ):
-    from vllm_gr.v1.core.sched.session import GRSessionStatus
+    from vllm_gr.v1.core.sched.beam_session import GRSessionStatus
 
     session = add(scheduler, "A", n=1)
     scheduled = scheduler.schedule()

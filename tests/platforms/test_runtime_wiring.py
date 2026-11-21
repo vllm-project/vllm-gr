@@ -8,8 +8,9 @@ from unittest.mock import Mock
 
 import pytest
 
-from vllm_gr import _env_check, npu_spawn_patch, patch, plugin
+from vllm_gr import _env_check, patch, plugin
 from vllm_gr.platforms import loader
+from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     get_active_backend,

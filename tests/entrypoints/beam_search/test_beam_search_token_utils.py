@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from vllm_gr.entrypoints.beam_search.token_utils import boundary_token_id
+from vllm_gr.entrypoints.beam_search.boundary_tokens import boundary_token_id
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 

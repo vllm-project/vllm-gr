@@ -35,6 +35,7 @@ import pytest
 _VLLM_GR_REIMPORT = (
     "vllm_gr.engine.arg_utils",
     "vllm_gr.entrypoints.gr",
+    "vllm_gr.entrypoints.llm",
 )
 
 

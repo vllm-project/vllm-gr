@@ -259,9 +259,9 @@ RPC names are unchanged and their functions remain importable in spawned workers
 The public CUDA installer owns NumPy staging installation for both versions;
 version-specific sampling delegates retain their own installation markers and
 call the shared stage sampler. Resource invalidation and consumer-drain timing
-are unchanged. Frontend request guards and startup-heap leases retain their
-separate owner in `entrypoints/frontend_lifecycle.py`; these guard a different request
-lifetime, including when engines run in process.
+are unchanged. Frontend request guards and startup-heap leases live in
+`entrypoints/common/lifecycle.py` and cover the frontend request lifetime,
+including when engines run in process.
 
 #### V2 runtime generations and teardown prerequisites
 

@@ -28,13 +28,13 @@ from vllm_gr.v1.beam.dispatch import (
     GRStageMetadata,
     GRWorkerResult,
 )
-from vllm_gr.v1.core.sched.session import (
+from vllm_gr.v1.core.sched.beam_session import (
     GRResourceStatus,
     GRSessionState,
     GRSessionStatus,
     GRStageCompletion,
 )
-from vllm_gr.v1.engine.beam_search import (
+from vllm_gr.v1.engine.beam_admission import (
     validate_gr_device_config,
     validate_gr_execution_config,
     validate_gr_request,

@@ -536,7 +536,7 @@ The CUDA plugin subprocess test and sliced-logits proxy tests cover this boundar
 
 - Scope: `backend`; backend ID: `ascend`
 
-- Source / Installer: `vllm_gr/npu_spawn_patch.py`
+- Source / Installer: `vllm_gr/platforms/ascend/spawn_patch.py`
 - Orchestration: `vllm_gr/patch.py`
 - Targets:
     - `vllm.utils.system_utils._maybe_force_spawn` (module attribute)
@@ -618,7 +618,7 @@ The CUDA plugin subprocess test and sliced-logits proxy tests cover this boundar
 
 - Scope: `core`; backend ID: `null`
 
-- Source / Installer: `vllm_gr/pangu_compat.py::apply_pangu_tied_embeddings_patch`
+- Source / Installer: `vllm_gr/config/pangu_patch.py::apply_pangu_tied_embeddings_patch`
 - Orchestration: `vllm_gr/patch.py::_apply_patches`
 - Target: `vllm.config.ModelConfig.maybe_untie_word_embeddings`
 - Platforms / process roles: GPU and NPU; main, EngineCore, worker

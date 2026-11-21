@@ -536,13 +536,13 @@ def test_inproc_step_failure_reaches_the_caller_with_its_cause() -> None:
     from vllm.v1.engine.exceptions import EngineDeadError
 
     from tests.helpers.beam_requests import make_batch_request
-    from vllm_gr.v1.engine.core_client_patch import apply_engine_client_patches
-    from vllm_gr.v1.engine.gr_session_client import (
+    from vllm_gr.v1.engine.beam_session_client import (
         abort_gr_session_sync,
         release_gr_session_sync,
         submit_gr_session_sync,
         wait_gr_session_sync,
     )
+    from vllm_gr.v1.engine.core_client_patch import apply_engine_client_patches
 
     oom = RuntimeError("CUDA out of memory (test)")
     calls = {"steps": 0, "retired_checks": 0}

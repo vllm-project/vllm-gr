@@ -597,7 +597,7 @@ def test_ascend_child_activates_live_trie_capacity_before_first_core_initializat
 
     import vllm_gr.patch as runtime_patch
     from tests.helpers.beam_requests import make_multi_batch_request
-    from vllm_gr.v1.beam import token_buffer
+    from vllm_gr.v1 import token_buffer
     from vllm_gr.v1.beam.batch_contracts import GRAdmissionError
     from vllm_gr.v1.engine import engine_core_patch
     from vllm_gr.v1.engine.core import loaded_constraint_trie_count

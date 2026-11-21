@@ -41,10 +41,10 @@ from vllm_gr.v1.beam.dispatch import (
     GR_RETIRE_OUTPUT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
 )
-from vllm_gr.v1.core.sched.gr_async_scheduler import (
+from vllm_gr.v1.core.sched.beam_async_scheduler import (
     consume_gr_retirement,
 )
-from vllm_gr.v1.core.sched.session import GRResourceStatus, GRSessionStatus
+from vllm_gr.v1.core.sched.beam_session import GRResourceStatus, GRSessionStatus
 from vllm_gr.v1.engine.core import _handle_submit_gr_session
 from vllm_gr.v1.engine.engine_core_patch import (
     apply_engine_core_request_patches,

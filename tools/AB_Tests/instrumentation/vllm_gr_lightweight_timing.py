@@ -359,7 +359,12 @@ def install() -> None:
     # V1 stage decisions receive candidate tensors directly. Refresh the copied
     # NPU alias if its stage module was imported before instrumentation.
     try:
-        from vllm_gr.v1.beam import beam_decision
+        try:
+            import vllm_gr.v1.beam.decision as beam_decision
+        except ModuleNotFoundError as exc:
+            if exc.name != "vllm_gr.v1.beam.decision":
+                raise
+            from vllm_gr.v1.beam import beam_decision
 
         original_decision = beam_decision.run_beam_decision_candidates
         wrapped_decision = _timed("beam_worker_decision", original_decision)

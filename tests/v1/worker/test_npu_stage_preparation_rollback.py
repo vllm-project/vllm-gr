@@ -11,9 +11,9 @@ import torch
 
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.v1.beam import BEAM_DATA_VAR
-from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.dispatch import GR_RETIRE_RESULT_ATTR, GRRetireMetadata
+from vllm_gr.v1.beam.session import BeamSearchSession
 from vllm_gr.v1.worker.npu import npu_beam_stage_runner as stage_module
 from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import NPUEagerStagePlan
 from vllm_gr.v1.worker.npu.npu_beam_stage_runner import (
@@ -179,7 +179,7 @@ def test_new_attention_batch_preparation_rolls_back_all_owned_slots(
     elif failure_point == "batch":
         monkeypatch.setattr(stage_module, "NPUBeamExecutionBatch", Mock(side_effect=failure))
     elif failure_point == "dynamic":
-        from vllm_gr.v1.beam.dynamic_beam import DynamicBeamState
+        from vllm_gr.v1.beam.dynamic_width import DynamicBeamState
 
         monkeypatch.setattr(DynamicBeamState, "initialize", Mock(side_effect=failure))
     elif failure_point == "parent_history":

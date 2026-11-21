@@ -17,7 +17,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     require_beam_decode_session,
     resolve_beam_pool,
 )
-from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
+from vllm_gr.v1.beam.attention_pool import write_eager_step
 from vllm_gr.v1.worker.prefill_graph_common import SUPPORTED_NUM_REQS
 
 logger = init_logger(__name__)

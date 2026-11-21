@@ -32,8 +32,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamRequestOutput,
     BeamSequenceColumns,
 )
-from vllm_gr.v1.beam.beam_decision import run_beam_decision_candidates
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+from vllm_gr.v1.beam.decision import run_beam_decision_candidates
 from vllm_gr.v1.beam.dispatch import (
     GR_RETIRE_OUTPUT_ATTR,
     GR_RETIRE_RESULT_ATTR,
@@ -45,6 +44,7 @@ from vllm_gr.v1.beam.dispatch import (
     GRWorkerResult,
 )
 from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
+from vllm_gr.v1.beam.session import BeamSearchSession
 from vllm_gr.v1.worker.npu.beam_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
@@ -173,7 +173,7 @@ class NPUEagerBeamStageRunner:
                 if getattr(
                     config, "beam_graph_widths", None
                 ) is not None or self._uses_dynamic_state(plan):
-                    from vllm_gr.v1.beam.dynamic_beam import (
+                    from vllm_gr.v1.beam.dynamic_width import (
                         initialize_packed_stage_pools,
                     )
 
@@ -186,7 +186,7 @@ class NPUEagerBeamStageRunner:
             # batch must own the complete context before initializing slots.
             raise RuntimeError("cannot initialize an NPU Beam batch in an active attention context")
         if self._uses_dynamic_state(plan):
-            from vllm_gr.v1.beam.dynamic_beam import prune_stage_pools
+            from vllm_gr.v1.beam.dynamic_width import prune_stage_pools
 
             widths = execution.dynamic_beam_widths or (execution.beam_width,) * required_steps
             keep_widths = set(widths[:-1])
@@ -217,7 +217,7 @@ class NPUEagerBeamStageRunner:
                 sessions.append(session)
             attention_batch = NPUBeamExecutionBatch(execution, sessions)
             if self._uses_dynamic_state(plan):
-                from vllm_gr.v1.beam.dynamic_beam import DynamicBeamState
+                from vllm_gr.v1.beam.dynamic_width import DynamicBeamState
 
                 if self.previous is None or self.previous.kind != "prefill":
                     raise RuntimeError("dynamic NPU Beam state requires the preceding Prefill")

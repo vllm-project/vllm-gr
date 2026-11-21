@@ -20,7 +20,7 @@ from vllm_gr.v1.attention.backends.beam_attn_gpu import (
     validate_short_suffix_attention,
 )
 from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
-from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 
 
 @pytest.fixture

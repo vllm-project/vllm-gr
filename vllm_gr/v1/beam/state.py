@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 
 from vllm_gr.config.models import MAX_BEAM_WIDTH
-from vllm_gr.v1.beam.beam_attention_context import BeamDecisionBuffers
+from vllm_gr.v1.beam.attention_context import BeamDecisionBuffers
 
 
 class BeamSearchState:

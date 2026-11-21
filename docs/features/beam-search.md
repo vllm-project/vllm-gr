@@ -48,7 +48,7 @@ GRLLM.beam_search / OpenAI Beam V1
 
 Contracts live in `vllm_gr/v1/beam/batch_contracts.py`. Production request
 transport uses the typed decoder in `vllm_gr/v1/engine/codec.py`, and final
-result validation lives in `gr_session_client._terminal_result`.
+result validation lives in `beam_session_client._terminal_result`.
 The NumPy CPU reference is an independent selection oracle, not the production
 scheduler or Worker loop.
 
@@ -353,7 +353,7 @@ stage's retained width.
 Unconstrained V1 generation has its own configuration and budget checks; it
 does not require a catalog artifact. NPU dynamic widths must satisfy their
 stage-specific capacity/parent bounds. These deployment checks are implemented
-in `vllm_gr/v1/engine/beam_search.py`, not in a parallel Plan schema.
+in `vllm_gr/v1/engine/beam_admission.py`, not in a parallel Plan schema.
 
 ### CPU candidate boundary
 

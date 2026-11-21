@@ -424,8 +424,8 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
 ) -> None:
     """Test that the incremental beam decode path uses beam_pool and
     skips reshape_and_cache for the paged KV cache."""
-    from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-    from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+    from vllm_gr.v1.beam.attention_context import BeamAttentionContext
+    from vllm_gr.v1.beam.session import BeamSearchSession
 
     calls: dict[str, Any] = {}
 
@@ -435,7 +435,7 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
     def cascade_attention(**kwargs: Any) -> None:
         calls.update(kwargs)
 
-    from vllm_gr.v1.beam.beam_attention_pool import write_eager_step
+    from vllm_gr.v1.beam.attention_pool import write_eager_step
 
     execution = SimpleNamespace(
         reshape_and_cache=unexpected_reshape,

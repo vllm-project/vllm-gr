@@ -10,13 +10,13 @@ from typing import Any, NoReturn
 
 from vllm.inputs import tokens_input
 
+from vllm_gr.entrypoints.beam_search.boundary_tokens import boundary_token_id
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchEngineError
 from vllm_gr.entrypoints.beam_search.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
-from vllm_gr.entrypoints.beam_search.token_utils import boundary_token_id
-from vllm_gr.entrypoints.detokenization import fast_batch_decode, fast_decode
+from vllm_gr.entrypoints.common.detokenization import fast_batch_decode, fast_decode
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchOutput,

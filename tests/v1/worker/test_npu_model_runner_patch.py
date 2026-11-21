@@ -1452,7 +1452,7 @@ def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, d
 
 
 def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+    from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 
     def context(batch_size: int) -> BeamAttentionContext:
         return BeamAttentionContext(batch_size, 4, 1, 3, 2, 1, torch.device("cpu"), torch.float16)
@@ -2394,7 +2394,7 @@ def test_npu_parent_history_follows_output_options_through_session(
     """Exercise the real decision, including duplicate parents and request offsets."""
     from unittest.mock import Mock
 
-    from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+    from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 
     context = BeamAttentionContext(batch_size, 3, 1, 3, 2, 1, torch.device("cpu"), torch.float16)
     sequence_pointer = context.decision.sequence.data_ptr()

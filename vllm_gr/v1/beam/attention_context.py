@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import torch
 
-from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool, _validate_pool_dtype
-from vllm_gr.v1.beam.beam_session_registry import BeamSessionRegistry
+from vllm_gr.v1.beam.attention_pool import BeamAttentionPool, _validate_pool_dtype
+from vllm_gr.v1.beam.session_registry import BeamSessionRegistry
 
 
 class BeamDecisionBuffers:

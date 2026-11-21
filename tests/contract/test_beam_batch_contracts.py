@@ -34,8 +34,8 @@ from vllm_gr.v1.beam.batch_contracts import (
     validate_beam_batch_request_limits,
     validate_beam_batch_result,
 )
+from vllm_gr.v1.engine.beam_session_client import _terminal_result
 from vllm_gr.v1.engine.codec import build_engine_core_decoders
-from vllm_gr.v1.engine.gr_session_client import _terminal_result
 
 
 def _engine_request(
@@ -177,7 +177,7 @@ def test_request_uses_engine_request_identity_and_beam_params_authority() -> Non
 
 
 def test_request_rejects_embedding_only_prompt() -> None:
-    from vllm_gr.v1.engine.beam_search import validate_gr_request
+    from vllm_gr.v1.engine.beam_admission import validate_gr_request
 
     engine_request = _engine_request("request-0", None)
     engine_request.prompt_embeds = torch.ones((2, 8), dtype=torch.float32)
