@@ -7,16 +7,16 @@
 
 Requires:
 - vLLM + GPU/NPU runtime
-- ``PANGU1B_MODEL_PATH`` / ``PANGU_MODEL_PATH`` or ``--model`` with weights
+- Prepared vLLM runtime; the pangu_model fixture prepares weights on demand.
 
-Skip when the model path is unavailable (CI without weights).
+Explicit local overrides remain supported. Input preparation failures are errors.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,11 +25,12 @@ from unittest import mock
 
 import pytest
 
+from tests.helpers.gate_process import run_gate_process
 from tests.helpers.paths import REPO_ROOT
 from tests.st import pangu_generate
 from tests.st.pangu1b_st_common import (
     GSM8K_MINI,
-    get_model_path,
+    load_dataset,
     require_pangu_st_runtime,
     score_answer,
 )
@@ -60,68 +61,75 @@ def _parse_cli_summary(stdout: str) -> dict:
 @pytest.mark.gpu_test
 @pytest.mark.npu_test
 @pytest.mark.model_test
+@pytest.mark.timeout(float(os.environ.get("PANGU1B_OFFLINE_TIMEOUT", "1800")) + 120)
 class TestPangu1bAccuracyST(unittest.TestCase):
     """End-to-end accuracy ST for the Pangu offline evaluation CLI."""
 
-    def setUp(self) -> None:
-        require_pangu_st_runtime()
+    @pytest.fixture(autouse=True)
+    def _prepared_inputs(self, pangu_model: Path, gsm8k_mini: Path) -> None:
+        self.model_path = pangu_model
+        self.dataset_path = gsm8k_mini
 
     def test_gsm8k_mini_accuracy_cli(self) -> None:
-        model_path = get_model_path()
+        model_path = str(self.model_path)
         with tempfile.NamedTemporaryFile(
             suffix=".json",
             delete=False,
         ) as handle:
             output_json = Path(handle.name)
 
+        measure_only = os.environ.get("PANGU1B_MEASURE_ONLY") == "1"
+        num_prompts = int(os.environ.get("PANGU1B_NUM_PROMPTS", "8"))
+        log = output_json.with_suffix(".log")
         cmd = [
             sys.executable,
             str(Path(__file__).with_name("pangu_generate.py")),
             "--model",
             model_path,
             "--dataset-path",
-            str(DEFAULT_DATASET),
+            str(self.dataset_path),
             "--num-prompts",
-            "8",
+            str(num_prompts),
             "--min-accuracy",
-            DEFAULT_MIN_ACCURACY,
+            "0" if measure_only else DEFAULT_MIN_ACCURACY,
             "--output-json",
             str(output_json),
         ]
         try:
-            proc = subprocess.run(
+            status = run_gate_process(
                 cmd,
-                cwd=str(ROOT),
-                capture_output=True,
-                text=True,
-                check=False,
+                cwd=ROOT,
+                log=log,
+                timeout=float(os.environ.get("PANGU1B_OFFLINE_TIMEOUT", "1800")),
             )
-            if proc.returncode != 0:
-                self.fail(
-                    f"Pangu accuracy ST failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-                )
+            stdout = log.read_text(encoding="utf-8")
+            self.assertEqual(status, 0, f"Pangu accuracy execution failed:\n{stdout}")
 
             if output_json.is_file() and output_json.stat().st_size > 0:
                 with output_json.open("r", encoding="utf-8") as handle:
                     summary = json.load(handle)
             else:
                 try:
-                    summary = _parse_cli_summary(proc.stdout)
+                    summary = _parse_cli_summary(stdout)
                 except json.JSONDecodeError as exc:
                     self.fail(
                         "Failed to parse evaluation JSON summary\n"
-                        f"stdout:\n{proc.stdout}\n"
-                        f"stderr:\n{proc.stderr}\n"
+                        f"stdout:\n{stdout}\n"
                         f"parse error: {exc}"
                     )
         finally:
             output_json.unlink(missing_ok=True)
+            log.unlink(missing_ok=True)
 
-        self.assertGreaterEqual(
-            float(summary["accuracy"]),
-            float(DEFAULT_MIN_ACCURACY),
-        )
-        self.assertEqual(summary["num_samples"], 8)
+        accuracy = float(summary["accuracy"])
+        self.assertTrue(math.isfinite(accuracy) and 0 <= accuracy <= 1)
+        self.assertGreater(summary["num_samples"], 0)
+        self.assertEqual(summary["num_samples"], len(load_dataset(self.dataset_path, num_prompts)))
+        if not measure_only:
+            self.assertGreaterEqual(accuracy, float(DEFAULT_MIN_ACCURACY))
+        result_path = os.environ.get("PANGU1B_OFFLINE_RESULT_JSON")
+        if result_path:
+            Path(result_path).write_text(json.dumps(summary), encoding="utf-8")
 
 
 @pytest.mark.cpu_test
@@ -183,4 +191,4 @@ class TestPangu1bAccuracyUnitHooks(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

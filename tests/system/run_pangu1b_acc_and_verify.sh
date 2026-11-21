@@ -17,15 +17,6 @@ MIN_ACCURACY="${PANGU1B_OFFLINE_ACCURACY_THRESHOLD:-}"
 FAILURE_MODE="${PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE:-}"
 DEVICE="${BENCHMARK_DEVICE:-unknown}"
 
-if [[ -z "$MODEL_PATH" || ! -d "$MODEL_PATH" ]]; then
-  echo "Error: PANGU1B_MODEL_PATH must point to a local Pangu checkpoint." >&2
-  exit 2
-fi
-if ! compgen -G "$MODEL_PATH/*.safetensors" > /dev/null && \
-   ! compgen -G "$MODEL_PATH/*.bin" > /dev/null; then
-  echo "Error: Pangu checkpoint has no .safetensors or .bin weights: $MODEL_PATH" >&2
-  exit 2
-fi
 if [[ -z "$MIN_ACCURACY" || -z "$FAILURE_MODE" ]]; then
   echo "Error: the offline Pangu accuracy policy was not resolved." >&2
   exit 2
@@ -45,12 +36,11 @@ echo "  dataset: $DATASET_PATH"
 echo "  num_prompts: $NUM_PROMPTS"
 echo "  threshold: $MIN_ACCURACY ($FAILURE_MODE)"
 
-python tests/st/pangu_generate.py \
-  --model "$MODEL_PATH" \
-  --dataset-path "$DATASET_PATH" \
-  --num-prompts "$NUM_PROMPTS" \
-  --min-accuracy 0 \
-  --output-json "$result_json"
+PANGU1B_REQUIRE_RUNTIME=1 \
+PANGU1B_MEASURE_ONLY=1 \
+PANGU1B_OFFLINE_RESULT_JSON="$result_json" \
+python -m pytest --run-slow --strict-test-levels -m model_test \
+  tests/st/test_pangu1b_accuracy_st.py
 execution_status=$?
 if [[ "$execution_status" -ne 0 ]]; then
   echo "Pangu offline execution failed with exit code $execution_status." >&2
