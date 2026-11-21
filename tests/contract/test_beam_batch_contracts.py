@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import msgspec
 import pytest
 import torch
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -16,6 +17,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 import vllm_gr.v1.beam as beam_package
 import vllm_gr.v1.beam.batch_contracts as contracts
 from vllm_gr.config import MAX_BEAM_WIDTH, MAX_CANDIDATE_WIDTH
+from vllm_gr.sampling_params import BeamSearchParams
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
@@ -265,6 +267,51 @@ def test_per_parent_beam_widths_require_matching_bootstrap_width() -> None:
                 )
             )
         )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("widths", "candidate_widths", "valid"),
+    [
+        (None, (4, 1, 1), True),
+        ((4, 1, 4), (4, 1, 4), True),
+        ((4, 1, 4), (4, 1, 3), False),
+    ],
+)
+def test_public_and_batch_params_share_candidate_capacity(
+    widths: tuple[int, ...] | None, candidate_widths: tuple[int, ...], valid: bool
+) -> None:
+    # Public max_tokens also counts the reserved begin and end tokens.
+    def public_params() -> BeamSearchParams:
+        return BeamSearchParams(
+            beam_width=4,
+            max_tokens=5,
+            begin_token="<begin>",
+            end_token="<end>",
+            dynamic_beam_widths=list(widths) if widths is not None else None,
+            per_parent_beam_widths=list(candidate_widths),
+        )
+
+    request = _request(
+        beam_params=_params(
+            beam_width=4,
+            dynamic_beam_widths=widths,
+            per_parent_beam_widths=candidate_widths,
+        )
+    )
+
+    if valid:
+        public_params()
+        validate_beam_batch_request(request)
+        return
+
+    message = "each retained width must not exceed"
+    with pytest.raises(VLLMValidationError, match=message) as exc_info:
+        public_params()
+    assert exc_info.value.parameter == "per_parent_beam_widths"
+    assert exc_info.value.value == list(candidate_widths)
+    with pytest.raises(BeamContractError, match=message):
+        validate_beam_batch_request(request)
 
 
 def test_per_parent_beam_widths_override_the_configured_candidate_width() -> None:

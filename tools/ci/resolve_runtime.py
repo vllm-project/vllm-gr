@@ -29,9 +29,9 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 GUARDS = {
-    "vllm": "_SUPPORTED_VLLM_VERSION",
-    "vllm-ascend": "_SUPPORTED_VLLM_ASCEND_VERSION",
-    "triton-ascend": "_SUPPORTED_TRITON_ASCEND_VERSION",
+    "vllm": "SUPPORTED_VLLM_VERSION",
+    "vllm-ascend": "SUPPORTED_VLLM_ASCEND_VERSION",
+    "triton-ascend": "SUPPORTED_TRITON_ASCEND_VERSION",
 }
 
 
@@ -71,9 +71,14 @@ def literal(path: Path, name: str) -> str:
 
 def declarations(repo: Path, device: str) -> dict[str, str]:
     packages = tuple(GUARDS) if device == "npu" else ("vllm",)
-    guards = {
-        package: literal(repo / "vllm_gr/_env_check.py", GUARDS[package]) for package in packages
-    }
+    guard_source = repo / "vllm_gr/platforms/compat.py"
+    prefix = ""
+    if not (repo / "vllm_gr/platforms/ascend/environment.py").is_file():
+        # Earlier A/B baselines may have provider compatibility code but
+        # still declare their built-in version pins in _env_check.py.
+        guard_source = repo / "vllm_gr/_env_check.py"
+        prefix = "_"
+    guards = {package: literal(guard_source, prefix + GUARDS[package]) for package in packages}
     base = literal(repo / "setup.py", "VLLM_GR_BASE_VERSION")
     config = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
     # Older A/B baseline revisions still declare a TOML fallback. Validate it
@@ -206,6 +211,8 @@ def source_digest(repo: Path) -> str:
         "setup.py",
         "pyproject.toml",
         "vllm_gr/_env_check.py",
+        "vllm_gr/platforms/compat.py",
+        "vllm_gr/platforms/ascend/environment.py",
         "vllm_gr/version.py",
         "tools/ci/resolve_runtime.py",
         "tools/packaging/git_version.py",
@@ -390,7 +397,10 @@ def verify(repo: Path, spec: dict[str, Any], venv: Path) -> dict[str, Any]:
         if not errors:
             try:
                 if spec["device"] == "npu":
-                    guard = importlib.import_module("vllm_gr._env_check")
+                    ascend_guard = "vllm_gr.platforms.ascend.environment"
+                    if not (repo / "vllm_gr/platforms/ascend/environment.py").is_file():
+                        ascend_guard = "vllm_gr._env_check"
+                    guard = importlib.import_module(ascend_guard)
                     report["ascend"] = guard.check_ascend_environment(require_npu_platform=True)
                 else:
                     platforms = importlib.import_module("vllm.platforms")

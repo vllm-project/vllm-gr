@@ -88,3 +88,10 @@ def _add_enum_member(name: str, value: bytes) -> None:
 def register_engine_core_request_types() -> None:
     """Register the vLLM-GR EngineCore request types in the current process."""
     _add_enum_member("SUBMIT_GR_SESSION", SUBMIT_GR_SESSION_WIRE_VALUE)
+
+
+def validate_request_types_patch() -> str | None:
+    member = getattr(EngineCoreRequestType, "SUBMIT_GR_SESSION", None)
+    if getattr(member, "value", None) != SUBMIT_GR_SESSION_WIRE_VALUE:
+        return "GR EngineCore request types are missing or use wrong wire values"
+    return None

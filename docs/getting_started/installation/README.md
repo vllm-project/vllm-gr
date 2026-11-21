@@ -35,7 +35,7 @@ python -c 'from importlib.metadata import version; print(version("vllm-gr"))'
 ```
 
 Dependency and Python constraints belong to `pyproject.toml`, `setup.py`,
-`requirements/`, and `vllm_gr/_env_check.py`. See the
+`requirements/`, and `vllm_gr/platforms/compat.py`. See the
 [dependency and version policy](../../contributing/dependency_policy.md) for
 release tags, overrides, and package versions.
 

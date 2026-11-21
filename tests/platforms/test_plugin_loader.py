@@ -184,13 +184,13 @@ def test_failed_range_check_keeps_backend_inactive(monkeypatch: pytest.MonkeyPat
     _install_entry_points(monkeypatch)
     _fake_current_platform(monkeypatch, _nvidia_platform())
     monkeypatch.setenv("VLLM_GR_STRICT_PROVIDER_RANGES", "1")
-    monkeypatch.setattr(compat, "_installed_version", lambda dist: "0.1")
+    monkeypatch.setattr(compat, "installed_version", lambda dist: "0.1")
     with pytest.raises(InvalidBackendProviderError, match="compatibility range"):
         loader.activate_current_backend()
     with pytest.raises(BackendNotActiveError):
         get_active_backend()
 
-    monkeypatch.setattr(compat, "_installed_version", lambda dist: "0.30.0")
+    monkeypatch.setattr(compat, "installed_version", lambda dist: "0.30.0")
     assert loader.activate_current_backend().backend_id == "cuda"
 
 

@@ -99,18 +99,13 @@ in its Python environment.
 python -c 'from importlib.metadata import version; print("vllm", version("vllm")); print("vllm-ascend", version("vllm-ascend")); print("vllm-gr", version("vllm-gr"))'
 ```
 
-### Enable the GR CLI and verify the runtime
-
-Apply the [vLLM 0.30.0 CLI dispatch patch](../../cli/README.md#command-form-and-installation)
-before running `vllm check-env --gr --npu`. The vendor image installs vLLM
-in editable mode. Use the vLLM source root from
-`python -m pip show vllm` as the patch target.
+### Verify the runtime
 
 In the same shell with the CANN and custom operator environment loaded, check
 the platform, NumPy/OpenCV import and the three fused Beam execution operators.
 
 ```bash
-vllm check-env --gr --npu
+python -m vllm_gr.entrypoints.cli.main check-env --gr --npu
 python -c "import numpy, cv2; print('numpy', numpy.__version__, 'cv2', cv2.__version__)"
 python - <<'PYOPS'
 import torch_npu
@@ -125,6 +120,11 @@ PYOPS
 The environment report should show `platform: npu`. The operator probe checks
 that the binding exports `cache_unshared_kv`, `x_attention` and
 `select_unshared_kv`. The quickstart below exercises inference on the device.
+
+To use `vllm ... --gr` commands, apply the
+[vLLM 0.30.0 CLI dispatch patch](../../cli/README.md#command-form-and-installation).
+The vendor image installs vLLM in editable mode. Use the source root reported
+by `python -m pip show vllm` as the patch target.
 
 ## Quick start
 

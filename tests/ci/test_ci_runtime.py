@@ -194,10 +194,14 @@ class TestRuntimeResolution(unittest.TestCase):
                 path.write_text(original)
 
     def test_annotated_guards_preserve_npu_declarations(self) -> None:
+        compat = self.repo / "vllm_gr/platforms/compat.py"
+        compat.parent.mkdir()
+        compat.write_text("# Provider range checks predate the pin move.\n")
         expected = runtime.declarations(self.repo, "npu")
         path = self.repo / "vllm_gr/_env_check.py"
         original = path.read_text()
-        for name in runtime.GUARDS.values():
+        for guard in runtime.GUARDS.values():
+            name = f"_{guard}"
             with self.subTest(name=name):
                 target = f"{name} = "
                 self.assertEqual(original.count(target), 1)

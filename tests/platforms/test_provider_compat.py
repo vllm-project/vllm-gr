@@ -147,7 +147,7 @@ class RangedProvider:
 
 
 def test_satisfied_declared_ranges_report_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(compat, "_installed_version", lambda name: "0.30.0")
+    monkeypatch.setattr(compat, "installed_version", lambda name: "0.30.0")
 
     assert compat.check_declared_ranges(RangedProvider(vllm_version_range="==0.30.0")) == ()
 
@@ -155,7 +155,7 @@ def test_satisfied_declared_ranges_report_nothing(monkeypatch: pytest.MonkeyPatc
 def test_unsatisfied_range_is_reported_with_provider_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(compat, "_installed_version", lambda name: "0.22.1")
+    monkeypatch.setattr(compat, "installed_version", lambda name: "0.22.1")
 
     failures = compat.check_declared_ranges(RangedProvider(vllm_version_range="==0.30.0"))
 
@@ -167,7 +167,7 @@ def test_unsatisfied_range_is_reported_with_provider_identity(
 def test_missing_vendor_distribution_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         compat,
-        "_installed_version",
+        "installed_version",
         lambda name: None if name == "vllm-ascend" else "0.30.0",
     )
     provider = RangedProvider(
@@ -188,7 +188,7 @@ def test_strict_mode_fails_and_default_mode_only_warns(
     caplog: pytest.LogCaptureFixture,
     ambient_log_level: int,
 ) -> None:
-    monkeypatch.setattr(compat, "_installed_version", lambda name: "0.22.1")
+    monkeypatch.setattr(compat, "installed_version", lambda name: "0.22.1")
     provider = RangedProvider(vllm_version_range="==0.30.0")
 
     monkeypatch.delenv(compat._STRICT_ENV, raising=False)
@@ -218,7 +218,7 @@ def test_strict_mode_fails_and_default_mode_only_warns(
 def test_unparsable_declared_range_is_a_provider_defect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(compat, "_installed_version", lambda name: "0.30.0")
+    monkeypatch.setattr(compat, "installed_version", lambda name: "0.30.0")
 
     with pytest.raises(InvalidBackendProviderError, match="unparsable version range"):
         compat.check_declared_ranges(RangedProvider(vllm_version_range="not a specifier"))

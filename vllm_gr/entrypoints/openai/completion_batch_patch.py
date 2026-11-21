@@ -376,7 +376,7 @@ def patch_completion_batch() -> None:
     OpenAIServingCompletion._create_completion = create_completion_batch_dispatch
 
 
-def _validate_completion_batch_patch() -> str | None:
+def validate_completion_batch_patch() -> str | None:
     """Verify the batch route is installed and the upstream seam still exists.
 
     Fail-closed on the surface the batch path calls. Instance attributes set by

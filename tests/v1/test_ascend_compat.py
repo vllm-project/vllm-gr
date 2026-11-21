@@ -654,7 +654,7 @@ def test_ascend_child_activates_live_trie_capacity_before_first_core_initializat
     raw_initialize = Core.__init__
     engine_core_patch.apply_engine_core_request_patches()
     Core.__init__ = raw_initialize  # type: ignore[method-assign]
-    assert runtime_patch._validate_engine_core_request_patch() is not None
+    assert engine_core_patch.validate_engine_core_request_patch() is not None
 
     def initialize_ascend(received: Any) -> None:
         assert received is config and received.additional_config == {}
@@ -663,7 +663,7 @@ def test_ascend_child_activates_live_trie_capacity_before_first_core_initializat
 
     def native_entry(*args: Any, **kwargs: Any) -> CoreProc:
         entry.init_ascend_config(config)
-        assert runtime_patch._validate_engine_core_request_patch() is None
+        assert engine_core_patch.validate_engine_core_request_patch() is None
         return CoreProc(kwargs["vllm_config"])
 
     setattr(entry, "_run_engine_core_patch_func", native_entry)

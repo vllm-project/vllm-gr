@@ -12,10 +12,14 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from vllm_gr.config import pangu_patch as pangu_compat
 from vllm_gr.v1.attention import selector_patch
 from vllm_gr.v1.worker import sliced_logits_patch
+
+if TYPE_CHECKING:
+    from vllm_gr.platforms.interface import GRBackendProvider
 
 logger = logging.getLogger("vllm_gr.patch")
 
@@ -89,303 +93,19 @@ class BeamPatchInitializationError(RuntimeError):
 _LAST_BEAM_PATCH_REPORT: BeamPatchReport | None = None
 
 
-def _call_patch(module_name: str, function_name: str) -> None:
-    module = importlib.import_module(module_name)
-    getattr(module, function_name)()
+def _module_patch(name: str, module_name: str, installer: str, validator: str) -> BeamPatch:
+    """Resolve patch callables when the process reaches this step."""
 
+    def apply() -> None:
+        getattr(importlib.import_module(module_name), installer)()
 
-def _verified(condition: bool, detail: str) -> str | None:
-    return None if condition else detail
-
-
-def _validate_flat_logprobs_patch() -> str | None:
-    from vllm.logprobs import FlatLogprobs
-
-    from vllm_gr.logprobs import append_fast
-
-    return _verified(
-        FlatLogprobs.append_fast is append_fast,
-        "FlatLogprobs.append_fast does not reference the GR implementation",
-    )
-
-
-def _validate_beam_search_dispatch_patch() -> str | None:
-    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
-
-    from vllm_gr.entrypoints.openai.beam_search_patch import beam_search_dispatch
-
-    return _verified(
-        GenerateBaseServing.beam_search is beam_search_dispatch,
-        "GenerateBaseServing.beam_search does not reference the GR dispatcher",
-    )
-
-
-def _validate_admission_rejection_patch() -> str | None:
-    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
-
-    from vllm_gr.entrypoints.openai.beam_search_patch import (
-        _ADMISSION_REJECTION_PATCH_MARKER,
-    )
-
-    return _verified(
-        getattr(
-            getattr(GenerateBaseServing, "_raise_if_error", None),
-            _ADMISSION_REJECTION_PATCH_MARKER,
-            False,
-        ),
-        "GenerateBaseServing._raise_if_error does not reference the GR admission-rejection wrapper",
-    )
-
-
-def _validate_client_request_id_patch() -> str | None:
-    """Verify the two sites that pair a caller's name with the engine's."""
-
-    from vllm.entrypoints.serve.engine.serving import BaseServing
-    from vllm.v1.engine.output_processor import OutputProcessor
-
-    from vllm_gr.entrypoints.openai.beam_search_patch import (
-        _CLIENT_REQUEST_ID_PATCH_MARKER,
-        _SUBMIT_REQUEST_ID_PATCH_MARKER,
-    )
-
-    return _verified(
-        getattr(
-            getattr(BaseServing, "_base_request_id", None),
-            _CLIENT_REQUEST_ID_PATCH_MARKER,
-            False,
-        ),
-        "BaseServing._base_request_id does not reference the GR client-request-id wrapper",
-    ) or _verified(
-        getattr(
-            getattr(OutputProcessor, "add_request", None),
-            _SUBMIT_REQUEST_ID_PATCH_MARKER,
-            False,
-        ),
-        "OutputProcessor.add_request does not reference the GR client-request-id wrapper",
-    )
-
-
-def _validate_openai_beam_search_patch() -> str | None:
-    """Verify every target mutated by the grouped OpenAI Beam installer."""
-
-    failures = tuple(
-        detail
-        for detail in (
-            _validate_beam_search_dispatch_patch(),
-            _validate_admission_rejection_patch(),
-            _validate_client_request_id_patch(),
-            _validate_completion_batch_patch(),
+    def verify() -> str | None:
+        validate: Callable[[], str | None] = getattr(
+            importlib.import_module(module_name), validator
         )
-        if detail is not None
-    )
-    return "; ".join(failures) or None
+        return validate()
 
-
-def _validate_completion_batch_patch() -> str | None:
-    """Verify the completions route still owns the batch seam.
-
-    The installer and its verifier are one responsibility and live together:
-    the list of upstream helpers the batch path borrows is long, and keeping a
-    second copy of it here is how the two drift apart.
-    """
-
-    from vllm_gr.entrypoints.openai.completion_batch_patch import (
-        _validate_completion_batch_patch as validate,
-    )
-
-    return validate()
-
-
-def _validate_chat_sampling_patch() -> str | None:
-    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-
-    from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
-
-    return _verified(
-        ChatCompletionRequest.to_beam_search_params is to_beam_search_params,
-        "ChatCompletionRequest.to_beam_search_params is not installed",
-    )
-
-
-def _validate_engine_args_patch() -> str | None:
-    from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
-
-    from vllm_gr.engine.arg_utils import (
-        _init_async_engine_args,
-        _init_engine_args,
-        add_cli_args,
-        create_engine_config,
-        from_cli_args,
-    )
-
-    return _verified(
-        EngineArgs.add_cli_args is add_cli_args
-        and EngineArgs.create_engine_config is create_engine_config
-        and EngineArgs.from_cli_args.__func__ is from_cli_args
-        and EngineArgs.__init__ is _init_engine_args
-        and AsyncEngineArgs.__init__ is _init_async_engine_args,
-        "EngineArgs GR integration is incomplete",
-    )
-
-
-def _validate_request_types_patch() -> str | None:
-    from vllm.v1.engine import EngineCoreRequestType
-
-    valid = (
-        getattr(getattr(EngineCoreRequestType, "SUBMIT_GR_SESSION", None), "value", None) == b"\x0a"
-    )
-    return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
-
-
-def _validate_engine_clients_patch() -> str | None:
-    from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
-
-    from vllm_gr.v1.engine.core_client import (
-        inproc_abort_requests,
-        inproc_add_request,
-        inproc_get_output,
-        inproc_shutdown,
-        inproc_submit_gr_session,
-        submit_gr_session_async,
-        sync_mp_submit_gr_session,
-    )
-
-    valid = (
-        getattr(AsyncMPClient, "submit_gr_session_async", None) is submit_gr_session_async
-        and getattr(SyncMPClient, "submit_gr_session", None) is sync_mp_submit_gr_session
-        and getattr(InprocClient, "submit_gr_session", None) is inproc_submit_gr_session
-        and getattr(InprocClient, "get_output", None) is inproc_get_output
-        and getattr(InprocClient, "add_request", None) is inproc_add_request
-        and getattr(InprocClient, "abort_requests", None) is inproc_abort_requests
-        and getattr(InprocClient, "shutdown", None) is inproc_shutdown
-    )
-    return _verified(valid, "EngineCore client methods are not fully installed")
-
-
-def _validate_async_llm_patch() -> str | None:
-    from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.v1.engine.llm_engine import LLMEngine
-    from vllm.v1.engine.output_processor import OutputProcessor
-
-    from vllm_gr.v1.engine import beam_session_client as gr_session_client
-    from vllm_gr.v1.engine.beam_session_client import (
-        async_llm_add_request,
-        llm_engine_add_request,
-    )
-    from vllm_gr.v1.engine.output_processor import _PROCESS_OUTPUTS_PATCH_MARKER
-
-    valid = (
-        bool(getattr(OutputProcessor.process_outputs, _PROCESS_OUTPUTS_PATCH_MARKER, False))
-        and getattr(LLMEngine, "add_request", None) is llm_engine_add_request
-        and getattr(AsyncLLM, "_add_request", None) is async_llm_add_request
-    )
-    for cls, suffix in ((LLMEngine, "sync"), (AsyncLLM, "async")):
-        for operation in ("submit", "wait", "abort", "release"):
-            name = f"{operation}_gr_session"
-            valid = valid and getattr(cls, name, None) is getattr(
-                gr_session_client, f"{name}_{suffix}"
-            )
-    return _verified(valid, "GR frontend lifecycle methods are not fully installed")
-
-
-def _validate_engine_core_entrypoint_patch() -> str | None:
-    from vllm.v1.engine.core import EngineCoreProc
-
-    from vllm_gr.v1.engine.engine_core_patch import run_engine_core
-
-    return _verified(
-        EngineCoreProc.run_engine_core is run_engine_core,
-        "EngineCore process entrypoint wrapper is not installed",
-    )
-
-
-def _validate_engine_core_request_patch() -> str | None:
-    from vllm.v1.engine.core import EngineCore, EngineCoreProc
-
-    from vllm_gr.v1.engine.core import (
-        _handle_submit_gr_session,
-        is_gr_session_retired,
-    )
-    from vllm_gr.v1.engine.core_socket import process_input_sockets
-    from vllm_gr.v1.engine.engine_core_patch import (
-        _CLIENT_REQUEST_PATCH_MARKER,
-        _ENGINE_STEP_PATCH_MARKER,
-        _PIS_PATCH_MARKER,
-    )
-
-    valid = (
-        getattr(EngineCore, "_handle_submit_gr_session", None) is _handle_submit_gr_session
-        and getattr(EngineCore.__init__, "_gr_trie_capacity_patch", False)
-        and getattr(EngineCoreProc, "_handle_submit_gr_session", None) is _handle_submit_gr_session
-        and getattr(EngineCore, "is_gr_session_retired", None) is is_gr_session_retired
-        and getattr(EngineCoreProc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)
-        and getattr(EngineCoreProc._handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, False)
-        and EngineCoreProc.process_input_sockets is process_input_sockets
-        and getattr(EngineCoreProc.process_input_sockets, _PIS_PATCH_MARKER, False)
-    )
-    return _verified(valid, "EngineCore GR session dispatch is not fully installed")
-
-
-def _validate_scheduler_patch() -> str | None:
-    from vllm.v1.core.sched.scheduler import Scheduler
-
-    from vllm_gr.v1.core.sched.scheduler_patch import (
-        _SCHEDULER_PATCH_MARKER,
-        _SCHEDULER_UPDATE_PATCH_MARKER,
-    )
-
-    return _verified(
-        bool(
-            getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False)
-            and getattr(Scheduler.update_from_output, _SCHEDULER_UPDATE_PATCH_MARKER, False)
-        ),
-        "Scheduler Beam dispatch or completion hook is missing",
-    )
-
-
-def _validate_model_runner_patch() -> str | None:
-    from vllm_gr.v1.worker.model_runner_patch import (
-        discover_active_worker_runners,
-        is_active_worker_runner_patched,
-    )
-
-    runners = discover_active_worker_runners()
-    if not runners:
-        return "No supported active-platform ModelRunner is available"
-
-    failures = [
-        f"{runner_name} beam execution hooks are not installed"
-        for runner_name, runner_class in runners
-        if not is_active_worker_runner_patched(runner_class)
-    ]
-    return "; ".join(failures) or None
-
-
-def _validate_kv_hash_memo_patch() -> str | None:
-    """Verify both prefix-hash wrappers and the factory used by EngineCore."""
-    from vllm.v1.core import kv_cache_utils
-    from vllm.v1.engine import core
-
-    if not getattr(kv_cache_utils.hash_block_tokens, "_gr_hash_memo", False):
-        return "hash_block_tokens memo wrapper not installed"
-    factory = kv_cache_utils.get_request_block_hasher
-    if not getattr(factory, "_gr_chain_memo", False):
-        return "get_request_block_hasher chain memo wrapper not installed"
-    if core.get_request_block_hasher is not factory:
-        return "EngineCore get_request_block_hasher is not bound to the chain memo wrapper"
-    return None
-
-
-def _validate_engine_core_request_group() -> str | None:
-    failures = tuple(
-        detail
-        for detail in (
-            _validate_request_types_patch(),
-            _validate_engine_core_request_patch(),
-        )
-        if detail is not None
-    )
-    return "; ".join(failures) or None
+    return BeamPatch(name=name, apply=apply, verify=verify)
 
 
 def install_engine_session_hooks() -> None:
@@ -397,19 +117,31 @@ def install_engine_session_hooks() -> None:
     patch_engine_core_process_entrypoint()
 
 
-def _validate_batch_and_fork_patch() -> str | None:
+def _validate_engine_session_hooks() -> str | None:
     """Verify every target mutated by the grouped Beam engine installer."""
+
+    from vllm_gr.v1.core.sched.scheduler_patch import validate_scheduler_patch
+    from vllm_gr.v1.engine.core_client_patch import (
+        validate_async_llm_patch,
+        validate_engine_clients_patch,
+    )
+    from vllm_gr.v1.engine.engine_core_patch import (
+        validate_engine_core_entrypoint_patch,
+        validate_engine_core_request_patch,
+    )
+    from vllm_gr.v1.engine.wire import validate_request_types_patch
+    from vllm_gr.v1.worker.model_runner_patch import validate_model_runner_patch
 
     failures = tuple(
         detail
         for detail in (
-            _validate_request_types_patch(),
-            _validate_engine_clients_patch(),
-            _validate_async_llm_patch(),
-            _validate_engine_core_entrypoint_patch(),
-            _validate_engine_core_request_patch(),
-            _validate_scheduler_patch(),
-            _validate_model_runner_patch(),
+            validate_request_types_patch(),
+            validate_engine_clients_patch(),
+            validate_async_llm_patch(),
+            validate_engine_core_entrypoint_patch(),
+            validate_engine_core_request_patch(),
+            validate_scheduler_patch(),
+            validate_model_runner_patch(),
         )
         if detail is not None
     )
@@ -417,50 +149,37 @@ def _validate_batch_and_fork_patch() -> str | None:
 
 
 def _required_beam_patches() -> tuple[BeamPatch, ...]:
-    """Return the six concrete Beam responsibilities used in production."""
-
-    def patch(
-        name: str,
-        module_name: str,
-        function_name: str,
-        verify: Callable[[], str | None],
-    ) -> BeamPatch:
-        return BeamPatch(
-            name=name,
-            apply=lambda: _call_patch(module_name, function_name),
-            verify=verify,
-        )
+    """Return the required frontend patch plan."""
 
     return (
-        patch(
+        _module_patch(
             "flat_logprobs",
-            "vllm_gr.logprobs",
+            "vllm_gr.v1.engine.logprobs_patch",
             "patch_flat_logprobs",
-            _validate_flat_logprobs_patch,
+            "validate_flat_logprobs_patch",
         ),
-        patch(
+        _module_patch(
             "openai_beam_search",
             "vllm_gr.entrypoints.openai.beam_search_patch",
             "patch_beam_search",
-            _validate_openai_beam_search_patch,
+            "validate_openai_beam_search_patch",
         ),
-        patch(
+        _module_patch(
             "chat_sampling_conversion",
             "vllm_gr.entrypoints.openai.beam_search_patch",
             "patch_sampling",
-            _validate_chat_sampling_patch,
+            "validate_chat_sampling_patch",
         ),
-        patch(
+        _module_patch(
             "engine_args",
             "vllm_gr.engine.arg_utils",
             "patch_add_cli_args",
-            _validate_engine_args_patch,
+            "validate_engine_args_patch",
         ),
-        patch(
-            "batch_and_fork",
-            "vllm_gr.patch",
-            "install_engine_session_hooks",
-            _validate_batch_and_fork_patch,
+        BeamPatch(
+            name="batch_and_fork",
+            apply=install_engine_session_hooks,
+            verify=_validate_engine_session_hooks,
         ),
     )
 
@@ -468,42 +187,30 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
 def _engine_core_beam_patches() -> tuple[BeamPatch, ...]:
     """Return only responsibilities required inside an EngineCore process."""
 
-    def patch(
-        name: str,
-        module_name: str,
-        function_name: str,
-        verify: Callable[[], str | None],
-    ) -> BeamPatch:
-        return BeamPatch(
-            name=name,
-            apply=lambda: _call_patch(module_name, function_name),
-            verify=verify,
-        )
-
     return (
-        patch(
+        _module_patch(
             "engine_core_requests",
             "vllm_gr.v1.engine.engine_core_patch",
             "apply_engine_core_request_patches",
-            _validate_engine_core_request_group,
+            "validate_engine_core_request_group",
         ),
-        patch(
+        _module_patch(
             "kv_hash_memo",
             "vllm_gr.v1.core.kv_cache_utils",
             "apply_kv_hash_memo_patch",
-            _validate_kv_hash_memo_patch,
+            "validate_kv_hash_memo_patch",
         ),
-        patch(
+        _module_patch(
             "scheduler",
             "vllm_gr.v1.core.sched.scheduler_patch",
             "apply_scheduler_patch",
-            _validate_scheduler_patch,
+            "validate_scheduler_patch",
         ),
-        patch(
+        _module_patch(
             "model_runner",
             "vllm_gr.v1.worker.model_runner_patch",
             "apply_worker_patches",
-            _validate_model_runner_patch,
+            "validate_model_runner_patch",
         ),
     )
 
@@ -562,13 +269,12 @@ def initialize_engine_core_beam_patches() -> BeamPatchReport:
     return _initialize_beam_patch_plan(_engine_core_beam_patches())
 
 
-def _apply_gr_beam_patches(force: bool = False) -> int:
+def _apply_gr_beam_patches() -> int:
     """Apply Beam patches through the single production initialization path.
 
     These patches are independent from the GR core type replacement patches
     and can be safely applied alongside them.
     """
-    del force  # Repeated initialization probes every target before applying it.
     patch_count = initialize_required_beam_patches().applied_count
 
     if sliced_logits_patch.apply_sliced_logits_patch():
@@ -582,12 +288,13 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
     return patch_count
 
 
-def _apply_patches(force: bool = False) -> int:
+def _apply_patches(force: bool = False, *, provider: "GRBackendProvider | None" = None) -> int:
     """Apply all runtime patches needed by vllm-gr."""
-    from vllm_gr.platforms.loader import activate_current_backend
+    if provider is None:
+        from vllm_gr.platforms.loader import activate_current_backend
 
-    # re_apply_patches is also called directly by fresh worker processes.
-    provider = activate_current_backend()
+        # Fresh workers can call this before provider activation.
+        provider = activate_current_backend()
     # ModelConfig construction happens before model loading, so preserve the
     # official Pangu tied-weight layout at the earliest runtime boundary.
     pangu_count = int(pangu_compat.apply_pangu_tied_embeddings_patch())
@@ -603,10 +310,10 @@ def _apply_patches(force: bool = False) -> int:
             f"Runtime patches for backend {provider.backend_id!r} failed; "
             "initialization may be partial, restart the process"
         ) from exc
-    beam_count = _apply_gr_beam_patches(force=force)
+    beam_count = _apply_gr_beam_patches()
     return pangu_count + attention_count + backend_count + beam_count
 
 
-def re_apply_patches() -> int:
-    """Re-scan sys.modules and patch any newly-loaded vLLM modules."""
-    return _apply_patches(force=True)
+def re_apply_patches(*, provider: "GRBackendProvider | None" = None) -> int:
+    """Recheck live runtime targets and apply the required patches."""
+    return _apply_patches(force=True, provider=provider)

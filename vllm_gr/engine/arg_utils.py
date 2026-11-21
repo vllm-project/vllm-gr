@@ -261,3 +261,15 @@ def patch_add_cli_args() -> None:
     EngineArgs.from_cli_args = classmethod(from_cli_args)
     EngineArgs.__init__ = _init_engine_args
     AsyncEngineArgs.__init__ = _init_async_engine_args
+
+
+def validate_engine_args_patch() -> str | None:
+    if (
+        EngineArgs.add_cli_args is add_cli_args
+        and EngineArgs.create_engine_config is create_engine_config
+        and EngineArgs.from_cli_args.__func__ is from_cli_args
+        and EngineArgs.__init__ is _init_engine_args
+        and AsyncEngineArgs.__init__ is _init_async_engine_args
+    ):
+        return None
+    return "EngineArgs GR integration is incomplete"

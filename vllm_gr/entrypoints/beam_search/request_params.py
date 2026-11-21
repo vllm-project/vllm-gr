@@ -8,6 +8,7 @@ from msgspec.structs import asdict
 from vllm.sampling_params import BeamSearchParams as NativeBeamSearchParams
 
 from vllm_gr.config import GRConfig
+from vllm_gr.config.beam_widths import SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
 from vllm_gr.sampling_params import BeamSearchParams
 
@@ -47,7 +48,7 @@ def resolve_request_widths(
         if values.get(name) is not None or default is None:
             continue
         if isinstance(default, tuple):
-            if steps not in (1, 2, 3) or steps > len(default):
+            if steps not in SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS or steps > len(default):
                 raise BeamSearchRequestError(
                     f"{steps} effective generation steps cannot use the engine's "
                     f"{len(default)}-entry {name} default; dynamic requests support "

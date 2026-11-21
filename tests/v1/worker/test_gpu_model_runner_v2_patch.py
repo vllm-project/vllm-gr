@@ -174,7 +174,7 @@ def test_sample_tokens_v2_stage_bypass() -> None:
 def test_configure_model_runner_default_normalizes_opt_in(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from vllm_gr._env_check import configure_model_runner_default
+    from vllm_gr.engine.startup import configure_model_runner_default
 
     for value in (None, "0", "false", "no", "off", "1", "true", "yes", "on"):
         caplog.clear()

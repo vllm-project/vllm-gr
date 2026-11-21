@@ -497,3 +497,16 @@ def install_v1_worker_hooks(
             install_runner_lifecycle(runner_class, implementation_id, prepare="_prepare_inputs")
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)
+
+
+def validate_model_runner_patch() -> str | None:
+    runners = discover_active_worker_runners()
+    if not runners:
+        return "No supported active-platform ModelRunner is available"
+
+    failures = [
+        f"{runner_name} beam execution hooks are not installed"
+        for runner_name, runner_class in runners
+        if not is_active_worker_runner_patched(runner_class)
+    ]
+    return "; ".join(failures) or None

@@ -912,7 +912,7 @@ def test_grllm_resolves_native_settings_once_with_explicit_provenance(
 ) -> None:
     from vllm.engine.arg_utils import EngineArgs
 
-    from vllm_gr import _env_check, plugin
+    from vllm_gr import plugin
     from vllm_gr.engine import arg_utils_gr
     from vllm_gr.entrypoints import gr as frontend
 
@@ -927,7 +927,6 @@ def test_grllm_resolves_native_settings_once_with_explicit_provenance(
     monkeypatch.setattr(EngineArgs, "__init__", arg_utils_gr._init_engine_args)
     monkeypatch.setattr(frontend.LLM, "__init__", native_llm)
     monkeypatch.setattr(frontend, "_install_renderer_eos_token_id_cache", lambda: None)
-    monkeypatch.setattr(_env_check, "configure_model_runner_default", lambda: None)
     monkeypatch.setattr(plugin, "initialize_runtime", lambda: None)
     with mock.patch.object(
         arg_utils_gr, "resolve_native_settings", wraps=arg_utils_gr.resolve_native_settings

@@ -8,9 +8,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from vllm_gr import _env_check, patch, plugin
-from vllm_gr.platforms import loader
-from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
+from vllm_gr import patch, plugin
+from vllm_gr.engine import startup
+from vllm_gr.platforms import compat, loader
+from vllm_gr.platforms.ascend import environment, spawn_patch
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     get_active_backend,
@@ -63,11 +64,11 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
 
         return Mock(side_effect=invoke)
 
-    monkeypatch.setattr(_env_check, "configure_model_runner_default", hook("defaults", None))
+    monkeypatch.setattr(startup, "configure_model_runner_default", hook("defaults", None))
     cuda_check = hook("cuda_environment", {})
     npu_check = hook("npu_environment", {})
-    monkeypatch.setattr(_env_check, "check_runtime_versions", cuda_check)
-    monkeypatch.setattr(_env_check, "check_ascend_environment", npu_check)
+    monkeypatch.setattr(compat, "check_vllm_runtime", cuda_check)
+    monkeypatch.setattr(environment, "check_ascend_environment", npu_check)
     monkeypatch.setattr(
         patch.pangu_compat, "apply_pangu_tied_embeddings_patch", hook("pangu", True)
     )
@@ -75,15 +76,19 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
     monkeypatch.setattr(patch.selector_patch, "apply_custom_attention_backend_patch", attention)
     spawn = hook("spawn", True)
     worker = hook("worker", 1)
-    monkeypatch.setattr(npu_spawn_patch, "apply_npu_spawn_patch", spawn)
+    monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", spawn)
     monkeypatch.setattr(ascend_compat, "patch_npu_worker_init_device", worker)
     beam = hook("beam", 1)
     monkeypatch.setattr(patch, "_apply_gr_beam_patches", beam)
     monkeypatch.setattr(patch, "get_last_beam_patch_report", lambda: None)
 
+    activate = Mock(wraps=loader.activate_current_backend)
+    monkeypatch.setattr(loader, "activate_current_backend", activate)
     for _ in range(2):
         events.clear()
+        activate.reset_mock()
         state = plugin.initialize_runtime()
+        activate.assert_called_once_with()
         expected_backend_id = "ascend" if device_type == "npu" else "cuda"
         assert get_active_backend().backend_id == expected_backend_id
         backend_events = ["spawn", "worker"] if device_type == "npu" else []
@@ -97,7 +102,7 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
         ]
         assert state == {"patch_count": 5 if device_type == "npu" else 3, "patches": {}}
         attention.assert_called_with(force=True)
-        beam.assert_called_with(force=True)
+        beam.assert_called_with()
 
     if device_type == "npu":
         npu_check.assert_called_with(require_npu_platform=True)
@@ -115,10 +120,8 @@ def test_environment_failure_prevents_runtime_patch_installation(
     import vllm.platforms
 
     monkeypatch.setattr(vllm.platforms, "current_platform", _synthetic_platform("cuda"))
-    monkeypatch.setattr(_env_check, "configure_model_runner_default", lambda: None)
-    monkeypatch.setattr(
-        _env_check, "check_runtime_versions", Mock(side_effect=RuntimeError("version"))
-    )
+    monkeypatch.setattr(startup, "configure_model_runner_default", lambda: None)
+    monkeypatch.setattr(compat, "check_vllm_runtime", Mock(side_effect=RuntimeError("version")))
     install = Mock()
     monkeypatch.setattr(patch, "re_apply_patches", install)
     with pytest.raises(RuntimeError, match="version"):
@@ -138,7 +141,7 @@ def test_partial_provider_failure_stops_common_plan_and_retains_cause(
         patch.selector_patch, "apply_custom_attention_backend_patch", lambda **kw: 0
     )
     spawn = Mock(return_value=True)
-    monkeypatch.setattr(npu_spawn_patch, "apply_npu_spawn_patch", spawn)
+    monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", spawn)
     failure = RuntimeError("native worker hook failed")
     monkeypatch.setattr(ascend_compat, "patch_npu_worker_init_device", Mock(side_effect=failure))
     beam = Mock()

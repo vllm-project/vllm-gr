@@ -27,6 +27,11 @@ from vllm_gr.config import (
     MAX_CANDIDATE_WIDTH,
     SUPPORTED_BEAM_BATCH_SIZES,
 )
+from vllm_gr.config.beam_widths import (
+    SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS,
+    final_retained_width,
+    per_parent_width_error,
+)
 
 BEAM_BATCH_PROTOCOL_VERSION = 2
 DEFAULT_CONSTRAINT_RESOURCE_ID = "default"
@@ -381,7 +386,7 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
     widths = params.dynamic_beam_widths
     if widths is not None:
         if (
-            params.max_tokens not in (1, 2, 3)
+            params.max_tokens not in SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
             or not isinstance(widths, tuple)
             or len(widths) != params.max_tokens
         ):
@@ -393,12 +398,11 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
     per_parent_beam_widths = params.per_parent_beam_widths
     if per_parent_beam_widths is not None:
         if (
-            params.max_tokens not in (1, 2, 3)
+            params.max_tokens not in SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
             or not isinstance(per_parent_beam_widths, tuple)
             or len(per_parent_beam_widths) != params.max_tokens
         ):
             _fail("beam_params.per_parent_beam_widths must contain one immutable value per step")
-        retained_widths = widths or (beam_width,) * params.max_tokens
         for index, per_parent_beam_width in enumerate(per_parent_beam_widths):
             per_parent_beam_width = _positive_int(
                 f"beam_params.per_parent_beam_widths[{index}]", per_parent_beam_width
@@ -407,15 +411,9 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
                 _fail(
                     f"beam_params.per_parent_beam_widths entries must be <= {MAX_CANDIDATE_WIDTH}"
                 )
-        if per_parent_beam_widths[0] != retained_widths[0]:
-            _fail("the first per-parent beam width must equal the first retained width")
-        input_width = retained_widths[0]
-        for per_parent_beam_width, output_width in zip(
-            per_parent_beam_widths[1:], retained_widths[1:]
-        ):
-            if output_width > input_width * per_parent_beam_width:
-                _fail("each retained width must not exceed input_width * per_parent_beam_width")
-            input_width = output_width
+        error = per_parent_width_error(beam_width, widths, per_parent_beam_widths)
+        if error is not None:
+            _fail(error)
     if (
         isinstance(params.temperature, bool)
         or not isinstance(params.temperature, (int, float))
@@ -502,10 +500,8 @@ def validate_beam_batch_request(request: BeamBatchRequest) -> None:
     _validate_beam_params(request.beam_params)
     _validate_output_options(
         request.output_options,
-        beam_width=(
-            request.beam_params.beam_width
-            if request.beam_params.dynamic_beam_widths is None
-            else request.beam_params.dynamic_beam_widths[-1]
+        beam_width=final_retained_width(
+            request.beam_params.beam_width, request.beam_params.dynamic_beam_widths
         ),
     )
     if not request.items:

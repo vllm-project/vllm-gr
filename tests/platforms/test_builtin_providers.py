@@ -130,7 +130,7 @@ def test_npu_runtime_patches_preserve_order_and_sum_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm_gr import v1
-    from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
+    from vllm_gr.platforms.ascend import spawn_patch
 
     events: list[tuple[str, bool | None]] = []
 
@@ -146,7 +146,7 @@ def test_npu_runtime_patches_preserve_order_and_sum_counts(
         patch_npu_worker_init_device=patch_worker,
     )
     monkeypatch.setattr(v1, "ascend_compat", ascend_compat, raising=False)
-    monkeypatch.setattr(npu_spawn_patch, "apply_npu_spawn_patch", apply_spawn)
+    monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", apply_spawn)
 
     assert npu.NPU_BACKEND.apply_runtime_patches(force=True) == 4
     assert events == [("spawn", None), ("worker", None)]
@@ -155,7 +155,7 @@ def test_npu_runtime_patches_preserve_order_and_sum_counts(
 def test_cuda_environment_check_validates_platform_and_versions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import _env_check
+    from vllm_gr.platforms import compat
 
     platforms = ModuleType("vllm.platforms")
     platforms.current_platform = SimpleNamespace(  # type: ignore[attr-defined]
@@ -165,7 +165,7 @@ def test_cuda_environment_check_validates_platform_and_versions(
 
     report = {"vllm": "0.30.0"}
     check_versions = mock.Mock(return_value=report)
-    monkeypatch.setattr(_env_check, "check_runtime_versions", check_versions)
+    monkeypatch.setattr(compat, "check_vllm_runtime", check_versions)
 
     assert cuda.CUDA_BACKEND.check_environment() == {
         "vllm": "0.30.0",
@@ -183,12 +183,12 @@ def test_cuda_environment_check_validates_platform_and_versions(
 def test_npu_environment_check_delegates_complete_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import _env_check
+    from vllm_gr.platforms.ascend import environment
 
     expected = {"platform": "npu"}
     check_ascend = mock.Mock(return_value=expected)
     monkeypatch.setattr(
-        _env_check,
+        environment,
         "check_ascend_environment",
         check_ascend,
     )

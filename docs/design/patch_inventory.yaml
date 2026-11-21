@@ -19,7 +19,7 @@ patches:
     backend_id: null
     owner: vllm_gr/plugin.py
     installer: vllm_gr.plugin.register
-    activation: vLLM loads the vllm.general_plugins entry point
+    activation: vLLM loads the vllm.general_plugins entry point and the selected provider passes environment checks
     validator_or_test:
       - tests/test_patch_initialization.py::test_plugin_exposes_simple_per_patch_status
       - tests/platforms/test_runtime_wiring.py
@@ -67,11 +67,11 @@ patches:
   - id: GR-PATCH-003
     scope: core
     backend_id: null
-    owner: vllm_gr/logprobs.py
-    installer: vllm_gr.logprobs.patch_flat_logprobs
+    owner: vllm_gr/v1/engine/logprobs_patch.py
+    installer: vllm_gr.v1.engine.logprobs_patch.patch_flat_logprobs
     activation: the required frontend patch plan detects the method is not installed
     validator_or_test:
-      - vllm_gr.patch._validate_flat_logprobs_patch
+      - vllm_gr.v1.engine.logprobs_patch.validate_flat_logprobs_patch
       - tests/test_patch_initialization.py
     process_roles: [offline_frontend, api_server]
     target: vllm.logprobs.FlatLogprobs.append_fast
@@ -86,8 +86,8 @@ patches:
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_beam_search and patch_sampling
     activation: the required frontend patch plan detects either method is not installed
     validator_or_test:
-      - vllm_gr.patch._validate_openai_beam_search_patch
-      - vllm_gr.patch._validate_chat_sampling_patch
+      - vllm_gr.entrypoints.openai.beam_search_patch.validate_openai_beam_search_patch
+      - vllm_gr.entrypoints.openai.beam_search_patch.validate_chat_sampling_patch
       - tests/entrypoints/beam_search/test_beam_search_online_entry.py
       - tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online
       - tests/entrypoints/openai/test_beam_search_dispatch.py
@@ -104,7 +104,7 @@ patches:
     installer: vllm_gr.engine.arg_utils.patch_add_cli_args
     activation: the required frontend patch plan detects GR EngineArgs methods are not installed; GR defaults and Beam validation activate only for explicit GR engines
     validator_or_test:
-      - vllm_gr.patch._validate_engine_args_patch
+      - vllm_gr.engine.arg_utils.validate_engine_args_patch
       - tests/engine/test_backend_plan_engine_args.py
       - tests/v1/attention/test_attention_backend_custom.py
       - tests/engine/test_gr_config_v1.py
@@ -121,7 +121,7 @@ patches:
     installer: vllm_gr.patch.install_engine_session_hooks
     activation: the required frontend patch plan detects grouped Beam client methods are incomplete
     validator_or_test:
-      - vllm_gr.patch._validate_batch_and_fork_patch
+      - vllm_gr.patch._validate_engine_session_hooks
       - tests/v1/beam/test_beam_request_unit.py
       - tests/v1/engine/test_gr_admission_queue.py
       - tests/entrypoints/beam_search/test_beam_search_online_entry.py
@@ -140,7 +140,7 @@ patches:
     installer: vllm_gr.v1.engine.wire.register_engine_core_request_types
     activation: frontend and EngineCore installers require the GR wire values
     validator_or_test:
-      - vllm_gr.patch._validate_request_types_patch
+      - vllm_gr.v1.engine.wire.validate_request_types_patch
       - tests/contract/test_engine_core_protocol_contracts.py
     process_roles: [api_server, engine_core]
     target: vllm.v1.engine.EngineCoreRequestType
@@ -155,8 +155,8 @@ patches:
     installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
     activation: the shared EngineCore plan, including the sanitized NPU child entrypoint, detects incomplete request dispatch or Trie-capacity initialization; the constructor also verifies backend plan readiness before accepting requests; the same installer mounts hot-update utilities independently of the optional management listener
     validator_or_test:
-      - vllm_gr.patch._validate_engine_core_request_group
-      - vllm_gr.patch._validate_engine_core_entrypoint_patch
+      - vllm_gr.v1.engine.engine_core_patch.validate_engine_core_request_group
+      - vllm_gr.v1.engine.engine_core_patch.validate_engine_core_entrypoint_patch
       - tests/v1/engine/test_gr_async_scheduler.py
       - tests/constraints/test_npu_multi_trie_routing.py
       - tests/platforms/test_backend_plan.py
@@ -177,7 +177,7 @@ patches:
     installer: vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch
     activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper
     validator_or_test:
-      - vllm_gr.patch._validate_scheduler_patch
+      - vllm_gr.v1.core.sched.scheduler_patch.validate_scheduler_patch
       - tests/contract/test_engine_core_protocol_contracts.py
     process_roles: [engine_core]
     target: Scheduler.schedule and Scheduler.update_from_output in vllm.v1.core.sched.scheduler
@@ -192,7 +192,7 @@ patches:
     installer: vllm_gr.v1.core.kv_cache_utils.apply_kv_hash_memo_patch
     activation: the EngineCore plan detects a missing block or chain hash wrapper or a stale EngineCore factory binding
     validator_or_test:
-      - vllm_gr.patch._validate_kv_hash_memo_patch
+      - vllm_gr.v1.core.kv_cache_utils.validate_kv_hash_memo_patch
       - tests/v1/core/test_gr_plain_hash_chain.py
       - tests/test_patch_initialization.py::test_kv_hash_memo_patch_equivalence_and_hits
       - tests/test_patch_initialization.py::test_kv_hash_memo_plan_repairs_partial_install
@@ -211,7 +211,7 @@ patches:
     activation: the CUDA provider mounts Worker utilities at process startup; Worker.init_device installs and verifies the admitted V1 or V2 generation, which binds the planned runner after model load regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
     binding_validation: first bind and full reload retain the admitted plan across positive native max_model_len reductions within its limit; provider validation sees the live fitted config and other drift fails before service creation
     validator_or_test:
-      - vllm_gr.patch._validate_model_runner_patch
+      - vllm_gr.v1.worker.model_runner_patch.validate_model_runner_patch
       - tests/platforms/test_runner_lifecycle.py::test_first_load_binds_admitted_plan_after_native_autofit
       - tests/platforms/test_runner_lifecycle.py::test_full_reload_rebinds_admitted_plan_after_native_autofit
       - tests/platforms/test_runner_lifecycle.py::test_autofit_does_not_hide_worker_plan_drift
@@ -254,7 +254,7 @@ patches:
     activation: the Ascend provider discovers NPUModelRunner and binds its planned lifecycle after model load; the delayed NPUWorker.init_device wrapper mounts common Worker utilities before native initialization, independently of the management listener; online Trie reload remains rejected by Core on NPU
     binding_validation: uses the same admitted-plan and native max_model_len autofit checks as GR-PATCH-011
     validator_or_test:
-      - vllm_gr.patch._validate_model_runner_patch
+      - vllm_gr.v1.worker.model_runner_patch.validate_model_runner_patch
       - tests/platforms/test_runner_lifecycle.py::test_first_load_binds_admitted_plan_after_native_autofit
       - tests/platforms/test_runner_lifecycle.py::test_full_reload_rebinds_admitted_plan_after_native_autofit
       - tests/platforms/test_runner_lifecycle.py::test_autofit_does_not_hide_worker_plan_drift

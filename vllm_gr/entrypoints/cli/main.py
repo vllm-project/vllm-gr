@@ -67,7 +67,7 @@ def _serving_parser_type():
 
 
 def _gr_main(argv: list[str]) -> None:
-    from vllm_gr._env_check import configure_model_runner_default
+    from vllm_gr.engine.startup import configure_model_runner_default
 
     configure_model_runner_default()
     from vllm.entrypoints.serve.utils.api_utils import cli_env_setup

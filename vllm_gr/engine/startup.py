@@ -1,13 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Typed native startup settings shared by Python and CLI entrypoints."""
+"""Native startup settings shared by Python and CLI entrypoints."""
 
 import argparse
+import logging
+import os
 from collections.abc import Iterator, Mapping
 from functools import lru_cache
 from typing import Any
 
-from vllm_gr.config.parser import common_engine_defaults
+logger = logging.getLogger(__name__)
+
+
+def configure_model_runner_default() -> None:
+    """Default vllm-gr processes to the V1 model runner.
+
+    The GR beam-search worker patches target the V1 GPU/NPU model runner
+    lifecycle by default. vLLM can enable ModelRunner V2 automatically for
+    supported models such as Qwen3, so set the environment default before
+    vLLM constructs its configuration.
+
+    An explicit ``VLLM_USE_V2_MODEL_RUNNER=1`` (or any truthy spelling) is
+    preserved as an opt-in experimental path: the V2 runner is
+    beam_search-only (``execution_mode=v1`` persistent GR stage path).  The
+    LEGACY ``beam_data`` frame stack is not supported under V2 and fails fast.
+    """
+    value = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
+    if value is None:
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        logger.info(
+            "VLLM_USE_V2_MODEL_RUNNER was not set; defaulting to ModelRunner V1 "
+            "for vllm-gr compatibility."
+        )
+        return
+
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        # Normalize truthy spellings to "1": vLLM's env parser converts the
+        # value with int(), which rejects "true"/"yes"/"on" (ValueError).
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+        logger.warning(
+            "VLLM_USE_V2_MODEL_RUNNER=%s is an experimental vllm-gr path; "
+            "the V2 runner is beam_search-only (legacy beam_data frames "
+            "fail fast).",
+            value,
+        )
+    elif normalized in ("0", "false", "no", "off", ""):
+        # Likewise normalize falsy spellings (and empty string) to "0".
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    # Any other value is left untouched so vLLM surfaces its own parse error.
 
 
 def argument_parsers(parser: argparse.ArgumentParser) -> Iterator[argparse.ArgumentParser]:
@@ -72,6 +113,8 @@ def resolve_native_settings(
     be captured before parsing. An explicit value equal to a default is still
     explicit; null, false and empty lists are never dropped.
     """
+    from vllm_gr.config.parser import common_engine_defaults
+
     supplied = native_settings(document) if document is not None else {}
     explicit = set(supplied) | (set(overrides) if explicit_fields is None else explicit_fields)
     defaults = common_engine_defaults()

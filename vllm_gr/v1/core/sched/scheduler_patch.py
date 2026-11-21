@@ -554,3 +554,13 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
 
     setattr(patched_update_from_output, _SCHEDULER_UPDATE_PATCH_MARKER, True)
     scheduler_cls.update_from_output = patched_update_from_output
+
+
+def validate_scheduler_patch() -> str | None:
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False) and getattr(
+        Scheduler.update_from_output, _SCHEDULER_UPDATE_PATCH_MARKER, False
+    ):
+        return None
+    return "Scheduler Beam dispatch or completion hook is missing"

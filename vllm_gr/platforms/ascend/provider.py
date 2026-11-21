@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
 
+from ..compat import SUPPORTED_VLLM_ASCEND_VERSION, SUPPORTED_VLLM_VERSION
 from ..identity import PlatformIdentity
 from ..interface import (
     PROVIDER_API_VERSION,
@@ -47,8 +48,8 @@ class NPUBackendProvider(BuiltinPlanSupport):
     )
     api_version: ClassVar[int] = PROVIDER_API_VERSION
     gr_version_range: ClassVar[str | None] = ">=0.30.0,<0.31.0"
-    vllm_version_range: ClassVar[str | None] = "==0.30.0"
-    vendor_version_range: ClassVar[str | None] = "==0.30.0rc2"
+    vllm_version_range: ClassVar[str | None] = f"=={SUPPORTED_VLLM_VERSION}"
+    vendor_version_range: ClassVar[str | None] = f"=={SUPPORTED_VLLM_ASCEND_VERSION}"
     vendor_distribution: ClassVar[str | None] = "vllm-ascend"
 
     def matches(self, identity: PlatformIdentity) -> bool:
@@ -119,19 +120,20 @@ class NPUBackendProvider(BuiltinPlanSupport):
         return AscendConfigService()
 
     def check_environment(self) -> dict[str, str]:
-        from vllm_gr._env_check import check_ascend_environment
+        from .environment import check_ascend_environment
 
         return check_ascend_environment(require_npu_platform=True)
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
         del force  # Installers inspect their current targets on every call.
-        from vllm_gr.platforms.ascend import spawn_patch as npu_spawn_patch
         from vllm_gr.v1 import ascend_compat
+
+        from .spawn_patch import apply_npu_spawn_patch
 
         # Preserve spawn protection before native worker imports or process
         # creation. NPUWorker initializes Ascend ops before its ModelRunner;
         # keep that delayed import before the common Beam installer runs.
-        spawn_count = int(npu_spawn_patch.apply_npu_spawn_patch())
+        spawn_count = int(apply_npu_spawn_patch())
         worker_count = ascend_compat.patch_npu_worker_init_device()
         return spawn_count + worker_count
 

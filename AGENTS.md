@@ -27,7 +27,8 @@ installation guide in an environment for the target device. Set
 The deprecated `[gpu]`/`[npu]` extras do not provision those runtimes.
 
 Dependency and Python constraints belong to `pyproject.toml`, `setup.py`,
-`requirements/`, and `vllm_gr/_env_check.py`. Preserve them unless compatibility
+and `requirements/`. Built-in runtime version pins live in
+`vllm_gr/platforms/compat.py`. Preserve these constraints unless compatibility
 is part of the task. In particular, the NPU requirements depend on a prepared
 vendor runtime. Confirm the interpreter and import origin before runtime work:
 

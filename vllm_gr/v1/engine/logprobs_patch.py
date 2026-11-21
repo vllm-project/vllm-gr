@@ -51,3 +51,11 @@ def patch_flat_logprobs() -> None:
     from vllm.logprobs import FlatLogprobs
 
     FlatLogprobs.append_fast = append_fast
+
+
+def validate_flat_logprobs_patch() -> str | None:
+    from vllm.logprobs import FlatLogprobs
+
+    if FlatLogprobs.append_fast is not append_fast:
+        return "FlatLogprobs.append_fast does not reference the GR implementation"
+    return None

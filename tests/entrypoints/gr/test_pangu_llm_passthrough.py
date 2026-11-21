@@ -95,7 +95,7 @@ class TestPanguPluginInitializeRuntime(unittest.TestCase):
         from vllm_gr import plugin
 
         with (
-            mock.patch("vllm_gr._env_check.check_environment"),
+            mock.patch("vllm_gr.platforms.loader.activate_current_backend"),
             mock.patch("vllm_gr.patch.re_apply_patches", return_value=0),
             mock.patch("vllm_gr.patch.get_last_beam_patch_report", return_value=None),
         ):
@@ -106,7 +106,7 @@ class TestPanguPluginInitializeRuntime(unittest.TestCase):
 
 class TestModelRunnerDefault(unittest.TestCase):
     def test_defaults_to_v1_when_unset(self):
-        from vllm_gr._env_check import configure_model_runner_default
+        from vllm_gr.engine.startup import configure_model_runner_default
 
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
@@ -114,7 +114,7 @@ class TestModelRunnerDefault(unittest.TestCase):
             self.assertEqual(os.environ["VLLM_USE_V2_MODEL_RUNNER"], "0")
 
     def test_preserves_explicit_v2_override(self):
-        from vllm_gr._env_check import configure_model_runner_default
+        from vllm_gr.engine.startup import configure_model_runner_default
 
         with mock.patch.dict(
             os.environ,

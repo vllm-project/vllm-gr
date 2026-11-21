@@ -603,7 +603,7 @@ def test_the_patch_installs_verifies_and_is_idempotent(restore_route: Any) -> No
     patch_completion_batch()
 
     assert OpenAIServingCompletion._create_completion is create_completion_batch_dispatch
-    assert patch_module._validate_completion_batch_patch() is None
+    assert patch_module.validate_completion_batch_patch() is None
     original = patch_module._original_create_completion
     assert callable(original)
     patch_completion_batch()

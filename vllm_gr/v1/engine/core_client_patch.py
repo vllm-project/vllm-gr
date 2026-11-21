@@ -76,3 +76,40 @@ def apply_gr_session_patches() -> None:
     from vllm_gr.v1.engine.engine_core_patch import apply_engine_core_child_patches
 
     apply_engine_core_child_patches()
+
+
+def validate_engine_clients_patch() -> str | None:
+    from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
+
+    valid = (
+        getattr(AsyncMPClient, "submit_gr_session_async", None) is submit_gr_session_async
+        and getattr(SyncMPClient, "submit_gr_session", None) is sync_mp_submit_gr_session
+        and getattr(InprocClient, "submit_gr_session", None) is inproc_submit_gr_session
+        and getattr(InprocClient, "get_output", None) is inproc_get_output
+        and getattr(InprocClient, "add_request", None) is inproc_add_request
+        and getattr(InprocClient, "abort_requests", None) is inproc_abort_requests
+        and getattr(InprocClient, "shutdown", None) is inproc_shutdown
+    )
+    return None if valid else "EngineCore client methods are not fully installed"
+
+
+def validate_async_llm_patch() -> str | None:
+    from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.v1.engine.llm_engine import LLMEngine
+    from vllm.v1.engine.output_processor import OutputProcessor
+
+    from vllm_gr.v1.engine import beam_session_client
+    from vllm_gr.v1.engine.output_processor import _PROCESS_OUTPUTS_PATCH_MARKER
+
+    valid = (
+        bool(getattr(OutputProcessor.process_outputs, _PROCESS_OUTPUTS_PATCH_MARKER, False))
+        and getattr(LLMEngine, "add_request", None) is llm_engine_add_request
+        and getattr(AsyncLLM, "_add_request", None) is async_llm_add_request
+    )
+    for cls, suffix in ((LLMEngine, "sync"), (AsyncLLM, "async")):
+        for operation in ("submit", "wait", "abort", "release"):
+            name = f"{operation}_gr_session"
+            valid = valid and getattr(cls, name, None) is getattr(
+                beam_session_client, f"{name}_{suffix}"
+            )
+    return None if valid else "GR frontend lifecycle methods are not fully installed"

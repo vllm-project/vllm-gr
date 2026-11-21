@@ -17,6 +17,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 ROWS = [[7, 8, 9], [10, 11, 12]]
 TRIE_ADMISSION_ERROR = "trie_id is outside the loaded constraint table"
+RESULT_WIDTH_ERROR = "result_width must be an integer in [1, 1]"
 
 
 def _offline(model: str, config: str) -> None:
@@ -44,9 +45,16 @@ def _offline(model: str, config: str) -> None:
     ) as llm:
         prompts = [{"prompt_token_ids": row} for row in ROWS]
 
-        def submit(steps: int, trie_ids: list[int] | None = None) -> list[CompactBeamSearchOutput]:
+        def submit(
+            steps: int, trie_ids: list[int] | None = None, *, result_width: int | None = None
+        ) -> list[CompactBeamSearchOutput]:
             params = BeamSearchParams(
-                beam_width=4, max_tokens=steps, temperature=0.0, ignore_eos=True
+                beam_width=4,
+                max_tokens=steps,
+                temperature=0.0,
+                ignore_eos=True,
+                dynamic_beam_widths=[4, 2, 1] if result_width is not None else None,
+                result_width=result_width,
             )
             outputs: list[CompactBeamSearchOutput] = llm.beam_search(
                 prompts, params, trie_ids=trie_ids, output_mode="compact"
@@ -55,6 +63,10 @@ def _offline(model: str, config: str) -> None:
 
         with pytest.raises(ValueError, match="step|token"):
             submit(4)
+        with pytest.raises(VLLMValidationError) as invalid_width:
+            submit(3, result_width=2)
+        assert RESULT_WIDTH_ERROR in str(invalid_width.value)
+        assert all(len(item.sequences) == 1 for item in submit(3, result_width=1))
         with pytest.raises(VLLMValidationError, match=TRIE_ADMISSION_ERROR):
             submit(3, [0, 1])
         assert not llm.llm_engine.has_unfinished_requests()
@@ -79,14 +91,28 @@ def _http(address: str, model: Path) -> None:
         return_token_ids=True,
     )
 
-    def submit(steps: int, trie_ids: list[int] | None = None) -> requests.Response:
+    def submit(
+        steps: int, trie_ids: list[int] | None = None, *, result_width: int | None = None
+    ) -> requests.Response:
         payload = {**body, "max_tokens": steps}
+        xargs: dict[str, object] = {}
         if trie_ids is not None:
-            payload["vllm_xargs"] = {"trie_ids": trie_ids}
+            xargs["trie_ids"] = trie_ids
+        if result_width is not None:
+            xargs["dynamic_beam_widths"] = [4, 2, 1]
+            xargs["result_width"] = result_width
+        if xargs:
+            payload["vllm_xargs"] = xargs
         return requests.post(f"http://{address}/v1/completions", json=payload, timeout=90)
 
     invalid = submit(4)
     assert invalid.status_code == 400, invalid.text
+    invalid_width = submit(3, result_width=2)
+    assert invalid_width.status_code == 400, invalid_width.text
+    assert RESULT_WIDTH_ERROR in invalid_width.json()["error"]["message"]
+    narrowed = submit(3, result_width=1)
+    assert narrowed.status_code == 200, narrowed.text
+    assert len(narrowed.json()["choices"]) == len(ROWS)
     rejected = submit(3, [0, 1])
     assert rejected.status_code == 400, rejected.text
     assert TRIE_ADMISSION_ERROR in rejected.json()["error"]["message"]
@@ -151,6 +177,20 @@ def _grpc(address: str) -> None:
             assert list(item.beams.output_ids) == [
                 token for beam in expected["token_ids"] for token in beam
             ]
+
+        for request in batch.requests:
+            request.beam_search.dynamic_beam_widths.extend([4, 2, 1])
+            request.beam_search.result_width = 2
+        with pytest.raises(grpc.RpcError) as invalid_width:
+            stub.GenerateBatch(batch, timeout=90)
+        assert invalid_width.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert RESULT_WIDTH_ERROR in invalid_width.value.details()
+
+        for request in batch.requests:
+            request.beam_search.result_width = 1
+        narrowed = stub.GenerateBatch(batch, timeout=90)
+        assert len(narrowed.items) == len(ROWS)
+        assert all(len(item.beams.output_ids) == 3 for item in narrowed.items)
 
 
 @pytest.mark.slow

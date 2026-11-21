@@ -20,8 +20,10 @@ describe which dependencies the platform environment supplies.
 
 A vLLM-GR release can keep its existing vLLM requirement. When changing the
 supported vLLM version, update the relevant requirements, the
-[runtime compatibility checks](../../vllm_gr/_env_check.py), and the tests for
-affected runtime paths together.
+[built-in runtime pins](../../vllm_gr/platforms/compat.py), and the tests for
+affected runtime paths together. The built-in checks and CI compare the exact
+public version and allow a local build suffix. Provider-declared ranges use
+PEP 440 specifiers.
 
 The installed package metadata and `vllm_gr.__version__` must agree. A wheel
 built from a source distribution must retain that distribution's version.

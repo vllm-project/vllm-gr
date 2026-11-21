@@ -206,14 +206,16 @@ def test_patch_is_idempotent_and_keeps_native_mixin(monkeypatch: Any) -> None:
     from vllm.entrypoints.generate.base.serving import GenerateBaseServing
     from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 
-    from vllm_gr.patch import _validate_openai_beam_search_patch
+    from vllm_gr.entrypoints.openai.beam_search_patch import (
+        validate_openai_beam_search_patch,
+    )
 
     native = BeamSearchOnlineMixin.beam_search
     patch_beam_search()
     patch_beam_search()
     assert GenerateBaseServing.beam_search is beam_search_dispatch
     assert BeamSearchOnlineMixin.beam_search is native
-    assert _validate_openai_beam_search_patch() is None
+    assert validate_openai_beam_search_patch() is None
     with pytest.raises(ValueError, match="gr.beam_width"):
         _dispatch(None, monkeypatch)
 

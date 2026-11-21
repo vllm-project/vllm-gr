@@ -206,3 +206,68 @@ def patch_engine_core_process_entrypoint() -> None:
     )
 
     install_core_entrypoint()
+
+
+def _validate_beam_search_dispatch_patch() -> str | None:
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
+
+    if GenerateBaseServing.beam_search is not beam_search_dispatch:
+        return "GenerateBaseServing.beam_search does not reference the GR dispatcher"
+    return None
+
+
+def _validate_admission_rejection_patch() -> str | None:
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
+
+    if not getattr(
+        getattr(GenerateBaseServing, "_raise_if_error", None),
+        _ADMISSION_REJECTION_PATCH_MARKER,
+        False,
+    ):
+        return "GenerateBaseServing._raise_if_error does not reference the GR admission-rejection wrapper"
+    return None
+
+
+def _validate_client_request_id_patch() -> str | None:
+    from vllm.entrypoints.serve.engine.serving import BaseServing
+    from vllm.v1.engine.output_processor import OutputProcessor
+
+    if not getattr(
+        getattr(BaseServing, "_base_request_id", None), _CLIENT_REQUEST_ID_PATCH_MARKER, False
+    ):
+        return "BaseServing._base_request_id does not reference the GR client-request-id wrapper"
+    if not getattr(
+        getattr(OutputProcessor, "add_request", None), _SUBMIT_REQUEST_ID_PATCH_MARKER, False
+    ):
+        return "OutputProcessor.add_request does not reference the GR client-request-id wrapper"
+    return None
+
+
+def validate_openai_beam_search_patch() -> str | None:
+    """Verify every target mutated by the grouped OpenAI Beam installer."""
+
+    from vllm_gr.entrypoints.openai.completion_batch_patch import (
+        validate_completion_batch_patch,
+    )
+
+    failures = tuple(
+        detail
+        for detail in (
+            _validate_beam_search_dispatch_patch(),
+            _validate_admission_rejection_patch(),
+            _validate_client_request_id_patch(),
+            validate_completion_batch_patch(),
+        )
+        if detail is not None
+    )
+    return "; ".join(failures) or None
+
+
+def validate_chat_sampling_patch() -> str | None:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+    from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
+
+    if ChatCompletionRequest.to_beam_search_params is not to_beam_search_params:
+        return "ChatCompletionRequest.to_beam_search_params is not installed"
+    return None

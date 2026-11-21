@@ -87,13 +87,6 @@ class GRLLM(LLM):
         if removed:
             raise ValueError(f"Removed GR options {sorted(removed)}; use gr or config")
 
-        # Apply the vllm-gr ModelRunner policy before LLM.__init__ constructs
-        # VllmConfig. This keeps V1 as the default and preserves an explicit
-        # V2 opt-in for the adapted beam_search path.
-        from vllm_gr._env_check import configure_model_runner_default
-
-        configure_model_runner_default()
-
         # Ensure the vllm-gr runtime patches are installed (EngineArgs
         # arg-threading, worker hooks, EngineCore entrypoint) before building
         # EngineArgs.  The vLLM general-plugin loader normally does this at

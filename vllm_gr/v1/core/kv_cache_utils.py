@@ -262,3 +262,18 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
     # Exposed for tests / diagnostics: the live chain-memo store.
     get_request_block_hasher_memo._gr_chain_memo_entries = chain_memo  # type: ignore[attr-defined]
     kv_cache_utils.get_request_block_hasher = get_request_block_hasher_memo
+
+
+def validate_kv_hash_memo_patch() -> str | None:
+    """Verify both prefix-hash wrappers and the factory used by EngineCore."""
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.engine import core
+
+    if not getattr(kv_cache_utils.hash_block_tokens, "_gr_hash_memo", False):
+        return "hash_block_tokens memo wrapper not installed"
+    factory = kv_cache_utils.get_request_block_hasher
+    if not getattr(factory, "_gr_chain_memo", False):
+        return "get_request_block_hasher chain memo wrapper not installed"
+    if core.get_request_block_hasher is not factory:
+        return "EngineCore get_request_block_hasher is not bound to the chain memo wrapper"
+    return None

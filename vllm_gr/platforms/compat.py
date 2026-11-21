@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Declared compatibility ranges checked before a provider is activated."""
+"""Package version checks for provider declarations and built-in runtimes."""
 
 from __future__ import annotations
 
 import logging
 import os
 from functools import cache
+from importlib import metadata
 
 from .errors import InvalidBackendProviderError
 from .interface import GRBackendProvider
 
 logger = logging.getLogger("vllm_gr.platforms.compat")
+
+# Exact versions supported by the built-in providers. The CI resolver reads
+# these literals without importing the target checkout.
+SUPPORTED_VLLM_VERSION = "0.30.0"
+SUPPORTED_VLLM_ASCEND_VERSION = "0.30.0rc2"
+SUPPORTED_TRITON_ASCEND_VERSION = "3.6.0"
 
 #: When set to a truthy value, an unsatisfied declared range is a hard failure.
 #: The default only warns: whether a declared range still holds is a vendor
@@ -53,15 +60,32 @@ def strict_ranges_enabled() -> bool:
     return os.environ.get(_STRICT_ENV, "").strip().lower() in _TRUTHY
 
 
-def _installed_version(distribution: str) -> str | None:
+def installed_version(distribution: str) -> str | None:
+    """Read distribution metadata without importing its runtime modules."""
     try:
-        from importlib.metadata import PackageNotFoundError, version
-    except ImportError:  # pragma: no cover - stdlib always provides it
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
         return None
-    try:
-        return version(distribution)
-    except PackageNotFoundError:
-        return None
+
+
+def require_runtime_version(distribution: str, required: str) -> str:
+    """Require an exact public runtime version and retain its local suffix."""
+    installed = installed_version(distribution)
+    if installed is None:
+        raise RuntimeError(
+            f"vllm-gr requires {distribution} to be installed before runtime initialization"
+        )
+    # Match the CI resolver's public version comparison for built-in pins.
+    if installed.partition("+")[0] != required:
+        raise RuntimeError(
+            f"Unsupported {distribution} version: found {installed}, required {required}."
+        )
+    return installed
+
+
+def check_vllm_runtime() -> dict[str, str]:
+    """Check the vLLM runtime supported by the built-in providers."""
+    return {"vllm": require_runtime_version("vllm", SUPPORTED_VLLM_VERSION)}
 
 
 def _specifier_allows(specifier: str, version: str) -> bool:
@@ -87,7 +111,7 @@ def _check_range(
 ) -> None:
     if declared is None:
         return
-    installed = _installed_version(distribution)
+    installed = installed_version(distribution)
     if installed is None:
         failures.append(
             f"{label} distribution {distribution!r} is not installed "
@@ -107,7 +131,7 @@ def check_declared_ranges(provider: GRBackendProvider) -> tuple[str, ...]:
     Empty means all declared ranges hold. ``None`` declares no constraint.
     """
     failures: list[str] = []
-    gr_version = _installed_version("vllm-gr") or _source_tree_version()
+    gr_version = installed_version("vllm-gr") or _source_tree_version()
 
     declared_gr = provider.gr_version_range
     if declared_gr is not None and gr_version is not None:

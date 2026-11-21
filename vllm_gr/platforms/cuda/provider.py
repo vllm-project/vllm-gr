@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
 
+from ..compat import SUPPORTED_VLLM_VERSION
 from ..identity import PlatformIdentity, platform_identity
 from ..interface import (
     PROVIDER_API_VERSION,
@@ -35,7 +36,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
     patch_ids: ClassVar[tuple[str, ...]] = ("GR-PATCH-011",)
     api_version: ClassVar[int] = PROVIDER_API_VERSION
     gr_version_range: ClassVar[str | None] = ">=0.30.0,<0.31.0"
-    vllm_version_range: ClassVar[str | None] = "==0.30.0"
+    vllm_version_range: ClassVar[str | None] = f"=={SUPPORTED_VLLM_VERSION}"
     vendor_version_range: ClassVar[None] = None
     vendor_distribution: ClassVar[None] = None
 
@@ -93,12 +94,12 @@ class CUDABackendProvider(BuiltinPlanSupport):
     def check_environment(self) -> dict[str, str]:
         from vllm.platforms import current_platform
 
-        from vllm_gr._env_check import check_runtime_versions
+        from ..compat import check_vllm_runtime
 
         if not self.matches(platform_identity(current_platform)):
             raise RuntimeError("CUDA provider requires the native CUDA platform")
 
-        report = check_runtime_versions()
+        report = check_vllm_runtime()
         report["platform"] = "cuda"
         return report
 

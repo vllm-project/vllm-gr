@@ -12,9 +12,10 @@ later in a worker or during native configuration.
 
 Scope: `core`; backend ID: `null`
 
-The general plugin installs runtime hooks in each process that needs them.
-Installation checks live targets so repeated initialization can reuse an existing
-wrapper.
+The general plugin sets ModelRunner defaults, activates the current provider,
+and validates its environment before passing that provider into patch installation.
+The frontend and EngineCore use their own ordered plans. Each patch module
+verifies its own bindings so repeated initialization can reuse an existing wrapper.
 
 ### GR-PATCH-001 — CUSTOM Attention Selector Compatibility
 
@@ -37,8 +38,9 @@ availability, so later initialization retries the installation.
 Scope: `core`; backend ID: `null`
 
 The frontend appends flattened log probabilities through the GR implementation of
-the native fast-append method. Its arguments and the upstream flattened
-representation must stay compatible.
+the native fast-append method in
+[logprobs_patch.py](../../../vllm_gr/v1/engine/logprobs_patch.py).
+Its arguments and the upstream flattened representation must stay compatible.
 
 ### GR-PATCH-004 — OpenAI Beam Serving Override
 
@@ -133,8 +135,8 @@ native weight reload.
 Scope: `backend`; backend ID: `ascend`
 
 Ascend subprocesses must use a compatible start method when the parent has
-initialized the device. The hook supplements the native process-start decision for
-NPU.
+initialized the device. The Ascend provider installs spawn protection before
+the native worker initialization hook.
 
 ### GR-PATCH-018 — Ascend Penalties Warmup OOM Guard
 

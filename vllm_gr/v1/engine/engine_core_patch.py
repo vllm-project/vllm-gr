@@ -340,3 +340,47 @@ def run_engine_core(
         )
     finally:
         _run_engine_core_active = False
+
+
+def validate_engine_core_entrypoint_patch() -> str | None:
+    from vllm.v1.engine.core import EngineCoreProc
+
+    if EngineCoreProc.run_engine_core is not run_engine_core:
+        return "EngineCore process entrypoint wrapper is not installed"
+    return None
+
+
+def validate_engine_core_request_patch() -> str | None:
+    from vllm.v1.engine.core import EngineCore, EngineCoreProc
+
+    from vllm_gr.v1.engine.core import (
+        _handle_submit_gr_session,
+        is_gr_session_retired,
+    )
+    from vllm_gr.v1.engine.core_socket import process_input_sockets
+
+    valid = (
+        getattr(EngineCore, "_handle_submit_gr_session", None) is _handle_submit_gr_session
+        and getattr(EngineCore.__init__, "_gr_trie_capacity_patch", False)
+        and getattr(EngineCoreProc, "_handle_submit_gr_session", None) is _handle_submit_gr_session
+        and getattr(EngineCore, "is_gr_session_retired", None) is is_gr_session_retired
+        and getattr(EngineCoreProc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)
+        and getattr(EngineCoreProc._handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, False)
+        and EngineCoreProc.process_input_sockets is process_input_sockets
+        and getattr(EngineCoreProc.process_input_sockets, _PIS_PATCH_MARKER, False)
+    )
+    return None if valid else "EngineCore GR session dispatch is not fully installed"
+
+
+def validate_engine_core_request_group() -> str | None:
+    from vllm_gr.v1.engine.wire import validate_request_types_patch
+
+    failures = tuple(
+        detail
+        for detail in (
+            validate_request_types_patch(),
+            validate_engine_core_request_patch(),
+        )
+        if detail is not None
+    )
+    return "; ".join(failures) or None

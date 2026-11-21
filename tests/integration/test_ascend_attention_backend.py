@@ -40,7 +40,7 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
     from vllm_ascend.ascend_config import clear_ascend_config, init_ascend_config
     from vllm_ascend.utils import register_ascend_customop
 
-    from vllm_gr._env_check import check_ascend_environment
+    from vllm_gr.platforms.ascend.environment import check_ascend_environment
     from vllm_gr.platforms.config import engine_config_service
     from vllm_gr.v1.attention import selector_patch
     from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend

@@ -12,6 +12,52 @@ import pytest
 from tests.helpers.paths import REPO_ROOT
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_package_import_defers_runtime_checks_and_runs_opencv_before_grllm() -> None:
+    code = """
+import importlib.metadata
+import sys
+from types import ModuleType
+from unittest.mock import patch
+
+
+def unexpected_version(distribution):
+    raise AssertionError(f"unexpected distribution lookup for {distribution}")
+
+
+with patch.object(importlib.metadata, "version", unexpected_version):
+    import vllm_gr
+
+assert "vllm" not in sys.modules
+assert "torch" not in sys.modules
+assert "GRLLM" in dir(vllm_gr)
+assert "GRLLM" not in vars(vllm_gr)
+
+from vllm_gr import _env_check
+
+with patch.object(_env_check, "check_opencv_env", side_effect=RuntimeError("bad ABI")):
+    try:
+        vllm_gr.GRLLM
+    except RuntimeError as exc:
+        assert str(exc) == "bad ABI"
+    else:
+        raise AssertionError("preflight failure should stop the lazy import")
+assert "vllm_gr.entrypoints.llm" not in sys.modules
+assert "GRLLM" not in vars(vllm_gr)
+
+frontend = ModuleType("vllm_gr.entrypoints.llm")
+frontend.GRLLM = object()
+sys.modules[frontend.__name__] = frontend
+with patch.object(_env_check, "check_opencv_env") as preflight:
+    assert vllm_gr.GRLLM is frontend.GRLLM
+    assert vllm_gr.GRLLM is frontend.GRLLM
+    preflight.assert_called_once_with()
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], cwd=REPO_ROOT, check=True, capture_output=True, text=True
+    )
+
+
 def test_platform_package_and_builtins_do_not_load_hardware_modules() -> None:
     project_root = REPO_ROOT
     code = """
