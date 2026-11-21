@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "targets": {
+    "cuda:L20": {
+      "enabled": false,
+      "allocations": {}
+    },
+    "cuda:A100": {
+      "enabled": false,
+      "allocations": {}
+    },
+    "cuda:H800": {
+      "enabled": false,
+      "allocations": {}
+    },
+    "cuda:H100": {
+      "enabled": false,
+      "allocations": {}
+    },
+    "cuda:L4": {
+      "enabled": false,
+      "allocations": {}
+    },
+    "cuda:B200": {
+      "enabled": false,
+      "allocations": {}
+    },
+    "npu:A2": {
+      "enabled": false,
+      "allocations": {}
+    },
+    "npu:A3": {
+      "enabled": false,
+      "allocations": {}
+    },
+    "npu:A5": {
+      "enabled": false,
+      "allocations": {}
+    }
+  }
+}
