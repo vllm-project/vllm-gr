@@ -1,0 +1,118 @@
+name: Pytest gate suites (opt-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Registered hardware targets, separated by spaces
+        required: true
+        default: cuda:H100
+        type: string
+      suites:
+        description: Suites separated by spaces; A/B remains in its PR workflow
+        required: true
+        default: unit
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install PyYAML
+      - id: plan
+        env:
+          TARGETS: ${{ inputs.targets }}
+          SUITES: ${{ inputs.suites }}
+        run: |
+          matrix=$(python -m tools.ci.gate_matrix plan --targets "$TARGETS" \
+            --suites "$SUITES" --commit "$GITHUB_SHA" --output gate-plan.json)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-plan
+          path: gate-plan.json
+          if-no-files-found: error
+          overwrite: true
+
+  suite:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.labels }}
+    timeout-minutes: 250
+    concurrency:
+      group: vllm-gr-accelerator-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
+    env:
+      GATE_PYTHON: ${{ matrix.python }}
+      GATE_CARDS: ${{ matrix.cards }}
+      GATE_SUITE: ${{ matrix.suite }}
+      POLICY_BOARD: ${{ matrix.policy_board }}
+      GATE_HARDWARE: ${{ matrix.hardware }}
+      VLLM_GR_ISOLATED_RUNNER: ${{ matrix.isolated }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use the provisioned runtime and development dependencies
+        run: |
+          export VLLM_GR_TARGET_DEVICE="${GATE_HARDWARE%%:*}"
+          echo "VLLM_GR_TARGET_DEVICE=$VLLM_GR_TARGET_DEVICE" >> "$GITHUB_ENV"
+          "$GATE_PYTHON" -m pip install --no-deps -e .
+          "$GATE_PYTHON" -c 'import pytest, pytest_timeout, filelock, huggingface_hub, vllm, vllm_gr'
+          "$GATE_PYTHON" -c 'from pathlib import Path; import vllm_gr; assert Path(vllm_gr.__file__).resolve().is_relative_to(Path.cwd())'
+      - name: Resolve the existing benchmark policy
+        env:
+          POLICY_REF: ${{ github.ref }}
+        run: |
+          device=gpu
+          if [[ "$GATE_HARDWARE" == npu:* ]]; then device=npu; fi
+          "$GATE_PYTHON" tools/ci/resolve_benchmark_policy.py \
+            --device "$device" --source-ref "$POLICY_REF" \
+            --policy-file .github/benchmark-gate.yaml --board-id "$POLICY_BOARD" \
+            --github-env "$GITHUB_ENV" --github-step-summary "$GITHUB_STEP_SUMMARY"
+      - name: Run the selected suite
+        run: |
+          "$GATE_PYTHON" -m tools.ci.run_gate --suite "$GATE_SUITE" \
+            --hardware "$GATE_HARDWARE" --cards "$GATE_CARDS" --output gate-output
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-result-${{ matrix.id }}
+          path: gate-output
+          if-no-files-found: error
+          overwrite: true
+
+  summary:
+    if: always()
+    needs: [plan, suite]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-plan
+          path: plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-result-*
+          path: reports
+      - name: Require every planned job and current report
+        env:
+          JOB_RESULT: ${{ needs.suite.result }}
+        run: |
+          python -m tools.ci.gate_matrix verify --plan plan/gate-plan.json \
+            --reports reports --job-result "$JOB_RESULT"
