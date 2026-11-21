@@ -77,7 +77,7 @@ def test_runtime_patch_order_preserves_ascend_initialization(
     import vllm_gr.patch as runtime_patch
     from vllm_gr.platforms import loader
     from vllm_gr.platforms.ascend import NPU_BACKEND, spawn_patch
-    from vllm_gr.v1 import ascend_compat
+    from vllm_gr.v1.worker.npu import startup_patch
 
     monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
     call_order: list[str] = []
@@ -118,7 +118,7 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_attention,
     )
     monkeypatch.setattr(
-        ascend_compat,
+        startup_patch,
         "patch_npu_worker_init_device",
         patch_npu_worker,
     )

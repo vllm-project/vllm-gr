@@ -126,15 +126,16 @@ class NPUBackendProvider(BuiltinPlanSupport):
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
         del force  # Installers inspect their current targets on every call.
-        from vllm_gr.v1 import ascend_compat
-
         from .spawn_patch import apply_npu_spawn_patch
 
         # Preserve spawn protection before native worker imports or process
         # creation. NPUWorker initializes Ascend ops before its ModelRunner;
         # keep that delayed import before the common Beam installer runs.
         spawn_count = int(apply_npu_spawn_patch())
-        worker_count = ascend_compat.patch_npu_worker_init_device()
+
+        from vllm_gr.v1.worker.npu.startup_patch import patch_npu_worker_init_device
+
+        worker_count = patch_npu_worker_init_device()
         return spawn_count + worker_count
 
     def get_model_runner_hooks(self) -> ModelRunnerInstaller:

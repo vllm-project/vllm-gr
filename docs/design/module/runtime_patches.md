@@ -33,9 +33,10 @@ attention selector or its cache can silently select a different backend.
 
 Scope: `backend`; backend ID: `ascend`
 
-Ascend needs its configuration filter and worker hooks before native device
-initialization constructs the runner. An early import can precede worker
-availability, so later initialization retries the installation.
+The [NPU startup hooks](../../../vllm_gr/v1/worker/npu/startup_patch.py) install
+worker utilities before native device initialization constructs the runner.
+An early import can precede worker availability, so later initialization
+retries the installation. The platform configuration filter can run separately.
 
 ## GR-PATCH-003 — FlatLogprobs Fast Append Override
 
@@ -54,7 +55,9 @@ Scope: `core`; backend ID: `null`
 
 The serving frontend groups prompts into one Beam submission and formats their
 ranked candidates for the OpenAI-compatible API. The wrapper depends on the
-native serving and protocol methods it replaces.
+native serving and protocol methods it replaces. The patch validates the Chat
+and Completion sampling methods and the Completion `vllm_xargs` schema for
+integer lists. A missing binding or a mismatched schema triggers reinstallation.
 
 ## GR-PATCH-005 — EngineArgs Configuration Override
 
@@ -121,6 +124,13 @@ execution. Cached prefixes, real row lengths and parent selection must stay
 aligned with native block tables. See
 [Ascend Beam Decode execution](../feature/npu_decode_execution.md).
 
+The [worker stage projection](../../../vllm_gr/v1/worker/npu/stage_projection.py)
+wraps the instance logits processor, runner reload and native worker weight-update
+methods. It invalidates the projection before native writes and refreshes it after
+finalization and device synchronization. The
+[operator helper](../../../vllm_gr/ops/npu/stage_projection.py) owns the fixed-address
+weights, biases and proxies.
+
 ## GR-PATCH-013 — CUSTOM Attention Backend Registration
 
 Scope: `core`; backend ID: `null`
@@ -150,16 +160,18 @@ the native worker initialization hook.
 Scope: `backend`; backend ID: `ascend`
 
 Ascend warmup can allocate penalty tensors that exceed available memory. The
-wrapper handles the warmup allocation failure while preserving other execution
-errors. The inventory lists no behavioural test for this guard.
+[NPU startup hook](../../../vllm_gr/v1/worker/npu/startup_patch.py) handles the
+warmup allocation failure while preserving other execution errors.
+The inventory lists no behavioural test for this guard.
 
 ## GR-PATCH-019 — Ascend additional_config Sanitizer
 
 Scope: `backend`; backend ID: `ascend`
 
-The engine retains GR settings while filtering keys passed to the Ascend
-configuration reader. Fresh EngineCore processes must install the common plan
-before native construction.
+The [Ascend configuration patch](../../../vllm_gr/platforms/ascend/config_patch.py)
+retains GR settings while filtering keys passed to the native configuration
+reader. Fresh EngineCore processes install the common plan before native
+construction. Worker startup also refreshes the filter's native bindings.
 
 ## GR-PATCH-020 — Pangu Tied Embeddings
 
@@ -173,11 +185,11 @@ zero logits.
 
 Scope: `backend`; backend ID: `ascend`
 
-Eligible Ascend xllm Beam layers can request contiguous prefix K/V at native
-allocation. The patch bridges that allocation policy. Attention row selection
-is a separate reader (`select_beam_rows`) that checks layout, strides and
-format before using the paged block table; an unsuitable layout keeps the
-gather path.
+The [NPU cache layout patch](../../../vllm_gr/v1/worker/npu/kv_layout_patch.py)
+lets eligible Ascend xllm Beam layers request contiguous prefix K/V at native
+allocation. Attention row selection is a separate reader (`select_beam_rows`)
+that checks layout, strides and format before using the paged block table.
+An unsuitable layout keeps the gather path.
 
 ## Retired patches
 

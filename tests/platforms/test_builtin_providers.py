@@ -129,8 +129,8 @@ def test_cuda_runtime_patch_is_noop() -> None:
 def test_npu_runtime_patches_preserve_order_and_sum_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import v1
     from vllm_gr.platforms.ascend import spawn_patch
+    from vllm_gr.v1.worker.npu import startup_patch
 
     events: list[tuple[str, bool | None]] = []
 
@@ -142,10 +142,7 @@ def test_npu_runtime_patches_preserve_order_and_sum_counts(
         events.append(("worker", None))
         return 3
 
-    ascend_compat = SimpleNamespace(
-        patch_npu_worker_init_device=patch_worker,
-    )
-    monkeypatch.setattr(v1, "ascend_compat", ascend_compat, raising=False)
+    monkeypatch.setattr(startup_patch, "patch_npu_worker_init_device", patch_worker)
     monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", apply_spawn)
 
     assert npu.NPU_BACKEND.apply_runtime_patches(force=True) == 4

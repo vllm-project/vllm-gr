@@ -41,9 +41,9 @@ Risk: `critical`; process roles: `engine_core`, `worker`
 
 Scope: `backend`; backend ID: `ascend`
 
-Owner: `vllm_gr/v1/ascend_compat.py`
+Owner: `vllm_gr/v1/worker/npu/startup_patch.py`
 
-Installer: `vllm_gr.v1.ascend_compat.patch_npu_worker_init_device`
+Installer: `vllm_gr.v1.worker.npu.startup_patch.patch_npu_worker_init_device`
 
 Risk: `high`; process roles: `worker`
 
@@ -141,7 +141,7 @@ Risk: `critical`; process roles: `gpu_worker`
 
 Scope: `backend`; backend ID: `ascend`
 
-Owner: `vllm_gr/v1/worker/npu/npu_model_runner_patch.py`
+Owner: `vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/stage_projection.py`
 
 Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
@@ -181,9 +181,9 @@ Risk: `medium`; process roles: `main`, `engine_core`
 
 Scope: `backend`; backend ID: `ascend`
 
-Owner: `vllm_gr/v1/ascend_compat.py`
+Owner: `vllm_gr/v1/worker/npu/startup_patch.py`
 
-Installer: `vllm_gr.v1.ascend_compat.apply_penalties_warmup_oom_guard`
+Installer: `vllm_gr.v1.worker.npu.startup_patch.apply_penalties_warmup_oom_guard`
 
 Risk: `medium`; process roles: `npu_worker`
 
@@ -191,9 +191,9 @@ Risk: `medium`; process roles: `npu_worker`
 
 Scope: `backend`; backend ID: `ascend`
 
-Owner: `vllm_gr/v1/ascend_compat.py`
+Owner: `vllm_gr/platforms/ascend/config_patch.py`
 
-Installer: `vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer and patch_npu_worker_init_device`
+Installer: `vllm_gr.platforms.ascend.config_patch.apply_engine_core_config_sanitizer and install_ascend_config_filter`
 
 Risk: `high`; process roles: `main`, `engine_core`, `worker`
 
@@ -211,9 +211,9 @@ Risk: `high`; process roles: `main`, `engine_core`, `worker`
 
 Scope: `backend`; backend ID: `ascend`
 
-Owner: `vllm_gr/v1/npu_kv_layout.py`
+Owner: `vllm_gr/v1/worker/npu/kv_layout_patch.py`
 
-Installer: `vllm_gr.v1.npu_kv_layout.apply_npu_contiguous_kv_cache_patch`
+Installer: `vllm_gr.v1.worker.npu.kv_layout_patch.apply_npu_contiguous_kv_cache_patch`
 
 Risk: `high`; process roles: `npu_worker`
 

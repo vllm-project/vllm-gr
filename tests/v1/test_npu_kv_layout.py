@@ -35,7 +35,7 @@ class _BeamImpl:
 
 @pytest.fixture  # type: ignore[misc]
 def policy(monkeypatch: pytest.MonkeyPatch) -> Any:
-    path = REPO_ROOT / "vllm_gr/v1/npu_kv_layout.py"
+    path = REPO_ROOT / "vllm_gr/v1/worker/npu/kv_layout_patch.py"
     spec = importlib.util.spec_from_file_location("_test_npu_kv_layout", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -442,7 +442,7 @@ def test_foreign_rebinding_after_install_is_preserved(policy: Any) -> None:
 
 
 def test_module_import_is_stdlib_only() -> None:
-    path = REPO_ROOT / "vllm_gr/v1/npu_kv_layout.py"
+    path = REPO_ROOT / "vllm_gr/v1/worker/npu/kv_layout_patch.py"
     spec = importlib.util.spec_from_file_location("_npu_kv_layout_no_runtime", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

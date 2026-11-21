@@ -2,14 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Scoped GR bindings for the upstream vLLM gRPC server lifecycle."""
 
-import asyncio
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 
 from google.protobuf import descriptor_pool
 
 from vllm_gr.config.models import deployment_for
-from vllm_gr.entrypoints.beam_search.client import _ASYNC_CLEANUP_TASKS
+from vllm_gr.entrypoints.beam_search.client import drain_async_cleanup
 
 from .generated import vllm_engine_pb2 as pb
 from .generated import vllm_engine_pb2_grpc as rpc
@@ -79,8 +78,7 @@ def patch_grpc_server():
                         await admin.stop()
                     # Request cancellation may leave retrying cleanup tasks.
                     # Finish them before upstream calls AsyncLLM.shutdown().
-                    while _ASYNC_CLEANUP_TASKS:
-                        await asyncio.gather(*list(_ASYNC_CLEANUP_TASKS), return_exceptions=True)
+                    await drain_async_cleanup()
 
             replace(server, "stop", stop_and_drain)
             rpc.add_VllmEngineServicer_to_server(servicer, server)

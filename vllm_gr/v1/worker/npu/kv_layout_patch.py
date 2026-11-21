@@ -13,7 +13,7 @@ from importlib import import_module
 from importlib.metadata import version
 from typing import Any, cast
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("vllm_gr.v1.npu_kv_layout")
 _MARKER = "_vllm_gr_contiguous_prefix_kv_policy"
 _ORIGINAL = "_vllm_gr_contiguous_prefix_kv_original"
 _HELPER = "requires_contiguous_pa_kv_cache"

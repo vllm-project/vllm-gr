@@ -15,11 +15,8 @@ from vllm.utils import random_uuid
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import GRConfig, resolve_candidate_width
-from vllm_gr.config.models import (
-    ConstraintTableBackendEnum,
-    configured_candidate_width,
-    runtime_constraint_table,
-)
+from vllm_gr.config.execution import validate_gr_execution_config
+from vllm_gr.config.models import configured_candidate_width
 from vllm_gr.entrypoints.beam_search.boundary_tokens import boundary_token_id
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search.protocol import (
@@ -28,6 +25,11 @@ from vllm_gr.entrypoints.beam_search.protocol import (
 )
 from vllm_gr.entrypoints.beam_search.request_params import (
     apply_beam_request_defaults,
+)
+from vllm_gr.platforms.beam_requests import (
+    uses_retained_candidate_widths,
+    validate_dynamic_width_support,
+    validate_frontend_constraint_mode,
 )
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
@@ -55,7 +57,7 @@ def _get_token_id(tokenizer: Any, token: str | None, name: str) -> int | None:
         raise BeamSearchRequestError(str(exc)) from exc
 
 
-def _resolve_candidate_width(vllm_config: Any, params: Any) -> int:
+def _resolve_candidate_width(vllm_config: Any) -> int:
     """Resolve K for one request, matching the engine's startup derivation.
 
     ``constraint_table.candidate_width`` is the single source of truth; when it
@@ -81,13 +83,7 @@ def _configured_candidate_width(vllm_config: Any) -> int | None:
 
     config = GRConfig.from_vllm_config(vllm_config)
     device = getattr(getattr(vllm_config, "device_config", None), "device", None)
-    if (
-        str(device).split(":")[0] == "npu"
-        and config.deployment.candidate_width is not None
-        and config.deployment.candidate_width == config.deployment.beam_width
-    ):
-        # NPU derives K from each stage's retained width. Do not serialize
-        # the workspace capacity as a fixed request override for dynamic W.
+    if uses_retained_candidate_widths(config, device):
         return None
     return configured_candidate_width(config)
 
@@ -134,18 +130,12 @@ def _create_request_params(
     except ValueError as error:
         raise BeamSearchRequestError(str(error)) from error
 
-    stop_token_id = end_token_id
-    if stop_token_id is None:
-        stop_token_id = getattr(tokenizer, "eos_token_id", None)
-    stop_token_ids = () if stop_token_id is None else (int(stop_token_id),)
-    if params.ignore_eos:
-        stop_token_ids = ()
     sampling_params = SamplingParams(
-        logprobs=_resolve_candidate_width(vllm_config, params),
+        logprobs=_resolve_candidate_width(vllm_config),
         max_tokens=decode_steps,
         temperature=params.temperature,
         ignore_eos=params.ignore_eos,
-        stop_token_ids=list(stop_token_ids),
+        stop_token_ids=[],
         detokenize=False,
         flat_logprobs=True,
         skip_clone=True,
@@ -174,7 +164,6 @@ def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> l
 def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     from vllm_gr.v1.engine.beam_admission import (
         validate_gr_device_config,
-        validate_gr_execution_config,
         validate_gr_request,
     )
 
@@ -182,33 +171,12 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
         validate_gr_execution_config(vllm_config)
         validate_gr_device_config(vllm_config, request)
         validate_gr_request(request, config=vllm_config)
+        gr_config = GRConfig.from_vllm_config(vllm_config)
+        validate_frontend_constraint_mode(
+            vllm_config, gr_config, request.beam_params.catalog_strategy
+        )
     except ValueError as error:
         raise BeamSearchRequestError(str(error)) from error
-    # Shared validation above owns request/config semantics. Only frontend
-    # limits and the configured Constraint Table remain to check here.
-    from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
-
-    gr_config = GRConfig.from_vllm_config(vllm_config)
-    table = runtime_constraint_table(gr_config)
-    unconstrained = configured_constraint_mode(gr_config) is ConstraintMode.NONE
-    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
-    device_type = str(device).split(":")[0]
-    if unconstrained and device_type not in ("cuda", "npu"):
-        raise BeamSearchRequestError("unconstrained beam_search requires CUDA or NPU")
-    required_backend = (
-        ConstraintTableBackendEnum.NPU if device_type == "npu" else ConstraintTableBackendEnum.CUDA
-    )
-    if not unconstrained and (
-        table is None or not table.enabled or table.backend is not required_backend
-    ):
-        raise BeamSearchRequestError(
-            "beam_search requires an enabled canonical "
-            f"{required_backend.value.upper()} constraint table"
-        )
-    if not unconstrained and request.beam_params.catalog_strategy is not None:
-        raise BeamSearchRequestError(
-            "catalog_strategy is not applicable to the constraint_table backend"
-        )
     max_width = gr_config.beam_max_width
     if max_width is None:
         raise BeamSearchRequestError("beam_search requires vllm-gr beam_max_width to be configured")
@@ -279,13 +247,11 @@ def _create_batch_request(
     dynamic_widths = getattr(params, "dynamic_beam_widths", None)
     per_parent_beam_widths = getattr(params, "per_parent_beam_widths", None)
     result_width = getattr(params, "result_width", None)
-    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
-    if str(device).split(":")[0] not in ("cuda", "npu") and (
-        dynamic_widths is not None or result_width is not None
-    ):
-        raise BeamSearchRequestError(
-            "dynamic_beam_widths and result_width require CUDA or NPU beam_search"
-        )
+    if dynamic_widths is not None or result_width is not None:
+        try:
+            validate_dynamic_width_support(vllm_config)
+        except ValueError as error:
+            raise BeamSearchRequestError(str(error)) from error
     if dynamic_widths is not None and (
         not isinstance(dynamic_widths, list)
         or len(dynamic_widths) != sampling_params.max_tokens

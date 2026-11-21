@@ -439,7 +439,6 @@
     "tests/engine/test_npu_sid_stage_config.py::test_sid_stage_vocab_canonical_transport_preserves_opt_in": "l1",
     "tests/engine/test_npu_sid_stage_config.py::test_sid_stage_vocab_canonical_update_invalidates_parsed_cache": "l1",
     "tests/engine/test_npu_sid_stage_config.py::test_sid_stage_vocab_defaults_off_without_activating_gr": "l1",
-    "tests/engine/test_npu_sid_stage_config.py::test_sid_stage_vocab_legacy_transport_and_disable_clear_stale_flag": "l1",
     "tests/engine/test_npu_sid_stage_config.py::test_sid_stage_vocab_rejects_mixed_canonical_and_legacy_inputs": "l1",
     "tests/engine/test_npu_sid_stage_config.py::test_sid_stage_vocab_rejects_non_boolean": "l1",
     "tests/engine/test_npu_sid_stage_config.py::test_sid_stage_vocab_rejects_other_or_unknown_device": "l1",

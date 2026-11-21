@@ -20,8 +20,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from tests.helpers.gr_config import set_deployment
-from vllm_gr.ops.npu.stage_projection import NPUStageProjection
 from vllm_gr.v1.worker.npu.stage_projection import (
+    NPUStageProjection,
     can_install_npu_stage_projection,
     install_npu_sid_stage_projection,
     install_npu_stage_projection,
@@ -517,8 +517,8 @@ def test_ineligible_runner_is_rejected_before_projection_allocation(
 def _projection_addresses(owner: NPUStageProjection) -> tuple[Any, ...]:
     return (
         tuple(weight.data_ptr() for weight in owner.stage_weights),
-        tuple(None if bias is None else bias.data_ptr() for bias in owner._stage_biases),
-        tuple((id(proxy), proxy.weight.data_ptr()) for proxy in owner._proxies),
+        tuple(None if bias is None else bias.data_ptr() for bias in owner._weights.stage_biases),
+        tuple((id(proxy), proxy.weight.data_ptr()) for proxy in owner._weights.proxies),
     )
 
 

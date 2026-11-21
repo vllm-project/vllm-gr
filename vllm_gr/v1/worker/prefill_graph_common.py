@@ -293,9 +293,7 @@ class BasePrefillGraphRunner:
             buckets or get_default_buckets(getattr(model_runner, "vllm_config", None))
         )
 
-        # GPU V1 treats every configured grid (including the packaged
-        # default) as total tokens. None retains the per-context V1 grid.
-        # Feasible request counts are planned before allocating buffers.
+        # Resolve and clamp bucket sizes before planning shapes and allocating buffers.
         scheduler_config = getattr(model_runner, "scheduler_config", None)
         if scheduler_config is None:
             vllm_config = getattr(model_runner, "vllm_config", None)
@@ -336,17 +334,12 @@ class BasePrefillGraphRunner:
         max_seqs = getattr(max_num_seqs_cfg, "max_num_seqs", 256) if max_num_seqs_cfg else 256
 
         if self.supports_multi_request_total_buckets:
-            from vllm_gr.v1.worker.prefill_capture_plan import plan_prefill_capture
-
-            self.capture_plan = plan_prefill_capture(
-                self.buckets,
-                self.gr_settings.beam_batch_sizes,
+            self._plan_capture_buckets(
                 max_num_seqs=int(getattr(scheduler_config, "max_num_seqs", max_seqs)),
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
                 total_token_buckets=supports_total_buckets,
             )
-            self.buckets = list(self.capture_plan)
 
         # Block-table column count from the model config (used to pre-size the
         # per-bucket staging buffers); None when the config is unavailable.
@@ -373,6 +366,19 @@ class BasePrefillGraphRunner:
             self._bucket_lut = [None] * (self.buckets[-1] + 1)
             for t in range(1, self.buckets[-1] + 1):
                 self._bucket_lut[t] = self._compute_match_bucket(t)
+
+    def _plan_capture_buckets(
+        self,
+        *,
+        max_num_seqs: int,
+        max_num_batched_tokens: int | None,
+        max_model_len: int,
+        total_token_buckets: bool,
+    ) -> None:
+        """Let CUDA V1 filter feasible capture shapes before allocation.
+
+        The NPU runner uses the shared bucket limits and plans its own captures.
+        """
 
     def _compute_match_bucket(self, total_tokens: int) -> int | None:
         """Return the smallest captured bucket that can hold the request."""

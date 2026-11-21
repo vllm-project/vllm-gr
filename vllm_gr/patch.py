@@ -168,7 +168,7 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
             "chat_sampling_conversion",
             "vllm_gr.entrypoints.openai.beam_search_patch",
             "patch_sampling",
-            "validate_chat_sampling_patch",
+            "validate_sampling_patch",
         ),
         _module_patch(
             "engine_args",

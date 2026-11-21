@@ -12,6 +12,7 @@ import pytest
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 ROOT = Path(__file__).resolve().parents[2]
+SCENARIO = "bw128-in1024"
 Summary = dict[str, Any]
 
 
@@ -115,6 +116,86 @@ def test_blank_revision_is_rejected(tmp_path: Path) -> None:
     )
 
 
+def historical_summary(side: str) -> Summary:
+    return {
+        "source": {"git_sha": side},
+        "scenario": {
+            "key": SCENARIO,
+            "execution_mode": "offline",
+            "endpoint": "GRLLM.beam_search",
+            "max_concurrency": 1,
+        },
+        "results": {"requests": {"completed": 100}, "latency_ms": {"e2el": {"mean": 100.0}}},
+    }
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("side", "field", "value"),
+    [
+        ("head", "key", "bw64-in1024"),
+        ("head", "execution_mode", "online"),
+        ("base", "endpoint", "/v1/chat/completions"),
+        ("head", "max_concurrency", 8),
+        ("head", "max_concurrency", None),
+    ],
+)
+def test_rejects_reported_scenario_mismatch(
+    tmp_path: Path, side: str, field: str, value: object
+) -> None:
+    runs = {name: [historical_summary(name), historical_summary(name)] for name in ("base", "head")}
+    runs[side][1]["scenario"][field] = value
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        compare_summaries(tmp_path, runs["base"], runs["head"])
+
+    assert exc.value.returncode == 2
+    assert f"{side}-1.json: scenario.{field} differs from" in exc.value.stderr.decode("utf-8")
+    assert not (tmp_path / "report.md").exists()
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_rejects_reported_blank_scenario_key(tmp_path: Path) -> None:
+    head = historical_summary("head")
+    head["scenario"]["key"] = " "
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        compare_summaries(tmp_path, [historical_summary("base")], [head])
+
+    assert exc.value.returncode == 2
+    assert b"scenario.key must be a nonempty string" in exc.value.stderr
+    assert not (tmp_path / "report.md").exists()
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("base", "head"),
+    [(0.0, 200.0), (100.0, "NaN"), (100.0, "Infinity"), (1e-308, 1e308)],
+    ids=["zero-base", "nan", "infinity", "delta-overflow"],
+)
+def test_rejects_no_comparable_latency(tmp_path: Path, base: float, head: float | str) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        compare_summaries(tmp_path, [(100, base)], [(100, head)])
+
+    assert exc.value.returncode == 2
+    assert b"No comparable latency metrics" in exc.value.stderr
+    assert not (tmp_path / "report.md").exists()
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_historical_report_uses_only_shared_percentiles(tmp_path: Path) -> None:
+    base = historical_summary("base")
+    head = historical_summary("head")
+    for summary in (base, head):
+        summary["scenario"].update(
+            execution_mode="online", endpoint="/v1/chat/completions", max_concurrency=None
+        )
+    base["results"]["latency_ms"]["e2el"] = {"mean": 100.0, "p50": 120.0}
+    head["results"]["latency_ms"]["e2el"] = {"mean": 200.0, "p99": 240.0}
+    markdown, report = compare_summaries(tmp_path, [base], [head])
+
+    assert report["scenario"] == SCENARIO
+    assert f"| Scenario | `{SCENARIO}` |" in markdown
+    assert [(row["percentile"], row["delta_pct"]) for row in report["rows"]] == [("mean", 100.0)]
+    assert report["regressions"] == {}
+
+
 def offline_summary(side: str, count: int = 100, warm_ms: float = 100.0) -> Summary:
     return {
         "run": {"status": "success"},
@@ -136,7 +217,9 @@ def offline_summary(side: str, count: int = 100, warm_ms: float = 100.0) -> Summ
             "runtime": {"vllm_version": "0.30.0", "torch_version": "2.11.0"},
         },
         "scenario": {
+            "key": SCENARIO,
             "execution_mode": "offline",
+            "endpoint": "GRLLM.beam_search",
             "n": 128,
             "input_tokens_target": 1024,
             "num_prompts": count,
@@ -295,6 +378,20 @@ def test_mixed_summary_generations_keep_shared_metrics(tmp_path: Path) -> None:
     assert report["baseline_eligible"] is False
     assert {row["metric"] for row in report["rows"]} == {"e2el"}
     assert "historical summary lacks verified offline measurement evidence" in markdown
+
+
+@pytest.mark.parametrize("field", ["key", "endpoint", "max_concurrency"])  # type: ignore[misc]
+def test_missing_scenario_evidence_keeps_report_descriptive(tmp_path: Path, field: str) -> None:
+    base = offline_summary("base")
+    head = offline_summary("head")
+    del base["scenario"][field]
+    del head["scenario"][field]
+    markdown, report = compare_summaries(tmp_path, [base], [head])
+
+    assert report["qualification"] == "smoke"
+    assert report["baseline_eligible"] is False
+    assert f"scenario.{field} is unavailable" in report["qualification_reasons"]
+    assert "No regressions" not in markdown
 
 
 def test_old_raw_version_with_null_cache_and_estimated_ids_stays_readable(tmp_path: Path) -> None:

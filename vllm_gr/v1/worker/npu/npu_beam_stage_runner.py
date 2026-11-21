@@ -32,7 +32,6 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamRequestOutput,
     BeamSequenceColumns,
 )
-from vllm_gr.v1.beam.decision import run_beam_decision_candidates
 from vllm_gr.v1.beam.dispatch import (
     GR_RETIRE_OUTPUT_ATTR,
     GR_RETIRE_RESULT_ATTR,
@@ -48,6 +47,7 @@ from vllm_gr.v1.beam.execution_batch import (
     BeamExecutionContractError,
 )
 from vllm_gr.v1.beam.session import BeamSearchSession
+from vllm_gr.v1.worker.npu.beam_decision import run_beam_decision_candidates
 from vllm_gr.v1.worker.npu.beam_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,

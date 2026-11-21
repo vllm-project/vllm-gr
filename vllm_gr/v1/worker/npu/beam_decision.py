@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Worker-side beam decision for incremental beam decode (asynchronous scheduling).
+"""Ascend Worker Beam decision for incremental Decode.
 
 The V1 stage runner supplies candidate tensors directly. Device-resident
 BeamDecisionBuffers own cumulative scores and sequence history through Prefill
@@ -8,9 +8,8 @@ initialization and subsequent Decode updates. Selected tokens and parent
 indices return to the stage runner for the same-step KV reorder and terminal
 result construction.
 
-The public ``onerec_decode`` operators dispatch to the active accelerator:
-CUDA uses the fused CUDA kernels, NPU uses the xllm operators, and CPU keeps a
-PyTorch reference path for parity tests.
+The fused xLLM path and the Torch fallback produce the same decision tensors
+for the stage runner. The Torch path also supports host parity tests.
 """
 
 from __future__ import annotations

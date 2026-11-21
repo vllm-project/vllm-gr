@@ -14,8 +14,10 @@ import pytest
 
 from tests.helpers.paths import REPO_ROOT
 from vllm_gr.config import GRAttentionBackend
+from vllm_gr.platforms.ascend import config_patch
 from vllm_gr.v1 import ascend_compat
 from vllm_gr.v1.attention import selector_patch
+from vllm_gr.v1.worker.npu import kv_layout_patch, startup_patch
 
 
 def _install_selector_patch(
@@ -34,8 +36,12 @@ def test_import_does_not_load_npu_worker() -> None:
     project_root = REPO_ROOT
     code = """
 import sys
+import vllm_gr.platforms.ascend.config_patch
 import vllm_gr.v1.ascend_compat
-assert "vllm_ascend.worker.worker" not in sys.modules
+import vllm_gr.v1.worker.npu.startup_patch
+
+for module_name in ("torch", "torch_npu", "vllm_ascend", "vllm_ascend.worker.worker"):
+    assert module_name not in sys.modules, module_name
 """
 
     subprocess.run(
@@ -238,25 +244,29 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
-    from vllm_gr.v1 import npu_kv_layout
 
     install_filter = mock.Mock()
-    monkeypatch.setattr(ascend_compat, "_install_init_ascend_config_sanitizer", install_filter)
-    monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: False)
+    monkeypatch.setattr(startup_patch, "install_ascend_config_filter", install_filter)
+    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: False)
     monkeypatch.delitem(sys.modules, "vllm_ascend.worker.worker", raising=False)
-    assert ascend_compat.patch_npu_worker_init_device() == 0
+    assert startup_patch.patch_npu_worker_init_device() == 0
     assert "vllm_ascend.worker.worker" not in sys.modules
 
-    monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: True)
+    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: True)
     monkeypatch.setitem(sys.modules, "vllm_ascend.worker.worker", None)
-    assert ascend_compat.patch_npu_worker_init_device() == 0
+    assert startup_patch.patch_npu_worker_init_device() == 0
     install_filter.assert_not_called()
 
     events: list[str] = []
     monkeypatch.setattr(
-        npu_kv_layout,
+        kv_layout_patch,
         "apply_npu_contiguous_kv_cache_patch",
         lambda: events.append("kv_layout"),
+    )
+    monkeypatch.setattr(
+        startup_patch,
+        "apply_penalties_warmup_oom_guard",
+        lambda: events.append("warmup"),
     )
     raise_from_original = False
 
@@ -278,11 +288,11 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
         re_apply_patches,
     )
 
-    assert ascend_compat.patch_npu_worker_init_device() == 1
-    assert ascend_compat.patch_npu_worker_init_device() == 0
+    assert startup_patch.patch_npu_worker_init_device() == 1
+    assert startup_patch.patch_npu_worker_init_device() == 0
     assert install_filter.call_args_list == [mock.call(), mock.call()]
     assert worker_class().init_device() == "ready"
-    assert events == ["re_apply", "kv_layout", "original"]
+    assert events == ["re_apply", "kv_layout", "warmup", "original"]
 
     from vllm_gr.v1.worker.gr_context import (
         get_beam_graph_runtime_stats,
@@ -301,7 +311,7 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     raise_from_original = True
     with pytest.raises(RuntimeError, match="init failed"):
         worker_class().init_device()
-    assert events == ["re_apply", "kv_layout", "original"]
+    assert events == ["re_apply", "kv_layout", "warmup", "original"]
     assert worker_class.__dict__["reload_trie"] is reload_trie
 
 
@@ -309,24 +319,24 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
 def test_npu_worker_reinstalls_over_replaced_upstream_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: True)
-    monkeypatch.setattr(ascend_compat, "_install_init_ascend_config_sanitizer", lambda: None)
+    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: True)
+    monkeypatch.setattr(startup_patch, "install_ascend_config_filter", lambda: None)
     worker = _install_fake_npu_worker(monkeypatch, lambda _: "native")
     original = worker.init_device
-    assert ascend_compat.patch_npu_worker_init_device() == 1
+    assert startup_patch.patch_npu_worker_init_device() == 1
     wrapper = worker.init_device
-    assert getattr(wrapper, ascend_compat._NPU_WORKER_ORIGINAL_ATTR) is original
-    assert ascend_compat.patch_npu_worker_init_device() == 0
+    assert getattr(wrapper, startup_patch._NPU_WORKER_ORIGINAL_ATTR) is original
+    assert startup_patch.patch_npu_worker_init_device() == 0
     assert worker.init_device is wrapper
 
     def replacement(self: object) -> str:
         return "replacement"
 
     monkeypatch.setattr(worker, "init_device", replacement)
-    assert ascend_compat.patch_npu_worker_init_device() == 1
+    assert startup_patch.patch_npu_worker_init_device() == 1
     repaired = worker.init_device
-    assert getattr(repaired, ascend_compat._NPU_WORKER_ORIGINAL_ATTR) is replacement
-    assert ascend_compat.patch_npu_worker_init_device() == 0
+    assert getattr(repaired, startup_patch._NPU_WORKER_ORIGINAL_ATTR) is replacement
+    assert startup_patch.patch_npu_worker_init_device() == 0
     assert worker.init_device is repaired
 
 
@@ -348,10 +358,10 @@ def _install_fake_ascend_config(
     monkeypatch.setitem(sys.modules, worker.__name__, worker)
     if not install:
         return initialize, entry
-    ascend_compat._install_init_ascend_config_sanitizer()
+    config_patch.install_ascend_config_filter()
     assert entry.init_ascend_config is config_module.init_ascend_config
     assert worker.init_ascend_config is config_module.init_ascend_config
-    ascend_compat._install_init_ascend_config_sanitizer()
+    config_patch.install_ascend_config_filter()
     assert entry.init_ascend_config is config_module.init_ascend_config
     return config_module.init_ascend_config, entry
 
@@ -382,8 +392,8 @@ def test_worker_installs_config_filter_before_constructor(
             raise AssertionError("config validation precedes device initialization")
 
     setattr(worker_module, "NPUWorker", NPUWorker)
-    monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: True)
-    assert ascend_compat.patch_npu_worker_init_device() == 1
+    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: True)
+    assert startup_patch.patch_npu_worker_init_device() == 1
     NPUWorker()
     assert seen == [config]
     assert parse_gr_config(config).beam_max_width == 8
@@ -414,15 +424,15 @@ def test_worker_rechecks_config_bindings_without_rewrapping_device_hook(
             raise AssertionError("constructor validation must precede device initialization")
 
     setattr(worker_module, "NPUWorker", NPUWorker)
-    monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: True)
-    assert ascend_compat.patch_npu_worker_init_device() == 1
+    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: True)
+    assert startup_patch.patch_npu_worker_init_device() == 1
     device_wrapper = NPUWorker.init_device
     sanitizer = config_module.init_ascend_config
 
     # A native import restores only this alias; both GR wrappers stay installed.
     rebound_module = worker_module if caller == "worker" else entry
     monkeypatch.setattr(rebound_module, "init_ascend_config", initialize)
-    assert ascend_compat.patch_npu_worker_init_device() == 0
+    assert startup_patch.patch_npu_worker_init_device() == 0
     assert rebound_module.init_ascend_config is sanitizer
     assert config_module.init_ascend_config is sanitizer
     assert sanitizer.__wrapped__ is initialize
@@ -436,7 +446,7 @@ def test_worker_rechecks_config_bindings_without_rewrapping_device_hook(
         "refresh": True,
     }
 
-    assert ascend_compat.patch_npu_worker_init_device() == 0
+    assert startup_patch.patch_npu_worker_init_device() == 0
     assert NPUWorker.init_device is device_wrapper
     assert config_module.init_ascend_config is sanitizer
 
@@ -452,7 +462,7 @@ def test_config_binding_recheck_preserves_unrelated_overrides(
     override = mock.Mock()
     monkeypatch.setattr(overridden_module, "init_ascend_config", override)
 
-    ascend_compat._install_init_ascend_config_sanitizer()
+    config_patch.install_ascend_config_filter()
 
     assert overridden_module.init_ascend_config is override
     assert sys.modules["vllm_ascend.ascend_config"].init_ascend_config is sanitizer
@@ -575,8 +585,23 @@ def test_ascend_entry_installs_filter_before_delegating(
         return "ready"
 
     setattr(entry, "_run_engine_core_patch_func", native_entry)
+
+    class EngineCoreProc:
+        run_engine_core = staticmethod(native_entry)
+
+    monkeypatch.setattr(config_patch, "is_npu_platform", lambda: False)
+    assert config_patch.apply_engine_core_config_sanitizer(EngineCoreProc) == 0
+    assert EngineCoreProc.run_engine_core is native_entry
+
+    monkeypatch.setattr(config_patch, "is_npu_platform", lambda: True)
+    assert config_patch.apply_engine_core_config_sanitizer(EngineCoreProc) == 1
+    assert EngineCoreProc.run_engine_core is config_patch._sanitize_engine_core_entry
+    assert config_patch.apply_engine_core_config_sanitizer(EngineCoreProc) == 0
+
+    monkeypatch.setattr(EngineCoreProc, "run_engine_core", staticmethod(native_entry))
+    assert config_patch.apply_engine_core_config_sanitizer(EngineCoreProc) == 1
     assert (
-        ascend_compat._sanitize_engine_core_entry(
+        EngineCoreProc.run_engine_core(
             "socket-address", vllm_config=config, dp_rank=2, local_dp_rank=1
         )
         == "ready"
@@ -669,7 +694,7 @@ def test_ascend_child_activates_live_trie_capacity_before_first_core_initializat
     setattr(entry, "_run_engine_core_patch_func", native_entry)
     initialize = None
     for _ in range(2):
-        core = ascend_compat._sanitize_engine_core_entry(vllm_config=config)
+        core = config_patch._sanitize_engine_core_entry(vllm_config=config)
         if initialize is None:
             initialize = Core.__init__
         assert Core.__init__ is initialize, "Repeated child activation stacked init wrappers"
@@ -713,7 +738,7 @@ def test_ascend_child_does_not_start_native_core_when_required_patching_fails(
         mock.Mock(side_effect=RuntimeError("required child patch failed")),
     )
     with pytest.raises(RuntimeError, match="required child patch failed"):
-        ascend_compat._sanitize_engine_core_entry(vllm_config=SimpleNamespace(additional_config={}))
+        config_patch._sanitize_engine_core_entry(vllm_config=SimpleNamespace(additional_config={}))
     native_entry.assert_not_called()
 
 

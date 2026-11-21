@@ -28,7 +28,7 @@ from tests.kernels.beam_stage_test_utils import (
     runtime,
 )
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
-from vllm_gr.v1.attention.backends.beam_graph_kernels import (
+from vllm_gr.ops.cuda.beam_kv_cache import (
     cache_unshared_kv_graph,
     copy_suffix_kv_graph,
 )

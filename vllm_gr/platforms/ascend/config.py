@@ -41,6 +41,6 @@ class AscendConfigService(BackendConfigService):
         # Wrap after all native plugins and before EngineCore is spawned.
         from vllm.v1.engine.core import EngineCoreProc
 
-        from vllm_gr.v1.ascend_compat import apply_engine_core_config_sanitizer
+        from .config_patch import apply_engine_core_config_sanitizer
 
         apply_engine_core_config_sanitizer(EngineCoreProc)

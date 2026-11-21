@@ -159,6 +159,9 @@ python tools/AB_Tests/compare_ab.py \
 Repeat `--base` or `--head` to include additional measurements of the same
 revision. The report shows the number of measurements and total samples for
 each side. It compares the median of each per-measurement latency metric.
+Reported scenario keys, execution modes, endpoints and concurrency limits
+must agree across runs. Missing scenario evidence keeps an otherwise readable
+comparison descriptive. Both sides must have a comparable latency statistic.
 
 For a cache-hit performance verdict, each run needs at least 100 measured
 requests, comparable input fingerprints and measurement environments, and

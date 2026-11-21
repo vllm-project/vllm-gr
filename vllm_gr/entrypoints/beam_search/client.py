@@ -42,6 +42,14 @@ logger = init_logger(__name__)
 _ASYNC_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
 
 
+async def drain_async_cleanup() -> None:
+    """Wait for retained Beam cleanup tasks on the current serving loop."""
+    loop = asyncio.get_running_loop()
+    while pending := [task for task in tuple(_ASYNC_CLEANUP_TASKS) if task.get_loop() is loop]:
+        # Cancelling a shutdown waiter must leave cleanup owned by the client.
+        await asyncio.wait(pending)
+
+
 def _run_sync_cleanup(cleanup: Callable[[], None], session_id: str) -> None:
     # The synchronous transport belongs to the calling thread. Keep ownership
     # here until acknowledgement instead of moving its RPCs to another thread.

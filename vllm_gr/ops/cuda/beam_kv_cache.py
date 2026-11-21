@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""CUDA Graph-compatible KV operators for incremental beam decode.
+"""CUDA Graph-compatible KV writes and packed suffix copies for Beam decode.
 
 cache_unshared_kv_kernel: Triton JIT kernel that writes the current step's
     beam KV into the pool's ``[slot, beam, head, decode_step, :]`` slice,

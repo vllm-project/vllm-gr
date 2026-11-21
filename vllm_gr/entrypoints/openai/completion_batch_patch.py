@@ -33,6 +33,7 @@ from vllm.renderers.inputs.preprocess import prompt_to_seq
 
 from vllm_gr.config import GRConfig
 from vllm_gr.logger import init_logger
+from vllm_gr.platforms.beam_requests import decode_batch_capacity
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 
 if TYPE_CHECKING:
@@ -141,17 +142,6 @@ def _needs_decode_stage(request: CompletionRequest, budget: int) -> bool:
     return budget - _output_boundary_tokens(request) > 1
 
 
-def _decode_batch_capacity(serving, request: CompletionRequest) -> int | None:
-    """Bound NPU B*W rows by native input storage, not the Prefill budget."""
-    config = serving.engine_client.vllm_config
-    device = getattr(getattr(config, "device_config", None), "device", "cuda")
-    if str(device).split(":")[0] != "npu":
-        return None
-    # The OpenAI beam adapter maps n to beam_width (None means one).
-    width = request.n if request.n is not None else 1
-    return config.scheduler_config.max_num_batched_tokens // width
-
-
 def _batch_decline_reason(
     serving, request: CompletionRequest, engine_inputs: list, budgets: list[int]
 ) -> str | None:
@@ -175,7 +165,11 @@ def _batch_decline_reason(
     )
     if total > token_budget:
         return f"Prefill tokens {total} exceed the scheduling budget {token_budget}"
-    decode_capacity = _decode_batch_capacity(serving, request)
+    # The OpenAI Beam adapter maps n to beam_width, defaulting to one.
+    width = getattr(request, "n", None)
+    decode_capacity = decode_batch_capacity(
+        serving.engine_client.vllm_config, width if width is not None else 1
+    )
     if (
         _needs_decode_stage(request, budgets[0])
         and decode_capacity is not None

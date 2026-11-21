@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -359,12 +360,20 @@ def install() -> None:
     # V1 stage decisions receive candidate tensors directly. Refresh the copied
     # NPU alias if its stage module was imported before instrumentation.
     try:
-        try:
-            import vllm_gr.v1.beam.decision as beam_decision
-        except ModuleNotFoundError as exc:
-            if exc.name != "vllm_gr.v1.beam.decision":
-                raise
-            from vllm_gr.v1.beam import beam_decision
+        # A/B runs can load either checkout's module layout.
+        for module_name in (
+            "vllm_gr.v1.worker.npu.beam_decision",
+            "vllm_gr.v1.beam.decision",
+            "vllm_gr.v1.beam.beam_decision",
+        ):
+            try:
+                beam_decision = import_module(module_name)
+                break
+            except ModuleNotFoundError as exc:
+                if exc.name != module_name and not module_name.startswith(f"{exc.name}."):
+                    raise
+        else:
+            raise ModuleNotFoundError("No Beam decision module in the runtime checkout")
 
         original_decision = beam_decision.run_beam_decision_candidates
         wrapped_decision = _timed("beam_worker_decision", original_decision)

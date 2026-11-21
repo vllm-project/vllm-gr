@@ -21,6 +21,7 @@ from vllm_gr.entrypoints.beam_search import (
 from vllm_gr.entrypoints.beam_search.client import (
     AsyncBeamSearchClient,
     BeamSearchClient,
+    drain_async_cleanup,
 )
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchEngineError
 from vllm_gr.entrypoints.beam_search.protocol import (
@@ -103,6 +104,12 @@ def test_close_survives_cancellation_and_joins_existing_cleanup(terminal: bool) 
         assert not session.closed
         assert backend.active == {"session-1"}
 
+        draining = asyncio.create_task(drain_async_cleanup())
+        await asyncio.sleep(0)
+        assert not draining.done()
+        await _cancel(draining)
+        assert not backend.cleanup_cancelled
+
         retry_started = asyncio.Event()
 
         async def retry_close() -> None:
@@ -116,7 +123,7 @@ def test_close_survives_cancellation_and_joins_existing_cleanup(terminal: bool) 
         assert not session.closed
 
         backend.allow_cleanup.set()
-        await asyncio.wait_for(client.close(session), timeout=2)
+        await asyncio.wait_for(drain_async_cleanup(), timeout=2)
         await client.close(session)
         assert session.closed
         assert not backend.active

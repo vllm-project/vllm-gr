@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.config.execution import validate_gr_execution_runtime
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchParams,
     BeamOutputOptions,
@@ -22,10 +23,7 @@ from vllm_gr.v1.beam.dispatch import (
     GRStageKind,
     GRStageMetadata,
 )
-from vllm_gr.v1.engine.beam_admission import (
-    validate_gr_device_config,
-    validate_gr_execution_runtime,
-)
+from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
 if TYPE_CHECKING:
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
