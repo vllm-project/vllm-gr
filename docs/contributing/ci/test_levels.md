@@ -69,6 +69,30 @@ the exceptions non-overlapping. For example, the
 checks that the small cases are L2 and the rest of the matrix is L4. Keep
 the entry in sync when moving or renaming the test.
 
+### Hardware selection
+
+Use standard pytest markers for the platform, eligible accelerator models and
+minimum card count. For example, add `@pytest.mark.gpu_test`, `@pytest.mark.H100`
+and `@pytest.mark.cards_2` to a two-card H100 test. A job can select exactly
+those declarations with `-m 'gpu_test and H100 and cards_2'`. Use separate
+`pytest.param(..., marks=[...])` entries when platforms need different counts.
+
+CUDA targets are L20, A100, H800, H100, L4 and B200. Ascend targets are A2, A3
+and A5. Lowercase `l4` selects a test level. Uppercase `L4` selects a GPU model.
+On the allocated runner, this command includes host, generic CUDA and H100
+tests at levels L1 through L3:
+
+```bash
+python -m pytest tests --test-hardware=cuda:H100 -m 'l1 or l2 or l3'
+```
+
+Use `--test-hardware=npu:A3` for an A3 runner or `--test-hardware=host` for
+host-only tests. Set device visibility to the allocated cards: during setup
+every visible device must match the explicit target. A wrong target stops
+the run and an insufficient card count skips the case. With plain `-m`,
+unavailable model- or card-marked cases skip. Collection and cases skipped by
+pytest do not probe accelerators.
+
 ## Running by level
 
 In a prepared development environment, run these commands from the repository
