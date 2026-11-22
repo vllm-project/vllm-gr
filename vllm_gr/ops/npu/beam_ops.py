@@ -3,16 +3,11 @@
 
 """NPU dispatch wrappers for the xLLM beam-search decode operators.
 
-Covers all six operators used by the asynchronous Decode pipeline. ``cache_unshared_kv``,
-``x_attention`` and ``select_unshared_kv`` form the execution path ported by the
-NPU decode migration plan; ``beam_search_group`` and ``beam_search_rec_final_select``
-are the worker-side beam-decision operators kept as building blocks for a future
-migration (their precision contracts are locked down by the
-``tests/kernels/test_*_npu.py`` suite).  ``rec_constrained_topk`` lives in its
-own module and is intentionally not re-exported here.
+Wraps the NPU decode operators for KV-cache updates, attention, KV selection,
+and worker-side beam decisions. ``rec_constrained_topk`` is provided by its
+own module and is not re-exported here.
 
-ABI notes (verified on device, 2026-08-22; recorded in the workspace
-operator survey ``xllm_ops-decode*.md`` and locked by ``tests/kernels/``):
+ABI contracts covered by ``tests/kernels/``:
 - ``decode_step`` is heterogeneous across the library: ``cache_unshared_kv``
   and ``x_attention`` require an int32 ``[1]`` device tensor, while ``select_unshared_kv``,
   ``beam_search_group`` and ``beam_search_rec_final_select`` take a host int.
