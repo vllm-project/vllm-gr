@@ -302,8 +302,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         device_type = getattr(device, "type", str(device).partition(":")[0])
         self._is_cuda = device_type == "cuda"
         self._is_npu = device_type == "npu"
-        # Default: no pre-allocated fixed-address buffers.  Overridden to True
-        # below when CUDA (or, in the future, ACL Graph on NPU) needs them.
+        # CUDA and NPU use fixed-address buffers when a maximum beam width is configured.
         # Tests / kernel harnesses that skip __init__ keep the default and
         # allocate device tensors per build() call.
         self._fixed_buffers = False

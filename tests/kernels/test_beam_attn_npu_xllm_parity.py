@@ -523,16 +523,10 @@ def test_xllm_incremental_matches_cascade(
 
 @pytest.mark.parametrize("beam_width", [2, 4])  # type: ignore[misc]
 def test_xllm_submax_width_matches_cascade(beam_width: int) -> None:
-    """Parity when beam_width < configured max_beams (eager path).
+    """Compare eager xLLM and cascade attention on a pool view narrower than max_beams.
 
-    The runtime pool is sized by ``beam_max_width`` (an upper bound), so a
-    request narrower than the maximum attends over ``pool[slot, :beam_width]``
-    — a leading-dim slice of the contiguous pool, which stays contiguous
-    (verified on device: kernel output identical to a packed ``.contiguous()``
-    copy).  This test locks that contract down: the xllm fused path must read
-    exactly the active rows and agree with the cascade path.  FULL-graph
-    replay never runs for sub-max widths (the determine patch gates on exact
-    width), so this is the eager path exercised end to end.
+    Distinct keys in the inactive tail rows help detect an incorrect read from
+    outside the active beam rows when comparing the two outputs.
     """
     torch.manual_seed(500 + beam_width)
     max_beams = 8  # > beam_width: pool keeps max-width layout
