@@ -253,7 +253,7 @@ def test_strict_hook_rejects_unclassified_and_normal_pytest_allows_it(
     for hint in (
         "assign exactly one @pytest.mark.l1 through",
         "tests/level_inventory.json",
-        "docs/contributing/tools/README.md#test-levels-and-ci-selection",
+        "docs/contributing/ci/test_levels.md#test-levels-and-ci-selection",
     ):
         assert hint in result.stderr.str()
     result = pytester.runpytest("--test-level-manifest", str(manifest))

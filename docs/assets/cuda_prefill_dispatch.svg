@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="340" viewBox="0 0 900 340" role="img" aria-labelledby="title desc">
+  <title id="title">CUDA ModelRunner V2 Prefill dispatch</title>
+  <desc id="desc">An eligible Prefill batch selects the smallest covering token bucket. A FULL miss tries PIECEWISE at that bucket. Missing captures or a missing bucket lead to eager execution.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 9 4 L 1 7" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" />
+    </marker>
+  </defs>
+  <rect width="900" height="340" fill="#ffffff" />
+  <g font-family="Arial, Helvetica, sans-serif" fill="#252627">
+    <rect x="23" y="25" width="238" height="62" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="142.0" y="51.11" font-size="17" font-weight="400" text-anchor="middle">Smallest fitting</text>
+    <text x="142.0" y="72.11" font-size="17" font-weight="400" text-anchor="middle">token bucket?</text>
+    <rect x="332" y="25" width="236" height="62" fill="#f9dce0" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="450.0" y="51.11" font-size="17" font-weight="400" text-anchor="middle">Compatible, captured</text>
+    <text x="450.0" y="72.11" font-size="17" font-weight="400" text-anchor="middle">FULL shape (T, B)?</text>
+    <rect x="666" y="25" width="209" height="62" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="770.5" y="61.61" font-size="17" font-weight="400" text-anchor="middle">Replay FULL</text>
+    <rect x="332" y="156" width="236" height="62" fill="#fbe6d5" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="450.0" y="182.11" font-size="17" font-weight="400" text-anchor="middle">PIECEWISE capture</text>
+    <text x="450.0" y="203.11" font-size="17" font-weight="400" text-anchor="middle">at the same T?</text>
+    <rect x="666" y="156" width="209" height="62" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="770.5" y="192.61" font-size="17" font-weight="400" text-anchor="middle">Replay PIECEWISE</text>
+    <rect x="332" y="260" width="236" height="52" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="450.0" y="291.61" font-size="17" font-weight="400" text-anchor="middle">Run eagerly</text>
+    <path d="M 261,56 L 332,56" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="296" y="45.95" font-size="15" font-weight="400" text-anchor="middle">Yes</text>
+    <path d="M 568,56 L 666,56" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="617" y="45.95" font-size="15" font-weight="400" text-anchor="middle">Yes</text>
+    <path d="M 450,87 L 450,156" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="471" y="124.95" font-size="15" font-weight="400" text-anchor="middle">No</text>
+    <path d="M 568,187 L 666,187" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="617" y="175.95" font-size="15" font-weight="400" text-anchor="middle">Yes</text>
+    <path d="M 450,218 L 450,260" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="470" y="244.95" font-size="15" font-weight="400" text-anchor="middle">No</text>
+    <path d="M 142,87 L 142,286 L 332,286" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="163" y="124.95" font-size="15" font-weight="400" text-anchor="middle">No</text>
+  </g>
+</svg>

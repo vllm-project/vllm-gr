@@ -12,16 +12,16 @@ explicitly targets them; they are not necessarily the imported runtime.
 - For setup and PR workflow, read [CONTRIBUTING.md](CONTRIBUTING.md).
 - Before changing runtime behavior, use [development navigation](docs/contributing/development.md)
   to find the owning code and read the relevant linked contract.
-- Before selecting tests, read [validation levels](docs/contributing/tools/README.md#validation-levels)
+- Before selecting tests, read [validation levels](docs/contributing/ci/test_levels.md#validation-levels)
   and the affected tests' fixtures and device requirements.
 - For documentation-only changes, use the
-  [documentation checks](docs/contributing/PRE_COMMIT.md#documentation-checks).
+  [documentation checks](docs/contributing/pre_commit_setup.md#documentation-checks).
 - When changing agent guidance or tool integration, read
   [AI instruction maintenance](docs/contributing/agent_instructions.md).
 
 ## Environment
 
-Follow the [CUDA](docs/getting_started/installation/cuda.md) or [Ascend](docs/getting_started/installation/ascend.md)
+Follow the [CUDA](docs/getting_started/installation/gpu.md) or [Ascend](docs/getting_started/installation/npu.md)
 installation guide in an environment for the target device. Set
 `VLLM_GR_TARGET_DEVICE` explicitly for platform-specific installs or wheels.
 The deprecated `[gpu]`/`[npu]` extras do not provision those runtimes.

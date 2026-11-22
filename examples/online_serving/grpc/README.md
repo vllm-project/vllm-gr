@@ -1,6 +1,6 @@
 # OneRec Beam Search over gRPC
 
-Install the [CUDA runtime](../../../docs/getting_started/installation/cuda.md) and the optional gRPC
+Install the [CUDA runtime](../../../docs/getting_started/installation/gpu.md) and the optional gRPC
 dependencies from the repository root.
 
 ```bash
@@ -40,7 +40,7 @@ The values below apply to that configuration. Library defaults can differ.
 | --- | --- | --- |
 | `gr.beam_graph_enabled` | `true` | Set in YAML to enable Beam graphs. |
 | `gr.worker_decision` | `true` | Set in YAML to enable Beam selection on the Worker. |
-| `gr.beam_width` | `[128, 128, 128]` | Match the first width with the client flag `--width 128`. |
+| `gr.beam_width` | `[128, 128, 128]` | Pass the maximum width with the client flag `--width 128`. |
 | `gr.max_decode_steps` | `3` | Set the effective token capacity in YAML. Use `--max-new-tokens 3` for the three-layer Constraint Table. The client handles the boundary markers separately. |
 
 ### Start the server

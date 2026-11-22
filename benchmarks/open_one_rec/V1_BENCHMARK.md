@@ -67,5 +67,5 @@ For targeted projection comparisons, use
 `--projection full|slice`. Its `--strict-bf16` option is an isolated numerical
 control, not a production default. Diagnostic GPU stage timing is separate from
 the public end-to-end timing defined above; mocked TP routing is not multi-GPU
-validation. Use the [accuracy gates](../../docs/usage/benchmarks/README.md) for business
+validation. Use the [accuracy gates](../../docs/benchmarking/README.md) for business
 acceptance.

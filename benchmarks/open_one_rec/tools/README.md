@@ -3,7 +3,7 @@
 ## Dataset prerequisite
 
 Before using these tools, download the OpenOneRec dataset as described in
-[the dataset guide](../../../docs/usage/benchmarks/README.md#get-dataset).
+[the dataset guide](../../../docs/benchmarking/README.md#download-the-dataset).
 For a custom dataset layout, set `ONEREC_DATA` to the directory containing the
 task parquet files and catalog mappings.
 

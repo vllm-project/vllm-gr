@@ -9,13 +9,9 @@ pre_upgrade_baseline:
 current_runtime:
   cuda:
     vllm: "0.30.0"
-    upgrade_evidence: "https://github.com/JiusiServe/vllm-gr/pull/553"
-    upgrade_validation_status: validated_with_release_precision_decision_pending
   npu:
     vllm: "0.30.0"
     vllm_ascend: "0.30.0rc2"
-    validation_baseline_commit: "43bc85f9b375281452d0af7005dc9fa752f43884"
-    upgrade_validation_status: baseline_validated_config_refactor_requires_npu_revalidation
 
 patches:
   - id: GR-PATCH-000
@@ -272,7 +268,7 @@ patches:
     process_roles: [npu_worker]
     target: NPUModelRunner execute_model, _prepare_inputs, sample_tokens and graph/lifecycle hooks; NPUWorker.reload_trie (native _sample and _bookkeeping_sync unchanged)
     risk: critical
-    contract: docs/features/attention.md
+    contract: docs/design/feature/npu_decode_execution.md
     removal_condition: vLLM-Ascend exposes stable grouped input/output, Worker utility, and constraint-backend lifecycle hooks
 
   - id: GR-PATCH-013

@@ -46,7 +46,7 @@ exiting. A pass can also succeed when there is no newer ready version.
 
 Upload each version into its own HDFS directory, such as
 `ckpt_1700000000` or `trie_20261106_120000`. Write `_SUCCESS` last, after
-all files have arrived. See the [publication guide](../../docs/features/hot-update.md#publish-a-version-and-inspect-status)
+all files have arrived. See the [publication guide](../../docs/user_guide/weight_update.md#publish-a-version-and-inspect-status)
 for the required contents and the default checkers.
 
 ## Verify the rollout
@@ -62,4 +62,4 @@ and `checkpoint_valid` as `true`. Compare `checkpoint_version` or
 `trie_version` with the HDFS version you published for that task.
 
 Deployment and recovery details are available in the
-[checkpoint and Trie hot-update guide](../../docs/features/hot-update.md#user-startup-and-publication-guide).
+[checkpoint and Trie hot-update guide](../../docs/user_guide/weight_update.md#user-startup-and-publication-guide).

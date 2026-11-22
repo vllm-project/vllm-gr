@@ -1,22 +1,31 @@
 # Configuration
 
-All startup paths use the structure in [default_config.yaml](https://github.com/JiusiServe/vllm-gr/blob/main/vllm_gr/config/default_config.yaml).
-Native vLLM options are top-level keys. Every GR option is inside `gr`.
-GR defaults and Beam validation apply to `GRLLM`, the `--gr` dispatcher, or an
-engine constructed with explicit GR configuration. Native engines without GR
-input keep upstream defaults and validation.
+`GRLLM` and `vllm serve --gr` use the same startup YAML. Put native vLLM
+options at the top level and vLLM-GR options under `gr`. The
+[packaged defaults](../../vllm_gr/config/default_config.yaml) list the common,
+CUDA and Ascend settings. Native engines started without GR configuration use
+the upstream vLLM defaults.
 
-The packaged file supplies the common defaults. You can supply a YAML file
-with only the values you want to override. See the
-[deployment recipes](https://github.com/JiusiServe/vllm-gr/tree/main/recipes)
-for model-specific configurations. A file can inherit another file
-with `import: ./base.yaml`. Dictionaries merge by key, and lists replace
-the inherited list as a whole. Explicit YAML `null`, `false`, and empty lists
-replace inherited values. Native string values use the upstream vLLM converters
-in both Python and CLI entrypoints (`4k` becomes 4000; `auto` becomes -1).
-When chunked prefill is disabled, an omitted token budget grows to cover the
-model length. An explicitly supplied budget, even 8192, is preserved for native
-validation.
+Use a [deployment recipe](../../recipes/README.md) for model-specific overrides.
+
+## Load and override a configuration
+
+Settings take precedence in this order, from highest to lowest.
+
+1. Explicit CLI or Python arguments
+2. Startup YAML
+3. YAML included with `import: ./base.yaml`
+4. Packaged defaults
+
+Mappings merge by key. Lists replace the entire inherited list. Explicit
+`null`, `false` and empty lists replace inherited values, subject to validation.
+Both entry points use native vLLM converters for values such as
+`max-model-len: 4k` (4000 tokens).
+
+### Example
+
+Save this example as `scenario.yaml`. It retains eight beams at the first
+step, four at the second and two at the third, and returns one result.
 
 ```yaml
 max-model-len: 4096
@@ -27,21 +36,22 @@ gr:
   worker_decision: true
   result_width: 1
   constraint_mode: none
-  beam_batch_sizes: [1, 2, 4]
 ```
 
-Start a server with this file. Explicit command-line values override YAML values.
+#### CLI
+
+Start the server and override the number of returned sequences.
 
 ```bash
-vllm serve /models/example --gr --config scenario.yaml \
-  --gr.result_width 2
+vllm serve /models/example --gr --config scenario.yaml --gr.result_width 2
 ```
 
-`--gr` selects the GR command. Use `--gr-config '{"result_width":2}'` for a
-JSON mapping, or `--gr.result_width 2` for a field override. Both populate the
-same `gr` settings used by Python.
+The equivalent JSON override is `--gr-config '{"result_width":2}'`. See
+[serve](../cli/serve.md#configuration) for all CLI forms.
 
-Use the same file in Python. Explicit Python arguments override YAML values.
+#### Python
+
+Use the same file and public GR field names.
 
 ```python
 from vllm_gr import GRLLM
@@ -54,100 +64,109 @@ llm = GRLLM(
 )
 ```
 
-The driver reads the user file during initialization and resolves YAML-declared
-artifact and calibration paths relative to their declaring files. It passes
-the resolved immutable configuration to workers. Workers reuse this snapshot
-without reopening the YAML. Restart the engine to apply file changes.
+### Path resolution
 
-The startup log prints the complete resolved GR configuration using the same
-public key names.
-Native settings are resolved once at the engine boundary. Python and CLI retain
-which fields were explicitly supplied, including values equal to defaults.
+The driver resolves artifact and calibration paths relative to the YAML file
+that declares them, including imported files. Workers receive the resolved
+configuration. Check the startup log for the effective GR settings and restart
+the engine to apply edits to its startup YAML.
 
 ## Migrate from `configs/`
 
-- Replace `configs/pangu1b.yaml` with `recipes/Pangu/pangu1b.yaml` in
-  `--config` and Python `config` arguments.
-- To use the packaged defaults, remove the `--config configs/default_config.yaml`
-  option or the corresponding Python `config` argument. In a source checkout,
-  pass `vllm_gr/config/default_config.yaml` explicitly to keep treating the
-  YAML values as supplied settings.
+- For Pangu, use [the Pangu recipe](../../recipes/Pangu/pangu1b.yaml) in
+  `--config` or Python's `config=` argument in place of `configs/pangu1b.yaml`.
+- For GR's packaged defaults, omit `--config configs/default_config.yaml`
+  or the equivalent Python `config=` argument. To keep the YAML values
+  explicit in a source checkout, pass `vllm_gr/config/default_config.yaml`.
 
-The old default YAML supplied a batch token budget of `8192` explicitly.
-With `--max-model-len 16384` and chunked prefill disabled, omitting both the
-file and the budget lets GR raise the budget to `16384`. To retain the explicit
-budget, pass `--max-num-batched-tokens 8192` on the CLI or
-`max_num_batched_tokens=8192` in Python. With chunked prefill disabled, vLLM
-rejects an explicit budget below the model length.
+The old default YAML supplied `max-num-batched-tokens: 8192` explicitly.
+With chunked Prefill disabled and `max-model-len: 16384`, omitting the file
+and the budget lets GR derive a budget of 16384. To preserve an explicit
+budget, pass `--max-num-batched-tokens` on the CLI or set
+`max_num_batched_tokens` in Python. When chunked Prefill is disabled,
+vLLM requires an explicit budget at least as large as the model length.
+
+## ModelRunner selection
+
+The vLLM ModelRunner executes model work on the device. For the library and
+general CLI, set `VLLM_USE_V2_MODEL_RUNNER` before importing vLLM or starting
+the CLI.
+
+| Setting | CUDA | Ascend |
+| --- | --- | --- |
+| Unset or `0` | ModelRunner V1, the vLLM-GR default | ModelRunner V1, required for Beam search |
+| `1` | Opt-in [ModelRunner V2](../design/module/model_runner_v2.md) for supported Beam workloads | Use `0` for Beam search |
+
+The CUDA direct offline Beam, HTTP serving and OneRec gRPC examples select
+ModelRunner V2 when the variable is unset. See the
+[example defaults](../../examples/README.md#choose-a-modelrunner) for the
+offline thinking path and the gRPC smoke test.
+
+Some logs and tests use the name "Beam Search V1" for the Beam execution path.
+The same path can use either ModelRunner on CUDA within the supported scope.
+The [constraint table formats](constraint_tables.md#build) describe the catalog
+artifact layout and have their own version identifiers.
 
 ## Beam settings
 
-- `beam_width` is the number of winners retained after each generated token.
-- `candidate_width` is the number of candidates expanded per parent at each step.
-- Unconstrained `beam_width` and `candidate_width` both support 1..1024.
-  The previous shared candidate ceiling of 256 does not apply to unconstrained
-  generation. Current CUDA/NPU constraint-table operators still cap candidates
-  per parent at 256; the backend loader checks that independent limit.
-  NPU independent per-step candidate widths require table mode; unconstrained
-  NPU generation requires matching candidate and retained width lists.
-- Both settings are lists with matching lengths. Their first entries must match.
-- `max_decode_steps` is the engine's generation capacity, excluding begin/end
-  tokens. It must cover the configured width lists. A dynamic request uses
-  the matching prefix of those lists and supports one to three effective
-  generation steps. Capacity 5 with a three-entry default is valid, but a
-  four- or five-step dynamic request is rejected; lists are never padded.
-  Fixed-width requests may use the full capacity where the backend supports it.
-  NPU unconstrained fixed-width generation supports up to **6** steps, with
-  capacity above 3 also checked against the model's native KV reorder buffer.
-  CUDA unconstrained fixed-width generation has no separate six-step ceiling.
-  Constraint-table and NPU SID-stage paths remain limited to 3 steps.
-  These are code-level backend limits, not environment variables; configure the
-  desired engine capacity with `gr.max_decode_steps` (default **3**).
-- `worker_decision` accepts `true`, `false`, or `null`. With `null`, the
-  driver selects the platform default at startup.
-- `result_width` controls the number of returned sequences. With `null`, the
-  request uses its final retained width.
+| Setting | How to choose it |
+| --- | --- |
+| `gr.beam_width` | Retained beams at each generated step. Set the request's `beam_width` (HTTP `n`) to the maximum of this list, including for a decreasing schedule such as `[8, 4, 2]`. |
+| `gr.candidate_width` | Candidates expanded per parent at each step. Supply one entry per retained width. The first entries must match because the first step has one parent. |
+| `max-logprobs` | Native vLLM setting. Its effective limit must cover the largest configured candidate width. The packaged default is 128. |
+| `gr.constraint_table.max_top_k` | In table mode, this capacity must cover the largest candidate width. CUDA and Ascend table operators support up to 256 candidates per parent. |
+| `gr.result_width` | Number of sequences to return, up to the final retained width. The default (`null`) uses the final retained width. |
+| `gr.worker_decision` | `true` enables worker-side Beam selection. `null` uses the platform default. |
+| `gr.max_decode_steps` | Generation capacity, excluding begin and end markers. It must cover the width lists and defaults to 3. |
 
-The configuration reference and supported values for every GR option are
-in the common YAML. CUDA and Ascend options are grouped in that file.
+Unconstrained generation accepts widths from 1 to 1024. On Ascend,
+unconstrained generation requires equal candidate and retained widths at each
+step. Independent candidate widths are available with a constraint table.
+
+A dynamic-width request uses a matching prefix of its configured schedule and
+supports one to three effective steps. Fixed-width unconstrained generation on
+Ascend supports up to six steps, subject to the model's KV reorder capacity.
+CUDA has no corresponding six-step limit. A constraint table requires exactly
+three effective steps on either device. Ascend SID-stage vocabulary execution
+also supports at most three steps. See the [device compatibility guide](../user_guide/feature_compatibility.md)
+for related features.
+
+## Asynchronous scheduling
+
+Beam execution requires `async-scheduling: true` and
+`enable-chunked-prefill: false`. Both are packaged defaults. In Python the
+corresponding arguments are `async_scheduling=True` and
+`enable_chunked_prefill=False`. See the [CUDA walkthrough](../user_guide/onerec_quickstart.md)
+or the [Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-python-entry-point).
+
+### Batch sizes and token budgets
+
+- `gr.beam_batch_sizes` selects the prompt counts eligible for one atomic
+  multi-prompt HTTP completion. The default is `[1, 2, 4]`. Add `8` to enable
+  the maximum size. Separate HTTP requests are not combined to fill a batch.
+  Both CUDA model runners use this list for Prefill and Decode graph capture.
+  Ascend has separate Decode graph settings.
+- `max-num-seqs` must cover the number of prompts in the Beam batch. For
+  example, two prompts at width 128 count as two requests for this check.
+- `max-num-batched-tokens` must cover the total prompt tokens at Prefill.
+  With chunked prefill disabled, an omitted budget grows to cover
+  `max-model-len`. An explicit budget goes through native validation.
+  On Ascend, a request with a Decode stage must also fit the batch size times
+  the peak input beam width for those stages. Two prompts at fixed width 128
+  therefore require capacity for at least 256 Decode rows.
 
 ## Constraint table
 
-Set `gr.constraint_mode: table` and supply `gr.constraint_table` with its
-path, backend, format, candidate capacity, and digests. The common YAML contains
-the artifact build command and a complete table example. Set
-`gr.constraint_mode: none` for unconstrained generation.
+Use `gr.constraint_mode: none` for unconstrained generation. For catalog
+serving, a table configuration records the artifact path, backend, format,
+candidate capacity and digests. Once you have built and configured a table,
+a scenario can inherit it and override just the serving settings.
 
-`gr.beam_batch_sizes` is a shared serving and graph policy. It selects which
-multi-prompt HTTP completions use one atomic Beam batch, and the CUDA ModelRunner
-V1/V2 Prefill and Decode capture sizes. Removing `4` both removes that capture
-size and sends four-prompt HTTP completions to the original handler. Separate
-requests are never combined to fill a batch. Ascend retains its own Decode graph
-settings; native `max-num-seqs` and token budgets still bound admission.
-The maximum atomic Beam batch is **8**. The default list enables **1, 2, 4**;
-include `8` in `gr.beam_batch_sizes` to route eight-prompt HTTP completions
-through Beam. The maximum is a code-level admission limit, not an environment
-variable.
+```yaml
+import: ./table.yaml
+gr:
+  result_width: 4
+```
 
-Configuration types and their invariants live in `config/models.py`; YAML I/O,
-relative paths, inheritance and merging live in `config/parser.py`. Workers use
-the resolved configuration snapshot and do not reopen deployment files.
-
-## Related guides
-
-The shared configuration is defined by
-[GRConfig](https://github.com/JiusiServe/vllm-gr/blob/main/vllm_gr/config/models.py) and the
-[configuration schema](https://github.com/JiusiServe/vllm-gr/blob/main/vllm_gr/config/schema.py). Read the
-[architecture overview](../design/main-arch.md#configuration-and-backend-selection)
-for configuration flow and backend selection.
-
-- [Dependency and version policy](dependency_version_policy.md): supported
-  runtimes, package constraints and developer tool versions.
-- [Beam Search](../features/beam-search.md) and
-  [unconstrained Beam Search](../features/unconstrained-beam-search.md):
-  execution modes, request options and capacity limits.
-- [CUDA graphs](../features/cuda-graphs.md) and
-  [Attention](../features/attention.md): backend-specific configuration.
-- [Hot updates](../features/hot-update.md): sidecar and resource configuration.
-
-Feature guides own option semantics and limits; this page is their common entrypoint.
+See [Constraint tables](constraint_tables.md) to build a single- or multi-Trie
+artifact, write `table.yaml` and select a catalog per prompt.

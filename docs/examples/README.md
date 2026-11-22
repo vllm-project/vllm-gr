@@ -1,24 +1,21 @@
 # Examples
 
-Use a complete recipe for the interface you plan to deploy. Runnable scripts
-and their detailed instructions stay together in the source checkout.
+Choose an offline example for a Python workload, or an online example for
+a client that sends requests to a running server. Start with the
+[quickstart](../getting_started/quickstart.md) to run OneRec for the first
+time. The repository's `examples/` directory contains the runnable scripts.
 
-| Goal | Recipe | Inputs to prepare | What to verify |
-| --- | --- | --- | --- |
-| Make one offline request | [First inference](../getting_started/first-inference.md) | OneRec model snapshot and supported accelerator | Returned candidates and successful shutdown |
-| Integrate Beam from Python | [Offline reference](https://github.com/JiusiServe/vllm-gr/blob/main/examples/offline_inference/beam_search/README.md) | Model, request parameters and optional table | Token sequences, cumulative scores and width limits |
-| Serve HTTP requests | [HTTP Beam](https://github.com/JiusiServe/vllm-gr/blob/main/examples/online_serving/beam_search/README.md) | Unified YAML and model snapshot | Readiness, response shape and returned SIDs |
-| Require catalog membership | [Catalog serving](https://github.com/JiusiServe/vllm-gr/blob/main/examples/online_serving/catalog/README.md) | Catalog, compiled artifact and both digests | Candidate membership with the catalog verifier |
-| Send binary token batches | [gRPC Beam](https://github.com/JiusiServe/vllm-gr/blob/main/examples/online_serving/grpc/README.md) | gRPC dependencies, token inputs and startup YAML | Batch ordering, token columns and scores |
-| Evaluate Pangu | [Pangu workflow](../contributing/tools/pangu1b.md) | Prepared model, vendor runtime and evaluation inputs | Task-specific evaluation results |
+## Offline inference
 
-## Choose the right evidence
+- [Run OneRec-1.7B on CUDA or Ascend](../../examples/README.md#run-onerec-offline) and inspect the returned candidates.
+- [Run with a constraint table](../../examples/offline_inference/beam_search/README.md#run-with-a-constraint-table) to generate candidates from a catalog.
+- [OneRec asynchronous Beam search on CUDA](../user_guide/onerec_quickstart.md) walks through a catalog-constrained run with ModelRunner V1.
+- [Full-vocabulary Beam search on Ascend](../user_guide/beam_search_npu.md) covers the Python API and supported execution modes.
+- [Prepare public openPangu weights for a SID smoke test](pangu_sid.md).
 
-An example demonstrates a public path. For acceptance evidence, use the
-[benchmark guides](../usage/benchmarks/README.md): accuracy needs identified
-evaluation inputs, latency needs a matching warmup/cache protocol, and graph
-claims need actual replay observations.
+## Online serving
 
-Start with [Getting started](../getting_started/README.md) if the matching
-runtime is not yet installed. Keep credentials and private datasets outside
-the repository.
+- [Serve OneRec over HTTP](../../examples/online_serving/beam_search/README.md) and inspect a completions response.
+- [Serve OneRec over gRPC](../../examples/online_serving/grpc/README.md) and send token inputs.
+- [Prepare a catalog and select a Trie](../../examples/online_serving/catalog/README.md) for a serving request.
+- [Run sidecar updates](../../examples/README.md#run-sidecar-hot-updates) to publish new weights or switch catalogs on running instances.

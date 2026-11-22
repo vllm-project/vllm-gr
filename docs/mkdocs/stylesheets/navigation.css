@@ -1,0 +1,10 @@
+/* Section labels follow the vLLM-Omni light and dark navigation palettes. */
+[data-md-color-scheme="default"] .md-nav__item--section > label .md-ellipsis {
+  color: rgb(0 0 0 / 70%);
+  font-weight: 700;
+}
+
+[data-md-color-scheme="slate"] .md-nav__item--section > label .md-ellipsis {
+  color: rgb(255 255 255 / 75%);
+  font-weight: 700;
+}

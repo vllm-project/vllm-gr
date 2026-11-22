@@ -1,0 +1,82 @@
+nav:
+  - Home: README.md
+  - User Guide:
+    - user_guide/README.md
+    - Getting Started:
+      - getting_started/README.md
+      - Installation:
+        - getting_started/installation/README.md
+        - getting_started/installation/gpu.md
+        - getting_started/installation/npu.md
+      - getting_started/quickstart.md
+    - Serving:
+      - serving/README.md
+      - serving/completions.md
+      - serving/grpc.md
+    - Deployment & Operations:
+      - HTTP Replicas: serving/replica_deployment.md
+      - Weight and Catalog Updates: user_guide/weight_update.md
+      - Serving Metrics: serving/metrics.md
+    - Beam guides:
+      - user_guide/onerec_quickstart.md
+      - user_guide/beam_search_npu.md
+    - Features & Compatibility: user_guide/feature_compatibility.md
+    - Configuration:
+      - configuration/README.md
+      - configuration/constraint_tables.md
+    - Models:
+      - models/supported_models.md
+      - models/pangu.md
+    - Examples:
+      - examples/README.md
+      - examples/pangu_sid.md
+  - Benchmarking:
+    - benchmarking/README.md
+    - benchmarking/common.md
+    - benchmarking/accuracy.md
+    - benchmarking/throughput.md
+  - CLI Reference:
+    - cli/README.md
+    - cli/serve.md
+    - Bench:
+      - Overview: cli/bench.md
+      - cli/bench/open_one_rec.md
+      - cli/bench/beam_performance.md
+      - cli/bench/beam_recall.md
+      - cli/bench/qwen_v1.md
+    - cli/check_env.md
+  - Developer Guide:
+    - Contributing:
+      - contributing/README.md
+      - contributing/development.md
+      - contributing/agent_instructions.md
+      - contributing/docs_guide.md
+      - contributing/pre_commit_setup.md
+      - contributing/dependency_policy.md
+      - CI:
+        - Test Levels and Platform Markers: contributing/ci/test_levels.md
+        - contributing/ci/local_runner.md
+        - Benchmark Acceptance and Gates: contributing/ci/benchmark_acceptance.md
+        - contributing/ci/pr_merge_loop.md
+    - Design:
+      - design/index.md
+      - design/architecture_overview.md
+      - Feature Design:
+        - Requests and Scheduling:
+          - design/feature/beam_batch_execution.md
+          - design/feature/async_scheduling.md
+        - Prefill Execution:
+          - design/feature/cuda_prefill_graph.md
+          - design/feature/npu_prefill_bsnd.md
+        - Decode Attention:
+          - design/feature/cuda_decode_attention.md
+          - design/feature/npu_decode_execution.md
+        - Online Updates:
+          - design/feature/weight_update.md
+      - Module Design:
+        - design/module/beam_state.md
+        - design/module/constraint_tables.md
+        - design/module/model_runner_v2.md
+        - design/module/platform_backend.md
+        - design/module/runtime_patches.md
+  - Legal: legal/README.md

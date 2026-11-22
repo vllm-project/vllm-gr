@@ -5,8 +5,8 @@ Each recipe overrides the
 [common defaults](../vllm_gr/config/default_config.yaml) loaded by vLLM-GR.
 
 - [Pangu Embedded 1B](Pangu/pangu1b.yaml) uses native vLLM sampling and
-  attention. Follow the [Ascend launch command and verification steps](../docs/contributing/tools/pangu1b.md#online-serving).
-  The command includes the required `--block-size 128`.
+  attention. Follow the [launch and verification steps](../docs/models/pangu.md#online-serving)
+  and pass `--block-size 128` on Ascend.
 
 If you installed a wheel, open `recipes/Pangu/pangu1b.yaml` on GitHub at the
 release tag or commit used to build your wheel. Select **Download raw file**

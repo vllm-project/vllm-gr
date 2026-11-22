@@ -1,71 +1,100 @@
----
-hide:
-  - navigation
-  - toc
----
+# Welcome to vLLM-GR
 
-# Generative recommendation with vLLM-GR
+<a id="vllm-gr-documentation"></a>
 
-Turn a user's context into ranked semantic IDs with native vLLM model execution,
-GPU or Ascend acceleration, and explicit Beam resource ownership.
+<p align="center">
+  <img src="assets/vLLM-GR.png" alt="vLLM-GR" width="55%">
+</p>
 
-[Get started](getting_started/README.md) | [Explore the architecture](design/main-arch.md) | [Browse examples](examples/README.md)
+<p align="center"><strong>vLLM-GR brings generative recommendation models to vLLM.</strong></p>
 
-[![vLLM-GR interfaces, EngineCore ownership and CUDA or Ascend Worker execution](assets/architecture.png)](assets/architecture.png)
+## About
 
-## Build your first application
+[vLLM](https://github.com/vllm-project/vllm) was originally built to serve
+large language models that generate text autoregressively. vLLM-GR extends
+that foundation to recommendation, where a model uses a person's interaction
+history to predict which items will interest them. vLLM-GR is an independent
+extension of vLLM.
 
-<div class="gr-cards" markdown="1">
+- **Recommendation inputs.** Views, clicks and other interactions describe a
+  user's history. A prompt can ask the model to recommend the next item.
+- **Model architectures.** The current implementation focuses on inference
+  for autoregressive generative recommendation models.
+- **Recommendation outputs.** Generation returns candidate item IDs, such as
+  semantic IDs (SIDs), ordered by sequence likelihood. Ranking a supplied
+  candidate set is planned.
 
-- **[Run your first inference](getting_started/first-inference.md)**
+![Recommendation model architecture for generating ranked item IDs, with a separate planned path for scoring supplied candidates.](assets/framework-overview.svg)
 
-    Prepare a supported runtime, load OneRec, and inspect the returned beams.
+### Inference performance
 
-- **[Serve recommendation requests](serving/README.md)**
+- **One submission for the entire Beam search.** The frontend submits the
+  request to EngineCore once. The engine drives prefill and every decode step,
+  then returns the ranked candidates and their scores in one response.
+- **BeamAttn and KV cache reuse.** All beams attend to the same cached prompt.
+  The beam KV cache carries each selected parent's suffix into the next step.
+  Across requests, vLLM's prefix cache skips prefill for matching prompt blocks.
+- **Asynchronous scheduling.** While the device executes one step, the
+  host can prepare and submit the next. This overlaps host preparation with
+  device execution across prefill and decode.
+- **On-device Beam postprocessing.** Device kernels apply catalog constraints
+  and select the highest-scoring valid continuations. The next decode step
+  uses the selected tokens directly on the device, avoiding a host round trip
+  for each beam decision.
 
-    Choose HTTP or gRPC, configure startup capacity, and verify SID outputs.
+### Configuration and serving
 
-- **[Generate within a catalog](features/constraint-tables.md)**
+- Generate candidate SIDs directly or, for compatible models, run an offline
+  reasoning step before catalog-constrained SID generation.
+- Choose full-vocabulary or catalog-constrained search, set candidate and beam
+  widths at each stage, and specify how many results to return.
+- Use the same [`gr` configuration](configuration/README.md) for offline Python
+  inference, [HTTP serving](serving/completions.md) and
+  [experimental gRPC serving](serving/grpc.md).
+- [Roll out model weights and update catalogs](user_guide/weight_update.md)
+  independently. Replacing a catalog on a running instance requires the CUDA
+  asynchronous Beam path.
+- Extend device support through [backend providers](design/module/platform_backend.md)
+  that validate the environment, apply runtime patches and implement
+  catalog-constrained top-k selection.
 
-    Compile a tokenizer-bound constraint artifact and select a catalog root.
+### Supported recommendation models
 
-- **[Tune execution](features/README.md)**
+- [OneRec-1.7B](https://huggingface.co/OpenOneRec/OneRec-1.7B) generates a ranked
+  list of candidate SIDs for a user's history. See the [model list](models/supported_models.md)
+  for device support and other model workloads.
 
-    Understand candidate widths, graph replay, Attention and resource updates.
+## Getting started
 
-</div>
+Install vLLM-GR on a [CUDA GPU or Ascend NPU](getting_started/installation/README.md),
+then run the [OneRec quickstart](getting_started/quickstart.md) to generate
+your first ranked candidates. Both device paths require upstream vLLM 0.30.0.
 
-## What vLLM-GR adds
+The first release includes CUDA and Ascend inference and
+[experimental gRPC serving](serving/grpc.md). See the
+[feature matrix](user_guide/feature_compatibility.md) for device-specific limits.
 
-vLLM-GR extends an installed vLLM runtime for generative recommendation.
-Native vLLM supplies model loading, scheduling and paged KV allocation. GR
-adds atomic Beam batches, persistent device state, constrained candidate
-selection, specialized Attention and resource-update control.
+## Find a guide
 
-| Capability | What you can do | Start here |
-| --- | --- | --- |
-| Beam generation | Retain and rank multiple continuations for each input | [Beam Search](features/beam-search.md) |
-| Catalog constraints | Generate valid three-component SIDs from compiled Tries | [Constraint tables](features/constraint-tables.md) |
-| Full-vocabulary generation | Run without a catalog, with backend-specific width limits | [Unconstrained Beam](features/unconstrained-beam-search.md) |
-| Device execution | Use CUDA V1/V2 or the prepared Ascend V1 runtime | [Installation](getting_started/README.md#choose-your-runtime) |
-| Serving and operations | Use Python, HTTP or gRPC and coordinate resource updates | [Serving](serving/README.md), [Hot updates](features/hot-update.md) |
-
-## Find your path
-
-| I want to... | Read |
+| I want to | Start here |
 | --- | --- |
-| Install and run a model | [Getting started](getting_started/README.md) |
-| Understand model-specific workflows | [Models](models/README.md) |
-| Set engine and GR options | [Configuration](configuration/README.md) |
-| Measure quality or latency | [Usage and benchmarks](usage/README.md) |
-| Integrate a public interface | [Python API](api/README.md), [CLI](cli/README.md) |
-| Change the implementation | [Developer guide](contributing/README.md), [Design](design/index.md) |
-| Report a problem or contribute | [Community](community/README.md) |
+| Install and run a model for the first time | [Getting started](getting_started/README.md) |
+| Send a request over HTTP or gRPC | [Serving APIs](serving/README.md) |
+| Scale replicas, update a running service, or monitor it | [Deployment and operations](user_guide/README.md#deployment-and-operations) |
+| Check which Beam features work on CUDA or Ascend | [Features and compatibility](user_guide/feature_compatibility.md) |
+| Run an offline or online example | [Examples](examples/README.md) |
+| Configure Beam search or a constraint table | [Configuration](configuration/README.md) |
+| Look up a command | [CLI reference](cli/README.md) |
+| Check which models are supported | [Supported models](models/supported_models.md) |
+| Measure accuracy or throughput | [Benchmarking](benchmarking/README.md) |
+| Understand scheduling, execution, or the platform contract | [Design overview](design/index.md) |
+| Change the code, run tests, or open a pull request | [Contributing](contributing/README.md) |
 
-## Runtime compatibility
+## Contributing
 
-**vLLM-GR 0.30.0 requires vLLM 0.30.0.** Ascend additionally requires the
-prepared vendor stack described in its installation guide. CPU packages support
-packaging and host checks; accelerator Beam inference requires CUDA or Ascend.
-See [dependency versions](configuration/dependency_version_policy.md) before
-changing a runtime. Feature guides document the supported backend combinations.
+See [Contributing to vLLM-GR](contributing/README.md) for development setup,
+validation and pull requests.
+
+## License
+
+vLLM-GR is distributed under the [Apache License, Version 2.0](../LICENSE).

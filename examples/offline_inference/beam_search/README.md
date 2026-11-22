@@ -7,8 +7,8 @@ catalog. The commands below run from the repository root in Bash.
 
 ## Run the V1 example
 
-Install the [CUDA](../../../docs/getting_started/installation/cuda.md) or
-[Ascend](../../../docs/getting_started/installation/ascend.md) runtime and set `ONEREC_MODEL`
+Install the [CUDA](../../../docs/getting_started/installation/gpu.md) or
+[Ascend](../../../docs/getting_started/installation/npu.md) runtime and set `ONEREC_MODEL`
 to a local OneRec-1.7B snapshot with its tokenizer. See the
 [model preparation steps](../../README.md#run-onerec-offline) to set the path
 or download the snapshot. On CUDA, use the default backend.
@@ -123,7 +123,7 @@ Both modes require:
 - Logical B=1..8 with shared generation parameters; online batch/capture policy
   defaults to `[1, 2, 4]` and must fit engine capacity.
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
-- Match the request `beam_width` to the first entry in `gr.beam_width`.
+- Set the request `beam_width` to the maximum value in `gr.beam_width`.
 - Token/text prompts rather than embedding prompts.
 - No speculative decoding, LoRA, quantization, hybrid model, encoder-decoder
   model, or multimodal model.
@@ -243,7 +243,7 @@ these values for the fixed-width example.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `beam_width` | `128` | Taken from `--beam-width`. Match the first entry in `gr.beam_width`. |
+| `beam_width` | `128` | Taken from `--beam-width`. Match the maximum value in `gr.beam_width`. |
 | `max_tokens` | `5` | The script adds two boundary positions to `--generated-steps`. |
 | `temperature` | `0.0` | Fixed by the script for Beam Search. |
 | `ignore_eos` | `True` | Ignores stop and EOS tokens during the fixed-length search. |
@@ -585,7 +585,7 @@ HTTP clients can pass the schedule in `vllm_xargs` through Completion or Chat;
 native non-GR Beam rejects an explicit schedule.
 
 `beam_width` remains the engine capacity in `[1, 256]` and must equal
-the first entry of `gr.beam_width`.
+the maximum value in `gr.beam_width`.
 The schedule has exactly one integer in `[1, beam_width]` per effective generated
 step N, which must equal 3 when the constraint table is enabled. Without
 constraints, N can range from 1 through `gr.max_decode_steps`, subject to the

@@ -2,8 +2,8 @@
 
 ## Run OneRec offline
 
-Install the [CUDA runtime](../docs/getting_started/installation/cuda.md) or
-[Ascend runtime](../docs/getting_started/installation/ascend.md). Run these commands from the
+Install the [CUDA runtime](../docs/getting_started/installation/gpu.md) or
+[Ascend runtime](../docs/getting_started/installation/npu.md). Run these commands from the
 repository root in Bash. The first run needs only a local OneRec-1.7B model
 snapshot with its tokenizer.
 
@@ -82,29 +82,34 @@ Trie updates for running gRPC instances and check the version on each instance.
 
 ## Choose a ModelRunner
 
-Direct offline Beam Search, HTTP serving, and gRPC serving default to
-ModelRunner V2 on CUDA. To select V1, set the variable below before startup.
+| Entry point | Default with `VLLM_USE_V2_MODEL_RUNNER` unset |
+| --- | --- |
+| Library and general CLI | ModelRunner V1 |
+| CUDA direct offline OneRec, HTTP serving and OneRec gRPC examples | ModelRunner V2 |
+| CUDA offline thinking and tiny-model gRPC smoke test | ModelRunner V1 |
+| Ascend Beam examples | ModelRunner V1 |
+
+Set `VLLM_USE_V2_MODEL_RUNNER=0` before startup to run a CUDA example with V1.
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=0
 ```
 
-Use `VLLM_USE_V2_MODEL_RUNNER=1`, an empty value, or an unset variable to
-select the CUDA example default. Restart the process after changing the
-setting. The Ascend examples and gRPC tiny-model smoke test use V1. The
-library, general CLI, and offline thinking modes default to V1 when the
-variable is unset.
+The CUDA examples listed under V2 also select V2 for an empty value. Restart
+the process after changing the setting. The Ascend Beam examples and tiny-model
+gRPC smoke test explicitly select V1. See [ModelRunner configuration](../docs/configuration/README.md#modelrunner-selection)
+for library and CLI use.
 
 Both runners use the same Beam Search API and `gr` configuration.
 CUDA Prefill and Decode capture policies differ by runner. See the
-[V2 integration guide](../docs/features/cuda-graphs.md#modelrunner-v2-multi-batch-execution) and
-[Prefill capture guide](../docs/features/cuda-graphs.md#prefill-capture-configuration).
+[V2 integration guide](../docs/design/module/model_runner_v2.md) and
+[Prefill capture guide](../docs/design/feature/cuda_prefill_graph.md#configuration).
 
 ## Run Pangu offline
 
-Follow the [Pangu evaluation guide](../docs/contributing/tools/pangu1b.md#run-the-offline-accuracy-evaluation) to run GSM8K-mini with the local checkpoint.
+Follow the [Pangu evaluation guide](../docs/models/pangu.md#run-the-offline-accuracy-evaluation) to run GSM8K-mini with the local checkpoint.
 
 ## Measure performance
 
 - [Measure offline Beam Search latency](offline_inference/beam_search/README.md#measure-latency-without-profiling)
-- [Measure offline or online throughput](../docs/usage/benchmarks/throughput.md)
+- [Measure offline or online throughput](../docs/benchmarking/throughput.md)

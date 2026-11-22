@@ -63,7 +63,7 @@ For a different raw catalog you already have, place it at
 
 Use the local snapshot for `ONEREC_MODEL` and set `ONEREC_BACKEND` to
 `npu` on Ascend. See the
-[download instructions](../../../docs/getting_started/quickstart.md#1-check-the-environment)
+[download instructions](../../../docs/user_guide/onerec_quickstart.md#1-check-the-environment)
 if you need the model or mapping.
 
 ```bash
@@ -151,12 +151,15 @@ EOF
 
 ## Change the beam width
 
-Set the request width to match the first entry of `gr.beam_width`. The first
-candidate width also matches the request width because Prefill expands one
-prompt into that many beams. Set `gr.constraint_table.max_top_k` to cover
-the largest configured candidate count. Set
-`--max-logprobs` to at least the candidate width and `--max-num-seqs` to at
-least the beam width for these server examples.
+Set the request width to the maximum value in `gr.beam_width`. The first
+entry of `gr.beam_width` controls how many beams Prefill keeps, so the first
+entry of `gr.candidate_width` must equal it. For example, with a retained
+schedule of `[4, 8, 4]`, send request width `8` and set the initial
+candidate width to `4`.
+
+Set `gr.constraint_table.max_top_k` and `--max-logprobs` to at least the
+largest configured candidate width. In these server examples, set
+`--max-num-seqs` to at least the largest configured retained width.
 
 For a CUDA beam width of 256, change these fields in the generated YAML.
 CUDA Constraint Table sampling supports up to 256 candidates.

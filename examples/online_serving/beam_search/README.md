@@ -5,8 +5,8 @@ Run one verified request against a temporary local server, or
 
 ## Prepare the environment and inputs
 
-Install the [CUDA runtime](../../../docs/getting_started/installation/cuda.md) or
-[Ascend runtime](../../../docs/getting_started/installation/ascend.md). Set `ONEREC_MODEL` to a
+Install the [CUDA runtime](../../../docs/getting_started/installation/gpu.md) or
+[Ascend runtime](../../../docs/getting_started/installation/npu.md). Set `ONEREC_MODEL` to a
 [local OneRec snapshot with its tokenizer](../../README.md#run-onerec-offline).
 Run the commands below from the repository root on Linux with Python, Bash
 and curl 7.76 or later.
@@ -79,7 +79,7 @@ client flags configure the request. Library defaults can differ.
 | --- | --- | --- |
 | `gr.beam_graph_enabled` | `true` | Set in YAML to enable Beam graphs. |
 | `gr.worker_decision` | `true` | Set in YAML to enable Beam selection on the Worker. |
-| `gr.beam_width` | `[128, 128, 128]` | Match the first width with the client flag `-b`. |
+| `gr.beam_width` | `[128, 128, 128]` | Pass the maximum width with the client flag `-b`. |
 | `gr.max_decode_steps` | `3` | Set the effective token capacity in YAML. The client sends `max_tokens: 5`, which includes two SID markers and three generated tokens. |
 
 ## Start the server
@@ -168,6 +168,6 @@ Press Ctrl+C in the server terminal to stop the service.
   filesystem, set `VLLM_RPC_BASE_PATH` to a short, writable directory on the
   serving node that supports Unix sockets.
 - If the request returns a model or width error, check the served model name
-  and match the request width to the first entry of `gr.beam_width`.
+  and match the request width to the maximum value in `gr.beam_width`.
 - If startup runs out of device memory, use a device with enough free memory
   for the model and Beam workspace.

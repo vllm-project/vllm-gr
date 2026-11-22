@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="518" viewBox="0 0 940 518" role="img" aria-labelledby="title desc">
+  <title id="title">Checkpoint reload on one instance</title>
+  <desc id="desc">The sidecar pauses an instance and waits for drain. The service marks weights invalid, loads them in place and commits only after every worker returns. The sidecar resumes the instance and verifies its version.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 9 4 L 1 7" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" />
+    </marker>
+  </defs>
+  <rect width="940" height="518" fill="#ffffff" />
+  <g font-family="Arial, Helvetica, sans-serif" fill="#252627">
+    <path d="M 90.0,60 L 90.0,502" fill="none" stroke="#888b86" stroke-width="1.1" stroke-linejoin="round" stroke-dasharray="5 5" />
+    <rect x="7.0" y="20" width="166" height="40" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="90.0" y="45.61" font-size="17" font-weight="600" text-anchor="middle">Sidecar</text>
+    <path d="M 470.0,60 L 470.0,502" fill="none" stroke="#888b86" stroke-width="1.1" stroke-linejoin="round" stroke-dasharray="5 5" />
+    <rect x="387.0" y="20" width="166" height="40" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="470.0" y="45.61" font-size="17" font-weight="600" text-anchor="middle">Service instance</text>
+    <path d="M 850.0,60 L 850.0,502" fill="none" stroke="#888b86" stroke-width="1.1" stroke-linejoin="round" stroke-dasharray="5 5" />
+    <rect x="767.0" y="20" width="166" height="40" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="850.0" y="45.61" font-size="17" font-weight="600" text-anchor="middle">Model workers</text>
+    <path d="M 90.0,110 L 470.0,110" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="280.0" y="101" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Pause and drain</text>
+    <path d="M 470.0,156 L 90.0,156" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="5 5" />
+    <text x="280.0" y="147" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Active work drained, caches cleared</text>
+    <path d="M 90.0,202 L 470.0,202" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="280.0" y="193" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Reload checkpoint</text>
+    <rect x="376.5" y="228" width="187.0" height="34" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="470.0" y="249.95" font-size="15" font-weight="400" text-anchor="middle">Mark weights invalid</text>
+    <path d="M 470.0,294 L 850.0,294" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="660.0" y="285" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Load weights in place</text>
+    <path d="M 850.0,340 L 470.0,340" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="5 5" />
+    <text x="660.0" y="331" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">All workers succeeded</text>
+    <rect x="326.4" y="366" width="287.2" height="34" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="470.0" y="387.95" font-size="15" font-weight="400" text-anchor="middle">Commit checkpoint and mark valid</text>
+    <path d="M 470.0,432 L 90.0,432" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="5 5" />
+    <text x="280.0" y="423" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Checkpoint committed</text>
+    <path d="M 90.0,478 L 470.0,478" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="280.0" y="469" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Resume, then verify running version</text>
+  </g>
+</svg>

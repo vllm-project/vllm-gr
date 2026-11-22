@@ -56,12 +56,12 @@ fi
 source "./tools/devices/resource.sh"
 if [ "${npu_state:-}" == "true" ]; then
     export VLLM_GR_TARGET_DEVICE=npu
-    # Jenkins must validate the same vendor Python that will run pytest.
+    # CI validates the same vendor Python that will run pytest.
     # Installing the NPU GR extra does not upgrade the vendor runtime.
     npu_runtime_spec=$(mktemp "${TMPDIR:-/tmp}/vllm-gr-npu-runtime.XXXXXX")
     if ! python3 tools/ci/resolve_runtime.py resolve --device npu --output "$npu_runtime_spec"; then
         rm -f -- "$npu_runtime_spec"
-        echo "NPU test runtime is incompatible with this checkout. Select the matching vendor environment before running this gate; see docs/getting_started/installation/ascend.md." >&2
+        echo "NPU test runtime is incompatible with this checkout. Select the matching vendor environment before running this gate; see docs/getting_started/installation/npu.md." >&2
         exit 1
     fi
     rm -f -- "$npu_runtime_spec"

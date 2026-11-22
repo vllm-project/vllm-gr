@@ -1,6 +1,6 @@
 # A/B benchmark utilities
 
-Use the [`ab-offline` CLI](../../docs/cli/README.md#offline-ab) with your local
+Use the [`ab-offline` CLI](../../docs/cli/bench.md#offline-ab) with your local
 CUDA runtime, model, and OneRec dataset. The
 [OneRec catalog guide](../../examples/online_serving/catalog/README.md#build-a-catalog-from-the-onerec-dataset)
 shows how to generate the constraint triples to pass with `--catalog`.
@@ -23,7 +23,7 @@ prefers the checkout from which `vllm_gr` is loaded, so changing only the
 working directory can measure the same revision twice.
 
 In Bash, set the two checkout paths and choose two fresh virtual environment
-paths. Follow the [CUDA installation guide](../../docs/getting_started/installation/cuda.md)
+paths. Follow the [CUDA installation guide](../../docs/getting_started/installation/gpu.md)
 and apply the [GR CLI patch](../../docs/cli/README.md#enable-gr-dispatch) in each
 environment. The following setup uses the vLLM wheel installed by `pip`.
 

@@ -1,0 +1,288 @@
+# Paths are relative to docs/. A page entry redirects the whole old path.
+# Without page, only the listed sections redirect and the source page stays live.
+api/README.md:
+  page: examples/README.md
+  sections:
+    examples/README.md#offline-inference: [python-entrypoint]
+    design/feature/beam_batch_execution.md#validation-boundaries: [contract-reference]
+    design/feature/async_scheduling.md#completion-and-cancellation: [batches-failures-and-cancellation]
+community/README.md:
+  page: contributing/README.md
+community/legal/README.md:
+  page: legal/README.md
+configuration/dependency_version_policy.md:
+  page: contributing/dependency_policy.md
+  sections:
+    contributing/dependency_policy.md#runtime-compatibility-and-package-versions: [runtime-compatibility, build-versions]
+    contributing/dependency_policy.md#changing-a-dependency: [dependency-constraints-and-developer-tools]
+contributing/PRE_COMMIT.md:
+  page: contributing/pre_commit_setup.md
+  sections:
+    contributing/pre_commit_setup.md#choose-the-scope: [repository-checks, failures-and-maintenance]
+    design/module/model_runner_v2.md#cuda-stage-hooks-contract: [cuda-stage-hooks-contract]
+contributing/ci/benchmark-policy-approvals.md:
+  page: contributing/ci/benchmark_acceptance.md
+  sections:
+    contributing/ci/benchmark_acceptance.md#policy-selection: [benchmark-policy-in-ci]
+    contributing/ci/benchmark_acceptance.md#local-validation: [local-validation-and-jenkins]
+contributing/documentation.md:
+  page: contributing/docs_guide.md
+  sections:
+    contributing/docs_guide.md#preview-the-site: [build-and-preview]
+    contributing/docs_guide.md#writing-a-page: [write-for-the-readers-task, diagrams-and-assets]
+    contributing/docs_guide.md#checks: [check-a-change]
+contributing/tools/README.md:
+  page: contributing/ci/test_levels.md
+  sections:
+    contributing/pre_commit_setup.md#documentation-checks: [documentation-and-selected-hooks]
+    contributing/ci/test_levels.md#validation-levels: [regression-design]
+    contributing/ci/test_levels.md#parameterized-cases: [maintaining-the-classification]
+    contributing/ci/test_levels.md#platform-markers: [device-and-model-tests]
+    contributing/ci/local_runner.md#run-the-test-suite: [targeted-tests-and-dependencies, local-test-runner]
+    contributing/dependency_policy.md#packaging-validation: [packaging]
+    contributing/ci/benchmark_acceptance.md#benchmark-gates: [benchmark-acceptance]
+    contributing/ci/local_runner.md#select-devices-and-test-levels: [resource-helper]
+    contributing/ci/local_runner.md#cuda-process-inspection-and-cleanup: [cuda-process-inspection-and-cleanup]
+    contributing/ci/pr_merge_loop.md#pull-request-ci: [github-actions-tester]
+contributing/tools/pangu1b.md:
+  page: examples/pangu_sid.md
+  sections:
+    examples/pangu_sid.md#download-and-prepare-a-public-snapshot: [download-the-model]
+    models/pangu.md#run-the-offline-accuracy-evaluation: [run-the-offline-accuracy-evaluation]
+    models/pangu.md#online-serving: [online-serving]
+    examples/pangu_sid.md#build-a-matching-catalog-and-run-beam-search: [prepare-public-weights-for-constrained-sid-beam-search]
+design/main-arch.md:
+  page: design/architecture_overview.md
+  sections:
+    design/architecture_overview.md#how-a-onerec-request-runs: [request-flow]
+    design/architecture_overview.md#component-responsibilities: [module-responsibilities, state-and-lifecycle-boundaries]
+    design/architecture_overview.md#platform-execution: [configuration-and-backend-selection]
+    design/index.md#feature-design: [feature-map]
+    design/module/platform_backend.md: [platform-backend-contract, scope]
+    design/module/platform_backend.md#engine-plans: [lifecycle-and-process-model, engine-plans-and-service-binding]
+    design/module/platform_backend.md#registration-and-activation: [platform-identity-and-deterministic-selection, external-provider-entry-points, current-built-in-mappings]
+    design/module/platform_backend.md#plugin-startup: [lazy-import-boundary]
+    design/module/platform_backend.md#provider-contract: [provider-contract, provider-api-versions, regression-after-removing-the-built-in-npu-provider]
+    design/module/runtime_patches.md: [modelrunner-patch-hooks]
+    design/index.md#decode-attention: [beam-attention-execution]
+features/README.md:
+  page: user_guide/feature_compatibility.md
+  sections:
+    user_guide/feature_compatibility.md#support-matrix: [generation-and-constraints, execution-and-memory, serving-and-operations]
+    design/module/platform_backend.md#registration-and-activation: [backend-selection]
+features/attention.md:
+  page: user_guide/feature_compatibility.md
+  sections:
+    design/feature/cuda_decode_attention.md#shared-prefix: [cuda-prefix-attention, selection-and-compatibility, device-calibration]
+    design/feature/cuda_decode_attention.md#cuda-graphs-and-fallback: [cuda-graphs-and-fallback]
+    design/feature/cuda_decode_attention.md#validation: [validation-status]
+    design/feature/cuda_decode_attention.md#per-beam-suffix-and-final-merge: [cuda-short-suffix-attention, scope-and-limitations]
+    design/feature/cuda_decode_attention.md#configuration: [configuration]
+    design/feature/cuda_decode_attention.md#performance: [validation-and-performance]
+    design/feature/npu_prefill_bsnd.md: [npu-bsnd-prefill]
+    design/feature/npu_prefill_bsnd.md#configuration: [configuration_1]
+    design/feature/npu_prefill_bsnd.md#replay-and-fallback: [execution-and-fallback]
+    design/feature/npu_prefill_bsnd.md#validation: [validation]
+    design/feature/npu_decode_execution.md#caller-owned-xattention-output: [npu-xattention-output-binding, supported-path-and-fallback]
+    user_guide/beam_search_npu.md#optional-xattention-output-binding: [requirements, build, validate-the-binding]
+features/beam-search.md:
+  page: design/feature/beam_batch_execution.md
+  sections:
+    design/feature/beam_batch_execution.md#architecture: [understand-a-beam-request, batch-execution-contract]
+    design/feature/beam_batch_execution.md#validation-boundaries: [production-boundary, request, cpu-beam-semantics, supported-execution-contract]
+    design/feature/beam_batch_execution.md#what-the-caller-receives: [result, npu-host-terminal-columns, numpy-token-representation]
+    design/feature/beam_batch_execution.md#related-files: [cpu-candidate-boundary, sampler-adapter, package-boundary]
+    user_guide/feature_compatibility.md#support-matrix: [deployment-compatibility]
+    design/module/constraint_tables.md#device-execution: [constraint-adapter]
+    design/feature/async_scheduling.md: [asynchronous-scheduling]
+    design/feature/async_scheduling.md#native-progress-and-execution-ownership: [native-progress-and-execution-ownership]
+    design/feature/async_scheduling.md#dispatch-timeline: [first-decode-after-prefill]
+    design/feature/beam_batch_execution.md#scheduling-and-resource-ownership: [independent-engine-reduction-policy]
+    design/module/beam_state.md#storage-and-ownership: [worker-state-and-execution, storage-and-ownership]
+    design/module/beam_state.md#stage-ordering-and-completion: [stage-ordering-and-completion]
+    design/module/beam_state.md#streams-graphs-and-retirement: [streams-graphs-and-retirement]
+features/constraint-tables.md:
+  page: configuration/constraint_tables.md
+  sections:
+    configuration/constraint_tables.md#build: [from-a-catalog-to-valid-candidates]
+    configuration/constraint_tables.md#multiple-tries: [multiple-trie-roots]
+    design/module/constraint_tables.md#ascend: [npu-execution]
+    design/module/constraint_tables.md#artifact-layout: [layout-and-compatibility]
+features/cuda-graphs.md:
+  page: design/feature/cuda_prefill_graph.md
+  sections:
+    design/feature/cuda_prefill_graph.md#capture-shape-selection: [choose-a-capture-policy, modelrunner-v1-preserve-the-gr-grid, modelrunner-v2-use-the-native-capture-plan, compare-actual-execution]
+    design/feature/cuda_prefill_graph.md#configuration: [prefill-capture-configuration, dense-cuda-prefill-opt-in]
+    design/module/model_runner_v2.md: [modelrunner-v2-multi-batch-execution]
+    design/module/model_runner_v2.md#reuse-of-native-vllm: [reuse-of-native-vllm, vllm-030-integration]
+    design/module/model_runner_v2.md#cuda-stage-hooks-contract: [graph-installation-and-startup-ownership, execution-and-shared-support-ownership, native-output-completion-boundary]
+    design/module/model_runner_v2.md#resource-lifetime: [v2-runtime-generations-and-teardown-prerequisites]
+    design/module/model_runner_v2.md#configuration-and-scope: [v1-compatibility-boundary, configuration-and-scope, supported-configuration]
+    design/module/model_runner_v2.md#regression-coverage: [regression-coverage, reproduce-the-execution-regression, online-functional-validation]
+    user_guide/feature_compatibility.md#support-matrix: [unconstrained-generation]
+    benchmarking/accuracy.md#offline-evaluation: [reproduce-the-real-data-accuracy-run]
+features/hot-update.md:
+  page: user_guide/weight_update.md
+  sections:
+    user_guide/weight_update.md#usage: [sidecar-architecture-and-usage, update-process, initial-task-combinations]
+    user_guide/weight_update.md#configuration: [core-abstractions, task, filesystem, update-mode]
+    user_guide/weight_update.md#publish-a-version-and-inspect-status: [service-checks]
+    design/feature/weight_update.md: [purpose-and-scope]
+    design/feature/weight_update.md#architecture: [architecture]
+    design/feature/weight_update.md#shared-update-lifecycle: [shared-update-lifecycle]
+    design/feature/weight_update.md#checkpoint-reload: [checkpoint-task]
+    design/feature/weight_update.md#online-catalog-replacement: [trie-task]
+    design/feature/weight_update.md#validation: [validation, validation-entrypoints, unit-and-component-coverage, related-regression-boundaries]
+features/unconstrained-beam-search.md:
+  page: user_guide/beam_search_npu.md
+  sections:
+    user_guide/beam_search_npu.md#configuration-and-python-entry-point: [configuration, optional-sid-token-family-restriction]
+    user_guide/beam_search_npu.md#supported-execution-boundaries: [candidate-and-score-semantics, execution-support]
+    design/feature/npu_decode_execution.md#validation: [validation-entrypoints]
+getting_started/first-inference.md:
+  page: getting_started/quickstart.md
+  sections:
+    getting_started/quickstart.md#offline-inference: [1-prepare-the-model, 2-run-the-offline-example]
+    getting_started/quickstart.md#expected-output: [3-inspect-the-result]
+    getting_started/quickstart.md#online-serving: [where-to-go-next]
+getting_started/installation/ascend.md:
+  page: getting_started/installation/npu.md
+  sections:
+    contributing/ci/local_runner.md#ascend-test-runtime: [jenkins-test-runtime]
+    design/feature/npu_decode_execution.md#configuration: [npu-decode-execution-options]
+    design/feature/npu_prefill_bsnd.md#configuration: [optional-bsnd-prefill-graphs]
+getting_started/installation/cuda.md:
+  page: getting_started/installation/gpu.md
+  sections:
+    getting_started/installation/gpu.md#setup: [installation]
+getting_started/troubleshooting.md:
+  page: cli/check_env.md
+  sections:
+    cli/check_env.md#output-and-exit-status: [collect-useful-evidence]
+models/README.md:
+  page: models/supported_models.md
+  sections:
+    getting_started/quickstart.md#offline-inference: [prepare-a-reproducible-snapshot, validate-the-workload-you-will-deploy]
+usage/README.md:
+  page: user_guide/README.md
+  sections:
+    benchmarking/README.md#choose-a-benchmark: [measurement-and-acceptance]
+usage/benchmarks/README.md:
+  page: benchmarking/README.md
+  sections:
+    benchmarking/README.md#download-the-dataset: [get-dataset]
+    benchmarking/README.md#choose-a-benchmark: [interpreting-results]
+usage/benchmarks/accuracy.md:
+  page: benchmarking/accuracy.md
+  sections:
+    benchmarking/common.md#prerequisites: [prerequisites]
+    benchmarking/common.md#online-server-mode: [terminal-1-prepare-the-full-catalog-and-start-the-server]
+    benchmarking/accuracy.md#offline-evaluation: [running-the-benchmark, 1-offline-accuracy-mode-simple-local]
+    benchmarking/accuracy.md#online-serving: [terminal-2-run-the-accuracy-benchmark-against-the-server]
+    benchmarking/accuracy.md#command-line-arguments: [usage]
+    benchmarking/accuracy.md#model: [core-arguments]
+    benchmarking/accuracy.md#benchmark-options: [benchmark-related-parameters]
+    benchmarking/accuracy.md#online-options: [arguments-for-online-benchmark]
+    benchmarking/accuracy.md#example-output: [expected-output]
+usage/benchmarks/beam_v1_recall_gate.md:
+  page: contributing/ci/benchmark_acceptance.md
+  sections:
+    contributing/ci/benchmark_acceptance.md#gpu-five-task-recall: [beam-v1-five-task-recall-gate, accepted-baseline, blocking-behavior-and-input-identity]
+usage/benchmarks/parent_score_gate.md:
+  page: contributing/ci/benchmark_acceptance.md
+  sections:
+    contributing/ci/benchmark_acceptance.md#npu-video-100: [video-100-accuracy-gate, effective-checks, interpretation]
+    contributing/ci/benchmark_acceptance.md#policy-selection: [scope-and-policy-selection, policy-revision]
+    contributing/ci/benchmark_acceptance.md#local-validation: [validation-without-accelerator-inference]
+usage/benchmarks/throughput.md:
+  page: benchmarking/throughput.md
+  sections:
+    benchmarking/common.md#prerequisites: [prerequisites]
+    benchmarking/throughput.md#offline-measurements: [running-the-benchmark, 1-offline-throughput-mode-simple-local]
+    benchmarking/throughput.md#run-the-http-client: [terminal-2-run-the-throughput-benchmark-against-the-server]
+    benchmarking/throughput.md#command-line-arguments: [usage]
+    benchmarking/throughput.md#server-options: [server-core-arguments]
+    benchmarking/throughput.md#benchmark-options: [benchmark-related-parameters]
+    benchmarking/throughput.md#prompt-length: [openonerec-length-caveats]
+    benchmarking/throughput.md#beam-options: [beam-search-parameters-optional]
+    benchmarking/throughput.md#online-options: [arguments-for-online-benchmark]
+    benchmarking/throughput.md#example-output: [expected-output]
+
+# Old headings on pages that kept their URLs.
+README.md:
+  sections:
+    README.md#about: [generative-recommendation-with-vllm-gr, what-vllm-gr-adds]
+    README.md#getting-started: [build-your-first-application]
+    README.md#find-a-guide: [find-your-path]
+    contributing/dependency_policy.md#runtime-compatibility-and-package-versions: [runtime-compatibility]
+cli/README.md:
+  sections:
+    cli/README.md#commands: [vllm-gr-cli-reference]
+    cli/serve.md: [serving]
+    cli/serve.md#configuration: [serving-configuration]
+    cli/bench.md#workloads: [benchmarks]
+    cli/bench.md#offline-ab: [offline-ab]
+    cli/bench.md#command-syntax: [example-benchmark-invocations]
+    cli/bench/open_one_rec.md: [onerec-additions]
+    cli/bench/beam_performance.md: [beam-performance, beam-performance-ab-report]
+    cli/bench/beam_recall.md: [beam-recall]
+    cli/bench/qwen_v1.md: [qwen-v1]
+configuration/README.md:
+  sections:
+    configuration/README.md#load-and-override-a-configuration: [related-guides]
+contributing/README.md:
+  sections:
+    contributing/README.md#find-a-contributor-guide: [developer-guide]
+    contributing/ci/pr_merge_loop.md#before-merging: [before-submitting]
+contributing/agent_instructions.md:
+  sections:
+    contributing/agent_instructions.md#where-to-make-a-change: [ai-coding-tools-and-instruction-maintenance, tool-integration, where-information-belongs, upstream-reference]
+    contributing/agent_instructions.md#verify-a-routing-change: [review-changes-to-instructions]
+contributing/development.md:
+  sections:
+    contributing/development.md: [scope-and-code-map, architecture-and-configuration, package-ownership, worker-packages, configuration-field-maintenance, modelrunner-and-graph-boundaries, constraint-and-candidate-boundaries]
+    contributing/development.md#validate-a-change: [select-regression-coverage, acceptance-evidence]
+design/index.md:
+  sections:
+    design/index.md#feature-design: [design-and-architecture, read-a-design-with-its-implementation]
+design/runtime_patch_inventory.md:
+  sections:
+    design/runtime_patch_inventory.md#active-patches: [runtime-patch-and-upstream-dependency-inventory, risk-levels, retired-patches]
+    contributing/dependency_policy.md#runtime-compatibility-and-package-versions: [supported-runtime]
+    design/module/runtime_patches.md: [benchmark-only-runtime-mutations, shared-implicit-contracts, dynamic-attributes, maintenance-rules]
+    configuration/README.md#load-and-override-a-configuration: [configuration-keys]
+examples/README.md:
+  sections:
+    examples/README.md#offline-inference: [choose-the-right-evidence]
+getting_started/README.md:
+  sections:
+    getting_started/installation/README.md#supported-hardware: [choose-your-runtime]
+    getting_started/quickstart.md#offline-inference: [your-first-successful-run]
+    configuration/README.md#load-and-override-a-configuration: [before-changing-settings]
+getting_started/quickstart.md:
+  sections:
+    user_guide/onerec_quickstart.md: [onerec-17b-v1-asynchronous-scheduling-quickstart-cuda]
+    user_guide/onerec_quickstart.md#1-check-the-environment: [1-check-the-environment]
+    user_guide/onerec_quickstart.md#2-prepare-the-constraint-table-inputs: [2-build-the-v1-constraint-table-inputs]
+    user_guide/onerec_quickstart.md#3-run-offline-beam-search: [3-run-the-minimal-v1-reproduction]
+    user_guide/onerec_quickstart.md#4-why-these-values-are-fixed: [4-why-these-values-are-fixed]
+    user_guide/onerec_quickstart.md#batching-several-prompts-in-one-http-request: [batching-several-prompts-in-one-http-request]
+    user_guide/onerec_quickstart.md#ownership: [ownership]
+    user_guide/onerec_quickstart.md#5-validate-and-troubleshoot: [5-validate-and-troubleshoot]
+    user_guide/onerec_quickstart.md#see-also: [further-reading]
+serving/README.md:
+  sections:
+    serving/README.md#choose-an-endpoint: [serving-binary-transport-and-metrics, choose-an-interface]
+    serving/grpc.md: [grpc-and-numpy-transport]
+    serving/grpc.md#token-inputs: [inputs-and-request-lifecycle]
+    serving/grpc.md#start-the-server: [usage-and-tests]
+    serving/grpc.md#binary-beam-results: [binary-beam-results]
+    serving/replica_deployment.md: [independent-replicas-and-load-balancing]
+    serving/replica_deployment.md#start-two-replicas: [start-two-replicas]
+    serving/replica_deployment.md#configure-nginx: [configure-nginx]
+    serving/replica_deployment.md#install-nginx: [install-nginx]
+    serving/replica_deployment.md#configure-the-upstream: [configure-the-upstream]
+    serving/replica_deployment.md#test-the-proxy: [test-the-proxy]
+    serving/metrics.md#read-prometheus-metrics: [beam-metrics]
+    serving/metrics.md#measure-beam-latency: [current-v1-measurements]
+    serving/metrics.md#benchmark-compatibility-with-older-servers: [benchmark-compatibility-with-older-servers]

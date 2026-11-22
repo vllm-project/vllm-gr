@@ -79,7 +79,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                     raise ClassificationError(
                         f"Unclassified test {key}; assign exactly one @pytest.mark.l1 through "
                         "@pytest.mark.l5, or add a parameter rule to tests/level_inventory.json. "
-                        "See docs/contributing/tools/README.md#test-levels-and-ci-selection."
+                        "See docs/contributing/ci/test_levels.md#test-levels-and-ci-selection."
                     )
                 else:
                     continue

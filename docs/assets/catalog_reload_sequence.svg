@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="472" viewBox="0 0 940 472" role="img" aria-labelledby="title desc">
+  <title id="title">Online catalog reload</title>
+  <desc id="desc">Workers validate and publish the local replacement table. EngineCore records the version after the collective call succeeds. A later default lookup can see the new catalog.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 9 4 L 1 7" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" />
+    </marker>
+  </defs>
+  <rect width="940" height="472" fill="#ffffff" />
+  <g font-family="Arial, Helvetica, sans-serif" fill="#252627">
+    <path d="M 90.0,60 L 90.0,456" fill="none" stroke="#888b86" stroke-width="1.1" stroke-linejoin="round" stroke-dasharray="5 5" />
+    <rect x="7.0" y="20" width="166" height="40" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="90.0" y="45.61" font-size="17" font-weight="600" text-anchor="middle">Sidecar</text>
+    <path d="M 470.0,60 L 470.0,456" fill="none" stroke="#888b86" stroke-width="1.1" stroke-linejoin="round" stroke-dasharray="5 5" />
+    <rect x="387.0" y="20" width="166" height="40" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="470.0" y="45.61" font-size="17" font-weight="600" text-anchor="middle">EngineCore</text>
+    <path d="M 850.0,60 L 850.0,456" fill="none" stroke="#888b86" stroke-width="1.1" stroke-linejoin="round" stroke-dasharray="5 5" />
+    <rect x="767.0" y="20" width="166" height="40" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="850.0" y="45.61" font-size="17" font-weight="600" text-anchor="middle">Worker table</text>
+    <path d="M 90.0,110 L 470.0,110" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="280.0" y="101" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Reload via management listener</text>
+    <path d="M 470.0,156 L 850.0,156" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="660.0" y="147" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Load candidate on each worker</text>
+    <rect x="559.3" y="182" width="370.7" height="34" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="744.65" y="203.95" font-size="15" font-weight="400" text-anchor="middle">Check trie count and vocabulary projection</text>
+    <rect x="567.7" y="228" width="362.3" height="34" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="748.85" y="249.95" font-size="15" font-weight="400" text-anchor="middle">Switch local default and retain old table</text>
+    <path d="M 850.0,294 L 470.0,294" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="5 5" />
+    <text x="660.0" y="285" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Worker completed reload</text>
+    <rect x="313.9" y="320" width="312.2" height="34" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="470.0" y="341.95" font-size="15" font-weight="400" text-anchor="middle">Record version after workers return</text>
+    <path d="M 470.0,386 L 90.0,386" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="5 5" />
+    <text x="280.0" y="377" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Instance version committed</text>
+    <path d="M 90.0,432 L 470.0,432" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <text x="280.0" y="423" font-size="16" text-anchor="middle" stroke="#ffffff" stroke-width="6" paint-order="stroke" stroke-linejoin="round">Verify version and running status</text>
+  </g>
+</svg>
