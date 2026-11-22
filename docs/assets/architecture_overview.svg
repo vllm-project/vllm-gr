@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="760" viewBox="0 0 1120 760" role="img" aria-labelledby="title description">
+  <title id="title">vLLM-GR Architecture</title>
+  <desc id="description">GRLLM, OpenAI HTTP, and gRPC pass requests through the Session Client to EngineCore. The Scheduler manages GR sessions and native KV cache, and the Executor dispatches work to the Worker. In ModelRunner, model forward produces logits, then Beam stage execution selects candidates and updates Beam state.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#596b85" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { fill: #1f2933; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; }
+      .title { font-size: 40px; font-weight: 700; }
+      .section-title { font-size: 24px; font-weight: 700; }
+      .component-title { font-size: 19px; font-weight: 700; }
+      .label { font-size: 18px; font-weight: 600; }
+      .method { fill: #475670; font-family: Consolas, monospace; font-size: 16px; }
+      .flow-label, .step-detail { fill: #475670; font-size: 14px; }
+      .step { fill: #ffffff; stroke: #BBD4E6; stroke-width: 1.5px; }
+      .legend-label { fill: #475670; font-size: 15px; text-anchor: start; }
+      .panel { fill: #FFF8DB; stroke: #E6C666; }
+      .entry-panel { fill: #E4F1FA; stroke: #90B8D2; }
+      .runner { fill: #F7FBFE; stroke: #90B8D2; }
+      .imported { fill: #D9EAF8; stroke: #90B8D2; }
+      .modified { fill: #FFF4CC; stroke: #E6C666; }
+      .new { fill: #F6DCE1; stroke: #D99BA9; }
+      .panel, .runner, .imported, .modified, .new { stroke-width: 1.5px; }
+      .flow { fill: none; stroke: #596b85; stroke-width: 1.6px; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1120" height="760" fill="#EFF7FC"/>
+  <text class="title" x="560" y="56">vLLM-GR Architecture</text>
+
+  <!-- Frontend entry points share one session client. -->
+  <g>
+    <rect class="panel entry-panel" x="40" y="82" width="1040" height="153" rx="16"/>
+    <text class="section-title" x="560" y="112">Entrypoint</text>
+
+    <rect class="new" x="88" y="127" width="280" height="41" rx="10"/>
+    <rect class="modified" x="420" y="127" width="280" height="41" rx="10"/>
+    <rect class="new" x="752" y="127" width="280" height="41" rx="10"/>
+    <text class="label" x="228" y="154">GRLLM</text>
+    <text class="label" x="560" y="154">OpenAI HTTP</text>
+    <text class="label" x="892" y="154">gRPC Server</text>
+
+    <rect class="new" x="88" y="186" width="944" height="36" rx="10"/>
+    <text class="label" x="560" y="210">Session Client</text>
+    <path class="flow" d="M 228 168 V 186"/>
+    <path class="flow" d="M 560 168 V 186"/>
+    <path class="flow" d="M 892 168 V 186"/>
+  </g>
+
+  <!-- EngineCore retains the native scheduler and executor. -->
+  <g>
+    <rect class="panel" x="40" y="258" width="1040" height="188" rx="16"/>
+    <text class="section-title" x="560" y="288">EngineCore</text>
+    <rect class="modified" x="88" y="303" width="944" height="79" rx="10"/>
+    <text class="component-title" x="560" y="326">Scheduler</text>
+    <rect class="new" x="108" y="336" width="440" height="35" rx="8"/>
+    <rect class="imported" x="572" y="336" width="440" height="35" rx="8"/>
+    <text class="label" x="328" y="359">GR Session State</text>
+    <text class="label" x="792" y="359">KV Cache Manager</text>
+
+    <rect class="imported" x="88" y="395" width="944" height="36" rx="10"/>
+    <text class="label" x="560" y="419">Executor</text>
+    <path class="flow" d="M 560 382 V 395"/>
+  </g>
+
+  <!-- ModelRunner shows how a scheduled stage executes on the worker. -->
+  <g>
+    <rect class="panel" x="40" y="469" width="1040" height="225" rx="16"/>
+    <text class="section-title" x="560" y="499">Worker</text>
+
+    <rect class="runner" x="88" y="514" width="944" height="166" rx="12"/>
+    <text class="component-title" x="560" y="541">ModelRunner</text>
+
+    <!-- The method headers group the work performed by each native hook. -->
+    <rect class="modified" x="108" y="553" width="256" height="30" rx="8"/>
+    <text class="method" x="236" y="574">execute_model</text>
+    <rect class="modified" x="432" y="553" width="580" height="30" rx="8"/>
+    <text class="method" x="722" y="574">sample_tokens</text>
+
+    <rect class="step" x="108" y="597" width="256" height="64" rx="10"/>
+    <text class="component-title" x="236" y="623">Model forward</text>
+    <text class="step-detail" x="236" y="645">vLLM layers and Beam attention</text>
+
+    <rect class="new" x="432" y="597" width="256" height="64" rx="10"/>
+    <text class="component-title" x="560" y="623">Select candidates</text>
+    <text class="step-detail" x="560" y="645">Optional catalog constraints</text>
+
+    <rect class="new" x="756" y="597" width="256" height="64" rx="10"/>
+    <text class="component-title" x="884" y="623">Update Beam state</text>
+    <text class="step-detail" x="884" y="645">Keep the winning beams</text>
+
+    <text class="flow-label" x="398" y="619">logits</text>
+    <path class="flow" d="M 364 629 H 432"/>
+    <path class="flow" d="M 688 629 H 756"/>
+  </g>
+
+  <path class="flow" d="M 560 222 V 258"/>
+  <path class="flow" d="M 560 431 V 469"/>
+
+  <g>
+    <rect class="imported" x="376" y="718" width="34" height="17" rx="3"/>
+    <text class="legend-label" x="420" y="732">Imported</text>
+    <rect class="modified" x="514" y="718" width="34" height="17" rx="3"/>
+    <text class="legend-label" x="558" y="732">Patched</text>
+    <rect class="new" x="652" y="718" width="34" height="17" rx="3"/>
+    <text class="legend-label" x="696" y="732">Added</text>
+  </g>
+</svg>

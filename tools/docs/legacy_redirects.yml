@@ -73,8 +73,8 @@ features/README.md:
 features/attention.md:
   page: user_guide/feature_compatibility.md
   sections:
-    design/feature/cuda_decode_attention.md#shared-prefix: [cuda-prefix-attention, selection-and-compatibility, device-calibration]
-    design/feature/cuda_decode_attention.md#cuda-graphs-and-fallback: [cuda-graphs-and-fallback]
+    design/feature/cuda_decode_attention.md#shared-prompt-prefix: [cuda-prefix-attention, selection-and-compatibility, device-calibration]
+    design/feature/cuda_decode_attention.md#decode-graphs-and-fallback: [cuda-graphs-and-fallback]
     design/feature/cuda_decode_attention.md#validation: [validation-status]
     design/feature/cuda_decode_attention.md#per-beam-suffix-and-final-merge: [cuda-short-suffix-attention, scope-and-limitations]
     design/feature/cuda_decode_attention.md#configuration: [configuration]
@@ -88,15 +88,15 @@ features/attention.md:
 features/beam-search.md:
   page: design/feature/beam_batch_execution.md
   sections:
-    design/feature/beam_batch_execution.md#architecture: [understand-a-beam-request, batch-execution-contract]
+    design/feature/beam_batch_execution.md#how-a-batch-runs: [understand-a-beam-request, batch-execution-contract]
     design/feature/beam_batch_execution.md#validation-boundaries: [production-boundary, request, cpu-beam-semantics, supported-execution-contract]
     design/feature/beam_batch_execution.md#what-the-caller-receives: [result, npu-host-terminal-columns, numpy-token-representation]
-    design/feature/beam_batch_execution.md#related-files: [cpu-candidate-boundary, sampler-adapter, package-boundary]
+    design/feature/beam_batch_execution.md#source-map: [cpu-candidate-boundary, sampler-adapter, package-boundary]
     user_guide/feature_compatibility.md#support-matrix: [deployment-compatibility]
     design/module/constraint_tables.md#device-execution: [constraint-adapter]
     design/feature/async_scheduling.md: [asynchronous-scheduling]
-    design/feature/async_scheduling.md#native-progress-and-execution-ownership: [native-progress-and-execution-ownership]
-    design/feature/async_scheduling.md#dispatch-timeline: [first-decode-after-prefill]
+    design/feature/async_scheduling.md#native-request-accounting: [native-progress-and-execution-ownership]
+    design/feature/async_scheduling.md#cuda-dispatch-timeline: [first-decode-after-prefill]
     design/feature/beam_batch_execution.md#scheduling-and-resource-ownership: [independent-engine-reduction-policy]
     design/module/beam_state.md#storage-and-ownership: [worker-state-and-execution, storage-and-ownership]
     design/module/beam_state.md#stage-ordering-and-completion: [stage-ordering-and-completion]
@@ -117,8 +117,8 @@ features/cuda-graphs.md:
     design/module/model_runner_v2.md#reuse-of-native-vllm: [reuse-of-native-vllm, vllm-030-integration]
     design/module/model_runner_v2.md#cuda-stage-hooks-contract: [graph-installation-and-startup-ownership, execution-and-shared-support-ownership, native-output-completion-boundary]
     design/module/model_runner_v2.md#resource-lifetime: [v2-runtime-generations-and-teardown-prerequisites]
-    design/module/model_runner_v2.md#configuration-and-scope: [v1-compatibility-boundary, configuration-and-scope, supported-configuration]
-    design/module/model_runner_v2.md#regression-coverage: [regression-coverage, reproduce-the-execution-regression, online-functional-validation]
+    design/module/model_runner_v2.md#configuration-and-limits: [v1-compatibility-boundary, configuration-and-scope, supported-configuration]
+    design/module/model_runner_v2.md#validation: [regression-coverage, reproduce-the-execution-regression, online-functional-validation]
     user_guide/feature_compatibility.md#support-matrix: [unconstrained-generation]
     benchmarking/accuracy.md#offline-evaluation: [reproduce-the-real-data-accuracy-run]
 features/hot-update.md:
@@ -128,8 +128,7 @@ features/hot-update.md:
     user_guide/weight_update.md#configuration: [core-abstractions, task, filesystem, update-mode]
     user_guide/weight_update.md#publish-a-version-and-inspect-status: [service-checks]
     design/feature/weight_update.md: [purpose-and-scope]
-    design/feature/weight_update.md#architecture: [architecture]
-    design/feature/weight_update.md#shared-update-lifecycle: [shared-update-lifecycle]
+    design/feature/weight_update.md#update-lifecycle: [architecture, shared-update-lifecycle]
     design/feature/weight_update.md#checkpoint-reload: [checkpoint-task]
     design/feature/weight_update.md#online-catalog-replacement: [trie-task]
     design/feature/weight_update.md#validation: [validation, validation-entrypoints, unit-and-component-coverage, related-regression-boundaries]
@@ -247,7 +246,7 @@ design/index.md:
     design/index.md#feature-design: [design-and-architecture, read-a-design-with-its-implementation]
 design/runtime_patch_inventory.md:
   sections:
-    design/runtime_patch_inventory.md#active-patches: [runtime-patch-and-upstream-dependency-inventory, risk-levels, retired-patches]
+    design/runtime_patch_inventory.md#active-patches: [runtime-patch-and-upstream-dependency-inventory, risk-levels]
     contributing/dependency_policy.md#runtime-compatibility-and-package-versions: [supported-runtime]
     design/module/runtime_patches.md: [benchmark-only-runtime-mutations, shared-implicit-contracts, dynamic-attributes, maintenance-rules]
     configuration/README.md#load-and-override-a-configuration: [configuration-keys]

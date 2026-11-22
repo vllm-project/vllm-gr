@@ -1,40 +1,39 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="930" height="405" viewBox="0 0 930 405" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="975" height="463" viewBox="0 0 975 463" role="img" aria-labelledby="title desc">
   <title id="title">CUDA Beam Decode attention</title>
-  <desc id="desc">Shared-prefix attention supplies output and LSE. For each beam, one of two paths combines that state with its suffix KV: a fused kernel or packed suffix attention and a separate merge.</desc>
+  <desc id="desc">Shared prompt pages produce prefix output and FP32 LSE. The suffix decision routes the per-beam suffix KV and prefix state through packed or fused attention and merge. Both branches produce per-beam output.</desc>
   <defs>
-    <marker id="arrow" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M 1 1 L 9 4 L 1 7" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" />
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round"/>
     </marker>
   </defs>
-  <rect width="930" height="405" fill="#ffffff" />
+  <rect width="975" height="463" fill="#ffffff"/>
   <g font-family="Arial, Helvetica, sans-serif" fill="#252627">
-    <rect x="29" y="18" width="256" height="52" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="157.0" y="49.61" font-size="17" font-weight="400" text-anchor="middle">Shared prompt pages</text>
-    <rect x="341" y="18" width="272" height="52" fill="#f9dce0" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="477.0" y="49.61" font-size="17" font-weight="400" text-anchor="middle">Native or segmented prefix</text>
-    <rect x="341" y="105" width="272" height="51" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="477.0" y="136.11" font-size="17" font-weight="400" text-anchor="middle">Prefix output + FP32 LSE</text>
-    <rect x="650" y="105" width="248" height="51" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="774.0" y="136.11" font-size="17" font-weight="400" text-anchor="middle">Per-beam suffix KV</text>
-    <rect x="477" y="192" width="280" height="45" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="617.0" y="220.11" font-size="17" font-weight="400" text-anchor="middle">Choose suffix path</text>
-    <rect x="55" y="270" width="358" height="58" fill="#fbe6d5" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="234.0" y="294.11" font-size="17" font-weight="400" text-anchor="middle">Packed suffix attention,</text>
-    <text x="234.0" y="315.11" font-size="17" font-weight="400" text-anchor="middle">then a separate merge</text>
-    <rect x="524" y="270" width="358" height="58" fill="#fbe6d5" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="703.0" y="294.11" font-size="17" font-weight="400" text-anchor="middle">Fused suffix attention</text>
-    <text x="703.0" y="315.11" font-size="17" font-weight="400" text-anchor="middle">and final merge</text>
-    <rect x="338" y="354" width="257" height="40" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="466.5" y="379.61" font-size="17" font-weight="400" text-anchor="middle">Per-beam output</text>
-    <path d="M 285,44 L 341,44" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <path d="M 477,70 L 477,105" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <path d="M 477,156 L 477,172 L 550,172 L 550,192" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <path d="M 774,156 L 774,172 L 686,172 L 686,192" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <path d="M 477,214 L 234,214 L 234,270" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <text x="249" y="245.95" font-size="15" font-weight="400" text-anchor="start">Mixed batch or fusion off</text>
-    <path d="M 703,237 L 703,270" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <text x="798" y="256.95" font-size="15" font-weight="400" text-anchor="middle">Eligible pure Decode</text>
-    <path d="M 234,328 L 234,374 L 338,374" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <path d="M 703,328 L 703,374 L 595,374" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
+    <!-- Prefix and suffix inputs feed the selected attention and merge path. -->
+    <path d="M 236 55 H 300" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 550 55 H 614" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 739 82 V 112 H 485 V 145" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 246 197 H 355" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 420 223 V 268 H 247 V 290" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 550 223 V 268 H 728 V 290" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 247 352 V 377 H 435 V 393" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 728 352 V 377 H 535 V 393" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <rect x="26" y="28" width="210" height="54" rx="8" fill="#e3f1d9" stroke="#252627" stroke-width="1.5"/>
+    <text x="131" y="51" font-size="16" text-anchor="middle" fill="#252627"><tspan x="131" dy="0">Shared prompt</tspan><tspan x="131" dy="19">pages</tspan></text>
+    <rect x="300" y="28" width="250" height="54" rx="8" fill="#fbe6d5" stroke="#252627" stroke-width="1.5"/>
+    <text x="425" y="51" font-size="16" text-anchor="middle" fill="#252627"><tspan x="425" dy="0">Native or</tspan><tspan x="425" dy="19">segmented prefix</tspan></text>
+    <rect x="614" y="28" width="250" height="54" rx="8" fill="#f9dce0" stroke="#252627" stroke-width="1.5"/>
+    <text x="739" y="51" font-size="16" text-anchor="middle" fill="#252627"><tspan x="739" dy="0">Prefix output +</tspan><tspan x="739" dy="19">FP32 LSE</tspan></text>
+    <rect x="26" y="170" width="220" height="54" rx="8" fill="#e3f1d9" stroke="#252627" stroke-width="1.5"/>
+    <text x="136" y="202" font-size="16" text-anchor="middle" fill="#252627">Per-beam suffix KV</text>
+    <polygon points="485,145 615,197 485,249 355,197" fill="#fff4cc" stroke="#252627" stroke-width="1.5"/>
+    <text x="485" y="193" font-size="15" text-anchor="middle" fill="#252627"><tspan x="485" dy="0">Eligible for</tspan><tspan x="485" dy="19">fused suffix?</tspan></text>
+    <rect x="89" y="290" width="316" height="62" rx="8" fill="#fbe6d5" stroke="#252627" stroke-width="1.5"/>
+    <text x="247" y="317" font-size="16" text-anchor="middle" fill="#252627"><tspan x="247" dy="0">Packed suffix attention</tspan><tspan x="247" dy="19">then a separate merge</tspan></text>
+    <rect x="570" y="290" width="316" height="62" rx="8" fill="#fbe6d5" stroke="#252627" stroke-width="1.5"/>
+    <text x="728" y="317" font-size="16" text-anchor="middle" fill="#252627"><tspan x="728" dy="0">Fused suffix attention</tspan><tspan x="728" dy="19">and final merge</tspan></text>
+    <rect x="355" y="393" width="260" height="54" rx="8" fill="#d7f1f1" stroke="#252627" stroke-width="1.5"/>
+    <text x="485" y="425" font-size="16" text-anchor="middle" fill="#252627">Per-beam output</text>
+    <text x="310" y="257" font-size="13" text-anchor="middle" fill="#5f6368">No</text>
+    <text x="664" y="257" font-size="13" text-anchor="middle" fill="#5f6368">Yes</text>
   </g>
 </svg>

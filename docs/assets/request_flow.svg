@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="600" viewBox="0 0 1100 600" role="img" aria-labelledby="title desc">
+<title id="title">OneRec request flow</title>
+<desc id="desc">Frontend submits one batch, EngineCore schedules Prefill and Decode stages, the worker returns receipts, and EngineCore delivers one ordered result after release.</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
+<path d="M 1 1 L 9 4 L 1 7" fill="none" stroke="#1f2933" stroke-width="1.6" stroke-linejoin="round"/>
+</marker>
+</defs>
+<rect width="1100" height="600" fill="#ffffff"/>
+<g font-family="Arial, Helvetica, sans-serif" fill="#1f2933">
+<rect x="20" y="210" width="1060" height="220" rx="0" fill="#FFFDF4" stroke="#E6C666" stroke-width="0"/>
+<rect x="20" y="100" width="1060" height="110" rx="0" fill="#F7FBF3" stroke="#C8DDB5" stroke-width="0"/>
+<rect x="20" y="430" width="1060" height="140" rx="0" fill="#F4FAFE" stroke="#90B8D2" stroke-width="0"/>
+<line x1="200" y1="82" x2="200" y2="580" stroke="#888b86" stroke-width="1.1" stroke-dasharray="5 5"/>
+<line x1="550" y1="82" x2="550" y2="580" stroke="#888b86" stroke-width="1.1" stroke-dasharray="5 5"/>
+<line x1="900" y1="82" x2="900" y2="580" stroke="#888b86" stroke-width="1.1" stroke-dasharray="5 5"/>
+<rect x="90" y="30" width="220" height="50" rx="6" fill="#e3f1d9" stroke="#7fa86a" stroke-width="1.2"/>
+<text x="200.0" y="60.6" font-size="16" font-weight="600" text-anchor="middle" fill="#1f2933">Frontend</text>
+<rect x="440" y="30" width="220" height="50" rx="6" fill="#F6DCE1" stroke="#D99BA9" stroke-width="1.2"/>
+<text x="550.0" y="60.25" font-size="15" font-weight="600" text-anchor="middle" fill="#1f2933">EngineCore / GR scheduler</text>
+<rect x="790" y="30" width="220" height="50" rx="6" fill="#D9EAF8" stroke="#90B8D2" stroke-width="1.2"/>
+<text x="900.0" y="60.6" font-size="16" font-weight="600" text-anchor="middle" fill="#1f2933">Device worker</text>
+<text x="50" y="118" font-size="12" font-weight="700" text-anchor="start" fill="#5f6368">Admission</text>
+<text x="50" y="228" font-size="12" font-weight="700" text-anchor="start" fill="#5f6368">Execution</text>
+<text x="50" y="448" font-size="12" font-weight="700" text-anchor="start" fill="#5f6368">Delivery</text>
+<rect x="420" y="145" width="260" height="44" rx="8" fill="#F6DCE1" stroke="#D99BA9" stroke-width="1.2"/>
+<circle cx="438" cy="167.0" r="11" fill="#ffffff" stroke="#D99BA9" stroke-width="1.2"/>
+<text x="438" y="171.0" font-size="12" font-weight="700" text-anchor="middle" fill="#1f2933">2</text>
+<text x="458" y="172.0" font-size="13" font-weight="400" text-anchor="start" fill="#1f2933">Validate and register batch</text>
+<rect x="760" y="270" width="280" height="44" rx="8" fill="#D9EAF8" stroke="#90B8D2" stroke-width="1.2"/>
+<circle cx="778" cy="292.0" r="11" fill="#ffffff" stroke="#90B8D2" stroke-width="1.2"/>
+<text x="778" y="296.0" font-size="12" font-weight="700" text-anchor="middle" fill="#1f2933">4</text>
+<text x="798" y="297.0" font-size="13" font-weight="400" text-anchor="start" fill="#1f2933">Run forward and select tokens</text>
+<rect x="420" y="372" width="260" height="44" rx="8" fill="#F6DCE1" stroke="#D99BA9" stroke-width="1.2"/>
+<circle cx="438" cy="394.0" r="11" fill="#ffffff" stroke="#D99BA9" stroke-width="1.2"/>
+<text x="438" y="398.0" font-size="12" font-weight="700" text-anchor="middle" fill="#1f2933">6</text>
+<text x="458" y="399.0" font-size="13" font-weight="400" text-anchor="start" fill="#1f2933">Apply receipt</text>
+<rect x="380" y="470" width="340" height="44" rx="8" fill="#F6DCE1" stroke="#D99BA9" stroke-width="1.2"/>
+<circle cx="398" cy="492.0" r="11" fill="#ffffff" stroke="#D99BA9" stroke-width="1.2"/>
+<text x="398" y="496.0" font-size="12" font-weight="700" text-anchor="middle" fill="#1f2933">7</text>
+<text x="418" y="497.0" font-size="13" font-weight="400" text-anchor="start" fill="#1f2933">Finalize after drain and release</text>
+<line x1="200" y1="128" x2="550" y2="128" stroke="#1f2933" stroke-width="1.6" marker-end="url(#arrow)"/>
+<text x="375" y="120" font-size="13" font-weight="400" text-anchor="middle" fill="#1f2933">1  Submit fixed batch</text>
+<!-- Messages connect the sender and receiver lifelines. -->
+<line x1="550" y1="240" x2="900" y2="240" stroke="#1f2933" stroke-width="1.6" marker-end="url(#arrow)"/>
+<text x="725" y="232" font-size="13" font-weight="400" text-anchor="middle" fill="#1f2933">3  Schedule stage</text>
+<line x1="900" y1="350" x2="550" y2="350" stroke="#5f6368" stroke-width="1.6" marker-end="url(#arrow)" stroke-dasharray="6 5"/>
+<text x="725.0" y="342" font-size="13" font-weight="400" text-anchor="middle" fill="#5f6368">5  Stage receipt</text>
+<line x1="550" y1="540" x2="200" y2="540" stroke="#5f6368" stroke-width="1.6" marker-end="url(#arrow)" stroke-dasharray="6 5"/>
+<text x="375.0" y="532" font-size="13" font-weight="400" text-anchor="middle" fill="#5f6368">8  Ordered batch result</text>
+<text x="50" y="247" font-size="12" text-anchor="start" fill="#5f6368">
+  <tspan x="50">Repeat for Prefill</tspan>
+  <tspan x="50" dy="15">and each Decode</tspan>
+</text>
+</g>
+</svg>

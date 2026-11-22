@@ -179,9 +179,10 @@ tries/
 
 The model structure/configuration stays fixed. Default checkpoint validation
 compares file lists/sizes, not weight contents; default Trie validation compares
-tensor names/count, not tensor values or file sizes. The server then performs
-native loading and its resource compatibility checks. Only single-file checkpoint
-loading has been exercised in the recorded GPU tests.
+tensor names/count, not tensor values or file sizes. The server then loads the
+weights into the existing model; it does not re-check architecture or tokenizer
+compatibility, so an incompatible checkpoint fails during native loading. Only
+single-file checkpoint loading has been exercised in the recorded GPU tests.
 
 Inspect each instance's committed version and readiness through its control port:
 
@@ -210,7 +211,7 @@ completion before loading weights.
 
 Version and path fields are independent of service state. The status
 contract, including `checkpoint_valid` and which component owns it, is defined
-in [the update lifecycle](../design/feature/weight_update.md#shared-update-lifecycle).
+in [the update lifecycle](../design/feature/weight_update.md#update-lifecycle).
 
 Sidecar compares the relevant version, reads its path for validation, and checks
 service state and checkpoint validity. A paused instance already on the target

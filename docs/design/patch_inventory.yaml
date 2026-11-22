@@ -1,5 +1,6 @@
 # Authoritative patch ownership inventory. Independent core/provider assertions
-# are checked against it; see docs/design/runtime_patch_inventory.md for the rationale.
+# are checked against it; see docs/design/module/runtime_patches.md for the
+# rationale and docs/design/runtime_patch_inventory.md for the checked index.
 schema_version: 3
 
 pre_upgrade_baseline:
@@ -72,7 +73,7 @@ patches:
     activation: the required frontend patch plan detects the method is not installed
     validator_or_test:
       - vllm_gr.v1.engine.logprobs_patch.validate_flat_logprobs_patch
-      - tests/test_patch_initialization.py
+      - tests/test_patch_initialization.py::test_flat_logprobs_patch_preserves_offsets_and_optional_columns
     process_roles: [offline_frontend, api_server]
     target: vllm.logprobs.FlatLogprobs.append_fast
     risk: medium
@@ -178,7 +179,8 @@ patches:
     activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper
     validator_or_test:
       - vllm_gr.v1.core.sched.scheduler_patch.validate_scheduler_patch
-      - tests/contract/test_engine_core_protocol_contracts.py
+      - tests/v1/engine/test_gr_async_scheduler.py
+      - tests/test_patch_initialization.py::test_scheduler_plan_repairs_partial_install
     process_roles: [engine_core]
     target: Scheduler.schedule and Scheduler.update_from_output in vllm.v1.core.sched.scheduler
     risk: critical
@@ -226,7 +228,6 @@ patches:
       - tests/kernels/test_gr_prefill_v2.py
       - tests/kernels/test_v2_multibatch_graphs.py
       - tests/kernels/test_beam_pool_recapture.py
-      - tests/kernels/test_stage_topk_v2.py
       - tests/v1/worker/test_model_runner_patch.py
       - tests/v1/worker/test_model_runner_patch.py::test_active_cuda_worker_hot_update_utility_contract
       - tests/sidecar/test_worker_update.py
@@ -234,7 +235,6 @@ patches:
       - tests/v1/worker/test_model_runner_stage_binding.py
       - tests/v1/worker/test_cuda_native_output.py
       - tests/v1/worker/test_v2_multibatch.py
-      - tests/kernels/test_gpu_beam_stage_lifecycle.py
       - tests/kernels/test_gpu_beam_stage_v2_state.py
       - tests/v1/worker/test_gr_startup.py
       - tests/tools/test_cuda_stage_typing.py
@@ -300,12 +300,11 @@ patches:
   - id: GR-PATCH-015
     scope: core
     backend_id: null
-    owner: vllm_gr/ops/sliced_logits.py
-    shared_helpers: vllm_gr/v1/worker/lm_head_cache.py
+    owner: vllm_gr/v1/worker/sliced_logits_patch.py
+    shared_helpers: vllm_gr/ops/sliced_logits.py, vllm_gr/v1/worker/lm_head_cache.py
     installer: vllm_gr.v1.worker.sliced_logits_patch.apply_sliced_logits_patch
     activation: projection hooks execute with a valid slice; cache reload hooks install after model load by ParallelLMHead type, independent of module names
     validator_or_test:
-      - vllm_gr.v1.worker.sliced_logits_patch.apply_sliced_logits_patch return value
       - tests/ops/test_sliced_logits.py
       - tests/platforms/test_import_isolation.py::test_cuda_plugin_initialization_does_not_import_ascend
       - tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload
@@ -323,7 +322,6 @@ patches:
     installer: vllm_gr.platforms.ascend.spawn_patch.apply_npu_spawn_patch
     activation: the selected NPU provider installs or repairs spawn protection before importing the native worker
     validator_or_test:
-      - vllm_gr.platforms.ascend.spawn_patch.apply_npu_spawn_patch return value
       - tests/test_patch_initialization.py::test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings
       - tests/test_patch_initialization.py::test_npu_spawn_patch_forces_spawn_only_when_npu_initialized
     process_roles: [main, engine_core]
@@ -338,9 +336,7 @@ patches:
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_penalties_warmup_oom_guard
     activation: NPUWorker init_device runs in the child process and the native penalties warmup callable is present
-    validator_or_test:
-      - vllm_gr.v1.ascend_compat.apply_penalties_warmup_oom_guard return value
-      - NPU end-to-end benchmark gate (engine startup at --max_num_seqs 2048)
+    validator_or_test: []  # No behavioural test yet; the native callable guard runs at install time.
     process_roles: [npu_worker]
     target: vllm_ascend.model_executor.warmup.kernel_warmup.penalties_triton_warmup
     risk: medium
@@ -354,14 +350,12 @@ patches:
     installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer and patch_npu_worker_init_device
     activation: NPU engine configuration and every worker plugin initialization, independently of the device hook; repair native config caller bindings even when the sanitizer is installed; entrypoint re-asserted on every create_engine_config call and initializes the shared EngineCore plan before native construction
     validator_or_test:
-      - vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer return value
       - tests/v1/test_ascend_compat.py::test_ascend_config_filter_preserves_engine_identity_and_gr_config
       - tests/v1/test_ascend_compat.py::test_ascend_config_filter_restores_mapping_on_native_failure
       - tests/v1/test_ascend_compat.py::test_ascend_entry_installs_filter_before_delegating
       - tests/v1/test_ascend_compat.py::test_worker_installs_config_filter_before_constructor
       - tests/v1/test_ascend_compat.py::test_worker_rechecks_config_bindings_without_rewrapping_device_hook
       - tests/v1/test_ascend_compat.py::test_config_binding_recheck_preserves_unrelated_overrides
-      - NPU EngineCore startup (vllm-ascend AscendConfig pydantic extra="forbid")
     process_roles: [main, engine_core, worker]
     target: vllm.v1.engine.core.EngineCoreProc.run_engine_core and vllm_ascend.ascend_config.init_ascend_config
     risk: high
@@ -392,7 +386,6 @@ patches:
     validator_or_test:
       - tests/v1/test_npu_kv_layout.py
       - tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
-      - tests/ops/npu/test_npu_beam_row_views.py
     process_roles: [npu_worker]
     target: vllm_ascend.attention.utils.requires_contiguous_pa_kv_cache and its model_runner_v1 import binding
     risk: high

@@ -3,36 +3,63 @@
 vLLM-GR extends vLLM to serve generative recommendation models. For OneRec,
 the prompt represents a user's history, and the model generates semantic IDs
 for candidate items. Beam search keeps several candidate continuations for
-each prompt. When a catalog constraint is enabled, the selected catalog trie limits which
-tokens may extend each partial ID.
+each prompt. When a catalog constraint is enabled, the selected catalog trie
+limits which tokens may extend each partial ID.
+
+![Architecture overview: the Entrypoint submits through the Session Client, EngineCore schedules Beam work, and the Worker's ModelRunner runs the forward pass, selects candidates, and updates Beam state.](../assets/architecture_overview.svg)
+
+Blue marks components imported from vLLM, yellow marks native components
+patched by GR, and pink marks components added by GR. The vLLM general plugin
+entry point installs the runtime hooks in each process that needs them.
+
+vLLM-GR ships as an open-source subproject. It extends vLLM's scheduler, model
+execution, KV cache, parallelism and quantization instead of replacing them.
+The serving goal is lower end-to-end latency, SLA compliance and higher
+effective throughput.
 
 ## How a OneRec request runs
 
-`GRLLM.beam_search()`, the HTTP Beam endpoint, and the gRPC Beam service
-accept different input formats. Each submits a complete logical Beam batch
-to EngineCore. A batch may contain several prompts. Each prompt keeps its
-own candidate history and results.
+The offline library, HTTP and gRPC accept Beam requests.
 
-![Sequence from frontend submission through EngineCore admission, Prefill and Decode on the device worker, and delivery of ranked results after retirement.](../assets/beam_batch_sequence.svg)
+| Entry point | Submission unit |
+| --- | --- |
+| `GRLLM.beam_search()` | One logical Beam batch. |
+| HTTP `POST /v1/completions` with `use_beam_search` | One Beam batch for an eligible non-streaming prompt list when its count is in `gr.beam_batch_sizes` and capacity and request checks pass. The fallback opens independent Beam sessions for each prompt. |
+| HTTP `POST /v1/chat/completions` with `use_beam_search` | One conversation per request, submitted as a single-prompt Beam session. |
+| gRPC `VllmEngine.GenerateBatch` | One logical Beam batch. |
+
+A batch may contain several prompts. Each prompt keeps its own candidate
+history and result.
+
+![Request flow: the frontend submits one batch, EngineCore schedules Prefill and Decode stages, the worker returns receipts, and EngineCore delivers one ordered result after release.](../assets/request_flow.svg)
 
 1. **Admission.** EngineCore validates the batch before admitting its members.
    The native scheduler accounts for prompt tokens and allocates paged KV
-   blocks. GR associates the native requests with a Beam session and adds
-   session and stage metadata to the scheduled work.
+   blocks for the prompt and the reserved Decode positions. GR associates the
+   native requests with a Beam session and adds session and stage metadata to
+   the scheduled work.
 2. **Prefill and Decode.** The worker runs the prompt forward and selects the
-   first candidates. At each Decode step it scores continuations, applies
-   catalog constraints when enabled, and retains the winning beams. Each
-   winner inherits its parent's history and KV state. The frontend submits the
-   batch once and waits for the terminal result.
+   first token for each retained beam. At each Decode step it scores
+   continuations, applies catalog constraints when enabled, and retains the
+   winning beams. Each winner inherits its parent's history and KV state. The
+   frontend submits the batch once and waits for the terminal result.
 3. **Completion and cancellation.** EngineCore tracks outstanding dispatches.
-   It publishes a successful result after receiving confirmation that the
-   session's worker resources have been released. An in-flight cancellation
-   also drains outstanding work before another session can reuse those
-   resources.
+   It publishes a successful result after confirming that the session's worker
+   resources have been released. An in-flight cancellation also drains
+   outstanding work before another session can reuse those resources.
 
 See [Beam batch execution](feature/beam_batch_execution.md) for the request
 and result contracts and [asynchronous scheduling](feature/async_scheduling.md)
-for dispatch and retirement ordering.
+for ownership, dispatch and retirement ordering.
+
+## Key techniques
+
+| Technique | Implementation |
+| --- | --- |
+| Session scheduling and asynchronous pipeline | Submit a whole Beam batch once, keep its session resident across stages, and overlap host preparation with device execution. |
+| Beam execution and KV optimization | Share the prompt KV across beams, fuse short-suffix attention, and replay captured graphs. |
+| SID constraints and dynamic Beam | Apply catalog-constrained selection, vary candidate and retained widths per stage, and slice the vocabulary projection. |
+| Online ingress and hot update | Admit requests with low copying, and reload model weights or swap the SID catalog on a running service. |
 
 <a id="what-vllm-and-vllm-gr-own"></a>
 
@@ -46,11 +73,11 @@ for dispatch and retirement ordering.
 | GR update sidecar | Coordinates checkpoint and catalog updates across serving instances through management requests. |
 
 The split matters during Decode. The scheduler advances a logical request by
-one token while the worker evaluates multiple beam rows for that request.
-The [constraint table](module/constraint_tables.md) determines which
-continuations are legal. The [Beam state design](module/beam_state.md)
-explains how the CUDA worker preserves candidate ancestry across reordering.
-The [update design](feature/weight_update.md) covers the separate management path.
+one token while the worker evaluates multiple beam rows for that request. The
+[constraint table](module/constraint_tables.md) determines which continuations
+are legal. The [Beam state design](module/beam_state.md) explains how the CUDA
+worker preserves candidate ancestry across reordering. The
+[update design](feature/weight_update.md) covers the separate management path.
 
 <a id="where-cuda-and-ascend-diverge"></a>
 
@@ -59,8 +86,8 @@ The [update design](feature/weight_update.md) covers the separate management pat
 Both backends use the same Beam batch and result contracts. At startup, each
 process activates the provider for the current vLLM device type. The provider
 checks the runtime and applies platform-specific patches. The worker and
-attention dispatchers select the runner and attention implementation for the
-device.
+attention dispatchers then select the runner and attention implementation for
+the device.
 
 - **CUDA** workers manage device Beam state and can replay captured Prefill
   and Decode work. The [CUDA Prefill design](feature/cuda_prefill_graph.md)
@@ -68,7 +95,7 @@ device.
   describes integration with the native runner.
 - **Ascend** workers use NPU-specific attention and KV operations. Eligible
   prompt shapes can use [BSND Prefill graphs](feature/npu_prefill_bsnd.md).
-  The [NPU Decode design](feature/npu_decode_execution.md) describes the
+  The [Ascend Decode design](feature/npu_decode_execution.md) describes the
   fused and cascade paths and their fallback conditions.
 
 See the [platform backend contract](module/platform_backend.md) for provider

@@ -1,34 +1,40 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="382" viewBox="0 0 900 382" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="575" viewBox="0 0 880 575" role="img" aria-labelledby="title desc">
   <title id="title">Ascend Decode and KV reorder</title>
-  <desc id="desc">The worker independently dispatches attention and KV reorder. Valid mixed batches use cascade attention. Fused reorder requires xllm and full-width parents in ascending source order.</desc>
+  <desc id="desc">Attention selects fused XAttention or cascade. Both paths lead to parent selection. A separate dispatch chooses fused or cascade KV reorder for those parents.</desc>
   <defs>
-    <marker id="arrow" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M 1 1 L 9 4 L 1 7" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" />
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round"/>
     </marker>
   </defs>
-  <rect width="900" height="382" fill="#ffffff" />
+  <rect width="880" height="575" fill="#ffffff"/>
   <g font-family="Arial, Helvetica, sans-serif" fill="#252627">
-    <rect x="275" y="14" width="350" height="46" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="450.0" y="42.61" font-size="17" font-weight="400" text-anchor="middle">Decode rows and session KV</text>
-    <rect x="41" y="107" width="347" height="52" fill="#fbe6d5" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="214.5" y="138.61" font-size="17" font-weight="400" text-anchor="middle">Fused XAttention</text>
-    <rect x="512" y="107" width="347" height="52" fill="#fbe6d5" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="685.5" y="138.61" font-size="17" font-weight="400" text-anchor="middle">Cascade attention</text>
-    <rect x="275" y="204" width="350" height="50" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="450.0" y="234.61" font-size="17" font-weight="400" text-anchor="middle">Select winning parents</text>
-    <rect x="41" y="314" width="347" height="50" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="214.5" y="344.61" font-size="17" font-weight="400" text-anchor="middle">Fused KV reorder</text>
-    <rect x="512" y="314" width="347" height="50" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
-    <text x="685.5" y="344.61" font-size="17" font-weight="400" text-anchor="middle">Cascade KV reorder</text>
-    <path d="M 350,60 L 350,75 L 215,75 L 215,107" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <path d="M 550,60 L 550,75 L 685,75 L 685,107" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <text x="172" y="59.95" font-size="15" font-weight="400" text-anchor="middle">Eligible xllm batch</text>
-    <text x="729" y="59.95" font-size="15" font-weight="400" text-anchor="middle">Cascade or mixed batch</text>
-    <path d="M 215,159 L 215,229 L 275,229" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <path d="M 685,159 L 685,229 L 625,229" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <path d="M 350,254 L 350,272 L 215,272 L 215,314" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <text x="201" y="294.95" font-size="15" font-weight="400" text-anchor="end">xllm, full width, grouped</text>
-    <path d="M 550,254 L 550,272 L 685,272 L 685,314" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)" />
-    <text x="696" y="294.95" font-size="15" font-weight="400" text-anchor="start">Other cases</text>
+    <path d="M 440 72 V 96" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 310 144 H 220 V 216" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 570 144 H 660 V 216" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 220 270 V 290 H 370 V 310" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 660 270 V 290 H 510 V 310" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 440 362 V 386" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 290 434 H 220 V 502" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 590 434 H 660 V 502" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <rect x="310" y="20" width="260" height="52" rx="8" fill="#e3f1d9" stroke="#252627" stroke-width="1.5"/>
+    <text x="440" y="42" font-size="16" text-anchor="middle" fill="#252627"><tspan x="440" dy="0">Decode rows and</tspan><tspan x="440" dy="19">session KV</tspan></text>
+    <polygon points="440,96 570,144 440,192 310,144" fill="#fff4cc" stroke="#252627" stroke-width="1.5"/>
+    <text x="440" y="140" font-size="15" text-anchor="middle" fill="#252627"><tspan x="440" dy="0">Eligible xllm</tspan><tspan x="440" dy="19">batch?</tspan></text>
+    <rect x="110" y="216" width="220" height="54" rx="8" fill="#d7f1f1" stroke="#252627" stroke-width="1.5"/>
+    <text x="220" y="248" font-size="16" text-anchor="middle" fill="#252627">Fused XAttention</text>
+    <rect x="550" y="216" width="220" height="54" rx="8" fill="#fbe6d5" stroke="#252627" stroke-width="1.5"/>
+    <text x="660" y="248" font-size="16" text-anchor="middle" fill="#252627">Cascade attention</text>
+    <rect x="310" y="310" width="260" height="52" rx="8" fill="#f9dce0" stroke="#252627" stroke-width="1.5"/>
+    <text x="440" y="341" font-size="16" text-anchor="middle" fill="#252627">Select winning parents</text>
+    <polygon points="440,386 590,434 440,482 290,434" fill="#fff4cc" stroke="#252627" stroke-width="1.5"/>
+    <text x="440" y="430" font-size="15" text-anchor="middle" fill="#252627"><tspan x="440" dy="0">xllm, full width,</tspan><tspan x="440" dy="19">grouped parents?</tspan></text>
+    <rect x="110" y="502" width="220" height="54" rx="8" fill="#d7f1f1" stroke="#252627" stroke-width="1.5"/>
+    <text x="220" y="534" font-size="16" text-anchor="middle" fill="#252627">Fused KV reorder</text>
+    <rect x="550" y="502" width="220" height="54" rx="8" fill="#fbe6d5" stroke="#252627" stroke-width="1.5"/>
+    <text x="660" y="534" font-size="16" text-anchor="middle" fill="#252627">Cascade KV reorder</text>
+    <text x="265" y="132" font-size="13" text-anchor="middle" fill="#5f6368">Yes</text>
+    <text x="650" y="132" font-size="13" text-anchor="middle" fill="#5f6368">No</text>
+    <text x="255" y="422" font-size="13" text-anchor="middle" fill="#5f6368">Yes</text>
+    <text x="625" y="422" font-size="13" text-anchor="middle" fill="#5f6368">No</text>
   </g>
 </svg>
