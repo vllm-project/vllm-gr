@@ -92,9 +92,9 @@ def apply_penalties_warmup_oom_guard() -> int:
 
     vllm-ascend >= 0.30 runs Triton kernel warmups right after the KV cache
     has consumed the memory budget, and the penalties stage allocates dummy
-    ``max_num_seqs x padded_vocab`` logits and bin-count tensors. Serving
-    OneRec's large vocabulary at the benchmark server's ``--max_num_seqs
-    2048`` needs ~2.7 GiB more than remains and aborts engine startup. The
+    ``max_num_seqs x padded_vocab`` logits and bin-count tensors. Large
+    sequence limits and vocabularies can make these temporary allocations exceed
+    the remaining memory budget. The
     warmup only JIT-compiles kernels for penalty sampling, which requests
     without penalties (including every vllm-gr beam request) never execute,
     so an OOM there skips the warmup instead of failing the engine.

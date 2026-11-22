@@ -238,7 +238,7 @@ def test_rejects_short_tokenizer_result() -> None:
         ConstraintTableCompiler(short_tokenizer, 10).compile(document)
 
 
-# --- P2-3: malformed document -> ValueError, not KeyError/AttributeError ---
+# --- malformed document -> ValueError, not KeyError/AttributeError ---
 
 
 def test_rejects_triple_missing_field(tokenizer: MagicMock) -> None:
