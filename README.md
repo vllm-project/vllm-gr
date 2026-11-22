@@ -61,78 +61,14 @@ extension of vLLM.
 - **Text generation.** See the [supported models](docs/models/supported_models.md)
   for openPangu passthrough and device-specific guidance.
 
-## Install from source
+## Getting Started
 
-The current vLLM-GR code requires **upstream vLLM 0.30.0**. Prepare an accelerator
-environment before installing.
-
-| Target | Runtime | Setup guide |
-| --- | --- | --- |
-| CUDA | Python 3.11-3.13, CUDA 13.0, vLLM 0.30.0 | [CUDA installation](docs/getting_started/installation/gpu.md) |
-| Ascend NPU | Validated with Python 3.12, CANN 9.2.0, vLLM 0.30.0, vLLM-Ascend 0.30.0rc2 and Triton-Ascend 3.6.0 | [Ascend installation](docs/getting_started/installation/npu.md) |
-
-Clone the repository and enter it.
-
-```bash
-git clone https://github.com/JiusiServe/vllm-gr.git
-cd vllm-gr
-```
-
-Install the CUDA build in a virtual environment.
-
-```bash
-VLLM_GR_TARGET_DEVICE=cuda python -m pip install -e .
-```
-
-Install the NPU build in the prepared Ascend container after installing its
-required operators.
-
-```bash
-VLLM_GR_TARGET_DEVICE=npu python -m pip install -e . --no-build-isolation
-```
-
-## Run OneRec offline
-
-In the installed environment, use a local OneRec-1.7B snapshot or download
-one with the Hugging Face CLI.
-
-```bash
-export ONEREC_MODEL="$HOME/.cache/vllm-gr/models/OneRec-1.7B"
-hf download OpenOneRec/OneRec-1.7B --local-dir "$ONEREC_MODEL"
-```
-
-Run Beam Search V1 on CUDA.
-
-```bash
-python examples/offline_inference/beam_search/quickstart.py --model "$ONEREC_MODEL"
-```
-
-On Ascend, use the eager path.
-
-```bash
-python examples/offline_inference/beam_search/quickstart.py \
-  --model "$ONEREC_MODEL" --constraint-backend npu --execution eager
-```
-
-Expect `request=0 returned_beams=128` followed by the top five token sequences
-and scores. See the [quickstart](docs/getting_started/quickstart.md) for HTTP
-serving and catalog-constrained generation.
-
-## Runtime limits
-
-The first release includes CUDA and Ascend inference and
-[experimental gRPC serving](docs/serving/grpc.md). The gRPC service requires
-the `grpc` extra. See the [feature matrix](docs/user_guide/feature_compatibility.md)
-for device-specific limits.
-
-- CPU packages support packaging and host checks. Beam inference requires
-  CUDA or Ascend.
-- Ascend Beam requires ModelRunner V1. On CUDA, the library and general CLI
-  default to V1, and the [direct Beam examples](examples/README.md#choose-a-modelrunner)
-  select V2 by default for supported workloads.
-
-See the [documentation](docs/README.md) for additional examples and deployment
-guides.
+- [Installation](docs/getting_started/installation/README.md) — Install vLLM-GR
+  from source on NVIDIA GPUs or Ascend NPUs.
+- [OneRec quickstart](docs/getting_started/quickstart.md) — Generate ranked
+  recommendations with OneRec-1.7B offline or serve the model over HTTP.
+- [Feature compatibility](docs/user_guide/feature_compatibility.md) — Check
+  which beam search and serving features are supported on each platform.
 
 ## Contributing
 

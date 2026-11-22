@@ -5,6 +5,7 @@ or send an [HTTP Beam request](../serving/completions.md#request). Use the
 matrix to choose settings for your device.
 
 The first release includes CUDA and Ascend inference and experimental gRPC.
+CPU packages support packaging and host checks only.
 The matrix describes the documented runtime paths and their configuration limits.
 
 ## Support matrix
