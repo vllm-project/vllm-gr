@@ -47,10 +47,10 @@ function is_available_npu() {
     # Missing or malformed telemetry must never make a device look idle.
     awk -F ':' -v threshold="$threshold" '
         $1 ~ /^[[:space:]]*HBM Capacity[[:space:]]*\(MB\)[[:space:]]*$/ {
-            capacity = $2; capacities++
+            capacity = (NF == 2 ? $2 : ""); capacities++
         }
         $1 ~ /^[[:space:]]*HBM Usage Rate[[:space:]]*\(%\)[[:space:]]*$/ {
-            rate = $2; rates++
+            rate = (NF == 2 ? $2 : ""); rates++
         }
         END {
             integer = "^[[:space:]]*[0-9]+[[:space:]]*$"

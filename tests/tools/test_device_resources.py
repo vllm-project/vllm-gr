@@ -193,6 +193,8 @@ def test_gpu_requires_usable_statistics(stats: str, status: str, available: bool
         ("unknown", "0", "0", False),
         ("64000", "", "0", False),
         ("64000", "101", "0", False),
+        ("64000:invalid", "0", "0", False),
+        ("64000", "0:invalid", "0", False),
     ],
 )
 def test_npu_usage_requires_valid_telemetry(
