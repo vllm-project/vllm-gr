@@ -19,7 +19,6 @@ class BackendConfigService:
     """Optional v2 policy. An engine plan supplies the hardware implementation."""
 
     default_worker_decision = False
-    promote_catalog_tables = False
     supports_constraint_vocab_slicing = False
 
     def apply_native_defaults(self, config: Any) -> None:

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Generator
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -27,12 +26,6 @@ pytestmark = pytest.mark.cpu_test
 
 pytest_plugins = ("pytester",)
 INVENTORY = json.loads((TESTS_DIR / "level_inventory.json").read_text(encoding="utf-8"))["tests"]
-
-
-@pytest.fixture(autouse=True)  # type: ignore[misc]
-def reset_vocab_slice_config() -> Generator[None, None, None]:
-    # These policy tests do not need to import the model/runtime stack.
-    yield
 
 
 def test_canonical_nodeid_keeps_class_and_removes_parameter_suffix() -> None:

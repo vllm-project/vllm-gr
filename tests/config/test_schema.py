@@ -42,7 +42,9 @@ def test_field_validation_runs_once_at_each_ingress(
             {"gr": {"beam_width": [32] * 3, "candidate_width": [32] * 3}}
         )
     assert config.beam_max_width == 32
-    assert calls == [32]
+    # Only the Python input supplies a scalar. The deployment schedule
+    # supplies its own validated width in the public mapping.
+    assert calls == [32 if source == "python" else None]
 
 
 def test_existing_positional_constructor_and_frozen_slots_contract() -> None:
@@ -57,35 +59,17 @@ def test_existing_positional_constructor_and_frozen_slots_contract() -> None:
     assert not hasattr(table, "__dict__")
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
-    ("first", "second", "message"),
-    [
-        (
-            ConfigFieldSpec("validate_catalog_path", legacy_key="duplicate"),
-            ConfigFieldSpec("validate_catalog_path", legacy_key="duplicate"),
-            "duplicate legacy",
-        ),
-        (
-            ConfigFieldSpec("validate_catalog_path", canonical_path=("beam", "path")),
-            ConfigFieldSpec("validate_catalog_path", canonical_path=("beam", "path")),
-            "overlapping canonical",
-        ),
-        (
-            ConfigFieldSpec("validate_catalog_path", canonical_path=("beam",)),
-            ConfigFieldSpec("validate_catalog_path", canonical_path=("beam", "path")),
-            "overlapping canonical",
-        ),
-    ],
-)
-def test_conflicting_declarations_fail_before_parsing(
-    first: ConfigFieldSpec, second: ConfigFieldSpec, message: str
-) -> None:
+@pytest.mark.parametrize("second_path", [("beam",), ("beam", "path")])  # type: ignore[misc]
+def test_overlapping_canonical_paths_fail_before_parsing(second_path: tuple[str, ...]) -> None:
+    first = ConfigFieldSpec("validate_constraint_table_path", canonical_path=("beam", "path"))
+    second = ConfigFieldSpec("validate_constraint_table_path", canonical_path=second_path)
+
     @dataclass
     class InvalidConfig:
         one: str | None = field(default=None, metadata={"gr": first})
         two: str | None = field(default=None, metadata={"gr": second})
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="overlapping canonical"):
         config_fields(InvalidConfig)
 
 

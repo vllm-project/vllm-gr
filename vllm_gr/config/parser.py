@@ -16,15 +16,12 @@ from typing import Any, Final, TypeAlias
 import yaml
 
 from vllm_gr.config.models import (
-    MAX_BEAM_WIDTH,
-    MAX_CANDIDATE_WIDTH,
     OPTION_KEYS,
     ConstraintConfig,
     ConstraintMode,
     ConstraintTableSpec,
     DeploymentOptions,
     GRConfig,
-    runtime_constraint_table,
 )
 from vllm_gr.config.schema import config_fields
 from vllm_gr.config.validation import validate_constraint_mode
@@ -122,6 +119,7 @@ def _read_settings(path: Path, parents: tuple[Path, ...]) -> dict:
 GR_CONFIG_KEY: Final = "vllm_gr"
 BACKEND_TRANSPORT_KEYS: Final = frozenset({"vllm_gr_backend_plan", "vllm_gr_backend_options"})
 GRConfigInput: TypeAlias = str | Path
+CAPACITY_FIELDS = ("beam_max_width", "beam_candidate_width")
 CONFIG_ATTRIBUTES = {
     spec.canonical_path[1]: item.name
     for item, spec in config_fields(GRConfig)
@@ -143,48 +141,20 @@ def _unknown_keys(value: Mapping, allowed: set | frozenset, name: str) -> None:
         raise ValueError(f"Unknown {name} settings: {sorted(unknown, key=str)}")
 
 
-def _step_widths(settings: Mapping) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
-    widths = settings.get("beam_width")
-    candidates = settings.get("candidate_width")
-    if widths is None:
-        if candidates is not None:
-            raise ValueError("gr.candidate_width requires gr.beam_width")
-        return None, None
-    for key, value, ceiling in (
-        ("beam_width", widths, MAX_BEAM_WIDTH),
-        ("candidate_width", candidates, MAX_CANDIDATE_WIDTH),
-    ):
-        if (
-            not isinstance(value, (list, tuple))
-            or not value
-            or any(type(v) is not int or not 1 <= v <= ceiling for v in value)
-        ):
-            raise ValueError(f"gr.{key} requires a nonempty list of integers in 1..{ceiling}")
-    assert candidates is not None
-    if len(widths) != len(candidates):
-        raise ValueError("gr.candidate_width must have one entry for each gr.beam_width entry")
-    if widths[0] != candidates[0]:
-        raise ValueError("first gr.candidate_width must equal first gr.beam_width")
-    if any(w > previous * k for previous, k, w in zip(widths, candidates[1:], widths[1:])):
-        raise ValueError("gr.beam_width exceeds the number of available candidates for a step")
-    if (len(set(widths)) > 1 or len(set(candidates)) > 1) and len(widths) > 3:
-        raise ValueError("varying gr.beam_width or gr.candidate_width supports up to three steps")
-    return tuple(widths), tuple(candidates)
+def _input_path(value: str, base_dir: str | Path | None) -> str:
+    if not value.strip():
+        return value
+    path = Path(value).expanduser()
+    if base_dir is not None:
+        path = Path(base_dir) / path
+    return str(path.resolve()) if path.is_absolute() or base_dir is not None else value
 
 
-def _table(value: object, base_dir: str | Path | None) -> ConstraintTableSpec:
+def _table(value: object) -> ConstraintTableSpec:
     raw = _mapping(value, "gr.constraint_table")
     _unknown_keys(raw, {"path", "backend", "format", "max_top_k", "digests"}, "gr.constraint_table")
     digests = _mapping(raw.get("digests", {}), "gr.constraint_table.digests")
     _unknown_keys(digests, {"artifact", "tokenizer"}, "gr.constraint_table.digests")
-    path = raw.get("path")
-    if isinstance(path, str):
-        artifact = Path(path).expanduser()
-        if not artifact.is_absolute():
-            if base_dir is None:
-                raise ValueError("gr.constraint_table.path must be absolute for mapping input")
-            artifact = Path(base_dir) / artifact
-        path = str(artifact.resolve())
     if type(raw.get("max_top_k")) is not int or raw["max_top_k"] < 1:
         raise ValueError("gr.constraint_table.max_top_k requires a positive integer")
     missing = [key for key in ("artifact", "tokenizer") if digests.get(key) is None]
@@ -192,7 +162,7 @@ def _table(value: object, base_dir: str | Path | None) -> ConstraintTableSpec:
         raise ValueError(f"gr.constraint_table.digests requires {missing}")
     kwargs = {k: raw[k] for k in ("backend", "format", "max_top_k") if k in raw}
     return ConstraintTableSpec(
-        path=path,
+        path=raw.get("path"),
         artifact_digest=digests.get("artifact"),
         tokenizer_digest=digests.get("tokenizer"),
         enabled=True,
@@ -200,8 +170,31 @@ def _table(value: object, base_dir: str | Path | None) -> ConstraintTableSpec:
     )
 
 
+def _parse_constraint(gr: Mapping[str, Any]) -> ConstraintConfig | None:
+    table = gr.get("constraint_table")
+    if "constraint_mode" not in gr:
+        if table is not None:
+            raise ValueError("gr.constraint_table requires gr.constraint_mode=table")
+        return None
+    mode = validate_constraint_mode(gr["constraint_mode"])
+    if mode is ConstraintMode.NONE:
+        if table is not None:
+            raise ValueError("gr.constraint_mode=none forbids gr.constraint_table")
+        return ConstraintConfig(mode)
+    if table is None:
+        raise ValueError("gr.constraint_mode=table requires gr.constraint_table")
+    return ConstraintConfig(mode, _table(table))
+
+
 def gr_config_from_mapping(
     mapping: Mapping[str, object], *, base_dir: str | Path | None = None
+) -> GRConfig:
+    """Resolve paths on the driver before publishing the configuration."""
+    return _decode_gr_config(mapping, resolve_paths=True, base_dir=base_dir)
+
+
+def _decode_gr_config(
+    mapping: Mapping[str, object], *, resolve_paths: bool, base_dir: str | Path | None = None
 ) -> GRConfig:
     document = _mapping(mapping, "Configuration")
     _unknown_keys(document, {"gr", "attention-config"}, "configuration")
@@ -209,57 +202,26 @@ def gr_config_from_mapping(
         raise ValueError("Configuration requires a gr mapping, using default_config.yaml format")
     gr = _mapping(document["gr"], "gr")
     _unknown_keys(
-        gr, set(CONFIG_ATTRIBUTES) | OPTION_KEYS | {"constraint_mode", "constraint_table"}, "gr"
+        gr,
+        set(CONFIG_ATTRIBUTES) | OPTION_KEYS | {"constraint_mode", "constraint_table"},
+        "gr",
     )
-    widths, candidates = _step_widths(gr)
-    kwargs = {
-        attribute: gr[key]
-        for key, attribute in CONFIG_ATTRIBUTES.items()
-        if key in gr and key not in ("beam_width", "candidate_width")
-    }
-    kwargs["beam_max_width"] = max(widths) if widths else None
-    candidate_capacity = max(candidates) if candidates else None
-    if widths and widths == candidates and len(set(widths)) > 1:
-        candidate_capacity = None
-    kwargs["beam_candidate_width"] = candidate_capacity
-
+    kwargs = {attribute: gr[key] for key, attribute in CONFIG_ATTRIBUTES.items() if key in gr}
     options = {k: v for k, v in gr.items() if k in OPTION_KEYS}
-    calibration = options.get("prefix_calibration_path")
-    if isinstance(calibration, str):
-        calibration_path = Path(calibration).expanduser()
-        if not calibration_path.is_absolute():
-            if base_dir is None:
-                raise ValueError("gr.prefix_calibration_path must be absolute for mapping input")
-            calibration_path = Path(base_dir) / calibration_path
-        options["prefix_calibration_path"] = str(calibration_path.resolve())
+    if resolve_paths:
+        calibration = options.get("prefix_calibration_path")
+        if isinstance(calibration, str):
+            options["prefix_calibration_path"] = _input_path(calibration, base_dir)
+        table = gr.get("constraint_table")
+        if isinstance(table, Mapping) and isinstance(path := table.get("path"), str):
+            gr["constraint_table"] = {**table, "path": _input_path(path, base_dir)}
     kwargs["deployment"] = DeploymentOptions.from_mapping(options)
-    mode = validate_constraint_mode(gr.get("constraint_mode", "none"))
-    table = gr.get("constraint_table")
-    if mode is ConstraintMode.NONE and table is not None:
-        raise ValueError("gr.constraint_mode=none forbids gr.constraint_table")
-    if mode is ConstraintMode.TABLE:
-        if table is None:
-            raise ValueError("gr.constraint_mode=table requires gr.constraint_table")
-        if widths is not None and len(widths) != 3:
-            raise ValueError("constraint tables require exactly three Beam steps")
-        table = _table(table, base_dir)
-    kwargs["constraint"] = ConstraintConfig(mode, table)
+    kwargs["constraint"] = _parse_constraint(gr)
     attention = document.get("attention-config")
     if attention is not None:
         attention = _mapping(attention, "attention-config")
         kwargs["attention_backend"] = attention.get("backend")
-    config = GRConfig(**kwargs)
-    if widths is not None and len(widths) > config.beam_max_decode_steps:
-        raise ValueError(
-            "gr.max_decode_steps must be at least the number of entries in gr.beam_width"
-        )
-    if (
-        config.deployment.result_width is not None
-        and widths
-        and config.deployment.result_width > widths[-1]
-    ):
-        raise ValueError("gr.result_width must not exceed the final gr.beam_width")
-    return config
+    return GRConfig(**kwargs)
 
 
 def _primitive(value: object) -> object:
@@ -273,38 +235,31 @@ def _primitive(value: object) -> object:
 def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     if not isinstance(config, GRConfig):
         raise TypeError("config must be a GRConfig")
-    retired = [
-        name for name in ("vocab_offset", "vocab_slice_size") if getattr(config, name) is not None
-    ]
-    if retired:
-        raise ValueError(f"Removed configuration controls: {retired}")
     gr = {}
-    for public, attribute in CONFIG_ATTRIBUTES.items():
-        gr[public] = _primitive(getattr(config, attribute))
     options = config.deployment
+    for public, attribute in CONFIG_ATTRIBUTES.items():
+        value = getattr(config, attribute)
+        # Schedules already determine both capacities. Standalone scalar
+        # capacities carry no per-step request defaults.
+        if public in CAPACITY_FIELDS and (options.beam_width is not None or value is None):
+            continue
+        gr[public] = _primitive(value)
     gr.update({f.name: _primitive(getattr(options, f.name)) for f in fields(options)})
-    if options.beam_width is None and config.beam_max_width is not None:
-        gr["beam_width"] = [config.beam_max_width] * config.beam_max_decode_steps
-    if options.candidate_width is None and config.beam_max_width is not None:
-        width = config.beam_candidate_width
-        table_config = runtime_constraint_table(config)
-        if width is None and table_config is not None:
-            width = table_config.candidate_width
-        gr["candidate_width"] = [width or config.beam_max_width] * config.beam_max_decode_steps
-    constraint = config.constraint_config
-    gr["constraint_mode"] = constraint.mode.value
-    table = constraint.table
-    gr["constraint_table"] = (
-        None
-        if table is None
-        else {
-            "path": table.path,
-            "backend": table.backend.value,
-            "format": table.format,
-            "max_top_k": table.max_top_k,
-            "digests": {"artifact": table.artifact_digest, "tokenizer": table.tokenizer_digest},
-        }
-    )
+    constraint = config.constraint
+    if constraint is not None:
+        gr["constraint_mode"] = constraint.mode.value
+        table = constraint.table
+        gr["constraint_table"] = (
+            None
+            if table is None
+            else {
+                "path": table.path,
+                "backend": table.backend.value,
+                "format": table.format,
+                "max_top_k": table.max_top_k,
+                "digests": {"artifact": table.artifact_digest, "tokenizer": table.tokenizer_digest},
+            }
+        )
     result: dict[str, object] = {"gr": gr}
     if config.attention_backend is not None:
         result["attention-config"] = {"backend": config.attention_backend.value}
@@ -358,10 +313,10 @@ def load_engine_gr_config(
         raise TypeError("config must be a YAML file path")
     if overrides is not None and not isinstance(overrides, Mapping):
         raise ValueError("gr must be a mapping")
-    if isinstance(additional, Mapping) and (
-        GR_CONFIG_KEY in additional or _retired_gr_keys(additional)
-    ):
-        raise ValueError("Supply GR settings with gr=..., --gr-config, or --config")
+    if isinstance(additional, Mapping):
+        _reject_flat_gr_keys(additional)
+        if GR_CONFIG_KEY in additional:
+            raise ValueError("Supply GR settings with gr=..., --gr-config, or --config")
     if startup_document is not None:
         return _load_document(
             startup_document, overrides, worker_decision_default=worker_decision_default
@@ -373,48 +328,33 @@ def load_engine_gr_config(
     return _load_document({"gr": {}}, overrides, worker_decision_default=worker_decision_default)
 
 
-def _retired_gr_keys(additional: Mapping) -> list[str]:
-    return [
+def _reject_flat_gr_keys(additional: Mapping) -> None:
+    invalid = sorted(
         key
         for key in additional
         if isinstance(key, str) and key.startswith("vllm_gr_") and key not in BACKEND_TRANSPORT_KEYS
-    ]
+    )
+    if invalid:
+        raise ValueError(
+            f"Removed vLLM-GR configuration keys: {invalid}. "
+            "Supply GR settings with gr=..., --gr-config, or --config"
+        )
 
 
 def parse_gr_config(vllm_config: object | None) -> GRConfig:
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, Mapping):
         return GRConfig()
-    retired = _retired_gr_keys(additional)
-    if retired:
-        raise ValueError(f"Removed vLLM-GR configuration keys: {sorted(retired)}; use gr")
+    _reject_flat_gr_keys(additional)
     if GR_CONFIG_KEY not in additional:
         return GRConfig()
-    return gr_config_from_mapping(additional[GR_CONFIG_KEY])
-
-
-def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
-    write_canonical_gr_config(vllm_config, gr_config)
+    return _decode_gr_config(additional[GR_CONFIG_KEY], resolve_paths=False)
 
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, MutableMapping):
         raise ValueError("vLLM-GR additional_config must be a mutable mapping")
-    retired = _retired_gr_keys(additional)
-    known = {spec.legacy_key for _, spec in config_fields(GRConfig)} | {
-        "vllm_gr_catalog_path",
-        "vllm_gr_constraint_backend",
-        "vllm_gr_vocab_offset",
-        "vllm_gr_vocab_slice_size",
-        "vllm_gr_constrained_generation",
-        "vllm_gr_beam_engine_driven",
-    }
-    unknown = set(retired) - known
-    if unknown:
-        raise ValueError(f"unknown vLLM-GR configuration keys: {sorted(unknown)}")
-    payload = gr_config_to_mapping(gr_config)
-    for key in retired:
-        additional.pop(key)
-    additional[GR_CONFIG_KEY] = payload
+    _reject_flat_gr_keys(additional)
+    additional[GR_CONFIG_KEY] = gr_config_to_mapping(gr_config)
     object.__setattr__(vllm_config, "_vllm_gr_parsed_config", gr_config)

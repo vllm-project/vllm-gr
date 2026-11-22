@@ -309,14 +309,14 @@ patches:
     owner: vllm_gr/v1/worker/sliced_logits_patch.py
     shared_helpers: vllm_gr/ops/sliced_logits.py, vllm_gr/v1/worker/lm_head_cache.py
     installer: vllm_gr.v1.worker.sliced_logits_patch.apply_sliced_logits_patch
-    activation: projection hooks execute with a valid slice; cache reload hooks install after model load by ParallelLMHead type, independent of module names
+    activation: projection uses the token window on the model's LogitsProcessor; cache reload hooks install after model load by ParallelLMHead type, independent of module names
     validator_or_test:
       - tests/ops/test_sliced_logits.py
       - tests/platforms/test_import_isolation.py::test_cuda_plugin_initialization_does_not_import_ascend
       - tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload
       - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
     process_roles: [worker]
-    target: LogitsProcessor, Sampler.gather_logprobs, V2 compute_topk_scores, and quant_method.process_weights_after_loading for dense ParallelLMHead weights and tied owners
+    target: LogitsProcessor._get_logits, Sampler.gather_logprobs, V2 compute_topk_scores, and quant_method.process_weights_after_loading for dense ParallelLMHead weights and tied owners
     risk: medium
     contract: sliced-vocabulary-projection
     removal_condition: vLLM exposes stable output-projection and logprob-width hooks

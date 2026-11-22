@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 
-from vllm_gr.config import ConstraintMode, ConstraintTableBackendEnum
+from vllm_gr.config import ConstraintBackendKind
 from vllm_gr.config.models import runtime_constraint_table
 from vllm_gr.platforms.interface import ModelRunnerInstaller, ModelRunnerPatchHooks
 from vllm_gr.v1.worker.gr_context import (
@@ -113,8 +113,8 @@ def make_load_model_with_constraint_backend(
         if close_runtime is not None:
             close_runtime(self)
         close_constraint_backend(self)
-        gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
-        table_config = runtime_constraint_table(gr_config)
+        # Validate the deployment before the native loader allocates model weights.
+        GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
         result = original(self, *args, **kwargs)
 
@@ -124,8 +124,6 @@ def make_load_model_with_constraint_backend(
         backend = None
         try:
             gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
-            if gr_config.constraint_config.mode is ConstraintMode.NONE:
-                return result
             table_config = runtime_constraint_table(gr_config)
             if table_config is None or not table_config.enabled:
                 return result
@@ -155,7 +153,7 @@ def make_load_model_with_constraint_backend(
 
             stage_options = {}
             if (
-                table_config.backend is ConstraintTableBackendEnum.NPU
+                table_config.backend is ConstraintBackendKind.NPU
                 and gr_config.beam_max_width is not None
                 and gr_config.beam_max_decode_steps <= 3
             ):
@@ -182,7 +180,7 @@ def make_load_model_with_constraint_backend(
             model_memory_usage = int(getattr(self, "model_memory_usage", 0))
             self.model_memory_usage = model_memory_usage + backend.info.device_memory_bytes
 
-            if getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.CUDA:
+            if getattr(backend.info, "backend", None) is ConstraintBackendKind.CUDA:
                 # Import GPU layers only after selecting the CUDA backend.
                 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
@@ -206,7 +204,7 @@ def make_load_model_with_constraint_backend(
                     processor._gr_vocab_slice = window
                 self._gr_vocab_slice_processors = processors
             elif (
-                getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.NPU
+                getattr(backend.info, "backend", None) is ConstraintBackendKind.NPU
                 and getattr(backend, "stage_vocab", None) is not None
             ):
                 # Keep NPU projection imports isolated from CPU/CUDA startup.

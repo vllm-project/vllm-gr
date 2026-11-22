@@ -11,10 +11,8 @@ from typing import Any, Protocol, TypeVar, cast
 import msgspec
 import pytest
 
-from tests.helpers.gr_config import make_gr_config
 from vllm_gr.config import (
-    ConstraintTableBackendEnum,
-    ConstraintTableSpec,
+    ConstraintConfig,
     GRConfig,
     gr_config_from_mapping,
     gr_config_to_mapping,
@@ -40,21 +38,18 @@ _parametrize = cast(_Parametrize, pytest.mark.parametrize)
 
 def _config(**overrides: Any) -> GRConfig:
     values: dict[str, Any] = {
-        "constrained_generation": False,
+        "constraint": ConstraintConfig(),
         "beam_worker_decision": True,
         "beam_max_width": 128,
         "beam_max_decode_steps": 3,
         "beam_sid_stage_vocab": True,
     }
     values.update(overrides)
-    return make_gr_config(**values)
+    return GRConfig(**values)
 
 
 def _mapping(*, enabled: bool = True) -> dict[str, Any]:
-    config = _config(
-        beam_sid_stage_vocab=enabled,
-        constraint_table=ConstraintTableSpec(max_top_k=128, backend=ConstraintTableBackendEnum.NPU),
-    )
+    config = _config(beam_sid_stage_vocab=enabled)
     return cast(dict[str, Any], gr_config_to_mapping(config))
 
 
@@ -66,7 +61,7 @@ def _device_config(device: str | None, *, enabled: bool = True) -> SimpleNamespa
 
 
 def test_sid_stage_vocab_defaults_off_without_activating_gr() -> None:
-    config = make_gr_config()
+    config = GRConfig()
     assert config.beam_sid_stage_vocab is False
     assert config.enabled is False
     assert parse_gr_config(SimpleNamespace(additional_config={})).beam_sid_stage_vocab is False
@@ -78,15 +73,10 @@ def test_sid_stage_vocab_rejects_non_boolean(value: Any, input_kind: str) -> Non
     with pytest.raises(TypeError, match=r"beam\.sid_stage_vocab must be a boolean"):
         if input_kind == "constructor":
             _config(beam_sid_stage_vocab=value)
-        elif input_kind == "canonical":
+        else:
             raw = _mapping()
             raw["gr"]["sid_stage_vocab"] = value
             gr_config_from_mapping(raw)
-        else:
-            host = SimpleNamespace(additional_config={})
-            _config().write_to_vllm_config(host)
-            host.additional_config[BEAM_SID_STAGE_VOCAB_KEY] = value
-            parse_gr_config(host)
 
 
 @_parametrize(
@@ -100,7 +90,7 @@ def test_sid_stage_vocab_rejects_non_boolean(value: Any, input_kind: str) -> Non
 def test_sid_stage_vocab_requires_explicit_supported_beam_semantics(
     override: dict[str, Any],
 ) -> None:
-    with pytest.raises(ValueError, match=r"beam\.sid_stage_vocab requires"):
+    with pytest.raises(ValueError, match=r"gr\.sid_stage_vocab requires"):
         _config(**override)
 
 

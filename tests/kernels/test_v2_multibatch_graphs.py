@@ -48,7 +48,7 @@ def test_runtime_recapture_refusal_preserves_live_request(monkeypatch):
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
     worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
-    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
     assert capture_multibatch_forward(worker)
@@ -95,7 +95,7 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
     worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
-    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
     assert capture_multibatch_forward(worker)
@@ -193,7 +193,7 @@ def test_all_batches_capture_at_startup_and_reuse_storage(
     worker.model_config.enforce_eager = False
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
     original = CudaStageHooksV2.forward_hidden

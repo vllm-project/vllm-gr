@@ -21,7 +21,7 @@ import torch
 
 from vllm_gr.config import (
     CONSTRAINT_TABLE_FORMAT,
-    ConstraintTableBackendEnum,
+    ConstraintBackendKind,
     ConstraintTableSpec,
 )
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
@@ -104,7 +104,7 @@ def backend(tmp_path_factory: pytest.TempPathFactory) -> Iterator[NPUConstraintB
     loaded = load_constraint_backend(
         ConstraintTableSpec(
             enabled=True,
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             path=str(path),
             artifact_digest=digest,
             tokenizer_digest="sha256:" + "b" * 64,

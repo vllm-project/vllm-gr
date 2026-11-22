@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
@@ -464,7 +465,7 @@ class NPUEagerBeamStageRunner:
         )
 
         stage_metadata = self._metadata(self.worker._current_scheduler_output)
-        if _get_gr_config(self.worker).constrained_generation is False:
+        if configured_constraint_mode(_get_gr_config(self.worker)) is ConstraintMode.NONE:
             candidates = self._select_unconstrained_candidates(
                 self.logits.contiguous(), stage_metadata
             )

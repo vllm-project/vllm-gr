@@ -11,13 +11,14 @@ from unittest.mock import Mock
 
 import pytest
 
-from tests.helpers.gr_config import engine_args_from_file, make_gr_config
+from tests.helpers.gr_config import engine_args_from_file
 from vllm_gr.config import (
-    ConstraintTableBackendEnum,
+    ConstraintBackendKind,
+    ConstraintConfig,
+    ConstraintMode,
     ConstraintTableSpec,
     GRConfig,
     gr_config_to_mapping,
-    write_canonical_gr_config,
 )
 from vllm_gr.platforms.legacy import legacy_config_service
 from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
@@ -25,37 +26,31 @@ from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 _V1_REQUIRED = "NPU unconstrained.*ModelRunner V1.*VLLM_USE_V2_MODEL_RUNNER=0"
 
 
-def _gr_config(mode: str, *, canonical: bool = False, device: str = "npu") -> GRConfig:
+def _gr_config(mode: str) -> GRConfig:
     if mode == "ordinary":
-        return make_gr_config()
+        return GRConfig()
     if mode == "ordinary_unconstrained":
-        return make_gr_config(constrained_generation=False)
+        return GRConfig(constraint=ConstraintConfig())
     common: dict[str, Any] = {
         "beam_max_width": 4,
         "beam_max_decode_steps": 3,
         "beam_worker_decision": True,
     }
-    if canonical:
-        common["constraint_table"] = ConstraintTableSpec(
-            max_top_k=4, backend=ConstraintTableBackendEnum(device)
-        )
     if mode == "catalog":
-        common["constraint_table"] = ConstraintTableSpec(
+        table = ConstraintTableSpec(
             max_top_k=4,
             enabled=True,
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             path=str(Path(__file__).resolve().with_name("catalog.npz")),
             artifact_digest="sha256:" + "a" * 64,
             tokenizer_digest="sha256:" + "b" * 64,
         )
-        return make_gr_config(
+        return GRConfig(
             **common,
-            constrained_generation=True,
+            constraint=ConstraintConfig(ConstraintMode.TABLE, table),
         )
     assert mode in ("generic", "sid")
-    return make_gr_config(
-        **common, constrained_generation=False, beam_sid_stage_vocab=mode == "sid"
-    )
+    return GRConfig(**common, constraint=ConstraintConfig(), beam_sid_stage_vocab=mode == "sid")
 
 
 def _host(device: str, use_v2: bool) -> SimpleNamespace:
@@ -67,28 +62,17 @@ def _host(device: str, use_v2: bool) -> SimpleNamespace:
     )
 
 
-def _write_config(host: SimpleNamespace, gr_config: GRConfig) -> None:
-    if gr_config.constraint is None:
-        gr_config.write_to_vllm_config(host)
-    else:
-        write_canonical_gr_config(host, gr_config)
-
-
 @pytest.mark.l1  # type: ignore[misc]
 def test_npu_admission_rejects_v2_unconstrained_candidate_width_mismatch() -> None:
     config = _host("npu", False)
-    gr_config = make_gr_config(
+    gr_config = GRConfig(
         beam_max_width=4,
         beam_max_decode_steps=3,
         beam_worker_decision=True,
-        constrained_generation=False,
-        constraint_table=ConstraintTableSpec(
-            max_top_k=4,
-            candidate_width=8,
-            enabled=False,
-        ),
+        constraint=ConstraintConfig(),
+        beam_candidate_width=8,
     )
-    _write_config(config, gr_config)
+    gr_config.write_to_vllm_config(config)
 
     with pytest.raises(ValueError, match="candidate_width.*beam width"):
         validate_gr_device_config(config)
@@ -180,7 +164,7 @@ def test_npu_v2_request_rejected_before_native_preprocessing(mode: str) -> None:
     from vllm_gr.v1.engine.core import _admit_gr_session
 
     config = _host("npu", True)
-    _write_config(config, _gr_config(mode))
+    _gr_config(mode).write_to_vllm_config(config)
     request = _request()
     with pytest.raises(ValueError, match=_V1_REQUIRED):
         validate_gr_device_config(config, request)
@@ -208,7 +192,7 @@ def test_native_npu_admission_rejects_candidate_width_before_preprocessing(
     from vllm_gr.v1.engine.core import _admit_gr_session
 
     config = _host("npu", False)
-    _write_config(config, _gr_config(mode))
+    _gr_config(mode).write_to_vllm_config(config)
     request = _request(candidate_width=candidate_width, dynamic_beam_widths=dynamic_beam_widths)
     # These are structurally valid wire requests. The native admission path
     # must also apply the NPU-specific K/W guard before allocating requests.
@@ -243,7 +227,7 @@ def test_device_admission_preserves_supported_and_existing_paths(
     device: str, use_v2: bool, mode: str
 ) -> None:
     config = _host(device, use_v2)
-    _write_config(config, _gr_config(mode))
+    _gr_config(mode).write_to_vllm_config(config)
     validate_gr_device_config(config)
 
 
@@ -266,7 +250,7 @@ def test_engine_config_preserves_supported_and_existing_paths(
     from vllm_gr.platforms.ascend import config_patch
 
     config = _host(device, use_v2)
-    gr_config = _gr_config(mode, canonical=True, device=device)
+    gr_config = _gr_config(mode)
     args = engine_args_from_file(tmp_path, gr_config_to_mapping(gr_config))
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
     monkeypatch.setattr(

@@ -12,7 +12,7 @@ from typing import Any, Literal
 import pytest
 import torch
 
-from tests.helpers.gr_config import engine_args_from_file, make_gr_config
+from tests.helpers.gr_config import engine_args_from_file
 from vllm_gr.config import GRConfig, gr_config_from_mapping, gr_config_to_mapping
 from vllm_gr.platforms.legacy import legacy_config_service
 from vllm_gr.v1.attention.backends.beam_attn_gpu import (
@@ -90,7 +90,7 @@ def test_config_roundtrip(enabled: bool, capacity: int) -> None:
     worker = SimpleNamespace(additional_config={"vllm_gr": gr_config_to_mapping(config)})
     assert GRConfig.from_vllm_config(worker).enable_short_suffix_attention is enabled
 
-    legacy = make_gr_config(
+    legacy = GRConfig(
         beam_max_width=256,
         beam_max_decode_steps=capacity,
         enable_short_suffix_attention=enabled,
@@ -99,23 +99,23 @@ def test_config_roundtrip(enabled: bool, capacity: int) -> None:
     legacy.write_to_vllm_config(worker)
 
     assert GRConfig.from_vllm_config(worker) == legacy
-    make_gr_config(beam_max_width=256).write_to_vllm_config(worker)
+    GRConfig(beam_max_width=256).write_to_vllm_config(worker)
     assert GRConfig.from_vllm_config(worker).enable_short_suffix_attention is True
 
 
 @pytest.mark.parametrize("value", [None, "1", 1])
 def test_config_requires_boolean(value: Any) -> None:
     with pytest.raises(TypeError, match="must be a boolean"):
-        make_gr_config(beam_max_width=128, enable_short_suffix_attention=value)
+        GRConfig(beam_max_width=128, enable_short_suffix_attention=value)
 
 
 @pytest.mark.parametrize("width", [None, 128])
 def test_config_defaults_enable_short_suffix_but_no_pool_stays_dormant(
     width: int | None,
 ) -> None:
-    config = make_gr_config(beam_max_width=width)
+    config = GRConfig(beam_max_width=width)
     assert config.enable_short_suffix_attention is True
-    assert make_gr_config().enabled is False
+    assert GRConfig().enabled is False
     worker = SimpleNamespace(additional_config={})
     config.write_to_vllm_config(worker)
     assert GRConfig.from_vllm_config(worker) == config
@@ -290,7 +290,7 @@ def test_fusion_preserves_platform_auto_selection(
 @pytest.mark.parametrize("enabled", [False, True])
 def test_config_rejects_nonpositive_capacity(capacity: int, enabled: bool) -> None:
     with pytest.raises(ValueError, match="beam_max_decode_steps"):
-        make_gr_config(
+        GRConfig(
             beam_max_width=128,
             beam_max_decode_steps=capacity,
             enable_short_suffix_attention=enabled,

@@ -8,11 +8,10 @@ from typing import Any, cast
 import pytest
 import torch
 
-from tests.helpers.gr_config import make_gr_config
+from tests.helpers.gr_config import table_constraint
 from vllm_gr.config import (
     ConstraintConfig,
     ConstraintMode,
-    ConstraintTableSpec,
     GRConfig,
     gr_config_from_mapping,
     gr_config_to_mapping,
@@ -35,7 +34,7 @@ def flash_backend(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
 @pytest.mark.parametrize("version", [None, "auto", 2, 3])
 @pytest.mark.parametrize("short_suffix", [False, True])
 def test_prefill_config_roundtrip(version: Any, short_suffix: bool) -> None:
-    config = make_gr_config(
+    config = GRConfig(
         prefill_flash_attn_version=version,
         enable_short_suffix_attention=short_suffix,
         constraint=ConstraintConfig(mode=ConstraintMode.NONE),
@@ -43,11 +42,10 @@ def test_prefill_config_roundtrip(version: Any, short_suffix: bool) -> None:
     worker = SimpleNamespace(additional_config={})
     config.write_to_vllm_config(worker)
     assert GRConfig.from_vllm_config(worker) == config
-    canonical = make_gr_config(
+    canonical = GRConfig(
         prefill_flash_attn_version=version,
         enable_short_suffix_attention=short_suffix,
-        constraint_table=ConstraintTableSpec(max_top_k=256),
-        constraint_backend="constraint_table",
+        constraint=table_constraint(max_top_k=256),
     )
     mapping = gr_config_to_mapping(canonical)
     assert gr_config_from_mapping(mapping) == canonical
@@ -58,7 +56,7 @@ def test_prefill_config_roundtrip(version: Any, short_suffix: bool) -> None:
 @pytest.mark.parametrize("version", [True, False, 0, 4, 3.0, "3", "fast", [], {}])
 def test_prefill_config_rejects_invalid_version(version: Any) -> None:
     with pytest.raises(ValueError, match="prefill_flash_attn_version"):
-        make_gr_config(prefill_flash_attn_version=version)
+        GRConfig(prefill_flash_attn_version=version)
 
 
 def _resolve(requested: Any, decode: int = 2, **changes: Any) -> int:
@@ -265,12 +263,12 @@ def test_initialization_preserves_global_decode_config(
 
 
 def test_omitted_prefill_policy_defaults_to_auto() -> None:
-    assert make_gr_config().prefill_flash_attn_version == "auto"
+    assert GRConfig().prefill_flash_attn_version == "auto"
     assert (
         GRConfig.from_vllm_config(SimpleNamespace(additional_config={})).prefill_flash_attn_version
         == "auto"
     )
-    canonical = make_gr_config(constraint_table=ConstraintTableSpec(max_top_k=256))
+    canonical = GRConfig()
     mapping = gr_config_to_mapping(canonical)
     assert mapping["gr"]["prefill_flash_attn_version"] == "auto"
     assert gr_config_from_mapping(mapping).prefill_flash_attn_version == "auto"

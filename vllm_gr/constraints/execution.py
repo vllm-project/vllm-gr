@@ -35,6 +35,7 @@ import torch
 from vllm_gr.config.models import MAX_CONSTRAINT_CANDIDATE_WIDTH
 from vllm_gr.constraints.compiler import validate_resource_tables
 from vllm_gr.constraints.scoring import INVALID_LOGIT as _INVALID_LOGIT
+from vllm_gr.constraints.table import token_id_window
 from vllm_gr.constraints.validity import (
     constraint_candidate_counts,
     valid_mask_from_counts,
@@ -326,12 +327,17 @@ class CUDAConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
     def load_tables(self, resource: "ConstraintTableResource") -> None:
         from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
 
+        if self._digest == resource.digest:
+            return
         validate_cuda_sort_capacity(
             int(resource.first_token_ids.size),
             resource.max_prefix1_degree,
             resource.max_prefix2_degree,
         )
         super().load_tables(resource)
+        self._vocab_slice = token_id_window(
+            resource.first_token_ids, resource.prefix1_values, resource.prefix2_values
+        )
 
     def is_available(self) -> bool:
         return torch.cuda.is_available()
@@ -347,24 +353,11 @@ class CUDAConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
         if logits.shape[1] == self._vocab_size:
             return 0, self._vocab_size
 
-        from vllm_gr.ops.sliced_logits import get_vocab_slice_config
-
-        offset, slice_size, _ = get_vocab_slice_config()
-        if offset is None or slice_size is None:
-            raise ValueError(
-                f"CUDA constraint logits vocab {logits.shape[1]} differs from table "
-                f"vocab_size {self._vocab_size}, but vocab slicing is not configured"
-            )
+        offset, slice_size = self._vocab_slice
         if logits.shape[1] != slice_size:
             raise ValueError(
-                f"CUDA constraint logits vocab {logits.shape[1]} must equal configured "
-                f"vocab_slice_size {slice_size}"
-            )
-        if offset < 0 or offset + slice_size > self._vocab_size:
-            raise ValueError(
-                "configured CUDA vocabulary slice is outside the constraint table "
-                f"vocabulary: offset={offset}, size={slice_size}, "
-                f"table_vocab_size={self._vocab_size}"
+                f"CUDA constraint logits width {logits.shape[1]} must match the table "
+                f"vocabulary {self._vocab_size} or its token window {slice_size}"
             )
         return offset, self._vocab_size
 

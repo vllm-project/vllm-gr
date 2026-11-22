@@ -15,7 +15,6 @@ from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_gr.config import GRConfig
-from vllm_gr.config.models import configured_candidate_width
 from vllm_gr.entrypoints.beam_search.client import AsyncBeamSearchClient
 from vllm_gr.entrypoints.beam_search.request_params import apply_beam_request_defaults
 from vllm_gr.sampling_params import BeamSearchParams
@@ -129,9 +128,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                 per_parent_beam_widths=tuple(params.per_parent_beam_widths)
                 if params.per_parent_beam_widths is not None
                 else None,
-                candidate_width=configured_candidate_width(gr_config)
-                if gr_config is not None
-                else None,
+                candidate_width=gr_config.beam_candidate_width if gr_config is not None else None,
             )
             output = BeamOutputOptions(
                 num_return_sequences=final_width

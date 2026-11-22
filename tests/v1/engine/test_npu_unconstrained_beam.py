@@ -15,8 +15,8 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
-from tests.helpers.gr_config import make_gr_config
-from vllm_gr.config import ConstraintConfig, ConstraintMode
+from tests.helpers.gr_config import table_constraint
+from vllm_gr.config import ConstraintConfig, ConstraintMode, GRConfig
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
 from vllm_gr.v1.beam.batch_contracts import (
@@ -242,7 +242,9 @@ def _prefill_runner(batch_size: int, constrained: bool) -> NPUEagerBeamStageRunn
         beam_params=SimpleNamespace(temperature=0.5), is_last_stage=False, output_device_state=None
     )
     worker = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(constrained_generation=constrained),
+        _vllm_gr_config=SimpleNamespace(
+            constraint=table_constraint() if constrained else ConstraintConfig()
+        ),
         _current_scheduler_output=SimpleNamespace(
             gr_stage_metadata={execution.session_id: metadata}
         ),
@@ -338,8 +340,8 @@ def test_npu_generation_capacity_is_checked_before_worker_state_is_allocated(
             get_num_kv_heads=lambda parallel: 8, get_head_size=lambda: 128
         ),
     )
-    make_gr_config(
-        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=capacity
+    GRConfig(
+        constraint=ConstraintConfig(), beam_max_width=2, beam_max_decode_steps=capacity
     ).write_to_vllm_config(config)
     worker = SimpleNamespace(
         device="npu",
@@ -418,7 +420,7 @@ def test_generation_horizon_checks_actual_request_and_capacity(
         ),
     )
     GRConfig(
-        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=capacity
+        constraint=ConstraintConfig(), beam_max_width=2, beam_max_decode_steps=capacity
     ).write_to_vllm_config(config)
     request = _generation_request(steps)
 
@@ -474,7 +476,7 @@ def test_extended_generation_fits_native_kv_reorder_buffer(
         parallel_config=parallel,
     )
     GRConfig(
-        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=capacity
+        constraint=ConstraintConfig(), beam_max_width=2, beam_max_decode_steps=capacity
     ).write_to_vllm_config(config)
 
     def validate() -> None:
@@ -519,7 +521,7 @@ def test_extended_generation_rejects_invalid_model_geometry(heads: Any, head_siz
             get_num_kv_heads=lambda parallel: heads, get_head_size=lambda: head_size
         ),
     )
-    GRConfig(constrained_generation=False, beam_max_decode_steps=6).write_to_vllm_config(config)
+    GRConfig(constraint=ConstraintConfig(), beam_max_decode_steps=6).write_to_vllm_config(config)
     with pytest.raises(ValueError, match="positive integer KV-head geometry"):
         validate_gr_device_config(config)
 
@@ -538,7 +540,7 @@ def test_extended_generation_fails_closed_without_model_geometry(
     config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device=device))
     if not missing_model:
         config.model_config = SimpleNamespace()
-    GRConfig(constrained_generation=False, beam_max_decode_steps=capacity).write_to_vllm_config(
+    GRConfig(constraint=ConstraintConfig(), beam_max_decode_steps=capacity).write_to_vllm_config(
         config
     )
     if rejected:
@@ -557,9 +559,9 @@ def test_bounded_generic_support_preserves_sid_stage_capacity(steps: int) -> Non
         validate_gr_request,
     )
 
-    with pytest.raises(ValueError, match=r"beam\.max_decode_steps <= 3"):
+    with pytest.raises(ValueError, match=r"gr\.max_decode_steps <= 3"):
         GRConfig(
-            constrained_generation=False,
+            constraint=ConstraintConfig(),
             beam_worker_decision=True,
             beam_max_width=2,
             beam_max_decode_steps=steps,
@@ -567,7 +569,7 @@ def test_bounded_generic_support_preserves_sid_stage_capacity(steps: int) -> Non
         )
     config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device="npu"))
     GRConfig(
-        constrained_generation=False,
+        constraint=ConstraintConfig(),
         beam_worker_decision=True,
         beam_max_width=2,
         beam_max_decode_steps=3,
@@ -583,7 +585,7 @@ def test_bounded_generic_support_preserves_sid_stage_capacity(steps: int) -> Non
 @pytest.mark.parametrize("steps", [4, 5, 6])
 def test_bounded_generic_support_preserves_catalog_depth(steps: int) -> None:
     from vllm_gr.config import (
-        ConstraintTableBackendEnum,
+        ConstraintBackendKind,
         ConstraintTableSpec,
         GRConfig,
         write_canonical_gr_config,
@@ -598,7 +600,7 @@ def test_bounded_generic_support_preserves_catalog_depth(steps: int) -> None:
             mode=ConstraintMode.TABLE,
             table=ConstraintTableSpec(
                 enabled=True,
-                backend=ConstraintTableBackendEnum.NPU,
+                backend=ConstraintBackendKind.NPU,
                 path="/tmp/test-constraint-table.safetensors",
                 format="constraint_table_v1",
                 artifact_digest="sha256:" + "a" * 64,
@@ -608,7 +610,7 @@ def test_bounded_generic_support_preserves_catalog_depth(steps: int) -> None:
         ),
     )
     write_canonical_gr_config(config, gr_config)
-    table = GRConfig.from_vllm_config(config).constraint_table
+    table = GRConfig.from_vllm_config(config).constraint_config.table
     assert table is not None and table.enabled and table.format == "constraint_table_v1"
     validate_gr_request(_generation_request(3), config=config)
     with pytest.raises(
@@ -649,8 +651,8 @@ def test_native_request_candidate_width_is_checked_at_device_admission(
     )
 
     config = SimpleNamespace(additional_config={}, device_config=SimpleNamespace(device=device))
-    make_gr_config(
-        constrained_generation=False, beam_max_width=2, beam_max_decode_steps=3
+    GRConfig(
+        constraint=ConstraintConfig(), beam_max_width=2, beam_max_decode_steps=3
     ).write_to_vllm_config(config)
     native = EngineCoreRequest(
         request_id="native-candidate-width",

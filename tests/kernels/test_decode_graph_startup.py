@@ -37,7 +37,7 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
     worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=1)
     for group in worker.kv_cache_config.kv_cache_groups:
         group.kv_cache_spec = SimpleNamespace(block_size=16)
@@ -125,7 +125,7 @@ def test_v1_startup_graphs_replay_with_their_own_batch_buffers() -> None:
     worker.model_config.enforce_eager = False
     cfg = worker._vllm_gr_config
     cfg.beam_graph_enabled = cfg.beam_worker_decision = True
-    cfg.constraint_table = SimpleNamespace(enabled=True)
+
     cfg.deployment = DeploymentOptions(beam_batch_sizes=(1, 2))
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=2)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))

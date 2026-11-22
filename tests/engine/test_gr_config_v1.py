@@ -8,7 +8,6 @@ import json
 import os
 import subprocess
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,7 +19,7 @@ from tests.helpers.gr_config import engine_args_from_file
 from tests.helpers.paths import REPO_ROOT, TESTS_DIR
 from vllm_gr.config import (
     CONSTRAINT_TABLE_FORMAT,
-    ConstraintTableBackendEnum,
+    ConstraintBackendKind,
     ConstraintTableSpec,
     GRConfig,
     gr_config_from_mapping,
@@ -67,9 +66,9 @@ def test_canonical_mapping_round_trip_is_exact(tmp_path: Path) -> None:
     config = gr_config_from_mapping(raw)
 
     assert config.beam_max_width == 32
-    table = config.constraint_table
+    table = config.constraint_config.table
     assert table is not None
-    assert table.backend is ConstraintTableBackendEnum.CPU
+    assert table.backend is ConstraintBackendKind.CPU
     assert gr_config_from_mapping(gr_config_to_mapping(config)) == config
 
 
@@ -103,10 +102,7 @@ def test_default_beam_batch_sizes() -> None:
     assert GRConfig().deployment.beam_batch_sizes == (1, 2, 4)
 
 
-@pytest.mark.parametrize("canonical", [False, True])  # type: ignore[misc]
-def test_graph_widths_and_beam_batch_sizes_survive_transport(
-    tmp_path: Path, canonical: bool
-) -> None:
+def test_graph_widths_and_beam_batch_sizes_survive_transport(tmp_path: Path) -> None:
     raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
     beam = raw["gr"]
     assert isinstance(beam, dict)
@@ -118,10 +114,7 @@ def test_graph_widths_and_beam_batch_sizes_survive_transport(
     host = SimpleNamespace(
         additional_config={}, scheduler_config=SimpleNamespace(async_scheduling=True)
     )
-    if canonical:
-        write_canonical_gr_config(host, config)
-    else:
-        replace(config, constraint_table=None).write_to_vllm_config(host)
+    config.write_to_vllm_config(host)
     restored = GRConfig.from_vllm_config(
         SimpleNamespace(additional_config=json.loads(json.dumps(host.additional_config)))
     )
@@ -200,20 +193,19 @@ def test_canonical_beam_runtime_options_round_trip(
     config = gr_config_from_mapping(raw)
 
     assert config.beam_worker_decision is worker_decision
-    assert config.beam_engine_driven is None
     assert gr_config_from_mapping(gr_config_to_mapping(config)) == config
 
 
-def test_canonical_mapping_defaults_constraint_backend_to_cuda(tmp_path: Path) -> None:
+def test_canonical_mapping_defaults_constraint_backend_to_auto(tmp_path: Path) -> None:
     raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
     table_mapping = raw["gr"]["constraint_table"]
     assert isinstance(table_mapping, dict)
     del table_mapping["backend"]
 
-    table = gr_config_from_mapping(raw).constraint_table
+    table = gr_config_from_mapping(raw).constraint_config.table
 
     assert table is not None
-    assert table.backend is ConstraintTableBackendEnum.CUDA
+    assert table.backend is ConstraintBackendKind.AUTO
 
 
 def test_canonical_writer_uses_primitive_mapping(tmp_path: Path) -> None:
@@ -224,12 +216,14 @@ def test_canonical_writer_uses_primitive_mapping(tmp_path: Path) -> None:
     stale = GRConfig.from_vllm_config(vllm_config)
     assert stale.beam_max_width is None
 
+    vllm_config.additional_config["vllm_gr_backend_options"] = {"provider": "example"}
     write_canonical_gr_config(vllm_config, config)
 
     payload = vllm_config.additional_config[GR_CONFIG_KEY]
     assert json.loads(json.dumps(payload)) == payload
     assert GRConfig.from_vllm_config(vllm_config) == config
     assert vllm_config.additional_config["unrelated"] == 1
+    assert vllm_config.additional_config["vllm_gr_backend_options"] == {"provider": "example"}
 
 
 @pytest.mark.parametrize("version", [True, 1.0, "1", None])  # type: ignore[misc]
@@ -287,7 +281,7 @@ def test_yaml_path_is_resolved_relative_to_yaml(tmp_path: Path) -> None:
 
     config = load_gr_config(config_path)
 
-    table = config.constraint_table
+    table = config.constraint_config.table
     assert table is not None
     assert table.path == str((tmp_path / "artifacts/table.safetensors").resolve())
 
@@ -299,7 +293,7 @@ def test_mapping_rejects_relative_artifact_path() -> None:
 
 def test_mapping_base_dir_resolves_relative_artifact_path(tmp_path: Path) -> None:
     config = gr_config_from_mapping(_canonical_mapping("table.safetensors"), base_dir=tmp_path)
-    table = config.constraint_table
+    table = config.constraint_config.table
     assert table is not None
     assert table.path == str((tmp_path / "table.safetensors").resolve())
 
@@ -315,24 +309,6 @@ def test_canonical_and_legacy_additional_config_are_mutually_exclusive(
     )
     with pytest.raises(ValueError, match="Removed vLLM-GR"):
         parse_gr_config(vllm_config)
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_legacy_config_fields_are_not_dataclass_fields() -> None:
-    from dataclasses import fields
-
-    names = {field.name for field in fields(GRConfig)}
-    assert names.isdisjoint(
-        {
-            "catalog_path",
-            "constraint_backend",
-            "constrained_generation",
-            "vocab_offset",
-            "vocab_slice_size",
-            "beam_engine_driven",
-            "constraint_table",
-        }
-    )
 
 
 def test_constraint_table_requires_complete_enabled_config(tmp_path: Path) -> None:
@@ -357,7 +333,7 @@ def test_canonical_mapping_requires_explicit_max_top_k(tmp_path: Path) -> None:
 def test_constraint_max_top_k_has_no_npu_upper_bound(tmp_path: Path) -> None:
     config = ConstraintTableSpec(
         enabled=True,
-        backend=ConstraintTableBackendEnum.NPU,
+        backend=ConstraintBackendKind.NPU,
         path=str(tmp_path / "table.safetensors"),
         artifact_digest=_ARTIFACT_DIGEST,
         tokenizer_digest=_TOKENIZER_DIGEST,
@@ -641,7 +617,6 @@ def test_engine_creation_serializes_cuda_decision_defaults(
     assert payload["gr"]["worker_decision"] is True
     assert "engine_driven" not in payload["gr"]
     assert parse_gr_config(vllm_config).beam_worker_decision is True
-    assert parse_gr_config(vllm_config).beam_engine_driven is None
 
 
 pytestmark = pytest.mark.cpu_test
@@ -661,8 +636,8 @@ def test_adapter_cache_switch_round_trip(enabled: bool, tmp_path: Path) -> None:
     host = SimpleNamespace(
         additional_config={}, scheduler_config=SimpleNamespace(async_scheduling=True)
     )
-    legacy = GRConfig(beam_adapter_cache_enabled=enabled)
-    legacy.write_to_vllm_config(host)
+    config = GRConfig(beam_adapter_cache_enabled=enabled)
+    config.write_to_vllm_config(host)
     assert GRConfig.from_vllm_config(host).beam_adapter_cache_enabled is enabled
 
 

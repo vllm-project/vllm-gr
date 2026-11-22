@@ -6,6 +6,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
+
 from ..config import BackendConfigService
 
 if TYPE_CHECKING:
@@ -14,7 +16,6 @@ if TYPE_CHECKING:
 
 class AscendConfigService(BackendConfigService):
     default_worker_decision = True
-    promote_catalog_tables = True
 
     def apply_native_defaults(self, config: Any) -> None:
         cache = getattr(config, "cache_config", None)
@@ -30,7 +31,7 @@ class AscendConfigService(BackendConfigService):
             cache.block_size = 128
 
     def validate_engine(self, config: Any, gr: GRConfig) -> None:
-        if gr.constrained_generation is False and gr.beam_max_width is not None:
+        if configured_constraint_mode(gr) is ConstraintMode.NONE and gr.beam_max_width is not None:
             from vllm_gr.platforms.ascend.admission import (
                 validate_npu_unconstrained_runner,
             )

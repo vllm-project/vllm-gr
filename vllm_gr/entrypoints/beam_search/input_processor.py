@@ -16,7 +16,6 @@ from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import GRConfig, resolve_candidate_width
 from vllm_gr.config.execution import validate_gr_execution_config
-from vllm_gr.config.models import configured_candidate_width
 from vllm_gr.entrypoints.beam_search.boundary_tokens import boundary_token_id
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search.protocol import (
@@ -60,7 +59,7 @@ def _get_token_id(tokenizer: Any, token: str | None, name: str) -> int | None:
 def _resolve_candidate_width(vllm_config: Any) -> int:
     """Resolve K for one request, matching the engine's startup derivation.
 
-    ``constraint_table.candidate_width`` is the single source of truth; when it
+    ``gr.candidate_width`` is the single source of truth; when it
     is unset K follows the beam width (the pre-decoupling behaviour).  Sampling
     ``logprobs`` must equal K so each beam row yields exactly K candidates.
     """
@@ -85,7 +84,7 @@ def _configured_candidate_width(vllm_config: Any) -> int | None:
     device = getattr(getattr(vllm_config, "device_config", None), "device", None)
     if uses_retained_candidate_widths(config, device):
         return None
-    return configured_candidate_width(config)
+    return config.beam_candidate_width
 
 
 def _effective_max_logprobs(vllm_config: Any) -> int | None:

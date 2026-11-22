@@ -17,7 +17,7 @@ from numpy.typing import NDArray
 from vllm_gr.config.models import (
     DEFAULT_DEPLOYMENT,
     MAX_CONSTRAINT_CANDIDATE_WIDTH,
-    ConstraintTableBackendEnum,
+    ConstraintBackendKind,
     ConstraintTableSpec,
 )
 from vllm_gr.constraints.artifact import load_constraint_table_artifact
@@ -38,6 +38,7 @@ from vllm_gr.constraints.npu_tables import (
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
+    token_id_window,
 )
 from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
 from vllm_gr.ops.npu.rec_constrained_topk import (
@@ -82,7 +83,7 @@ def _validate_loader_inputs(
 def _backend_info(
     table: ConstraintTable,
     *,
-    backend: ConstraintTableBackendEnum,
+    backend: ConstraintBackendKind,
     max_top_k: int,
     max_rows: int,
     host_memory_bytes: int,
@@ -238,7 +239,7 @@ def _upload_npu_backend(
         _synchronize_current_npu_stream(device)
         info = _backend_info(
             table,
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             max_top_k=max_top_k,
             max_rows=max_rows,
             host_memory_bytes=0,
@@ -293,16 +294,12 @@ def _upload_cuda_backend(
         _synchronize_current_cuda_stream(device)
         info = _backend_info(
             table,
-            backend=ConstraintTableBackendEnum.CUDA,
+            backend=ConstraintBackendKind.CUDA,
             max_top_k=max_top_k,
             max_rows=max_rows,
             host_memory_bytes=0,
             device_memory_bytes=_unique_storage_bytes(device_tables),
         )
-        # One shared window covers all three decode steps; table IDs stay global.
-        token_arrays = (table.first_token_ids, table.prefix1_values, table.prefix2_values)
-        offset = min(int(ids.min()) for ids in token_arrays)
-        end = max(int(ids.max()) for ids in token_arrays) + 1
         backend = CUDAConstraintBackend(
             first_token_ids=device_tables["first_token_ids"],
             prefix1_offsets=device_tables["prefix1_offsets"],
@@ -311,7 +308,9 @@ def _upload_cuda_backend(
             prefix2_value_offsets=device_tables["prefix2_value_offsets"],
             prefix2_values=device_tables["prefix2_values"],
             info=info,
-            vocab_slice=(offset, end - offset),
+            vocab_slice=token_id_window(
+                table.first_token_ids, table.prefix1_values, table.prefix2_values
+            ),
             first_token_offsets=device_tables.get("first_token_offsets"),
             max_first_degree=table.max_first_degree,
         )
@@ -588,8 +587,8 @@ def load_constraint_backend(
     if not config.enabled:
         return None
     backend_kind = (
-        ConstraintTableBackendEnum.CUDA
-        if config.backend is ConstraintTableBackendEnum.AUTO
+        ConstraintBackendKind.CUDA
+        if config.backend is ConstraintBackendKind.AUTO
         else config.backend
     )
     _validate_loader_inputs(
@@ -604,7 +603,7 @@ def load_constraint_backend(
     max_top_k = config.max_top_k
     assert max_top_k is not None
     op: NPUConstraintOp | None = None
-    if backend_kind is ConstraintTableBackendEnum.CUDA:
+    if backend_kind is ConstraintBackendKind.CUDA:
         if max_top_k > MAX_CONSTRAINT_CANDIDATE_WIDTH:
             raise ValueError(
                 f"CUDA constraint max_top_k must be <= {MAX_CONSTRAINT_CANDIDATE_WIDTH}, "
@@ -614,7 +613,7 @@ def load_constraint_backend(
             raise ValueError(f"CUDA constraint logits must be fp16/bf16, got {dtype}")
         if device.type != "cuda":
             raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
-    if backend_kind is ConstraintTableBackendEnum.NPU:
+    if backend_kind is ConstraintBackendKind.NPU:
         if max_top_k > MAX_TOP_K:
             raise ValueError(f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {max_top_k}")
         if device.type != "npu":
@@ -628,17 +627,17 @@ def load_constraint_backend(
         expected_vocab_size=vocab_size,
         expected_format=config.format,
     )
-    if backend_kind is ConstraintTableBackendEnum.CPU:
+    if backend_kind is ConstraintBackendKind.CPU:
         info = _backend_info(
             table,
-            backend=ConstraintTableBackendEnum.CPU,
+            backend=ConstraintBackendKind.CPU,
             max_top_k=max_top_k,
             max_rows=max_rows,
             host_memory_bytes=table.total_bytes,
             device_memory_bytes=0,
         )
         return CPUConstraintBackend(table, info)
-    if backend_kind is ConstraintTableBackendEnum.CUDA:
+    if backend_kind is ConstraintBackendKind.CUDA:
         backend, cases = _upload_cuda_backend(
             table,
             device=device,
@@ -659,7 +658,7 @@ def load_constraint_backend(
         except BaseException:
             backend.close()
             raise
-    if backend_kind is not ConstraintTableBackendEnum.NPU or op is None:
+    if backend_kind is not ConstraintBackendKind.NPU or op is None:
         raise RuntimeError(f"unsupported constraint table backend {backend_kind!r}")
 
     _reject_unsupported_last_vocab_prefix(table)

@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.helpers.gr_config import table_constraint
 from vllm_gr.config.models import DEFAULT_DEPLOYMENT, DeploymentOptions
 from vllm_gr.v1.worker import gr_startup as startup
 from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
@@ -59,7 +60,7 @@ def capture_runtime(monkeypatch: pytest.MonkeyPatch) -> CaptureRuntime:
             beam_max_decode_steps=3,
             beam_worker_decision=True,
             beam_graph_enabled=True,
-            constraint_table=SimpleNamespace(enabled=True),
+            constraint=table_constraint(),
         ),
         _gr_async_decode_graph_capture_failed=False,
         _gr_async_decode_graph_capture_error=None,
@@ -105,29 +106,6 @@ def capture_runtime(monkeypatch: pytest.MonkeyPatch) -> CaptureRuntime:
 
 def _capture(worker: SimpleNamespace, *, allow: bool = True) -> bool:
     return bool(capture_multibatch_forward(worker, allow_eager_fallback=allow))
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_legacy_v1_enabled_table_still_enables_startup_capture(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = SimpleNamespace(
-        deployment=DEFAULT_DEPLOYMENT,
-        beam_max_width=4,
-        beam_max_decode_steps=3,
-        beam_worker_decision=True,
-        beam_graph_enabled=True,
-        constraint_table=SimpleNamespace(enabled=True),
-    )
-    worker = SimpleNamespace(
-        device="cuda",
-        vllm_config=SimpleNamespace(),
-        model_config=SimpleNamespace(enforce_eager=False),
-        _vllm_gr_config=config,
-    )
-    monkeypatch.setattr(startup, "validate_gr_execution_runtime", lambda _: None)
-
-    assert startup._capture_enabled(worker)
 
 
 @pytest.mark.l1  # type: ignore[misc]

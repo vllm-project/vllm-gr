@@ -31,8 +31,10 @@ class Core:
         self.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model="/models/v1"))
         self.vllm_config._vllm_gr_parsed_config = SimpleNamespace(
             beam_max_width=128,
-            constraint_table=SimpleNamespace(
-                enabled=True, path="/tries/v1/table", backend=SimpleNamespace(value="cuda")
+            constraint=SimpleNamespace(
+                table=SimpleNamespace(
+                    enabled=True, path="/tries/v1/table", backend=SimpleNamespace(value="cuda")
+                )
             ),
         )
         self.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True)
@@ -336,9 +338,9 @@ def test_trie_rejects_unsupported_execution_before_worker_rpc(unsupported: str) 
     core = Core()
     config = core.vllm_config._vllm_gr_parsed_config
     if unsupported == "disabled":
-        config.constraint_table.enabled = False
+        config.constraint = None
     elif unsupported == "npu":
-        config.constraint_table.backend.value = "npu"
+        config.constraint.table.backend.value = "npu"
     else:
         core.vllm_config.scheduler_config.async_scheduling = False
     result = reload_trie(core, "/v2", "v2")
@@ -395,7 +397,7 @@ def test_status_has_one_enum_state_and_both_resource_versions() -> None:
     )
     core.paused = True
     assert service_status(core).service_state is ServiceState.PAUSED
-    core.vllm_config._vllm_gr_parsed_config.constraint_table = None
+    core.vllm_config._vllm_gr_parsed_config.constraint = None
     delattr(core, "_gr_serving_resources")
     current = service_status(core)
     assert current.service_state is ServiceState.PAUSED

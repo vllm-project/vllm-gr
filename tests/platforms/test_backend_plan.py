@@ -51,7 +51,7 @@ def test_historical_backend_paths_resolve_the_same_wire_and_rpc_objects() -> Non
     assert binding.bind_backend_services is bind_backend_services
     assert binding.worker_backend_readiness is worker_backend_readiness
     assert readiness.verify_engine_backend_readiness is verify_engine_backend_readiness
-    # Captured from the pre-migration codec. A self-round-trip alone can hide a wire change.
+    # An existing v1 envelope must be rejected even with its original valid fingerprint.
     envelope = {
         "plan": {
             "schema_version": 1,
@@ -63,7 +63,8 @@ def test_historical_backend_paths_resolve_the_same_wire_and_rpc_objects() -> Non
         },
         "fingerprint": "60b287d597511794960c55988945c2f3c4451fd733075503432e1694fffadfa7",
     }
-    assert BackendPlan.from_wire(envelope).to_wire() == envelope
+    with pytest.raises(ValueError, match="planning API version"):
+        BackendPlan.from_wire(envelope)
 
 
 class Service:
@@ -84,7 +85,7 @@ class Service:
 class Provider:
     backend_id = "test-backend"
     api_version = 2
-    plan_api_version: int | None = 1
+    plan_api_version: int | None = 2
     adapter_revision = "test-adapter-v1"
 
     def __init__(self) -> None:
@@ -196,7 +197,7 @@ def test_service_requirements_extend_existing_wire_plans() -> None:
     legacy = BackendPlan(
         "fixture", 2, BackendRequest(empty, empty, empty, empty), PlanData({"stage": "old"})
     )
-    assert legacy.fingerprint == "3e1fe9147d21e927146995e78cffd1a2559e9fa936dfa13eb23c7b3a86af71d5"
+    assert legacy.fingerprint == "6d51588d8f2980d7d836452746c6dc20cbb871d4a9d9f41e21ec15b41859c043"
     assert "requirements" not in legacy.to_dict()
     assert BackendPlan.from_wire(legacy.to_wire()) == legacy
     plan = replace(legacy, requirements=ServiceRequirements(stage="external.stage"))
@@ -292,7 +293,7 @@ def test_canonical_table_reports_its_identity_and_keeps_its_native_owner(
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "field,value", [("schema_version", 2), ("schema_version", True), ("plan_api_version", 2)]
+    "field,value", [("schema_version", 2), ("schema_version", True), ("plan_api_version", 3)]
 )
 def test_wire_rejects_unsupported_schema(provider: Provider, field: str, value: Any) -> None:
     plan = admit_backend_plan(config())
@@ -528,11 +529,11 @@ def test_legacy_provider_never_infers_a_planning_extension(provider: Provider) -
 
 
 def test_bad_planning_version_and_missing_methods_fail_registration() -> None:
-    for version in (True, 2, "1"):
+    for version in (True, 1, 3, "2"):
         with pytest.raises(ValueError, match="plan_api_version"):
             validate_planning_api(SimpleNamespace(plan_api_version=version))
     with pytest.raises(ValueError, match="missing methods"):
-        validate_planning_api(SimpleNamespace(plan_api_version=1))
+        validate_planning_api(SimpleNamespace(plan_api_version=2))
 
 
 def test_resolver_cannot_change_request_identity(

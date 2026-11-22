@@ -68,7 +68,9 @@ def validate_planning_api(provider: Any) -> None:
     if version is None:
         return  # API-v1/v2 did not declare a planning extension.
     if type(version) is not int or version != PLAN_API_VERSION:
-        raise ValueError(f"Unsupported backend plan_api_version={version!r}")
+        raise ValueError(
+            f"Unsupported backend plan_api_version={version!r}; supported={PLAN_API_VERSION}"
+        )
     missing = [name for name in PLAN_METHODS if not callable(getattr(provider, name, None))]
     if missing:
         raise ValueError(f"Backend planning API is missing methods: {missing}")
@@ -141,9 +143,7 @@ class LegacyPlanningProvider:
                 {
                     "runner": "legacy-provider-hooks",
                     "attention": "legacy-provider-execution",
-                    "constraint": "canonical"
-                    if (gr["constraint_table"] or {}).get("enabled")
-                    else ("legacy" if gr["constraint_backend"] == "constraint_table" else "none"),
+                    "constraint": "canonical" if request.has_constraint_table else "none",
                     "requires_attention": gr["attention_backend"] == "CUSTOM",
                     "compatibility": "provider-api-v2-delegation",
                 }

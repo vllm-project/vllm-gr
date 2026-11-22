@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from vllm_gr.config import ConstraintTableBackendEnum
+from vllm_gr.config import ConstraintBackendKind
 from vllm_gr.constraints.backend import ConstraintBackendInfo, ConstraintMetadata
 from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
@@ -28,7 +28,7 @@ def _backends() -> tuple[CPUConstraintBackend, NPUConstraintBackend]:
         table,
         ConstraintBackendInfo(
             **common,
-            backend=ConstraintTableBackendEnum.CPU,
+            backend=ConstraintBackendKind.CPU,
             host_memory_bytes=table.total_bytes,
             device_memory_bytes=0,
         ),
@@ -46,7 +46,7 @@ def _backends() -> tuple[CPUConstraintBackend, NPUConstraintBackend]:
         **tensors,
         info=ConstraintBackendInfo(
             **common,
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             host_memory_bytes=0,
             device_memory_bytes=table.total_bytes,
         ),

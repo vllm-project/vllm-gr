@@ -1291,7 +1291,7 @@ def test_reserved_tokens_independent_candidates_and_result_width() -> None:
 def test_native_params_reach_offline_preparation() -> None:
     from vllm.sampling_params import BeamSearchParams
 
-    host = _request_defaults_host()
+    host = _request_defaults_host(constraint_mode="none")
     engine = _make_engine(additional_config=host.additional_config)
     request = _prepare_request(
         engine, [1, 2], BeamSearchParams(beam_width=8, max_tokens=3, ignore_eos=True), online=False

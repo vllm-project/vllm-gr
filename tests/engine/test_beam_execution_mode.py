@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_gr.config import (
+    ConstraintConfig,
     GRConfig,
 )
 from vllm_gr.config.execution import validate_gr_execution_config
@@ -28,7 +29,7 @@ def test_v1_requires_native_async() -> None:
         scheduler_config=SimpleNamespace(async_scheduling=False),
     )
     GRConfig(
-        beam_max_width=4, beam_worker_decision=True, constrained_generation=False
+        beam_max_width=4, beam_worker_decision=True, constraint=ConstraintConfig()
     ).write_to_vllm_config(config)
     with pytest.raises(ValueError, match="async_scheduling=True"):
         validate_gr_execution_config(config)
@@ -51,7 +52,7 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
         capture,
     )
     GRConfig(
-        beam_max_width=4, beam_worker_decision=True, constrained_generation=False
+        beam_max_width=4, beam_worker_decision=True, constraint=ConstraintConfig()
     ).write_to_vllm_config(
         worker_vllm_config := SimpleNamespace(
             additional_config={}, scheduler_config=SimpleNamespace(async_scheduling=True)
@@ -62,7 +63,7 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
         model_config=SimpleNamespace(enforce_eager=False),
         vllm_config=worker_vllm_config,
         _vllm_gr_config=GRConfig(
-            beam_max_width=4, beam_worker_decision=True, constrained_generation=False
+            beam_max_width=4, beam_worker_decision=True, constraint=ConstraintConfig()
         ),
     )
 

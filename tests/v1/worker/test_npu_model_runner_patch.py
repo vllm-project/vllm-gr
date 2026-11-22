@@ -13,6 +13,7 @@ import pytest
 import torch
 from vllm.v1.core.sched.output import NewRequestData
 
+from tests.helpers.gr_config import table_constraint
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
 from vllm_gr.v1.attention.backends.npu_cache_layout import restore_npu_cache_pool_layout
 from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
@@ -2423,7 +2424,7 @@ def test_npu_parent_history_follows_output_options_through_session(
 
     worker = SimpleNamespace(
         device=torch.device("cpu"),
-        _vllm_gr_config=SimpleNamespace(constrained_generation=True),
+        _vllm_gr_config=SimpleNamespace(constraint=table_constraint()),
         _gr_npu_graph_context=context,
         _gr_npu_beam_graph_shapes={(batch_size, 3)},
         constraint_backend=SimpleNamespace(

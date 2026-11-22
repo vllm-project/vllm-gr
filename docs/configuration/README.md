@@ -6,6 +6,28 @@ options at the top level and vLLM-GR options under `gr`. The
 CUDA and Ascend settings. Native engines started without GR configuration use
 the upstream vLLM defaults.
 
+GR stores its resolved configuration in `additional_config["vllm_gr"]`.
+Supply settings through `gr=`, `--gr-config`, or the YAML `gr` section.
+EngineArgs resolves the settings on the driver before publishing a JSON-compatible
+snapshot in the vLLM configuration. Step width lists determine the runtime
+capacities when present. A Python `GRConfig` can also describe pool and candidate
+capacities without setting request defaults. Its snapshot carries these scalar
+capacities as `gr.beam_max_width` and `gr.beam_candidate_width`, preserving the
+absence of a step schedule when reloaded. Conflicting capacities and schedules
+are rejected during configuration construction.
+When a `GRConfig` has no constraint setting, its worker snapshot omits both
+constraint keys. An explicit `constraint_mode: none` selects unconstrained
+generation. The packaged GR startup defaults select this mode explicitly.
+Old flat settings such as `additional_config["vllm_gr_beam_max_width"]`
+raise an error on read and write. Move their intended values to the current
+GR settings and remove the flat keys before starting the engine.
+
+Use `gr.constraint_mode: table` with a compiled artifact in `gr.constraint_table`,
+or `gr.constraint_mode: none` for unconstrained generation. The driver resolves
+`backend: auto` before publishing the configuration to workers. On CUDA, each
+worker derives its model's projection window from the token IDs in the loaded
+table. Per-parent candidate counts come from `gr.candidate_width`.
+
 Use a [deployment recipe](../../recipes/README.md) for model-specific overrides.
 
 ## Load and override a configuration
@@ -67,8 +89,9 @@ llm = GRLLM(
 ### Path resolution
 
 The driver resolves artifact and calibration paths relative to the YAML file
-that declares them, including imported files. Workers receive the resolved
-configuration. Check the startup log for the effective GR settings and restart
+that declares them, including imported files. When parsing a public Python
+mapping, the driver also resolves symlinks in absolute artifact and calibration
+paths. Workers use the published paths even if the link changes after startup. Check the startup log for the effective GR settings and restart
 the engine to apply edits to its startup YAML.
 
 ## Migrate from `configs/`

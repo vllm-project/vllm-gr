@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import torch
 
-from tests.helpers.gr_config import make_gr_config
+from vllm_gr.config import GRConfig
 from vllm_gr.v1.beam.dispatch import GRStageKind
 from vllm_gr.v1.worker import gr_context as _gr_context
 from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as gpu_patch
@@ -743,7 +743,7 @@ def test_create_beam_context_uses_grconfig_params(device: str, enabled: bool | N
     """_create_beam_context must pass gr_cfg.max_width/max_decode_steps."""
     from unittest.mock import MagicMock, patch
 
-    gr_cfg = make_gr_config(beam_max_width=64, beam_max_decode_steps=10)
+    gr_cfg = GRConfig(beam_max_width=64, beam_max_decode_steps=10)
     if enabled is not None:
         gr_cfg = replace(gr_cfg, enable_short_suffix_attention=enabled)
     runner = SimpleNamespace(
@@ -777,7 +777,7 @@ def test_create_beam_context_dtype_from_model_config() -> None:
     """dtype must come from model_config.dtype, not hardcoded."""
     from unittest.mock import MagicMock, patch
 
-    gr_cfg = make_gr_config(beam_max_width=32, beam_max_decode_steps=5)
+    gr_cfg = GRConfig(beam_max_width=32, beam_max_decode_steps=5)
     runner = SimpleNamespace(
         model_config=SimpleNamespace(
             get_num_kv_heads=lambda pc: 4,

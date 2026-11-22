@@ -16,7 +16,7 @@ import torch
 from numpy.typing import NDArray
 
 from tests.constraints.test_table import make_table
-from vllm_gr.config import CONSTRAINT_TABLE_FORMAT, ConstraintTableBackendEnum
+from vllm_gr.config import CONSTRAINT_TABLE_FORMAT, ConstraintBackendKind
 from vllm_gr.constraints.backend import (
     INVALID_LOGIT,
     ConstraintBackendInfo,
@@ -143,7 +143,7 @@ def _backend(
         **tables,
         info=ConstraintBackendInfo(
             table_metadata=table.metadata,
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             max_top_k=3,
             max_rows=16,
             host_memory_bytes=0,

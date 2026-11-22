@@ -228,9 +228,9 @@ def test_recall_gr_config_preserves_calibrated_b4_capture(tmp_path: Path) -> Non
     config = gr_config_from_mapping({"gr": options, "attention-config": {"backend": "CUSTOM"}})
     assert config.deployment.candidate_width == config.deployment.beam_width == (128, 128, 128)
     assert str(config.deployment.prefill_kv_bound) == profile["prefill_kv_bound"]
-    assert config.constraint_table is not None
-    assert config.constraint_table.path == str(artifact)
-    assert config.constraint_table.max_top_k == 128
+    assert config.constraint_config.table is not None
+    assert config.constraint_config.table.path == str(artifact)
+    assert config.constraint_config.table.max_top_k == 128
     host = SimpleNamespace(additional_config={"vllm_gr": {"gr": options}})
     captures = plan_prefill_capture(
         get_default_buckets(host),

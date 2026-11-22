@@ -11,6 +11,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from vllm_gr.config import ConstraintConfig, ConstraintMode
 from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.ops.sliced_logits import compute_sliced_logits
 from vllm_gr.v1.worker.lm_head_cache import install_lm_head_cache_reload_hooks
@@ -103,7 +104,8 @@ def test_reload_trie_switches_then_releases_old_table_on_expiry(
         model_config=SimpleNamespace(get_vocab_size=lambda: 6, dtype=torch.float32),
         vllm_config=SimpleNamespace(
             _vllm_gr_parsed_config=SimpleNamespace(
-                constraint_table=config, deployment=DeploymentOptions(trie_retention_seconds=5)
+                constraint=ConstraintConfig(ConstraintMode.TABLE, config),
+                deployment=DeploymentOptions(trie_retention_seconds=5),
             )
         ),
     )

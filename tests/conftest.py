@@ -51,12 +51,3 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 @pytest.fixture  # type: ignore
 def loops(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("--loops"))
-
-
-@pytest.fixture(autouse=True)  # type: ignore
-def reset_vocab_slice_config() -> None:
-    from vllm_gr.ops.sliced_logits import set_vocab_slice_config
-
-    set_vocab_slice_config(None, None)
-    yield
-    set_vocab_slice_config(None, None)

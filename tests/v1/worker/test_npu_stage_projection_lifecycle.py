@@ -23,7 +23,6 @@ from vllm_gr.config import (
     ConstraintBackendKind,
     ConstraintConfig,
     ConstraintMode,
-    ConstraintTableBackendEnum,
     ConstraintTableSpec,
     GRConfig,
 )
@@ -38,7 +37,7 @@ from vllm_gr.v1.worker.npu.stage_projection import make_npu_stage_reload_weights
 class _Backend:
     def __init__(self) -> None:
         self.info = SimpleNamespace(
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             device_memory_bytes=32,
             table_metadata=SimpleNamespace(vocab_size=384),
         )

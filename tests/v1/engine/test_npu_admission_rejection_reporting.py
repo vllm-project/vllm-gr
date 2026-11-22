@@ -16,10 +16,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc
 
-from tests.helpers.gr_config import make_gr_config
 from vllm_gr.config import (
-    ConstraintTableBackendEnum,
+    ConstraintBackendKind,
+    ConstraintConfig,
+    ConstraintMode,
     ConstraintTableSpec,
+    GRConfig,
     write_canonical_gr_config,
 )
 from vllm_gr.v1.beam.batch_contracts import (
@@ -65,8 +67,7 @@ def _config(
     )
     table = ConstraintTableSpec(
         max_top_k=capacity,
-        candidate_width=configured_width,
-        backend=ConstraintTableBackendEnum(device),
+        backend=ConstraintBackendKind(device),
         enabled=catalog,
         path=str(Path(__file__).resolve().with_name("catalog.npz")) if catalog else None,
         artifact_digest="sha256:" + "a" * 64 if catalog else None,
@@ -74,13 +75,15 @@ def _config(
     )
     write_canonical_gr_config(
         config,
-        make_gr_config(
+        GRConfig(
             beam_max_width=4,
             beam_max_decode_steps=3,
             beam_worker_decision=True,
-            constrained_generation=catalog,
+            beam_candidate_width=configured_width,
             beam_sid_stage_vocab=sid,
-            constraint_table=table,
+            constraint=ConstraintConfig(ConstraintMode.TABLE, table)
+            if catalog
+            else ConstraintConfig(),
         ),
     )
     return config

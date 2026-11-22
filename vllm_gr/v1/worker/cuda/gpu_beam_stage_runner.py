@@ -20,7 +20,11 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gr.config import resolve_candidate_width
-from vllm_gr.config.models import deployment_for
+from vllm_gr.config.models import (
+    ConstraintMode,
+    configured_constraint_mode,
+    deployment_for,
+)
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
@@ -1272,9 +1276,7 @@ def get_stage_runner(
             "persistent GR requires CUDA async, TP/PP/DP=1, FP16/BF16 and matching capacity"
         )
     backend = getattr(worker, "constraint_backend", None)
-    # A GRConfig without the switch (or a partial config object) keeps the
-    # constrained default: only an explicit ``False`` selects full vocabulary.
-    unconstrained = getattr(cfg, "constrained_generation", None) is False
+    unconstrained = configured_constraint_mode(cfg) is ConstraintMode.NONE
     if not unconstrained and (
         backend is None or not isinstance(backend.get(), CUDAConstraintBackend)
     ):

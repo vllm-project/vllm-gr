@@ -13,7 +13,7 @@ import torch
 
 from tests.constraints.test_table import make_table
 from tests.helpers.beam_requests import make_batch_request
-from tests.helpers.gr_config import engine_config
+from tests.helpers.gr_config import engine_config, table_constraint
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.config.models import DEFAULT_DEPLOYMENT
 from vllm_gr.constraints.loader import _upload_cuda_backend
@@ -221,9 +221,8 @@ def admission_worker(
             beam_max_width=4,
             beam_max_decode_steps=3,
             enable_short_suffix_attention=False,
-            # resolve_candidate_width reads this; None keeps K == W for the
-            # fixture's W=4 workspace.
-            constraint_table=None,
+            beam_candidate_width=None,
+            constraint=table_constraint(),
         ),
         constraint_backend=VersionedConstraintTable(backend, loader=lambda _: backend),
         kv_cache_config=SimpleNamespace(

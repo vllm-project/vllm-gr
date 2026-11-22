@@ -65,12 +65,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
         if request.options.to_dict():
             raise ValueError("Ascend currently accepts no additional backend options")
         gr = request.config.to_dict()
-        table = gr["constraint_table"] or {}
-        constraint = (
-            "canonical"
-            if table.get("enabled")
-            else ("legacy" if gr["constraint_backend"] == "constraint_table" else "none")
-        )
+        constraint = "canonical" if request.has_constraint_table else "none"
         return BackendPlan(
             self.backend_id,
             self.api_version,

@@ -139,7 +139,7 @@ def test_full_load_rebinds_the_same_plan_only_once_per_model(
     provider = Mock(
         backend_id="test",
         api_version=2,
-        plan_api_version=1,
+        plan_api_version=2,
         adapter_revision="1",
         vendor_distribution=None,
     )
@@ -181,7 +181,7 @@ def autofit_runner(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, BackendPl
     provider = Mock(
         backend_id="test",
         api_version=2,
-        plan_api_version=1,
+        plan_api_version=2,
         adapter_revision="1",
         vendor_distribution=None,
     )

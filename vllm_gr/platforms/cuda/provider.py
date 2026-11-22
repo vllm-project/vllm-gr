@@ -58,12 +58,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
         native = request.native.to_dict()
         if gr["npu_decode_execution"] == "xllm":
             raise ValueError("CUDA does not support npu_decode_execution='xllm'")
-        table = gr["constraint_table"] or {}
-        constraint = (
-            "canonical"
-            if table.get("enabled")
-            else ("legacy" if gr["constraint_backend"] == "constraint_table" else "none")
-        )
+        constraint = "canonical" if request.has_constraint_table else "none"
         return BackendPlan(
             self.backend_id,
             self.api_version,

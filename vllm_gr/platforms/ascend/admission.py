@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 from vllm_gr.config.models import (
     ConstraintMode,
-    configured_candidate_width,
     configured_constraint_mode,
     runtime_constraint_table,
 )
@@ -92,7 +91,7 @@ def validate_npu_device_config(
         # maximum is workspace capacity, not a fixed K for dynamic requests.
         # Keep the fixed-width check for internal scalar configurations and
         # explicit request overrides below.
-        configured_k = configured_candidate_width(gr_config) if parent_widths is None else None
+        configured_k = gr_config.beam_candidate_width if parent_widths is None else None
         candidate_width_error = (
             "NPU unconstrained beam_search requires candidate_width "
             "to match each stage's beam width"

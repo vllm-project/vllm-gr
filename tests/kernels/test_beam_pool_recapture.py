@@ -40,7 +40,7 @@ def test_recapture_after_last_graph_retired_with_live_output(
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
     worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
-    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
 
@@ -94,7 +94,7 @@ def test_recapture_preserves_other_live_geometry(
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
     worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1, 2))
-    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
 

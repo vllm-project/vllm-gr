@@ -11,11 +11,10 @@ from unittest import mock
 
 import pytest
 
-from tests.helpers.gr_config import engine_args_from_file
+from tests.helpers.gr_config import engine_args_from_file, table_constraint
 from vllm_gr.config import (
     MAX_BEAM_WIDTH,
-    MAX_CANDIDATE_WIDTH,
-    ConstraintTableSpec,
+    ConstraintMode,
     GRAttentionBackend,
     GRConfig,
     NPUDecodeExecution,
@@ -26,8 +25,6 @@ from vllm_gr.platforms.legacy import legacy_config_service
 
 ATTENTION_BACKEND_KEY = "vllm_gr_attention_backend"
 CATALOG_PATH_KEY = "vllm_gr_catalog_path"
-CONSTRAINT_BACKEND_KEY = "vllm_gr_constraint_backend"
-NPU_DECODE_EXECUTION_KEY = "vllm_gr_npu_decode_execution"
 
 
 def _vllm_config(additional_config: object | None = None) -> SimpleNamespace:
@@ -54,17 +51,6 @@ def test_none_vllm_config_uses_defaults() -> None:
     assert GRConfig.from_vllm_config(None) == GRConfig()
 
 
-@pytest.mark.parametrize("value", [1, True, [], "unknown"])  # type: ignore[misc]
-def test_rejects_invalid_constraint_backend(value: object) -> None:
-    with pytest.raises(ValueError, match="constraint_backend"):
-        GRConfig.from_vllm_config(_vllm_config({CONSTRAINT_BACKEND_KEY: value}))
-
-
-def test_constraint_table_requires_catalog_path() -> None:
-    with pytest.raises(ValueError, match="requires catalog_path"):
-        GRConfig(constraint_backend="constraint_table")
-
-
 def test_npu_decode_execution_defaults_to_unset() -> None:
     # Unset (None): the runtime resolves per platform (xllm on NPU with the
     # operator library, cascade otherwise).
@@ -78,19 +64,17 @@ def test_npu_decode_execution_defaults_to_unset() -> None:
 @pytest.mark.parametrize("value", [1, True, [], {}, "flash"])  # type: ignore[misc]
 def test_rejects_invalid_npu_decode_execution(value: object) -> None:
     with pytest.raises(ValueError, match="npu_decode_execution"):
-        GRConfig.from_vllm_config(_vllm_config({NPU_DECODE_EXECUTION_KEY: value}))
-
-
-@pytest.mark.parametrize("value", [1, True, [], {}])  # type: ignore[misc]
-def test_rejects_non_string_catalog_path(value: object) -> None:
-    with pytest.raises(ValueError, match="catalog_path"):
-        GRConfig.from_vllm_config(_vllm_config({CATALOG_PATH_KEY: value}))
+        GRConfig.from_vllm_config(
+            _vllm_config({"vllm_gr": {"gr": {"npu_decode_execution": value}}})
+        )
 
 
 @pytest.mark.parametrize("value", [1, True, [], "FLASH_ATTN"])  # type: ignore[misc]
 def test_rejects_invalid_attention_backend(value: object) -> None:
     with pytest.raises(ValueError, match="attention_backend"):
-        GRConfig.from_vllm_config(_vllm_config({ATTENTION_BACKEND_KEY: value}))
+        GRConfig.from_vllm_config(
+            _vllm_config({"vllm_gr": {"gr": {}, "attention-config": {"backend": value}}})
+        )
 
 
 def test_parse_preserves_opaque_additional_config() -> None:
@@ -103,9 +87,7 @@ def test_parse_preserves_opaque_additional_config() -> None:
 
 def test_write_rejects_opaque_additional_config_when_gr_values_are_stored() -> None:
     with pytest.raises(ValueError, match="must be a mutable mapping"):
-        GRConfig(catalog_path=str(Path("/models/catalog.json").resolve())).write_to_vllm_config(
-            _vllm_config(_OpaqueAdditionalConfig())
-        )
+        GRConfig(beam_max_width=4).write_to_vllm_config(_vllm_config(_OpaqueAdditionalConfig()))
 
 
 def test_rejects_unknown_prefixed_key_but_preserves_unrelated_keys() -> None:
@@ -120,19 +102,27 @@ def test_rejects_unknown_prefixed_key_but_preserves_unrelated_keys() -> None:
         )
 
 
-def test_write_rejects_unknown_prefixed_key() -> None:
-    with pytest.raises(ValueError, match="unknown vLLM-GR"):
-        GRConfig().write_to_vllm_config(_vllm_config({"vllm_gr_unknown_option": True}))
+@pytest.mark.parametrize(
+    "key", ["vllm_gr_unknown_option", "vllm_gr_beam_max_width", CATALOG_PATH_KEY]
+)  # type: ignore[misc]
+def test_write_rejects_unknown_prefixed_key(key: str) -> None:
+    host = _vllm_config({"unrelated": 1})
+    original = GRConfig(beam_max_width=4)
+    original.write_to_vllm_config(host)
+    host.additional_config[key] = True
+    snapshot = dict(host.additional_config)
+
+    with pytest.raises(ValueError, match=key):
+        GRConfig().write_to_vllm_config(host)
+
+    assert host.additional_config == snapshot
+    assert host._vllm_gr_parsed_config is original
 
 
 def test_direct_construction_validates_and_normalizes() -> None:
     config = GRConfig(attention_backend="custom")
     assert config.attention_backend is GRAttentionBackend.CUSTOM
 
-    with pytest.raises(ValueError, match="catalog_path"):
-        GRConfig(catalog_path=123)
-    with pytest.raises(ValueError, match="must not be empty"):
-        GRConfig(catalog_path="   ")
     with pytest.raises(ValueError, match="attention_backend"):
         GRConfig(attention_backend="FLASH_ATTN")
 
@@ -208,7 +198,6 @@ def test_engine_config_preserves_opaque_additional_config_without_gr_overrides()
     additional_config = _OpaqueAdditionalConfig()
     vllm_config = _vllm_config(additional_config)
     engine_args = SimpleNamespace(
-        catalog_path=None,
         attention_backend=None,
         attention_config=None,
     )
@@ -226,7 +215,6 @@ def test_engine_config_rejects_invalid_raw_gr_value_without_cli_override() -> No
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
     engine_args = SimpleNamespace(
-        catalog_path=None,
         attention_backend=None,
         attention_config=None,
     )
@@ -261,105 +249,30 @@ def test_beam_max_width_rejects_values_above_global_limit() -> None:
 
 
 def test_candidate_width_follows_the_beam_width_until_it_cannot() -> None:
-    """K follows W up to the supported width; invalid derived K still fails."""
-    table = ConstraintTableSpec(
-        max_top_k=MAX_CANDIDATE_WIDTH,
-        enabled=True,
-        path=str(Path("/tmp/catalog.json").resolve()),
-        artifact_digest="sha256:" + "0" * 64,
-        tokenizer_digest="sha256:" + "0" * 64,
-    )
-    # Unset K follows the Beam width.
-    follows = GRConfig(beam_max_width=128, constraint_table=table)
-    assert resolve_candidate_width(follows) == 128
-    # An explicit K equal to W is still accepted; it states today's behaviour.
-    same = GRConfig(beam_max_width=128, constraint_table=replace(table, candidate_width=128))
-    assert resolve_candidate_width(same) == 128
-
-    # The derivation refuses a Beam wider than the candidate ceiling unless the
-    # config states K itself.  Build the object directly: construction rejects
-    # this width before the derivation is ever reached.
-    wide = SimpleNamespace(
-        beam_max_width=MAX_CANDIDATE_WIDTH * 2,
-        constraint_table=replace(table, enabled=False),
-    )
-    with pytest.raises(ValueError, match="exceeds the candidate width ceiling"):
-        resolve_candidate_width(wide)
-    wide.constraint_table = replace(table, enabled=False, candidate_width=MAX_CANDIDATE_WIDTH)
-    assert resolve_candidate_width(wide) == MAX_CANDIDATE_WIDTH
+    """An omitted candidate width follows the configured beam width."""
+    config = GRConfig(beam_max_width=128, constraint=table_constraint())
+    assert resolve_candidate_width(config) == 128
+    assert resolve_candidate_width(replace(config, beam_candidate_width=128)) == 128
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
-    "constraint_table",
-    [
-        None,
-        ConstraintTableSpec(
-            max_top_k=MAX_CANDIDATE_WIDTH,
-            enabled=False,
-            path=str(Path("/tmp/catalog.json").resolve()),
-            artifact_digest="sha256:" + "0" * 64,
-            tokenizer_digest="sha256:" + "0" * 64,
-        ),
-    ],
-    ids=["no-table", "disabled-table"],
-)
-def test_unconstrained_candidate_width_follows_wide_beam(
-    constraint_table: ConstraintTableSpec | None,
-) -> None:
-    """Unconstrained K can follow W above 256 without an explicit override."""
+def test_unconstrained_candidate_width_follows_wide_beam() -> None:
     for width in (257, 512, MAX_BEAM_WIDTH):
-        accepted = GRConfig(beam_max_width=width, constraint_table=constraint_table)
-        assert resolve_candidate_width(accepted) == width
+        assert resolve_candidate_width(GRConfig(beam_max_width=width)) == width
 
 
 def test_wide_beam_is_servable_once_the_candidate_width_is_stated() -> None:
-    """Beam capacity and an explicit table candidate width resolve independently."""
-
-    table = ConstraintTableSpec(
-        max_top_k=MAX_CANDIDATE_WIDTH,
-        enabled=True,
-        path=str(Path("/tmp/catalog.json").resolve()),
-        artifact_digest="sha256:" + "0" * 64,
-        tokenizer_digest="sha256:" + "0" * 64,
-        candidate_width=MAX_CANDIDATE_WIDTH,
+    config = GRConfig(
+        beam_max_width=MAX_BEAM_WIDTH,
+        beam_candidate_width=256,
+        constraint=table_constraint(max_top_k=256),
     )
-    wide = GRConfig(beam_max_width=MAX_BEAM_WIDTH, constraint_table=table)
-    assert wide.beam_max_width == MAX_BEAM_WIDTH
-    assert resolve_candidate_width(wide) == MAX_CANDIDATE_WIDTH
+    assert resolve_candidate_width(config) == 256
 
 
 @pytest.mark.parametrize("candidate_width", [64, 256])  # type: ignore[misc]
-def test_explicit_candidate_width_may_differ_from_the_beam_width(
-    candidate_width: int,
-) -> None:
-    """The engine-wiring layer makes K live, so K != W is now accepted.
-
-    The workspace bucket, the constrained Top-K and the decision state are all
-    keyed by ``resolve_candidate_width``, so a configured K that differs from W
-    is carried through instead of being executed as W.
-    """
-    table = ConstraintTableSpec(
-        max_top_k=MAX_CANDIDATE_WIDTH,
-        enabled=True,
-        path=str(Path("/tmp/catalog.json").resolve()),
-        artifact_digest="sha256:" + "0" * 64,
-        tokenizer_digest="sha256:" + "0" * 64,
-    )
-    decoupled = GRConfig(
-        beam_max_width=128,
-        constraint_table=replace(table, candidate_width=candidate_width),
-    )
-    assert resolve_candidate_width(decoupled) == candidate_width
-    assert decoupled.beam_max_width == 128
-
-    # K == W still resolves, and unset K still follows the Beam width.
-    matching = GRConfig(
-        beam_max_width=candidate_width,
-        constraint_table=replace(table, candidate_width=candidate_width),
-    )
-    assert resolve_candidate_width(matching) == candidate_width
-    follows = GRConfig(beam_max_width=128, constraint_table=table)
-    assert resolve_candidate_width(follows) == 128
+def test_explicit_candidate_width_may_differ_from_the_beam_width(candidate_width: int) -> None:
+    config = GRConfig(beam_max_width=128, beam_candidate_width=candidate_width)
+    assert resolve_candidate_width(config) == candidate_width
 
 
 @pytest.mark.parametrize("widths", [tuple(range(1, 8)), (*range(1, 8), 128)])  # type: ignore[misc]
@@ -394,14 +307,7 @@ def test_beam_graph_capture_limit_preserves_default_and_disabled_graphs() -> Non
 
 
 def test_npu_beam_without_catalog_stays_unconstrained(tmp_path: Path) -> None:
-    """A catalog-free NPU GRLLM must not auto-promote to Constraint Tables.
-
-    Auto-promotion needs a constraint data source.  Without a catalog the
-    tokenizer auto-build sentinel path would fail fast on models whose
-    s_a/s_b/s_c groups exceed ``max_valid_items`` (e.g. OneRec 8192 > 500),
-    regressing catalog-free single-prompt beam search — so no catalog means
-    the deployment stays unconstrained (legacy Trie default, no catalog).
-    """
+    """A catalog-free NPU deployment uses full-vocabulary generation."""
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
     vllm_config = _vllm_config()
@@ -422,8 +328,8 @@ def test_npu_beam_without_catalog_stays_unconstrained(tmp_path: Path) -> None:
         )
 
     config = GRConfig.from_vllm_config(result)
-    assert config.constraint_backend != "constraint_table"
-    assert config.catalog_path is None
+    assert config.constraint_config.mode is ConstraintMode.NONE
+    assert config.constraint_config.table is None
 
 
 def test_cuda_beam_enables_worker_decision_by_default(tmp_path: Path) -> None:
@@ -446,12 +352,6 @@ def test_cuda_beam_enables_worker_decision_by_default(tmp_path: Path) -> None:
 
     config = GRConfig.from_vllm_config(result)
     assert config.beam_worker_decision is True
-    # The unified flag auto-enables for accelerator beam with worker
-    # decisions regardless of backend; actual chaining is lazy-gated by
-    # data availability (trie-catalog deployments never produce worker
-    # decisions, unconstrained deployments chain decode from step 1).
-    assert config.beam_engine_driven is None
-    assert config.constraint_backend == "trie"
 
 
 @pytest.mark.parametrize("platform", ["cpu", "cuda", "npu"])  # type: ignore[misc]
@@ -484,7 +384,6 @@ def test_engine_config_preserves_explicit_decision_controls(
         if expected_worker is None:
             expected_worker = True
     assert result.beam_worker_decision is expected_worker
-    assert result.beam_engine_driven is None
 
 
 pytestmark = pytest.mark.cpu_test

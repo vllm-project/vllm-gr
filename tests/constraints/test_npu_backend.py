@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from vllm_gr.config import ConstraintTableBackendEnum
+from vllm_gr.config import ConstraintBackendKind
 from vllm_gr.constraints.backend import (
     INVALID_LOGIT,
     ConstraintBackendInfo,
@@ -32,7 +32,7 @@ def _backend(op: Callable[..., tuple[torch.Tensor, torch.Tensor]]) -> NPUConstra
         **tensors,
         info=ConstraintBackendInfo(
             table_metadata=table.metadata,
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             max_top_k=4,
             max_rows=2,
             host_memory_bytes=0,

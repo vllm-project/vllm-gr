@@ -287,9 +287,9 @@ pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.l1  # type: ignore[misc]
-@pytest.mark.parametrize("with_layers", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("plan_version,with_layers", [(1, False), (2, False), (2, True)])  # type: ignore[misc]
 def test_installed_provider_plan_round_trip_and_factory_binding(
-    tmp_path: Path, with_layers: bool
+    tmp_path: Path, plan_version: int, with_layers: bool
 ) -> None:
     """An external planning extension adds options without a core serializer edit."""
     source = _PROVIDER_MODULE.replace(
@@ -325,10 +325,16 @@ class Attention:
         self.closed = True
 
 class PlannedProvider(HostOnlyProvider):
-    plan_api_version = 1
+    plan_api_version = PLAN_VERSION
     adapter_revision = "host-only-v1"
 
     def resolve(self, request):
+        fields = request.config.to_dict()
+        if self.plan_api_version == 1:
+            table = fields["constraint_table"]
+        else:
+            table = fields["constraint"]["table"]
+        assert table["backend"] == "cpu"
         tile = request.options.to_dict().get("tile", 16)
         if type(tile) is not int or tile not in (16, 32):
             raise ValueError("tile must be 16 or 32")
@@ -359,13 +365,33 @@ BACKEND = PlannedProvider()
         distribution="vllm-gr-host-planned",
         module="host_planned",
         backend_id="host_only",
-        source=source,
+        source=source.replace("PLAN_VERSION", str(plan_version)),
     )
+    if plan_version == 1:
+        result = _run(
+            """
+from vllm_gr.platforms import loader
+from vllm_gr.platforms.errors import InvalidBackendProviderError
+try:
+    loader.activate_current_backend()
+except InvalidBackendProviderError as exc:
+    assert "plan_api_version=1" in str(exc), exc
+    assert "supported=2" in str(exc), exc
+else:
+    raise AssertionError("plan API v1 provider was registered")
+""",
+            site_packages=site_packages,
+            project_root=Path(__file__).resolve().parents[2],
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
     code = """
 import json
 import sys
 from types import SimpleNamespace
-from vllm_gr.config import GRConfig
+from dataclasses import replace
+from tests.helpers.gr_config import table_constraint
+from vllm_gr.config import ConstraintBackendKind, GRConfig
 from vllm_gr.platforms import loader
 from vllm_gr.platforms.identity import PlatformIdentity
 from vllm_gr.platforms.plan import BackendPlan
@@ -377,7 +403,9 @@ provider = loader.activate_current_backend()
 engines = []
 for tile in (16, 32):
     config = SimpleNamespace(additional_config={"vllm_gr_backend_options": {"tile": tile}})
-    GRConfig(beam_max_width=tile).write_to_vllm_config(config)
+    constraint = table_constraint()
+    constraint = replace(constraint, table=replace(constraint.table, backend=ConstraintBackendKind.CPU))
+    GRConfig(beam_max_width=tile, constraint=constraint).write_to_vllm_config(config)
     plan = admit_backend_plan(config)
     assert plan == BackendPlan.from_wire(json.loads(json.dumps(plan.to_wire())))
     assert ["vllm-gr-host-planned", "1.0.0"] in plan.request.compatibility.to_dict()["provider_distributions"]
@@ -481,7 +509,7 @@ class Hooks:
         install_runner_lifecycle(HostRunner, __name__, prepare="prepare_inputs")
 
 class RunnerProvider(HostOnlyProvider):
-    plan_api_version = 1
+    plan_api_version = 2
     adapter_revision = "host-v1"
 
     def get_model_runner_hooks(self):

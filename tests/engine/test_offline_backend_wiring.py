@@ -80,12 +80,6 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
             self.model = model
             self._last_kwargs = kwargs
             additional_config: dict[str, Any] = {}
-            catalog_path = kwargs.get("catalog_path")
-            constraint_backend = kwargs.get("constraint_backend")
-            if catalog_path is not None:
-                additional_config["vllm_gr_catalog_path"] = catalog_path
-            if constraint_backend is not None:
-                additional_config["vllm_gr_constraint_backend"] = str(constraint_backend)
             self.llm_engine = SimpleNamespace(
                 # Post-wiring GRLLM calls model_config.get_vocab_size() for
                 # the Constraint Table install; model the method form.
@@ -336,7 +330,7 @@ class TestEngineArgsGrInitPatch:
             result = create_engine_config(engine_args)
         from vllm_gr.config import GRConfig
 
-        assert GRConfig.from_vllm_config(result).constraint_table is None
+        assert GRConfig.from_vllm_config(result).constraint_config.table is None
 
 
 class TestGrllmCanonicalConstruction:

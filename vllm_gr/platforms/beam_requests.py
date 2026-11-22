@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from vllm_gr.config import GRConfig
 from vllm_gr.config.models import (
+    ConstraintBackendKind,
     ConstraintMode,
-    ConstraintTableBackendEnum,
     configured_constraint_mode,
     runtime_constraint_table,
 )
@@ -78,7 +78,7 @@ def validate_frontend_constraint_mode(
         return
 
     table = runtime_constraint_table(gr_config)
-    backend = ConstraintTableBackendEnum.NPU if device == "npu" else ConstraintTableBackendEnum.CUDA
+    backend = ConstraintBackendKind.NPU if device == "npu" else ConstraintBackendKind.CUDA
     if table is None or not table.enabled or table.backend is not backend:
         raise ValueError(
             f"beam_search requires an enabled canonical {backend.value.upper()} constraint table"

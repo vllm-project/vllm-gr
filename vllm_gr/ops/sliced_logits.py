@@ -16,11 +16,6 @@ from vllm.logger import init_logger
 
 logger = init_logger("vllm.ops.sliced_logits")
 
-# Global configuration variables for static offset mode
-_VOCAB_OFFSET: Optional[int] = None
-_VOCAB_SLICE_SIZE: Optional[int] = None
-_QUANT_GROUP_SIZE: int = 128
-
 
 class SlicedLMHeadProxy(nn.Module):
     """Local unquantized projection over cached, contiguous sliced weights."""
@@ -42,26 +37,6 @@ class SlicedLMHeadProxy(nn.Module):
         replicated_mode = getattr(type(parallel_mode), "REPLICATED", None)
         if replicated_mode is not None:
             self.parallel_mode = replicated_mode
-
-
-def set_vocab_slice_config(
-    offset: Optional[int], slice_size: Optional[int], quant_group_size: int = 128
-) -> None:
-    """Configures global vocabulary slice settings."""
-    global _VOCAB_OFFSET, _VOCAB_SLICE_SIZE, _QUANT_GROUP_SIZE
-    _VOCAB_OFFSET = offset
-    _VOCAB_SLICE_SIZE = slice_size
-    _QUANT_GROUP_SIZE = quant_group_size
-
-
-def get_vocab_slice_config() -> Tuple[Optional[int], Optional[int], int]:
-    """Retrieves current global vocabulary slice settings."""
-    return _VOCAB_OFFSET, _VOCAB_SLICE_SIZE, _QUANT_GROUP_SIZE
-
-
-def is_vocab_slice_enabled() -> bool:
-    """Returns True if a valid vocabulary slice is configured."""
-    return _VOCAB_OFFSET is not None and _VOCAB_SLICE_SIZE is not None and _VOCAB_SLICE_SIZE > 0
 
 
 def get_rank_vocab_bounds(lm_head: Any) -> Tuple[int, int]:
@@ -174,8 +149,9 @@ def compute_sliced_logits(
     hidden_states: torch.Tensor,
     lm_head: Any,
     embedding_bias: Optional[torch.Tensor] = None,
-    offset: Optional[int] = None,
-    slice_size: Optional[int] = None,
+    *,
+    offset: int,
+    slice_size: int,
     quant_group_size: int = 128,
     logits_processor: Optional[Any] = None,
     orig_get_logits: Optional[Any] = None,
@@ -191,13 +167,6 @@ def compute_sliced_logits(
     skip_gather (or without a processor), the result is the rank-local overlap
     with the requested global window.
     """
-    cfg_offset, cfg_slice_size, _ = get_vocab_slice_config()
-    off = offset if offset is not None else cfg_offset
-    sz = slice_size if slice_size is not None else cfg_slice_size
-
-    if off is None or sz is None:
-        raise ValueError("Vocabulary slice offset and slice_size must be specified.")
-
     use_processor = logits_processor is not None and orig_get_logits is not None
     unquantized = is_supported_unquantized_lm_head(lm_head)
     needs_tp_gather = use_processor and not skip_gather and getattr(lm_head, "tp_size", 1) > 1
@@ -225,17 +194,17 @@ def compute_sliced_logits(
 
         if full_logits is not None and full_logits.numel() > 0:
             if use_processor and not skip_gather:
-                start, end = off, off + sz
+                start, end = offset, offset + slice_size
             else:
                 rank_start, rank_end = get_rank_vocab_bounds(lm_head)
-                start = max(off, rank_start) - rank_start
-                end = max(start, min(off + sz, rank_end) - rank_start)
+                start = max(offset, rank_start) - rank_start
+                end = max(start, min(offset + slice_size, rank_end) - rank_start)
             return full_logits[..., start:end].contiguous()
         return full_logits
 
     rank_start, rank_end = get_rank_vocab_bounds(lm_head)
-    global_start = off
-    global_end = off + sz
+    global_start = offset
+    global_end = offset + slice_size
 
     inter_start = max(global_start, rank_start)
     inter_end = min(global_end, rank_end)
@@ -248,7 +217,7 @@ def compute_sliced_logits(
         return torch.empty(empty_shape, dtype=dtype, device=hidden_states.device)
 
     proxy = _get_sliced_head(
-        lm_head, embedding_bias, (off, sz, rank_start, rank_end), quant_group_size
+        lm_head, embedding_bias, (offset, slice_size, rank_start, rank_end), quant_group_size
     )
     if logits_processor is not None and orig_get_logits is not None:
         # This projection is local even when the original head is TP-sharded.

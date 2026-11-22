@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableSpec
+from vllm_gr.config import ConstraintBackendKind, ConstraintTableSpec
 from vllm_gr.constraints import loader
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.backend import INVALID_LOGIT, ConstraintBackendInfo
@@ -34,7 +34,7 @@ npu_op_module = importlib.import_module("vllm_gr.ops.npu.rec_constrained_topk")
 def _config(path: Path, digest: str, **overrides: object) -> ConstraintTableSpec:
     values: dict[str, object] = {
         "enabled": True,
-        "backend": ConstraintTableBackendEnum.CPU,
+        "backend": ConstraintBackendKind.CPU,
         "path": str(path),
         "max_top_k": 4,
         "artifact_digest": digest,
@@ -74,17 +74,15 @@ def test_cpu_loader_constructs_info_from_canonical_artifact(tmp_path: Path) -> N
         max_rows=7,
     )
     assert backend is not None
-    assert backend.info.backend is ConstraintTableBackendEnum.CPU
+    assert backend.info.backend is ConstraintBackendKind.CPU
     assert backend.info.host_memory_bytes == make_table().total_bytes
     assert backend.info.device_memory_bytes == 0
     assert backend.info.max_rows == 7
 
 
-@pytest.mark.parametrize(
-    "backend", [ConstraintTableBackendEnum.CUDA, ConstraintTableBackendEnum.NPU]
-)
+@pytest.mark.parametrize("backend", [ConstraintBackendKind.CUDA, ConstraintBackendKind.NPU])
 def test_npu_top_k_limit_fails_before_artifact_io(
-    monkeypatch: pytest.MonkeyPatch, backend: ConstraintTableBackendEnum
+    monkeypatch: pytest.MonkeyPatch, backend: ConstraintBackendKind
 ) -> None:
     config = ConstraintTableSpec(
         enabled=True,
@@ -270,7 +268,7 @@ def _readiness_backend(
         **tensors,
         info=ConstraintBackendInfo(
             table_metadata=table.metadata,
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             max_top_k=top_k,
             max_rows=2,
             host_memory_bytes=0,
@@ -440,7 +438,7 @@ def test_readiness_failure_closes_backend_and_preserves_exception(
         **tensors,
         info=ConstraintBackendInfo(
             table_metadata=table.metadata,
-            backend=ConstraintTableBackendEnum.NPU,
+            backend=ConstraintBackendKind.NPU,
             max_top_k=2,
             max_rows=2,
             host_memory_bytes=0,

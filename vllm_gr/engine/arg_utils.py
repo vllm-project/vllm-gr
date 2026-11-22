@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
 import argparse
 import inspect
 import json
@@ -19,8 +20,11 @@ from vllm_gr.config import (
     gr_config_to_mapping,
     write_canonical_gr_config,
 )
-from vllm_gr.config.models import resolve_constraint_backend
+from vllm_gr.config.models import (
+    resolve_constraint_backend,
+)
 from vllm_gr.config.parser import (
+    GR_CONFIG_KEY,
     load_engine_gr_config,
     merge_gr_settings,
     read_settings,
@@ -37,6 +41,13 @@ logger = logging.getLogger(__name__)
 _ORIGIN_ENGINE_ARG_POSITIONAL_NAMES: Final = tuple(
     list(inspect.signature(origin_engine_args_init).parameters)[1:]
 )
+
+
+def _has_gr_additional_config(additional: object) -> bool:
+    return isinstance(additional, Mapping) and any(
+        key == GR_CONFIG_KEY or isinstance(key, str) and key.startswith("vllm_gr_")
+        for key in additional
+    )
 
 
 def _gr_engine_args_init(original):
@@ -57,11 +68,7 @@ def _gr_engine_args_init(original):
             or config is not None
             or _gr_startup_document is not None
             or gr is not None
-            or isinstance(additional, Mapping)
-            and any(
-                key == "vllm_gr" or isinstance(key, str) and key.startswith("vllm_gr_")
-                for key in additional
-            )
+            or _has_gr_additional_config(additional)
         )
         if not selected:
             original(self, *args, **kwargs)
@@ -151,14 +158,9 @@ def create_engine_config(self, usage_context=None, headless=False):
         requested_backend = getattr(getattr(self, "attention_config", None), "backend", None)
     requested_backend_name = getattr(requested_backend, "name", requested_backend)
     config = origin_create_engine_config(self, usage_context, headless)
-    additional_input = getattr(config, "additional_config", None)
-    has_gr_additional = isinstance(additional_input, Mapping) and any(
-        key == "vllm_gr" or isinstance(key, str) and key.startswith("vllm_gr_")
-        for key in additional_input
-    )
     if (
         not getattr(self, "_gr_selected", False)
-        and not has_gr_additional
+        and not _has_gr_additional_config(getattr(config, "additional_config", None))
         and not any(
             getattr(self, name, None) is not None
             for name in ("config", "gr", "_gr_startup_document")
@@ -180,7 +182,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         return config
     effective_gr_config = load_engine_gr_config(
         path,
-        getattr(config, "additional_config", None),
+        additional,
         overrides,
         startup_document=getattr(self, "_gr_startup_document", None),
         worker_decision_default=_beam_worker_decision_default(
@@ -213,11 +215,6 @@ def create_engine_config(self, usage_context=None, headless=False):
     effective_gr_config = _resolve_constraint_backend(effective_gr_config)
 
     service.validate_engine(config, effective_gr_config)
-
-    if effective_gr_config.constrained_generation is False:
-        from vllm_gr.ops.sliced_logits import set_vocab_slice_config
-
-        set_vocab_slice_config(None, None)
 
     # vLLM also allows opaque, hashable objects for other plugins. They
     # cannot carry GR state, but a plain engine needs no transport override.

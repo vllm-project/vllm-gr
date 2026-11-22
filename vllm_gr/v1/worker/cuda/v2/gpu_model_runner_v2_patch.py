@@ -73,9 +73,9 @@ _WORKER_V2_PROFILE_PATCH_MARKER = "_vllm_gr_beam_profile_v2_patch"
 
 
 def _warmup_constraint_backend(runner: Any, backend: Any) -> None:
-    from vllm_gr.config import ConstraintTableBackendEnum
+    from vllm_gr.config import ConstraintBackendKind
 
-    if backend.info.backend is ConstraintTableBackendEnum.CUDA:
+    if backend.info.backend is ConstraintBackendKind.CUDA:
         backend.warmup_stage_topk(runner.model_config.dtype)
         head_dtype = getattr(runner.model_config, "head_dtype", None)
         if head_dtype is not None and head_dtype != runner.model_config.dtype:

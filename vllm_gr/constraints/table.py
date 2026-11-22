@@ -31,6 +31,15 @@ _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 IntArray: TypeAlias = NDArray[np.signedinteger[Any]]
 
 
+def token_id_window(first: IntArray, second: IntArray, third: IntArray) -> tuple[int, int]:
+    """Smallest contiguous vocabulary window covering all allowed token IDs."""
+    arrays = [ids for ids in (first, second, third) if ids.size]
+    if not arrays:
+        return 0, 0
+    start = min(int(ids.min()) for ids in arrays)
+    return start, max(int(ids.max()) for ids in arrays) + 1 - start
+
+
 @dataclass(frozen=True, slots=True)
 class ConstraintTableMetadata:
     """Small metadata values required to validate and identify a table."""

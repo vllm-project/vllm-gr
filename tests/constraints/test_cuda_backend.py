@@ -11,8 +11,13 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from tests.helpers.gr_config import make_gr_config
-from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableSpec
+from vllm_gr.config import (
+    ConstraintBackendKind,
+    ConstraintConfig,
+    ConstraintMode,
+    ConstraintTableSpec,
+    GRConfig,
+)
 from vllm_gr.constraints import loader
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.backend import ConstraintMetadata
@@ -30,7 +35,7 @@ def test_cuda_loader_readiness_select_and_close(tmp_path: Path) -> None:
     backend = load_constraint_backend(
         ConstraintTableSpec(
             enabled=True,
-            backend=ConstraintTableBackendEnum.CUDA,
+            backend=ConstraintBackendKind.CUDA,
             path=str(path),
             artifact_digest=digest,
             tokenizer_digest="sha256:" + "b" * 64,
@@ -42,7 +47,7 @@ def test_cuda_loader_readiness_select_and_close(tmp_path: Path) -> None:
         max_rows=2,
     )
     assert backend is not None
-    assert backend.info.backend is ConstraintTableBackendEnum.CUDA
+    assert backend.info.backend is ConstraintBackendKind.CUDA
     assert backend.info.host_memory_bytes == 0
     assert backend.info.device_memory_bytes == make_table().total_bytes
     output = backend.select(
@@ -122,7 +127,7 @@ def test_cuda_readiness_failure_closes_unpublished_backend(
         load_constraint_backend(
             ConstraintTableSpec(
                 enabled=True,
-                backend=ConstraintTableBackendEnum.CUDA,
+                backend=ConstraintBackendKind.CUDA,
                 path=str(path),
                 artifact_digest=digest,
                 tokenizer_digest="sha256:" + "b" * 64,
@@ -145,7 +150,7 @@ def test_cuda_loader_rejects_fp32_logits_before_upload(tmp_path: Path) -> None:
         load_constraint_backend(
             ConstraintTableSpec(
                 enabled=True,
-                backend=ConstraintTableBackendEnum.CUDA,
+                backend=ConstraintBackendKind.CUDA,
                 path=str(path),
                 artifact_digest=digest,
                 tokenizer_digest="sha256:" + "b" * 64,
@@ -184,10 +189,6 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     from vllm_gr.config.parser import gr_config_to_mapping
     from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler
     from vllm_gr.constraints.json_compiler import compile_relations_json
-    from vllm_gr.ops.sliced_logits import (
-        get_vocab_slice_config,
-        is_vocab_slice_enabled,
-    )
     from vllm_gr.v1.worker.model_runner_patch import (
         make_load_model_with_constraint_backend,
         make_shutdown_with_constraint_backend,
@@ -211,16 +212,19 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     slice_size = 25 if multi_trie else 9
     path = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(table, path)
-    config = make_gr_config(
+    config = GRConfig(
         beam_max_width=2,
-        constraint_table=ConstraintTableSpec(
-            enabled=True,
-            backend=ConstraintTableBackendEnum.CUDA,
-            path=str(path),
-            artifact_digest=digest,
-            tokenizer_digest=table.metadata.tokenizer_digest,
-            format=table.metadata.format,
-            max_top_k=2,
+        constraint=ConstraintConfig(
+            ConstraintMode.TABLE,
+            ConstraintTableSpec(
+                enabled=True,
+                backend=ConstraintBackendKind.CUDA,
+                path=str(path),
+                artifact_digest=digest,
+                tokenizer_digest=table.metadata.tokenizer_digest,
+                format=table.metadata.format,
+                max_top_k=2,
+            ),
         ),
     )
     runner = SimpleNamespace(
@@ -237,7 +241,6 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     apply_sliced_logits_patch()
 
     def load_weights(self: SimpleNamespace) -> None:
-        assert not is_vocab_slice_enabled()
         self.model_memory_usage = 0
         # The native model loader supplies the current config during construction.
         with set_current_vllm_config(VllmConfig()):
@@ -249,7 +252,6 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     try:
         load(runner)
         assert runner.model[0]._gr_vocab_slice == (offset, slice_size)
-        assert get_vocab_slice_config()[:2] == (None, None)
         # Exercise the existing projection with the worker-derived configuration.
         torch.manual_seed(0)
         head = torch.nn.Linear(64, 256, bias=False, device="cuda", dtype=torch.float16)
@@ -317,10 +319,8 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
         # A reload must clear the old slice before constructing the next model.
         load(runner)
         assert runner.model[0]._gr_vocab_slice == (offset, slice_size)
-        assert get_vocab_slice_config()[:2] == (None, None)
     finally:
         shutdown(runner)
-    assert not is_vocab_slice_enabled()
 
 
 def test_cuda_backend_scores_over_full_window_not_candidate_set(
@@ -339,7 +339,7 @@ def test_cuda_backend_scores_over_full_window_not_candidate_set(
     backend = load_constraint_backend(
         ConstraintTableSpec(
             enabled=True,
-            backend=ConstraintTableBackendEnum.CUDA,
+            backend=ConstraintBackendKind.CUDA,
             path=str(path),
             artifact_digest=digest,
             tokenizer_digest="sha256:" + "b" * 64,
@@ -393,3 +393,30 @@ def test_cuda_backend_scores_over_full_window_not_candidate_set(
         torch.ones(1, dtype=torch.float32, device="cuda"),
     )
     torch.testing.assert_close(output.logprobs, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.l2  # type: ignore[misc]
+def test_cuda_execution_uses_loaded_table_token_window() -> None:
+    from unittest.mock import MagicMock
+
+    from vllm_gr.constraints.compiler import ConstraintTableCompiler
+    from vllm_gr.constraints.execution import CUDAConstrainedTopKExecution
+    from vllm_gr.constraints.json_compiler import compile_relations_json
+
+    tokenizer = MagicMock()
+    tokenizer.get_vocab.return_value = {str(i): i for i in range(32)}
+    tokenizer.convert_tokens_to_ids.side_effect = lambda values: [int(v) for v in values]
+    compiler = ConstraintTableCompiler(tokenizer, 32)
+    execution = CUDAConstrainedTopKExecution("cuda")
+    logits = torch.zeros((1, 32), dtype=torch.float16, device="cuda")
+    group = torch.zeros((1, 1, 1), dtype=torch.int32, device="cuda")
+    temperatures = torch.ones(1, device="cuda")
+    for start in (3, 19):
+        document = compile_relations_json([[str(start + step) for step in range(3)]])
+        execution.load_tables(compiler.compile(document))
+        for scores in (logits, logits[:, start : start + 3]):
+            result = execution.run(scores, group, temperatures, current_step=0, top_k=1)
+            assert result.top_tokens.item() == start and result.valid_mask.item()
+        with pytest.raises(ValueError, match="token window"):
+            execution.run(logits[:, :2], group, temperatures, current_step=0, top_k=1)
+        execution.reset()

@@ -10,8 +10,8 @@ from typing import Any, cast
 import pytest
 
 from vllm_gr.config import (
+    ConstraintBackendKind,
     ConstraintMode,
-    ConstraintTableBackendEnum,
     gr_config_from_mapping,
     gr_config_to_mapping,
     resolve_candidate_width,
@@ -43,24 +43,17 @@ def _v2_table(*, digests: bool = True, max_top_k: int | None = 128) -> dict[str,
     }
 
 
-def test_v2_table_parses_and_derives_legacy_view() -> None:
+def test_table_mode_preserves_auto_placement_and_candidate_width() -> None:
     config = gr_config_from_mapping(_v2_table())
 
     assert config.constraint is not None
     assert config.constraint.mode is ConstraintMode.TABLE
-    assert config.constraint_config.mode is ConstraintMode.TABLE
-    assert config.constraint_table is not None
-    assert config.constraint_table.enabled is True
-    # "auto" is resolved later against the active platform; the derived legacy
-    # view keeps the historical CUDA default until then.
-    assert config.constraint_table.backend is ConstraintTableBackendEnum.CUDA
-    assert config.constraint_backend == "constraint_table"
-    assert config.constrained_generation is None
+    assert config.constraint.table is not None and config.constraint.table.enabled
+    assert config.constraint.table.backend is ConstraintBackendKind.AUTO
     assert config.beam_candidate_width == 64
-    assert config.constraint_table.candidate_width == 64
 
 
-def test_v2_none_derives_unconstrained_view() -> None:
+def test_none_mode_has_no_table() -> None:
     config = gr_config_from_mapping(
         {
             "gr": {
@@ -73,10 +66,8 @@ def test_v2_none_derives_unconstrained_view() -> None:
     )
 
     assert config.constraint is not None
-    assert config.constraint_config.mode is ConstraintMode.NONE
-    assert config.constraint_backend == "trie"
-    assert config.constrained_generation is False
-    assert config.constraint_table is None
+    assert config.constraint.mode is ConstraintMode.NONE
+    assert config.constraint.table is None
 
 
 def test_v2_round_trip() -> None:
@@ -292,22 +283,6 @@ def test_auto_backend_remains_unbound_until_driver_selects_device(device: str) -
         gr_config_to_mapping(resolve_constraint_backend(config, device))
     )
     assert worker.constraint.table.enabled and worker.constraint.table.backend.value == device
-    assert worker.constraint_table.backend.value == device
-
-
-def test_failed_write_preserves_transport_and_cached_config() -> None:
-    from types import SimpleNamespace
-
-    from vllm_gr.config import GRConfig, write_canonical_gr_config
-
-    config = GRConfig(vocab_offset=7)
-    previous = GRConfig()
-    original = {"vllm_gr_beam_max_width": 8, "another_plugin": 1}
-    host = SimpleNamespace(additional_config=original.copy(), _vllm_gr_parsed_config=previous)
-    with pytest.raises(ValueError, match="vocab_offset"):
-        write_canonical_gr_config(host, config)
-    assert host.additional_config == original
-    assert host._vllm_gr_parsed_config is previous
 
 
 def test_v1_candidate_width_cannot_be_silently_ignored() -> None:

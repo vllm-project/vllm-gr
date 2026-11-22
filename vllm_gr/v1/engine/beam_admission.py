@@ -10,7 +10,6 @@ from typing import Any
 from vllm_gr.config import GRConfig
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_MAX_DECODE_STEPS,
-    configured_candidate_width,
     runtime_constraint_table,
 )
 from vllm_gr.platforms.beam_requests import (
@@ -44,13 +43,13 @@ def _reject_candidate_width_below_dynamic_schedule(
     widths = params.dynamic_beam_widths
     if widths is None:
         return
-    configured = configured_candidate_width(gr_config)
+    configured = gr_config.beam_candidate_width
     if configured is None:
         return
     for index, width in enumerate(widths):
         if width > configured:
             raise ValueError(
-                f"vllm-gr constraint_table.candidate_width={configured} is below "
+                f"vllm-gr gr.candidate_width={configured} is below "
                 f"dynamic_beam_widths[{index}]={width}: each parent must supply at "
                 "least as many candidates as the stage retains"
             )

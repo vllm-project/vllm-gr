@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from vllm_gr.config import ConstraintTableBackendEnum
+from vllm_gr.config import ConstraintBackendKind
 from vllm_gr.constraints.backend import (
     INVALID_LOGIT,
     ConstraintBackendInfo,
@@ -23,7 +23,7 @@ from vllm_gr.constraints.backend import (
 def _info(**overrides: object) -> ConstraintBackendInfo:
     values: dict[str, object] = {
         "table_metadata": make_table().metadata,
-        "backend": ConstraintTableBackendEnum.CPU,
+        "backend": ConstraintBackendKind.CPU,
         "max_top_k": 4,
         "max_rows": 2,
         "host_memory_bytes": make_table().total_bytes,

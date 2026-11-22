@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-"""Test-only schema-v2 config factory.
-
-Keeps legacy fixtures readable while production migrates to
-``GRConfig(constraint=ConstraintConfig(...))``.
-"""
+"""Fixtures for GR deployment settings and constraint artifacts."""
 
 from __future__ import annotations
 
@@ -13,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 from vllm_gr.config import (
     ConstraintBackendKind,
@@ -24,86 +20,18 @@ from vllm_gr.config import (
 )
 from vllm_gr.config.models import DeploymentOptions
 
-_DEFAULT_PATH = "/tmp/constraint_table.safetensors"
-_DEFAULT_ARTIFACT_DIGEST = "sha256:" + "a" * 64
-_DEFAULT_TOKENIZER_DIGEST = "sha256:" + "b" * 64
 
-
-def _table_constraint(table: object | None, catalog_path: str | None) -> ConstraintConfig:
-    path = getattr(table, "path", None) if table is not None else None
-    path = path or catalog_path or _DEFAULT_PATH
-    if not Path(path).is_absolute():
-        # Legacy catalog_path was a marker, not an artifact path.
-        path = _DEFAULT_PATH
-    backend = getattr(table, "backend", None) if table is not None else None
-    backend_kind = (
-        ConstraintBackendKind(backend.value) if backend is not None else ConstraintBackendKind.CUDA
-    )
+def table_constraint(*, max_top_k: int = 128) -> ConstraintConfig:
     return ConstraintConfig(
         mode=ConstraintMode.TABLE,
         table=ConstraintTableSpec(
-            path=path,
-            backend=backend_kind,
-            max_top_k=(
-                getattr(table, "max_top_k", None)
-                if table is not None and getattr(table, "max_top_k", None) is not None
-                else 128
-            ),
-            format=(
-                getattr(table, "format", "constraint_table_v1")
-                if table is not None
-                else "constraint_table_v1"
-            ),
-            artifact_digest=(
-                getattr(table, "artifact_digest", None) or _DEFAULT_ARTIFACT_DIGEST
-                if table is not None
-                else _DEFAULT_ARTIFACT_DIGEST
-            ),
-            tokenizer_digest=(
-                getattr(table, "tokenizer_digest", None) or _DEFAULT_TOKENIZER_DIGEST
-                if table is not None
-                else _DEFAULT_TOKENIZER_DIGEST
-            ),
+            backend=ConstraintBackendKind.CUDA,
+            path="/tmp/constraint_table.safetensors",
+            max_top_k=max_top_k,
+            artifact_digest="sha256:" + "a" * 64,
+            tokenizer_digest="sha256:" + "b" * 64,
         ),
     )
-
-
-def make_gr_config(**kwargs: object) -> GRConfig:
-    """Build a GRConfig from legacy keyword arguments used by old tests."""
-
-    constraint = kwargs.pop("constraint", None)
-    table = kwargs.pop("constraint_table", None)
-    backend = kwargs.pop("constraint_backend", None)
-    constrained = kwargs.pop("constrained_generation", None)
-    catalog_path = cast(str | None, kwargs.pop("catalog_path", None))
-
-    has_legacy_constraint = (
-        table is not None
-        or backend is not None
-        or constrained is not None
-        or catalog_path is not None
-    )
-    if constraint is None:
-        if not has_legacy_constraint:
-            return GRConfig(**kwargs)
-        if table is None and backend is None and catalog_path is None:
-            # No table/backend: constrained_generation alone is schema-v1 state.
-            return GRConfig(constrained_generation=constrained, **kwargs)
-        if constrained is False:
-            constraint = ConstraintConfig(mode=ConstraintMode.NONE)
-        elif table is not None and not getattr(table, "enabled", False) and backend is None:
-            # A disabled table is still a valid sizing holder in schema-v1.
-            return GRConfig(constraint_table=table, **kwargs)
-        elif table is not None or backend == "constraint_table":
-            constraint = _table_constraint(table, catalog_path)
-        else:
-            constraint = ConstraintConfig(mode=ConstraintMode.NONE)
-
-    if "beam_candidate_width" not in kwargs and table is not None:
-        candidate_width = getattr(table, "candidate_width", None)
-        if candidate_width is not None:
-            kwargs["beam_candidate_width"] = candidate_width
-    return GRConfig(constraint=constraint, **kwargs)
 
 
 def engine_args_from_file(tmp_path: Path, mapping: Mapping[str, object]) -> SimpleNamespace:

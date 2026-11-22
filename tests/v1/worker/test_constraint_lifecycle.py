@@ -374,8 +374,7 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-    from vllm_gr.config import ConstraintTableBackendEnum
-    from vllm_gr.ops.sliced_logits import get_vocab_slice_config, set_vocab_slice_config
+    from vllm_gr.config import ConstraintBackendKind
     from vllm_gr.v1.worker.sliced_logits_patch import apply_sliced_logits_patch
 
     apply_sliced_logits_patch()
@@ -383,7 +382,7 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
     runner.vllm_config.additional_config["vllm_gr"]["gr"]["constraint_table"]["backend"] = "cuda"
     runner.vllm_config.parallel_config = SimpleNamespace(tensor_parallel_size=2)
     backend = _Backend()
-    backend.info.backend = ConstraintTableBackendEnum.CUDA
+    backend.info.backend = ConstraintBackendKind.CUDA
     backend.vocab_slice = (3, 5)
     monkeypatch.setattr(
         "vllm_gr.constraints.loader.load_constraint_backend", lambda **kwargs: backend
@@ -408,8 +407,6 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
         )
     )
     hidden = torch.randn(2, 8)
-    old = get_vocab_slice_config()
-    set_vocab_slice_config(99, 5)
     try:
         assert make_load_model_with_constraint_backend(weights)(runner) == "loaded"
         assert runner.constraint_backend.get() is backend
@@ -419,10 +416,8 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
         torch.testing.assert_close(actual, head(hidden))
         assert len(gathered) == 1 and gathered[0].shape == (2, 256)
         assert not hasattr(head, "_sliced_weight")
-        assert get_vocab_slice_config()[:2] == (99, 5)
     finally:
         make_shutdown_with_constraint_backend()(runner)
-        set_vocab_slice_config(*old)
 
 
 def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -434,16 +429,15 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-    from vllm_gr.config import ConstraintTableBackendEnum
+    from vllm_gr.config import ConstraintBackendKind
     from vllm_gr.constraints import loader
-    from vllm_gr.ops.sliced_logits import get_vocab_slice_config, set_vocab_slice_config
     from vllm_gr.v1.worker.sliced_logits_patch import apply_sliced_logits_patch
 
     apply_sliced_logits_patch()
     backends = []
     for window in ((3, 5), (40, 5), (0, 32000)):
         backend = _Backend()
-        backend.info.backend = ConstraintTableBackendEnum.CUDA
+        backend.info.backend = ConstraintBackendKind.CUDA
         backend.vocab_slice = window
         backends.append(backend)
     queue = iter(backends)
@@ -458,8 +452,6 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
     load = make_load_model_with_constraint_backend(weights)
     close = make_shutdown_with_constraint_backend()
     a, b, full = _runner(), _runner(), _runner()
-    old = get_vocab_slice_config()
-    set_vocab_slice_config(99, 5)
     try:
         load(a)
         load(b)
@@ -485,14 +477,12 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
         torch.testing.assert_close(a.model[0]._get_logits(hidden, head, None), expected[:, 3:8])
         torch.testing.assert_close(full.model[0]._get_logits(hidden, head, None), expected)
         assert full.model[0]._gr_vocab_slice is None
-        assert get_vocab_slice_config()[:2] == (99, 5)
         close(a)
         assert backends[0].close_calls == backends[1].close_calls == 1
     finally:
         close(a)
         close(b)
         close(full)
-        set_vocab_slice_config(*old)
 
 
 def test_dispatcher_import_without_cuda_or_triton() -> None:

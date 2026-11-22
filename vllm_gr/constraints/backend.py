@@ -10,7 +10,7 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
-from vllm_gr.config.models import ConstraintTableBackendEnum
+from vllm_gr.config.models import ConstraintBackendKind
 from vllm_gr.constraints.scoring import INVALID_LOGIT
 from vllm_gr.constraints.table import ConstraintTableMetadata
 
@@ -22,7 +22,7 @@ class ConstraintBackendInfo:
     """Immutable construction and ownership diagnostics for one Backend."""
 
     table_metadata: ConstraintTableMetadata
-    backend: ConstraintTableBackendEnum
+    backend: ConstraintBackendKind
     max_top_k: int
     max_rows: int
     host_memory_bytes: int

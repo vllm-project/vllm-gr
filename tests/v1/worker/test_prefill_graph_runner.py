@@ -577,10 +577,10 @@ def test_custom_b4_bucket_limit_uses_total_tokens(monkeypatch: pytest.MonkeyPatc
     runner = MockModelRunner()
     from dataclasses import replace
 
-    from tests.helpers.gr_config import make_gr_config
+    from vllm_gr.config import GRConfig
     from vllm_gr.config.models import DeploymentOptions
 
-    config = make_gr_config(beam_max_width=4)
+    config = GRConfig(beam_max_width=4)
     config.write_to_vllm_config(runner.vllm_config)
     setattr(runner, "scheduler_config", SimpleNamespace(max_num_batched_tokens=24))
     setattr(runner, "model_config", SimpleNamespace(max_model_len=8))

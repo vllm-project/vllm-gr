@@ -14,7 +14,6 @@ from vllm_gr.ops.sliced_logits import (
     SlicedLMHeadProxy,
     compute_sliced_logits,
     get_rank_vocab_bounds,
-    set_vocab_slice_config,
 )
 from vllm_gr.utils.npu_adapter import is_cuda_available
 
@@ -289,7 +288,7 @@ def _native_processor(vocab_size: int, head_dtype: torch.dtype | None = None) ->
 )
 @pytest.mark.parametrize("head_dtype", [None, torch.float32])  # type: ignore[misc]
 @pytest.mark.parametrize("skip_gather", [False, True])  # type: ignore[misc]
-@pytest.mark.parametrize("slice_mode", ["disabled", "global", "window", "override_none"])  # type: ignore[misc]
+@pytest.mark.parametrize("slice_mode", ["disabled", "window"])  # type: ignore[misc]
 def test_native_logits_forward(
     device: str,
     dtype: torch.dtype,
@@ -314,16 +313,9 @@ def test_native_logits_forward(
     processor = _native_processor(350, head_dtype)
     processor.scale = 0.7
     processor.soft_cap = 1.5
-    window = None
-    if slice_mode != "disabled":
-        set_vocab_slice_config(129, 157)
-        window = (129, 157)
-    if slice_mode == "window":
-        window = (269, 57)
+    window = (269, 57) if slice_mode == "window" else None
+    if window is not None:
         processor._gr_vocab_slice = window
-    elif slice_mode == "override_none":
-        processor._gr_vocab_slice = None
-        window = None
 
     output = processor(head, hidden, head.bias, skip_gather)
     expected_dtype = head_dtype or dtype

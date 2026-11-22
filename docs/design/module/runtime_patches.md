@@ -143,8 +143,9 @@ can invalidate the selection.
 
 Scope: `core`; backend ID: `null`
 
-Sliced vocabulary projection computes logits over a configured token range and
-adapts log-probability collection. Head-derived caches must stay valid across
+The worker binds the loaded table's token window to each model's logits processor.
+Processors without a window use native full-vocabulary projection. Sliced
+projection also adapts log-probability collection. Head-derived caches must stay valid across
 native weight reload.
 
 ## GR-PATCH-016 — NPU-aware Spawn Start Method

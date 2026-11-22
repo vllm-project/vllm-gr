@@ -12,7 +12,7 @@ import torch
 
 from vllm_gr.config.models import (
     MULTI_TRIE_CONSTRAINT_TABLE_FORMAT,
-    ConstraintTableBackendEnum,
+    ConstraintBackendKind,
     ConstraintTableSpec,
 )
 from vllm_gr.constraints.artifact import (
@@ -151,7 +151,7 @@ def test_checked_backends_share_root_defaults_and_range_errors(count: int, mode:
         backend = CPUConstraintBackend(
             table,
             ConstraintBackendInfo(
-                table.metadata, ConstraintTableBackendEnum.CPU, 2, 1, table.total_bytes, 0
+                table.metadata, ConstraintBackendKind.CPU, 2, 1, table.total_bytes, 0
             ),
         )
     else:

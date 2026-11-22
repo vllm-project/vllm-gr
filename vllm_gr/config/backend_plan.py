@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 PLAN_SCHEMA_VERSION = 1
-PLAN_API_VERSION = 1
+PLAN_API_VERSION = 2
 BACKEND_PLAN_KEY = "vllm_gr_backend_plan"
 
 
@@ -61,6 +61,11 @@ class BackendRequest:
         for value in (self.config, self.native, self.compatibility, self.options):
             if not isinstance(value, PlanData):
                 raise TypeError("BackendRequest fields must be immutable PlanData")
+
+    @property
+    def has_constraint_table(self) -> bool:
+        constraint = self.config.to_dict().get("constraint")
+        return bool(constraint and constraint["mode"] == "table")
 
     @property
     def uses_custom_attention(self) -> bool:
@@ -188,8 +193,7 @@ class BackendPlan:
             return self.choices.to_dict().get("constraint")
         if self.requirements.constraint is None:
             return None
-        table = self.request.config.to_dict().get("constraint_table") or {}
-        return "canonical" if table.get("enabled") else "legacy"
+        return "canonical" if self.request.has_constraint_table else "legacy"
 
     @property
     def fingerprint(self) -> str:

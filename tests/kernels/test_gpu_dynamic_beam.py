@@ -17,6 +17,7 @@ from tests.kernels.beam_stage_test_utils import (
     install_decode_model,
     metadata,
 )
+from vllm_gr.config import ConstraintConfig
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.beam.dispatch import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
@@ -79,7 +80,7 @@ def test_dynamic_stage_execution_and_reuse(
     worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     if not constrained:
         worker.constraint_backend = None
-        worker._vllm_gr_config.constrained_generation = False
+        worker._vllm_gr_config.constraint = ConstraintConfig()
     worker.model_config.enforce_eager = not graph
     worker.model_config.max_model_len = 64
     worker._vllm_gr_config.beam_graph_enabled = graph

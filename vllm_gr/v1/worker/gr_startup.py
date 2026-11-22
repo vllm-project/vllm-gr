@@ -131,7 +131,7 @@ def _capture_enabled(worker: Any) -> bool:
     if not cfg.beam_worker_decision or cfg.beam_max_width is None or mode is None:
         raise ValueError(
             "Beam V1 requires worker decisions, fixed width and either an enabled "
-            "canonical table or constrained_generation=False"
+            "canonical table or gr.constraint_mode=none"
         )
     if mode is ConstraintMode.NONE and str(worker.device).split(":")[0] not in ("cuda", "npu"):
         raise ValueError("unconstrained Beam V1 requires CUDA or NPU")

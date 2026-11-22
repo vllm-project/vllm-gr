@@ -4,19 +4,24 @@
 
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from tests.helpers.gr_config import table_constraint
 from vllm_gr.config import (
+    ConstraintConfig,
     GRConfig,
     gr_config_from_mapping,
     gr_config_to_mapping,
     load_gr_config,
 )
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.config.parser import (
+    CAPACITY_FIELDS,
     COMMON_ENGINE_CONFIG,
     CONFIG_ATTRIBUTES,
     OPTION_KEYS,
@@ -63,7 +68,8 @@ def test_decode_gate_configuration_reaches_public_loader(
 
 def test_default_document_declares_every_public_option() -> None:
     settings = read_settings(COMMON_ENGINE_CONFIG)["gr"]
-    assert set(settings) == set(CONFIG_ATTRIBUTES) | OPTION_KEYS | {
+    # The packaged schedules determine both capacities.
+    assert set(settings) == (set(CONFIG_ATTRIBUTES) - set(CAPACITY_FIELDS)) | OPTION_KEYS | {
         "constraint_mode",
         "constraint_table",
     }
@@ -106,9 +112,9 @@ def test_performance_gate_emits_server_config(
     config_path = tmp_path / "gr-config.yaml"
     config = load_gr_config(config_path)
     assert config.attention_backend is not None and config.attention_backend.value == "CUSTOM"
-    assert config.constraint_table is not None
-    assert config.constraint_table.artifact_digest == digests[0]
-    assert config.constraint_table.tokenizer_digest == digests[1]
+    assert config.constraint_config.table is not None
+    assert config.constraint_config.table.artifact_digest == digests[0]
+    assert config.constraint_config.table.tokenizer_digest == digests[1]
     assert config.deployment.prefill_token_buckets == (1024, 2048, 4096)
     assert (
         read_settings(config_path)["gr"] == json.loads((tmp_path / "setup.json").read_text())["gr"]
@@ -123,6 +129,148 @@ def test_public_snapshot_round_trip_without_file_io(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(Path, "open", lambda *a, **k: pytest.fail("worker reopened configuration"))
     restored = gr_config_from_mapping(json.loads(json.dumps(mapping)))
     assert restored == config
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "config,mode,enabled",
+    [
+        (GRConfig(), None, False),
+        (GRConfig(beam_worker_decision=True), None, True),
+        (GRConfig(constraint=ConstraintConfig()), "none", True),
+        (GRConfig(constraint=table_constraint()), "table", True),
+    ],
+)
+def test_driver_and_worker_preserve_constraint_state(
+    config: GRConfig, mode: str | None, enabled: bool
+) -> None:
+    driver = SimpleNamespace(additional_config={})
+    config.write_to_vllm_config(driver)
+    wire = json.loads(json.dumps(driver.additional_config))
+    cached = GRConfig.from_vllm_config(driver)
+    worker = GRConfig.from_vllm_config(SimpleNamespace(additional_config=wire))
+
+    assert cached is config
+    assert worker.constraint == cached.constraint
+    assert worker.enabled is cached.enabled is enabled
+    gr = wire["vllm_gr"]["gr"]
+    if mode is None:
+        assert "constraint_mode" not in gr
+        assert "constraint_table" not in gr
+    else:
+        assert gr["constraint_mode"] == mode
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "config",
+    [
+        GRConfig(beam_max_width=8),
+        GRConfig(beam_candidate_width=4),
+        GRConfig(beam_max_width=8, beam_candidate_width=4, constraint=table_constraint()),
+        GRConfig(deployment=DeploymentOptions(beam_width=(8, 4, 2), candidate_width=(8, 4, 2))),
+        GRConfig(deployment=DeploymentOptions(beam_width=(8, 16, 16), candidate_width=(8, 4, 4))),
+    ],
+)
+def test_resolved_widths_survive_worker_transport(config: GRConfig) -> None:
+    driver = SimpleNamespace(additional_config={})
+    config.write_to_vllm_config(driver)
+    wire = json.loads(json.dumps(driver.additional_config))
+    worker = GRConfig.from_vllm_config(SimpleNamespace(additional_config=wire))
+    assert worker == GRConfig.from_vllm_config(driver) == config
+    assert worker.beam_graph_active == config.beam_graph_active
+    assert worker.enabled == config.enabled
+    assert gr_config_to_mapping(worker) == wire["vllm_gr"]
+    if config.deployment.beam_width:
+        assert config.beam_max_width == max(config.deployment.beam_width)
+    else:
+        assert wire["vllm_gr"]["gr"]["beam_width"] is None
+        assert wire["vllm_gr"]["gr"]["candidate_width"] is None
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "kwargs, message",
+    [
+        ({"admin_port": 70000}, "admin_port"),
+        ({"beam_width": (8, 4)}, "candidate_width"),
+        ({"prefill_token_buckets": (256, 128)}, "strictly increasing"),
+        ({"prefix_calibration_path": "relative.yaml"}, "absolute"),
+    ],
+)
+def test_python_deployment_rejects_invalid_settings(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        DeploymentOptions(**kwargs)
+
+
+@pytest.mark.parametrize("capacity", [{"beam_max_width": 16}, {"beam_candidate_width": 4}])  # type: ignore[misc]
+def test_python_capacity_cannot_override_step_widths(capacity: dict[str, int]) -> None:
+    deployment = DeploymentOptions(beam_width=(8, 4), candidate_width=(8, 2))
+    with pytest.raises(ValueError, match="conflicts"):
+        GRConfig(deployment=deployment, **capacity)
+
+
+def test_capacity_only_snapshot_can_be_loaded_as_startup_yaml(tmp_path: Path) -> None:
+    config = GRConfig(beam_max_width=8, beam_candidate_width=4, constraint=ConstraintConfig())
+    path = tmp_path / "startup.yaml"
+    path.write_text(json.dumps(gr_config_to_mapping(config)))
+    assert load_gr_config(path) == config
+
+
+def test_public_mapping_pins_symlink_targets_before_worker_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = tmp_path / "A", tmp_path / "B"
+    for directory in (first, second):
+        directory.mkdir()
+        for name in ("table", "calibration"):
+            (directory / name).write_text(directory.name)
+    current = tmp_path / "current"
+    current.symlink_to(first, target_is_directory=True)
+    spec = table_constraint()
+    assert spec.table is not None
+    mapping = gr_config_to_mapping(
+        GRConfig(
+            constraint=replace(spec, table=replace(spec.table, path=str(current / "table"))),
+            deployment=DeploymentOptions(prefix_calibration_path=str(current / "calibration")),
+        )
+    )
+    driver = gr_config_from_mapping(mapping)
+    host = SimpleNamespace(additional_config={})
+    driver.write_to_vllm_config(host)
+    snapshot = json.loads(json.dumps(host.additional_config))
+    current.unlink()
+    current.symlink_to(second, target_is_directory=True)
+    monkeypatch.setattr(Path, "resolve", lambda *a, **k: pytest.fail("worker resolved a path"))
+    worker = GRConfig.from_vllm_config(SimpleNamespace(additional_config=snapshot))
+    assert driver == worker
+    assert worker.constraint is not None and worker.constraint.table is not None
+    assert worker.constraint.table.path == str(first / "table")
+    assert worker.deployment.prefix_calibration_path == str(first / "calibration")
+    assert Path(worker.constraint.table.path).read_text() == "A"
+    assert Path(worker.deployment.prefix_calibration_path).read_text() == "A"
+
+
+def test_worker_uses_driver_paths_and_frozen_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = table_constraint()
+    assert table.table is not None
+    path = str(tmp_path / "dir" / ".." / "artifact")
+    batches = [1, 4]
+    config = GRConfig(
+        constraint=replace(table, table=replace(table.table, path=path)),
+        deployment=DeploymentOptions.from_mapping(
+            {"beam_batch_sizes": batches, "prefix_calibration_path": path}
+        ),
+    )
+    batches.clear()
+    assert config.deployment.beam_batch_sizes == (1, 4)
+    assert config.deployment.prefix_calibration_path == str(tmp_path / "artifact")
+    driver = SimpleNamespace(additional_config={})
+    config.write_to_vllm_config(driver)
+    worker = SimpleNamespace(additional_config=json.loads(json.dumps(driver.additional_config)))
+    monkeypatch.setattr(Path, "resolve", lambda *a, **k: pytest.fail("worker resolved a path"))
+    assert GRConfig.from_vllm_config(worker) == config
 
 
 @pytest.mark.parametrize("key", ["execution_mode", "dynamic_beam_widths", "per_parent_beam_widths"])  # type: ignore[misc]

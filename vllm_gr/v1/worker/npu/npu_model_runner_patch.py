@@ -17,7 +17,11 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.config.models import deployment_for
+from vllm_gr.config.models import (
+    ConstraintMode,
+    configured_constraint_mode,
+    deployment_for,
+)
 from vllm_gr.v1.worker.gr_context import (
     _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
@@ -62,7 +66,10 @@ def make_patched_load_model(original: Callable[..., Any]) -> Callable[..., Any]:
             from vllm_gr.config import GRConfig
 
             config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
-            if config.constrained_generation is not False or not config.beam_sid_stage_vocab:
+            if (
+                configured_constraint_mode(config) is not ConstraintMode.NONE
+                or not config.beam_sid_stage_vocab
+            ):
                 return result
             if str(getattr(self, "device", "")).split(":")[0] != "npu":
                 raise ValueError("beam.sid_stage_vocab currently requires NPU")
