@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Persistent eager NPU runtime for a fixed Beam Batch Session.
+"""Persistent NPU runtime for a fixed Beam Batch Session.
 
 Prefill stays logical B; Decode executes physical B*W rows. Candidate state,
 request-local KV reorder, terminal materialization, and retirement stay owned
@@ -56,7 +56,7 @@ from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
 
 
 class NPUEagerBeamStageRunner:
-    """Own persistent eager NPU Beam execution for one fixed batch."""
+    """Own persistent NPU Beam execution for one fixed batch."""
 
     def __init__(self, worker: Any) -> None:
         validate_npu_eager_capabilities(worker)
