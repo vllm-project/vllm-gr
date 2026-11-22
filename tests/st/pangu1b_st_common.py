@@ -13,7 +13,7 @@ from typing import Any, TypedDict
 
 import regex as re
 
-PANGU_CONFIG = Path("configs/pangu1b.yaml")
+PANGU_CONFIG = Path("recipes/Pangu/pangu1b.yaml")
 GSM8K_MINI = Path("tests/resources/pangu1b/gsm8k_mini.json")
 _ANSWER_RE = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 

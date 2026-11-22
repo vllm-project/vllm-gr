@@ -7,7 +7,9 @@ engine constructed with explicit GR configuration. Native engines without GR
 input keep upstream defaults and validation.
 
 The packaged file supplies the common defaults. You can supply a YAML file
-with only the values you want to override. A file can inherit another file
+with only the values you want to override. See the
+[deployment recipes](https://github.com/JiusiServe/vllm-gr/tree/main/recipes)
+for model-specific configurations. A file can inherit another file
 with `import: ./base.yaml`. Dictionaries merge by key, and lists replace
 the inherited list as a whole. Explicit YAML `null`, `false`, and empty lists
 replace inherited values. Native string values use the upstream vLLM converters
@@ -61,6 +63,22 @@ The startup log prints the complete resolved GR configuration using the same
 public key names.
 Native settings are resolved once at the engine boundary. Python and CLI retain
 which fields were explicitly supplied, including values equal to defaults.
+
+## Migrate from `configs/`
+
+- Replace `configs/pangu1b.yaml` with `recipes/Pangu/pangu1b.yaml` in
+  `--config` and Python `config` arguments.
+- To use the packaged defaults, remove the `--config configs/default_config.yaml`
+  option or the corresponding Python `config` argument. In a source checkout,
+  pass `vllm_gr/config/default_config.yaml` explicitly to keep treating the
+  YAML values as supplied settings.
+
+The old default YAML supplied a batch token budget of `8192` explicitly.
+With `--max-model-len 16384` and chunked prefill disabled, omitting both the
+file and the budget lets GR raise the budget to `16384`. To retain the explicit
+budget, pass `--max-num-batched-tokens 8192` on the CLI or
+`max_num_batched_tokens=8192` in Python. With chunked prefill disabled, vLLM
+rejects an explicit budget below the model length.
 
 ## Beam settings
 

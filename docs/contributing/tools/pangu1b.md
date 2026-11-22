@@ -45,7 +45,7 @@ OpenAI-compatible server on Ascend with the required KV cache block size.
 
 ```bash
 vllm serve "$PANGU1B_MODEL_PATH" --gr \
-    --config configs/pangu1b.yaml \
+    --config recipes/Pangu/pangu1b.yaml \
     --trust-remote-code \
     --dtype bfloat16 \
     --max-model-len 32768 \
@@ -55,7 +55,7 @@ vllm serve "$PANGU1B_MODEL_PATH" --gr \
     --no-enable-prefix-caching
 ```
 
-Both entrypoints use [the Pangu configuration](https://github.com/JiusiServe/vllm-gr/blob/main/configs/pangu1b.yaml)
+Both entrypoints use [the Pangu recipe](https://github.com/JiusiServe/vllm-gr/blob/main/recipes/Pangu/pangu1b.yaml)
 to select native sampling and attention.
 
 Then send a chat completion request:
