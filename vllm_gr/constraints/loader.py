@@ -40,7 +40,7 @@ from vllm_gr.constraints.table import (
     ConstraintTable,
     token_id_window,
 )
-from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
+from vllm_gr.ops.gpu.rec_constrained_topk import validate_cuda_sort_capacity
 from vllm_gr.ops.npu.rec_constrained_topk import (
     MAX_TOP_K,
     NPUConstraintOp,

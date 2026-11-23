@@ -10,7 +10,7 @@ import numpy.typing as npt
 import pytest
 
 from tests.v1.worker.test_beam_final_output_payload import bindings
-from vllm_gr.ops.cuda.beam_state import FINISH_LENGTH, FINISH_STOP
+from vllm_gr.ops.gpu.beam_state import FINISH_LENGTH, FINISH_STOP
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputOptions,
@@ -19,7 +19,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     sequence_columns,
     validate_complete_sequences,
 )
-from vllm_gr.v1.worker.cuda.beam_final_output import _build_batch_result, _PayloadLayout
+from vllm_gr.v1.worker.gpu.beam_final_output import _build_batch_result, _PayloadLayout
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 

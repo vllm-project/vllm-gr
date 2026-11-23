@@ -25,7 +25,7 @@ before constrained selection.
 
 ## CUDA stage hooks contract
 
-The [CUDA hooks](../../../vllm_gr/v1/worker/cuda/gpu_stage_hooks.py) bind
+The [CUDA hooks](../../../vllm_gr/v1/worker/gpu/stage_hooks.py) bind
 runner-specific input preparation, native output completion and graph policy.
 The shared stage runner owns pending dispatches, cancellation and retirement.
 Native output bookkeeping completes after submission and before pending state
@@ -40,7 +40,7 @@ storage and prepares configured batch shapes at startup. Changing the logical
 batch size selects a compatible graph or eager execution. An unsupported
 capture can fall back per shape after cleanup and a device-health check. Losing
 a graph recorded as successfully captured is an error. Profiled prefix-length
-buckets have a separate [capture policy](../feature/cuda_decode_attention.md#decode-graphs-and-fallback).
+buckets have a separate [capture policy](../feature/gpu_decode_attention.md#decode-graphs-and-fallback).
 
 ## Resource lifetime
 
@@ -87,8 +87,8 @@ GR enforces `ignore_eos=true` on admitted requests.
 
 | File | Responsibility |
 | --- | --- |
-| [Stage hooks](../../../vllm_gr/v1/worker/cuda/gpu_stage_hooks.py) | Define runner-specific input, output and graph policy. |
-| [CUDA stage runner](../../../vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py) | Owns pending dispatches, status copies and retirement. |
-| [V2 resources](../../../vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py) | Owns the V2 runtime, Decode graphs and cleanup checks. |
-| [V2 runner patch](../../../vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py) | Adapts native input preparation and output completion. |
+| [Stage hooks](../../../vllm_gr/v1/worker/gpu/stage_hooks.py) | Define runner-specific input, output and graph policy. |
+| [CUDA stage runner](../../../vllm_gr/v1/worker/gpu/beam_stage_runner.py) | Owns pending dispatches, status copies and retirement. |
+| [V2 resources](../../../vllm_gr/v1/worker/gpu/v2/model_runner_v2_resources.py) | Owns the V2 runtime, Decode graphs and cleanup checks. |
+| [V2 runner patch](../../../vllm_gr/v1/worker/gpu/v2/model_runner_v2_patch.py) | Adapts native input preparation and output completion. |
 | [GR startup](../../../vllm_gr/v1/worker/gr_startup.py) | Decides which capture sizes and widths are installed at startup. |

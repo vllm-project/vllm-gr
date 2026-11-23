@@ -10,10 +10,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
-from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.gpu import beam_stage_runner as stages
+from vllm_gr.v1.worker.gpu.stage_hooks import CudaStageHooksType
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 

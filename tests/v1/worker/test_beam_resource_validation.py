@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_gr.v1.worker.cuda import beam_search_runner as module
+from vllm_gr.v1.worker.gpu import beam_search_runner as module
 
 Runner = module.BeamSearchRunner
 

@@ -10,9 +10,9 @@ from unittest import mock
 
 import pytest
 
-from vllm_gr.platforms.ascend import provider as npu
 from vllm_gr.platforms.cuda import provider as cuda
 from vllm_gr.platforms.loader import load_backend_plugins
+from vllm_gr.platforms.npu import provider as npu
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     resolve_backend,
@@ -32,7 +32,7 @@ def test_builtin_providers_register_idempotently() -> None:
     load_backend_plugins()
 
     assert resolve_backend("cuda") is cuda.CUDA_BACKEND
-    assert resolve_backend("ascend") is npu.NPU_BACKEND
+    assert resolve_backend("npu") is npu.NPU_BACKEND
 
 
 def test_cuda_provider_lazily_returns_platform_modules(
@@ -41,7 +41,7 @@ def test_cuda_provider_lazily_returns_platform_modules(
     envs = ModuleType("vllm.envs")
     setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
     monkeypatch.setitem(sys.modules, "vllm.envs", envs)
-    from vllm_gr.v1.worker.cuda import runner_installer as runner
+    from vllm_gr.v1.worker.gpu import runner_installer as runner
 
     gpu_attention = object()
     imported: list[str] = []
@@ -129,7 +129,7 @@ def test_cuda_runtime_patch_is_noop() -> None:
 def test_npu_runtime_patches_preserve_order_and_sum_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr.platforms.ascend import spawn_patch
+    from vllm_gr.platforms.npu import spawn_patch
     from vllm_gr.v1.worker.npu import startup_patch
 
     events: list[tuple[str, bool | None]] = []

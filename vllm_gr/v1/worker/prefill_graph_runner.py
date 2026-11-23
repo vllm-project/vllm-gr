@@ -44,7 +44,7 @@ def get_active_prefill_graph_runner_class() -> type[BasePrefillGraphRunner]:
 
         return NPUPrefillGraphRunner
     else:
-        from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import (
+        from vllm_gr.v1.worker.gpu.v1.prefill_graph_runner import (
             GPUPrefillGraphRunner,
         )
 

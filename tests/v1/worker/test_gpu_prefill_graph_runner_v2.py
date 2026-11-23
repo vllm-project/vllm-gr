@@ -14,8 +14,8 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from tests.helpers.gr_config import set_deployment
 from vllm_gr.v1.worker import prefill_graph_common as common
-from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as pg2
-from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import close_v2_runtime
+from vllm_gr.v1.worker.gpu.v2 import prefill_graph_runner_v2 as pg2
+from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import close_v2_runtime
 from vllm_gr.v1.worker.model_runner_patch import (
     make_load_model_with_constraint_backend,
     make_shutdown_with_constraint_backend,

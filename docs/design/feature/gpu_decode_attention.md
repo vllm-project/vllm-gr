@@ -1,4 +1,4 @@
-# CUDA Beam Decode attention
+# GPU Beam Decode attention
 
 At Decode, each beam attends to two histories: the paged prompt KV shared by
 all beams of that prompt, and the suffix KV for its own selected tokens. CUDA
@@ -6,7 +6,7 @@ can split a long prefix across GPU work or fuse a short suffix with the final
 merge. The two decisions are independent: a step can use a segmented prefix
 with either suffix path.
 
-![Block diagram: shared prompt pages feed native or segmented prefix attention, which produces prefix output and FP32 LSE; both suffix paths combine the prefix state with per-beam suffix KV to produce per-beam output.](../../assets/cuda_decode_attention.svg)
+![Block diagram: shared prompt pages feed native or segmented prefix attention, which produces prefix output and FP32 LSE; both suffix paths combine the prefix state with per-beam suffix KV to produce per-beam output.](../../assets/gpu_decode_attention.svg)
 
 | Color or shape | Meaning |
 | --- | --- |

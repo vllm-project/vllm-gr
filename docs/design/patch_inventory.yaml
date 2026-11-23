@@ -51,7 +51,7 @@ patches:
 
   - id: GR-PATCH-002
     scope: backend
-    backend_id: ascend
+    backend_id: npu
     owner: vllm_gr/v1/worker/npu/startup_patch.py
     installer: vllm_gr.v1.worker.npu.startup_patch.patch_npu_worker_init_device
     activation: the selected NPU provider revalidates early config bindings on every call and wraps NPUWorker.init_device only when needed; unavailable native worker imports are retried on later initialization
@@ -207,8 +207,8 @@ patches:
   - id: GR-PATCH-011
     scope: backend
     backend_id: cuda
-    owner: vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py and vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/cuda/gpu_postprocess_workspace.py, vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/cuda/v1/gpu_prefill_inputs.py, vllm_gr/v1/worker/cuda/v2/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/cuda/gpu_stage_hooks.py, vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py, vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py
+    owner: vllm_gr/v1/worker/gpu/runner_installer.py, vllm_gr/v1/worker/gpu/v1/model_runner_patch.py and vllm_gr/v1/worker/gpu/v2/model_runner_v2_patch.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/gpu/postprocess_workspace.py, vllm_gr/v1/worker/gpu/v2/model_runner_v2_resources.py, vllm_gr/v1/worker/gpu/v1/prefill_inputs.py, vllm_gr/v1/worker/gpu/v2/prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/gpu/stage_hooks.py, vllm_gr/v1/worker/gpu/beam_stage_runner.py, vllm_gr/v1/worker/gpu/v1/beam_stage_runner_v1.py, vllm_gr/v1/worker/gpu/v2/beam_stage_runner_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the CUDA provider mounts Worker utilities at process startup; Worker.init_device installs and verifies the admitted V1 or V2 generation, which binds the planned runner after model load regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
     binding_validation: first bind and full reload retain the admitted plan across positive native max_model_len reductions within its limit; provider validation sees the live fitted config and other drift fails before service creation
@@ -247,7 +247,7 @@ patches:
 
   - id: GR-PATCH-012
     scope: backend
-    backend_id: ascend
+    backend_id: npu
     owner: vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/stage_projection.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/npu/npu_model_runner_inputs.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/ops/npu/stage_projection.py, vllm_gr/v1/worker/npu/startup_patch.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
@@ -323,9 +323,9 @@ patches:
 
   - id: GR-PATCH-016
     scope: backend
-    backend_id: ascend
-    owner: vllm_gr/platforms/ascend/spawn_patch.py
-    installer: vllm_gr.platforms.ascend.spawn_patch.apply_npu_spawn_patch
+    backend_id: npu
+    owner: vllm_gr/platforms/npu/spawn_patch.py
+    installer: vllm_gr.platforms.npu.spawn_patch.apply_npu_spawn_patch
     activation: the selected NPU provider installs or repairs spawn protection before importing the native worker
     validator_or_test:
       - tests/patch/test_patch_initialization.py::test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings
@@ -338,7 +338,7 @@ patches:
 
   - id: GR-PATCH-018
     scope: backend
-    backend_id: ascend
+    backend_id: npu
     owner: vllm_gr/v1/worker/npu/startup_patch.py
     installer: vllm_gr.v1.worker.npu.startup_patch.apply_penalties_warmup_oom_guard
     activation: NPUWorker init_device runs in the child process and the native penalties warmup callable is present
@@ -351,9 +351,9 @@ patches:
 
   - id: GR-PATCH-019
     scope: backend
-    backend_id: ascend
-    owner: vllm_gr/platforms/ascend/config_patch.py
-    installer: vllm_gr.platforms.ascend.config_patch.apply_engine_core_config_sanitizer and install_ascend_config_filter
+    backend_id: npu
+    owner: vllm_gr/platforms/npu/config_patch.py
+    installer: vllm_gr.platforms.npu.config_patch.apply_engine_core_config_sanitizer and install_ascend_config_filter
     activation: NPU engine configuration and every worker plugin initialization, independently of the device hook; repair native config caller bindings even when the sanitizer is installed; entrypoint re-asserted on every create_engine_config call and initializes the shared EngineCore plan before native construction
     validator_or_test:
       - tests/v1/test_ascend_compat.py::test_ascend_config_filter_preserves_engine_identity_and_gr_config
@@ -385,7 +385,7 @@ patches:
 
   - id: GR-PATCH-021
     scope: backend
-    backend_id: ascend
+    backend_id: npu
     owner: vllm_gr/v1/worker/npu/kv_layout_patch.py
     installer: vllm_gr.v1.worker.npu.kv_layout_patch.apply_npu_contiguous_kv_cache_patch
     activation: NPUWorker init_device before native runner construction; known Ascend 0.30.0rc2 bindings

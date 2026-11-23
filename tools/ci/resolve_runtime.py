@@ -33,6 +33,12 @@ GUARDS = {
     "vllm-ascend": "SUPPORTED_VLLM_ASCEND_VERSION",
     "triton-ascend": "SUPPORTED_TRITON_ASCEND_VERSION",
 }
+LEGACY_NPU_ENVIRONMENT_SOURCE = "vllm_gr/_env_check.py"
+NPU_ENVIRONMENT_CHECKS = {
+    "vllm_gr/platforms/npu/environment.py": "check_npu_environment",
+    "vllm_gr/platforms/ascend/environment.py": "check_ascend_environment",
+    LEGACY_NPU_ENVIRONMENT_SOURCE: "check_ascend_environment",
+}
 
 
 def digest(value: Any) -> str:
@@ -69,14 +75,21 @@ def literal(path: Path, name: str) -> str:
     return value
 
 
+def npu_environment_source(repo: Path) -> str:
+    return next(
+        (path for path in NPU_ENVIRONMENT_CHECKS if (repo / path).is_file()),
+        LEGACY_NPU_ENVIRONMENT_SOURCE,
+    )
+
+
 def declarations(repo: Path, device: str) -> dict[str, str]:
     packages = tuple(GUARDS) if device == "npu" else ("vllm",)
     guard_source = repo / "vllm_gr/platforms/compat.py"
     prefix = ""
-    if not (repo / "vllm_gr/platforms/ascend/environment.py").is_file():
+    if npu_environment_source(repo) == LEGACY_NPU_ENVIRONMENT_SOURCE:
         # Earlier A/B baselines may have provider compatibility code but
         # still declare their built-in version pins in _env_check.py.
-        guard_source = repo / "vllm_gr/_env_check.py"
+        guard_source = repo / LEGACY_NPU_ENVIRONMENT_SOURCE
         prefix = "_"
     guards = {package: literal(guard_source, prefix + GUARDS[package]) for package in packages}
     base = literal(repo / "setup.py", "VLLM_GR_BASE_VERSION")
@@ -210,9 +223,8 @@ def source_digest(repo: Path) -> str:
     names = (
         "setup.py",
         "pyproject.toml",
-        "vllm_gr/_env_check.py",
+        *NPU_ENVIRONMENT_CHECKS,
         "vllm_gr/platforms/compat.py",
-        "vllm_gr/platforms/ascend/environment.py",
         "vllm_gr/version.py",
         "tools/ci/resolve_runtime.py",
         "tools/packaging/git_version.py",
@@ -397,11 +409,11 @@ def verify(repo: Path, spec: dict[str, Any], venv: Path) -> dict[str, Any]:
         if not errors:
             try:
                 if spec["device"] == "npu":
-                    ascend_guard = "vllm_gr.platforms.ascend.environment"
-                    if not (repo / "vllm_gr/platforms/ascend/environment.py").is_file():
-                        ascend_guard = "vllm_gr._env_check"
-                    guard = importlib.import_module(ascend_guard)
-                    report["ascend"] = guard.check_ascend_environment(require_npu_platform=True)
+                    source = npu_environment_source(repo)
+                    module_name = source.removesuffix(".py").replace("/", ".")
+                    guard = importlib.import_module(module_name)
+                    check_environment = getattr(guard, NPU_ENVIRONMENT_CHECKS[source])
+                    report["ascend"] = check_environment(require_npu_platform=True)
                 else:
                     platforms = importlib.import_module("vllm.platforms")
                     report["platform"] = str(platforms.current_platform.device_type)

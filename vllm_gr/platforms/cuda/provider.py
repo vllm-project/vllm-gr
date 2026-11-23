@@ -50,7 +50,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
 
     def resolve(self, request: BackendRequest) -> BackendPlan:
         """Admit the existing CUDA paths without importing a device runtime."""
-        from vllm_gr.v1.worker.cuda.runner_installer import runner_id
+        from vllm_gr.v1.worker.gpu.runner_installer import runner_id
 
         if request.options.to_dict():
             raise ValueError("CUDA currently accepts no additional backend options")
@@ -103,7 +103,7 @@ class CUDABackendProvider(BuiltinPlanSupport):
         return 0
 
     def get_model_runner_hooks(self) -> ModelRunnerInstaller:
-        from vllm_gr.v1.worker.cuda import runner_installer
+        from vllm_gr.v1.worker.gpu import runner_installer
 
         return runner_installer
 

@@ -75,8 +75,8 @@ current model Forward.
 
 | File | Responsibility |
 | --- | --- |
-| [Beam state](../../../vllm_gr/v1/worker/cuda/beam_state.py) | Completion-record layout, capacity and reset. |
+| [Beam state](../../../vllm_gr/v1/worker/gpu/beam_state.py) | Completion-record layout, capacity and reset. |
 | [Attention context](../../../vllm_gr/v1/beam/attention_context.py) | KV pools, suffix buffers and session slots. |
 | [Session facade](../../../vllm_gr/v1/beam/session.py) | Per-request view of the worker context. |
 | [Execution batch](../../../vllm_gr/v1/beam/execution_batch.py) | Fixed and dynamic width schedules and cross-stage validation. |
-| [CUDA runner](../../../vllm_gr/v1/worker/cuda/beam_search_runner.py) | Device updates and session reset. |
+| [CUDA runner](../../../vllm_gr/v1/worker/gpu/beam_search_runner.py) | Device updates and session reset. |

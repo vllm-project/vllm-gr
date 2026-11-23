@@ -90,7 +90,7 @@ attention dispatchers then select the runner and attention implementation for
 the device.
 
 - **CUDA** workers manage device Beam state and can replay captured Prefill
-  and Decode work. The [CUDA Prefill design](feature/cuda_prefill_graph.md)
+  and Decode work. The [CUDA Prefill design](feature/gpu_prefill_graph.md)
   explains capture selection, and the [ModelRunner V2 design](module/model_runner_v2.md)
   describes integration with the native runner.
 - **Ascend** workers use NPU-specific attention and KV operations. Eligible

@@ -23,9 +23,9 @@ class CheckEnvSubcommand(CLISubcommand):
         detected_device = str(current_platform.device_type)
         require_npu = bool(args.npu or detected_device == "npu")
         if require_npu:
-            from vllm_gr.platforms.ascend.environment import check_ascend_environment
+            from vllm_gr.platforms.npu.environment import check_npu_environment
 
-            report = check_ascend_environment(require_npu_platform=True)
+            report = check_npu_environment(require_npu_platform=True)
         else:
             report = check_vllm_runtime()
             report["platform"] = detected_device

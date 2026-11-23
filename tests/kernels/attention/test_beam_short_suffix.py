@@ -720,7 +720,7 @@ def packed_fa2_reference(
     active: torch.Tensor | None,
 ) -> torch.Tensor:
     """Run the real disabled path, including FA2's GQA LSE conversion."""
-    from vllm_gr.ops.cuda.beam_kv_cache import copy_suffix_kv_graph
+    from vllm_gr.ops.gpu.beam_kv_cache import copy_suffix_kv_graph
     from vllm_gr.v1.attention.backends import beam_attn_gpu as gpu
 
     width, heads, dim = query.shape

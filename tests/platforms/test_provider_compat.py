@@ -74,7 +74,7 @@ def test_legacy_cuda_and_npu_map_to_fixed_identities() -> None:
     npu = legacy.adapt_legacy_provider(LegacyProvider("npu"), source="entrypoint:npu")
 
     assert cuda is not None and cuda.backend_id == "cuda"
-    assert npu is not None and npu.backend_id == "ascend"
+    assert npu is not None and npu.backend_id == "npu"
 
 
 def test_legacy_adapter_delegates_every_operation() -> None:
@@ -222,8 +222,8 @@ def test_unparsable_declared_range_is_a_provider_defect(
 
 
 def test_builtin_providers_declare_the_supported_runtime_pair() -> None:
-    from vllm_gr.platforms.ascend import NPU_BACKEND
     from vllm_gr.platforms.cuda import CUDA_BACKEND
+    from vllm_gr.platforms.npu import NPU_BACKEND
 
     for provider in (CUDA_BACKEND, NPU_BACKEND):
         assert provider.vllm_version_range == f"=={compat.SUPPORTED_VLLM_VERSION}"

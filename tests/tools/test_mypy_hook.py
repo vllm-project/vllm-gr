@@ -23,8 +23,8 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
             "vllm_gr/v1/worker/model_runner_contracts.py",
             "vllm_gr/v1/worker/gr_gc.py",
             "vllm_gr/v1/worker/gr_context.py",
-            "vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py",
-            "vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py",
+            "vllm_gr/v1/worker/gpu/v2/model_runner_v2_patch.py",
+            "vllm_gr/v1/worker/gpu/v2/model_runner_v2_resources.py",
         }
     ),
 )

@@ -106,7 +106,7 @@ def _get_platform_execution_module() -> Any:
         return provider.get_attention_execution()
 
     if NPU_DEVICE and not CUDA_DEVICE:
-        from vllm_gr.platforms.ascend import NPU_BACKEND
+        from vllm_gr.platforms.npu import NPU_BACKEND
 
         return NPU_BACKEND.get_attention_execution()
     if CUDA_DEVICE and not NPU_DEVICE:
@@ -473,7 +473,7 @@ class BeamAttentionImpl(AttentionImpl):
             # of host Python int, enabling CUDA Graph capture/replay).
             decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
             if decode_step_buf is not None and decode_step_buf.is_cuda:
-                from vllm_gr.ops.cuda.beam_kv_cache import cache_unshared_kv_graph
+                from vllm_gr.ops.gpu.beam_kv_cache import cache_unshared_kv_graph
 
                 cache_unshared_kv_graph(
                     pool.unshared_key,

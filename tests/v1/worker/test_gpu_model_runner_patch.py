@@ -12,7 +12,7 @@ import torch
 from vllm_gr.config import GRConfig
 from vllm_gr.v1.beam.dispatch import GRStageKind
 from vllm_gr.v1.worker import gr_context as _gr_context
-from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as gpu_patch
+from vllm_gr.v1.worker.gpu.v1 import model_runner_patch as gpu_patch
 
 
 def _prefill_stage(*request_ids: str) -> SimpleNamespace:
@@ -356,7 +356,7 @@ def test_patched_determine_session_missing_downgrades_full() -> None:
         _beam_graph_keys={4},
     )
 
-    import vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch as mod
+    import vllm_gr.v1.worker.gpu.v1.model_runner_patch as mod
 
     original_fn = mod._beam_graph_enabled_for_run
 
@@ -391,7 +391,7 @@ def test_patched_determine_mixed_batch_downgrades_full() -> None:
         _beam_graph_keys={8},
     )
 
-    import vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch as mod
+    import vllm_gr.v1.worker.gpu.v1.model_runner_patch as mod
 
     original_fn = mod._beam_graph_enabled_for_run
 
@@ -423,7 +423,7 @@ def test_patched_determine_pure_beam_batch_grants_full() -> None:
         _beam_graph_keys={4},
     )
 
-    import vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch as mod
+    import vllm_gr.v1.worker.gpu.v1.model_runner_patch as mod
 
     original_fn = mod._beam_graph_enabled_for_run
 
@@ -470,7 +470,7 @@ def test_worker_graph_stats_hook_is_named_and_idempotent(
 ) -> None:
     import vllm.v1.worker.gpu_worker as gpu_worker
 
-    from vllm_gr.v1.worker.cuda import runner_installer as cuda
+    from vllm_gr.v1.worker.gpu import runner_installer as cuda
 
     class FakeWorker:
         pass
@@ -503,7 +503,7 @@ def test_patched_determine_active_lora_downgrades_full() -> None:
         _beam_graph_keys={4},
     )
 
-    import vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch as mod
+    import vllm_gr.v1.worker.gpu.v1.model_runner_patch as mod
 
     original_fn = mod._beam_graph_enabled_for_run
 
@@ -535,7 +535,7 @@ def test_patched_determine_graph_disabled_no_full() -> None:
         _beam_graph_keys={4},
     )
 
-    import vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch as mod
+    import vllm_gr.v1.worker.gpu.v1.model_runner_patch as mod
 
     original_fn = mod._beam_graph_enabled_for_run
 
@@ -567,7 +567,7 @@ def test_patched_determine_width_mismatch_no_full() -> None:
         _beam_graph_keys={4},  # captured at 4, but batch is 8 tokens
     )
 
-    import vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch as mod
+    import vllm_gr.v1.worker.gpu.v1.model_runner_patch as mod
 
     original_fn = mod._beam_graph_enabled_for_run
 
@@ -667,7 +667,7 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
 
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 
-    from vllm_gr.v1.worker.cuda import beam_decode_graph as shared
+    from vllm_gr.v1.worker.gpu import beam_decode_graph as shared
 
     monkeypatch.setattr(
         _gr_context,
@@ -808,9 +808,7 @@ def test_capture_create_dummy_context_creates_session_and_beam_info() -> None:
 
     gr_cfg = SimpleNamespace(beam_max_width=128, beam_max_decode_steps=5)
 
-    with patch(
-        "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch._create_beam_context"
-    ) as mock_create:
+    with patch("vllm_gr.v1.worker.gpu.v1.model_runner_patch._create_beam_context") as mock_create:
         mock_context = MagicMock()
         mock_context.registry.allocate.return_value = 0
         mock_create.return_value = mock_context

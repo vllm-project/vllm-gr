@@ -18,9 +18,9 @@ from tests.kernels.beam_stage_test_utils import (
 from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.dispatch import GRDeviceStateRef
 from vllm_gr.v1.beam.session import BeamSearchSession
-from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
-from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspace
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.beam_stage_runner import get_stage_runner
+from vllm_gr.v1.worker.gpu.postprocess_workspace import BeamPostprocessWorkspace
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"

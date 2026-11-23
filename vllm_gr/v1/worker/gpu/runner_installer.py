@@ -13,12 +13,12 @@ from vllm_gr.config.backend_plan import read_backend_plan
 from vllm_gr.platforms.interface import ModelRunnerInstaller
 
 # These IDs are already serialized in admitted plans and reported in readiness.
-V1_RUNNER = "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch"
-V2_RUNNER = "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch"
+V1_RUNNER = "vllm_gr.v1.worker.gpu.v1.model_runner_patch"
+V2_RUNNER = "vllm_gr.v1.worker.gpu.v2.model_runner_v2_patch"
 # Deployment paths can move independently of the historical plan values above.
 _INSTALLER_MODULES = {
-    V1_RUNNER: "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
-    V2_RUNNER: "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch",
+    V1_RUNNER: "vllm_gr.v1.worker.gpu.v1.model_runner_patch",
+    V2_RUNNER: "vllm_gr.v1.worker.gpu.v2.model_runner_v2_patch",
 }
 _INSTALL_LOCK = RLock()
 _WORKER_MARKER = "_gr_cuda_runner_selection"
@@ -98,7 +98,7 @@ def install_worker_utilities() -> None:
 
 def install_worker_hooks() -> None:
     """Both CUDA runner generations use the same Worker and NumPy staging."""
-    from vllm_gr.v1.worker.cuda.numpy_staging import install_numpy_staging
+    from vllm_gr.v1.worker.gpu.numpy_staging import install_numpy_staging
 
     install_worker_utilities()
     install_numpy_staging()

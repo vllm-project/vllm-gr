@@ -33,8 +33,8 @@ from vllm_gr.v1.beam.dispatch import (
     GRRetireMetadata,
 )
 from vllm_gr.v1.worker import gr_gc as _gc_runtime
-from vllm_gr.v1.worker.cuda.gr_inputs import ERROR_DISPATCH_STATE, GRInputBuffers
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.gr_inputs import ERROR_DISPATCH_STATE, GRInputBuffers
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 
@@ -263,8 +263,8 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         admission_worker,
         install_decode_model,
     )
-    from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
-    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+    from vllm_gr.v1.worker.gpu.beam_decode_graph import BeamDecodeGraph
+    from vllm_gr.v1.worker.gpu.beam_stage_runner import (
         GPUBeamStageRunner,
         get_stage_runner,
     )

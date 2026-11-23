@@ -14,7 +14,7 @@ import pytest
 
 from tests.helpers.paths import REPO_ROOT
 from vllm_gr.config import GRAttentionBackend
-from vllm_gr.platforms.ascend import config_patch
+from vllm_gr.platforms.npu import config_patch
 from vllm_gr.v1 import ascend_compat
 from vllm_gr.v1.attention import selector_patch
 from vllm_gr.v1.worker.npu import kv_layout_patch, startup_patch
@@ -36,7 +36,7 @@ def test_import_does_not_load_npu_worker() -> None:
     project_root = REPO_ROOT
     code = """
 import sys
-import vllm_gr.platforms.ascend.config_patch
+import vllm_gr.platforms.npu.config_patch
 import vllm_gr.v1.ascend_compat
 import vllm_gr.v1.worker.npu.startup_patch
 

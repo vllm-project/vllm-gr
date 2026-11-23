@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     import torch
 
     from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+    from vllm_gr.v1.worker.gpu.beam_stage_runner import (
         BeamRequestBinding,
         GPUBeamStageRunner,
     )

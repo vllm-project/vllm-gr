@@ -31,7 +31,7 @@ attention selector or its cache can silently select a different backend.
 
 ## GR-PATCH-002 — NPUWorker Initialization Hook
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 The [NPU startup hooks](../../../vllm_gr/v1/worker/npu/startup_patch.py) install
 worker utilities before native device initialization constructs the runner.
@@ -117,7 +117,7 @@ boundaries have to agree. See the [runner contract](model_runner_v2.md).
 
 ## GR-PATCH-012 — NPU ModelRunner Override
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 The Ascend worker adapts native rows and attention metadata for grouped Beam
 execution. Cached prefixes, real row lengths and parent selection must stay
@@ -150,7 +150,7 @@ native weight reload.
 
 ## GR-PATCH-016 — NPU-aware Spawn Start Method
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 Ascend subprocesses must use a compatible start method when the parent has
 initialized the device. The Ascend provider installs spawn protection before
@@ -158,7 +158,7 @@ the native worker initialization hook.
 
 ## GR-PATCH-018 — Ascend Penalties Warmup OOM Guard
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 Ascend warmup can allocate penalty tensors that exceed available memory. The
 [NPU startup hook](../../../vllm_gr/v1/worker/npu/startup_patch.py) handles the
@@ -167,9 +167,9 @@ The inventory lists no behavioural test for this guard.
 
 ## GR-PATCH-019 — Ascend additional_config Sanitizer
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
-The [Ascend configuration patch](../../../vllm_gr/platforms/ascend/config_patch.py)
+The [Ascend configuration patch](../../../vllm_gr/platforms/npu/config_patch.py)
 retains GR settings while filtering keys passed to the native configuration
 reader. Fresh EngineCore processes install the common plan before native
 construction. Worker startup also refreshes the filter's native bindings.
@@ -184,7 +184,7 @@ zero logits.
 
 ## GR-PATCH-021 — Contiguous Beam Prefix KV
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 The [NPU cache layout patch](../../../vllm_gr/v1/worker/npu/kv_layout_patch.py)
 lets eligible Ascend xllm Beam layers request contiguous prefix K/V at native

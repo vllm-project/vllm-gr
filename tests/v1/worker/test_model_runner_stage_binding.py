@@ -10,11 +10,11 @@ import pytest
 from tests.helpers.gr_config import engine_config
 from vllm_gr.v1.beam.dispatch import GR_RETIRE_OUTPUT_ATTR, GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.worker import model_runner_common
-from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
-from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as _v2_integration
-from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.gpu import beam_stage_runner as stages
+from vllm_gr.v1.worker.gpu.stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.v2 import model_runner_v2_patch as _v2_integration
+from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
 
 
 def _unexpected_native(*args: object, **kwargs: object) -> None:
@@ -104,8 +104,8 @@ def test_cuda_dispatch_requires_explicit_hooks(monkeypatch: pytest.MonkeyPatch) 
 @pytest.mark.l1  # type: ignore[misc]
 def test_v1_installer_binds_execution_and_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_gr.v1.worker import gr_startup, model_runner_patch
-    from vllm_gr.v1.worker.cuda import runner_installer as cuda
-    from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
+    from vllm_gr.v1.worker.gpu import runner_installer as cuda
+    from vllm_gr.v1.worker.gpu.v1 import model_runner_patch as gpu_model_runner_patch
 
     class Runner:
         device = "cuda"
@@ -202,7 +202,7 @@ def test_stage_capture_passes_bound_model_install_policy(
     hooks_type: type[CudaStageHooks],
     input_width: int | None,
 ) -> None:
-    from vllm_gr.v1.worker.cuda import beam_decode_graph
+    from vllm_gr.v1.worker.gpu import beam_decode_graph
 
     worker = SimpleNamespace()
     owner = object.__new__(stages.GPUBeamStageRunner)

@@ -496,13 +496,13 @@ import torch
 import vllm.logger
 class BlockCUDA(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname == 'triton' or fullname.startswith('triton.') or fullname.startswith('vllm_gr.ops.cuda') or fullname == 'vllm_gr.constraints.cuda_backend':
+        if fullname == 'triton' or fullname.startswith('triton.') or fullname.startswith('vllm_gr.ops.gpu') or fullname == 'vllm_gr.constraints.cuda_backend':
             raise ImportError('blocked CUDA/Triton dependency: ' + fullname)
 sys.meta_path.insert(0, BlockCUDA())
 import vllm_gr.plugin
 from vllm_gr.v1.worker import model_runner_patch
 assert 'vllm_gr.constraints.cuda_backend' not in sys.modules
-assert 'vllm_gr.ops.cuda.rec_constrained_topk' not in sys.modules
+assert 'vllm_gr.ops.gpu.rec_constrained_topk' not in sys.modules
 """
     subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
 
@@ -515,7 +515,7 @@ def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
     from threading import Lock
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+    from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import (
         V2RuntimeState,
         close_v2_runtime,
     )

@@ -73,12 +73,12 @@ for module_name in (
     "torch_npu",
     "vllm",
     "vllm_ascend",
-    "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
+    "vllm_gr.v1.worker.gpu.v1.model_runner_patch",
     "vllm_gr.v1.worker.npu.npu_model_runner_patch",
     "vllm_gr.v1.attention.backends.beam_attn_gpu",
     "vllm_gr.v1.attention.backends.beam_attn_npu",
     "vllm_gr.v1.ascend_compat",
-    "vllm_gr.platforms.ascend.config_patch",
+    "vllm_gr.platforms.npu.config_patch",
     "vllm_gr.v1.worker.npu.startup_patch",
     "vllm_gr.v1.worker.npu.kv_layout_patch",
 ):
@@ -93,12 +93,12 @@ for module_name in (
     "torch_npu",
     "vllm",
     "vllm_ascend",
-    "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
+    "vllm_gr.v1.worker.gpu.v1.model_runner_patch",
     "vllm_gr.v1.worker.npu.npu_model_runner_patch",
     "vllm_gr.v1.attention.backends.beam_attn_gpu",
     "vllm_gr.v1.attention.backends.beam_attn_npu",
     "vllm_gr.v1.ascend_compat",
-    "vllm_gr.platforms.ascend.config_patch",
+    "vllm_gr.platforms.npu.config_patch",
     "vllm_gr.v1.worker.npu.startup_patch",
     "vllm_gr.v1.worker.npu.kv_layout_patch",
 ):
@@ -129,8 +129,8 @@ import sys
 # CUDA provider initializes.
 blocked = (
     "vllm_gr.v1.ascend_compat",
-    "vllm_gr.platforms.ascend.config_patch",
-    "vllm_gr.platforms.ascend.spawn_patch",
+    "vllm_gr.platforms.npu.config_patch",
+    "vllm_gr.platforms.npu.spawn_patch",
     "vllm_gr.v1.worker.npu.startup_patch",
     "vllm_gr.v1.worker.npu.kv_layout_patch",
 )
@@ -179,8 +179,8 @@ assert not any(name in sys.modules for name in blocked)
 @pytest.mark.parametrize(  # type: ignore[misc]
     "module_name",
     [
-        "vllm_gr.v1.worker.cuda.gpu_postprocess_workspace",
-        "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch",
+        "vllm_gr.v1.worker.gpu.postprocess_workspace",
+        "vllm_gr.v1.worker.gpu.v2.model_runner_v2_patch",
         "vllm_gr.v1.worker.model_runner_patch",
     ],
 )
@@ -193,7 +193,7 @@ import os
 import sys
 from unittest.mock import Mock
 
-blocked_packages = ("vllm_gr.v1.worker.cuda.v1", "vllm_gr.v1.worker.npu")
+blocked_packages = ("vllm_gr.v1.worker.gpu.v1", "vllm_gr.v1.worker.npu")
 
 def forbidden(name):
     return name == "vllm_gr.v1.worker.model_runner_common" or any(
@@ -219,7 +219,7 @@ if module_name == "vllm_gr.v1.worker.model_runner_patch":
     vllm.platforms.current_platform = platform
 
     from vllm_gr.platforms import loader
-    from vllm_gr.v1.worker.cuda import runner_installer as runner
+    from vllm_gr.v1.worker.gpu import runner_installer as runner
     from vllm_gr.v1.worker import model_runner_patch
     class Worker:
         vllm_config = None
@@ -228,7 +228,7 @@ if module_name == "vllm_gr.v1.worker.model_runner_patch":
             pass
 
     runner.discover_worker_runners = lambda: (("CUDA Worker.init_device", Worker),)
-    from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
+    from vllm_gr.v1.worker.gpu.v2 import model_runner_v2_patch as v2
     native_class = type("V2", (), {})
     v2.discover_worker_runners = lambda: (("V2", native_class),)
     v2.is_patched = lambda cls: bool(getattr(cls, "_installed", False))
@@ -261,19 +261,19 @@ pytestmark = pytest.mark.cpu_test
 def test_runner_contracts_import_stays_hardware_free() -> None:
     code = """
 import sys
-from vllm_gr.v1.worker import cuda, model_runner_contracts, npu
-from vllm_gr.v1.worker.cuda import v1, v2
+from vllm_gr.v1.worker import gpu, model_runner_contracts, npu
+from vllm_gr.v1.worker.gpu import v1, v2
 
-for package in (cuda, v1, v2, npu):
+for package in (gpu, v1, v2, npu):
     assert not any(
         name.startswith(package.__name__ + ".")
-        and (package is not cuda or name not in (v1.__name__, v2.__name__))
+        and (package is not gpu or name not in (v1.__name__, v2.__name__))
         for name in sys.modules
     )
 assert callable(model_runner_contracts.is_worker_runner_patched)
 for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
              "vllm_gr.v1.worker.model_runner_common",
-             "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch"):
+             "vllm_gr.v1.worker.gpu.v2.model_runner_v2_patch"):
     assert name not in sys.modules, name
 """
     subprocess.run(

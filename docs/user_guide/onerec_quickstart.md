@@ -263,6 +263,6 @@ when comparing runs.
 
 - [ModelRunner V2 multi-batch execution](../design/module/model_runner_v2.md): native integration, B=1/2/4 configuration, validation and remaining accuracy work.
 - [Asynchronous scheduling](../design/feature/async_scheduling.md) explains Prefill/Decode overlap and retirement. Its [validation section](../design/feature/async_scheduling.md#validation) links the scheduler test and earlier OneRec measurements.
-- [CUDA Prefill graph capture](../design/feature/cuda_prefill_graph.md) describes token bucket selection and multi-request capacity.
+- [CUDA Prefill graph capture](../design/feature/gpu_prefill_graph.md) describes token bucket selection and multi-request capacity.
 - [Offline Beam example reference](../../examples/offline_inference/beam_search/README.md#beam-search-v1) lists configuration fields and script arguments.
 - [OneRec benchmark](../benchmarking/README.md): dataset, online benchmarks, and accuracy evaluation.

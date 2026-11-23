@@ -51,6 +51,10 @@ contributing/tools/pangu1b.md:
     models/pangu.md#run-the-offline-accuracy-evaluation: [run-the-offline-accuracy-evaluation]
     models/pangu.md#online-serving: [online-serving]
     examples/pangu_sid.md#build-a-matching-catalog-and-run-beam-search: [prepare-public-weights-for-constrained-sid-beam-search]
+design/feature/cuda_decode_attention.md:
+  page: design/feature/gpu_decode_attention.md
+design/feature/cuda_prefill_graph.md:
+  page: design/feature/gpu_prefill_graph.md
 design/main-arch.md:
   page: design/architecture_overview.md
   sections:
@@ -73,12 +77,12 @@ features/README.md:
 features/attention.md:
   page: user_guide/feature_compatibility.md
   sections:
-    design/feature/cuda_decode_attention.md#shared-prompt-prefix: [cuda-prefix-attention, selection-and-compatibility, device-calibration]
-    design/feature/cuda_decode_attention.md#decode-graphs-and-fallback: [cuda-graphs-and-fallback]
-    design/feature/cuda_decode_attention.md#validation: [validation-status]
-    design/feature/cuda_decode_attention.md#per-beam-suffix-and-final-merge: [cuda-short-suffix-attention, scope-and-limitations]
-    design/feature/cuda_decode_attention.md#configuration: [configuration]
-    design/feature/cuda_decode_attention.md#performance: [validation-and-performance]
+    design/feature/gpu_decode_attention.md#shared-prompt-prefix: [cuda-prefix-attention, selection-and-compatibility, device-calibration]
+    design/feature/gpu_decode_attention.md#decode-graphs-and-fallback: [cuda-graphs-and-fallback]
+    design/feature/gpu_decode_attention.md#validation: [validation-status]
+    design/feature/gpu_decode_attention.md#per-beam-suffix-and-final-merge: [cuda-short-suffix-attention, scope-and-limitations]
+    design/feature/gpu_decode_attention.md#configuration: [configuration]
+    design/feature/gpu_decode_attention.md#performance: [validation-and-performance]
     design/feature/npu_prefill_bsnd.md: [npu-bsnd-prefill]
     design/feature/npu_prefill_bsnd.md#configuration: [configuration_1]
     design/feature/npu_prefill_bsnd.md#replay-and-fallback: [execution-and-fallback]
@@ -109,10 +113,10 @@ features/constraint-tables.md:
     design/module/constraint_tables.md#ascend: [npu-execution]
     design/module/constraint_tables.md#artifact-layout: [layout-and-compatibility]
 features/cuda-graphs.md:
-  page: design/feature/cuda_prefill_graph.md
+  page: design/feature/gpu_prefill_graph.md
   sections:
-    design/feature/cuda_prefill_graph.md#capture-shape-selection: [choose-a-capture-policy, modelrunner-v1-preserve-the-gr-grid, modelrunner-v2-use-the-native-capture-plan, compare-actual-execution]
-    design/feature/cuda_prefill_graph.md#configuration: [prefill-capture-configuration, dense-cuda-prefill-opt-in]
+    design/feature/gpu_prefill_graph.md#capture-shape-selection: [choose-a-capture-policy, modelrunner-v1-preserve-the-gr-grid, modelrunner-v2-use-the-native-capture-plan, compare-actual-execution]
+    design/feature/gpu_prefill_graph.md#configuration: [prefill-capture-configuration, dense-cuda-prefill-opt-in]
     design/module/model_runner_v2.md: [modelrunner-v2-multi-batch-execution]
     design/module/model_runner_v2.md#reuse-of-native-vllm: [reuse-of-native-vllm, vllm-030-integration]
     design/module/model_runner_v2.md#cuda-stage-hooks-contract: [graph-installation-and-startup-ownership, execution-and-shared-support-ownership, native-output-completion-boundary]

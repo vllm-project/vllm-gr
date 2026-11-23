@@ -14,12 +14,12 @@ import numpy as np
 import torch
 import triton
 
-from vllm_gr.ops.cuda import beam_state as beam_state_ops
-from vllm_gr.ops.cuda.beam_selection import (
+from vllm_gr.ops.gpu import beam_state as beam_state_ops
+from vllm_gr.ops.gpu.beam_selection import (
     _hierarchical_topk_out,
     allocate_beam_selection_scratch,
 )
-from vllm_gr.ops.cuda.beam_state import FINISH_STOP
+from vllm_gr.ops.gpu.beam_state import FINISH_STOP
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
@@ -35,7 +35,7 @@ from vllm_gr.v1.beam.batch_contracts import (
 _CONTROL_WORDS = 3
 
 if TYPE_CHECKING:
-    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+    from vllm_gr.v1.worker.gpu.beam_stage_runner import (
         BeamRequestBinding,
         GPUBeamStageRunner,
     )

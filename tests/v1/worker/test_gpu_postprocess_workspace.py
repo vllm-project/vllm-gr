@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_gr.v1.worker.cuda import gpu_postprocess_workspace as workspace_support
+from vllm_gr.v1.worker.gpu import postprocess_workspace as workspace_support
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
@@ -102,7 +102,7 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
     from unittest.mock import Mock
 
     from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, GRConfig
-    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+    from vllm_gr.v1.worker.gpu.postprocess_workspace import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
     )
@@ -186,7 +186,7 @@ def _flash_runner(*, constrained: bool = False, beam_width: int = 64, **deployme
 def test_workspace_reserves_shared_flash_logits_before_kv_cache_sizing(
     monkeypatch: pytest.MonkeyPatch, deployment: dict[str, Any], rows: int
 ) -> None:
-    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+    from vllm_gr.v1.worker.gpu.postprocess_workspace import (
         BeamPostprocessWorkspace,
     )
 
@@ -233,7 +233,7 @@ def test_workspace_reserves_shared_flash_logits_before_kv_cache_sizing(
 def test_workspace_reserves_flash_logits_for_multi_request_prefill(
     monkeypatch: pytest.MonkeyPatch, beam_width: int, rows: int
 ) -> None:
-    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+    from vllm_gr.v1.worker.gpu.postprocess_workspace import (
         BeamPostprocessWorkspace,
     )
 
@@ -257,7 +257,7 @@ def test_workspace_reserves_flash_logits_for_multi_request_prefill(
 def test_workspace_does_not_reserve_flash_logits_for_constrained_tables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+    from vllm_gr.v1.worker.gpu.postprocess_workspace import (
         BeamPostprocessWorkspace,
     )
 
@@ -282,10 +282,10 @@ def test_cuda_admission_fixture_supports_unconstrained_head_selection(
     import torch
 
     from tests.kernels import beam_stage_test_utils as builders
-    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+    from vllm_gr.v1.worker.gpu.beam_stage_runner import (
         _get_unconstrained_head_layout,
     )
-    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+    from vllm_gr.v1.worker.gpu.postprocess_workspace import (
         BeamPostprocessWorkspace,
     )
 

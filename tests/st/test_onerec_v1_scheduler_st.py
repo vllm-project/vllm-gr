@@ -93,12 +93,12 @@ class OneRecV1STWorkerExtension:
         return f"{type(runner).__module__}.{type(runner).__name__}"
 
     def onerec_v1_st_observe(self) -> None:
-        from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
-        from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+        from vllm_gr.v1.worker.gpu.beam_decode_graph import BeamDecodeGraph
+        from vllm_gr.v1.worker.gpu.beam_stage_runner import (
             AsyncGPUBeamOutput,
             GPUBeamStageRunner,
         )
-        from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import (
+        from vllm_gr.v1.worker.gpu.v1.prefill_graph_runner import (
             GPUPrefillGraphRunner,
         )
 
@@ -224,7 +224,7 @@ class OneRecV1STWorkerExtension:
 
 def _observe_v2_prefill(runner: Any, events: list[dict[str, Any]], wrap: Any) -> None:
     """Observe native V2 inputs and completed FULL replays without GPU readback."""
-    from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
+    from vllm_gr.v1.worker.gpu.v2.prefill_graph_runner_v2 import (
         GRPrefillCudaGraphManager,
     )
 
@@ -339,7 +339,7 @@ def _check_v2_graph_events(events: list[dict[str, Any]]) -> None:
 def _completed_sequences(
     snapshot: dict[str, Any], steps: int
 ) -> list[tuple[tuple[int, ...], float]]:
-    from vllm_gr.ops.cuda.beam_state import FINISH_LENGTH
+    from vllm_gr.ops.gpu.beam_state import FINISH_LENGTH
 
     completed = snapshot["completed"]
     sequences = []

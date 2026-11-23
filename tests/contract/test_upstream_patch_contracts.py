@@ -57,7 +57,7 @@ _SyntheticAscendPlatform.__qualname__ = "NPUPlatform"
 
 
 @pytest.mark.l1
-@pytest.mark.parametrize("backend_id", ["cuda", "ascend"])
+@pytest.mark.parametrize("backend_id", ["cuda", "npu"])
 def test_common_and_selected_provider_patch_ownership_is_unique(
     monkeypatch: pytest.MonkeyPatch, backend_id: str
 ) -> None:
@@ -73,12 +73,12 @@ def test_common_and_selected_provider_patch_ownership_is_unique(
     patches = inventory["patches"]
     assert all(
         (p["scope"] == "core" and p["backend_id"] is None)
-        or (p["scope"] == "backend" and p["backend_id"] in {"cuda", "ascend"})
+        or (p["scope"] == "backend" and p["backend_id"] in {"cuda", "npu"})
         for p in patches
     )
     platforms = {
         "cuda": SimpleNamespace(_enum="CUDA", device_type="cuda", device_name="cuda"),
-        "ascend": _SyntheticAscendPlatform(),
+        "npu": _SyntheticAscendPlatform(),
     }
     monkeypatch.setattr(vllm.platforms, "current_platform", platforms[backend_id])
     monkeypatch.setattr(loader, "entry_points", lambda **kwargs: ())

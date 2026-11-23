@@ -12,7 +12,7 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 
 from tests.st.test_modelrunner_v2_stage_parity_st import OneRecV2ParityWorkerExtension
-from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
+from vllm_gr.v1.worker.gpu.v2.prefill_graph_runner_v2 import (
     GRPrefillCudaGraphManager,
 )
 

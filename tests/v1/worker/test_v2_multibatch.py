@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
 
 
 def test_prefill_restores_member_order_without_reordering_native_state(
@@ -22,7 +22,7 @@ def test_prefill_restores_member_order_without_reordering_native_state(
     # Load native dependencies before replacing the converter. Otherwise their
     # module-level imports can retain this CPU-only double after monkeypatch
     # restores torch_utils, breaking CUDA tests later in the same process.
-    import_module("vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2")
+    import_module("vllm_gr.v1.worker.gpu.v2.prefill_graph_runner_v2")
     logical = ("a", "b", "c", "d")
     native = ("d", "b", "c", "a")
     batch = SimpleNamespace(
@@ -99,7 +99,7 @@ def test_retirement_preserves_runner_policy_and_scheduler_output(v2: bool) -> No
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_gr.v1.beam.dispatch import GRRetireMetadata
-    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import execute_gr_retirement
+    from vllm_gr.v1.worker.gpu.beam_stage_runner import execute_gr_retirement
 
     scheduled = SchedulerOutput.make_empty()
     scheduled.gr_retire_metadata = GRRetireMetadata("a", 0, 1)

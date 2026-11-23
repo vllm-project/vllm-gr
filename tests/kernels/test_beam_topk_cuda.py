@@ -9,15 +9,15 @@ oracle bit for bit, and a vocabulary-sliced scan must match the single-shot one.
 import pytest
 import torch
 
-from vllm_gr.ops.cuda.beam_selection import (
+from vllm_gr.ops.gpu.beam_selection import (
     _hierarchical_topk_out,
     allocate_beam_selection_scratch,
 )
-from vllm_gr.ops.cuda.unconstrained_topk import (
+from vllm_gr.ops.gpu.unconstrained_topk import (
     allocate_unconstrained_topk_scratch,
     unconstrained_topk_out,
 )
-from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+from vllm_gr.ops.gpu.unconstrained_topk_mcap import (
     LOCAL_KEEP_MAX,
     LOCAL_TILE_SIZE,
     MCarryTopKScratch,
@@ -34,7 +34,7 @@ from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     stream_slice,
     unconstrained_topk_mcap_out,
 )
-from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import head_slice_plan
+from vllm_gr.v1.worker.gpu.beam_stage_runner import head_slice_plan
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 
@@ -671,7 +671,7 @@ def test_hierarchical_top1_ties_and_invalid_candidates(mask_invalid_indices: boo
 
 
 def _flash_supported() -> bool:
-    from vllm_gr.ops.cuda.unconstrained_topk_mcap import _flash_topk_kernel
+    from vllm_gr.ops.gpu.unconstrained_topk_mcap import _flash_topk_kernel
 
     return _flash_topk_kernel(torch.accelerator.current_device_index()) is not None
 
@@ -736,7 +736,7 @@ def _flash_backend(backend: str, monkeypatch: pytest.MonkeyPatch) -> list[tuple[
     exercised by that variant.
     """
 
-    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+    import vllm_gr.ops.gpu.unconstrained_topk_mcap as mcap
 
     calls: list[tuple[int, ...]] = []
     if backend == "reference_topk":
@@ -964,7 +964,7 @@ def _forbid_flashinfer(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     import flashinfer
     import flashinfer.topk as flashinfer_topk
 
-    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+    import vllm_gr.ops.gpu.unconstrained_topk_mcap as mcap
 
     calls: list[str] = []
 
@@ -985,7 +985,7 @@ def _forbid_flashinfer(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 def test_flash_topk_excludes_devices_below_filtered_topk_shared_memory_before_jit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+    import vllm_gr.ops.gpu.unconstrained_topk_mcap as mcap
 
     calls = _forbid_flashinfer(monkeypatch)
     monkeypatch.setattr(mcap, "_shared_memory_per_sm", lambda index: 100 * 1024)
@@ -1002,7 +1002,7 @@ def test_flash_topk_excludes_devices_below_filtered_topk_shared_memory_before_ji
 def test_flash_topk_queries_flashinfer_only_on_devices_with_enough_shared_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+    import vllm_gr.ops.gpu.unconstrained_topk_mcap as mcap
 
     calls = _forbid_flashinfer(monkeypatch)
     monkeypatch.setattr(mcap, "_shared_memory_per_sm", lambda index: 228 * 1024)
@@ -1018,7 +1018,7 @@ def test_flash_topk_queries_flashinfer_only_on_devices_with_enough_shared_memory
 def test_flash_topk_falls_back_to_i64_without_touching_flashinfer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+    import vllm_gr.ops.gpu.unconstrained_topk_mcap as mcap
 
     calls = _forbid_flashinfer(monkeypatch)
     monkeypatch.setattr(mcap, "_shared_memory_per_sm", lambda index: 100 * 1024)
@@ -1043,7 +1043,7 @@ def test_flash_topk_falls_back_to_i64_without_touching_flashinfer(
 
 def test_flash_stats_kernel_stores_one_zero_and_sanitizes_nonfinite() -> None:
     # Runs on every CUDA device, including those without FilteredTopK.
-    from vllm_gr.ops.cuda.unconstrained_topk_mcap import _flash_stats_kernel
+    from vllm_gr.ops.gpu.unconstrained_topk_mcap import _flash_stats_kernel
 
     logits = _flash_parity_logits()
     rows, vocab_size = logits.shape

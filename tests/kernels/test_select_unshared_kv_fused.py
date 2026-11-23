@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_fused
+from vllm_gr.ops.gpu.beam_kv_reorder import select_unshared_kv_fused
 from vllm_gr.v1.beam.reorder import select_unshared_kv
 
 CUDA_OK = torch.cuda.is_available()

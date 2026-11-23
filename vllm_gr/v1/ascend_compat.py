@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Compatibility imports for historical Ascend patch entry points."""
 
-from vllm_gr.platforms.ascend.config_patch import (
+from vllm_gr.platforms.npu.config_patch import (
     apply_engine_core_config_sanitizer,
     is_npu_platform,
 )

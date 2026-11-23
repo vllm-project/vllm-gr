@@ -3,8 +3,13 @@
 A provider binds GR operations to the active vLLM platform. Registry state is
 process-local module state: each frontend, EngineCore and worker process
 resolves its own provider, and an in-process EngineCore shares the frontend's
-registry. The built-in backend IDs are `cuda` and `ascend`, with device types
-`cuda` and `npu` respectively.
+registry. The built-in backend IDs are `cuda` and `npu`, matching their device
+types.
+
+If an existing deployment selects or disables the Ascend provider by ID, use
+`npu` in place of `ascend` in `VLLM_GR_BACKEND` or
+`VLLM_GR_DISABLE_BUILTIN_BACKENDS`. Integrations looking up the built-in
+provider in `vllm_gr.platform_backends` use the entry point named `npu`.
 
 ## Registration and activation
 

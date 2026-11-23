@@ -6,7 +6,7 @@
 beam decision.  The mode follows ``vllm_gr_npu_decode_execution``:
 
 - ``cascade`` (default, any device): the Triton fused fast path
-  ``ops.cuda.beam_kv_reorder.select_unshared_kv_fused`` (one gather + one scatter launch
+  ``ops.gpu.beam_kv_reorder.select_unshared_kv_fused`` (one gather + one scatter launch
   across all layers, CUDA only), falling back to the per-layer reference
   ``select_unshared_kv`` indexed by ``slot`` with 0-based
   ``decode_step`` semantics when the fused path declines (non-CUDA,
@@ -198,7 +198,7 @@ def reorder_unshared_kv(
     key_caches = [p.unshared_key for p in pools]
     value_caches = [p.unshared_value for p in pools]
     if aux_key is not None and aux_value is not None:
-        from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_fused
+        from vllm_gr.ops.gpu.beam_kv_reorder import select_unshared_kv_fused
 
         if select_unshared_kv_fused(
             parent,

@@ -9,9 +9,9 @@ import or execute these deliberately incompatible implementations.
 
 from typing import Any, ClassVar
 
-from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks, CudaStageHooksType
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.gpu.stage_hooks import CudaStageHooks, CudaStageHooksType
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
 
 v1: CudaStageHooksType = CudaStageHooksV1
 v2: CudaStageHooksType = CudaStageHooksV2

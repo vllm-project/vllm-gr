@@ -27,8 +27,8 @@ from vllm.v1.worker.gpu import cudagraph_utils as native
 
 from vllm_gr.config import GRConfig
 from vllm_gr.config.models import DeploymentOptions
-from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import close_v2_runtime
-from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
+from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import close_v2_runtime
+from vllm_gr.v1.worker.gpu.v2.prefill_graph_runner_v2 import (
     PrefillCapturePlan,
     install_prefill_graph_manager_v2,
 )

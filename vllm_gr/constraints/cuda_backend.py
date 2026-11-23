@@ -17,7 +17,7 @@ from vllm_gr.constraints.backend import (
     build_constraint_output,
     validate_select_inputs,
 )
-from vllm_gr.ops.cuda.rec_constrained_topk import (
+from vllm_gr.ops.gpu.rec_constrained_topk import (
     _rec_constrained_topk_cuda_out_unchecked,
     rec_constrained_topk_cuda,
     rec_constrained_topk_cuda_out,

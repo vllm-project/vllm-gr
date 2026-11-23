@@ -14,7 +14,7 @@ from ..compat import (
 )
 
 
-def check_ascend_environment(*, require_npu_platform: bool = False) -> dict[str, str]:
+def check_npu_environment(*, require_npu_platform: bool = False) -> dict[str, str]:
     """Validate the complete Ascend runtime used by vllm-gr.
 
     Checking the ``triton-ascend`` distribution alone is insufficient because

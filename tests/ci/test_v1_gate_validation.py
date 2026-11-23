@@ -204,7 +204,7 @@ def test_recall_graph_gate_requires_every_b4_batch_to_replay() -> None:
 @pytest.mark.l1  # type: ignore[misc]
 def test_recall_gr_config_preserves_calibrated_b4_capture(tmp_path: Path) -> None:
     from vllm_gr.config import gr_config_from_mapping
-    from vllm_gr.v1.worker.cuda.v1.prefill_capture_plan import plan_prefill_capture
+    from vllm_gr.v1.worker.gpu.v1.prefill_capture_plan import plan_prefill_capture
     from vllm_gr.v1.worker.prefill_graph_common import (
         get_default_buckets,
         get_prefill_graph_capture_num_reqs,

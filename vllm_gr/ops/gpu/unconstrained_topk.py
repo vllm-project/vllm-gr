@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from vllm_gr.ops.cuda.topk_sort_key import pack_score_index, unpack_score
+from vllm_gr.ops.gpu.topk_sort_key import pack_score_index, unpack_score
 
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"

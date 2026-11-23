@@ -27,20 +27,20 @@ from vllm_gr.config.models import (
 )
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
-from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+from vllm_gr.ops.gpu.unconstrained_topk_mcap import (
     LOCAL_TILE_SIZE,
 )
-from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+from vllm_gr.ops.gpu.unconstrained_topk_mcap import (
     MCarryTopKScratch as UnconstrainedTopKScratch,
 )
-from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+from vllm_gr.ops.gpu.unconstrained_topk_mcap import (
     allocate_mcap_topk_scratch as allocate_unconstrained_topk_scratch,
 )
-from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+from vllm_gr.ops.gpu.unconstrained_topk_mcap import (
     repair_emit,
     stream_slice,
 )
-from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
+from vllm_gr.ops.gpu.unconstrained_topk_mcap import (
     unconstrained_topk_mcap_out as unconstrained_topk_out,
 )
 from vllm_gr.v1.attention.backends.beam_prefix_policy import configured_fa_version
@@ -67,23 +67,23 @@ from vllm_gr.v1.beam.dispatch import (
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.beam.session import BeamSearchSession
-from vllm_gr.v1.worker.cuda.beam_final_output import GPUBeamFinalOutput
-from vllm_gr.v1.worker.cuda.beam_search_runner import (
+from vllm_gr.v1.worker.gpu.beam_final_output import GPUBeamFinalOutput
+from vllm_gr.v1.worker.gpu.beam_search_runner import (
     BeamBatchSearchRunner,
     BeamCandidateBatch,
     BeamSearchRunner,
 )
-from vllm_gr.v1.worker.cuda.beam_state import BeamSearchState
-from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspaceKey
-from vllm_gr.v1.worker.cuda.gpu_stage_hooks import (
-    CudaStageHooks,
-    CudaStageHooksType,
-    validate_stage_hooks_type,
-)
-from vllm_gr.v1.worker.cuda.gr_inputs import (
+from vllm_gr.v1.worker.gpu.beam_state import BeamSearchState
+from vllm_gr.v1.worker.gpu.gr_inputs import (
     GRInputBuffers,
     PreparedGRInputs,
     bind_device_inputs,
+)
+from vllm_gr.v1.worker.gpu.postprocess_workspace import BeamPostprocessWorkspaceKey
+from vllm_gr.v1.worker.gpu.stage_hooks import (
+    CudaStageHooks,
+    CudaStageHooksType,
+    validate_stage_hooks_type,
 )
 
 METADATA_ABI = 1
@@ -1406,7 +1406,7 @@ def get_stage_runner(
         raise ValueError("captured Beam resource addresses or layouts changed")
     # The graph captures the adapter's fixed Forward and attention buffers,
     # not the request-local Beam state or its effective token budget.
-    from vllm_gr.v1.worker.cuda.gpu_dynamic_beam import (
+    from vllm_gr.v1.worker.gpu.dynamic_beam import (
         GPUDynamicBeam,
         discard_dynamic_graphs,
         uses_dynamic_beam,

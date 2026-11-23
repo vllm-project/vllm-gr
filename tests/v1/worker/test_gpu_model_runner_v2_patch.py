@@ -14,9 +14,9 @@ import pytest
 from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.v1.worker import gr_gc as _gc_runtime
 from vllm_gr.v1.worker import model_runner_contracts as _patch_contracts
-from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
-from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_resources as resources
-from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runtime
+from vllm_gr.v1.worker.gpu.v2 import model_runner_v2_patch as v2
+from vllm_gr.v1.worker.gpu.v2 import model_runner_v2_resources as resources
+from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import get_v2_runtime
 
 
 def test_discover_worker_runners_returns_v2_class() -> None:
@@ -195,7 +195,7 @@ def test_configure_model_runner_default_normalizes_opt_in(
 def test_capture_order_and_failure_propagation(
     monkeypatch: pytest.MonkeyPatch, beam_enabled: bool, failure: str | None
 ) -> None:
-    from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
+    from vllm_gr.v1.worker.gpu.v2 import prefill_graph_runner_v2 as prefill
 
     worker = SimpleNamespace(
         _vllm_gr_config=SimpleNamespace(beam_max_width=4 if beam_enabled else None),
@@ -236,8 +236,8 @@ def test_repeated_capture_preserves_published_decode_failure(
 ) -> None:
     from vllm_gr.v1.attention.backends import beam_prefix_calibrate
     from vllm_gr.v1.worker import gr_startup
-    from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
-    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+    from vllm_gr.v1.worker.gpu.v2 import prefill_graph_runner_v2 as prefill
+    from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
 
     worker = SimpleNamespace(
         device="cuda",
@@ -279,7 +279,7 @@ def test_repeated_capture_preserves_published_decode_failure(
 
 
 def test_stage_hooks_require_native_prefill_output_and_scheduler_kv() -> None:
-    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+    from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
 
     hooks = CudaStageHooksV2(SimpleNamespace())
     with pytest.raises(RuntimeError, match="hidden states"):
@@ -296,7 +296,7 @@ def test_profile_capture_includes_decode_without_freezing(
 ) -> None:
     from vllm.compilation import monitor
 
-    from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
+    from vllm_gr.v1.worker.gpu.v2 import prefill_graph_runner_v2 as prefill
 
     manager = (
         prefill.GRPrefillCudaGraphManager.__new__(prefill.GRPrefillCudaGraphManager)
@@ -344,7 +344,7 @@ def test_profile_decode_failure_restores_native_capture_state(
 ) -> None:
     from vllm.compilation import monitor
 
-    from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
+    from vllm_gr.v1.worker.gpu.v2 import prefill_graph_runner_v2 as prefill
 
     worker = SimpleNamespace(
         _vllm_gr_config=SimpleNamespace(beam_max_width=128),
@@ -384,7 +384,7 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
     from vllm.config import CUDAGraphMode as Mode
     from vllm.v1.worker.gpu import cudagraph_utils as native
 
-    from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
+    from vllm_gr.v1.worker.gpu.v2 import prefill_graph_runner_v2 as prefill
 
     mib = 1 << 20
     manager = SimpleNamespace(

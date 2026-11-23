@@ -11,7 +11,7 @@ import pytest
 from vllm_gr import patch, plugin
 from vllm_gr.engine import startup
 from vllm_gr.platforms import compat, loader
-from vllm_gr.platforms.ascend import environment, spawn_patch
+from vllm_gr.platforms.npu import environment, spawn_patch
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     get_active_backend,
@@ -68,7 +68,7 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
     cuda_check = hook("cuda_environment", {})
     npu_check = hook("npu_environment", {})
     monkeypatch.setattr(compat, "check_vllm_runtime", cuda_check)
-    monkeypatch.setattr(environment, "check_ascend_environment", npu_check)
+    monkeypatch.setattr(environment, "check_npu_environment", npu_check)
     monkeypatch.setattr(
         patch.pangu_compat, "apply_pangu_tied_embeddings_patch", hook("pangu", True)
     )
@@ -89,7 +89,7 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
         activate.reset_mock()
         state = plugin.initialize_runtime()
         activate.assert_called_once_with()
-        expected_backend_id = "ascend" if device_type == "npu" else "cuda"
+        expected_backend_id = "npu" if device_type == "npu" else "cuda"
         assert get_active_backend().backend_id == expected_backend_id
         backend_events = ["spawn", "worker"] if device_type == "npu" else []
         assert events == [
@@ -147,9 +147,9 @@ def test_partial_provider_failure_stops_common_plan_and_retains_cause(
     beam = Mock()
     monkeypatch.setattr(patch, "_apply_gr_beam_patches", beam)
 
-    with pytest.raises(RuntimeError, match="backend 'ascend'.*partial.*restart") as raised:
+    with pytest.raises(RuntimeError, match="backend 'npu'.*partial.*restart") as raised:
         patch.re_apply_patches()
     assert raised.value.__cause__ is failure
-    assert get_active_backend().backend_id == "ascend"
+    assert get_active_backend().backend_id == "npu"
     spawn.assert_called_once_with()
     beam.assert_not_called()

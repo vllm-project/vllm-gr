@@ -8,9 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_gr.platforms.ascend import NPU_BACKEND
 from vllm_gr.platforms.cuda import CUDA_BACKEND
 from vllm_gr.platforms.identity import platform_identity
+from vllm_gr.platforms.npu import NPU_BACKEND
 
 
 class _VendorPlatform:
@@ -139,7 +139,7 @@ def test_matches_is_the_only_acceptance_point_for_a_synthetic_identity() -> None
     try:
         load_backend_plugins()
         identity = platform_identity(_VendorSubclass())
-        assert select_backend(identity).backend_id == "ascend"
+        assert select_backend(identity).backend_id == "npu"
     finally:
         _reset_backend_registry_for_tests()
 

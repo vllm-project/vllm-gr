@@ -34,14 +34,14 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
     if gr_config.beam_sid_stage_vocab and device != "npu":
         raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
     if device == "npu":
-        from vllm_gr.platforms.ascend.admission import validate_npu_device_config
+        from vllm_gr.platforms.npu.admission import validate_npu_device_config
 
         validate_npu_device_config(config, gr_config, request)
 
 
 def validate_decode_token_budget(request: BeamBatchRequest, config: Any) -> None:
     if _device_type(config) == "npu":
-        from vllm_gr.platforms.ascend.admission import validate_decode_token_budget
+        from vllm_gr.platforms.npu.admission import validate_decode_token_budget
 
         validate_decode_token_budget(request, config)
 

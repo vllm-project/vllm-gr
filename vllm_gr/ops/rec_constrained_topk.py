@@ -262,7 +262,7 @@ def rec_constrained_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dispatch constrained top-k to a device implementation or Torch fallback."""
     if logits.device.type == "cuda":
-        from vllm_gr.ops.cuda.rec_constrained_topk import rec_constrained_topk_cuda
+        from vllm_gr.ops.gpu.rec_constrained_topk import rec_constrained_topk_cuda
 
         tokens, logprobs, _, _ = rec_constrained_topk_cuda(
             logits,
