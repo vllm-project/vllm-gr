@@ -48,14 +48,13 @@ CUDA_STAGE_FILES = [
     "tests/tools/cuda_stage_typing_cases.py",
 ]
 
-# Check the NPU input/bookkeeping helpers together with both production callers
-# so a signature change cannot escape caller-side validation.
+# Check the NPU input helpers together with both production callers so a
+# signature change cannot escape caller-side validation.
 NPU_WORKER_GROUP = "npu-worker"
 NPU_WORKER_FILES = [
     "vllm_gr/v1/worker/npu/npu_model_runner_patch.py",
     "vllm_gr/v1/worker/npu/npu_beam_stage_runner.py",
     "vllm_gr/v1/worker/npu/npu_model_runner_inputs.py",
-    "vllm_gr/v1/worker/npu/npu_model_runner_bookkeeping.py",
 ]
 
 

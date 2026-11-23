@@ -16,7 +16,7 @@ from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     get_active_backend,
 )
-from vllm_gr.v1 import ascend_compat
+from vllm_gr.v1.worker.npu import startup_patch
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
@@ -77,7 +77,7 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
     spawn = hook("spawn", True)
     worker = hook("worker", 1)
     monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", spawn)
-    monkeypatch.setattr(ascend_compat, "patch_npu_worker_init_device", worker)
+    monkeypatch.setattr(startup_patch, "patch_npu_worker_init_device", worker)
     beam = hook("beam", 1)
     monkeypatch.setattr(patch, "_apply_gr_beam_patches", beam)
     monkeypatch.setattr(patch, "get_last_beam_patch_report", lambda: None)
@@ -143,7 +143,7 @@ def test_partial_provider_failure_stops_common_plan_and_retains_cause(
     spawn = Mock(return_value=True)
     monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", spawn)
     failure = RuntimeError("native worker hook failed")
-    monkeypatch.setattr(ascend_compat, "patch_npu_worker_init_device", Mock(side_effect=failure))
+    monkeypatch.setattr(startup_patch, "patch_npu_worker_init_device", Mock(side_effect=failure))
     beam = Mock()
     monkeypatch.setattr(patch, "_apply_gr_beam_patches", beam)
 

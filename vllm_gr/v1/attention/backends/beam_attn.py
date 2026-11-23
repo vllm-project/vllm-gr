@@ -473,9 +473,7 @@ class BeamAttentionImpl(AttentionImpl):
             # of host Python int, enabling CUDA Graph capture/replay).
             decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
             if decode_step_buf is not None and decode_step_buf.is_cuda:
-                from vllm_gr.v1.attention.backends.beam_graph_kernels import (
-                    cache_unshared_kv_graph,
-                )
+                from vllm_gr.ops.cuda.beam_kv_cache import cache_unshared_kv_graph
 
                 cache_unshared_kv_graph(
                     pool.unshared_key,

@@ -137,14 +137,14 @@ class TestPanguGrllmShutdown(unittest.TestCase):
         llm.llm_engine = engine
 
         with mock.patch(
-            "vllm_gr.utils.npu_adapter.release_accelerator_memory",
-            create=True,
-        ):
+            "vllm_gr.entrypoints.llm.release_accelerator_memory",
+        ) as release_accelerator_memory:
             with mock.patch.object(gc, "collect") as mock_gc:
                 GRLLM.shutdown(llm)
 
         engine.shutdown.assert_called_once_with()
         mock_gc.assert_called_once_with()
+        release_accelerator_memory.assert_called_once_with()
         self.assertIsNone(llm.llm_engine)
         self.assertTrue(llm._shutdown_complete)
 

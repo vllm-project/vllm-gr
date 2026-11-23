@@ -17,9 +17,7 @@ from vllm.sampling_params import RequestOutputKind
 from vllm_gr.config import GRConfig
 from vllm_gr.config.models import configured_candidate_width
 from vllm_gr.entrypoints.beam_search.client import AsyncBeamSearchClient
-from vllm_gr.entrypoints.beam_search.input_processor import (
-    apply_beam_request_defaults,
-)
+from vllm_gr.entrypoints.beam_search.request_params import apply_beam_request_defaults
 from vllm_gr.sampling_params import BeamSearchParams
 from vllm_gr.v1.beam.batch_contracts import (
     ADMISSION_REJECTED_CODE,

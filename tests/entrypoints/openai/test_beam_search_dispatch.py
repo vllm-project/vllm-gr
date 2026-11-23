@@ -181,16 +181,50 @@ def test_completion_fallback_binds_ids_before_iteration(monkeypatch: Any) -> Non
     ]
 
 
-def test_completion_schema_accepts_trie_id_list() -> None:
+def test_completion_schema_accepts_trie_id_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 
-    from vllm_gr.entrypoints.openai.beam_search_patch import patch_sampling
+    from vllm_gr import patch as runtime_patch
+    from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
 
-    patch_sampling()
-    request = CompletionRequest.model_validate_json(
-        '{"model":"test","prompt":["a","b"],"use_beam_search":true,"vllm_xargs":{"trie_ids":[1,0]}}'
+    sampling_patch = next(
+        patch
+        for patch in runtime_patch._required_beam_patches()
+        if patch.name == "chat_sampling_conversion"
     )
-    assert request.vllm_xargs["trie_ids"] == [1, 0]
+    field = CompletionRequest.model_fields["vllm_xargs"]
+    try:
+        with monkeypatch.context() as changes:
+            changes.setattr(runtime_patch, "_LAST_BEAM_PATCH_REPORT", None)
+            changes.setattr(ChatCompletionRequest, "to_beam_search_params", to_beam_search_params)
+            changes.setattr(CompletionRequest, "to_beam_search_params", to_beam_search_params)
+            changes.setattr(field, "annotation", dict[str, str | int | float] | None)
+            CompletionRequest.model_rebuild(force=True)
+
+            # Chat and Completion methods are live, but the Completion schema drifted.
+            assert "CompletionRequest.vllm_xargs" in (sampling_patch.verify() or "")
+            report = runtime_patch._initialize_beam_patch_plan((sampling_patch,))
+            assert report.statuses() == {"chat_sampling_conversion": "applied"}
+            request = CompletionRequest.model_validate(
+                {
+                    "model": "test",
+                    "prompt": ["a", "b"],
+                    "use_beam_search": True,
+                    "vllm_xargs": {"trie_ids": [1, 0]},
+                }
+            )
+            assert request.vllm_xargs["trie_ids"] == [1, 0]
+
+            # Drift at only the Completion method must also trigger repair.
+            changes.setattr(CompletionRequest, "to_beam_search_params", lambda *args: None)
+            assert "CompletionRequest.to_beam_search_params" in (sampling_patch.verify() or "")
+            report = runtime_patch._initialize_beam_patch_plan((sampling_patch,))
+            assert report.statuses() == {"chat_sampling_conversion": "applied"}
+            assert CompletionRequest.to_beam_search_params is to_beam_search_params
+            assert sampling_patch.verify() is None
+    finally:
+        CompletionRequest.model_rebuild(force=True)
 
 
 def test_legacy_gr_configuration_is_rejected(monkeypatch: Any) -> None:

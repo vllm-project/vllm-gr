@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any
 
+from vllm_gr.config.execution import validate_gr_execution_config
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchRequest,
@@ -36,7 +37,6 @@ from vllm_gr.v1.core.sched.beam_session import (
 )
 from vllm_gr.v1.engine.beam_admission import (
     validate_gr_device_config,
-    validate_gr_execution_config,
     validate_gr_request,
 )
 

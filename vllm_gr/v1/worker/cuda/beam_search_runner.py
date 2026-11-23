@@ -22,7 +22,7 @@ from vllm_gr.ops.cuda.beam_selection import (
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.beam.session import BeamSearchSession
-from vllm_gr.v1.beam.state import BeamSearchState
+from vllm_gr.v1.worker.cuda.beam_state import BeamSearchState
 from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspace
 
 try:

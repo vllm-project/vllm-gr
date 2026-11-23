@@ -16,7 +16,7 @@ from vllm.inputs import TokensPrompt
 
 from vllm_gr.config import GRConfig
 from vllm_gr.logger import init_logger
-from vllm_gr.utils.npu_adapter import release_accelerator_memory
+from vllm_gr.utils.accelerator import release_accelerator_memory
 
 if TYPE_CHECKING:
     from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput

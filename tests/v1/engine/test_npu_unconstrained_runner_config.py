@@ -263,7 +263,7 @@ def test_engine_config_preserves_supported_and_existing_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str, use_v2: bool, mode: str
 ) -> None:
     from vllm_gr.engine import arg_utils_gr
-    from vllm_gr.v1 import ascend_compat
+    from vllm_gr.platforms.ascend import config_patch
 
     config = _host(device, use_v2)
     gr_config = _gr_config(mode, canonical=True, device=device)
@@ -272,7 +272,7 @@ def test_engine_config_preserves_supported_and_existing_paths(
     monkeypatch.setattr(
         arg_utils_gr, "engine_config_service", lambda: legacy_config_service(device)
     )
-    monkeypatch.setattr(ascend_compat, "apply_engine_core_config_sanitizer", Mock())
+    monkeypatch.setattr(config_patch, "apply_engine_core_config_sanitizer", Mock())
 
     assert arg_utils_gr.create_engine_config(args) is config
     effective = GRConfig.from_vllm_config(config)

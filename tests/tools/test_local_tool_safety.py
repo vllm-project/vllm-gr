@@ -112,32 +112,41 @@ def wait_for_mock_act(path: Path, wrapper: subprocess.Popen[str]) -> None:
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    ("signum", "expected_status"), [(signal.SIGINT, 130), (signal.SIGTERM, 143)]
+    ("signum", "expected_status", "signal_group"),
+    [
+        pytest.param(signal.SIGINT, 130, False, id="2-130"),
+        pytest.param(signal.SIGTERM, 143, False, id="15-143"),
+        pytest.param(signal.SIGINT, 130, True, id="foreground-group"),
+    ],
 )
 def test_run_act_forwards_signal_and_waits_for_cleanup(
-    tmp_path: Path, signum: signal.Signals, expected_status: int
+    tmp_path: Path, signum: signal.Signals, expected_status: int, signal_group: bool
 ) -> None:
     env = setup_mock_act(
         tmp_path,
         f"#!{sys.executable}\n"
         r"""
+import os
 import signal
 import sys
 import time
 from pathlib import Path
 
+pid_marker = Path("act-pid.tmp")
+pid_marker.write_text(str(os.getpid()))
+pid_marker.rename("act-pid")
 assert sys.argv[1] == "--secret-file"
 assert sys.stdin.readline() == "mock stdin\n"
 assert signal.getsignal(signal.SIGINT) != signal.SIG_IGN
 secret_file = Path(sys.argv[2])
 unlocked = Path("unlocked")
+received_signals = []
 
 def handle_signal(signum, _frame):
     assert secret_file.is_file()
     assert not unlocked.exists()
-    marker = Path("received-signal.tmp")
-    marker.write_text(str(signum))
-    marker.rename("received-signal")
+    received_signals.append(signum)
+    Path("received-signal").touch()
 
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
@@ -147,9 +156,11 @@ while not Path("allow-exit").exists():
     time.sleep(0.01)
 assert secret_file.is_file()
 assert not unlocked.exists()
+Path("handled-signals").write_text("\n".join(map(str, received_signals)))
 sys.exit(55)
 """,
     )
+    act_pid_path = tmp_path / "act-pid"
     with subprocess.Popen(
         ["bash", str(ROOT / "tools/run_act.sh")],
         cwd=tmp_path,
@@ -166,22 +177,34 @@ sys.exit(55)
             wrapper.stdin.flush()
             wait_for_mock_act(tmp_path / "running", wrapper)
             secret_file = Path((tmp_path / "secret-path").read_text())
-            wrapper.send_signal(signum)
-            received = tmp_path / "received-signal"
-            wait_for_mock_act(received, wrapper)
-            assert received.read_text() == str(int(signum))
+            act_group = os.getpgid(int(act_pid_path.read_text()))
+            if signal_group:
+                os.killpg(wrapper.pid, signum)
+            else:
+                wrapper.send_signal(signum)
+            wait_for_mock_act(tmp_path / "received-signal", wrapper)
             assert wrapper.poll() is None
             assert secret_file.is_file()
             assert not (tmp_path / "unlocked").exists()
             (tmp_path / "allow-exit").touch()
             stdout, stderr = wrapper.communicate(timeout=5)
         except BaseException:
-            with suppress(ProcessLookupError):
-                os.killpg(wrapper.pid, signal.SIGKILL)
-            wrapper.wait(timeout=5)
+            if wrapper.poll() is None and act_pid_path.is_file():
+                with suppress(ProcessLookupError):
+                    os.kill(int(act_pid_path.read_text()), signal.SIGKILL)
+                with suppress(subprocess.TimeoutExpired):
+                    wrapper.wait(timeout=5)
+            if wrapper.poll() is None:
+                with suppress(ProcessLookupError):
+                    os.killpg(wrapper.pid, signal.SIGKILL)
+                wrapper.wait(timeout=5)
             raise
     assert TOKEN not in stdout
     assert TOKEN not in stderr
     assert wrapper.returncode == expected_status, stderr
+    assert (tmp_path / "handled-signals").read_text().splitlines() == [str(int(signum))]
+    if signal_group:
+        # Linux can coalesce duplicate SIGINTs before either is handled.
+        assert act_group != wrapper.pid
     assert not secret_file.exists()
     assert (tmp_path / "unlocked").read_text() == "123\n"

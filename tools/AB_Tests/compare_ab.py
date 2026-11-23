@@ -53,6 +53,12 @@ KEY_METRICS = [
 
 PERCENTILES = ("mean", "p50", "p90", "p99")
 CANONICAL_METRICS = ("e2el", "e2el_hit")
+SCENARIO_FIELDS = (
+    "scenario.key",
+    "scenario.execution_mode",
+    "scenario.endpoint",
+    "scenario.max_concurrency",
+)
 CONTENT_FIELDS = (
     "dataset.measured_sha256",
     "dataset.selection.workload_sha256",
@@ -66,7 +72,6 @@ MEASUREMENT_FIELDS = (
     "scenario.input_tokens_target",
     "scenario.num_prompts",
     "scenario.warmup_requests",
-    "scenario.max_concurrency",
     "scenario.batch_size",
     "scenario.benchmark_args.max_tokens",
     "scenario.benchmark_args.measurement_mode",
@@ -79,6 +84,7 @@ GPU_FIELDS = (
     "environment.gpu.memory_mib",
     "environment.gpu.driver_version",
 )
+MISSING = object()
 
 
 def load(path: Path) -> dict:
@@ -143,12 +149,12 @@ def merge_latency(summaries: list[dict]) -> dict[str, dict[str, float]]:
     return merged
 
 
-def field(summary: dict, name: str):
+def field(summary: dict, name: str, *, default=None):
     value = summary
     for part in name.split("."):
         if not isinstance(value, dict):
-            return None
-        value = value.get(part)
+            return default
+        value = value.get(part, default)
     return value
 
 
@@ -243,7 +249,9 @@ def check_summary(summary: dict, completed: int) -> list[str]:
     )
     validate_samples(summary, sample_count)
 
-    reasons = []
+    reasons = [
+        f"{name} is unavailable" for name in SCENARIO_FIELDS if field(summary, name) in (None, "")
+    ]
     for name in (*CONTENT_FIELDS, "dataset.selection.sample_ids_sha256"):
         digest = comparison_field(summary, name)
         if digest is None:
@@ -292,10 +300,10 @@ def check_summary(summary: dict, completed: int) -> list[str]:
     return reasons
 
 
-def check_matching_runs(runs: list[tuple[Path, dict]]) -> None:
+def check_matching_runs(runs: list[tuple[Path, dict]]) -> str:
     seen = {}
     for path, summary in runs:
-        fields = (*CONTENT_FIELDS, "model.revision", "dataset.task")
+        fields = (*SCENARIO_FIELDS, *CONTENT_FIELDS, "model.revision", "dataset.task")
         if new_offline(summary):
             fields += (
                 *MEASUREMENT_FIELDS,
@@ -313,12 +321,22 @@ def check_matching_runs(runs: list[tuple[Path, dict]]) -> None:
                 if key != "catalog_path" and f"scenario.server_args.{key}" not in CONTENT_FIELDS
             )
         for name in fields:
-            value = comparison_field(summary, name)
-            if value is None or value == "":
+            # A reported null concurrency is an unlimited run. Older summaries
+            # may omit the field entirely, which is only descriptive evidence.
+            if name in ("scenario.key", "scenario.max_concurrency"):
+                value = field(summary, name, default=MISSING)
+                if value is MISSING:
+                    continue
+            else:
+                value = comparison_field(summary, name)
+            if name == "scenario.key" and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{path}: scenario.key must be a nonempty string")
+            if value == "" or (value is None and name != "scenario.max_concurrency"):
                 continue
             previous_path, previous_value = seen.setdefault(name, (path, value))
             if value != previous_value:
                 raise ValueError(f"{path}: {name} differs from {previous_path}")
+    return seen.get("scenario.key", (None, ""))[1]
 
 
 def pct(delta: float) -> str:
@@ -345,7 +363,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--label", required=True)
-    parser.add_argument("--scenario", default="")
+    parser.add_argument("--scenario", help="scenario display label (defaults to the summary key)")
     args = parser.parse_args()
 
     def validate_runs(paths: list[Path], summaries: list[dict]) -> list[int]:
@@ -372,7 +390,7 @@ def main() -> int:
         base_completed = validate_runs(args.base, base_summaries)
         head_completed = validate_runs(args.head, head_summaries)
         summaries = base_summaries + head_summaries
-        check_matching_runs(list(zip(args.base + args.head, summaries, strict=True)))
+        scenario_key = check_matching_runs(list(zip(args.base + args.head, summaries, strict=True)))
         historical = any(not new_offline(summary) for summary in summaries)
         gpu_identity = ("environment.gpu.uuid",)
         if not historical and not any(
@@ -391,6 +409,7 @@ def main() -> int:
         head = merge_latency(head_summaries)
     except (ValueError, TypeError, OverflowError) as exc:
         parser.error(str(exc))
+    scenario_label = args.scenario or scenario_key
     qualification = "historical" if historical else "smoke" if reasons else "performance"
     base_repeats = len(base_summaries)
     head_repeats = len(head_summaries)
@@ -407,6 +426,8 @@ def main() -> int:
                 continue
             bv, hv = b[pctl], h[pctl]
             delta = 100.0 * ((hv - bv) / bv)
+            if not math.isfinite(delta):
+                continue
             limit = NOISE_LIMITS[pctl]
             data.setdefault(metric, {})[pctl] = {
                 "base_ms": bv,
@@ -415,6 +436,8 @@ def main() -> int:
                 "significant": abs(delta) > limit
                 and not math.isclose(abs(delta), limit, rel_tol=1e-12),
             }
+    if not data:
+        parser.error("No comparable latency metrics in baseline and head summaries")
 
     def cell(row: dict[str, object] | None) -> str:
         if row is None:
@@ -428,7 +451,7 @@ def main() -> int:
     lines.append("|---|---|")
     lines.append(f"| Baseline | `{base_sha}` |")
     lines.append(f"| Head | `{head_sha}` |")
-    lines.append(f"| Scenario | `{args.scenario}` |")
+    lines.append(f"| Scenario | `{scenario_label}` |")
     lines.append(f"| Samples | {sum(base_completed)} baseline, {sum(head_completed)} head |")
     lines.append(f"| Repeats | {base_repeats} baseline, {head_repeats} head |")
     lines.append(f"| Qualification | {qualification} |")
@@ -519,7 +542,7 @@ def main() -> int:
             "qualification": qualification,
             "baseline_eligible": not reasons,
             "qualification_reasons": sorted(reasons),
-            "scenario": args.scenario,
+            "scenario": scenario_label,
             "base_sha": base_sha,
             "head_sha": head_sha,
             # The JSON fields carry the first summary's counts for compatibility.

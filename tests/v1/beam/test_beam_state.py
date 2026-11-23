@@ -11,7 +11,7 @@ from vllm_gr.v1.beam.attention_context import (
     BeamDecisionBuffers,
 )
 from vllm_gr.v1.beam.session import BeamSearchSession
-from vllm_gr.v1.beam.state import BeamSearchState
+from vllm_gr.v1.worker.cuda.beam_state import BeamSearchState
 
 # pytest's parametrization decorators are untyped.
 # mypy: disable-error-code="misc"

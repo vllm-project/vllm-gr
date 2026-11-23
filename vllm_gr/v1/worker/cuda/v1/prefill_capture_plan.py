@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Feasible GPU V1 Prefill shapes, shared by allocation and graph capture."""
+"""Feasible CUDA V1 Prefill shapes for buffer allocation and graph capture."""
 
 from collections.abc import Iterable
 

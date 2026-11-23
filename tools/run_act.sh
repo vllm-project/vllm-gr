@@ -80,9 +80,11 @@ if (( signal_status != 0 )); then
     exit "$signal_status"
 fi
 
-# Bash defers traps during a foreground command. Use an interruptible wait
-# with a child that keeps stdin and can receive SIGINT despite async launch.
-env --default-signal=INT,QUIT act "${token[@]}" \
+# Keep the launcher waitable by disabling job control before setsid.
+# The separate session routes terminal signals through the wrapper while
+# act keeps its inherited stdin.
+set +m
+setsid -- env --default-signal=INT,QUIT act "${token[@]}" \
     --container-options "--runtime=nvidia --gpus device=$cuda_dev -v ${HOME}/.cache/act-cache:/data/actions/cache" \
     --env NVIDIA_DRIVER_CAPABILITIES=all --artifact-server-path "${HOME}/artifacts" \
     -P self-hosted=ghcr.io/catthehacker/ubuntu:act-latest <&0 &

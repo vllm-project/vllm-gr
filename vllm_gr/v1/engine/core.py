@@ -92,10 +92,10 @@ def _admit_gr_session(self, batch_request) -> None:
         return
     engine_requests = tuple(item.request for item in batch_request.items)
     try:
+        from vllm_gr.config.execution import validate_gr_execution_config
+        from vllm_gr.platforms.errors import GRDeviceRequestError
         from vllm_gr.v1.engine.beam_admission import (
-            GRDeviceRequestError,
             validate_gr_device_config,
-            validate_gr_execution_config,
             validate_gr_request,
         )
 
@@ -119,11 +119,7 @@ def _admit_gr_session(self, batch_request) -> None:
         # engine started with the wrong settings is a server fault, not
         # something the caller can fix by resending.
         validate_gr_execution_config(self.vllm_config)
-        device = getattr(getattr(self.vllm_config, "device_config", None), "device", None)
-        if str(device).split(":")[0] == "npu":
-            validate_gr_device_config(self.vllm_config, batch_request)
-        else:
-            validate_gr_device_config(self.vllm_config)
+        validate_gr_device_config(self.vllm_config, batch_request)
         if self.batch_queue is None or self.batch_queue_size < 2:
             raise RuntimeError("beam_search requires a non-blocking EngineCore batch queue")
         preprocessed_batch = []

@@ -10,12 +10,12 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_gr.v1.beam import decision as beam_decision
 from vllm_gr.v1.beam.attention_context import (
     BeamAttentionContext,
     BeamDecisionBuffers,
 )
 from vllm_gr.v1.beam.session import BeamSearchSession
+from vllm_gr.v1.worker.npu import beam_decision
 
 
 def _make_context(

@@ -1,84 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-"""EngineCore Beam admission checks and interfaces."""
+"""EngineCore Beam admission checks."""
 
 from __future__ import annotations
 
-from concurrent.futures import Future
-from typing import Any, Protocol
-
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
+from typing import Any
 
 from vllm_gr.config import GRConfig
-from vllm_gr.config.execution import (
-    validate_gr_execution_config,
-    validate_gr_execution_runtime,
-)
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_MAX_DECODE_STEPS,
     configured_candidate_width,
     runtime_constraint_table,
 )
-from vllm_gr.platforms.ascend.admission import (
+from vllm_gr.platforms.beam_requests import (
     validate_decode_token_budget,
-    validate_npu_unconstrained_runner,
+    validate_gr_device_config,
 )
-from vllm_gr.platforms.errors import GRDeviceRequestError
-from vllm_gr.v1.beam.batch_contracts import (
-    BeamBatchParams,
-    BeamBatchRequest,
-    BeamBatchResult,
-)
-from vllm_gr.v1.beam.dispatch import (
-    GRDeviceStateRef,
-    GRDispatchSession,
-    GRExecutionCapacity,
-    GRRetireMetadata,
-    GRRetireResult,
-    GRStageKind,
-    GRStageMetadata,
-    GRWorkerResult,
-    validate_dispatch,
-    validate_dispatch_request,
-    validate_dispatch_session,
-)
-from vllm_gr.v1.core.sched.beam_session import (
-    GRAsyncSchedulerInterface,
-    GRResourceStatus,
-    GRSessionState,
-    GRSessionStatus,
-    GRStageCompletion,
-)
-
-
-def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
-    """Reject unavailable adapters without importing a device runtime."""
-    from vllm_gr.config import GRConfig
-
-    device = getattr(getattr(config, "device_config", None), "device", None)
-    if device is not None and str(device).split(":")[0] not in ("cuda", "npu"):
-        raise ValueError(
-            "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
-        )
-    gr_config = GRConfig.from_vllm_config(config)
-    if gr_config.beam_sid_stage_vocab and (device is None or str(device).split(":")[0] != "npu"):
-        raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
-    if device is not None and str(device).split(":")[0] == "npu":
-        from vllm_gr.platforms.ascend.admission import validate_npu_device_config
-
-        validate_npu_device_config(config, gr_config, request)
-    if (
-        request is not None
-        and device is not None
-        and str(device).split(":")[0] not in ("cuda", "npu")
-        and (
-            request.beam_params.dynamic_beam_widths is not None
-            or request.output_options.num_return_sequences != request.beam_params.beam_width
-        )
-    ):
-        raise ValueError("dynamic beam widths and result widths require CUDA or NPU beam_search")
+from vllm_gr.v1.beam.batch_contracts import BeamBatchParams, BeamBatchRequest
+from vllm_gr.v1.beam.dispatch import validate_dispatch_request
 
 
 def _reject_candidate_width_below_dynamic_schedule(
@@ -142,70 +82,8 @@ def validate_gr_request(
         validate_decode_token_budget(request, config)
 
 
-class GRModelExecutorInterface(Protocol):
-    """Native vLLM ModelExecutor call extended by the A4 Worker patch."""
-
-    def execute_model(
-        self,
-        scheduler_output: SchedulerOutput,
-        *,
-        non_block: bool,
-    ) -> Future[ModelRunnerOutput] | ModelRunnerOutput:
-        """Use vLLM's entry; non-blocking execution returns a Future."""
-        ...
-
-
-class GREngineCoreInterface(Protocol):
-    """GR hooks installed on vLLM EngineCore by monkey patching."""
-
-    def submit_gr_session(self, request: BeamBatchRequest) -> str:
-        """Enqueue one frontend submission and return its session ID.
-
-        Both online and offline adapters call this same entry exactly once.
-        """
-        ...
-
-    def step_with_batch_queue(self) -> Any:
-        """Patched native vLLM asynchronous EngineCore iteration.
-
-        A3 adds GR session transitions around the existing schedule,
-        ``execute_model(non_block=True)``, queue, and update-from-output flow.
-        Consecutive stages of the same session may coexist in the native queue
-        when ``can_issue_gr_stage`` permits look-ahead. The upstream return
-        contract remains unchanged.
-        """
-        ...
-
-    def finish_gr_session(self, session_id: str) -> BeamBatchResult:
-        """Return the retained terminal result after Scheduler/device drain."""
-        ...
-
-    def abort_gr_session(self, session_id: str) -> None: ...
-
-
 __all__ = [
-    "GRAsyncSchedulerInterface",
-    "GRDeviceRequestError",
-    "GRDeviceStateRef",
-    "GREngineCoreInterface",
-    "GRExecutionCapacity",
-    "GRModelExecutorInterface",
-    "GRResourceStatus",
-    "GRRetireMetadata",
-    "GRRetireResult",
-    "GRSessionState",
-    "GRSessionStatus",
-    "GRStageCompletion",
-    "GRStageKind",
-    "GRStageMetadata",
-    "GRWorkerResult",
-    "GRDispatchSession",
-    "validate_dispatch",
-    "validate_dispatch_session",
     "validate_gr_device_config",
-    "validate_gr_execution_config",
-    "validate_gr_execution_runtime",
     "validate_gr_generation_budget",
     "validate_gr_request",
-    "validate_npu_unconstrained_runner",
 ]

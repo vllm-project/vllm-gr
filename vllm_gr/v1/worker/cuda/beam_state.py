@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Fixed-capacity device state for one or more physical Beam storage rows.
+"""Fixed-capacity CUDA Beam state for one or more physical storage rows.
 
 Execution currently admits one session. The leading capacity dimension does
 not imply concurrent execution or ownership of a session/KV registry.

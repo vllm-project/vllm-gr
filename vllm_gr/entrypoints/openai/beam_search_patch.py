@@ -168,28 +168,39 @@ def patch_client_request_id():
     OutputProcessor.add_request = patched_add_request
 
 
-def patch_sampling():
+def _completion_xargs_annotation():
     from pydantic import StrictInt
+
+    return dict[str, str | int | float | list[StrictInt]] | None
+
+
+def patch_sampling() -> None:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 
     from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
 
-    # Completion must accept the same list-valued extension parameters as Chat.
-    field = CompletionRequest.model_fields["vllm_xargs"]
-    annotation = ChatCompletionRequest.model_fields["vllm_xargs"].annotation
-    if field.annotation != annotation:
-        field.annotation = annotation
-        CompletionRequest.model_rebuild(force=True)
-
     ChatCompletionRequest.to_beam_search_params = to_beam_search_params
     CompletionRequest.to_beam_search_params = to_beam_search_params
     # Upstream xargs only accepts scalars; the GR completion extension also
     # carries per-input selectors and per-stage widths as integer lists.
-    CompletionRequest.model_fields["vllm_xargs"].annotation = (
-        dict[str, str | int | float | list[StrictInt]] | None
-    )
+    CompletionRequest.model_fields["vllm_xargs"].annotation = _completion_xargs_annotation()
     CompletionRequest.model_rebuild(force=True)
+
+
+def validate_sampling_patch() -> str | None:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+
+    from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
+
+    for request_type in (ChatCompletionRequest, CompletionRequest):
+        if getattr(request_type, "to_beam_search_params", None) is not to_beam_search_params:
+            return f"{request_type.__name__}.to_beam_search_params is not installed"
+    field = CompletionRequest.model_fields.get("vllm_xargs")
+    if field is None or field.annotation != _completion_xargs_annotation():
+        return "CompletionRequest.vllm_xargs does not accept the GR list-valued extensions"
+    return None
 
 
 def patch_batch_and_fork() -> None:
@@ -261,13 +272,3 @@ def validate_openai_beam_search_patch() -> str | None:
         if detail is not None
     )
     return "; ".join(failures) or None
-
-
-def validate_chat_sampling_patch() -> str | None:
-    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-
-    from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
-
-    if ChatCompletionRequest.to_beam_search_params is not to_beam_search_params:
-        return "ChatCompletionRequest.to_beam_search_params is not installed"
-    return None

@@ -69,7 +69,7 @@ paged attention.
 
 | Startup setting | ModelRunner V1 | ModelRunner V2 |
 | --- | --- | --- |
-| `gr.prefill_token_buckets` is a list (packaged default) | Clamps each value to `min(max_num_batched_tokens, max_model_len)`, drops buckets with no feasible request count from `gr.beam_batch_sizes`, then allocates buffers per surviving bucket. When a beam width is configured and the list is non-null, values are total tokens; otherwise the default grid is per-context and clamped to `max_model_len`. | Filters by the token budget `min(max_num_batched_tokens, max(batch_sizes) * max_model_len)` and filters batch sizes by `max_num_seqs`. |
+| `gr.prefill_token_buckets` is a list (packaged default) | With a configured beam width, values are batch token totals capped by `max_num_batched_tokens`. For a batch size `B` from `gr.beam_batch_sizes` and token total `T`, capture requires `B <= T <= B * max_model_len` and `B <= max_num_seqs`. Without a beam width, buckets are also capped by `max_model_len`. | Filters by the token budget `min(max_num_batched_tokens, max(batch_sizes) * max_model_len)` and filters batch sizes by `max_num_seqs`. |
 | `gr.prefill_token_buckets: null` | Uses the built-in grid bounded by token and context capacity. | Uses native `cudagraph_capture_sizes`. An absent list uses the fallback grid; an explicitly empty native list stays empty. |
 
 `gr.prefill_graph_enabled` controls GR Prefill capture. On V1,
@@ -103,7 +103,8 @@ compare attention outputs on CUDA.
 | --- | --- |
 | [V1 Prefill graph runner](../../../vllm_gr/v1/worker/cuda/v1/gpu_prefill_graph_runner.py) | Owns V1 capture buffers, KV bounds and replay gates. |
 | [V2 Prefill graph runner](../../../vllm_gr/v1/worker/cuda/v2/gpu_prefill_graph_runner_v2.py) | Builds the FULL and PIECEWISE plan and selects a descriptor at dispatch. |
-| [Shared Prefill plan](../../../vllm_gr/v1/worker/prefill_graph_common.py) | Clamps buckets, chooses capture shapes and applies the KV bound. |
+| [V1 capture planner](../../../vllm_gr/v1/worker/cuda/v1/prefill_capture_plan.py) | Filters feasible token buckets and request counts before buffer allocation. |
+| [Shared Prefill graph utilities](../../../vllm_gr/v1/worker/prefill_graph_common.py) | Resolves bucket limits and KV bounds, allocates buffers and matches live token counts. |
 | [Dense Prefill attention](../../../vllm_gr/v1/attention/backends/beam_attn_gpu.py) | Checks whether attention can use projected KV. |
 
 The next generation stage uses [CUDA Decode attention](cuda_decode_attention.md).

@@ -7,13 +7,14 @@ from unittest.mock import Mock
 
 import pytest
 
-from vllm_gr.utils import npu_adapter
+from vllm_gr.utils import accelerator, npu_adapter
 
 
 @pytest.mark.parametrize("initialized", [False, True])  # type: ignore[misc]
 def test_release_memory_preserves_npu_initialization_state(
     monkeypatch: pytest.MonkeyPatch, initialized: bool
 ) -> None:
+    assert npu_adapter is accelerator
     state = {"initialized": initialized}
 
     def synchronize() -> None:
@@ -35,7 +36,7 @@ def test_release_memory_preserves_npu_initialization_state(
     )
     monkeypatch.setattr(npu_adapter, "torch", SimpleNamespace(npu=npu, cuda=cuda))
 
-    npu_adapter.release_accelerator_memory()
+    accelerator.release_accelerator_memory()
 
     assert state["initialized"] is initialized
     if initialized:

@@ -10,6 +10,7 @@ from vllm.sampling_params import BeamSearchParams as NativeBeamSearchParams
 from vllm_gr.config import GRConfig
 from vllm_gr.config.beam_widths import SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
+from vllm_gr.platforms.beam_requests import uses_retained_candidate_widths
 from vllm_gr.sampling_params import BeamSearchParams
 
 
@@ -58,10 +59,9 @@ def resolve_request_widths(
             updates[name] = list(default[:steps])
         else:
             updates[name] = default
-    if str(device).split(":")[0] == "npu" and "per_parent_beam_widths" in updates:
+    if "per_parent_beam_widths" in updates and uses_retained_candidate_widths(config, device):
         widths = updates.get("dynamic_beam_widths", values.get("dynamic_beam_widths"))
-        if updates["per_parent_beam_widths"] == widths and expanded == retained:
-            # NPU derives candidate width from the retained width of each stage.
+        if updates["per_parent_beam_widths"] == widths:
             del updates["per_parent_beam_widths"]
     # Construction validates result_width against this request's final retained
     # width, and validates explicit schedules too. msgspec.replace skips that.

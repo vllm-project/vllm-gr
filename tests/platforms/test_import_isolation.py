@@ -78,6 +78,9 @@ for module_name in (
     "vllm_gr.v1.attention.backends.beam_attn_gpu",
     "vllm_gr.v1.attention.backends.beam_attn_npu",
     "vllm_gr.v1.ascend_compat",
+    "vllm_gr.platforms.ascend.config_patch",
+    "vllm_gr.v1.worker.npu.startup_patch",
+    "vllm_gr.v1.worker.npu.kv_layout_patch",
 ):
     assert module_name not in sys.modules, module_name
 
@@ -95,6 +98,9 @@ for module_name in (
     "vllm_gr.v1.attention.backends.beam_attn_gpu",
     "vllm_gr.v1.attention.backends.beam_attn_npu",
     "vllm_gr.v1.ascend_compat",
+    "vllm_gr.platforms.ascend.config_patch",
+    "vllm_gr.v1.worker.npu.startup_patch",
+    "vllm_gr.v1.worker.npu.kv_layout_patch",
 ):
     assert module_name not in sys.modules, module_name
 """
@@ -121,7 +127,13 @@ import sys
 # selection, so they cannot be forbidden here. The enforceable isolation
 # contract is that vllm-gr's own Ascend integration stays unloaded while the
 # CUDA provider initializes.
-blocked = ("vllm_gr.v1.ascend_compat", "vllm_gr.platforms.ascend.spawn_patch")
+blocked = (
+    "vllm_gr.v1.ascend_compat",
+    "vllm_gr.platforms.ascend.config_patch",
+    "vllm_gr.platforms.ascend.spawn_patch",
+    "vllm_gr.v1.worker.npu.startup_patch",
+    "vllm_gr.v1.worker.npu.kv_layout_patch",
+)
 
 def reject_ascend(event, args):
     # Metadata probes (find_spec) are allowed; importing the GR Ascend

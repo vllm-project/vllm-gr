@@ -52,8 +52,8 @@ patches:
   - id: GR-PATCH-002
     scope: backend
     backend_id: ascend
-    owner: vllm_gr/v1/ascend_compat.py
-    installer: vllm_gr.v1.ascend_compat.patch_npu_worker_init_device
+    owner: vllm_gr/v1/worker/npu/startup_patch.py
+    installer: vllm_gr.v1.worker.npu.startup_patch.patch_npu_worker_init_device
     activation: the selected NPU provider revalidates early config bindings on every call and wraps NPUWorker.init_device only when needed; unavailable native worker imports are retried on later initialization
     validator_or_test:
       - tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
@@ -85,15 +85,15 @@ patches:
     backend_id: null
     owner: vllm_gr/entrypoints/openai/serving_engine.py and protocol.py
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_beam_search and patch_sampling
-    activation: the required frontend patch plan detects either method is not installed
+    activation: the required frontend patch plan detects a missing serving or sampling binding, or a mismatched Completion vllm_xargs schema
     validator_or_test:
       - vllm_gr.entrypoints.openai.beam_search_patch.validate_openai_beam_search_patch
-      - vllm_gr.entrypoints.openai.beam_search_patch.validate_chat_sampling_patch
+      - vllm_gr.entrypoints.openai.beam_search_patch.validate_sampling_patch
       - tests/entrypoints/beam_search/test_beam_search_online_entry.py
       - tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online
       - tests/entrypoints/openai/test_beam_search_dispatch.py
     process_roles: [api_server]
-    target: GenerateBaseServing.beam_search and ChatCompletionRequest/CompletionRequest.to_beam_search_params
+    target: GenerateBaseServing.beam_search, ChatCompletionRequest/CompletionRequest.to_beam_search_params, and CompletionRequest.model_fields["vllm_xargs"]
     risk: high
     contract: beam_search adapts upstream callers exclusively to the GR implementation
     removal_condition: upstream exposes grouped-Beam serving and sampling extension points
@@ -248,8 +248,8 @@ patches:
   - id: GR-PATCH-012
     scope: backend
     backend_id: ascend
-    owner: vllm_gr/v1/worker/npu/npu_model_runner_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/npu/npu_model_runner_inputs.py, vllm_gr/v1/worker/npu/npu_model_runner_bookkeeping.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
+    owner: vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/stage_projection.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/npu/npu_model_runner_inputs.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/ops/npu/stage_projection.py, vllm_gr/v1/worker/npu/startup_patch.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the Ascend provider discovers NPUModelRunner and binds its planned lifecycle after model load; the delayed NPUWorker.init_device wrapper mounts common Worker utilities before native initialization, independently of the management listener; online Trie reload remains rejected by Core on NPU
     binding_validation: uses the same admitted-plan and native max_model_len autofit checks as GR-PATCH-011
@@ -265,8 +265,14 @@ patches:
       - tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
       - tests/sidecar/test_management.py::test_trie_rejects_unsupported_execution_before_worker_rpc
       - tests/sidecar/test_worker_update.py
+      - tests/ops/test_npu_stage_logits.py
+      - tests/v1/worker/test_npu_stage_projection_lifecycle.py
     process_roles: [npu_worker]
-    target: NPUModelRunner execute_model, _prepare_inputs, sample_tokens and graph/lifecycle hooks; NPUWorker.reload_trie (native _sample and _bookkeeping_sync unchanged)
+    target: >-
+      NPUModelRunner execute_model, _prepare_inputs, sample_tokens and graph/lifecycle hooks,
+      and NPUWorker.reload_trie (native _sample and _bookkeeping_sync unchanged).
+      Stage projection wraps the instance LogitsProcessor._get_logits, NPUModelRunner.reload_weights,
+      and NPUWorker start_weight_update, update_weights, and finish_weight_update.
     risk: critical
     contract: docs/design/feature/npu_decode_execution.md
     removal_condition: vLLM-Ascend exposes stable grouped input/output, Worker utility, and constraint-backend lifecycle hooks
@@ -333,8 +339,8 @@ patches:
   - id: GR-PATCH-018
     scope: backend
     backend_id: ascend
-    owner: vllm_gr/v1/ascend_compat.py
-    installer: vllm_gr.v1.ascend_compat.apply_penalties_warmup_oom_guard
+    owner: vllm_gr/v1/worker/npu/startup_patch.py
+    installer: vllm_gr.v1.worker.npu.startup_patch.apply_penalties_warmup_oom_guard
     activation: NPUWorker init_device runs in the child process and the native penalties warmup callable is present
     validator_or_test: []  # No behavioural test yet; the native callable guard runs at install time.
     process_roles: [npu_worker]
@@ -346,8 +352,8 @@ patches:
   - id: GR-PATCH-019
     scope: backend
     backend_id: ascend
-    owner: vllm_gr/v1/ascend_compat.py
-    installer: vllm_gr.v1.ascend_compat.apply_engine_core_config_sanitizer and patch_npu_worker_init_device
+    owner: vllm_gr/platforms/ascend/config_patch.py
+    installer: vllm_gr.platforms.ascend.config_patch.apply_engine_core_config_sanitizer and install_ascend_config_filter
     activation: NPU engine configuration and every worker plugin initialization, independently of the device hook; repair native config caller bindings even when the sanitizer is installed; entrypoint re-asserted on every create_engine_config call and initializes the shared EngineCore plan before native construction
     validator_or_test:
       - tests/v1/test_ascend_compat.py::test_ascend_config_filter_preserves_engine_identity_and_gr_config
@@ -380,8 +386,8 @@ patches:
   - id: GR-PATCH-021
     scope: backend
     backend_id: ascend
-    owner: vllm_gr/v1/npu_kv_layout.py
-    installer: vllm_gr.v1.npu_kv_layout.apply_npu_contiguous_kv_cache_patch
+    owner: vllm_gr/v1/worker/npu/kv_layout_patch.py
+    installer: vllm_gr.v1.worker.npu.kv_layout_patch.apply_npu_contiguous_kv_cache_patch
     activation: NPUWorker init_device before native runner construction; known Ascend 0.30.0rc2 bindings
     validator_or_test:
       - tests/v1/test_npu_kv_layout.py

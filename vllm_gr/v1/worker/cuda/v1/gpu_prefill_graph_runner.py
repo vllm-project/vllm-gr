@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 
 from vllm_gr.utils.npu_adapter import is_cuda_available
 from vllm_gr.v1.forward_context import fresh_prefill_capture
+from vllm_gr.v1.worker.cuda.v1.prefill_capture_plan import plan_prefill_capture
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
     SUPPORTED_NUM_REQS,
@@ -83,6 +84,24 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             self.device,
             self.buckets,
         )
+
+    def _plan_capture_buckets(
+        self,
+        *,
+        max_num_seqs: int,
+        max_num_batched_tokens: int | None,
+        max_model_len: int,
+        total_token_buckets: bool,
+    ) -> None:
+        self.capture_plan = plan_prefill_capture(
+            self.buckets,
+            self.gr_settings.beam_batch_sizes,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
+            total_token_buckets=total_token_buckets,
+        )
+        self.buckets = list(self.capture_plan)
 
     def capture_graphs(self, runner: Any) -> None:
         """Capture configured request-count CUDA graphs for each prefill bucket."""

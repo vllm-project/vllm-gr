@@ -1297,7 +1297,8 @@ pytestmark = pytest.mark.cpu_test
 @pytest.mark.l1  # type: ignore[misc]
 def test_prefill_allocates_only_shapes_in_capture_plan(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_gr.v1.worker import prefill_graph_common as common
-    from vllm_gr.v1.worker.prefill_capture_plan import plan_prefill_capture
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.cuda.v1.prefill_capture_plan import plan_prefill_capture
 
     allocated: list[int] = []
     monkeypatch.setattr(
@@ -1305,7 +1306,6 @@ def test_prefill_allocates_only_shapes_in_capture_plan(monkeypatch: pytest.Monke
     )
     monkeypatch.setattr(common, "_get_block_table_cols", lambda runner: None)
     monkeypatch.setattr(common, "get_max_context_len", lambda runner: 512)
-    monkeypatch.setattr(common.BasePrefillGraphRunner, "supports_multi_request_total_buckets", True)
     scheduler = SimpleNamespace(max_num_batched_tokens=8192, max_num_seqs=4)
     config = SimpleNamespace(
         additional_config={
@@ -1321,7 +1321,7 @@ def test_prefill_allocates_only_shapes_in_capture_plan(monkeypatch: pytest.Monke
     )
     config.scheduler_config = scheduler
     runner = SimpleNamespace(vllm_config=config, scheduler_config=scheduler, device="cpu")
-    graph = common.BasePrefillGraphRunner(runner, list(range(128, 8193, 128)))
+    graph = GPUPrefillGraphRunner(runner, list(range(128, 8193, 128)))
     assert allocated == list(graph.capture_plan) == list(range(128, 2049, 128))
     assert graph.capture_plan[512] == (1, 2, 4)
     assert graph.capture_plan[2048] == (4,)

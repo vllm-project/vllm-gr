@@ -19,8 +19,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
-    BeamSequenceColumns,
-    validate_complete_sequences,
+    validate_terminal_beam_batch_result,
 )
 
 
@@ -77,89 +76,7 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
     elif isinstance(result, (list, tuple)):
         result = msgspec.convert(result, type=BeamBatchResult)
     if isinstance(result, BeamBatchResult):
-        # Typed conversion checks every nested field on both transports,
-        # including nonnegative indices and finite cumulative scores.
-        # Check the V1 envelope and request-dependent semantics once here.
-        if result.protocol_version != request.protocol_version:
-            raise ValueError("terminal Beam result protocol version changed")
-        if (result.output is None) == (result.failure is None):
-            raise ValueError("terminal Beam result requires exactly one output or failure")
-        if result.batch_id != request.batch_id:
-            raise ValueError("terminal Beam result belongs to a different session")
-        if (
-            result.failure is not None
-            and result.failure.item_index is not None
-            and not 0 <= result.failure.item_index < len(request.items)
-        ):
-            raise ValueError("terminal Beam failure has an invalid item identity")
-        if result.failure is not None and (
-            not result.failure.code.strip() or not result.failure.message.strip()
-        ):
-            raise ValueError("terminal Beam failure requires a code and message")
-        if result.output is not None:
-            if len(result.output.items) != len(request.items):
-                raise ValueError("terminal Beam result item count changed")
-            options = request.output_options
-            budget = request.beam_params.max_tokens
-            width = request.beam_params.beam_width
-            stage_widths = request.beam_params.dynamic_beam_widths
-            parent_widths = None if stage_widths is None else (1, *stage_widths[:-1])
-            include_scores = options.include_cumulative_logprob
-            include_parents = options.include_parent_beam_indices
-            expected_sequence = (
-                "length",
-                budget,
-                None,
-                include_scores,
-                budget if include_parents else 0,
-            )
-            for item, source in zip(result.output.items, request.items):
-                if (
-                    item.request_id != source.request.request_id
-                    or item.item_index != source.item_index
-                ):
-                    raise ValueError("terminal Beam result item identity changed")
-                if isinstance(item.sequences, BeamSequenceColumns):
-                    validate_complete_sequences(item.sequences, request)
-                    continue
-                if not item.sequences or len(item.sequences) > options.num_return_sequences:
-                    raise ValueError("terminal Beam result has an invalid sequence count")
-                for sequence in item.sequences:
-                    parents = sequence.parent_beam_indices
-                    # Compare the request-dependent shape together. Typed
-                    # conversion above has already checked every field's type.
-                    if (
-                        sequence.finish_reason,
-                        len(sequence.token_ids),
-                        sequence.stop_token_id,
-                        sequence.cumulative_logprob is not None,
-                        len(parents),
-                    ) != expected_sequence:
-                        # Keep precise protocol failures on malformed results.
-                        if (
-                            sequence.finish_reason != "length"
-                            or len(sequence.token_ids) != budget
-                            or sequence.stop_token_id is not None
-                        ):
-                            raise ValueError("terminal Beam result violates the effective budget")
-                        if include_scores != (sequence.cumulative_logprob is not None):
-                            raise ValueError(
-                                "terminal Beam score presence differs from requested options"
-                            )
-                        if not include_parents and parents:
-                            raise ValueError(
-                                "terminal Beam result contains unrequested parent indices"
-                            )
-                        raise ValueError("terminal Beam result has invalid parent indices")
-                    if include_parents:
-                        if parent_widths is None:
-                            invalid_parent = max(parents) >= width
-                        else:
-                            invalid_parent = any(
-                                parent >= bound for parent, bound in zip(parents, parent_widths)
-                            )
-                        if invalid_parent:
-                            raise ValueError("terminal Beam result has invalid parent indices")
+        validate_terminal_beam_batch_result(request, result)
         return result
     return BeamBatchResult(
         protocol_version=request.protocol_version,

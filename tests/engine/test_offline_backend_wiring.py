@@ -347,7 +347,6 @@ class TestGrllmCanonicalConstruction:
         # exercise argument forwarding using the lightweight LLM above.
         for name, symbols in {
             "vllm.logger": {"init_logger": logging.getLogger},
-            "vllm_gr.utils.npu_adapter": {"release_accelerator_memory": mock.Mock()},
             "vllm_gr.plugin": {"initialize_runtime": mock.Mock()},
         }.items():
             module = ModuleType(name)
@@ -356,6 +355,7 @@ class TestGrllmCanonicalConstruction:
 
         from vllm_gr.entrypoints import gr
 
+        monkeypatch.setattr(gr, "release_accelerator_memory", mock.Mock())
         monkeypatch.setattr(gr, "_install_renderer_eos_token_id_cache", lambda: None)
         return gr
 
