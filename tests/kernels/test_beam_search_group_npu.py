@@ -143,7 +143,7 @@ def test_group_compacts_history_from_configured_capacity(
 ) -> None:
     """A shorter terminal request must not expose unused history to the op."""
     from vllm_gr.ops.npu import beam_ops
-    from vllm_gr.v1.beam.beam_decision import _run_npu_decision
+    from vllm_gr.v1.worker.npu.beam_decision import _run_npu_decision
 
     beam_width = 8
     sentinel = -1234567

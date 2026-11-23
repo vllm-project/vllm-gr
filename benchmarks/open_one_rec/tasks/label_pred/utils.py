@@ -10,9 +10,9 @@ Functions for label extraction, probability processing, and AUC/wuAUC computatio
 
 import json
 import logging
+import math
 from typing import Any, Dict, List
 
-import numpy as np
 from sklearn.metrics import roc_auc_score
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,9 @@ def extract_probability_from_logprobs(
         >>> result['normalized_probs']
         {'是': 0.75, '否': 0.25}
     """
+    if not isinstance(generations, list) or any(not isinstance(gen, str) for gen in generations):
+        raise ValueError("Expected a list of text generations with label probabilities")
+
     parsed_list = []
     normalized_list = []
     scores = []
@@ -117,13 +120,17 @@ def extract_probability_from_logprobs(
                 )
 
             # Extract probabilities
-            p_pos = float(probs_dict[positive_token])
-            p_neg = float(probs_dict[negative_token])
+            weights = [probs_dict[token] for token in (positive_token, negative_token)]
+            if any(isinstance(weight, bool) for weight in weights):
+                raise ValueError("Probability weights must be numbers")
+            p_pos, p_neg = map(float, weights)
+            if not all(math.isfinite(p) and p >= 0 for p in (p_pos, p_neg)):
+                raise ValueError("Probability weights must be finite and non-negative")
 
             # Apply L1 normalization (divide by sum so probabilities sum to 1)
             total = p_pos + p_neg
-            if total <= 0:
-                raise ValueError(f"Sum of probabilities is non-positive: {total}")
+            if not math.isfinite(total) or total <= 0:
+                raise ValueError(f"Invalid sum of probability weights: {total}")
 
             p_pos_normalized = p_pos / total
             p_neg_normalized = p_neg / total
@@ -135,7 +142,14 @@ def extract_probability_from_logprobs(
             )
             scores.append(p_pos_normalized)
 
-        except (json.JSONDecodeError, TypeError, AttributeError, ValueError, KeyError) as e:
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            AttributeError,
+            ValueError,
+            KeyError,
+            OverflowError,
+        ) as e:
             # Raise detailed exception
             error_msg = "Failed to parse generation"
             if sample_id:
@@ -178,43 +192,13 @@ def extract_probability_from_logprobs(
         return {"parsed_probs": avg_parsed, "normalized_probs": avg_normalized, "score": avg_score}
 
 
-def calculate_auc(predictions: Dict[str, float], labels: Dict[str, int]) -> float:
-    """
-    Calculate AUC (Area Under ROC Curve) using sklearn
-
-    Args:
-        predictions: Predicted probabilities, format: {sample_id: probability}
-        labels: Ground truth labels (0 or 1), format: {sample_id: label}
-
-    Returns:
-        AUC value (float between 0 and 1)
-    """
-    if not predictions or not labels:
-        logger.info("✗ Predictions or labels are empty")
-        return 0.0
-
-    # Align predictions and labels
-    sample_ids = sorted(set(predictions.keys()) & set(labels.keys()))
-
-    if len(sample_ids) == 0:
-        logger.info("✗ No overlapping samples between predictions and labels")
-        return 0.0
-
-    y_true = np.array([labels[id] for id in sample_ids])
-    y_scores = np.array([predictions[id] for id in sample_ids])
-
-    # Check if we have both positive and negative samples
-    if len(np.unique(y_true)) < 2:
-        logger.info("⚠ Only one class present in labels, AUC is not defined")
-        return 0.5
-
-    try:
-        # Calculate AUC using sklearn
-        auc = roc_auc_score(y_true, y_scores)
-        return float(auc)
-    except ValueError as e:
-        logger.info(f"✗ Error calculating AUC: {e}")
-        return 0.5
+def calculate_auc(predictions: Dict[str, float], labels: Dict[str, int]) -> float | None:
+    """Calculate AUC over samples with a probability and a label."""
+    sample_ids = sorted(predictions.keys() & labels.keys())
+    y_true = [labels[sample_id] for sample_id in sample_ids]
+    if len(set(y_true)) < 2:
+        return None
+    return float(roc_auc_score(y_true, [predictions[sample_id] for sample_id in sample_ids]))
 
 
 def get_debug_info(

@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.helpers.paths import REPO_ROOT
+
 pytestmark = [
     pytest.mark.gpu_test,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
@@ -102,7 +104,7 @@ def test_previously_disabled_gc_remains_disabled():
 """,
         encoding="utf-8",
     )
-    root = Path(__file__).resolve().parents[2]
+    root = REPO_ROOT
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
     env.pop("PYTEST_ADDOPTS", None)

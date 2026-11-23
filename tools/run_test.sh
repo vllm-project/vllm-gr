@@ -49,19 +49,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -n "${CONDA_PREFIX:-}" ]; then
-    export LD_LIBRARY_PATH=${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export PATH=${CONDA_PREFIX}/bin:${PATH:-}
 fi
 
-source "./tools/resource.sh"
+source "./tools/devices/resource.sh"
 if [ "${npu_state:-}" == "true" ]; then
     export VLLM_GR_TARGET_DEVICE=npu
-    # Jenkins must validate the same vendor Python that will run pytest.
+    # CI validates the same vendor Python that will run pytest.
     # Installing the NPU GR extra does not upgrade the vendor runtime.
     npu_runtime_spec=$(mktemp "${TMPDIR:-/tmp}/vllm-gr-npu-runtime.XXXXXX")
     if ! python3 tools/ci/resolve_runtime.py resolve --device npu --output "$npu_runtime_spec"; then
         rm -f -- "$npu_runtime_spec"
-        echo "NPU test runtime is incompatible with this checkout. Select the matching vendor environment before running this gate; see docs/quickstart-ascend.md." >&2
+        echo "NPU test runtime is incompatible with this checkout. Select the matching vendor environment before running this gate; see docs/getting_started/installation/npu.md." >&2
         exit 1
     fi
     rm -f -- "$npu_runtime_spec"
@@ -127,23 +127,11 @@ if [ "${npu_state:-false}" == "true" ]; then
     # library is available before entering the pre-commit/test gate. The
     # installer is a no-op on non-NPU hosts and skips work when already ready.
     echo "ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-}"
-    run_test_workdir="$(pwd)"
     ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
-    bash tools/install_xllm_ops.sh
+    bash tools/npu/install_xllm_ops.sh
 
-    CUSTOM_XLLM_VENDORS_ROOT="${ASCEND_TOOLKIT_HOME}/opp/vendors"
-    CUSTOM_XLLM_MATH_ROOT="${CUSTOM_XLLM_VENDORS_ROOT}/custom_xllm_math"
-    CUSTOM_XLLM_MATH_SET_ENV=$(find "${CUSTOM_XLLM_MATH_ROOT}" -name set_env.bash -print -quit)
-    test -n "${CUSTOM_XLLM_MATH_SET_ENV}" || {
-        echo "set_env.bash not found under ${CUSTOM_XLLM_MATH_ROOT}"
-        exit 1
-    }
-    echo "Found set_env.bash at ${CUSTOM_XLLM_MATH_SET_ENV}"
-    CUSTOM_XLLM_MATH_LIB="${CUSTOM_XLLM_MATH_ROOT}/op_api/lib"
-    export LD_LIBRARY_PATH="${CUSTOM_XLLM_MATH_LIB}:${LD_LIBRARY_PATH}"
-    # shellcheck source=/dev/null
-    source "${CUSTOM_XLLM_MATH_ROOT}/bin/set_env.bash"
-    cd "${run_test_workdir}"
+    source tools/npu/xllm_env.sh
+    load_xllm_env
 
     PYTORCH_NPU_ALLOW_FORK=true \
     VLLM_WORKER_MULTIPROC_METHOD="spawn" \
@@ -160,10 +148,10 @@ if [[ "$RUN_WHEEL" == "true" ]]; then
     if [[ "${npu_state:-false}" == "true" ]]; then
         VLLM_GR_TARGET_DEVICE=npu \
         ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
-        ./tools/run_wheel_smoke_test.sh --python python3
+        ./tools/packaging/run_wheel_smoke_test.sh --python python3
     else
         VLLM_GR_TARGET_DEVICE=cuda \
         CUDA_VISIBLE_DEVICES=$idle_gpu \
-        ./tools/run_wheel_smoke_test.sh --python python3
+        ./tools/packaging/run_wheel_smoke_test.sh --python python3
     fi
 fi

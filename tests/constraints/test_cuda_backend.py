@@ -11,7 +11,8 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableConfig
+from tests.helpers.gr_config import make_gr_config
+from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableSpec
 from vllm_gr.constraints import loader
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.backend import ConstraintMetadata
@@ -27,7 +28,7 @@ def test_cuda_loader_readiness_select_and_close(tmp_path: Path) -> None:
     path = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(make_table(), path)
     backend = load_constraint_backend(
-        ConstraintTableConfig(
+        ConstraintTableSpec(
             enabled=True,
             backend=ConstraintTableBackendEnum.CUDA,
             path=str(path),
@@ -119,7 +120,7 @@ def test_cuda_readiness_failure_closes_unpublished_backend(
     )
     with pytest.raises(RuntimeError, match="readiness failed"):
         load_constraint_backend(
-            ConstraintTableConfig(
+            ConstraintTableSpec(
                 enabled=True,
                 backend=ConstraintTableBackendEnum.CUDA,
                 path=str(path),
@@ -142,7 +143,7 @@ def test_cuda_loader_rejects_fp32_logits_before_upload(tmp_path: Path) -> None:
     digest = save_constraint_table_artifact(make_table(), path)
     with pytest.raises(ValueError, match="fp16/bf16"):
         load_constraint_backend(
-            ConstraintTableConfig(
+            ConstraintTableSpec(
                 enabled=True,
                 backend=ConstraintTableBackendEnum.CUDA,
                 path=str(path),
@@ -180,7 +181,6 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
 ) -> None:
     from unittest.mock import MagicMock
 
-    from vllm_gr.config import GRConfig
     from vllm_gr.config.parser import gr_config_to_mapping
     from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler
     from vllm_gr.constraints.json_compiler import compile_relations_json
@@ -211,9 +211,9 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     slice_size = 25 if multi_trie else 9
     path = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(table, path)
-    config = GRConfig(
+    config = make_gr_config(
         beam_max_width=2,
-        constraint_table=ConstraintTableConfig(
+        constraint_table=ConstraintTableSpec(
             enabled=True,
             backend=ConstraintTableBackendEnum.CUDA,
             path=str(path),
@@ -232,7 +232,7 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-    from vllm_gr.ops.sliced_logits_patch import apply_sliced_logits_patch
+    from vllm_gr.v1.worker.sliced_logits_patch import apply_sliced_logits_patch
 
     apply_sliced_logits_patch()
 
@@ -337,7 +337,7 @@ def test_cuda_backend_scores_over_full_window_not_candidate_set(
     path = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(make_table(), path)
     backend = load_constraint_backend(
-        ConstraintTableConfig(
+        ConstraintTableSpec(
             enabled=True,
             backend=ConstraintTableBackendEnum.CUDA,
             path=str(path),

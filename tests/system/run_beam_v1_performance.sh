@@ -8,7 +8,7 @@ set -euo pipefail
 repo_root="${V1_PERF_REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$repo_root"
 # A/B can share one driver while importing each side's runtime from its own tree.
-driver="${V1_PERF_DRIVER:-$repo_root/benchmarks/beam_search/v1_performance_gate.py}"
+driver="${V1_PERF_DRIVER:-$repo_root/benchmarks/beam_search/measure_latency.py}"
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 model="${VLLM_GR_TEST_MODEL:-OpenOneRec/OneRec-1.7B}"
 triples="${TRIPLES_PATH:?TRIPLES_PATH must point to the CI video triples}"
@@ -36,6 +36,7 @@ if [[ ! -d "$model" ]]; then
   revision_args=(--revision "${V1_PERF_MODEL_REVISION:-cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b}")
 fi
 args=(
+  "$@"
   --model "$model"
   "${revision_args[@]}"
   --triples "$triples"
@@ -84,7 +85,7 @@ trap stop_server EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "Running offline GRLLM.beam_search_v1 batch performance"
+echo "Running offline GRLLM.beam_search batch performance"
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
   python "$driver" offline "${args[@]}"
 
@@ -111,7 +112,7 @@ server_args=(
   --port "$port"
   --served-model-name "$server_identity"
   --seed 0
-  --vllm-gr-config "$output_dir/vllm_gr_config.yaml"
+  --config "$output_dir/gr-config.yaml"
   --async-scheduling
   --max-logprobs "$beam_width"
   --max-num-seqs "$max_batch_size"

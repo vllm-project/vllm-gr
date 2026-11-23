@@ -25,15 +25,17 @@ def initialize_runtime() -> dict[str, object]:
     startup paths in the main process. Environment validation activates the
     process-local provider before runtime patches can import its backend.
     """
-    from vllm_gr._env_check import check_environment, configure_model_runner_default
+    from vllm_gr.engine.startup import configure_model_runner_default
+    from vllm_gr.platforms.loader import activate_current_backend
 
     configure_model_runner_default()
 
-    check_environment()
+    provider = activate_current_backend()
+    provider.check_environment()
 
     from vllm_gr.patch import get_last_beam_patch_report, re_apply_patches
 
-    patch_count = re_apply_patches()
+    patch_count = re_apply_patches(provider=provider)
 
     report = get_last_beam_patch_report()
     state: dict[str, object] = {

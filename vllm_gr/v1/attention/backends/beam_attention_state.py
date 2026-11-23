@@ -71,7 +71,7 @@ def clear_empty_prefix_states(
     Infinity checks alone cannot identify those entries. Consult the device
     lengths and clear only empty requests; nonempty outputs stay untouched.
     """
-    from vllm_gr.v1.attention.backends.beam_prefix_state_kernels import (
+    from vllm_gr.v1.attention.backends.beam_prefix_kernels import (
         clear_empty_prefix,
     )
 

@@ -14,7 +14,6 @@ Skip when the model path is unavailable (CI without weights).
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import socket
@@ -31,11 +30,19 @@ from unittest import mock
 import pytest
 import requests
 
-from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
+from tests.helpers.paths import REPO_ROOT
+from tests.st.pangu1b_st_common import (
+    GSM8K_MINI,
+    PANGU_CONFIG,
+    build_prompt,
+    get_model_path,
+    load_dataset,
+    require_pangu_st_runtime,
+    score_answer,
+)
 
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATASET = ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
-PANGU_EXAMPLE_DIR = ROOT / "examples" / "offline_inference" / "pangu1b"
+ROOT = REPO_ROOT
+DEFAULT_DATASET = ROOT / GSM8K_MINI
 DEFAULT_SERVE_TIMEOUT = int(os.environ.get("PANGU1B_SERVE_TIMEOUT", "600"))
 SERVED_MODEL_NAME = os.environ.get("PANGU1B_SERVED_MODEL_NAME", "pangu1b-st")
 
@@ -67,6 +74,8 @@ def _build_serve_cmd(model_path: str, port: int) -> list[str]:
         "serve",
         "--gr",
         model_path,
+        "--config",
+        str(ROOT / PANGU_CONFIG),
         "--host",
         "127.0.0.1",
         "--port",
@@ -243,7 +252,7 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
     def test_chat_completions_smoke(self) -> None:
         body = _chat_completion(
             self.base_url,
-            content="Question: What is 2 + 2?\nAnswer:",
+            content=build_prompt("What is 2 + 2?"),
             max_tokens=64,
         )
         message = body["choices"][0]["message"]
@@ -270,18 +279,6 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_gsm8k_mini_online_accuracy(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "pangu_generate_online_test",
-            PANGU_EXAMPLE_DIR / "pangu_generate.py",
-        )
-        assert spec is not None and spec.loader is not None
-        pangu_generate = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(pangu_generate)
-        _normalize_numeric = pangu_generate._normalize_numeric
-        build_prompt = pangu_generate.build_prompt
-        extract_final_answer = pangu_generate.extract_final_answer
-        load_dataset = pangu_generate.load_dataset
-
         records = load_dataset(DEFAULT_DATASET, num_prompts=8)
         correct = 0
         for row in records:
@@ -292,10 +289,7 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
                 max_tokens=512,
             )
             generated = body["choices"][0]["message"].get("content") or ""
-            predicted = extract_final_answer(generated)
-            expected = _normalize_numeric(str(row["answer"]))
-            if predicted == expected:
-                correct += 1
+            correct += score_answer(generated, str(row["answer"]))["correct"]
 
         accuracy = correct / len(records)
         result_path = os.environ.get("PANGU1B_ONLINE_RESULT_JSON")
@@ -320,11 +314,16 @@ class TestPangu1bOnlineUnitHooks(unittest.TestCase):
     """Lightweight checks that do not load the full model or start a server."""
 
     def test_serve_command_builder(self) -> None:
+        from vllm_gr.config import load_gr_config
+
         cmd = _build_serve_cmd("/tmp/pangu", 18080)
         self.assertIn("serve", cmd)
         self.assertNotIn("--model-family", cmd)
         self.assertIn("--served-model-name", cmd)
         self.assertEqual(cmd[cmd.index("--served-model-name") + 1], SERVED_MODEL_NAME)
+        config = load_gr_config(cmd[cmd.index("--config") + 1])
+        self.assertIsNone(config.beam_max_width)
+        self.assertFalse(config.deployment.prefill_graph_enabled)
 
     def test_min_accuracy_environment_value_is_float(self) -> None:
         with mock.patch.dict(

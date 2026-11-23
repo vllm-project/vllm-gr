@@ -62,7 +62,7 @@ jobs:
 
       - name: Install uv
         run: |
-          pip install uv pytest packaging regex
+          pip install uv pytest pytest-timeout packaging regex
 
       - name: Build and smoke-test wheel
         env:
@@ -71,7 +71,7 @@ jobs:
         run: |
           # Packaging tests cover tags/fallbacks; the smoke test checks that
           # installed module and distribution versions agree for this target.
-          bash tools/run_wheel_smoke_test.sh --python python
+          bash tools/packaging/run_wheel_smoke_test.sh --python python
 
       - name: Upload Wheel Artifact
         if: ${{ !env.ACT }}

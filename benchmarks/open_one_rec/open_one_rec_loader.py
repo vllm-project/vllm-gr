@@ -8,6 +8,7 @@ Base Loader for all task data loaders
 Provides common functionality for data loading, sampling, and file path resolution.
 """
 
+import errno
 import json
 import logging
 import os
@@ -16,6 +17,8 @@ from collections import Counter
 from dataclasses import dataclass
 from json import JSONDecodeError
 from numbers import Integral
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, Optional, Type
 
 import pandas as pd
@@ -36,6 +39,8 @@ from .tasks.recommendation.config import (
 from .tasks.recommendation.evaluator import RecommendationEvaluator
 
 logger = logging.getLogger(__name__)
+DEFAULT_DATASET_PATH = "./data/benchmark_data"
+_SOURCE_ROW_ID_COLUMN = "_vllm_gr_source_row_id"
 
 
 @dataclass
@@ -403,10 +408,7 @@ class BaseLoader(ABC):
 
     def _get_data_file_path(self, split: str) -> str:
         """Get data file path for the given split"""
-        if self.data_dir:
-            base_dir = self.data_dir
-        else:
-            base_dir = "./data"
+        base_dir = self.data_dir or DEFAULT_DATASET_PATH
 
         filename = f"{self.task_name}_{split}.parquet"
 
@@ -422,10 +424,7 @@ class BaseLoader(ABC):
 
     def _get_sample_data_file_path(self, split: str, sample_size: int) -> str:
         """Get sample data file path"""
-        if self.data_dir:
-            base_dir = self.data_dir
-        else:
-            base_dir = "./data"
+        base_dir = self.data_dir or DEFAULT_DATASET_PATH
 
         possible_paths = [
             os.path.join(
@@ -462,7 +461,7 @@ class BaseLoader(ABC):
         return df
 
     def _sample_data(self, df: pd.DataFrame, sample_size: int) -> pd.DataFrame:
-        """Reproducibly sample data (take head) from DataFrame"""
+        """Select a random subset with a fixed seed."""
         if sample_size >= len(df):
             return df
 
@@ -471,14 +470,21 @@ class BaseLoader(ABC):
 
     def _save_sample_data(self, df: pd.DataFrame, split: str, sample_size: int):
         """Save sample data in parquet format"""
-        sample_file = self._get_sample_data_file_path(split, sample_size)
-
-        sample_dir = os.path.dirname(sample_file)
-        if sample_dir:
-            os.makedirs(sample_dir, exist_ok=True)
-
-        df.to_parquet(sample_file, index=False)
-        logger.info(f"Sample data saved to: {sample_file}")
+        sample_file = Path(self._get_sample_data_file_path(split, sample_size))
+        try:
+            sample_file.parent.mkdir(parents=True, exist_ok=True)
+            with TemporaryDirectory(dir=sample_file.parent) as tmp:
+                temporary_path = Path(tmp) / sample_file.name
+                cached = df.copy()
+                cached[_SOURCE_ROW_ID_COLUMN] = df.index
+                cached.to_parquet(temporary_path, index=False)
+                os.replace(temporary_path, sample_file)
+        except OSError as exc:
+            if not isinstance(exc, PermissionError) and exc.errno != errno.EROFS:
+                raise
+            logger.warning("Could not write sample cache %s: %s", sample_file, exc)
+        else:
+            logger.info("Sample data saved to: %s", sample_file)
 
     def _load_sample_dataframe(self, split: str, sample_size: int) -> Optional[pd.DataFrame]:
         """Load sample dataframe from cache if exists"""
@@ -490,7 +496,10 @@ class BaseLoader(ABC):
         logger.info(f"Loading sample data from cache: {sample_file}")
 
         df = pd.read_parquet(sample_file)
-        return df
+        if _SOURCE_ROW_ID_COLUMN not in df.columns:
+            logger.info("Rebuilding sample cache without source row IDs: %s", sample_file)
+            return None
+        return df.set_index(_SOURCE_ROW_ID_COLUMN)
 
     def _process_dataframe(self, df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
         """Process DataFrame and convert to model input format"""
@@ -566,7 +575,11 @@ class BaseLoader(ABC):
                 "prompt": formatted_prompt,
                 "ground_truth": ground_truth_str,
                 "metadata": self._make_metadata_serializable(idx, metadata_dict),
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
             }
+
+            if self.custom_input_len is None:
+                result_item["chat_messages"] = messages
 
             result[sample_id] = result_item
 
@@ -650,6 +663,6 @@ class BaseLoader(ABC):
         Returns a new dict — does NOT mutate ``metadata_dict`` in place.
         """
         return {
-            "row_index": int(idx) if hasattr(idx, "__int__") else str(idx),
             **{k: v for k, v in metadata_dict.items() if k != "answer"},
+            "row_index": int(idx) if hasattr(idx, "__int__") else str(idx),
         }

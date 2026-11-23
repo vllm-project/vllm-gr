@@ -11,24 +11,39 @@ import pytest
 
 from vllm_gr.platforms.cuda import CUDA_BACKEND
 from vllm_gr.platforms.errors import (
+    AmbiguousBackendError,
     BackendAlreadyActiveError,
     BackendNotActiveError,
     DuplicateBackendRegistrationError,
+    IncompatibleBackendError,
     InvalidBackendProviderError,
+    InvalidBackendVersionError,
     UnsupportedBackendError,
 )
+from vllm_gr.platforms.identity import PlatformIdentity
+from vllm_gr.platforms.protocol import PROVIDER_API_VERSION
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     activate_backend,
     get_active_backend,
     register_backend,
     resolve_backend,
+    select_backend,
 )
 
 
 @dataclass(frozen=True)
 class FakeProvider:
+    backend_id: str = "fake"
     device_type: str = "fake"
+    api_version: int = PROVIDER_API_VERSION
+    gr_version_range: str | None = None
+    vllm_version_range: str | None = None
+    vendor_version_range: str | None = None
+    vendor_distribution: str | None = None
+
+    def matches(self, identity: PlatformIdentity) -> bool:
+        return bool(identity.device_type == self.device_type)
 
     def check_environment(self) -> dict[str, str]:
         return {}
@@ -46,6 +61,19 @@ class FakeProvider:
     def create_constrained_topk_execution(self, *, device: Any = None) -> None:
         del device
         return None
+
+
+def fake_identity(device_type: str = "cuda", **overrides: Any) -> PlatformIdentity:
+    """A synthetic identity that never touches a real vLLM platform."""
+    fields: dict[str, Any] = {
+        "platform_enum": "CUDA",
+        "device_type": device_type,
+        "device_name": device_type,
+        "platform_class": "tests.platforms.fakes.FakePlatform",
+        "platform_lineage": ("tests.platforms.fakes.FakePlatform", "builtins.object"),
+    }
+    fields.update(overrides)
+    return PlatformIdentity(**fields)
 
 
 def setup_function() -> None:
@@ -75,7 +103,16 @@ def test_registering_same_provider_object_is_idempotent() -> None:
     assert resolve_backend("fake") is provider
 
 
-def test_different_provider_for_same_device_type_is_rejected() -> None:
+@pytest.mark.parametrize("factory", [3, lambda self, required: None])  # type: ignore[misc]
+def test_invalid_config_factory_fails_registration(
+    monkeypatch: pytest.MonkeyPatch, factory: Any
+) -> None:
+    monkeypatch.setattr(FakeProvider, "create_config_service", factory, raising=False)
+    with pytest.raises(InvalidBackendProviderError, match="create_config_service"):
+        register_backend(FakeProvider(), source="test:malformed")
+
+
+def test_different_provider_for_same_backend_id_is_rejected() -> None:
     register_backend(FakeProvider(), source="first-package")
 
     with pytest.raises(DuplicateBackendRegistrationError) as exc_info:
@@ -83,8 +120,8 @@ def test_different_provider_for_same_device_type_is_rejected() -> None:
 
     message = str(exc_info.value)
     assert "requested='fake'" in message
-    assert "existing_source='first-package'" in message
-    assert "attempted_source='second-package'" in message
+    assert "existing_origin='first-package [backend_id=fake]'" in message
+    assert "attempted_origin='second-package [backend_id=fake]'" in message
     assert "active=None" in message
 
 
@@ -116,31 +153,31 @@ def test_activation_and_repeated_activation_are_idempotent() -> None:
 
 
 def test_active_backend_cannot_switch_in_same_process() -> None:
-    npu = FakeProvider(device_type="npu")
+    ascend = FakeProvider(backend_id="ascend", device_type="npu")
     register_backend(CUDA_BACKEND, source="builtin:cuda")
-    register_backend(npu, source="builtin:npu")
+    register_backend(ascend, source="builtin:ascend")
     activate_backend("cuda")
 
     with pytest.raises(BackendAlreadyActiveError) as exc_info:
-        activate_backend("npu")
+        activate_backend("ascend")
 
     message = str(exc_info.value)
-    assert "requested='npu'" in message
+    assert "requested='ascend'" in message
     assert "active='cuda'" in message
-    assert "active_source='builtin:cuda'" in message
-    assert "requested_source='builtin:npu'" in message
+    assert "active_origin='builtin:cuda [backend_id=cuda]'" in message
+    assert "requested_origin='builtin:ascend [backend_id=ascend]'" in message
 
 
-def test_empty_device_types_are_rejected() -> None:
+def test_empty_backend_ids_are_rejected() -> None:
     with pytest.raises(ValueError, match="must not be empty"):
         resolve_backend("  ")
 
     with pytest.raises(InvalidBackendProviderError, match="must not be empty"):
-        register_backend(FakeProvider(device_type="  "))
+        register_backend(FakeProvider(backend_id="  "))
 
 
-def test_device_type_lookup_is_normalized_without_aliases() -> None:
-    provider = FakeProvider(device_type=" CuDa ")
+def test_backend_id_lookup_is_normalized_without_aliases() -> None:
+    provider = FakeProvider(backend_id=" CuDa ")
     register_backend(provider)
 
     assert resolve_backend("  CUDA ") is provider
@@ -162,6 +199,10 @@ def test_provider_surface_validation_does_not_call_getters() -> None:
             calls.append("attention")
             return object()
 
+        def matches(self, identity: PlatformIdentity) -> bool:
+            calls.append("matches")
+            return True
+
     register_backend(LazyProvider())
 
     assert calls == []
@@ -172,6 +213,8 @@ def test_provider_class_and_missing_methods_are_rejected() -> None:
         register_backend(FakeProvider)
 
     class IncompleteProvider:
+        backend_id = "incomplete"
+        api_version = PROVIDER_API_VERSION
         device_type = "incomplete"
 
     with pytest.raises(InvalidBackendProviderError, match="required callable"):
@@ -186,7 +229,12 @@ def test_provider_missing_only_constrained_topk_execution_is_rejected() -> None:
     """
 
     class IncompleteProvider:
+        backend_id = "incomplete"
+        api_version = PROVIDER_API_VERSION
         device_type = "incomplete"
+
+        def matches(self, identity: PlatformIdentity) -> bool:
+            return False
 
         def check_environment(self) -> dict[str, str]:
             return {}
@@ -214,4 +262,82 @@ def test_provider_missing_only_constrained_topk_execution_is_rejected() -> None:
     assert "missing=('create_constrained_topk_execution',)" in str(exc_info.value)
 
 
-pytestmark = pytest.mark.cpu_test
+def test_invalid_v2_range_declarations_fail_at_registration() -> None:
+    with pytest.raises(InvalidBackendProviderError, match="Invalid gr_version_range.*example"):
+        register_backend(FakeProvider(gr_version_range="not-a-range"), source="example")
+    with pytest.raises(InvalidBackendProviderError, match="requires vendor_distribution"):
+        register_backend(FakeProvider(vendor_version_range=">=1"))
+
+
+def test_provider_without_matches_is_rejected() -> None:
+    @dataclass(frozen=True)
+    class NoMatchProvider(FakeProvider):
+        matches = None  # type: ignore[assignment]
+
+    with pytest.raises(InvalidBackendProviderError, match="matches"):
+        register_backend(NoMatchProvider())
+
+
+@pytest.mark.parametrize("api_version", [1, 3, "2", None, True])  # type: ignore[misc]
+def test_unsupported_api_versions_are_rejected(api_version: object) -> None:
+    with pytest.raises(InvalidBackendVersionError) as exc_info:
+        register_backend(FakeProvider(api_version=api_version))  # type: ignore[arg-type]
+
+    message = str(exc_info.value)
+    assert f"found={api_version!r}" in message
+    assert "backend_id=fake" in message
+
+
+def test_select_requires_exactly_one_match() -> None:
+    register_backend(FakeProvider(backend_id="one", device_type="cuda"))
+    register_backend(FakeProvider(backend_id="two", device_type="cuda"))
+
+    with pytest.raises(AmbiguousBackendError) as exc_info:
+        select_backend(fake_identity("cuda"))
+
+    message = str(exc_info.value)
+    assert "backend_id=one" in message
+    assert "backend_id=two" in message
+    assert "VLLM_GR_BACKEND" in message
+
+
+def test_select_reports_unsupported_platform_without_fallback() -> None:
+    register_backend(CUDA_BACKEND, source="builtin:cuda")
+
+    with pytest.raises(UnsupportedBackendError) as exc_info:
+        select_backend(fake_identity("cpu", platform_enum="CPU"))
+
+    message = str(exc_info.value)
+    assert "device_type='cpu'" in message
+    assert "available=('cuda',)" in message
+
+
+def test_explicit_selection_resolves_ambiguity_and_must_be_compatible() -> None:
+    register_backend(FakeProvider(backend_id="one", device_type="cuda"))
+    register_backend(FakeProvider(backend_id="two", device_type="cuda"))
+
+    assert select_backend(fake_identity("cuda"), requested="two").backend_id == "two"
+
+    with pytest.raises(IncompatibleBackendError) as exc_info:
+        select_backend(fake_identity("cpu", platform_enum="CPU"), requested="one")
+
+    assert "requested_origin='manual [backend_id=one]'" in str(exc_info.value)
+
+
+def test_explicit_selection_cannot_bypass_duplicate_ids() -> None:
+    register_backend(FakeProvider(), source="first-package")
+
+    with pytest.raises(DuplicateBackendRegistrationError):
+        register_backend(FakeProvider(), source="second-package")
+
+    assert select_backend(fake_identity("fake"), requested="fake").backend_id == "fake"
+
+
+def test_activation_with_identity_rejects_incompatible_request() -> None:
+    register_backend(CUDA_BACKEND, source="builtin:cuda")
+
+    with pytest.raises(IncompatibleBackendError):
+        activate_backend("cuda", identity=fake_identity("cpu", platform_enum="CPU"))
+
+
+pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

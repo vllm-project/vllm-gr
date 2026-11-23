@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="975" height="357" viewBox="0 0 975 357" role="img" aria-labelledby="title desc">
+  <title id="title">CUDA asynchronous scheduling timeline</title>
+  <desc id="desc">Queueing sampling starts device token selection and lets the host prepare the next layout. Decode k+1 needs both the layout and the selected tokens. The status copy for k runs on its own stream.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect width="975" height="357" fill="#ffffff"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#252627">
+    <!-- Separate input ports distinguish layout readiness from token readiness. -->
+    <path d="M 375 81 H 455" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 295 107 V 171 H 455" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 695 81 H 865 V 145" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 695 171 H 775" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <path d="M 575 197 V 261 H 775" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <rect x="20" y="55" width="160" height="52" rx="8" fill="#e3f1d9" stroke="#252627" stroke-width="1.5"/>
+    <text x="100" y="86" font-size="16" text-anchor="middle" fill="#252627">Worker host</text>
+    <rect x="20" y="145" width="160" height="52" rx="8" fill="#e3f1d9" stroke="#252627" stroke-width="1.5"/>
+    <text x="100" y="176" font-size="16" text-anchor="middle" fill="#252627">Compute stream</text>
+    <rect x="20" y="235" width="160" height="52" rx="8" fill="#e3f1d9" stroke="#252627" stroke-width="1.5"/>
+    <text x="100" y="266" font-size="16" text-anchor="middle" fill="#252627">Copy stream</text>
+    <rect x="215" y="55" width="160" height="52" rx="8" fill="#f9dce0" stroke="#252627" stroke-width="1.5"/>
+    <text x="295" y="77" font-size="16" text-anchor="middle" fill="#252627"><tspan x="295" dy="0">Queue</tspan><tspan x="295" dy="19">sampling</tspan></text>
+    <rect x="455" y="55" width="240" height="52" rx="8" fill="#fbe6d5" stroke="#252627" stroke-width="1.5"/>
+    <text x="575" y="77" font-size="16" text-anchor="middle" fill="#252627"><tspan x="575" dy="0">Prepare layout</tspan><tspan x="575" dy="19">for k+1</tspan></text>
+    <rect x="455" y="145" width="240" height="52" rx="8" fill="#f9dce0" stroke="#252627" stroke-width="1.5"/>
+    <text x="575" y="167" font-size="16" text-anchor="middle" fill="#252627"><tspan x="575" dy="0">Select tokens</tspan><tspan x="575" dy="19">for k</tspan></text>
+    <rect x="775" y="145" width="180" height="52" rx="8" fill="#fbe6d5" stroke="#252627" stroke-width="1.5"/>
+    <text x="865" y="167" font-size="16" text-anchor="middle" fill="#252627"><tspan x="865" dy="0">Run Decode</tspan><tspan x="865" dy="19">k+1</tspan></text>
+    <rect x="775" y="235" width="180" height="52" rx="8" fill="#d7f1f1" stroke="#252627" stroke-width="1.5"/>
+    <text x="865" y="257" font-size="16" text-anchor="middle" fill="#252627"><tspan x="865" dy="0">Copy status</tspan><tspan x="865" dy="19">for k</tspan></text>
+    <path d="M 215 313 H 955" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#arrow)"/>
+    <text x="215" y="334" font-size="13" text-anchor="start" fill="#5f6368">Time</text>
+  </g>
+</svg>

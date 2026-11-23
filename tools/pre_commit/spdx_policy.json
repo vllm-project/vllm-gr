@@ -9,20 +9,6 @@
       ],
       "source": "https://github.com/vllm-project/vllm"
     },
-    "tools/pre_commit/enforce_regex_import.py": {
-      "license": "Apache-2.0",
-      "copyrights": [
-        "Copyright contributors to the vLLM project"
-      ],
-      "source": "https://github.com/vllm-project/vllm"
-    },
-    "tools/pre_commit/png-lint.sh": {
-      "license": "Apache-2.0",
-      "copyrights": [
-        "Copyright contributors to the vLLM project"
-      ],
-      "source": "https://github.com/vllm-project/vllm"
-    },
     "tools/pre_commit/validate_config.py": {
       "license": "Apache-2.0 AND MIT",
       "copyrights": [

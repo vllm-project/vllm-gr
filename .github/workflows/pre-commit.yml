@@ -4,9 +4,7 @@ name: Pre-commit and Benchmark
 run-name: >-
   ${{ github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      !((github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
-        github.event.action == 'labeled' &&
+      !(github.event.action == 'labeled' &&
         github.event.label.name == 'abtest') &&
       contains(github.event.pull_request.labels.*.name, 'ready') &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
@@ -21,7 +19,7 @@ run-name: >-
 
 on:
   pull_request:
-    branches: [main, decode_graph]
+    branches: [main]
     types:
       - opened
       - synchronize
@@ -63,6 +61,7 @@ permissions:
   pull-requests: read
 
 env:
+  POLICY_TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name }}
   # Use PCI order; the standalone UUID check verifies actual device identity.
   CUDA_DEVICE_ORDER: PCI_BUS_ID
 
@@ -72,7 +71,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'decode_graph') &&
+      github.event.pull_request.base.ref == 'main' &&
       ((contains(github.event.pull_request.labels.*.name, 'ready') &&
         ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
          github.event.label.name == 'ready')) ||
@@ -198,8 +197,7 @@ jobs:
       !cancelled() && needs.docs-scope.outputs.docs-only != 'true' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+      github.event.pull_request.base.ref == 'main' &&
       contains(github.event.pull_request.labels.*.name, 'ready') &&
       !(github.event.action == 'labeled' && github.event.label.name == 'abtest') &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
@@ -277,10 +275,8 @@ jobs:
       !cancelled() && needs.docs-scope.outputs.docs-only != 'true' &&
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
-       (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'decode_graph') &&
-       !((github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
-         github.event.action == 'labeled' &&
+       github.event.pull_request.base.ref == 'main' &&
+       !(github.event.action == 'labeled' &&
          github.event.label.name == 'abtest') &&
        contains(github.event.pull_request.labels.*.name, 'ready') &&
        ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
@@ -306,7 +302,6 @@ jobs:
         id: benchmark-policy
         env:
           POLICY_REF: ${{ github.sha }}
-          POLICY_TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name }}
         run: |
           device="gpu"
           board_id="unknown"
@@ -318,9 +313,9 @@ jobs:
             )"
           fi
 
-          if [[ "$POLICY_TARGET_BRANCH" == "decode_graph" ||
-                "$POLICY_TARGET_BRANCH" == "main" ]]; then
-            # Use the migrated accuracy floors and retain the known NPU performance profile.
+          if [[ "$POLICY_TARGET_BRANCH" == "main" ||
+                ( "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && "$POLICY_TARGET_BRANCH" == "decode_graph" ) ]]; then
+            # Preserve the manual decode_graph profile alongside main PR validation.
             if [[ "$device" == "npu" && "$board_id" == "Ascend910_9362" ]]; then
               board_id="decode_graph_Ascend910_9362"
             else
@@ -408,10 +403,11 @@ jobs:
           env.VLLM_GR_TARGET_DEVICE == 'cuda'
         run: uv pip install "$CI_VLLM_REQUIREMENT"
 
+      # The editable package version depends on Git HEAD. Refresh this package on reused runners.
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev,grpc]"
+          uv pip install --reinstall-package vllm-gr -e ".[dev,grpc]"
 
       - name: Verify gRPC runtime dependencies
         run: |
@@ -433,7 +429,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Install pre-commit
         run: uv pip install pre-commit==4.6.2
@@ -542,7 +538,7 @@ jobs:
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
+          uv pip install --reinstall-package vllm-gr -e ".[dev]"
 
       - name: Verify installed runtime identity
         run: >-
@@ -560,7 +556,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache OpenOneRec dataset
         uses: corca-ai/local-cache@v2
@@ -593,7 +589,7 @@ jobs:
             -t video \
             -d ./OpenOneRec/benchmark_data \
             -o generated_data/video_catalog.json
-          python ./tools/build_constraint_triples.py \
+          python ./tools/constraints/build_constraint_triples.py \
             --catalog generated_data/video_catalog.json \
             --output generated_data/video_constraint_triples.json \
             --begin "<|sid_begin|>" \
@@ -601,9 +597,8 @@ jobs:
 
       - name: Cache OneRec Recall constraint tables
         if: >-
-          ((github.ref_name == 'decode_graph' || github.ref_name == 'main') ||
-           (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main')) &&
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
           env.BENCHMARK_DEVICE == 'gpu'
         uses: corca-ai/local-cache@v2
         id: cache-recall-constraints
@@ -614,9 +609,8 @@ jobs:
 
       - name: Build OneRec Recall constraint tables
         if: >-
-          ((github.ref_name == 'decode_graph' || github.ref_name == 'main') ||
-           (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main')) &&
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
           env.BENCHMARK_DEVICE == 'gpu' &&
           steps.cache-recall-constraints.outputs.cache-hit != 'true'
         run: |
@@ -627,7 +621,7 @@ jobs:
               --dataset-path OpenOneRec/benchmark_data \
               --mapping-file "$mapping.json" \
               --output-path "generated_data/recall_constraints/$mapping-catalog.json"
-            python tools/build_constraint_triples.py \
+            python tools/constraints/build_constraint_triples.py \
               --catalog "generated_data/recall_constraints/$mapping-catalog.json" \
               --output "generated_data/recall_constraints/${mapping}_triples.json" \
               --begin '<|sid_begin|>' \
@@ -637,23 +631,21 @@ jobs:
 
       - name: Gate Beam V1 B=4 OneRec Recall on fixed samples
         if: >-
-          ((github.ref_name == 'decode_graph' || github.ref_name == 'main') ||
-           (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main')) &&
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
           env.BENCHMARK_DEVICE == 'gpu'
         env:
           V1_RECALL_DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           V1_RECALL_OUTPUT_DIR: ${{ github.workspace }}/v1_recall_results
-          V1_RECALL_BASELINE_FILE: ${{ github.workspace }}/benchmarks/beam_search/v1_recall_b4_baseline.json
+          V1_RECALL_BASELINE_FILE: ${{ github.workspace }}/benchmarks/beam_search/recall_baseline_batch4.json
           V1_RECALL_DIAGNOSTICS: '1'
         run: bash ./tests/system/run_beam_v1_recall.sh
 
       - name: Upload Beam V1 Recall measurements
         if: >-
           always() &&
-          ((github.ref_name == 'decode_graph' || github.ref_name == 'main') ||
-           (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main')) &&
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
           env.BENCHMARK_DEVICE == 'gpu'
         uses: actions/upload-artifact@v4
         with:
@@ -665,9 +657,8 @@ jobs:
       - name: Execute decode benchmark gates
         if: >-
           env.BENCHMARK_DEVICE != 'gpu' ||
-          ((github.ref_name != 'decode_graph' && github.ref_name != 'main') &&
-           (github.event.pull_request.base.ref != 'decode_graph' &&
-            github.event.pull_request.base.ref != 'main'))
+          !(env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph'))
         env:
           DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
@@ -686,8 +677,7 @@ jobs:
       needs.docs-scope.outputs.docs-only != 'true' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+      github.event.pull_request.base.ref == 'main' &&
       ((github.event.action == 'labeled' &&
         github.event.label.name == 'abtest') ||
        (contains(github.event.pull_request.labels.*.name, 'ready') &&
@@ -750,7 +740,7 @@ jobs:
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
+          uv pip install --reinstall-package vllm-gr -e ".[dev]"
 
       - name: Verify candidate runtime identity
         run: >-
@@ -768,7 +758,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache OpenOneRec dataset
         uses: corca-ai/local-cache@v2
@@ -801,7 +791,7 @@ jobs:
             -t video \
             -d ./OpenOneRec/benchmark_data \
             -o generated_data/video_catalog.json
-          python ./tools/build_constraint_triples.py \
+          python ./tools/constraints/build_constraint_triples.py \
             --catalog generated_data/video_catalog.json \
             --output generated_data/video_constraint_triples.json \
             --begin "<|sid_begin|>" \
@@ -917,7 +907,7 @@ jobs:
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
+          uv pip install --reinstall-package vllm-gr -e ".[dev]"
 
       - name: Verify installed runtime identity
         run: >-
@@ -935,7 +925,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache Pangu 1B model
         uses: corca-ai/local-cache@v2
@@ -1034,7 +1024,7 @@ jobs:
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
+          uv pip install --reinstall-package vllm-gr -e ".[dev]"
 
       - name: Verify installed runtime identity
         run: >-
@@ -1052,7 +1042,7 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
+        run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache Pangu 1B model
         uses: corca-ai/local-cache@v2
@@ -1087,8 +1077,7 @@ jobs:
            github.event.action == 'unlabeled') &&
           'Ignored label event' ||
           github.event_name == 'pull_request' &&
-          (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+          github.event.pull_request.base.ref == 'main' &&
           contains(github.event.pull_request.labels.*.name, 'abtest') &&
           !(github.event.action == 'unlabeled' &&
             github.event.label.name == 'ready') &&
@@ -1166,8 +1155,7 @@ jobs:
         env:
           ABTEST_ONLY: >-
             ${{ github.event_name == 'pull_request' &&
-                (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+                github.event.pull_request.base.ref == 'main' &&
                 contains(github.event.pull_request.labels.*.name, 'abtest') &&
                 !(github.event.action == 'unlabeled' &&
                   github.event.label.name == 'ready') &&
@@ -1179,8 +1167,7 @@ jobs:
           ABTEST_PASSED: ${{ needs.resolve-ab-freshness.outputs.passed }}
           ABTEST_REQUIRED: >-
             ${{ github.event_name == 'pull_request' &&
-                (github.event.pull_request.base.ref == 'decode_graph' ||
-                 github.event.pull_request.base.ref == 'main') &&
+                github.event.pull_request.base.ref == 'main' &&
                 contains(github.event.pull_request.labels.*.name, 'ready') &&
                 !(github.event.action == 'labeled' &&
                   github.event.label.name == 'abtest') }}

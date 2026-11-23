@@ -6,27 +6,55 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
-import os
-import random
-import socket
+import math
 import statistics
 import subprocess
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-
-import pandas as pd
-import torch
-import vllm
-
-import vllm_gr
+from uuid import UUID
 
 SHANGHAI = timezone(timedelta(hours=8))
+OFFLINE_RAW_V3 = "vllm-gr.offline.raw.v3"
+INCOMPLETE_MEASUREMENT_IDENTITY = "historical or incomplete measurement identity"
 
 
-def run_text(*command: str) -> str:
-    return subprocess.check_output(command, text=True).strip()
+def gpu_metadata(gpu_uuid: str | None) -> dict[str, object]:
+    """Query the measured physical device, which may differ from local device 0."""
+    if gpu_uuid is None:
+        return {
+            "uuid": None,
+            "count": None,
+            "name": None,
+            "memory_mib": None,
+            "driver_version": None,
+        }
+
+    if not gpu_uuid.startswith("GPU-") or str(UUID(gpu_uuid[4:])) != gpu_uuid[4:].lower():
+        raise ValueError("expected a full GPU UUID")
+    output = subprocess.check_output(
+        (
+            "nvidia-smi",
+            f"--id={gpu_uuid}",
+            "--query-gpu=uuid,name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ),
+        text=True,
+        timeout=10,
+    )
+    (row,) = csv.reader(output.splitlines(), skipinitialspace=True)
+    observed_uuid, name, memory, driver = (field.strip() for field in row)
+    if observed_uuid.lower() != gpu_uuid.lower():
+        raise ValueError("nvidia-smi returned a different GPU UUID")
+    return {
+        "uuid": observed_uuid,
+        "count": 1,
+        "name": name,
+        "memory_mib": int(memory),
+        "driver_version": driver,
+    }
 
 
 def file_sha256(path: Path) -> str:
@@ -35,14 +63,6 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def sample_ids_sha256(dataset_path: Path, count: int) -> str:
-    frame = pd.read_parquet(dataset_path, columns=["metadata"])
-    indices = [str(index) for index in frame.sample(n=count, random_state=42).index]
-    random.Random(0).shuffle(indices)
-    payload = json.dumps([f"video_{index}" for index in indices], separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def latency(raw: dict, metric: str) -> dict[str, float | str]:
@@ -223,11 +243,99 @@ def artifact(path: Path, name: str) -> dict[str, object] | None:
     }
 
 
+def validate_offline_raw(raw: dict, args: argparse.Namespace, dataset: dict) -> None:
+    for key in ("beam_width", "input_length", "warmup_requests"):
+        if type(raw[key]) is not int or raw[key] != getattr(args, key):
+            raise ValueError(f"raw {key}={raw[key]!r} disagrees with the summary argument")
+    count = raw["num_prompts"]
+    if (
+        type(count) is not int
+        or count < 1
+        or type(raw["completed"]) is not int
+        or raw["completed"] != count
+        or type(raw["failed"]) is not int
+        or raw["failed"] != 0
+    ):
+        raise ValueError("incomplete offline measurement: check completed, failed and num_prompts")
+    sample_count = count
+    if raw.get("sample_unit") == "logical-batch":
+        batch_size = raw["batch_size"]
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        sample_count = (count + batch_size - 1) // batch_size
+    for phase, distribution in (("miss", "e2e_ms_miss"), ("hit", "e2e_ms_hit")):
+        values = raw[phase]["e2e_ms"]
+        if (
+            not isinstance(values, list)
+            or len(values) != sample_count
+            or any(type(t) not in (int, float) or not math.isfinite(t) or t <= 0 for t in values)
+        ):
+            raise ValueError(f"{phase}.e2e_ms must contain {sample_count} finite positive samples")
+        if "distributions" in raw:
+            for key in ("mean", "p50", "p90", "p95", "p99"):
+                value = raw["distributions"][distribution][key]
+                if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                    raise ValueError(
+                        f"distributions.{distribution}.{key} must be finite and positive"
+                    )
+    for field, expected in (("input_lens", count), ("output_lens", sample_count)):
+        values = raw[field]
+        if (
+            not isinstance(values, list)
+            or len(values) != expected
+            or any(type(value) is not int or value < 0 for value in values)
+        ):
+            raise ValueError(f"{field} must contain {expected} nonnegative token counts")
+    if raw.get("dataset_sha256") is not None and raw["dataset_sha256"] != dataset["sha256"]:
+        raise ValueError("dataset_sha256 disagrees with the manifest entry for the measured task")
+
+
+def cache_qualification_reason(
+    samples: dict, count: int, *, check_request_lengths: bool = False
+) -> str | None:
+    """Validate observations and return the first unsupported cache condition."""
+    input_tokens = samples.get("input_tokens") if check_request_lengths else None
+    if check_request_lengths and (
+        not isinstance(input_tokens, list)
+        or len(input_tokens) != count
+        or any(type(value) is not int or value < 0 for value in input_tokens)
+    ):
+        raise ValueError(f"input_tokens must contain {count} nonnegative request lengths")
+
+    reasons = []
+    for phase in ("cold", "warm"):
+        field = f"{phase}_cached_tokens"
+        counts = samples.get(field)
+        if counts is not None:
+            if not isinstance(counts, list) or len(counts) != count:
+                raise ValueError(f"{field} must contain {count} observations")
+            if any(v is not None and (type(v) is not int or v < 0) for v in counts):
+                raise ValueError(f"{field} must contain nonnegative integers or null")
+            if input_tokens is not None:
+                for index, (cached, length) in enumerate(zip(counts, input_tokens, strict=True)):
+                    if cached is not None and cached > length + 1:
+                        raise ValueError(
+                            f"{field}[{index}] exceeds the input length plus one SID token "
+                            f"({length + 1})"
+                        )
+        if counts is None or None in counts:
+            reasons.append(f"{phase} prefix cache observations unavailable")
+        elif phase == "cold" and any(counts):
+            reasons.append("a cold request reused prefix cache tokens")
+        elif phase == "warm" and 0 in counts:
+            reasons.append("a warm request reused zero prefix cache tokens")
+    return next(iter(reasons), None)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-result", type=Path, required=True)
     parser.add_argument("--dataset-manifest", type=Path, required=True)
-    parser.add_argument("--repo-dir", type=Path, default=Path("/opt/vllm-gr"))
+    parser.add_argument(
+        "--repo-dir", type=Path, help="Accepted for compatibility with existing invocations"
+    )
+    parser.add_argument("--catalog-path", help="Actual server catalog path for online summaries")
+    parser.add_argument("--gpu-uuid", help="Full NVIDIA UUID of the device used for measurement")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--warmup-requests", type=int, required=True)
@@ -236,20 +344,29 @@ def main() -> int:
     parser.add_argument("--service-metrics", type=Path)
     parser.add_argument("--server-log", type=Path)
     parser.add_argument("--execution-mode", choices=("online", "offline"), default="online")
-    parser.add_argument("--host-name", default=os.environ.get("HOST_NAME") or socket.gethostname())
-    parser.add_argument("--container-name", default="vllm-gr-benchmark")
+    parser.add_argument("--host-name")
+    parser.add_argument("--container-name")
     parser.add_argument("--git-sha", required=True)
     parser.add_argument("--git-subject", required=True)
     parser.add_argument("--git-branch")
     parser.add_argument("--tracked-clean", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--container-image", default="vllm-gr:dev")
+    parser.add_argument("--container-image")
     parser.add_argument("--container-digest")
     parser.add_argument("--cpu-timing-dir", type=Path)
     parser.add_argument("--source-change", type=Path)
     args = parser.parse_args()
 
-    raw = json.loads(args.raw_result.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(args.raw_result.read_text(encoding="utf-8"))
+        runtime_source = raw.get("runtime_source") or {}
+        actual_sha = runtime_source.get("git_sha")
+        if actual_sha is not None and actual_sha != args.git_sha:
+            raise ValueError("runtime_source.git_sha disagrees with --git-sha")
+    except (AttributeError, OSError, ValueError) as exc:
+        parser.error(f"{args.raw_result}: {exc}")
     offline = args.execution_mode == "offline" or raw.get("execution_mode") == "offline"
+    if not offline and not args.catalog_path:
+        parser.error("--catalog-path is required for online summaries")
     if not offline and args.service_metrics is None:
         parser.error("--service-metrics is required for online summaries")
     service_metrics = (
@@ -257,29 +374,82 @@ def main() -> int:
         if args.service_metrics is not None
         else {}
     )
-    dataset_manifest = json.loads(args.dataset_manifest.read_text(encoding="utf-8"))
-    dataset_file = next(item for item in dataset_manifest["files"] if item["task"] == "video")
-    dataset_path = Path(dataset_file["path"])
+    task = raw.get("task", "video")
+    try:
+        dataset_manifest = json.loads(args.dataset_manifest.read_text(encoding="utf-8"))
+        entries = [item for item in dataset_manifest["files"] if item["task"] == task]
+        if len(entries) != 1:
+            raise ValueError(f"expected exactly one manifest entry for task {task!r}")
+        (dataset_file,) = entries
+        dataset_path = dataset_file["path"]
+        dataset_sha = dataset_file["sha256"]
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        parser.error(f"{args.dataset_manifest}: {exc}")
+    token_samples = {}
+    reasons = []
     if offline:
-        started_utc = datetime.fromisoformat(raw["started_at"])
-        finished_utc = datetime.fromisoformat(raw["finished_at"])
+        try:
+            validate_offline_raw(raw, args, dataset_file)
+            started_utc = datetime.fromisoformat(raw["started_at"])
+            finished_utc = datetime.fromisoformat(raw["finished_at"])
+            token_samples = {
+                "input_tokens": raw["input_lens"],
+                "cold_cached_tokens": raw["miss"].get("cached_tokens"),
+                "warm_cached_tokens": raw["hit"].get("cached_tokens"),
+            }
+            cache_issue = cache_qualification_reason(
+                token_samples,
+                len(raw["miss"]["e2e_ms"]),
+                check_request_lengths=(
+                    raw.get("schema_version") == OFFLINE_RAW_V3 and raw.get("batch_size", 1) == 1
+                ),
+            )
+            if cache_issue:
+                reasons.append(cache_issue)
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            parser.error(f"{args.raw_result} (manifest {args.dataset_manifest}): {exc}")
     else:
         started_utc = datetime.strptime(raw["date"], "%Y%m%d-%H%M%S").replace(tzinfo=UTC)
         finished_utc = datetime.fromtimestamp(args.raw_result.stat().st_mtime, tz=UTC)
     started = started_utc.astimezone(SHANGHAI)
     finished = finished_utc.astimezone(SHANGHAI)
 
-    gpu_line = run_text(
-        "nvidia-smi",
-        "--query-gpu=name,memory.total,driver_version",
-        "--format=csv,noheader,nounits",
-        "--id=0",
-    )
-    gpu_name, gpu_memory, driver_version = [part.strip() for part in gpu_line.split(",")]
+    try:
+        gpu = gpu_metadata(args.gpu_uuid)
+        visible_gpu = raw.get("visible_gpu")
+        if (
+            args.gpu_uuid is not None
+            and isinstance(visible_gpu, str)
+            and visible_gpu.startswith("GPU-")
+            and "," not in visible_gpu
+            and visible_gpu.lower() != args.gpu_uuid.lower()
+        ):
+            raise ValueError("measured visible_gpu disagrees with --gpu-uuid")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        parser.error(f"could not verify --gpu-uuid: {exc}")
     num_prompts = int(raw["num_prompts"])
     failed = int(raw["failed"])
     cache = service_metrics.get("prefix_cache")
-    reasons = []
+    selection = raw.get("selection") or {}
+    runtime = raw.get("runtime") or {}
+    if offline and raw.get("dataset_sha256") is None:
+        reasons.append("measured dataset SHA-256 is unavailable")
+    if offline and not all(
+        (
+            raw.get("model_revision"),
+            selection.get("workload_sha256"),
+            selection.get("sample_ids_sha256"),
+            raw.get("warmup_workload_sha256"),
+            raw.get("engine_config", {}).get("catalog_sha256"),
+        )
+    ):
+        reasons.append(INCOMPLETE_MEASUREMENT_IDENTITY)
+    if offline and raw.get("sample_unit") == "logical-batch" and raw["batch_size"] != 1:
+        reasons.append("historical logical-batch samples use more than one request per call")
+    if offline and (
+        gpu["uuid"] is None or not runtime.get("vllm_version") or not runtime.get("torch_version")
+    ):
+        reasons.append("measurement environment was not fully recorded")
     if num_prompts < 100:
         reasons.append("smoke run uses fewer than 100 measured requests")
     if failed:
@@ -324,7 +494,10 @@ def main() -> int:
                     diagnostic_miss["total_beam_ms"] + diagnostic_hit["total_beam_ms"]
                 ),
             }
-        duration_seconds = float(raw["duration_seconds"])
+        duration = raw.get("duration_seconds")
+        if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
+            parser.error(f"{args.raw_result}: duration_seconds must be finite and positive")
+        duration_seconds = float(duration)
         output_total = int(raw["aggregate_output_tokens"])
         input_total = sum(observed_input_lengths)
         requests_per_second = num_prompts / duration_seconds
@@ -342,9 +515,10 @@ def main() -> int:
         )
         offline_api = raw.get("api", "GRLLM.beam_search")
         notes = [
-            f"Offline {offline_api}; max_concurrency=1 and one prompt per call.",
+            f"Offline {offline_api}; max_concurrency={raw['max_concurrency']}, "
+            f"batch_size={raw.get('batch_size', 1)}.",
             "Canonical E2E is measured before diagnostic sampling with one outer perf_counter_ns and no internal monkeypatch or profiler.",
-            "Each canonical sample is a cold-cache call followed by an identical warm-cache call.",
+            "Each canonical sample is a cache-reset call followed by an identical repeat call.",
             "Offline E2E excludes HTTP, SSE, serialization, and network round-trip overhead.",
             "Internal stages are not measured by the V1 E2E frontend benchmark."
             if not diagnostic_latency
@@ -371,6 +545,14 @@ def main() -> int:
         if args.source_change is not None and args.source_change.is_file()
         else None
     )
+    server_args = (
+        raw["engine_config"]
+        if offline
+        else {
+            **(raw.get("engine_config") or service_metrics.get("server_args") or {}),
+            "catalog_path": args.catalog_path,
+        }
+    )
     summary = {
         "schema_version": "vllm-gr.daily.v1",
         "run": {
@@ -387,6 +569,8 @@ def main() -> int:
         "source": {
             "repository": "vllm-gr",
             "git_sha": args.git_sha,
+            "runtime_source": raw.get("runtime_source"),
+            "raw_schema_version": raw.get("schema_version"),
             "git_subject": args.git_subject,
             "branch": args.git_branch,
             "tracked_clean": args.tracked_clean,
@@ -394,51 +578,48 @@ def main() -> int:
         },
         "environment": {
             "host": args.host_name,
-            "hardware": "L20",
-            "gpu": {
-                "count": 1,
-                "name": gpu_name,
-                "memory_mib": int(gpu_memory),
-                "driver_version": driver_version,
-            },
+            "hardware": gpu["name"],
+            "gpu": gpu,
             "container": {
                 "name": args.container_name,
                 "image": args.container_image,
                 "image_digest": args.container_digest,
             },
             "runtime": {
-                "vllm_version": vllm.__version__,
-                "vllm_gr_version": vllm_gr.__version__,
-                "torch_version": torch.__version__,
-                "cuda_forward_compat": True,
+                "vllm_version": runtime.get("vllm_version"),
+                "vllm_gr_version": runtime.get("vllm_gr_version"),
+                "torch_version": runtime.get("torch_version"),
+                "cuda_forward_compat": runtime.get("cuda_forward_compat"),
             },
         },
         "model": {
             "id": raw["model"] if offline else raw["model_id"],
-            "revision": None,
+            "revision": raw.get("model_revision"),
             "generation_config_source": "model",
         },
         "dataset": {
             "name": dataset_manifest["repo_id"],
             "kind": "real",
             "representative": True,
-            "task": "video",
-            "path": str(dataset_path),
+            "task": task,
+            "path": dataset_path,
             "revision": dataset_manifest["revision"],
-            "sha256": dataset_file["sha256"],
+            "sha256": dataset_sha,
             "selection": {
                 "strategy": "seeded-sample",
                 "seed": 42,
                 "sample_count": num_prompts,
-                "sample_ids_sha256": sample_ids_sha256(dataset_path, num_prompts),
+                "sample_ids_sha256": selection.get("sample_ids_sha256"),
+                "workload_sha256": selection.get("workload_sha256"),
+                "warmup_workload_sha256": raw.get("warmup_workload_sha256"),
                 "shuffle": True,
             },
         },
         "scenario": {
             "key": scenario_key,
-            "name": f"RecIF video / beam-{args.beam_width} / input-{args.input_length} / offline-c1"
+            "name": f"RecIF {task} / beam-{args.beam_width} / input-{args.input_length} / offline-c1"
             if offline
-            else f"RecIF video / beam-{args.beam_width} / input-{args.input_length} / concurrency-{raw['max_concurrency']}",
+            else f"RecIF {task} / beam-{args.beam_width} / input-{args.input_length} / concurrency-{raw['max_concurrency']}",
             "execution_mode": "offline" if offline else "online",
             "endpoint": offline_api if offline else "/v1/chat/completions",
             "backend": "vllm-gr-offline" if offline else raw["backend"],
@@ -447,6 +628,7 @@ def main() -> int:
             "request_rate": "sequential" if offline else raw["request_rate"],
             "beam_search": True,
             "n": args.beam_width,
+            "batch_size": raw.get("batch_size", 1) if offline else None,
             "input_tokens_target": args.input_length,
             "input_tokens_observed": {
                 "min": min(observed_input_lengths),
@@ -459,19 +641,7 @@ def main() -> int:
                 "input_tokens": args.input_length,
             },
             "warmup_requests": args.warmup_requests,
-            "server_args": raw["engine_config"]
-            if offline
-            else {
-                "max_logprobs": 1024,
-                "beam_max_width": 1024,
-                "max_num_seqs": 1024,
-                "max_num_batched_tokens": 16384,
-                "scheduling_policy": "fcfs",
-                "gpu_memory_utilization": 0.90,
-                "catalog_path": "/opt/vllm-gr/test_profilling/video_constraint_triples.json",
-                "constraint_backend": "constraint_table",
-                "enable_thinking": False,
-            },
+            "server_args": server_args,
             "benchmark_args": {
                 "temperature": 0,
                 "max_tokens": raw["max_tokens"] if offline else None,
@@ -517,9 +687,10 @@ def main() -> int:
             ),
             "samples": (
                 {
+                    "unit": raw.get("sample_unit", "request"),
                     "e2el_ms": raw["miss"]["e2e_ms"],
                     "e2el_hit_ms": raw["hit"]["e2e_ms"],
-                    "input_tokens": raw["input_lens"],
+                    **token_samples,
                     "output_tokens": raw["output_lens"],
                 }
                 if offline
@@ -532,7 +703,9 @@ def main() -> int:
         },
         "artifacts": [],
     }
-    if not offline:
+    if offline:
+        summary["dataset"]["measured_sha256"] = raw.get("dataset_sha256")
+    else:
         summary["results"]["cache"] = {"prefix": cache}
 
     for path, name in (

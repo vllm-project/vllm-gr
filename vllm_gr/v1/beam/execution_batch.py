@@ -133,7 +133,7 @@ class BeamBatchExecutionView:
             # a stage expands ``input_width`` parents into ``candidate_width``
             # candidates each, so it can never produce more than
             # ``input_width * candidate_width`` survivors.
-            active_candidates = per_parent[self.stage_index]
+            active_candidates = self.per_parent_beam_widths[self.stage_index]
             if self.input_width * active_candidates < self.output_width:
                 _fail(
                     f"per_parent_beam_widths[{self.stage_index}]={active_candidates} cannot "

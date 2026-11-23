@@ -17,7 +17,7 @@ from vllm_gr.constraints.backend import (
     build_constraint_output,
     validate_select_inputs,
 )
-from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab
+from vllm_gr.constraints.npu_tables import NPUStageVocab
 from vllm_gr.constraints.validity import (
     constraint_candidate_counts,
     valid_mask_from_counts,

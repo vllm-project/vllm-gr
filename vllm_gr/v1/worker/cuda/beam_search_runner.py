@@ -18,11 +18,12 @@ from vllm_gr.ops.cuda.beam_kv_reorder import (
 from vllm_gr.ops.cuda.beam_selection import (
     _group_beam_outputs_kernel,
     _hierarchical_topk_out,
+    bootstrap_beam_outputs_out,
 )
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
-from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspace
+from vllm_gr.v1.beam.session import BeamSearchSession
+from vllm_gr.v1.worker.cuda.beam_state import BeamSearchState
+from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspace
 
 try:
     from torch._C._dynamo.guards import TensorGuards as _TensorGuards
@@ -516,31 +517,48 @@ class BeamSearchRunner:
             KV_CAPACITY=self._kv_capacity,
             PREFILL=prefill,
         )
-        selected_scores, selected_flat, stride = _hierarchical_topk_out(
-            w["parent_scores"],
-            logprobs,
-            w["selection_mask"],
-            1,
-            rows,
-            candidate_width,
-            width,
-            self.workspace.selection_scratch,
-            mask_invalid_indices=True,
-        )
-        _group_beam_outputs_kernel[(1,)](
-            selected_scores,
-            selected_flat,
-            token_ids,
-            self._selected_tokens,
-            self._selected_parents,
-            self._selected_scores,
-            self._selected_flat,
-            width,
-            candidate_width,
-            stride,
-            WRITE_FLAT_INDICES=True,
-            BLOCK=block,
-        )
+        if prefill and candidate_width == width:
+            bootstrap_beam_outputs_out(
+                w["parent_scores"],
+                token_ids,
+                logprobs,
+                w["selection_mask"],
+                self._selected_tokens,
+                self._selected_parents,
+                self._selected_scores,
+                self._selected_flat,
+                batch_size=1,
+                beam_width=width,
+                candidate_width=candidate_width,
+                compact_input=True,
+                reuse_ordered_candidates=True,
+            )
+        else:
+            selected_scores, selected_flat, stride = _hierarchical_topk_out(
+                w["parent_scores"],
+                logprobs,
+                w["selection_mask"],
+                1,
+                rows,
+                candidate_width,
+                width,
+                self.workspace.selection_scratch,
+                mask_invalid_indices=True,
+            )
+            _group_beam_outputs_kernel[(1,)](
+                selected_scores,
+                selected_flat,
+                token_ids,
+                self._selected_tokens,
+                self._selected_parents,
+                self._selected_scores,
+                self._selected_flat,
+                width,
+                candidate_width,
+                stride,
+                WRITE_FLAT_INDICES=True,
+                BLOCK=block,
+            )
         ops._append_completed_kernel[(rows,)](
             token_ids,
             w["terminal_ranks"],

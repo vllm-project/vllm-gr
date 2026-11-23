@@ -38,7 +38,7 @@ jobs:
       - name: Build sdist and wheel
         run: bash scripts/build_wheel.sh --python python
       - name: Compare wheel contents and read the installed protocol files
-        run: python tools/check_wheel_contents.py
+        run: python tools/packaging/check_wheel_contents.py
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:

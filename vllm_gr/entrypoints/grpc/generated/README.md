@@ -9,7 +9,7 @@ After changing `../proto/common.proto` or `../proto/vllm_engine.proto`:
 
 ```bash
 pip install grpcio-tools==1.84.0   # also included in the `dev` extra
-python tools/generate_grpc_proto.py
+python tools/codegen/generate_grpc_proto.py
 ```
 
 `grpcio-tools` is pinned because the bundled protoc version is written into the
@@ -26,7 +26,7 @@ The script also rewrites the protoc output so that:
 
 ## Drift check
 
-`python tools/generate_grpc_proto.py --check` regenerates into a temporary
+`python tools/codegen/generate_grpc_proto.py --check` regenerates into a temporary
 directory and fails with a diff if the committed files differ. It runs as the
 `check-grpc-generated` pre-commit hook, which CI executes with `--all-files`.
 

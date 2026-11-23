@@ -8,10 +8,11 @@ Recommendation Reason Evaluator
 Evaluates model predictions on Recommendation Reason task using LLM-based multi-dimensional evaluation.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Tuple
 
-from benchmarks.open_one_rec.base_evaluator import BaseEval
+from benchmarks.open_one_rec.base_evaluator import BaseEval, EvaluationError
 from benchmarks.open_one_rec.tasks.rec_reason.utils import (
     evaluate_reasoning,
     extract_after_think,
@@ -20,8 +21,49 @@ from benchmarks.open_one_rec.tasks.rec_reason.utils import (
 logger = logging.getLogger(__name__)
 
 
+class _OpenAIJudge:
+    """Provide the scorer's blocking interface using the configured OpenAI SDK."""
+
+    def __init__(
+        self, client_type, model_name: str, endpoint: str, api_key: str, use_async: bool
+    ) -> None:
+        self.client_type = client_type
+        self.model_name = model_name
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.use_async = use_async
+
+    def generate(self, prompt: str) -> str:
+        if self.use_async:
+            return asyncio.run(self._generate_async(prompt))
+        with self.client_type(base_url=self.endpoint, api_key=self.api_key) as client:
+            response = client.chat.completions.create(
+                model=self.model_name, messages=[{"role": "user", "content": prompt}]
+            )
+        return self._response_text(response)
+
+    async def _generate_async(self, prompt: str) -> str:
+        # Each worker owns its client and event loop until the request completes.
+        async with self.client_type(base_url=self.endpoint, api_key=self.api_key) as client:
+            response = await client.chat.completions.create(
+                model=self.model_name, messages=[{"role": "user", "content": prompt}]
+            )
+        return self._response_text(response)
+
+    @staticmethod
+    def _response_text(response) -> str:
+        if not response.choices:
+            raise ValueError("Judge response contains no choices")
+        content = response.choices[0].message.content
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Judge response contains no text content")
+        return content
+
+
 class RecoReasonEvaluator(BaseEval):
     """Recommendation Reason task evaluator"""
+
+    reuse_cached_metrics = False
 
     @property
     def required_metrics(self) -> List[str]:
@@ -36,7 +78,7 @@ class RecoReasonEvaluator(BaseEval):
             eval_config: Evaluation configuration with vLLM endpoint settings
 
         Returns:
-            OpenAI client configured for vLLM endpoint
+            Blocking Judge adapter configured for the vLLM endpoint
 
         Raises:
             ImportError: If openai package not available
@@ -54,12 +96,13 @@ class RecoReasonEvaluator(BaseEval):
 
         logger.info(f"Creating vLLM client for endpoint: {vllm_endpoint}")
 
-        if use_async:
-            client = AsyncOpenAI(base_url=vllm_endpoint, api_key=vllm_api_key)
-        else:
-            client = OpenAI(base_url=vllm_endpoint, api_key=vllm_api_key)
-
-        return client
+        return _OpenAIJudge(
+            client_type=AsyncOpenAI if use_async else OpenAI,
+            model_name=eval_config.get("llm_judge_model", "gemini"),
+            endpoint=vllm_endpoint,
+            api_key=vllm_api_key,
+            use_async=use_async,
+        )
 
     def _compute_metrics_from_scratch(
         self,
@@ -149,13 +192,15 @@ class RecoReasonEvaluator(BaseEval):
         try:
             llm_client = self._get_vllm_client(eval_config)
         except Exception as e:
-            logger.info(f"[red]Failed to initialize vLLM client: {e}[/red]")
-            return {}, {}
+            raise EvaluationError(f"Cannot initialize recommendation-reason Judge: {e}") from e
 
         # Get LLM eval config
         llm_judge_model = eval_config.get("llm_judge_model", "gemini")
         llm_max_workers = eval_config.get("llm_max_workers", 3)
         llm_max_samples = eval_config.get("llm_max_samples", 300)
+
+        if not callable(getattr(llm_client, "generate", None)):
+            raise EvaluationError(f"{self.task_name}: Judge client must provide generate(prompt)")
 
         # Prepare data as dicts
         predictions_dict = {id: pred for id, pred in zip(sample_ids, predictions)}
@@ -176,17 +221,13 @@ class RecoReasonEvaluator(BaseEval):
                 save_dir=self.predictions_dir,
             )
 
-            logger.info(
-                f"[green]LLM evaluation completed: {llm_metrics.get('llm_eval_num_samples', 0)} samples evaluated[/green]"
-            )
-            return llm_metrics, llm_per_sample
-
+        except EvaluationError:
+            raise
         except Exception as e:
-            logger.info(f"[red]LLM evaluation failed: {e}[/red]")
-            import traceback
+            raise EvaluationError(f"{self.task_name}: Judge evaluation failed: {e}") from e
 
-            traceback.print_exc()
-            return {}, {}
+        self._require_judge_metrics(llm_metrics, "llm_score", "llm_eval_num_samples", 1, 5)
+        return llm_metrics, llm_per_sample
 
     def _save_debug_info(
         self,

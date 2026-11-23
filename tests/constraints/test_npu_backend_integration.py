@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableConfig
+from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableSpec
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.backend import INVALID_LOGIT, ConstraintMetadata
 from vllm_gr.constraints.loader import load_constraint_backend
@@ -50,7 +50,7 @@ def test_real_npu_loader_passes_step_zero_one_two_at_top_k_256(
 ) -> None:
     path = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(make_table(), path)
-    config = ConstraintTableConfig(
+    config = ConstraintTableSpec(
         enabled=True,
         backend=ConstraintTableBackendEnum.NPU,
         path=str(path),
@@ -74,7 +74,7 @@ def test_real_npu_keeps_low_legal_logprob_separate_from_padding(tmp_path: Path) 
     path = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(make_table(), path)
     backend = load_constraint_backend(
-        ConstraintTableConfig(
+        ConstraintTableSpec(
             enabled=True,
             backend=ConstraintTableBackendEnum.NPU,
             path=str(path),

@@ -12,7 +12,7 @@ from typing import Any
 import torch
 
 from vllm_gr.constraints.backend import ConstraintOutput
-from vllm_gr.v1.beam.dynamic_beam import DynamicBeamState, prune_stage_pools
+from vllm_gr.v1.beam.dynamic_width import DynamicBeamState, prune_stage_pools
 from vllm_gr.v1.worker.cuda.gr_inputs import GRInputBuffers
 
 

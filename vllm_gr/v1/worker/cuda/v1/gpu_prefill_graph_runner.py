@@ -4,35 +4,26 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.config import BeamExecutionMode, GRConfig
 from vllm_gr.utils.npu_adapter import is_cuda_available
-from vllm_gr.v1.attention.backends.beam_dense_prefill import fresh_prefill_capture
+from vllm_gr.v1.forward_context import fresh_prefill_capture
+from vllm_gr.v1.worker.cuda.v1.prefill_capture_plan import plan_prefill_capture
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
-    ENV_ENABLE_PREFILL_GRAPH,
-    ENV_PREFILL_GRAPH_BUCKETS,
     SUPPORTED_NUM_REQS,
     BasePrefillGraphRunner,
-    get_kv_capture_bound,
     get_max_context_len,
-    get_prefill_graph_capture_num_reqs,
     is_prefill_graph_enabled,
 )
 
 logger = init_logger(__name__)
 
 
-def _capture_request_counts(
-    configured: tuple[int, ...], max_num_seqs: int, mode: BeamExecutionMode | None
-) -> tuple[int, ...]:
-    if mode is not BeamExecutionMode.V1:
-        return (1,) if max_num_seqs >= 1 else ()
+def _capture_request_counts(configured: tuple[int, ...], max_num_seqs: int) -> tuple[int, ...]:
     return tuple(count for count in configured if count <= max_num_seqs)
 
 
@@ -94,12 +85,29 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             self.buckets,
         )
 
+    def _plan_capture_buckets(
+        self,
+        *,
+        max_num_seqs: int,
+        max_num_batched_tokens: int | None,
+        max_model_len: int,
+        total_token_buckets: bool,
+    ) -> None:
+        self.capture_plan = plan_prefill_capture(
+            self.buckets,
+            self.gr_settings.beam_batch_sizes,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
+            total_token_buckets=total_token_buckets,
+        )
+        self.buckets = list(self.capture_plan)
+
     def capture_graphs(self, runner: Any) -> None:
         """Capture configured request-count CUDA graphs for each prefill bucket."""
-        if not is_prefill_graph_enabled():
+        if not is_prefill_graph_enabled(runner):
             logger.info(
-                "Prefill CUDA Graph capture is disabled via environment variable (%s=0).",
-                ENV_ENABLE_PREFILL_GRAPH,
+                "Prefill CUDA Graph capture is disabled by gr.prefill_graph_enabled.",
             )
             return
 
@@ -115,21 +123,11 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         from vllm.forward_context import set_forward_context
         from vllm.platforms import current_platform
 
-        scheduler_config = getattr(runner, "scheduler_config", None)
-        if scheduler_config is None:
-            scheduler_config = getattr(
-                getattr(runner, "vllm_config", None), "scheduler_config", None
-            )
-        configured_num_reqs = get_prefill_graph_capture_num_reqs(
-            getattr(runner, "vllm_config", None)
-        )
-        max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", configured_num_reqs[-1]))
-        custom_total_buckets = os.getenv(ENV_PREFILL_GRAPH_BUCKETS) is not None
+        custom_total_buckets = self.gr_settings.prefill_token_buckets is not None
         max_context_len = get_max_context_len(runner)
-        # Legacy Beam Search dispatches one request at a time. Keep its
-        # original capture footprint; reserve B=4 graphs for V1 sessions.
-        mode = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None)).beam_execution_mode
-        capture_num_reqs = _capture_request_counts(configured_num_reqs, max_num_seqs, mode)
+        capture_num_reqs = tuple(
+            sorted({n for counts in self.capture_plan.values() for n in counts})
+        )
 
         logger.info(
             "Beginning Prefill CUDA graph capture for buckets: %s (batch sizes: %s)",
@@ -176,9 +174,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                 for layer_name in kv_cache_config.kv_cache_groups[0].layer_names:
                     slot_mappings_by_layer[layer_name] = buf.slot_mapping_buf
 
-            for num_reqs in _capture_eligible_request_counts(
-                bucket, capture_num_reqs, max_context_len, custom_total_buckets
-            ):
+            for num_reqs in self.capture_plan[bucket]:
                 try:
                     # Distribute bucket tokens evenly across num_reqs for capture
                     req_lens = _capture_request_lengths(
@@ -370,8 +366,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         buf = self.buffers.get(bucket)
         return buf is not None and buf.has_captured_graph(num_reqs)
 
-    @staticmethod
-    def _kv_capture_bound(bucket: int) -> int:
+    def _kv_capture_bound(self, bucket: int) -> int:
         """KV bound baked into this bucket's graph.
 
         The returned value feeds both the captured attention scalar
@@ -382,7 +377,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         is what keeps miss-path graphs byte-identical.
         """
         bound = 2 * bucket
-        kv_bound = get_kv_capture_bound()
+        kv_bound = self.gr_settings.prefill_kv_bound
         if kv_bound is not None and kv_bound > bound:
             bound = kv_bound
         return bound

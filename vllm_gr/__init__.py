@@ -23,39 +23,24 @@ from typing import Any
 
 from vllm_gr.version import __version__
 
-_PUBLIC_EXPORTS: dict[str, tuple[str, str, bool]] = {
-    "GRLLM": ("vllm_gr.entrypoints.gr", "GRLLM", True),
-}
-
-_LAZY_EXPORTS = dict(_PUBLIC_EXPORTS)
-
 __all__ = [
     "__version__",
     "GRLLM",
 ]
 
 
-def _check_env_before_vllm_import() -> None:
+def __getattr__(name: str) -> Any:
+    if name != "GRLLM":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
     from vllm_gr._env_check import check_opencv_env
 
     check_opencv_env()
 
+    from vllm_gr.entrypoints.llm import GRLLM
 
-def __getattr__(name: str) -> Any:
-    try:
-        module_name, attr_name, needs_env_check = _LAZY_EXPORTS[name]
-    except KeyError as exc:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
-
-    if needs_env_check:
-        _check_env_before_vllm_import()
-
-    from importlib import import_module
-
-    module = import_module(module_name)
-    value = getattr(module, attr_name)
-    globals()[name] = value
-    return value
+    globals()[name] = GRLLM
+    return GRLLM
 
 
 def __dir__() -> list[str]:

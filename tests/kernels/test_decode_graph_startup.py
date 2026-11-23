@@ -14,6 +14,8 @@ from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     install_decode_model,
 )
+from vllm_gr.config.models import DeploymentOptions
+from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import (
     should_replay_decode_graph_v2,
 )
@@ -21,6 +23,7 @@ from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
     capture_multibatch_forward,
     get_v2_runtime,
 )
+from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -32,7 +35,7 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
     worker.model_config.enforce_eager = False
     worker.model_config.max_model_len = 64
     worker._vllm_gr_config.beam_graph_enabled = True
-    worker._vllm_gr_config.beam_online_batch_sizes = (1,)
+    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
     worker._vllm_gr_config.beam_worker_decision = True
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=1)
@@ -114,3 +117,29 @@ def test_invalidated_decode_capture_aborts_in_isolated_process() -> None:
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@torch.inference_mode()  # type: ignore[misc]
+def test_v1_startup_graphs_replay_with_their_own_batch_buffers() -> None:
+    worker = admission_worker()
+    worker.model_config.enforce_eager = False
+    cfg = worker._vllm_gr_config
+    cfg.beam_graph_enabled = cfg.beam_worker_decision = True
+    cfg.constraint_table = SimpleNamespace(enabled=True)
+    cfg.deployment = DeploymentOptions(beam_batch_sizes=(1, 2))
+    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=2)
+    install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
+    assert capture_async_forward(worker, hooks_type=CudaStageHooksV1)
+    assert capture_async_forward(worker, hooks_type=CudaStageHooksV1)
+    for batch, token in ((1, 5), (2, 9), (1, 17)):
+        owner = worker._gr_gpu_stage_runner_cache[batch]
+        owner.input_ids.fill_(token)
+        owner.positions.fill_(1)
+        graph = worker._beam_decode_graph.select(batch, cfg.beam_max_width)
+        assert graph.ready
+        torch.testing.assert_close(
+            graph.replay(),
+            torch.full(
+                (batch * cfg.beam_max_width, 1), token + 1, device="cuda", dtype=torch.float16
+            ),
+        )

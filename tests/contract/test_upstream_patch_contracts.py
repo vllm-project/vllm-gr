@@ -17,7 +17,7 @@ def _parameter_names(callable_obj: object) -> list[str]:
 
 
 def test_patch_inventories_are_aligned_and_complete() -> None:
-    inventory = yaml.safe_load(Path("docs/patch_inventory.yaml").read_text(encoding="utf-8"))
+    inventory = yaml.safe_load(Path("docs/design/patch_inventory.yaml").read_text(encoding="utf-8"))
     patches = inventory["patches"]
     patch_ids = [patch["id"] for patch in patches]
     required_fields = {
@@ -35,7 +35,7 @@ def test_patch_inventories_are_aligned_and_complete() -> None:
     assert all(re.fullmatch(r"GR-PATCH-\d{3}", patch_id) for patch_id in patch_ids)
     assert all(required_fields <= patch.keys() for patch in patches)
 
-    runtime_inventory = Path("docs/runtime_patch_inventory.md").read_text(encoding="utf-8")
+    runtime_inventory = Path("docs/design/runtime_patch_inventory.md").read_text(encoding="utf-8")
     runtime_ids = re.findall(r"^### (GR-PATCH-\d{3})", runtime_inventory, re.MULTILINE)
     assert runtime_ids == patch_ids
     for patch in patches:
@@ -44,10 +44,22 @@ def test_patch_inventories_are_aligned_and_complete() -> None:
         assert f"Scope: `{patch['scope']}`; backend ID: `{backend_id}`" in section
 
 
+class _SyntheticAscendPlatform:
+    """Synthetic Ascend identity: vendor class lineage without the vendor import."""
+
+    _enum = "OOT"
+    device_type = "npu"
+    device_name = "npu"
+
+
+_SyntheticAscendPlatform.__module__ = "vllm_ascend.platform"
+_SyntheticAscendPlatform.__qualname__ = "NPUPlatform"
+
+
 @pytest.mark.l1
-@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+@pytest.mark.parametrize("backend_id", ["cuda", "ascend"])
 def test_common_and_selected_provider_patch_ownership_is_unique(
-    monkeypatch: pytest.MonkeyPatch, device_type: str
+    monkeypatch: pytest.MonkeyPatch, backend_id: str
 ) -> None:
     from types import SimpleNamespace
 
@@ -57,22 +69,24 @@ def test_common_and_selected_provider_patch_ownership_is_unique(
     from vllm_gr.platforms import loader
     from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
 
-    inventory = yaml.safe_load(Path("docs/patch_inventory.yaml").read_text(encoding="utf-8"))
+    inventory = yaml.safe_load(Path("docs/design/patch_inventory.yaml").read_text(encoding="utf-8"))
     patches = inventory["patches"]
     assert all(
         (p["scope"] == "core" and p["backend_id"] is None)
-        or (p["scope"] == "backend" and p["backend_id"] in {"cuda", "npu"})
+        or (p["scope"] == "backend" and p["backend_id"] in {"cuda", "ascend"})
         for p in patches
     )
-    monkeypatch.setattr(
-        vllm.platforms, "current_platform", SimpleNamespace(device_type=device_type)
-    )
+    platforms = {
+        "cuda": SimpleNamespace(_enum="CUDA", device_type="cuda", device_name="cuda"),
+        "ascend": _SyntheticAscendPlatform(),
+    }
+    monkeypatch.setattr(vllm.platforms, "current_platform", platforms[backend_id])
     monkeypatch.setattr(loader, "entry_points", lambda **kwargs: ())
     _reset_backend_registry_for_tests()
     try:
         provider = loader.activate_current_backend()
         core_ids = {p["id"] for p in patches if p["scope"] == "core"}
-        backend_ids = {p["id"] for p in patches if p["backend_id"] == device_type}
+        backend_ids = {p["id"] for p in patches if p["backend_id"] == backend_id}
         assert set(CORE_PATCH_IDS) == core_ids
         assert set(provider.patch_ids) == backend_ids
         claimed = (*CORE_PATCH_IDS, *provider.patch_ids)

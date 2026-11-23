@@ -50,7 +50,7 @@ def test_irregular_graph_parity(tmp_path):
             captures = None
             for eager in (True, False, False):
                 worker.model_config.enforce_eager = eager
-                outputs = llm.beam_search_v1(prompts, params, output_mode="full")
+                outputs = llm.beam_search(prompts, params, output_mode="full")
                 results.append(
                     [[(tuple(s.tokens), s.cum_logprob) for s in out.sequences] for out in outputs]
                 )
@@ -105,7 +105,7 @@ def test_uniform_result_limit_keeps_fixed_adapter(tmp_path, explicit_schedule):
             captures = None
             reference = None
             for returned in (16, 5, 1, 16):
-                outputs = llm.beam_search_v1(
+                outputs = llm.beam_search(
                     prompts,
                     BeamSearchParams(
                         beam_width=16,

@@ -32,55 +32,23 @@ def beam_search_dispatch(
     *,
     trie_ids: list[int] | tuple[int, ...] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
-    """Adapt upstream OpenAI Beam calls to GR V1 or native non-GR inference.
+    """Route upstream OpenAI Beam calls exclusively to GR V1.
 
-    Upstream Chat/Completion still call ``self.beam_search``. Only that name
-    remains: the GR frontend token loop has been retired. Calling the native
-    mixin directly keeps repeated patch installation from capturing this
-    dispatcher as its own fallback.
-
-    ``prompt`` may be a sequence when a caller submits one fixed V1 batch.
+    Chat/Completion still call ``self.beam_search``; that upstream name is
+    only an adapter to ``beam_search``, never a separate token loop.
+    ``prompt`` may be a sequence for one fixed V1 batch.
     """
     # Capture at generator creation, not iteration: upstream may consume the
     # per-prompt generators concurrently or after returning a streaming response.
     selectors = _COMPLETION_TRIE_IDS.get()
     if trie_ids is None and selectors is not None:
         trie_ids = [next(selectors)]
-    from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
+    from vllm_gr.config.execution import require_beam_config
+    from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
-    from vllm_gr.config import BeamExecutionMode, GRConfig
-    from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
-
-    config = getattr(self.engine_client, "vllm_config", None)
-    gr_config = GRConfig.from_vllm_config(config)
-    if gr_config.beam_execution_mode is BeamExecutionMode.V1:
-        impl = beam_search_v1
-    else:
-        additional = getattr(config, "additional_config", None) or {}
-        if (
-            gr_config.enabled
-            or gr_config.beam_max_width is not None
-            or "vllm_gr_beam_execution_mode" in additional
-            or "vllm_gr" in additional
-        ):
-            raise ValueError(
-                "Legacy GR beam_search() has been removed. Configure "
-                "beam.execution_mode='v1' and a canonical constraint artifact."
-            )
-        if getattr(params, "per_parent_beam_widths", None) is not None:
-            from vllm.exceptions import VLLMValidationError
-
-            raise VLLMValidationError(
-                "per_parent_beam_widths requires GR beam_search_v1",
-                parameter="per_parent_beam_widths",
-            )
-        impl = BeamSearchOnlineMixin.beam_search
-    trie_kwargs = {}
-    if trie_ids is not None:
-        if gr_config.beam_execution_mode is not BeamExecutionMode.V1:
-            raise ValueError("trie_ids require GR beam_search_v1")
-        trie_kwargs["trie_ids"] = trie_ids
-    return impl(
+    require_beam_config(getattr(self.engine_client, "vllm_config", None))
+    trie_kwargs = {} if trie_ids is None else {"trie_ids": trie_ids}
+    return beam_search(
         self,
         prompt=prompt,
         request_id=request_id,
@@ -96,10 +64,8 @@ def patch_beam_search():
     from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 
     from vllm_gr.entrypoints.openai.completion_batch_patch import patch_completion_batch
-    from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
 
     GenerateBaseServing.beam_search = beam_search_dispatch
-    GenerateBaseServing.beam_search_v1 = beam_search_v1
     patch_admission_rejection_reporting()
     patch_completion_batch()
 
@@ -121,7 +87,7 @@ def patch_admission_rejection_reporting():
     from vllm.entrypoints.generate.base.serving import GenerateBaseServing
     from vllm.exceptions import VLLMValidationError
 
-    from vllm_gr.v1.engine.async_llm import (
+    from vllm_gr.v1.engine.output_processor import (
         _CLIENT_REQUEST_ID,
         take_admission_rejection,
     )
@@ -170,7 +136,7 @@ def patch_client_request_id():
     from vllm.entrypoints.serve.engine.serving import BaseServing
     from vllm.v1.engine.output_processor import OutputProcessor
 
-    from vllm_gr.v1.engine.async_llm import (
+    from vllm_gr.v1.engine.output_processor import (
         _CLIENT_REQUEST_ID,
         remember_client_request_id,
     )
@@ -202,58 +168,107 @@ def patch_client_request_id():
     OutputProcessor.add_request = patched_add_request
 
 
-def patch_sampling():
+def _completion_xargs_annotation():
     from pydantic import StrictInt
+
+    return dict[str, str | int | float | list[StrictInt]] | None
+
+
+def patch_sampling() -> None:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 
     from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
 
-    # Completion must accept the same list-valued extension parameters as Chat.
-    field = CompletionRequest.model_fields["vllm_xargs"]
-    annotation = ChatCompletionRequest.model_fields["vllm_xargs"].annotation
-    if field.annotation != annotation:
-        field.annotation = annotation
-        CompletionRequest.model_rebuild(force=True)
-
     ChatCompletionRequest.to_beam_search_params = to_beam_search_params
     CompletionRequest.to_beam_search_params = to_beam_search_params
     # Upstream xargs only accepts scalars; the GR completion extension also
     # carries per-input selectors and per-stage widths as integer lists.
-    CompletionRequest.model_fields["vllm_xargs"].annotation = (
-        dict[str, str | int | float | list[StrictInt]] | None
-    )
+    CompletionRequest.model_fields["vllm_xargs"].annotation = _completion_xargs_annotation()
     CompletionRequest.model_rebuild(force=True)
 
 
-def patch_engine_core_process_entrypoint() -> None:
-    """Wrap the EngineCore process entrypoint for spawn-based runtimes."""
-    from vllm.logger import init_logger
-    from vllm.v1.engine.core import EngineCoreProc
+def validate_sampling_patch() -> str | None:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 
-    from vllm_gr.v1.engine.engine_core_patch import run_engine_core
+    from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
 
-    init_logger(__name__).info("vllm-gr: patch_engine_core_process_entrypoint called")
-
-    # Save the original so the wrapper can delegate without recursion
-    # even if run_patch() is called again in a spawned child process.
-    current_run_engine_core = EngineCoreProc.run_engine_core
-    if current_run_engine_core is run_engine_core:
-        return
-    original_run_engine_core = getattr(
-        run_engine_core,
-        "_original_run_engine_core",
-        current_run_engine_core,
-    )
-    if original_run_engine_core is run_engine_core:
-        original_run_engine_core = current_run_engine_core
-    run_engine_core._original_run_engine_core = original_run_engine_core
-    EngineCoreProc.run_engine_core = run_engine_core
+    for request_type in (ChatCompletionRequest, CompletionRequest):
+        if getattr(request_type, "to_beam_search_params", None) is not to_beam_search_params:
+            return f"{request_type.__name__}.to_beam_search_params is not installed"
+    field = CompletionRequest.model_fields.get("vllm_xargs")
+    if field is None or field.annotation != _completion_xargs_annotation():
+        return "CompletionRequest.vllm_xargs does not accept the GR list-valued extensions"
+    return None
 
 
 def patch_batch_and_fork() -> None:
-    """Compatibility installer name for the V1 session pipeline."""
-    from vllm_gr.v1.engine.core_client_patch import apply_gr_session_patches
+    """Compatibility entry point for installing the V1 session hooks."""
+    from vllm_gr.patch import install_engine_session_hooks
 
-    apply_gr_session_patches()
-    patch_engine_core_process_entrypoint()
+    install_engine_session_hooks()
+
+
+def patch_engine_core_process_entrypoint() -> None:
+    """Compatibility entry point for installing the spawned EngineCore wrapper."""
+    from vllm_gr.v1.engine.engine_core_patch import (
+        patch_engine_core_process_entrypoint as install_core_entrypoint,
+    )
+
+    install_core_entrypoint()
+
+
+def _validate_beam_search_dispatch_patch() -> str | None:
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
+
+    if GenerateBaseServing.beam_search is not beam_search_dispatch:
+        return "GenerateBaseServing.beam_search does not reference the GR dispatcher"
+    return None
+
+
+def _validate_admission_rejection_patch() -> str | None:
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
+
+    if not getattr(
+        getattr(GenerateBaseServing, "_raise_if_error", None),
+        _ADMISSION_REJECTION_PATCH_MARKER,
+        False,
+    ):
+        return "GenerateBaseServing._raise_if_error does not reference the GR admission-rejection wrapper"
+    return None
+
+
+def _validate_client_request_id_patch() -> str | None:
+    from vllm.entrypoints.serve.engine.serving import BaseServing
+    from vllm.v1.engine.output_processor import OutputProcessor
+
+    if not getattr(
+        getattr(BaseServing, "_base_request_id", None), _CLIENT_REQUEST_ID_PATCH_MARKER, False
+    ):
+        return "BaseServing._base_request_id does not reference the GR client-request-id wrapper"
+    if not getattr(
+        getattr(OutputProcessor, "add_request", None), _SUBMIT_REQUEST_ID_PATCH_MARKER, False
+    ):
+        return "OutputProcessor.add_request does not reference the GR client-request-id wrapper"
+    return None
+
+
+def validate_openai_beam_search_patch() -> str | None:
+    """Verify every target mutated by the grouped OpenAI Beam installer."""
+
+    from vllm_gr.entrypoints.openai.completion_batch_patch import (
+        validate_completion_batch_patch,
+    )
+
+    failures = tuple(
+        detail
+        for detail in (
+            _validate_beam_search_dispatch_patch(),
+            _validate_admission_rejection_patch(),
+            _validate_client_request_id_patch(),
+            validate_completion_batch_patch(),
+        )
+        if detail is not None
+    )
+    return "; ".join(failures) or None

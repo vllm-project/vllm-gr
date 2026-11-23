@@ -3,8 +3,9 @@
 """Create a tiny random Llama checkpoint and GR config without downloads."""
 
 import argparse
-import json
 from pathlib import Path
+
+import yaml
 
 
 def prepare_model(output: Path, *, context_length: int = 128, width: int = 4) -> tuple[Path, Path]:
@@ -43,25 +44,23 @@ def prepare_model(output: Path, *, context_length: int = 128, width: int = 4) ->
         pad_token="tok0",
     )
     tokenizer.save_pretrained(model_path)
-    gr_path = output / "gr-config.json"
+    gr_path = output / "gr-config.yaml"
     gr_path.write_text(
-        json.dumps(
+        yaml.safe_dump(
             {
-                "schema_version": 1,
-                "attention_backend": "CUSTOM",
-                "constrained_generation": False,
-                "constraint_table": {"enabled": False, "backend": "cuda", "max_top_k": width},
-                "beam": {
-                    "execution_mode": "v1",
-                    "graph_enabled": False,
+                "attention-config": {"backend": "CUSTOM"},
+                "gr": {
+                    "constraint_mode": "none",
+                    "beam_graph_enabled": False,
                     "worker_decision": True,
-                    "max_width": width,
+                    "beam_width": [width] * 3,
+                    "candidate_width": [width] * 3,
                     "max_decode_steps": 3,
                 },
             },
-            indent=2,
-        )
-        + "\n"
+            sort_keys=False,
+        ),
+        encoding="utf-8",
     )
     return model_path, gr_path
 

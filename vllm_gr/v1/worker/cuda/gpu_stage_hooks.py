@@ -159,6 +159,8 @@ class CudaStageHooksType(Protocol):
     constructors. Keep this callable boundary separate from the runtime ABC.
     """
 
+    persistent_graph_install: bool
+
     def __call__(self, worker: Any) -> CudaStageHooks: ...
 
     def required_constraint_rows(self, batch_size: int, beam_width: int) -> int: ...
@@ -170,5 +172,6 @@ def validate_stage_hooks_type(hooks: CudaStageHooks, hooks_type: CudaStageHooksT
     The ABC guarantees both classes implement the same operations; this only
     enforces the lifetime rule that one Worker keeps one concrete hooks type.
     """
-    if type(hooks) is not hooks_type:
+    expected_hooks_type: object = hooks_type
+    if type(hooks) is not expected_hooks_type:
         raise ValueError("GR execution hooks cannot change during the runner lifetime")

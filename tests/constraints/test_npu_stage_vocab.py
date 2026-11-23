@@ -23,7 +23,7 @@ from vllm_gr.constraints.backend import (
     ConstraintMetadata,
 )
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
-from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab, build_npu_stage_vocab
+from vllm_gr.constraints.npu_tables import NPUStageVocab, build_npu_stage_vocab
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,

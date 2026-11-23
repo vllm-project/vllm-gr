@@ -1,0 +1,91 @@
+site_name: vLLM-GR
+site_description: Inference and serving for generative recommendation models
+repo_name: vllm-gr
+repo_url: !ENV [DOCS_REPO_URL, 'https://github.com/JiusiServe/vllm-gr']
+edit_uri: edit/main/docs/
+strict: true
+
+theme:
+  name: material
+  logo: assets/vLLM-GR.png
+  font:
+    text: Roboto
+    code: Roboto Mono
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      toggle:
+        icon: material/brightness-2
+        name: Switch to system preference
+  features:
+    - content.action.edit
+    - content.code.copy
+    - content.code.annotate
+    - content.tooltips
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.prune
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - search.share
+    - toc.follow
+
+plugins:
+  - search
+  - awesome-nav
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - toc:
+      permalink: true
+
+hooks:
+  - tools/docs/repository_links.py
+  - tools/docs/legacy_redirects.py
+
+watch:
+  - tools/docs/legacy_redirects.yml
+
+extra_css:
+  - mkdocs/stylesheets/navigation.css
+  - mkdocs/stylesheets/content.css
+
+not_in_nav: |
+  /design/runtime_patch_inventory.md
+
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    anchors: warn
+    not_found: warn

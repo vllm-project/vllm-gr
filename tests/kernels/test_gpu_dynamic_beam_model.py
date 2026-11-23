@@ -87,29 +87,24 @@ def build_tiny_engine(tmp_path, *, capacity=4, dense_catalog=False, graph=True):
     artifact = tmp_path / "table.safetensors"
     digest = save_constraint_table_artifact(table, artifact)
     config = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": graph,
-            "worker_decision": True,
-            "max_width": capacity,
-            "max_decode_steps": 3,
-        },
+        "beam_graph_enabled": graph,
+        "worker_decision": True,
+        "beam_width": [capacity] * 3,
+        "max_decode_steps": 3,
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "max_top_k": capacity,
             "path": str(artifact),
             "format": "constraint_table_v1",
-            "artifact_digest": digest,
-            "tokenizer_digest": table.metadata.tokenizer_digest,
+            "digests": {"artifact": digest, "tokenizer": table.metadata.tokenizer_digest},
         },
+        "candidate_width": [capacity] * 3,
     }
     llm = GRLLM(
         model=str(model_path),
         dtype="float16",
-        vllm_gr_config=config,
+        gr=config,
+        attention_config={"backend": "CUSTOM"},
         async_scheduling=True,
         enable_chunked_prefill=False,
         enable_prefix_caching=False,
@@ -146,7 +141,7 @@ def test_tiny_model_dynamic_decode(tmp_path):
                     ignore_eos=True,
                     temperature=0.0,
                 )
-                outputs = llm.beam_search_v1(prompts, params, output_mode="full")
+                outputs = llm.beam_search(prompts, params, output_mode="full")
                 runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
                 graph = runner._beam_decode_graph
                 expected_shapes = {(batch, width) for width in widths[:-1]}
@@ -158,7 +153,7 @@ def test_tiny_model_dynamic_decode(tmp_path):
                     for shape, entries in graph._registries.items()
                     if entries
                 }
-                repeated = llm.beam_search_v1(prompts, params, output_mode="full")
+                repeated = llm.beam_search(prompts, params, output_mode="full")
                 assert captures == {
                     shape: id(next(iter(entries.values())).cudagraph)
                     for shape, entries in graph._registries.items()

@@ -79,8 +79,15 @@ def cleanup(gpus: list[dict[str, Any]], processes: list[dict[str, Any]], timeout
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("cleanup", "check"))
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm SIGTERM of EngineCore processes on the selected GPUs",
+    )
     parser.add_argument("--timeout", type=float, default=30, help="SIGTERM wait timeout in seconds")
     args = parser.parse_args()
+    if args.action == "cleanup" and not args.yes:
+        parser.error("cleanup sends SIGTERM to EngineCore processes; pass --yes to confirm")
     try:
         if not 0 < args.timeout < float("inf"):
             raise devices.DeviceError("Timeout must be finite and positive")

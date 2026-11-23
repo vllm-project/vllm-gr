@@ -18,18 +18,21 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
+from tests.helpers.gr_config import set_deployment
 from vllm_gr.config import (
-    BeamExecutionMode,
+    ConstraintBackendKind,
+    ConstraintConfig,
+    ConstraintMode,
     ConstraintTableBackendEnum,
-    ConstraintTableConfig,
+    ConstraintTableSpec,
     GRConfig,
 )
 from vllm_gr.config.parser import gr_config_to_mapping
-from vllm_gr.ops.npu_stage_logits import make_npu_stage_reload_weights
 from vllm_gr.v1.worker.model_runner_patch import (
     make_load_model_with_constraint_backend,
     make_shutdown_with_constraint_backend,
 )
+from vllm_gr.v1.worker.npu.stage_projection import make_npu_stage_reload_weights
 
 
 class _Backend:
@@ -62,7 +65,7 @@ def _replace_model(runner: Any, value: float) -> None:
     head.quant_method = UnquantizedEmbeddingMethod()
     head.tp_size = 1
     # vLLM 0.30 CustomOps read the current config at construction time (same
-    # pattern as tests/test_sliced_logits.py::_native_processor).
+    # pattern as tests/ops/test_sliced_logits.py::_native_processor).
     with set_current_vllm_config(VllmConfig()):
         processor = LogitsProcessor(384, scale=0.7, soft_cap=13.0)
     processor._gather_logits = lambda logits: logits
@@ -81,17 +84,25 @@ def lifecycle(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     from vllm.model_executor.custom_op import op_registry_oot
 
     monkeypatch.delitem(op_registry_oot, "LogitsProcessor", raising=False)
+    # CPU model doubles bypass the native weight loader and cpu_linear setup.
+    # Exercise the real projection and lifecycle hooks with a host GEMM.
+    monkeypatch.setattr(
+        UnquantizedEmbeddingMethod,
+        "apply",
+        lambda self, layer, x, bias=None: F.linear(x, layer.weight, bias),
+    )
     config = GRConfig(
-        beam_execution_mode=BeamExecutionMode.V1,
         beam_max_width=4,
         beam_max_decode_steps=3,
-        constraint_table=ConstraintTableConfig(
-            backend=ConstraintTableBackendEnum.NPU,
-            enabled=True,
-            max_top_k=4,
-            path="/models/test-constraint-table.safetensors",
-            artifact_digest="sha256:" + "1" * 64,
-            tokenizer_digest="sha256:" + "2" * 64,
+        constraint=ConstraintConfig(
+            mode=ConstraintMode.TABLE,
+            table=ConstraintTableSpec(
+                backend=ConstraintBackendKind.NPU,
+                max_top_k=4,
+                path="/models/test-constraint-table.safetensors",
+                artifact_digest="sha256:" + "1" * 64,
+                tokenizer_digest="sha256:" + "2" * 64,
+            ),
         ),
     )
     plan = SimpleNamespace(execution=SimpleNamespace(stage_index=0, num_execution_rows=2))
@@ -122,7 +133,6 @@ def lifecycle(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         created.append(backend)
         return backend
 
-    monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
     monkeypatch.setattr("vllm_gr.constraints.loader.load_constraint_backend", load_backend)
     yield SimpleNamespace(runner=runner, backends=created)
     make_shutdown_with_constraint_backend()(runner)
@@ -214,7 +224,7 @@ def test_failed_reload_restores_old_hook_and_does_not_publish_partial_owner(
             raise RuntimeError("install failed")
 
         monkeypatch.setattr(
-            "vllm_gr.ops.npu_stage_logits.install_npu_stage_projection", fail_install
+            "vllm_gr.v1.worker.npu.stage_projection.install_npu_stage_projection", fail_install
         )
     with pytest.raises(RuntimeError, match=f"{failure} failed"):
         load(runner)
@@ -245,12 +255,23 @@ def test_unsupported_worker_never_requests_compact_vocab_or_installs_projection(
     elif case == "speculative":
         runner.vllm_config.speculative_config = SimpleNamespace()
     elif case == "disabled":
-        monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "0")
+        set_deployment(runner.vllm_config, npu_stage_lm_head=False)
     else:
-        mapping = runner.vllm_config.additional_config["vllm_gr"]
-        mapping["beam"].pop("execution_mode")
+        from dataclasses import replace
 
-    make_load_model_with_constraint_backend(lambda self: _replace_model(self, 1.0))(runner)
+        from vllm_gr.config import GRConfig
+
+        config = GRConfig.from_vllm_config(runner.vllm_config)
+        runner.vllm_config._vllm_gr_parsed_config = replace(config, beam_max_width=None)
+
+    load = make_load_model_with_constraint_backend(lambda self: _replace_model(self, 1.0))
+    if case == "unset":
+        with pytest.raises(ValueError, match="beam_max_width"):
+            load(runner)
+        assert not lifecycle.backends
+        assert getattr(runner, "_gr_npu_stage_projection", None) is None
+        return
+    load(runner)
     assert runner.constraint_backend.get() is lifecycle.backends[-1]
     assert runner.constraint_backend.stage_vocab is None
     assert getattr(runner, "_gr_npu_stage_projection", None) is None

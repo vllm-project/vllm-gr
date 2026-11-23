@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR, GRStageKind
 
 
 def try_prepare_gr_prefill_inputs(
@@ -21,7 +21,7 @@ def try_prepare_gr_prefill_inputs(
     The native execute_model input-prep fence still encloses this function.
     Both CPU mirrors and fixed-address GPU buffers retain their native ABI.
     """
-    stages = getattr(scheduler_output, "gr_stage_metadata", None)
+    stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
     if not stages or len(stages) != 1 or getattr(scheduler_output, "beam_data", None):
         return None
     batch = runner.input_batch

@@ -15,7 +15,9 @@ from typing import Any, Protocol, cast
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[2] / "tools/pre_commit/check_spdx_header.py"
+from tests.helpers.paths import REPO_ROOT
+
+SCRIPT = REPO_ROOT / "tools/pre_commit/check_spdx_header.py"
 LICENSE = "# SPDX-License-Identifier: Apache-2.0\n"
 PROJECT = "# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project\n"
 UPSTREAM = "# SPDX-FileCopyrightText: Copyright 2025 The xLLM Authors. All Rights Reserved.\n"
@@ -337,5 +339,5 @@ if __name__ == "__main__":
 
 
 # Every case here is a host-only check of the hook and its policy, so the
-# whole module is CPU tier and L1 (see docs/tools/README.md#test-levels-and-ci-selection).
+# whole module is CPU tier and L1 (see docs/contributing/ci/test_levels.md#test-levels-and-ci-selection).
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

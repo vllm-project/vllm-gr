@@ -14,20 +14,20 @@ from vllm.outputs import RequestOutput
 from vllm.renderers.inputs.preprocess import prompt_to_seq
 from vllm.sampling_params import BeamSearchParams
 
-from vllm_gr.utils.engine_lifecycle import (
+from vllm_gr.entrypoints.common.lifecycle import (
     frontend_request_scope,
     schedule_frontend_gc_freeze,
 )
 
 if TYPE_CHECKING:
-    from vllm_gr.entrypoints.beam_search_v1.protocol import AsyncBeamSearchFrontend
+    from vllm_gr.entrypoints.beam_search.protocol import AsyncBeamSearchFrontend
 
 logger = init_logger(__name__)
 
 
-def create_online_beam_search_v1_client(self) -> "AsyncBeamSearchFrontend":
+def create_online_beam_search_client(self) -> "AsyncBeamSearchFrontend":
     """Create the online A2 request/session adapter."""
-    from vllm_gr.entrypoints.beam_search_v1.client import (
+    from vllm_gr.entrypoints.beam_search.client import (
         AsyncBeamSearchClient,
     )
 
@@ -35,7 +35,7 @@ def create_online_beam_search_v1_client(self) -> "AsyncBeamSearchFrontend":
 
 
 @frontend_request_scope
-async def beam_search_v1(
+async def beam_search(
     self,
     prompt: EngineInput | Sequence[EngineInput],
     request_id: str,
@@ -59,15 +59,12 @@ async def beam_search_v1(
     doing it at this boundary rather than in the shared parser is also what
     keeps it off an engine that is not running V1.
     """
-    from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.config.execution import require_beam_execution_mode
+    from vllm_gr.config.execution import require_beam_config
 
-    require_beam_execution_mode(
-        getattr(self.engine_client, "vllm_config", None), BeamExecutionMode.V1
-    )
+    require_beam_config(getattr(self.engine_client, "vllm_config", None))
     prompts = tuple(prompt_to_seq(prompt))
     if not prompts:
-        raise VLLMValidationError("beam_search_v1 requires at least one prompt")
+        raise VLLMValidationError("beam_search requires at least one prompt")
     for candidate in prompts:
         # A session runs the one token stream its decoder owns, and the engine
         # refuses the multimodal features an encoder-decoder request arrives
@@ -79,8 +76,8 @@ async def beam_search_v1(
                 "beam search is not implemented for encoder-decoder inputs such as "
                 "speech-to-text requests"
             )
-    from vllm_gr.entrypoints.beam_search_v1 import run_beam_search_v1_async
-    from vllm_gr.entrypoints.beam_search_v1.protocol import OnlineBeamSearchRequest
+    from vllm_gr.entrypoints.beam_search import run_beam_search_async
+    from vllm_gr.entrypoints.beam_search.protocol import OnlineBeamSearchRequest
 
     params = copy(params)
     params.ignore_eos = True
@@ -99,8 +96,8 @@ async def beam_search_v1(
         session_id=session_id,
         trie_ids=trie_ids,
     )
-    outputs = await run_beam_search_v1_async(
-        create_online_beam_search_v1_client(self),
+    outputs = await run_beam_search_async(
+        create_online_beam_search_client(self),
         call,
     )
     # Multi-process deployments run this serving frontend in a process
@@ -127,7 +124,7 @@ async def _next_data_parallel_rank(engine_client) -> int | None:
     data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
     if data_parallel_size is None or data_parallel_size <= 1:
         return None
-    if getattr(parallel_config, "local_engines_only", False):
+    if parallel_config is not None and getattr(parallel_config, "local_engines_only", False):
         data_parallel_size = parallel_config.data_parallel_size_local
 
     async with _dp_rank_lock:

@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
-from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableConfig
+from vllm_gr.config import ConstraintTableBackendEnum, ConstraintTableSpec
 from vllm_gr.constraints import loader
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.backend import INVALID_LOGIT, ConstraintBackendInfo
@@ -31,21 +31,21 @@ from vllm_gr.ops.rec_constrained_topk import rec_constrained_topk_torch
 npu_op_module = importlib.import_module("vllm_gr.ops.npu.rec_constrained_topk")
 
 
-def _config(path: Path, digest: str, **overrides: object) -> ConstraintTableConfig:
+def _config(path: Path, digest: str, **overrides: object) -> ConstraintTableSpec:
     values: dict[str, object] = {
         "enabled": True,
         "backend": ConstraintTableBackendEnum.CPU,
         "path": str(path),
+        "max_top_k": 4,
         "artifact_digest": digest,
         "tokenizer_digest": "sha256:" + "b" * 64,
-        "max_top_k": 4,
     }
     values.update(overrides)
-    return ConstraintTableConfig(**values)
+    return ConstraintTableSpec(**values)
 
 
 def test_disabled_loader_returns_before_validation_or_io(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = ConstraintTableConfig(max_top_k=1, enabled=False)
+    config = ConstraintTableSpec(max_top_k=1, enabled=False)
     monkeypatch.setattr(
         loader,
         "load_constraint_table_artifact",
@@ -80,10 +80,15 @@ def test_cpu_loader_constructs_info_from_canonical_artifact(tmp_path: Path) -> N
     assert backend.info.max_rows == 7
 
 
-def test_npu_top_k_limit_fails_before_artifact_io(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = ConstraintTableConfig(
+@pytest.mark.parametrize(
+    "backend", [ConstraintTableBackendEnum.CUDA, ConstraintTableBackendEnum.NPU]
+)
+def test_npu_top_k_limit_fails_before_artifact_io(
+    monkeypatch: pytest.MonkeyPatch, backend: ConstraintTableBackendEnum
+) -> None:
+    config = ConstraintTableSpec(
         enabled=True,
-        backend=ConstraintTableBackendEnum.NPU,
+        backend=backend,
         path="/does/not/exist",
         artifact_digest="sha256:" + "a" * 64,
         tokenizer_digest="sha256:" + "b" * 64,
@@ -200,15 +205,11 @@ def test_unique_storage_memory_is_deduplicated() -> None:
     )
 
 
-@pytest.mark.parametrize("env", [None, "1", "0", "invalid"])
+@pytest.mark.parametrize("enabled", [True, False])
 @pytest.mark.parametrize("eligible", [False, True])
 def test_npu_stage_vocab_allocation_requires_explicit_eligible_worker(
-    env: str | None, eligible: bool, monkeypatch: pytest.MonkeyPatch
+    enabled: bool, eligible: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if env is None:
-        monkeypatch.delenv("VLLM_GR_NPU_STAGE_LM_HEAD", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", env)
     table = make_table()
     allocations: list[ConstraintTable] = []
 
@@ -224,9 +225,10 @@ def test_npu_stage_vocab_allocation_requires_explicit_eligible_worker(
         max_top_k=2,
         max_rows=2,
         enable_npu_stage_vocab=eligible,
+        stage_lm_head=enabled,
     )
     try:
-        assert allocations == ([table] if eligible and env in (None, "1") else [])
+        assert allocations == ([table] if eligible and enabled else [])
         assert backend.stage_vocab is None
     finally:
         backend.close()
@@ -235,7 +237,6 @@ def test_npu_stage_vocab_allocation_requires_explicit_eligible_worker(
 def test_direct_npu_upload_does_not_allocate_stage_vocab_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
     monkeypatch.setattr(
         loader,
         "build_npu_stage_vocab",

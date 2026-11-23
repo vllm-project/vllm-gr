@@ -5,14 +5,6 @@
 set -euo pipefail
 export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
 export V1_PERF_BEAM_WIDTH=128
-# This workload prefills 1024 tokens per request at B=1,2,4. Keep its graph
-# captures local to the A/B job instead of changing the runtime defaults.
-export VLLM_GR_PREFILL_GRAPH_BUCKETS=1024,2048,4096
-export VLLM_GR_PREFILL_GRAPH_BUCKET_STEP=1024
-export VLLM_GR_PREFILL_GRAPH_MAX_BUCKET=4096
-export VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS=1,2,4
-unset VLLM_GR_PREFILL_GRAPH_KV_BOUND
-
 candidate_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 event_base_sha="${V1_PERF_BASE_SHA:?V1_PERF_BASE_SHA is required}"
 candidate_sha="${V1_PERF_CANDIDATE_SHA:?V1_PERF_CANDIDATE_SHA is required}"
@@ -67,6 +59,21 @@ fi
 if ! git -C "$candidate_root" cat-file -e "$base_sha^{commit}" 2>/dev/null; then
   git -C "$candidate_root" fetch --no-tags origin "$base_sha"
 fi
+# Both sides use the candidate's driver and the validator and prompt from
+# their selected checkout. Compare committed inputs before setting up the base.
+cd "$candidate_root"
+"$candidate_python" - "$candidate_root" "$base_sha" "$candidate_sha" <<'PY'
+import sys
+from pathlib import Path
+
+from benchmarks.beam_search.compare_latency_ab import verify_workload
+
+try:
+    verify_workload(Path(sys.argv[1]), sys.argv[2], sys.argv[3])
+except ValueError as exc:
+    raise SystemExit(str(exc)) from exc
+PY
+
 git -C "$candidate_root" worktree add --detach "$base_root" "$base_sha"
 worktree_added=1
 
@@ -96,34 +103,32 @@ VLLM_GR_TARGET_DEVICE=cuda uv pip install \
   --venv "$base_venv" \
   --output "$output_dir/runtime/base-installed.json"
 
-# Both sides run the candidate's benchmark driver, including lifetime fixes.
-# Its SID validator and prompt are still imported/read from each selected tree.
-for path in \
-  benchmarks/beam_search/v1_sid_validation.py \
-  tests/resources/single_one_rec_prompt.txt; do
-  diff_options=(--quiet)
-  if [[ "$path" == benchmarks/beam_search/v1_sid_validation.py ]]; then
-    # The SPDX copyright header does not affect SID validation.
-    diff_options+=(-I '^# SPDX-FileCopyrightText: Copyright contributors to the vLLM(-GR)? project$')
-  fi
-  if ! git -C "$candidate_root" diff "${diff_options[@]}" "$base_sha" "$candidate_sha" -- "$path"; then
-    echo "A/B workload changed between base and PR: $path" >&2
-    exit 1
-  fi
-done
-
-run_pass() {
+run_pass() (
   local repo_root="$1"
   local result_dir="$2"
   local runtime_venv="$3"
+  local driver_args=(--ab-prefill-grid)
   cd "$repo_root"
+  # Keep the legacy Prefill overrides local to this pass.
+  unset VLLM_ENABLE_PREFILL_CUDAGRAPH VLLM_GR_PREFILL_GRAPH_BUCKETS \
+    VLLM_GR_PREFILL_GRAPH_BUCKET_STEP VLLM_GR_PREFILL_GRAPH_MAX_BUCKET \
+    VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS VLLM_GR_PREFILL_GRAPH_KV_BOUND
+  if [[ ! -f "$repo_root/vllm_gr/config/default_config.yaml" ]]; then
+    driver_args+=(--ab-legacy-config)
+    export VLLM_ENABLE_PREFILL_CUDAGRAPH=1
+    export VLLM_GR_PREFILL_GRAPH_BUCKETS=1024,2048,4096
+    # V2 uses the step/max variables to opt out of its native bucket list.
+    export VLLM_GR_PREFILL_GRAPH_BUCKET_STEP=1024
+    export VLLM_GR_PREFILL_GRAPH_MAX_BUCKET=4096
+    export VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS=1,2,4
+  fi
   PATH="$runtime_venv/bin:$PATH" VIRTUAL_ENV="$runtime_venv" \
     V1_PERF_REPO_ROOT="$repo_root" V1_PERF_OUTPUT_DIR="$result_dir" \
-    V1_PERF_DRIVER="$candidate_root/benchmarks/beam_search/v1_performance_gate.py" \
+    V1_PERF_DRIVER="$candidate_root/benchmarks/beam_search/measure_latency.py" \
     V1_PERF_MEASURE_ONLY=1 V1_PERF_OFFLINE_ONLY=1 \
     V1_PERF_WARMUP_RUNS=10 V1_PERF_MEASURED_RUNS=20 \
-    bash "$candidate_root/tests/system/run_beam_v1_performance.sh"
-}
+    bash "$candidate_root/tests/system/run_beam_v1_performance.sh" "${driver_args[@]}"
+)
 
 run_abba() {
   local results="$1"
@@ -141,7 +146,7 @@ run_abba "$output_dir"
 printf '{"pr_number":%s,"base_sha":"%s","head_sha":"%s","merge_sha":"%s"}\n' \
   "$pr_number" "$base_sha" "$head_sha" "$candidate_sha" > "$output_dir/context.json"
 
-if V1_PERF_DEFER_SUMMARY=1 "$candidate_python" -m benchmarks.beam_search.v1_performance_ab \
+if V1_PERF_DEFER_SUMMARY=1 "$candidate_python" -m benchmarks.beam_search.compare_latency_ab \
   --base "$output_dir/base" \
   --pr "$output_dir/pr" \
   --output-dir "$output_dir/initial" \
@@ -160,7 +165,7 @@ fi
 import sys
 from pathlib import Path
 
-from benchmarks.beam_search.v1_performance_ab import read_json, should_retry
+from benchmarks.beam_search.compare_latency_ab import read_json, should_retry
 
 report = read_json(Path(sys.argv[1]))
 if not report.get("failures"):
@@ -190,7 +195,7 @@ import os
 import sys
 from pathlib import Path
 
-from benchmarks.beam_search.v1_performance_ab import (
+from benchmarks.beam_search.compare_latency_ab import (
     SETUP_KEYS,
     combine_retry_results,
     compare,

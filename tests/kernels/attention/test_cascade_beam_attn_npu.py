@@ -10,7 +10,7 @@ the NPU cascade path (``beam_attn_npu.cascade_attention`` ->
 ``merge_tnd_attention_outputs``) had no correctness coverage.
 
 This module fills that gap. It runs the real backend
-(``BeamAttentionImpl.cascade_attention``) on NPU and compares its output
+(``beam_attn_npu.cascade_attention``) on NPU and compares its output
 against a device-agnostic pure-torch reference that reproduces the GPU test's
 beam gather and bottom-right causal convention (both share the decomposition
 in ``cascade_beam_attn_utils.iter_beam_segments``). It is parametrised over
@@ -75,7 +75,7 @@ except (ImportError, RuntimeError) as _npu_import_error:
 
 
 try:
-    from cascade_beam_attn_utils import (
+    from tests.kernels.attention.cascade_beam_attn_utils import (
         NPU_CASES,
         NUM_HEADS,
         BeamAttnInputs,

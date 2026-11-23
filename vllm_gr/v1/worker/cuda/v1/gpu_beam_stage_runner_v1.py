@@ -121,9 +121,16 @@ class CudaStageHooksV1(CudaStageHooks):
             _get_gr_config,
         )
 
+        batch_size = len(owner.bindings)
+        cfg = _get_gr_config(worker)
+        if batch_size not in cfg.deployment.beam_batch_sizes or batch_size in getattr(
+            worker, "_gr_decode_capture_failures", {}
+        ):
+            owner.graph = None
+            return owner._forward()
         graph_enabled = (
             not worker.model_config.enforce_eager
-            and _get_gr_config(worker).beam_graph_enabled
+            and cfg.beam_graph_enabled
             and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
         )
         if graph_enabled:

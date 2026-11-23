@@ -5,14 +5,19 @@ from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import BeamSearchParams as BaseBeamSearchParams
 
 from vllm_gr.config import MAX_BEAM_WIDTH, MAX_CANDIDATE_WIDTH
+from vllm_gr.config.beam_widths import (
+    SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS,
+    final_retained_width,
+    per_parent_width_error,
+)
 
 
 class BeamSearchParams(
-    BaseBeamSearchParams,
+    BaseBeamSearchParams,  # type: ignore[misc]
     omit_defaults=True,  # type: ignore[call-arg]
     # required for @cached_property.
     dict=True,
-):  # type: ignore[call-arg]
+):
     """Beam search parameters for text generation."""
 
     begin_token: str | None = None
@@ -58,7 +63,7 @@ class BeamSearchParams(
         widths = self.dynamic_beam_widths
         if widths is not None and (
             not isinstance(widths, list)
-            or decode_steps not in (1, 2, 3)
+            or decode_steps not in SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
             or len(widths) != decode_steps
             or any(type(width) is not int or not 1 <= width <= self.beam_width for width in widths)
         ):
@@ -72,7 +77,7 @@ class BeamSearchParams(
         if per_parent_beam_widths is not None:
             if (
                 not isinstance(per_parent_beam_widths, list)
-                or decode_steps not in (1, 2, 3)
+                or decode_steps not in SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
                 or len(per_parent_beam_widths) != decode_steps
                 or any(
                     type(factor) is not int or not 1 <= factor <= MAX_CANDIDATE_WIDTH
@@ -85,25 +90,14 @@ class BeamSearchParams(
                     parameter="per_parent_beam_widths",
                     value=per_parent_beam_widths,
                 )
-            retained_widths = widths or [self.beam_width] * decode_steps
-            if per_parent_beam_widths[0] != retained_widths[0]:
+            error = per_parent_width_error(self.beam_width, widths, per_parent_beam_widths)
+            if error is not None:
                 raise VLLMValidationError(
-                    "the first per-parent beam width must equal the first retained width",
+                    error,
                     parameter="per_parent_beam_widths",
                     value=per_parent_beam_widths,
                 )
-            input_width = retained_widths[0]
-            for per_parent_beam_width, output_width in zip(
-                per_parent_beam_widths[1:], retained_widths[1:]
-            ):
-                if output_width > input_width * per_parent_beam_width:
-                    raise VLLMValidationError(
-                        "each retained width must not exceed input_width * per_parent_beam_width",
-                        parameter="per_parent_beam_widths",
-                        value=per_parent_beam_widths,
-                    )
-                input_width = output_width
-        final_width = self.beam_width if widths is None else widths[-1]
+        final_width = final_retained_width(self.beam_width, widths)
         if self.result_width is not None and (
             type(self.result_width) is not int or not 1 <= self.result_width <= final_width
         ):

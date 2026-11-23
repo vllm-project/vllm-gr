@@ -86,7 +86,7 @@ p99_tpot_th="$P99_TPOT_THRESHOLD"
 # covering the CUDA constrained-top-k kernels it is meant to protect.
 #
 # The triples document follows the video_catalog.json generation flow: CI
-# pre-generates it in the "Build catalog" step (tools/build_constraint_triples.py)
+# pre-generates it in the "Build catalog" step (tools/constraints/build_constraint_triples.py)
 # and passes TRIPLES_PATH, mirroring CATALOG_PATH.  When it is absent (local
 # runs) it is derived from the catalog location and built on demand.
 constraint_device=cuda
@@ -96,7 +96,7 @@ if [[ "$device" == "npu" || "$device" == "gpu" || "$device" == "cuda" ]] \
   triples_path="${TRIPLES_PATH:-$(dirname "$CATALOG_PATH")/video_constraint_triples.json}"
   if [[ ! -f "$triples_path" ]]; then
     echo "Building Constraint Tables triples: $triples_path"
-    if ! python tools/build_constraint_triples.py \
+    if ! python tools/constraints/build_constraint_triples.py \
         --catalog "$CATALOG_PATH" \
         --output "$triples_path" \
         --begin "<|sid_begin|>" \
@@ -124,33 +124,6 @@ echo "Online elapsed failures: $online_elapsed_failure_mode"
 echo "Offline elapsed failures: $offline_elapsed_failure_mode"
 echo "Execution, transport, timeout, and parsing failures: blocking"
 
-extract_numeric_value() {
-    local input_lines="$1"
-    local string_key="$2"
-    local matched_line
-    local value
-
-    matched_line=$(printf '%s\n' "$input_lines" | grep -F -m 1 -- "$string_key")
-    if [[ -z "$matched_line" ]]; then
-      echo "Error: key $string_key not found" >&2
-      return 1
-    fi
-    value=$(
-      printf '%s\n' "$matched_line" |
-        grep -oE '[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?' |
-        tail -n 1
-    )
-    if [[ -z "$value" ]]; then
-      echo "Error: key $string_key did not contain a numeric value" >&2
-      return 1
-    fi
-    if ! awk -v val="$value" 'BEGIN {exit !(val >= 0)}'; then
-      echo "Error: key $string_key contained an invalid negative value: $value" >&2
-      return 1
-    fi
-    printf '%s\n' "$value"
-}
-
 echo "Running OneRec offline benchmark"
 # Single source of truth for the beam width driven by every client below
 # (--n).  The beam KV pool / captured graph width must cover it, so both are
@@ -160,33 +133,40 @@ beam_width=128
 config_dir="${VLLM_GR_BENCHMARK_CONFIG_DIR:-$SCRIPT_DIR/../../generated_data/benchmark_v1}"
 mkdir -p "$config_dir" || exit 1
 config_dir="$(cd "$config_dir" && pwd)"
-config_path="$config_dir/vllm_gr_config.json"
-python - "$MODEL_PATH" "${triples_path:?Beam V1 requires CUDA or NPU constraint triples}" \
-    "$config_path" "$constraint_device" "$beam_width" <<'PY_CONFIG' || exit 1
+# Keep accuracy and serving results in a new directory so a stale result can
+# never satisfy the gate.
+results_dir=$(mktemp -d "$config_dir/onerec-results.XXXXXX") || exit 1
+metrics_reader="$SCRIPT_DIR/../../tools/ci/read_benchmark_metrics.py"
+echo "OneRec metrics directory: $results_dir"
+gr_overrides=$(python - "$MODEL_PATH" "${triples_path:?Beam V1 requires CUDA or NPU constraint triples}" \
+    "$config_dir/constraint_table.safetensors" "$constraint_device" "$beam_width" <<'PY_CONFIG'
 import json
 import sys
 from pathlib import Path
-from examples.offline_inference.beam_search.offline_beam_search_v1 import build_artifact
+from contextlib import redirect_stdout
 
-model, triples, config_path, backend, width = sys.argv[1:]
-path = Path(config_path)
-artifact = path.with_suffix(".safetensors")
-digest, tokenizer_digest = build_artifact(Path(model), Path(triples), artifact)
-config = {
-    "schema_version": 1,
-    "attention_backend": "CUSTOM",
-    "beam": {"execution_mode": "v1", "max_width": int(width), "max_decode_steps": 3,
-             "graph_enabled": backend == "cuda", "worker_decision": True},
+model, triples, artifact_path, backend, width = sys.argv[1:]
+artifact = Path(artifact_path)
+with redirect_stdout(sys.stderr):
+    from vllm_gr.constraints.artifact_builder import build_single_trie_artifact
+
+    digest, tokenizer_digest = build_single_trie_artifact(Path(model), Path(triples), artifact)
+print(json.dumps({
+    "beam_width": [int(width)] * 3,
+    "beam_graph_enabled": backend == "cuda",
+    "worker_decision": True,
     "constraint_table": {
-        "enabled": True, "backend": backend, "max_top_k": int(width),
-        "path": str(artifact), "format": "constraint_table_v1",
-        "artifact_digest": digest, "tokenizer_digest": tokenizer_digest,
+        "backend": backend,
+        "max_top_k": int(width),
+        "path": str(artifact.resolve()),
+        "digests": {"artifact": digest, "tokenizer": tokenizer_digest},
     },
-}
-path.write_text(json.dumps(config, indent=2) + "\n")
+    "candidate_width": [int(width)] * 3,
+}))
 PY_CONFIG
+) || exit 1
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
-  --gr \
+  --result-dir "$results_dir/offline" \
   --model "$MODEL_PATH" \
   --dataset-path "$DATASET_PATH" \
   --dataset-name onerec \
@@ -194,7 +174,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --batch-size 1 \
   --use-beam-search \
   --task-type video \
-  --vllm-gr-config "$config_path" \
+  --gr "$gr_overrides" \
   --n "$beam_width")
 offline_status=$?
 printf '%s\n' "$output"
@@ -203,10 +183,8 @@ if [[ "$offline_status" -ne 0 ]]; then
   exit "$offline_status"
 fi
 
-pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
-pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
-recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
-elapsed_time=$(extract_numeric_value "$output" "elapsed_time") || exit 1
+metrics=$(python "$metrics_reader" accuracy "$results_dir"/offline/*.json) || exit 1
+read -r pass_1 pass_32 recall_32 elapsed_time <<< "$metrics"
 
 validate_accuracy_metric "offline pass@1" "$pass_1" "$pass_1_th" \
   "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
@@ -248,18 +226,19 @@ wait_for_server() {
 }
 
 echo "Starting OneRec online server"
-python -m vllm_gr.entrypoints.cli.main serve --gr \
-  --vllm-gr-config "$config_path" \
+python -m vllm_gr.entrypoints.cli.main serve --gr "$MODEL_PATH" \
+  --attention-config '{"backend":"CUSTOM"}' \
+  --gr-config "$gr_overrides" \
   --async-scheduling \
   --no-enable-chunked-prefill \
   --port "$run_port" \
   --seed 123 \
+  --chat-template "$SCRIPT_DIR/../../benchmarks/open_one_rec/qwen3_soft_switch.jinja2" \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --max-logprobs 512 \
   --max_num_seqs 2048 \
   --max_num_batched_tokens 16384 \
-  --scheduling-policy priority \
-  "$MODEL_PATH" &
+  --scheduling-policy priority &
 SERVER_PID=$!
 
 wait_for_server || exit 1
@@ -298,6 +277,9 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   --port "$run_port" \
   --request-rate 0.5 \
   --max-concurrency 1 \
+  --save-result \
+  --result-dir "$results_dir" \
+  --result-filename serving.json \
   --n "$beam_width")
 online_performance_status=$?
 printf '%s\n' "$output"
@@ -306,19 +288,19 @@ if [[ "$online_performance_status" -ne 0 ]]; then
   exit "$online_performance_status"
 fi
 
-failed=$(extract_numeric_value "$output" "Failed requests") || exit 1
-if ! awk -v val="$failed" 'BEGIN {exit !(val == 0)}'; then
+metrics=$(python "$metrics_reader" serving "$results_dir/serving.json") || exit 1
+read -r failed p99_ttft p99_tpot <<< "$metrics"
+if [[ "$failed" != 0 ]]; then
   echo "FAILURE: There were $failed failed requests." >&2
   exit 1
 fi
-p99_ttft=$(extract_numeric_value "$output" "P99 TTFT") || exit 1
-p99_tpot=$(extract_numeric_value "$output" "P99 TPOT") || exit 1
 validate_performance_metric "P99 TTFT" "$p99_ttft" "$p99_ttft_th" \
   "$p99_ttft_failure_mode" "$device" 87 || exit $?
 validate_performance_metric "P99 TPOT" "$p99_tpot" "$p99_tpot_th" \
   "$p99_tpot_failure_mode" "$device" 88 || exit $?
 
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+  --result-dir "$results_dir/online" \
   --model "$MODEL_PATH" \
   --dataset-path "$DATASET_PATH" \
   --dataset-name onerec \
@@ -337,10 +319,8 @@ if [[ "$online_accuracy_status" -ne 0 ]]; then
   exit "$online_accuracy_status"
 fi
 
-pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
-pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
-recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
-elapsed_time_online=$(extract_numeric_value "$output" "elapsed_time") || exit 1
+metrics=$(python "$metrics_reader" accuracy "$results_dir"/online/*.json) || exit 1
+read -r pass_1 pass_32 recall_32 elapsed_time_online <<< "$metrics"
 validate_accuracy_metric "online pass@1" "$pass_1" "$pass_1_th" \
   "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
 validate_accuracy_metric "online pass@32" "$pass_32" "$pass_32_th" \

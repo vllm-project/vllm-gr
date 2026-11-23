@@ -138,21 +138,19 @@ def startup_expectations(
     *, runner: str, config: dict[str, Any], max_num_seqs: int, enforce_eager: bool
 ) -> tuple[int, list[int]]:
     """Keep persistent Backend capacity separate from the selected graph set."""
-    from vllm_gr.config import gr_config_from_mapping
+    from vllm_gr.config.parser import load_engine_gr_config
 
-    cfg = gr_config_from_mapping(config)
+    cfg = load_engine_gr_config(None, {}, config)
     assert cfg.beam_max_width is not None
     if runner == "v2":
-        from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
+        from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
 
         max_batch = max(SUPPORTED_BEAM_BATCH_SIZES)
-        batches = [b for b in cfg.beam_online_batch_sizes if b <= max_num_seqs]
     else:
         assert runner == "v1", runner
-        from vllm_gr.v1.worker.gr_startup import _startup_capture_batch_size
 
         max_batch = 1
-        batches = [_startup_capture_batch_size()]
+    batches = [b for b in cfg.deployment.beam_batch_sizes if b <= max_num_seqs]
     if enforce_eager or not cfg.beam_graph_enabled:
         batches = []
     return max_batch * cfg.beam_max_width, batches
@@ -163,20 +161,16 @@ def run(args: argparse.Namespace) -> None:
         VLLM_USE_V2_MODEL_RUNNER=str(int(args.runner == "v2")),
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
-        VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
-        VLLM_GR_PREFILL_GRAPH_KV_BOUND="256",
     )
-    for name in ("VLLM_GR_PREFILL_GRAPH_BUCKET_STEP", "VLLM_GR_PREFILL_GRAPH_MAX_BUCKET"):
-        os.environ.pop(name, None)
-
     from tests.st.test_onerec_v1_scheduler_st import _engine_kwargs, _inputs, _params
     from vllm_gr import GRLLM
 
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     model, _tokenizer, config, source, _newline, legal = _inputs(output)
-    width = config["beam"]["max_width"]
-    config["beam"]["graph_enabled"] = args.mode == "graph"
+    config["prefill_kv_bound"] = 256
+    width = max(config["beam_width"])
+    config["beam_graph_enabled"] = args.mode == "graph"
     kwargs = _engine_kwargs(model, config)
     kwargs.update(
         max_num_seqs=4,
@@ -208,7 +202,7 @@ def run(args: argparse.Namespace) -> None:
     def save() -> None:
         (output / "results.json").write_text(json.dumps(result, indent=2) + "\n")
 
-    llm = GRLLM(**kwargs, vllm_gr_config=config)
+    llm = GRLLM(**kwargs, attention_config={"backend": "CUSTOM"}, gr=config)
     processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
     addresses = None
 
@@ -231,7 +225,7 @@ def run(args: argparse.Namespace) -> None:
         return value
 
     def generate(ids_list: list[list[int]], steps: int) -> list[list[dict[str, Any]]]:
-        outputs = llm.beam_search_v1(
+        outputs = llm.beam_search(
             [{"prompt_token_ids": ids} for ids in ids_list],
             _params(steps),
             use_tqdm=False,

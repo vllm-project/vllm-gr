@@ -32,6 +32,7 @@ from vllm_gr.ops.npu import beam_ops
 
 assert beam_ops.is_available(), f"NPU Beam operators are required: {beam_ops.unavailable_reason()}"
 
+from tests.helpers.paths import REPO_ROOT  # noqa: E402
 from tests.st.test_onerec_v1_npu_e2e import (  # noqa: E402
     _BEGIN_TOKEN,
     _END_TOKEN,
@@ -153,7 +154,7 @@ def _run_case(
     before = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
     llm.collective_rpc("dynamic_beam_trace_start")
     try:
-        outputs: list[Any] = llm.beam_search_v1(
+        outputs: list[Any] = llm.beam_search(
             [
                 tokens_input(prompt, cache_salt=f"{schedule}-{result_width}-{row}")
                 for row, prompt in enumerate(prompts)
@@ -251,6 +252,7 @@ def _assert_graph_isolation(signature: dict[str, Any]) -> None:
 
 
 def _run_regression(work_dir: Path) -> None:
+    from tests.helpers.gr_config import npu_dynamic_engine_args
     from vllm_gr.entrypoints.gr import GRLLM
 
     model = os.environ.get("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
@@ -260,44 +262,6 @@ def _run_regression(work_dir: Path) -> None:
     )
     prompts = [_prompt_tokens(tokenizer, 127), _prompt_tokens(tokenizer, 159)[:127]]
     assert prompts[0] != prompts[1], "multi-request regression needs distinct prompts"
-    config: dict[str, Any] = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "worker_decision": True,
-            "max_width": _WIDTH,
-            "max_decode_steps": 3,
-            "graph_enabled": False,
-            "graph_batch_size": 2,
-            "graph_widths": [8, 16, 32],
-        },
-        "constraint_table": {
-            "enabled": True,
-            "backend": "npu",
-            "max_top_k": _WIDTH,
-            "path": str(artifact),
-            "format": "constraint_table_v1",
-            "artifact_digest": digest,
-            "tokenizer_digest": tokenizer_digest,
-        },
-    }
-    kwargs: dict[str, Any] = dict(
-        model=model,
-        trust_remote_code=True,
-        dtype="float16",
-        seed=0,
-        vllm_gr_config=config,
-        async_scheduling=True,
-        enable_prefix_caching=True,
-        enable_chunked_prefill=False,
-        max_model_len=512,
-        max_num_batched_tokens=512,
-        max_num_seqs=64,
-        max_logprobs=_WIDTH,
-        gpu_memory_utilization=0.5,
-        worker_extension_cls="tests.st.test_npu_dynamic_beam_st.DynamicBeamTestWorkerExtension",
-    )
     reference: list[list[Any]] = []
     ordinary_reference: list[list[int]] = []
     single_reference: list[Any] = []
@@ -305,12 +269,17 @@ def _run_regression(work_dir: Path) -> None:
     # stale histories/KV banks cannot pass as single-request happy-path coverage.
     cases = [(schedule, None) for schedule in _SCHEDULES] + [((32, 16, 8), 3), ((8, 16, 32), 7)]
     for graph, explicit_widths in ((False, True), (True, True), (True, False)):
-        config["beam"]["graph_enabled"] = graph
-        if explicit_widths:
-            config["beam"]["graph_widths"] = [8, 16, 32]
-        else:
-            config["beam"].pop("graph_widths")
-        with GRLLM(**kwargs, enforce_eager=not graph) as llm:
+        with GRLLM(
+            **npu_dynamic_engine_args(
+                model,
+                artifact,
+                digest,
+                tokenizer_digest,
+                beam_width=_WIDTH,
+                graph=graph,
+                explicit_widths=explicit_widths,
+            )
+        ) as llm:
             if graph:
                 stats = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
                 expected_shapes = {(2, 8), (2, 16), (2, 32)} if explicit_widths else {(2, 32)}
@@ -396,12 +365,9 @@ def test_npu_dynamic_beam_full_model_eager_graph(tmp_path: Path) -> None:
         VLLM_USE_V2_MODEL_RUNNER="0",
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
-        VLLM_ENABLE_PREFILL_CUDAGRAPH="0",
     )
     command = [sys.executable, "-m", "tests.st.test_npu_dynamic_beam_st", str(tmp_path)]
-    with subprocess.Popen(
-        command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-    ) as process:
+    with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
         try:
             assert process.wait(timeout=900) == 0, "NPU dynamic Beam E2E subprocess failed"
         finally:

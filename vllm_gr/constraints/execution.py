@@ -32,7 +32,7 @@ import torch
 
 # Single source of truth for the operator's legacy padding payload. Structural
 # validity is carried separately and never inferred from this numeric value.
-from vllm_gr.config.models import MAX_CANDIDATE_WIDTH
+from vllm_gr.config.models import MAX_CONSTRAINT_CANDIDATE_WIDTH
 from vllm_gr.constraints.compiler import validate_resource_tables
 from vllm_gr.constraints.scoring import INVALID_LOGIT as _INVALID_LOGIT
 from vllm_gr.constraints.validity import (
@@ -44,8 +44,6 @@ INVALID_LOGIT = _INVALID_LOGIT
 
 if TYPE_CHECKING:
     from vllm_gr.constraints.compiler import ConstraintTableResource
-
-    _DEVICE = torch.device
 
 
 @dataclass(frozen=True)
@@ -92,12 +90,6 @@ class ConstrainedTopKTensorResult:
         return int(self.top_tokens.shape[1])
 
 
-def valid_candidate_mask(valid_counts: torch.Tensor, top_k: int) -> torch.Tensor:
-    """Expand authoritative per-row counts into a fixed-width mask."""
-
-    return valid_mask_from_counts(valid_counts, top_k)
-
-
 class ConstrainedTopKExecution(Protocol):
     """Load constraint tables and run constrained top-k on raw logits."""
 
@@ -127,7 +119,7 @@ class ConstrainedTopKExecution(Protocol):
 
 def _tables_to_device(
     resource: "ConstraintTableResource",
-    device: "_DEVICE",
+    device: torch.device,
 ) -> dict[str, torch.Tensor]:
     """Copy the resource's NumPy tables to device tensors.
 
@@ -157,8 +149,7 @@ class _ConstrainedTopKExecutionBase:
     Owns the loaded-table state and the digest-keyed idempotent lifecycle:
 
     - ``load_tables`` reuses the same digest and rejects a different digest.
-    - ``reset`` drops the loaded state so a fresh digest can be loaded again
-      (pair with :meth:`ConstraintResourceManager.clear`).
+    - ``reset`` drops the loaded state so a different digest can be loaded.
     """
 
     def __init__(self, device: str | torch.device | None = None) -> None:
@@ -178,9 +169,7 @@ class _ConstrainedTopKExecutionBase:
                 f"{self._digest} with {resource.digest}; reloading is not allowed "
                 "(call reset() first)"
             )
-        # Validate the full table contract before moving anything to device.  A
-        # directly-constructed or pickle-tampered resource bypasses from_wire's
-        # validation, and must not reach the device tables.
+        # Callers can supply a directly constructed resource.
         validate_resource_tables(resource)
         self._tables = _tables_to_device(resource, device)
         self._digest = resource.digest
@@ -191,12 +180,7 @@ class _ConstrainedTopKExecutionBase:
         }
 
     def reset(self) -> None:
-        """Drop loaded tables and digest so a new digest can be loaded again.
-
-        This must be paired with
-        :meth:`~vllm_gr.constraints.resource_manager.ConstraintResourceManager.clear`
-        so the CPU-side manager and the device-side execution stay in sync.
-        """
+        """Release the device tables so the adapter can load a different resource."""
         self._tables = {}
         self._digest = None
         self._vocab_size = None
@@ -418,142 +402,6 @@ class CUDAConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
         )
         return tokens, logprobs
 
-    def run_out(
-        self,
-        logits: torch.Tensor,
-        sequence_group: torch.Tensor,
-        temperatures: torch.Tensor,
-        current_step: int,
-        top_k: int,
-        *,
-        out_token_ids: torch.Tensor,
-        out_logprobs: torch.Tensor,
-        out_valid_mask: torch.Tensor,
-        out_valid_counts: torch.Tensor,
-        out_wire_logprobs: torch.Tensor | None = None,
-    ) -> ConstrainedTopKTensorResult:
-        """CUDA-only caller-owned output path used by Worker postprocessing."""
-
-        return self._run_out_impl(
-            logits,
-            sequence_group,
-            temperatures,
-            current_step,
-            top_k,
-            out_token_ids=out_token_ids,
-            out_logprobs=out_logprobs,
-            out_valid_mask=out_valid_mask,
-            out_valid_counts=out_valid_counts,
-            out_wire_logprobs=out_wire_logprobs,
-            validate=True,
-        )
-
-    def run_out_unchecked(
-        self,
-        logits: torch.Tensor,
-        sequence_group: torch.Tensor,
-        temperatures: torch.Tensor,
-        current_step: int,
-        top_k: int,
-        *,
-        out_token_ids: torch.Tensor,
-        out_logprobs: torch.Tensor,
-        out_valid_mask: torch.Tensor,
-        out_valid_counts: torch.Tensor,
-        out_wire_logprobs: torch.Tensor | None = None,
-        out_prefill_status: torch.Tensor | None = None,
-        out_prefill_payload: torch.Tensor | None = None,
-    ) -> ConstrainedTopKTensorResult:
-        """Launch into a prewarmed Worker workspace without repeated validation."""
-
-        return self._run_out_impl(
-            logits,
-            sequence_group,
-            temperatures,
-            current_step,
-            top_k,
-            out_token_ids=out_token_ids,
-            out_logprobs=out_logprobs,
-            out_valid_mask=out_valid_mask,
-            out_valid_counts=out_valid_counts,
-            out_wire_logprobs=out_wire_logprobs,
-            out_prefill_status=out_prefill_status,
-            out_prefill_payload=out_prefill_payload,
-            validate=False,
-        )
-
-    def _run_out_impl(
-        self,
-        logits: torch.Tensor,
-        sequence_group: torch.Tensor,
-        temperatures: torch.Tensor,
-        current_step: int,
-        top_k: int,
-        *,
-        out_token_ids: torch.Tensor,
-        out_logprobs: torch.Tensor,
-        out_valid_mask: torch.Tensor,
-        out_valid_counts: torch.Tensor,
-        out_wire_logprobs: torch.Tensor | None,
-        out_prefill_status: torch.Tensor | None = None,
-        out_prefill_payload: torch.Tensor | None = None,
-        validate: bool,
-    ) -> ConstrainedTopKTensorResult:
-        """Shared checked/unchecked caller-owned launch implementation."""
-
-        if self._digest is None:
-            raise RuntimeError("constraint tables not loaded; call load_tables first")
-        if validate:
-            self._validate_runtime_inputs(
-                logits,
-                sequence_group,
-                temperatures,
-                current_step,
-                top_k,
-            )
-        from vllm_gr.ops.cuda.rec_constrained_topk import (
-            _rec_constrained_topk_cuda_out_unchecked,
-            rec_constrained_topk_cuda_out,
-        )
-
-        vocab_offset, table_vocab_size = self._vocab_window(logits)
-        launch = (
-            rec_constrained_topk_cuda_out if validate else _rec_constrained_topk_cuda_out_unchecked
-        )
-        launch_kwargs = {
-            "vocab_offset": vocab_offset,
-            "table_vocab_size": table_vocab_size,
-            "out_wire_logprobs": out_wire_logprobs,
-        }
-        if not validate:
-            launch_kwargs["out_prefill_status"] = out_prefill_status
-            launch_kwargs["out_prefill_payload"] = out_prefill_payload
-        launch(
-            logits,
-            sequence_group,
-            self._tables["first_token_ids"],
-            self._tables["prefix1_offsets"],
-            self._tables["prefix1_values"],
-            self._tables["prefix1_pair_keys"],
-            self._tables["prefix2_value_offsets"],
-            self._tables["prefix2_values"],
-            temperatures,
-            current_step,
-            top_k,
-            self._max_degrees["max_prefix1_degree"],
-            self._max_degrees["max_prefix2_degree"],
-            out_token_ids,
-            out_logprobs,
-            out_valid_mask,
-            out_valid_counts,
-            **launch_kwargs,
-        )
-        return ConstrainedTopKTensorResult(
-            top_tokens=out_token_ids,
-            top_logprobs=out_logprobs,
-            valid_mask=out_valid_mask,
-        )
-
 
 class NPUConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
     """NPU constrained top-k backed by the fused ``custom_ops_lib`` operator.
@@ -614,8 +462,8 @@ def _validate_runtime_inputs(
         raise ValueError(f"unsupported current_step={current_step}; expected 0, 1, or 2")
     if not isinstance(top_k, int) or isinstance(top_k, bool):
         raise ValueError(f"top_k must be an int, got {type(top_k).__name__}")
-    if not (1 <= top_k <= MAX_CANDIDATE_WIDTH):
-        raise ValueError(f"top_k must be in [1, {MAX_CANDIDATE_WIDTH}], got {top_k}")
+    if not (1 <= top_k <= MAX_CONSTRAINT_CANDIDATE_WIDTH):
+        raise ValueError(f"top_k must be in [1, {MAX_CONSTRAINT_CANDIDATE_WIDTH}], got {top_k}")
     _validate_input_dtypes(logits, sequence_group, temperatures, tables)
     _validate_shapes(logits, sequence_group, current_step, vocab_size)
     _validate_same_device(logits, sequence_group, temperatures)

@@ -138,7 +138,7 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
             "beam_max_width must be set before creating a BeamAttentionContext "
             "(beam KV pool is disabled when beam_max_width is None)"
         )
-    from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+    from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 
     model_config = runner.model_config
     parallel_config = runner.parallel_config

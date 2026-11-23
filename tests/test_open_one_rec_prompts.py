@@ -7,11 +7,12 @@ from pathlib import Path
 import pytest
 
 from benchmarks.open_one_rec.prompts import load_prompt
+from tests.helpers.paths import REPO_ROOT
 
 # Host-only checks of the prompt data files: CPU tier, L1.
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
-PROMPT_DIR = Path(__file__).resolve().parents[1] / "benchmarks/open_one_rec/prompts"
+PROMPT_DIR = REPO_ROOT / "benchmarks/open_one_rec/prompts"
 
 # How many values each evaluator passes to str.format, read from the call
 # sites: tasks/item_understand/utils.py format(text) and format(gt, model),
@@ -30,7 +31,9 @@ def _prompt_files() -> list[Path]:
 
 
 def test_every_prompt_matches_its_evaluator_call() -> None:
-    for path in _prompt_files():
+    paths = _prompt_files()
+    assert {path.stem for path in paths} == FORMAT_ARGS.keys()
+    for path in paths:
         text = load_prompt(path.stem)
         assert text.strip(), path.name
         expected = FORMAT_ARGS[path.stem]

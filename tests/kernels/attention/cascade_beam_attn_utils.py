@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -13,8 +14,9 @@ import torch
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
 )
-from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam import BEAM_DATA_VAR
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.session import BeamSearchSession
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 # (queries per beam, complete KV length, suffix KV length).
@@ -186,6 +188,7 @@ def build_beam_attn_metadata(
     )
     try:
         builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
+        builder.vllm_config = SimpleNamespace(speculative_config=None)
         builder.device = torch.device(device)
         builder.block_size = inputs.block_size
         builder.aot_schedule = False

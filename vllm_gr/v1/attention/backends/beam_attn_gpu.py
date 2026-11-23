@@ -28,9 +28,12 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     require_beam_decode_session,
     resolve_beam_pool,
 )
-from vllm_gr.v1.attention.backends.beam_dense_prefill import in_fresh_prefill_capture
+from vllm_gr.v1.beam.attention_pool import write_eager_step
+from vllm_gr.v1.forward_context import in_fresh_prefill_capture
 
 logger = init_logger(__name__)
+
+cache_unshared_kv = write_eager_step
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -78,7 +81,7 @@ class GPUBeamAttentionBatch:
             raise RuntimeError("GPU Beam batch requires the configured exact Beam width")
 
         self.pools = []
-        from vllm_gr.v1.beam.dynamic_beam import get_stage_pools
+        from vllm_gr.v1.beam.dynamic_width import get_stage_pools
 
         for source in get_stage_pools(self.context, self.request_width):
             pool = copy(source)
@@ -186,31 +189,6 @@ def resolve_prefill_flash_attn_version(
 
 def supports_sinks() -> bool:
     return bool(is_available() and flash_attn_supports_sinks())
-
-
-def cache_unshared_kv(
-    unshared_key: Any,
-    unshared_value: Any,
-    curr_key: Any,
-    curr_value: Any,
-    slot: int,
-    decode_step: int,
-    beam_session: object = None,  # unused on GPU; xllm-only contract
-) -> None:
-    """Cascade-mode pool write: slot/0-based semantics, unchanged behavior."""
-    from vllm_gr.v1.attention.backends.beam_kernels import (
-        cache_unshared_kv as _cache_unshared_kv,
-    )
-
-    del beam_session
-    _cache_unshared_kv(
-        unshared_key,
-        unshared_value,
-        curr_key,
-        curr_value,
-        slot,
-        decode_step,
-    )
 
 
 def reshape_and_cache(
@@ -536,10 +514,8 @@ def prefix_attention(
         plan is None
         and plain
         and attn_metadata.max_num_splits == 0
-        and getattr(attn_metadata, "prefix_length_bucket", 0)
+        and getattr(attn_metadata, "prefix_length_bucket", False)
     ):
-        from vllm.config import get_current_vllm_config_or_none
-
         from vllm_gr.v1.attention.backends.beam_prefix_policy import (
             PrefixShape,
             resolve_prefix_plan,
@@ -547,8 +523,6 @@ def prefix_attention(
 
         widths = attn_metadata.prefix_seqlens_q_cpu
         if widths and all(w == attn_metadata.prefix_max_q_len for w in widths):
-            config = get_current_vllm_config_or_none()
-            explicit = config.attention_config.flash_attn_version if config else None
             shape = PrefixShape(
                 batch=len(widths),
                 width=widths[0],
@@ -565,7 +539,10 @@ def prefix_attention(
                 fingerprint=device_fingerprint(query.device.index),
                 supported_versions=available_prefix_versions(query.device.index),
                 sm_count=multi_processor_count(query.device.index),
-                explicit_version=explicit,
+                explicit_version=attn_metadata.explicit_fa_version,
+                policy=attn_metadata.prefix_policy,
+                min_chain_us=attn_metadata.prefix_min_chain_us,
+                calibrations=attn_metadata.prefix_calibrations,
                 batch_invariant=envs.VLLM_BATCH_INVARIANT,
             )
             if plan is not None and plan.segments > 1:
@@ -573,7 +550,9 @@ def prefix_attention(
                 # allocate; drop the plan instead of raising inside capture.
                 pages = -(-attn_metadata.prefix_max_seq_len // key_cache.shape[1])
                 chunk = max(1, -(-pages // plan.segments))
-                columns = attn_metadata.prefix_block_table.shape[1]
+                block_table = attn_metadata.prefix_block_table
+                assert block_table is not None
+                columns = block_table.shape[1]
                 if chunk * plan.segments > columns:
                     plan = None
     scheduler = attn_metadata.prefix_scheduler_metadata
@@ -590,7 +569,7 @@ def prefix_attention(
         # an AOT schedule built for the layer's original plan.
         scheduler = None
         if plan.segments > 1:
-            from vllm_gr.v1.attention.backends.beam_prefix_segmented import (
+            from vllm_gr.v1.attention.backends.beam_prefix_kernels import (
                 segmented_prefix,
             )
 
@@ -760,9 +739,7 @@ def cascade_attention(
         # graph captured at step=1 would forever copy only 2 KV rows.
         decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
         if decode_step_buf is not None and decode_step_buf.is_cuda:
-            from vllm_gr.v1.attention.backends.beam_graph_kernels import (
-                copy_suffix_kv_graph,
-            )
+            from vllm_gr.ops.cuda.beam_kv_cache import copy_suffix_kv_graph
 
             copy_suffix_kv_graph(
                 pool.unshared_key,

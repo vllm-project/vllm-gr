@@ -2,8 +2,8 @@
 # vLLM-Ascend 0.30.0rc2, triton-ascend 3.6.0, torch/torch-npu 2.10, CANN
 # 9.2.0 — is supplied by the base image (validated on
 # quay.io/ascend/vllm-ascend:v0.30.0rc2), and the xllm-ops operator library
-# must be built for that image's CANN version. vllm_gr._env_check pins the
-# validated vLLM-Ascend/Triton-Ascend pair at startup.
+# must be built for that image's CANN version. The Ascend provider checks
+# the pins declared in vllm_gr.platforms.compat at startup.
 -r common.txt
 
 # Match the validated vendor image: triton-ascend 3.6.0 declares numpy==1.26.4

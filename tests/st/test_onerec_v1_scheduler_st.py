@@ -28,6 +28,8 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.paths import REPO_ROOT, TESTS_DIR
+
 pytestmark = pytest.mark.gpu_test
 
 _MODULE_READY = time.monotonic()
@@ -398,26 +400,21 @@ def _inputs(work_dir: Path) -> tuple[Any, ...]:
         digest = save_constraint_table_artifact(table, artifact)
     legal = {tuple(tokenizer.convert_tokens_to_ids(triple)) for triple in triples}
     config = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": not _EAGER,
-            "worker_decision": True,
-            "max_width": _BEAM_WIDTH,
-            "max_decode_steps": 3,
-        },
+        "beam_graph_enabled": not _EAGER,
+        "worker_decision": True,
+        "beam_width": [_BEAM_WIDTH] * 3,
+        "max_decode_steps": 3,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "max_top_k": _BEAM_WIDTH,
             "path": str(artifact),
             "format": "constraint_table_v1",
-            "artifact_digest": digest,
-            "tokenizer_digest": tokenizer_digest,
+            "digests": {"artifact": digest, "tokenizer": tokenizer_digest},
         },
+        "candidate_width": [_BEAM_WIDTH] * 3,
     }
-    prompt_text = (Path(__file__).parents[1] / "resources/single_one_rec_prompt.txt").read_text()
+    prompt_text = (TESTS_DIR / "resources/single_one_rec_prompt.txt").read_text()
     source = tokenizer.encode(prompt_text, add_special_tokens=False)
     newline = tokenizer.encode("\n", add_special_tokens=False)
     assert len(newline) == 1
@@ -520,7 +517,14 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
     rows: list[dict[str, Any]] = []
     reference: dict[tuple[int, int], list[tuple[tuple[int, ...], float]]] = {}
-    with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **_engine_kwargs(model, config)) as llm:
+    with (
+        GRLLM(
+            attention_config={"backend": "CUSTOM"},
+            gr=config,
+            shutdown_timeout=10,
+            **_engine_kwargs(model, config),
+        ) as llm,
+    ):
         expected_client = (
             "InprocClient"
             if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"
@@ -535,14 +539,14 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
         llm.collective_rpc("onerec_v1_st_observe")
         for steps in (1, 2):
             with pytest.raises(ValueError, match="must equal constraint_table_v1 depth"):
-                llm.beam_search_v1([{"prompt_token_ids": source}], _params(steps))
+                llm.beam_search([{"prompt_token_ids": source}], _params(steps))
         assert not llm.collective_rpc("onerec_v1_st_events")[0]
         state_address = None
         for length, steps, cold in _CASES:
             if cold:
                 assert llm.reset_prefix_cache()
             ids = (newline * length + source)[-(length - 1) :]
-            public = llm.beam_search_v1(
+            public = llm.beam_search(
                 [{"prompt_token_ids": ids}], _params(steps), output_mode="full"
             )[0]
             snapshot = llm.collective_rpc("onerec_v1_st_snapshot")[0]
@@ -591,7 +595,8 @@ async def _run_online(work_dir: Path) -> None:
     # The native 0.30 default is zero: it kills EngineCore before IPC cleanup.
     # Give the real shutdown path time to run and check its exit below.
     args = AsyncEngineArgs(
-        additional_config={"vllm_gr": config},
+        gr=config,
+        attention_config={"backend": "CUSTOM"},
         shutdown_timeout=10,
         **_engine_kwargs(model, config),
     )
@@ -609,7 +614,7 @@ async def _run_online(work_dir: Path) -> None:
         await engine.collective_rpc("onerec_v1_st_observe")
         for steps in (1, 2):
             with pytest.raises(ValueError, match="must equal constraint_table_v1 depth"):
-                async for _ in serving.beam_search_v1(
+                async for _ in serving.beam_search(
                     tokens_input(source), "invalid-length", _params(steps)
                 ):
                     pytest.fail("invalid constrained length reached generation")
@@ -624,9 +629,7 @@ async def _run_online(work_dir: Path) -> None:
             ids = (newline * length + source)[-(length - 1) :]
             outputs = [
                 out
-                async for out in serving.beam_search_v1(
-                    tokens_input(ids), request_id, _params(steps)
-                )
+                async for out in serving.beam_search(tokens_input(ids), request_id, _params(steps))
             ]
             assert len(outputs) == 1 and outputs[0].finished
             output = outputs[0]
@@ -652,7 +655,7 @@ async def _run_online(work_dir: Path) -> None:
             if waiting:
                 await engine.pause_generation(mode="keep", clear_cache=False)
             before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
-            stream = serving.beam_search_v1(tokens_input(newline * 1023), "cancelled", _params(3))
+            stream = serving.beam_search(tokens_input(newline * 1023), "cancelled", _params(3))
             task = asyncio.create_task(anext(stream))
             try:
                 deadline = time.monotonic() + 30
@@ -750,14 +753,12 @@ async def _completion_http_client(app: Any) -> AsyncIterator[Any]:
 def _completion_inputs(work_dir: Path) -> tuple[Any, ...]:
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
     if _UNCONSTRAINED:
-        config["constraint_table"] = {
-            "enabled": False,
-            "max_top_k": config["beam"]["max_width"],
-        }
-        config["constrained_generation"] = False
-    configured_sizes = os.environ.get("VLLM_GR_TEST_ONLINE_BATCH_SIZES")
+        config.pop("constraint_table")
+        config["constraint_mode"] = "none"
+    config["prefill_token_buckets"] = list(range(128, 4097, 128))
+    configured_sizes = os.environ.get("VLLM_GR_TEST_CAPTURE_BATCH_SIZES")
     sizes = (1, 2, 3, 4, 8) if configured_sizes is None else tuple(json.loads(configured_sizes))
-    config["beam"]["online_batch_sizes"] = list(sizes)
+    config["beam_batch_sizes"] = list(sizes)
     kwargs = _engine_kwargs(model, config) | dict(
         max_num_seqs=max(sizes),
         max_num_batched_tokens=4096,
@@ -801,13 +802,17 @@ def _run_completion_reference(work_dir: Path) -> None:
 
     model, config, sizes, kwargs, prompts, _ = _completion_inputs(work_dir)
     rows = []
-    with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **kwargs) as llm:
+    with (
+        GRLLM(
+            attention_config={"backend": "CUSTOM"}, gr=config, shutdown_timeout=10, **kwargs
+        ) as llm,
+    ):
         processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
         llm.collective_rpc("onerec_v1_st_observe")
         for count in sizes:
             assert llm.reset_prefix_cache()
             before = len(llm.collective_rpc("onerec_v1_st_events")[0])
-            outputs = llm.beam_search_v1(
+            outputs = llm.beam_search(
                 [{"prompt_token_ids": p} for p in prompts[:count]],
                 _params(3),
                 output_mode="full",
@@ -891,7 +896,9 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
         kwargs,
         prompts,
     )
-    args = AsyncEngineArgs(additional_config={"vllm_gr": config}, shutdown_timeout=10, **kwargs)
+    args = AsyncEngineArgs(
+        gr=config, attention_config={"backend": "CUSTOM"}, shutdown_timeout=10, **kwargs
+    )
     async with _measured_engine(build_async_engine_client_from_engine_args, args) as engine:
         processes = list(engine.engine_core.resources.engine_manager.processes)
         models = OpenAIServingModels(
@@ -987,7 +994,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                 before_direct = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
                 direct = [
                     output
-                    async for output in serving.beam_search_v1(
+                    async for output in serving.beam_search(
                         [tokens_input(p) for p in prompts[:count]], "direct-reference", _params(3)
                     )
                 ]
@@ -1193,17 +1200,12 @@ def test_onerec_v1_completion_batch_online(
     if not torch.cuda.is_available():
         pytest.skip("OneRec completion batching ST requires CUDA")
     env = dict(os.environ)
-    env.pop("VLLM_GR_TEST_ONLINE_BATCH_SIZES", None)
+    env.pop("VLLM_GR_TEST_CAPTURE_BATCH_SIZES", None)
     env.pop("VLLM_GR_TEST_UNCONSTRAINED", None)
     if unconstrained:
         env["VLLM_GR_TEST_UNCONSTRAINED"] = "1"
     if batch_sizes is not None:
-        env["VLLM_GR_TEST_ONLINE_BATCH_SIZES"] = json.dumps(batch_sizes)
-    # The default eight-request and custom seven-request prompt lists exceed
-    # max_model_len in total. This ST requires graph replay for every batch, so
-    # its explicit grid covers the scheduler budget; the production default
-    # remains bounded by max_model_len.
-    env["VLLM_GR_PREFILL_GRAPH_BUCKETS"] = ",".join(str(n) for n in range(128, 4097, 128))
+        env["VLLM_GR_TEST_CAPTURE_BATCH_SIZES"] = json.dumps(batch_sizes)
     env.update(
         USE_TF="0",
         VLLM_USE_V2_MODEL_RUNNER=str(int(runner == "v2")),
@@ -1219,9 +1221,7 @@ def test_onerec_v1_completion_batch_online(
             str(tmp_path),
             mode,
         ]
-        with subprocess.Popen(
-            command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-        ) as process:
+        with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
             try:
                 assert process.wait(timeout=550) == 0, f"OneRec {mode} subprocess failed"
             finally:
@@ -1262,9 +1262,7 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool, runner: str) -
     if online:
         command.append("--online")
     process_started = time.monotonic()
-    with subprocess.Popen(
-        command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-    ) as process:
+    with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
         try:
             assert process.wait(timeout=600) == 0, "OneRec V1 scheduling subprocess failed"
         finally:

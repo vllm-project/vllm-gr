@@ -9,6 +9,8 @@ import os
 import sys
 import time
 import traceback
+from codecs import BOM_UTF8
+from collections.abc import AsyncIterable, AsyncIterator
 from importlib import import_module
 from typing import Literal
 
@@ -21,7 +23,6 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     ASYNC_REQUEST_FUNCS,
     RequestFuncInput,
     RequestFuncOutput,
-    StreamedResponseHandler,
     _get_chat_content,
     _update_headers_common,
     _update_payload_common,
@@ -34,6 +35,7 @@ from vllm.benchmarks.throughput import get_requests as original_get_requests
 from vllm.benchmarks.throughput import main as original_main
 from vllm.benchmarks.throughput import validate_args as original_validate_args
 
+from benchmarks.open_one_rec.chat import messages_for_prompt, text_from_message
 from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
 # ============================================================================
@@ -235,6 +237,33 @@ def __init__(
 RequestFuncInput.__init__ = __init__
 
 
+async def _iter_sse_data(chunks: AsyncIterable[bytes]) -> AsyncIterator[str]:
+    buffer = b""
+    stream_start = True
+    previous_chunk_ended_in_cr = False
+    async for chunk in chunks:
+        if not chunk:
+            continue
+        # A CRLF may straddle network chunks.
+        if previous_chunk_ended_in_cr:
+            chunk = chunk.removeprefix(b"\n")
+        previous_chunk_ended_in_cr = chunk.endswith(b"\r")
+        buffer += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+        while b"\n\n" in buffer:
+            event, buffer = buffer.split(b"\n\n", 1)
+            if stream_start:
+                event = event.removeprefix(BOM_UTF8)
+                stream_start = False
+            data_lines = []
+            for line in event.split(b"\n"):
+                field, _, value = line.partition(b":")
+                if field == b"data":
+                    data_lines.append(value.removeprefix(b" "))
+            if payload := b"\n".join(data_lines):
+                yield payload.decode("utf-8")
+
+
 async def patched_async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -245,7 +274,12 @@ async def patched_async_request_openai_chat_completions(
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Chat Completions API", "chat/completions")
 
-    content = _get_chat_content(request_func_input, mm_position=mm_position)
+    chat_messages = request_func_input.chat_messages
+    content = (
+        _get_chat_content(request_func_input, mm_position=mm_position)
+        if chat_messages is None
+        else None
+    )
     temperature = 0.0
     if hasattr(request_func_input, "temperature") and request_func_input.temperature is not None:
         temperature = request_func_input.temperature
@@ -259,9 +293,7 @@ async def patched_async_request_openai_chat_completions(
         "model": request_func_input.model_name
         if request_func_input.model_name
         else request_func_input.model,
-        "messages": [
-            {"role": "user", "content": content},
-        ],
+        "messages": messages_for_prompt(content, chat_messages, parse_transcript=False),
         "use_beam_search": request_func_input.use_beam_search,
         "n": request_func_input.n,
         "temperature": temperature,
@@ -284,66 +316,63 @@ async def patched_async_request_openai_chat_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
-    ttft = 0.0
+    last_text_timestamp: float | None = None
+    received_done = False
+    stream_error: str | None = None
     st = time.perf_counter()
     output.start_time = st
-    most_recent_timestamp = st
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == HTTP_OK:
-                handler = StreamedResponseHandler()
-                async for chunk_bytes in response.content.iter_any():
-                    chunk_bytes = chunk_bytes.strip()
-                    if not chunk_bytes:
+                async for chunk in _iter_sse_data(response.content.iter_any()):
+                    if chunk == "[DONE]":
+                        received_done = True
+                        break
+
+                    data = json.loads(chunk)
+                    if "error" in data:
+                        if stream_error is None:
+                            error = data["error"]
+                            error_message = (
+                                error.get("message") if isinstance(error, dict) else error
+                            )
+                            stream_error = str(error_message or chunk)
                         continue
 
-                    messages = handler.add_chunk(chunk_bytes)
-                    for message in messages:
-                        # NOTE: SSE comments (often used as pings) start with
-                        # a colon. These are not JSON data payload and should
-                        # be skipped.
-                        if message.startswith(":"):
-                            continue
-
-                        chunk = message.removeprefix("data: ")
-
-                        if chunk != "[DONE]":
+                    if choices := data.get("choices"):
+                        delta = choices[0]["delta"]
+                        text = text_from_message(delta)
+                        if text:
                             timestamp = time.perf_counter()
-                            data = json.loads(chunk)
+                            if last_text_timestamp is None:
+                                output.ttft = timestamp - st
+                            else:
+                                output.itl.append(timestamp - last_text_timestamp)
+                            last_text_timestamp = timestamp
+                            generated_text += text
+                    if usage := data.get("usage"):
+                        output.output_tokens = usage.get("completion_tokens", output.output_tokens)
+                        output.prompt_len = usage.get("prompt_tokens", output.prompt_len)
 
-                            if choices := data.get("choices"):
-                                delta = choices[0]["delta"]
-                                content = delta.get("content")
-                                reasoning_content = delta.get("reasoning_content")
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                if reasoning_content:
-                                    generated_text += reasoning_content
-                                if content:
-                                    generated_text += content
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
-
-                            most_recent_timestamp = timestamp
-
-                output.generated_text = generated_text
-                output.success = True
-                output.latency = most_recent_timestamp - st
+                output.success = (
+                    received_done and last_text_timestamp is not None and stream_error is None
+                )
+                if stream_error is not None:
+                    output.error = stream_error
+                elif not received_done:
+                    output.error = "response ended without [DONE]"
+                elif last_text_timestamp is None:
+                    output.error = "response contains no text output"
             else:
                 output.error = response.reason or ""
                 output.success = False
     except Exception:
         output.success = False
         exc_info = sys.exc_info()
-        output.error = "".join(traceback.format_exception(*exc_info))
+        output.error = stream_error or "".join(traceback.format_exception(*exc_info))
 
+    output.generated_text = generated_text
+    output.latency = time.perf_counter() - st
     if pbar:
         pbar.update(1)
     return output
@@ -444,6 +473,9 @@ def patched_get_samples(args, tokenizer):
             # OneRec intentionally disables oversample: duplicated requests
             # would inflate throughput via spurious KV-cache hits.
             no_oversample=True,
+            chat_template_kwargs=(getattr(args, "extra_body", None) or {}).get(
+                "chat_template_kwargs"
+            ),
         )
 
     return original_get_samples(args, tokenizer)
@@ -462,7 +494,7 @@ def patched_add_cli_args(parser):
     """Patch add_cli_args to include onerec arguments."""
     original_add_cli_args(parser)
     parser.add_argument(
-        "--beam-search-v1",
+        "--beam-search",
         action="store_true",
         help="Select Beam benchmarking (all GR Beam benchmarks use V1)",
     )
@@ -521,7 +553,8 @@ def patched_validate_args(args):
 
     if not getattr(args, "dataset_path", None):
         raise ValueError(
-            "--dataset-path is required for onerec dataset. Example: --dataset-path ./data"
+            "--dataset-path is required for onerec dataset. "
+            "Example: --dataset-path ./data/benchmark_data"
         )
 
 
@@ -556,7 +589,7 @@ def patched_main(args):
     """Patch main to handle beam search and fix tokenizer initialization."""
     # Check if this is an offline beam search benchmark
     is_beam_search = (
-        getattr(args, "beam_search_v1", False)
+        getattr(args, "beam_search", False)
         or USE_BEAM_SEARCH
         or (hasattr(args, "n") and args.n and args.n > 1)
     )

@@ -13,12 +13,14 @@ its flagged tiles.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
+
+from vllm_gr.config.models import DEFAULT_DEPLOYMENT
+from vllm_gr.ops.cuda.topk_sort_key import pack_score_index, unpack_score
 
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
@@ -29,9 +31,7 @@ LOCAL_TILE_SIZE = 1024
 # write-back and the merge traffic proportional to the read instead of to
 # ``tiles * top_k``.  Lowering it trades local ``tl.topk`` work for a higher
 # chance of the (exact) repair pass, so it stays tunable per deployment.
-LOCAL_KEEP_MAX = int(os.environ.get("VLLM_GR_TOPK_KEEP", "8"))
-if not 1 <= LOCAL_KEEP_MAX <= 256:
-    raise ValueError(f"VLLM_GR_TOPK_KEEP must be in [1, 256], got {LOCAL_KEEP_MAX}")
+LOCAL_KEEP_MAX = DEFAULT_DEPLOYMENT.topk_keep
 # Width of one chunk in the first merge stage.  The stage is a plain
 # "sort this chunk, keep its best top_k" pass, so the chunk count (not the tile
 # count) bounds the second stage.
@@ -56,29 +56,8 @@ class MCarryTopKScratch:
     vocab_size: int
     top_k: int
     keep: int
-
-
-@triton.jit
-def _pack_score_index(score, index, valid):
-    min_i32: tl.constexpr = -2147483648
-    score = tl.where(valid & (score == score), score, -float("inf"))
-    # Collapse -0.0 onto +0.0 so the packed order is a total order.
-    score = tl.where(score == 0.0, 0.0, score)
-    score_bits = score.to(tl.int32, bitcast=True)
-    sign = score_bits >> 31
-    sort_key = tl.where(sign == 0, score_bits ^ -1, score_bits ^ min_i32)
-    high = sort_key.to(tl.int64) & 0x00000000FFFFFFFF
-    low = tl.where(valid, index.to(tl.int64), 0x00000000FFFFFFFF)
-    return (high << 32) | low
-
-
-@triton.jit
-def _unpack_score(packed):
-    min_i32: tl.constexpr = -2147483648
-    sort_key = ((packed >> 32) & 0x00000000FFFFFFFF).to(tl.int32)
-    sign = sort_key >> 31
-    score_bits = tl.where(sign < 0, sort_key ^ -1, sort_key ^ min_i32)
-    return score_bits.to(tl.float32, bitcast=True)
+    keep_limit: int = LOCAL_KEEP_MAX
+    select: str = DEFAULT_DEPLOYMENT.topk_select
 
 
 @triton.jit
@@ -130,7 +109,7 @@ def _local_keys_kernel(
     tl.store(partial_max + row * partial_stride + tile, tile_max)
     tl.store(partial_sum + row * partial_stride + tile, tile_sum)
 
-    packed = _pack_score_index(values, flat, valid)
+    packed = pack_score_index(values, flat, valid)
     retained = tl.arange(0, KEEP_BLOCK)
     if KEEP_BLOCK == 1:
         # Smallest packed key wins: highest score, then lowest token index.
@@ -165,7 +144,7 @@ def _local_keys_kernel(
             selected_values,
             -float("inf"),
         )
-        exact = _pack_score_index(selected_values, selected_flat, selected_valid)
+        exact = pack_score_index(selected_values, selected_flat, selected_valid)
         tl.store(
             local_keys + row * keep_stride + tile * keep_width + retained,
             exact,
@@ -279,7 +258,7 @@ def _finalize_kernel(
     selected = ranks < top_k
     key = tl.load(keys + row * key_stride + ranks, mask=selected, other=_MAX_I64)
     tokens = (key & 0x00000000FFFFFFFF).to(tl.int32)
-    scores = _unpack_score(key)
+    scores = unpack_score(key)
     valid = selected & has_mass & (tokens >= 0) & (scores > -float("inf")) & (scores < float("inf"))
     output_offset = row * output_stride + ranks
     tl.store(output_ids + output_offset, tokens, mask=selected)
@@ -383,14 +362,16 @@ def _repair_row_kernel(
                 values = tl.where(
                     (values > -float("inf")) & (values < float("inf")), values, -float("inf")
                 )
-                packed = _pack_score_index(values, flat, valid)
+                packed = pack_score_index(values, flat, valid)
                 if TOPK_BLOCK == 1:
                     # The i32 cutoff can require exact repair even for K=1.
                     # Avoid Triton's scalar reshape in tl.topk(..., 1).
                     tile_top = tl.min(packed, axis=0, keep_dims=True)
                     running = tl.minimum(running, tile_top)
                 else:
-                    tile_top = ~tl.topk(~packed, TOPK_BLOCK)
+                    # The final Top-K accepts unordered keys. When every key
+                    # in this tile survives local selection, merge them as-is.
+                    tile_top = packed if TOPK_BLOCK == BLOCK else ~tl.topk(~packed, TOPK_BLOCK)
                     both = tl.cat(running, tile_top, can_reorder=True)
                     running = ~tl.topk(~both, TOPK_BLOCK)
         key = running
@@ -415,7 +396,7 @@ def _repair_row_kernel(
         ranks = tl.arange(0, OUTPUT_BLOCK)
         selected = ranks < top_k
         tokens = (key & 0x00000000FFFFFFFF).to(tl.int32)
-        scores = _unpack_score(key)
+        scores = unpack_score(key)
         valid_out = (
             selected & has_mass & (tokens >= 0) & (scores > -float("inf")) & (scores < float("inf"))
         )
@@ -498,7 +479,7 @@ def _repair_fold_kernel(
                     values,
                     -float("inf"),
                 )
-                packed = _pack_score_index(values, global_flat, valid)
+                packed = pack_score_index(values, global_flat, valid)
                 tile_top = ~tl.topk(~packed, TOPK_BLOCK)
                 both = tl.cat(current, tile_top, can_reorder=True)
                 current = ~tl.topk(~both, TOPK_BLOCK)
@@ -603,7 +584,7 @@ def _stream_slice_kernel(
             values = tl.where(
                 (values > -float("inf")) & (values < float("inf")), values, -float("inf")
             )
-            packed = _pack_score_index(values, flat, valid)
+            packed = pack_score_index(values, flat, valid)
             if TOPK_BLOCK == 1:
                 tile_top = tl.min(packed, axis=0, keep_dims=True)
             else:
@@ -660,7 +641,7 @@ def _repair_emit_kernel(
         safe_max = tl.where(has_mass, global_max, 0.0)
         denominator = safe_max + tl.log(tl.sum(tile_sums * tl.exp(tile_maxes - safe_max), axis=0))
         tokens = (key & 0x00000000FFFFFFFF).to(tl.int32)
-        scores = _unpack_score(key)
+        scores = unpack_score(key)
         valid = (
             selected & has_mass & (tokens >= 0) & (scores > -float("inf")) & (scores < float("inf"))
         )
@@ -675,7 +656,9 @@ def _repair_emit_kernel(
         tl.store(output_counts + row, tl.sum(valid.to(tl.int32), axis=0))
 
 
-def mcap_topk_tiling(vocab_size: int, top_k: int) -> tuple[int, int, int, int]:
+def mcap_topk_tiling(
+    vocab_size: int, top_k: int, keep_limit: int = LOCAL_KEEP_MAX
+) -> tuple[int, int, int, int]:
     """Return ``(tiles, keep, candidates, chunk_count)``; one shared definition."""
 
     if vocab_size <= 0 or top_k <= 0:
@@ -684,7 +667,7 @@ def mcap_topk_tiling(vocab_size: int, top_k: int) -> tuple[int, int, int, int]:
     # A row must be able to retain at least ``top_k`` candidates in total, so a
     # vocabulary with only a few tiles widens the per-tile cap instead of
     # silently dropping winners.
-    keep = min(top_k, max(LOCAL_KEEP_MAX, -(-top_k // tiles)))
+    keep = min(top_k, max(keep_limit, -(-top_k // tiles)))
     candidates = tiles * keep
     chunk_count = (candidates + MERGE_CHUNK - 1) // MERGE_CHUNK
     return tiles, keep, candidates, chunk_count
@@ -705,10 +688,13 @@ def allocate_mcap_topk_scratch(
     vocab_size: int,
     top_k: int,
     device: torch.device,
+    *,
+    keep_limit: int = LOCAL_KEEP_MAX,
+    select: str = DEFAULT_DEPLOYMENT.topk_select,
 ) -> MCarryTopKScratch:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k)
+    tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k, keep_limit)
     return MCarryTopKScratch(
         local_keys=torch.empty((batch_size, candidates), dtype=torch.int64, device=device),
         local_marginal=torch.empty((batch_size, tiles), dtype=torch.int64, device=device),
@@ -728,6 +714,8 @@ def allocate_mcap_topk_scratch(
         vocab_size=vocab_size,
         top_k=top_k,
         keep=keep,
+        keep_limit=keep_limit,
+        select=select,
     )
 
 
@@ -809,11 +797,11 @@ def unconstrained_topk_mcap_out(
 def _local_slice_plan(
     vocab_size: int, top_k: int, scratch: MCarryTopKScratch
 ) -> tuple[int, int, int, int, bool, bool, int]:
-    tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k)
+    tiles, keep, candidates, chunk_count = mcap_topk_tiling(vocab_size, top_k, scratch.keep_limit)
     if keep != scratch.keep:
         raise ValueError("bounded Top-K scratch retention width does not match its tiling")
     need_marginal = keep < top_k
-    i32_select = os.environ.get("VLLM_GR_TOPK_SELECT", "i64").strip().lower() == "i32"
+    i32_select = scratch.select == "i32"
     # The i32 surrogate ranks a truncated key, so it must also retain the value
     # just below the cutoff to notice a collision there.  That extra slot is
     # needed even when ``keep == top_k``, where exact i64 selection is already
@@ -845,7 +833,7 @@ def _launch_local_slice(
     tiles, keep, candidates, _, need_marginal, _, keep_block = _local_slice_plan(
         scratch.vocab_size, top_k, scratch
     )
-    mode = os.environ.get("VLLM_GR_TOPK_SELECT", "i64").strip().lower()
+    mode = scratch.select
     slice_tiles = -(-slice_size // LOCAL_TILE_SIZE)
     _local_keys_kernel[(rows, slice_tiles)](
         logits,

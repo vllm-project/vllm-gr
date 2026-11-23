@@ -235,7 +235,7 @@ def test_decode_graph_capture_keeps_paged_attention(mode):
 @torch.inference_mode()
 @pytest.mark.parametrize("mode", ["fa2", "cudnn"])
 def test_fresh_prefill_capture_scope_captures_dense_attention(mode):
-    from vllm_gr.v1.attention.backends.beam_dense_prefill import fresh_prefill_capture
+    from vllm_gr.v1.forward_context import fresh_prefill_capture
 
     q, k, v, key_cache, value_cache, meta, expected = _case((600,))
     # A zeroed paged cache can only reproduce the reference via the dense path.

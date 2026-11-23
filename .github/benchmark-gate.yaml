@@ -1,3 +1,7 @@
+# Reference policy snapshot: 2026-11. Hardware-specific measurements and setup
+# are documented in docs/contributing/ci/benchmark_acceptance.md. These thresholds are
+# not universal performance guarantees; calibrate them for your own hardware.
+# Board keys are compatibility selectors, not required server hostnames.
 version: 2
 name: development
 
@@ -42,7 +46,7 @@ device_overrides:
         # Logical policy selector for every GPU on decode_graph, not a GPU model.
         # A100 CI offline result + L20 correctness reference.
         # A100 online uses the explicitly accepted offline-floor assumption.
-        # Measurement evidence and rollout order: docs/benchmarks/parent_score_gate.md.
+        # Gate scope and policy selection: docs/contributing/ci/benchmark_acceptance.md.
         thresholds:
           accuracy: &decode_graph_accuracy
             pass_at_1_min: 0.05

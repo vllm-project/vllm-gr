@@ -4,13 +4,15 @@
 
 import json
 import logging
+import math
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 from tqdm import tqdm
 
+from benchmarks.open_one_rec.base_evaluator import EvaluationError
 from benchmarks.open_one_rec.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,14 @@ def extract_json_from_response(response: str) -> Optional[Dict]:
         return None
 
 
+def _valid_wip(wip: Any) -> bool:
+    if not isinstance(wip, dict):
+        return False
+    text = wip.get("info_point")
+    score = wip.get("importance_score")
+    return isinstance(text, str) and bool(text.strip()) and type(score) is int and 1 <= score <= 5
+
+
 def extract_wips_single(text: str, llm_client) -> Tuple[Optional[List[Dict]], Optional[str]]:
     """
     Extract WIPs from a single text using LLM.
@@ -56,8 +66,9 @@ def extract_wips_single(text: str, llm_client) -> Tuple[Optional[List[Dict]], Op
         response = llm_client.generate(prompt)
         result = extract_json_from_response(response)
 
-        if result is not None and "wips" in result:
-            return result["wips"], None
+        wips = result.get("wips") if isinstance(result, dict) else None
+        if isinstance(wips, list) and all(_valid_wip(wip) for wip in wips):
+            return wips, None
 
         return None, "Failed to parse JSON from response"
 
@@ -94,7 +105,7 @@ def extract_wips_batch(
 
         for future in tqdm(as_completed(futures), total=len(futures), desc=desc):
             sample_id, wips, error = future.result()
-            if wips:
+            if wips is not None:
                 results[sample_id] = wips
             if error:
                 errors[sample_id] = error
@@ -109,6 +120,10 @@ def extract_wips_batch(
     )
 
     return results, errors
+
+
+def _count_wips(wips: List[Dict]) -> Counter[tuple[str, int]]:
+    return Counter((wip["info_point"], wip["importance_score"]) for wip in wips)
 
 
 def match_wips_single(
@@ -133,10 +148,37 @@ def match_wips_single(
         response = llm_client.generate(prompt)
         result = extract_json_from_response(response)
 
-        if result is not None and all(
-            k in result for k in ["matches", "unmatched_model_wips", "unmatched_gt_wips"]
-        ):
-            return result, None
+        if isinstance(result, dict):
+            matches = result.get("matches")
+            unmatched_model = result.get("unmatched_model_wips")
+            unmatched_gt = result.get("unmatched_gt_wips")
+            if (
+                isinstance(matches, list)
+                and isinstance(unmatched_model, list)
+                and isinstance(unmatched_gt, list)
+                and (matches or unmatched_model or unmatched_gt)
+                and all(_valid_wip(wip) for wip in unmatched_model + unmatched_gt)
+                and all(
+                    isinstance(match, dict)
+                    and _valid_wip(match.get("gt_wip"))
+                    and _valid_wip(match.get("model_wip"))
+                    for match in matches
+                )
+            ):
+                for side, expected_wips, reported_wips in (
+                    ("reference", gt_wips, [m["gt_wip"] for m in matches] + unmatched_gt),
+                    ("model", model_wips, [m["model_wip"] for m in matches] + unmatched_model),
+                ):
+                    expected = _count_wips(expected_wips)
+                    reported = _count_wips(reported_wips)
+                    if expected != reported:
+                        missing = sum((expected - reported).values())
+                        unexpected = sum((reported - expected).values())
+                        return None, (
+                            f"{side} WIP coverage mismatch: {missing} missing, "
+                            f"{unexpected} unexpected occurrence(s)"
+                        )
+                return result, None
 
         return None, "Failed to parse match JSON from response"
 
@@ -551,147 +593,6 @@ def save_wip_detailed_results(
     logger.info(f"WIP detailed results saved to {save_path}")
 
 
-def get_gt_cache_path(cache_dir: str, model_name: str) -> str:
-    """Get the path for GT WIPs cache file."""
-    return os.path.join(cache_dir, f"test_gt_wip_{model_name}.parquet")
-
-
-def load_wip_results_cache(cache_path: str) -> Optional[Dict[str, Any]]:
-    """
-    Load previously saved WIP results (model_wips and match_results).
-
-    Args:
-        cache_path: Path to wip_{model_name}.json file
-
-    Returns:
-        Dict with "model_wips" and "match_results" or None if not found
-    """
-    if not os.path.exists(cache_path):
-        return None
-
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Extract model_wips and match_results from saved file
-        model_wips = {}
-        match_results = {}
-
-        for sample_id, sample_data in data.items():
-            # Load model_wips except it's an empty list
-            if "model_wips" in sample_data and sample_data["model_wips"]:
-                model_wips[sample_id] = sample_data["model_wips"]
-            # Load match_result only if it's not empty (empty dict means no matching was done)
-            if "match_result" in sample_data and sample_data["match_result"]:
-                match_results[sample_id] = sample_data["match_result"]
-
-        return {
-            "model_wips": model_wips,
-            "match_results": match_results,
-        }
-
-    except Exception as e:
-        logger.info(f"Failed to load WIP results cache: {e}")
-        return None
-
-
-def load_gt_wips_cache(cache_path: str) -> Optional[Dict[str, List[Dict]]]:
-    """
-    Load GT WIPs from cache file.
-
-    Args:
-        cache_path: Path to parquet cache file
-
-    Returns:
-        Dict of {sample_id: wips_list} or None if not found
-    """
-    if not os.path.exists(cache_path):
-        return None
-
-    try:
-        df = pd.read_parquet(cache_path)
-        result = {}
-        for _, row in df.iterrows():
-            sample_id = str(row["sample_id"])
-            wips = row["wips"]
-            if isinstance(wips, str):
-                wips = json.loads(wips)
-            if wips:
-                result[sample_id] = wips
-        logger.info(f"Loaded GT WIPs cache from {cache_path} ({len(result)} samples)")
-        return result
-    except Exception as e:
-        logger.info(f"Failed to load GT cache: {e}")
-        return None
-
-
-def save_gt_wips_cache(gt_wips: Dict[str, List[Dict]], cache_path: str):
-    """
-    Save GT WIPs to cache file.
-
-    Args:
-        gt_wips: Dict of {sample_id: wips_list}
-        cache_path: Path to save parquet file
-    """
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-
-    data = []
-    for sample_id, wips in gt_wips.items():
-        data.append({"sample_id": sample_id, "wips": json.dumps(wips, ensure_ascii=False)})
-
-    df = pd.DataFrame(data)
-    df.to_parquet(cache_path, index=False)
-    logger.info(f"Saved GT WIPs cache to {cache_path} ({len(gt_wips)} samples)")
-
-
-def _load_or_extract_gt_wips(
-    sample_ids: List[str],
-    references: Dict[str, str],
-    llm_client,
-    max_workers: int,
-    gt_cache_dir: Optional[str],
-    model_name: str,
-) -> Dict[str, List[Dict]]:
-    """Load GT WIPs from cache or extract if missing."""
-    gt_wips = None
-    if gt_cache_dir:
-        cache_path = get_gt_cache_path(gt_cache_dir, model_name)
-        full_gt_cache = load_gt_wips_cache(cache_path)
-
-        if full_gt_cache is not None:
-            gt_wips = {id: full_gt_cache[id] for id in sample_ids if id in full_gt_cache}
-
-            missing_ids = set(sample_ids) - set(gt_wips.keys())
-            if missing_ids:
-                logger.info(f"Missing {len(missing_ids)} samples in GT cache, extracting...")
-                missing_refs = {id: references[id] for id in missing_ids}
-                new_gt_wips, gt_errors = extract_wips_batch(
-                    missing_refs, llm_client, max_workers, "Extracting GT WIPs"
-                )
-                gt_wips.update(new_gt_wips)
-                full_gt_cache.update(new_gt_wips)
-                save_gt_wips_cache(full_gt_cache, cache_path)
-
-                if gt_errors:
-                    logger.info(f"GT extraction errors: {len(gt_errors)} samples")
-
-    if gt_wips is None:
-        logger.info("Extracting GT WIPs...")
-        gt_wips, gt_errors = extract_wips_batch(
-            references, llm_client, max_workers, "Extracting GT WIPs"
-        )
-
-        if gt_cache_dir:
-            cache_path = get_gt_cache_path(gt_cache_dir, model_name)
-            save_gt_wips_cache(gt_wips, cache_path)
-
-        if gt_errors:
-            logger.info(f"GT extraction errors: {len(gt_errors)} samples")
-
-    return gt_wips
-
-
-# Extract text after last と思 tag if present
 def extract_after_think(text: str) -> str:
     """Extract text after the last と思 tag"""
     if "と思" in text:
@@ -699,159 +600,38 @@ def extract_after_think(text: str) -> str:
     return text
 
 
-def _load_or_extract_model_wips(
-    sample_ids: List[str],
-    predictions: Dict[str, str],
-    gt_wips: Dict[str, List[Dict]],
-    llm_client,
-    max_workers: int,
-    save_dir: Optional[str],
-    model_name: str,
-) -> Dict[str, List[Dict]]:
-    """Load Model WIPs from cache or extract if missing (incremental)."""
-    model_wips = {}
-
-    if save_dir:
-        wip_cache_path = os.path.join(save_dir, f"wip_{model_name}.json")
-        cached_data = load_wip_results_cache(wip_cache_path)
-        if cached_data:
-            model_wips = cached_data.get("model_wips", {})
-            logger.info(f"Loaded {len(model_wips)} cached model_wips")
-
-    missing_model_ids = set(sample_ids) - set(model_wips.keys())
-    missing_model_ids = {id for id in missing_model_ids if id in gt_wips}
-
-    if missing_model_ids:
-        logger.info(f"Extracting Model WIPs for {len(missing_model_ids)} missing samples...")
-        missing_predictions = {id: extract_after_think(predictions[id]) for id in missing_model_ids}
-        new_model_wips, model_errors = extract_wips_batch(
-            missing_predictions, llm_client, max_workers, "Extracting Model WIPs"
-        )
-        model_wips.update(new_model_wips)
-
-        if model_errors:
-            logger.info(f"Model extraction errors: {len(model_errors)} samples")
-    else:
-        logger.info(f"All {len(sample_ids)} samples already have Model WIPs (from cache)")
-
-    return model_wips
-
-
-def _load_or_match_wips(
-    sample_ids: List[str],
-    gt_wips: Dict[str, List[Dict]],
-    model_wips: Dict[str, List[Dict]],
-    llm_client,
-    max_workers: int,
-    save_dir: Optional[str],
-    model_name: str,
-) -> Dict[str, Dict]:
-    """Load match results from cache or match if missing (incremental)."""
-    match_results = {}
-
-    if save_dir:
-        wip_cache_path = os.path.join(save_dir, f"wip_{model_name}.json")
-        cached_data = load_wip_results_cache(wip_cache_path)
-        if cached_data:
-            match_results = cached_data.get("match_results", {})
-            logger.info(f"Loaded {len(match_results)} cached match_results")
-
-    missing_match_ids = set(sample_ids) - set(match_results.keys())
-    # Only match if both gt_wips and model_wips exist and are non-empty
-    missing_match_ids = {
-        id
-        for id in missing_match_ids
-        if id in gt_wips and id in model_wips and gt_wips[id] and model_wips[id]
-    }
-
-    if missing_match_ids:
-        logger.info(f"Matching WIPs for {len(missing_match_ids)} missing samples...")
-        missing_gt_wips = {id: gt_wips[id] for id in missing_match_ids}
-        missing_model_wips = {id: model_wips[id] for id in missing_match_ids}
-        new_match_results, match_errors = match_wips_batch(
-            missing_gt_wips, missing_model_wips, llm_client, max_workers
-        )
-        match_results.update(new_match_results)
-
-        if match_errors:
-            logger.info(f"Matching errors: {len(match_errors)} samples")
-    else:
-        logger.info(f"All {len(sample_ids)} samples already have match results (from cache)")
-
-    return match_results
-
-
-def _compute_bertscore_incremental(
-    sample_ids: List[str],
-    match_results: Dict[str, Dict],
-    bertscore_model: str,
-    bertscore_num_layers: int,
+def _compute_bertscore(
+    match_results: Dict[str, Dict], bertscore_model: str, bertscore_num_layers: int
 ) -> None:
-    """Compute BERTScore for matches that don't have it yet (incremental, in-place update)."""
+    """Compute match quality from the current run's matched pairs."""
+    matches = [match for result in match_results.values() for match in result["matches"]]
+    if not matches:
+        return
+
     import torch
     from bert_score import BERTScorer
 
-    logger.info("Computing BERTScore for matched pairs...")
+    scorer = BERTScorer(
+        model_type=bertscore_model,
+        num_layers=bertscore_num_layers,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        lang="zh",
+        rescale_with_baseline=False,
+    )
+    _, _, f1 = scorer.score(
+        [match["model_wip"]["info_point"] for match in matches],
+        [match["gt_wip"]["info_point"] for match in matches],
+    )
+    for match, score in zip(matches, f1.tolist(), strict=True):
+        if not 0 <= score <= 1 and not math.isclose(score, 1.0, abs_tol=1e-6):
+            raise EvaluationError(f"Invalid WIP match quality: {score!r}")
+        match["match_quality"] = min(score, 1.0)
 
-    all_gt_texts = []
-    all_model_texts = []
-    sample_match_indices = []
 
-    for sample_id in sample_ids:
-        if sample_id in match_results:
-            matches = match_results[sample_id].get("matches", [])
-            for match_idx, match in enumerate(matches):
-                if match.get("match_quality") is not None:
-                    continue
-
-                gt_wip = match.get("gt_wip")
-                model_wip = match.get("model_wip")
-
-                # Skip if either wip is None or not a dict
-                if (
-                    not gt_wip
-                    or not isinstance(gt_wip, dict)
-                    or not model_wip
-                    or not isinstance(model_wip, dict)
-                ):
-                    continue
-
-                gt_text = gt_wip.get("info_point", "")
-                model_text = model_wip.get("info_point", "")
-
-                if gt_text and model_text:
-                    batch_idx = len(all_gt_texts)
-                    all_gt_texts.append(gt_text)
-                    all_model_texts.append(model_text)
-                    sample_match_indices.append((sample_id, match_idx, batch_idx))
-
-    if all_gt_texts and all_model_texts:
-        logger.info(f"Computing BERTScore for {len(all_gt_texts)} new matched pairs...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        scorer = BERTScorer(
-            model_type=bertscore_model,
-            num_layers=bertscore_num_layers,
-            device=device,
-            lang="zh",
-            rescale_with_baseline=False,
-        )
-
-        try:
-            P, R, F1 = scorer.score(all_model_texts, all_gt_texts)
-            match_qualities = F1.tolist()
-
-            for sample_id, match_idx, batch_idx in sample_match_indices:
-                match_results[sample_id]["matches"][match_idx]["match_quality"] = match_qualities[
-                    batch_idx
-                ]
-
-            logger.info(f"Computed BERTScore for {len(match_qualities)} matched pairs")
-        except Exception as e:
-            logger.info(f"BERTScore computation failed: {e}")
-            for sample_id, match_idx, _ in sample_match_indices:
-                match_results[sample_id]["matches"][match_idx]["match_quality"] = None
-    else:
-        logger.info("All matches already have BERTScore (from cache)")
+def _check_wip_errors(stage: str, errors: Dict[str, str]) -> None:
+    if errors:
+        sample_id, reason = next(iter(errors.items()))
+        raise EvaluationError(f"{stage} failed for {len(errors)} sample(s); {sample_id}: {reason}")
 
 
 def evaluate_wip(
@@ -860,7 +640,6 @@ def evaluate_wip(
     llm_client,
     max_workers: int = 5,
     max_samples: Optional[int] = None,
-    gt_cache_dir: Optional[str] = None,
     model_name: str = "unknown",
     save_dir: Optional[str] = None,
     bertscore_model: str = "bert-base-chinese",
@@ -881,7 +660,6 @@ def evaluate_wip(
         llm_client: LLM client instance for judge (with built-in retry mechanism)
         max_workers: Number of concurrent workers
         max_samples: Maximum samples to evaluate (None for all)
-        gt_cache_dir: Directory for GT WIPs cache
         model_name: Model name for cache file naming
         save_dir: Directory to save results
         bertscore_model: BERT model for computing match quality
@@ -906,23 +684,38 @@ def evaluate_wip(
     selected_predictions = {id: predictions[id] for id in sample_ids}
     selected_references = {id: references[id] for id in sample_ids}
 
-    # Step 1: Load/Extract GT WIPs
-    gt_wips = _load_or_extract_gt_wips(
-        sample_ids, selected_references, llm_client, max_workers, gt_cache_dir, model_name
+    # Reference and prediction WIPs must both come from the current run.
+    # The old Parquet and JSON files were indexed by sample ID alone.
+    gt_wips, errors = extract_wips_batch(
+        selected_references, llm_client, max_workers, "Extracting GT WIPs"
     )
+    _check_wip_errors("Reference WIP extraction", errors)
+    if missing_references := [sample_id for sample_id, wips in gt_wips.items() if not wips]:
+        raise EvaluationError(
+            f"Reference WIP extraction returned no points for {missing_references[0]}"
+        )
 
-    # Step 2: Load/Extract Model WIPs (incremental)
-    model_wips = _load_or_extract_model_wips(
-        sample_ids, selected_predictions, gt_wips, llm_client, max_workers, save_dir, model_name
+    model_wips, errors = extract_wips_batch(
+        {key: extract_after_think(value) for key, value in selected_predictions.items()},
+        llm_client,
+        max_workers,
+        "Extracting Model WIPs",
     )
+    _check_wip_errors("Prediction WIP extraction", errors)
 
-    # Step 3: Load/Match WIPs (incremental)
-    match_results = _load_or_match_wips(
-        sample_ids, gt_wips, model_wips, llm_client, max_workers, save_dir, model_name
-    )
+    match_results, errors = match_wips_batch(gt_wips, model_wips, llm_client, max_workers)
+    _check_wip_errors("WIP matching", errors)
+    for sample_id, wips in model_wips.items():
+        if not wips:
+            match_results[sample_id] = {
+                "matches": [],
+                "unmatched_model_wips": [],
+                "unmatched_gt_wips": gt_wips[sample_id],
+            }
 
-    # Step 3.5: Compute BERTScore (incremental)
-    _compute_bertscore_incremental(sample_ids, match_results, bertscore_model, bertscore_num_layers)
+    if not match_results:
+        raise EvaluationError("WIP Judge produced zero valid scores")
+    _compute_bertscore(match_results, bertscore_model, bertscore_num_layers)
 
     # Step 4: Calculate three types of metrics (each with overall, core, and per-sample)
     logger.info("Computing all metrics (unweighted, importance-weighted, double-weighted)...")

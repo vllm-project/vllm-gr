@@ -83,6 +83,15 @@ Issues = "https://github.com/JiusiServe/vllm-gr/issues"
 [project.entry-points."vllm.general_plugins"]
 vllm_gr = "vllm_gr.plugin:register"
 
+[project.entry-points."vllm_gr.platform_backends"]
+cuda = "vllm_gr.platforms.cuda.provider:CUDA_BACKEND"
+ascend = "vllm_gr.platforms.ascend.provider:NPU_BACKEND"
+
+# Historical v1 entry points identify tensor placement instead of the provider.
+[project.entry-points."vllm_gr.legacy_placements"]
+cuda = "vllm_gr.platforms.cuda.provider:CUDA_BACKEND"
+npu = "vllm_gr.platforms.ascend.provider:NPU_BACKEND"
+
 [project.scripts]
 vllm-gr-sidecar = "vllm_gr.sidecar.__main__:main"
 
@@ -92,6 +101,7 @@ include = ["vllm_gr*"]
 
 [tool.setuptools.package-data]
 "vllm_gr" = ["_version.py", "*.json"]
+"vllm_gr.config" = ["default_config.yaml"]
 "vllm_gr.entrypoints.grpc" = ["proto/*.proto"]
 "vllm_gr.entrypoints.grpc.generated" = ["README.md"]
 
@@ -102,7 +112,7 @@ include = ["vllm_gr*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v"
+addopts = "-v --strict-markers --strict-config"
 # Default guard; the long system tests carry their own @pytest.mark.timeout.
 timeout = 250
 # Mirrors the upstream vLLM convention: markers describe which execution
@@ -116,6 +126,13 @@ markers = [
     "npu_test: mark test as requiring an Ascend NPU runtime",
     "model_test: mark test as requiring model weights",
     "network: mark test as requiring network access",
+    # Also registered by tests/level_plugin.py. Listed here so entry points that
+    # skip tests/conftest.py (--confcutdir) still pass --strict-markers.
+    "l1: vllm-gr L1 CI test level",
+    "l2: vllm-gr L2 CI test level",
+    "l3: vllm-gr L3 CI test level",
+    "l4: vllm-gr L4 CI test level",
+    "l5: vllm-gr L5 CI test level",
 ]
 
 [tool.ruff]
@@ -124,7 +141,14 @@ line-length = 100
 target-version = "py311"
 
 [tool.mypy]
-strict = true
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+check_untyped_defs = true
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = "vllm_gr.entrypoints.grpc.generated.*"
+follow_imports = "skip"
 
 [tool.typos.default.extend-identifiers]
 image_grid_thw = "image_grid_thw"

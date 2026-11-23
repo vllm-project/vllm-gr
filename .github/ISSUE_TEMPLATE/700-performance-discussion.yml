@@ -19,7 +19,8 @@ body:
   attributes:
     label: Report of performance regression
     description: >
-      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark scripts. See https://github.com/JiusiServe/vllm-gr/blob/main/docs/benchmarks/README.md
+      Describe the performance comparison used to confirm the regression.
+      For reproducible workloads, see https://github.com/JiusiServe/vllm-gr/blob/main/docs/benchmarking/README.md
   validations:
     required: false
 - type: textarea
@@ -33,12 +34,9 @@ body:
   attributes:
     label: Your current environment (if you think it is necessary)
     description: |
-      Run the `collect_env.py` script from the repository root and paste its output below.
-      ```sh
-      # For security purposes, please feel free to check the contents of collect_env.py before running it.
-      python collect_env.py
-      ```
-      It is suggested to download and execute the latest script, as vllm-gr might frequently update the diagnosis information needed for accurately and quickly responding to issues.
+      Run `python collect_env.py` in the affected Python environment and paste the output below.
+      If you installed from a wheel, [download collect_env.py](https://github.com/JiusiServe/vllm-gr/raw/refs/heads/main/collect_env.py) first.
+      Review the script before running it and the output before sharing it.
     value: |
       ```text
       The output of `python collect_env.py`

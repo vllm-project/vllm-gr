@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Real video accuracy for beam_search_v1, using the system benchmark evaluator.
+"""Real video accuracy for beam_search, using the system benchmark evaluator.
 
 Run as a module in a fresh process. The runner flag selects ModelRunner;
 both runners use the same public Beam V1 protocol and CUDA constraint table.
@@ -42,11 +42,7 @@ def run(args: argparse.Namespace) -> int:
         VLLM_USE_V2_MODEL_RUNNER=str(int(args.runner == "v2")),
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
-        VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
-        VLLM_GR_PREFILL_GRAPH_KV_BOUND="8192",
     )
-    os.environ.pop("VLLM_GR_PREFILL_GRAPH_BUCKET_STEP", None)
-    os.environ.pop("VLLM_GR_PREFILL_GRAPH_MAX_BUCKET", None)
 
     from transformers import AutoTokenizer
 
@@ -54,12 +50,12 @@ def run(args: argparse.Namespace) -> int:
         TASK_REGISTRY,
         DataLoaderWrapper,
     )
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
-        build_artifact,
-        load_triples,
-    )
     from tests.st.model_runner_policy_isolation import check_idle, startup_expectations
     from tests.st.multibatch_accuracy_checks import compare_output, validate_output
+    from vllm_gr.constraints.artifact_builder import (
+        build_single_trie_artifact,
+        load_triples,
+    )
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
 
@@ -136,8 +132,6 @@ def run(args: argparse.Namespace) -> int:
             "VLLM_USE_V2_MODEL_RUNNER",
             "VLLM_ENABLE_V1_MULTIPROCESSING",
             "VLLM_WORKER_MULTIPROC_METHOD",
-            "VLLM_ENABLE_PREFILL_CUDAGRAPH",
-            "VLLM_GR_PREFILL_GRAPH_KV_BOUND",
         )
     }
     result["packages"] = {
@@ -175,7 +169,7 @@ def run(args: argparse.Namespace) -> int:
         assert artifact_info["file"] == fingerprint(artifact)
     else:
         print("Compiling full real catalog constraint artifact", flush=True)
-        digest, tokenizer_digest = build_artifact(model, triples, artifact)
+        digest, tokenizer_digest = build_single_trie_artifact(model, triples, artifact)
         artifact_info = {
             "inputs": artifact_inputs,
             "file": fingerprint(artifact),
@@ -186,24 +180,23 @@ def run(args: argparse.Namespace) -> int:
     legal = {tuple(tokenizer.convert_tokens_to_ids(row)) for row in load_triples(triples)}
     result["catalog_legal_triples"] = len(legal)
     config = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": True,
-            "worker_decision": True,
-            "max_width": 128,
-            "max_decode_steps": 3,
-        },
+        "prefill_kv_bound": 8192,
+        "beam_graph_enabled": True,
+        "worker_decision": True,
+        "beam_width": [128] * 3,
+        "max_decode_steps": 3,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "max_top_k": 128,
             "path": str(artifact),
             "format": "constraint_table_v1",
-            "artifact_digest": artifact_info["artifact_digest"],
-            "tokenizer_digest": artifact_info["tokenizer_digest"],
+            "digests": {
+                "artifact": artifact_info["artifact_digest"],
+                "tokenizer": artifact_info["tokenizer_digest"],
+            },
         },
+        "candidate_width": [128] * 3,
     }
     kwargs: dict[str, Any] = {
         "model": str(model),
@@ -268,7 +261,7 @@ def run(args: argparse.Namespace) -> int:
     result["thresholds"] = thresholds
     persist()
     engine_start = time.perf_counter()
-    llm = GRLLM(**kwargs, vllm_gr_config=config)
+    llm = GRLLM(**kwargs, attention_config={"backend": "CUSTOM"}, gr=config)
     result["startup_seconds"] = time.perf_counter() - engine_start
     begin, end = tokenizer.convert_tokens_to_ids(["<|sid_begin|>", "<|sid_end|>"])
     addresses = None
@@ -300,7 +293,7 @@ def run(args: argparse.Namespace) -> int:
             persist()
             for offset in range(0, len(samples), b):
                 tick = time.perf_counter()
-                outputs = llm.beam_search_v1(
+                outputs = llm.beam_search(
                     [{"prompt": s["prompt"]} for s in samples[offset : offset + b]],
                     params,
                     use_tqdm=False,

@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """vLLM-compatible logger helpers for vllm-gr."""
 
+from typing import TYPE_CHECKING
+
 from vllm.logger import init_logger as _init_vllm_logger
 
+if TYPE_CHECKING:
+    from vllm.logger import _VllmLogger
 
-def init_logger(name: str):
+
+def init_logger(name: str) -> "_VllmLogger":
     """Attach vllm-gr loggers under the `vllm` namespace.
 
     vLLM only configures the `vllm` logger tree by default. Mapping local

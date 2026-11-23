@@ -33,6 +33,7 @@ from typing import Any, ClassVar
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
@@ -127,7 +128,7 @@ class CudaStageHooksV2(CudaStageHooks):
         enabled = (
             not worker.model_config.enforce_eager
             and cfg.beam_graph_enabled
-            and batch_size in cfg.beam_online_batch_sizes
+            and batch_size in cfg.deployment.beam_batch_sizes
             and not runtime.capture_failed
             and batch_size not in (runtime.startup_failures or {})
         )
@@ -238,7 +239,7 @@ class CudaStageHooksV2(CudaStageHooks):
         # force a device->host sync right after the Prefill forward — the
         # sampler's own indexing is the authoritative contract and needs none.
         batch = state.input_batch
-        stages = getattr(scheduler_output, "gr_stage_metadata", None)
+        stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
         if not stages or len(stages) != 1:
             raise ValueError("GR Prefill requires one logical batch's metadata")
         request_ids = next(iter(stages.values())).request_ids
@@ -317,7 +318,7 @@ def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -
 
     cfg = _get_gr_config(worker)
     requested = not worker.model_config.enforce_eager and cfg.beam_graph_enabled
-    if requested and batch_size not in cfg.beam_online_batch_sizes:
+    if requested and batch_size not in cfg.deployment.beam_batch_sizes:
         if graph is not None:
             raise RuntimeError("Unconfigured Decode shape has a published graph")
         return False

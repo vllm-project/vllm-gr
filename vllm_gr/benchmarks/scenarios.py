@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-"""Scenario registry for ``vllm bench --gr``.
-
-The benchmark implementations still live under the repository-level
-``benchmarks/`` and ``tools/AB_Tests`` trees.  Keeping the mapping in one place
-lets the CLI converge on a single entry point before the implementations are
-moved into the installed package.
-"""
+"""Scenario registry for ``vllm bench --gr`` workloads in the source checkout."""
 
 from __future__ import annotations
 
@@ -39,17 +33,17 @@ SCENARIOS: dict[str, BenchScenario] = {
     "beam-performance": BenchScenario(
         "beam-performance",
         "Beam V1 performance gate (prepare/offline/online)",
-        module="benchmarks.beam_search.v1_performance_gate",
+        module="benchmarks.beam_search.measure_latency",
     ),
     "beam-performance-ab": BenchScenario(
         "beam-performance-ab",
         "Compare recorded base and PR result directories and write a report",
-        module="benchmarks.beam_search.v1_performance_ab",
+        module="benchmarks.beam_search.compare_latency_ab",
     ),
     "beam-recall": BenchScenario(
         "beam-recall",
         "Beam V1 recall gate",
-        module="benchmarks.beam_search.v1_recall_gate",
+        module="benchmarks.beam_search.measure_onerec_recall",
     ),
     "qwen-v1": BenchScenario(
         "qwen-v1",
@@ -58,8 +52,8 @@ SCENARIOS: dict[str, BenchScenario] = {
     ),
     "ab-offline": BenchScenario(
         "ab-offline",
-        "Offline A/B engine benchmark",
-        path=Path("tools") / "AB_Tests" / "run_offline_benchmark.py",
+        "Offline OneRec cold/warm latency benchmark",
+        module="benchmarks.open_one_rec.offline_ab",
     ),
 }
 
@@ -69,11 +63,7 @@ def scenario_names() -> tuple[str, ...]:
 
 
 def run_scenario(name: str, argv: list[str]) -> None:
-    """Run an existing benchmark entrypoint with ``argv``.
-
-    This is deliberately a dispatcher: each scenario keeps its own parser and
-    result format until its implementation moves into the installed package.
-    """
+    """Dispatch to the workload's own argument parser and result format."""
 
     scenario = SCENARIOS[name]
     # Accept the old nested spelling as well as the documented shorter form.

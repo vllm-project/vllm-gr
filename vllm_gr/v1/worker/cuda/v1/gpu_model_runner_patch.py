@@ -4,23 +4,24 @@
 
 from __future__ import annotations
 
+import sys
 from functools import wraps
 
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.attention.backends.beam_dense_prefill import (
-    requires_fresh_prefill_replay,
-)
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
 )
+from vllm_gr.v1.worker.cuda.runner_installer import V1_RUNNER
 from vllm_gr.v1.worker.cuda.v1.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 from vllm_gr.v1.worker.gr_context import (
     _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
     _create_beam_context,
+    _get_gr_config,
 )
 
 # Shared context helpers and installation contracts have independent owners.
@@ -29,6 +30,7 @@ from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
+    is_worker_runner_patched,
 )
 from vllm_gr.v1.worker.prefill_graph_common import scheduled_requests_are_fresh
 from vllm_gr.v1.worker.prefill_graph_runner import (
@@ -243,7 +245,7 @@ def _capture_create_dummy_context(
     """
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 
-    from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+    from vllm_gr.v1.beam.session import BeamSearchSession
 
     context = _create_beam_context(runner, gr_cfg, max_batch=1)
     slot = context.registry.allocate(_BEAM_DUMMY_REQ_ID, beam_width=width, prefix_len=prefix_len)
@@ -313,7 +315,7 @@ def _dummy_beam_forward(
     from vllm.forward_context import set_forward_context
     from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
-    from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+    from vllm_gr.v1.beam import BEAM_DATA_VAR
 
     # 1. Refresh the per-step device buffer (same as runtime path).
     context.decode_step_buf.fill_(0)
@@ -405,7 +407,11 @@ def capture_beam_decode_graph(runner) -> bool:
     )
 
     gr_cfg = _get_gr_config(runner)
-    if not gr_cfg.beam_graph_active or runner.model_config.enforce_eager:
+    if (
+        not gr_cfg.beam_graph_active
+        or runner.model_config.enforce_eager
+        or 1 not in gr_cfg.deployment.beam_batch_sizes
+    ):
         return False
 
     # ── TP / DP ubatching guard ─────────────────────────────────
@@ -520,7 +526,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
     @wraps(_orig_model_forward)
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
         scheduler_output = getattr(self, "_current_scheduler_output", None)
-        gr_stages = getattr(scheduler_output, "gr_stage_metadata", None)
+        gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
         batch_view = None
         if gr_stages:
             # Decode uses its independent startup graph. A Batch Session has
@@ -548,18 +554,18 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                 return _orig_model_forward(
                     self, input_ids=input_ids, positions=positions, *args, **kwargs
                 )
-            if is_prefill_graph_enabled() and not hasattr(self, "_prefill_graph_runner"):
+            if is_prefill_graph_enabled(self) and not hasattr(self, "_prefill_graph_runner"):
                 logger.debug("Prefill CUDA graph fallback: runner_not_initialized")
                 return _orig_model_forward(
                     self, input_ids=input_ids, positions=positions, *args, **kwargs
                 )
         if scheduler_output is not None:
             if (
-                is_prefill_graph_enabled()
+                is_prefill_graph_enabled(self)
                 and is_prefill_phase_batch(self, scheduler_output)
                 # Dense-Prefill graphs replay only for fresh prompts.
                 and (
-                    not requires_fresh_prefill_replay()
+                    _get_gr_config(self).deployment.dense_prefill == "off"
                     or scheduled_requests_are_fresh(self, scheduler_output)
                 )
             ):
@@ -678,7 +684,7 @@ def capture_prefill_graphs(runner) -> None:
     only when the prefill graph env gate is enabled. Only explicitly
     recoverable capture failures fall back to eager prefill.
     """
-    if not is_prefill_graph_enabled():
+    if not is_prefill_graph_enabled(runner):
         return
     if getattr(runner, "_prefill_graphs_captured", False):
         return
@@ -707,3 +713,27 @@ def capture_prefill_graphs(runner) -> None:
 
 
 make_patched_model_forward = make_patched_model_forward_gpu
+
+
+def is_patched(runner_class: type) -> bool:
+    from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle
+
+    return is_worker_runner_patched(runner_class) and has_runner_lifecycle(runner_class, V1_RUNNER)
+
+
+def install() -> None:
+    """Install CUDA Worker utilities and the V1 native runner wrappers."""
+    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+        make_load_model_with_beam_postprocess_workspace,
+    )
+    from vllm_gr.v1.worker.cuda.runner_installer import install_worker_hooks
+    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+    from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
+
+    install_worker_hooks()
+    install_v1_worker_hooks(
+        sys.modules[__name__],
+        cuda_hooks_type=CudaStageHooksV1,
+        workspace_load_patcher=make_load_model_with_beam_postprocess_workspace,
+        implementation_id=V1_RUNNER,
+    )

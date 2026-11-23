@@ -7,11 +7,11 @@ from typing import Any
 
 import torch
 
-from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
     build_async_batch_layout,
 )
+from vllm_gr.v1.beam.dispatch import GRStageMetadata
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.engine.beam_search_v1 import GRStageMetadata
 
 ERROR_DISPATCH_STATE = 6
 
