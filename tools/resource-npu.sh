@@ -64,7 +64,8 @@ function is_available_npu() {
 # Prints the logical NPU device ids to consider, one per line. Honors
 # ASCEND_RT_VISIBLE_DEVICES (a comma-separated list of logical device ids, the
 # same ids get_npu returns) so selection stays inside the devices the CANN
-# runtime can see. Falls back to all ids when unset/empty.
+# runtime can see. Uses all ids only when unset; an explicitly empty value
+# exposes no devices.
 function _npu_device_indices() {
     local total=$1
     if ! [[ -v ASCEND_RT_VISIBLE_DEVICES ]]; then
@@ -189,11 +190,11 @@ function get_npus() {
 # This is a STUB implementation. It starts a background sleep process and
 # returns its PID.
 # WARNING: This does NOT reserve the NPU in a way that is visible to `npu-smi`.
-# The `is_available_npu` function, which checks for running processes via
-# `npu-smi`, will NOT see this lock. Therefore, this locking mechanism is
-# NOT effective for preventing race conditions between scripts using `get_npu`.
-# A robust solution would require a program that allocates NPU resources
-# (e.g., memory) to make it appear "in-use" to `npu-smi`.
+# The `is_available_npu` function queries HBM capacity and usage via
+# `npu-smi`. A background sleep does not affect that query or provide
+# per-device mutual exclusion. This stub does NOT prevent race conditions
+# between scripts using `get_npu`; allocating a small amount of memory alone
+# would not guarantee exclusive device selection.
 function lock_npu() {
     local npu_id=$1
     local pid=0
