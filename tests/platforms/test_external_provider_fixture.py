@@ -287,7 +287,9 @@ pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.l1  # type: ignore[misc]
-@pytest.mark.parametrize("plan_version,with_layers", [(1, False), (2, False), (2, True)])  # type: ignore[misc]
+@pytest.mark.parametrize(
+    "plan_version,with_layers", [(1, False), (2, False), (3, False), (3, True)]
+)  # type: ignore[misc]
 def test_installed_provider_plan_round_trip_and_factory_binding(
     tmp_path: Path, plan_version: int, with_layers: bool
 ) -> None:
@@ -330,6 +332,7 @@ class PlannedProvider(HostOnlyProvider):
 
     def resolve(self, request):
         fields = request.config.to_dict()
+        assert "admin_port" not in fields["deployment"]
         if self.plan_api_version == 1:
             table = fields["constraint_table"]
         else:
@@ -367,7 +370,7 @@ BACKEND = PlannedProvider()
         backend_id="host_only",
         source=source.replace("PLAN_VERSION", str(plan_version)),
     )
-    if plan_version == 1:
+    if plan_version < 3:
         result = _run(
             """
 from vllm_gr.platforms import loader
@@ -375,8 +378,8 @@ from vllm_gr.platforms.errors import InvalidBackendProviderError
 try:
     loader.activate_current_backend()
 except InvalidBackendProviderError as exc:
-    assert "plan_api_version=1" in str(exc), exc
-    assert "supported=2" in str(exc), exc
+    assert "plan_api_version=" in str(exc), exc
+    assert "supported=3" in str(exc), exc
 else:
     raise AssertionError("plan API v1 provider was registered")
 """,
@@ -509,7 +512,7 @@ class Hooks:
         install_runner_lifecycle(HostRunner, __name__, prepare="prepare_inputs")
 
 class RunnerProvider(HostOnlyProvider):
-    plan_api_version = 2
+    plan_api_version = 3
     adapter_revision = "host-v1"
 
     def get_model_runner_hooks(self):

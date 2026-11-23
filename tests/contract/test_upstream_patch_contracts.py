@@ -158,11 +158,22 @@ def test_scheduler_contracts() -> None:
 
 
 def test_engine_args_descriptor_contracts() -> None:
-    from vllm.engine.arg_utils import EngineArgs
+    from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 
-    from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+    from vllm_gr.engine.arg_utils import (
+        create_engine_config,
+        patch_create_engine_config,
+    )
 
-    patch_add_cli_args()
+    patch_create_engine_config()
+    assert EngineArgs.create_engine_config is create_engine_config
+    for method in (
+        EngineArgs.__init__,
+        AsyncEngineArgs.__init__,
+        EngineArgs.add_cli_args,
+        EngineArgs.from_cli_args,
+    ):
+        assert method.__module__ == "vllm.engine.arg_utils"
     assert isinstance(inspect.getattr_static(EngineArgs, "add_cli_args"), staticmethod)
     assert EngineArgs.add_cli_args is object.__new__(EngineArgs).add_cli_args
     assert isinstance(inspect.getattr_static(EngineArgs, "from_cli_args"), classmethod)

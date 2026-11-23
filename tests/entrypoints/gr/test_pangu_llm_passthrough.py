@@ -85,9 +85,8 @@ class TestPanguGrllmPassthrough(unittest.TestCase):
 
         assert len(calls) == 1
         kwargs = calls[0]
-        assert kwargs.pop("_gr_mode") is True
-        assert "model" in kwargs.pop("_gr_explicit_native_fields")
-        assert kwargs == {"model": "/fake/pangu"}
+        assert kwargs["model"] == "/fake/pangu"
+        assert "vllm_gr" in kwargs["additional_config"]
 
 
 class TestPanguPluginInitializeRuntime(unittest.TestCase):

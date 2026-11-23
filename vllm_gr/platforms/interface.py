@@ -181,7 +181,7 @@ class GRBackendProvider(Protocol):
 
 
 class GRPlanningProvider(GRBackendProvider, Protocol):
-    """Explicit planning extension version 1 to provider API version 2.
+    """Planning extension for provider API version 2.
 
     Providers without plan_api_version keep the narrow API-v2 delegation path.
     New factories receive an immutable engine plan, never provider.current_plan.

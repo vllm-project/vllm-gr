@@ -8,7 +8,8 @@ from typing import Any
 
 import pytest
 
-from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
+from tests.helpers.gr_config import worker_config
+from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, GRConfig
 from vllm_gr.platforms.ascend import provider as npu
 from vllm_gr.platforms.cuda import CUDA_BACKEND
 from vllm_gr.v1.worker import model_runner_patch
@@ -363,7 +364,7 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     events: list[str] = []
 
     class Runner:
-        _vllm_gr_config = SimpleNamespace(beam_max_width=mode)
+        vllm_config = worker_config(GRConfig(beam_max_width=mode))
 
         def execute_model(self, *args: Any) -> None:
             pass
@@ -394,9 +395,11 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     monkeypatch.setattr(
         gr_startup,
         "capture_async_forward",
-        lambda _, *, hooks_type: events.append("stages")
-        if hooks_type is None
-        else pytest.fail("NPU received CUDA hooks"),
+        lambda _, *, hooks_type: (
+            events.append("stages")
+            if hooks_type is None
+            else pytest.fail("NPU received CUDA hooks")
+        ),
     )
     monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
 

@@ -13,8 +13,8 @@ import torch
 
 from tests.constraints.test_table import make_table
 from tests.helpers.beam_requests import make_batch_request
-from tests.helpers.gr_config import engine_config, table_constraint
-from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
+from tests.helpers.gr_config import engine_config, table_constraint, worker_config
+from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, GRConfig
 from vllm_gr.config.models import DEFAULT_DEPLOYMENT
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
@@ -209,20 +209,19 @@ def admission_worker(
             get_num_layers=lambda _: len(layers),
         ),
         supports_mm_inputs=False,
-        vllm_config=SimpleNamespace(
-            additional_config={
-                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
-            },
-            scheduler_config=SimpleNamespace(async_scheduling=True),
-        ),
         cache_config=SimpleNamespace(cache_dtype="auto", sliding_window=None),
-        _vllm_gr_config=SimpleNamespace(
-            deployment=DEFAULT_DEPLOYMENT,
-            beam_max_width=4,
-            beam_max_decode_steps=3,
-            enable_short_suffix_attention=False,
-            beam_candidate_width=None,
-            constraint=table_constraint(),
+        vllm_config=worker_config(
+            GRConfig(
+                deployment=DEFAULT_DEPLOYMENT,
+                beam_max_width=4,
+                beam_max_decode_steps=3,
+                enable_short_suffix_attention=False,
+                beam_candidate_width=None,
+                constraint=table_constraint(),
+            ),
+            SimpleNamespace(
+                scheduler_config=SimpleNamespace(async_scheduling=True),
+            ),
         ),
         constraint_backend=VersionedConstraintTable(backend, loader=lambda _: backend),
         kv_cache_config=SimpleNamespace(

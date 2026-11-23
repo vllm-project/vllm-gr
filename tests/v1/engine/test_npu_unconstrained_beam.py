@@ -15,7 +15,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
-from tests.helpers.gr_config import table_constraint
+from tests.helpers.gr_config import table_constraint, worker_config
 from vllm_gr.config import ConstraintConfig, ConstraintMode, GRConfig
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
@@ -242,8 +242,8 @@ def _prefill_runner(batch_size: int, constrained: bool) -> NPUEagerBeamStageRunn
         beam_params=SimpleNamespace(temperature=0.5), is_last_stage=False, output_device_state=None
     )
     worker = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(
-            constraint=table_constraint() if constrained else ConstraintConfig()
+        vllm_config=worker_config(
+            GRConfig(constraint=table_constraint() if constrained else ConstraintConfig())
         ),
         _current_scheduler_output=SimpleNamespace(
             gr_stage_metadata={execution.session_id: metadata}
@@ -317,13 +317,15 @@ def test_unconstrained_startup_selects_the_existing_npu_graph_adapter(
     worker = SimpleNamespace(
         device="npu",
         model_config=SimpleNamespace(enforce_eager=eager),
-        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=True)),
-        _vllm_gr_config=SimpleNamespace(
-            constraint=ConstraintConfig(mode=ConstraintMode.NONE),
-            beam_worker_decision=True,
-            beam_max_width=2,
-            beam_max_decode_steps=steps,
-            beam_graph_enabled=True,
+        vllm_config=worker_config(
+            GRConfig(
+                constraint=ConstraintConfig(mode=ConstraintMode.NONE),
+                beam_worker_decision=True,
+                beam_max_width=2,
+                beam_max_decode_steps=steps,
+                beam_graph_enabled=True,
+            ),
+            SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=True)),
         ),
     )
     assert _capture_enabled(worker) is expected

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.gr_config import worker_config
 from vllm_gr.config import GRConfig
 from vllm_gr.v1.beam.dispatch import GRStageKind
 from vllm_gr.v1.worker import gr_context as _gr_context
@@ -445,9 +446,9 @@ def test_patched_determine_pure_beam_batch_grants_full() -> None:
 
 
 def test_beam_graph_runtime_stats_reports_capture_and_dispatch_state() -> None:
-    config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
+    config = GRConfig(beam_graph_enabled=True, beam_max_width=128)
     runner = SimpleNamespace(
-        _vllm_gr_config=config,
+        vllm_config=worker_config(config),
         _beam_graph_keys={128},
         _beam_graph_full_dispatch_count=2,
     )

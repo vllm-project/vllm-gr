@@ -11,7 +11,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tests.helpers.gr_config import table_constraint
+from tests.helpers.gr_config import (
+    table_constraint,
+    update_worker_config,
+    worker_config,
+)
+from vllm_gr.config import GRConfig
 from vllm_gr.config.models import DEFAULT_DEPLOYMENT, DeploymentOptions
 from vllm_gr.v1.worker import gr_startup as startup
 from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
@@ -50,17 +55,19 @@ CaptureRuntime = tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace, Mock, 
 def capture_runtime(monkeypatch: pytest.MonkeyPatch) -> CaptureRuntime:
     worker = SimpleNamespace(
         device="cuda",
-        vllm_config=SimpleNamespace(
-            scheduler_config=SimpleNamespace(async_scheduling=True, max_num_seqs=1)
-        ),
         model_config=SimpleNamespace(enforce_eager=False),
-        _vllm_gr_config=SimpleNamespace(
-            deployment=DEFAULT_DEPLOYMENT,
-            beam_max_width=4,
-            beam_max_decode_steps=3,
-            beam_worker_decision=True,
-            beam_graph_enabled=True,
-            constraint=table_constraint(),
+        vllm_config=worker_config(
+            GRConfig(
+                deployment=DEFAULT_DEPLOYMENT,
+                beam_max_width=4,
+                beam_max_decode_steps=3,
+                beam_worker_decision=True,
+                beam_graph_enabled=True,
+                constraint=table_constraint(),
+            ),
+            SimpleNamespace(
+                scheduler_config=SimpleNamespace(async_scheduling=True, max_num_seqs=1)
+            ),
         ),
         _gr_async_decode_graph_capture_failed=False,
         _gr_async_decode_graph_capture_error=None,
@@ -146,8 +153,8 @@ def test_success_publishes_only_after_release_and_sync(
 def test_opt_in_startup_capture_uses_requested_rows(
     capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch, batch_size: int
 ) -> None:
-    capture_runtime[0]._vllm_gr_config.deployment = DeploymentOptions(
-        beam_batch_sizes=(batch_size,)
+    update_worker_config(
+        capture_runtime[0], deployment=DeploymentOptions(beam_batch_sizes=(batch_size,))
     )
     worker, owner, _graph, _stream, _health = capture_runtime
     worker.vllm_config.scheduler_config.max_num_seqs = batch_size
@@ -169,7 +176,7 @@ def test_cuda_startup_skips_batches_above_capacity(
     capture_runtime: CaptureRuntime, v2: bool
 ) -> None:
     worker, owner, *_ = capture_runtime
-    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(4,))
+    update_worker_config(worker, deployment=DeploymentOptions(beam_batch_sizes=(4,)))
     capture = (
         capture_multibatch_forward
         if v2
@@ -215,7 +222,7 @@ def test_default_capture_batch_list() -> None:
 @pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
 def test_single_step_skips_decode_capture(capture_runtime: CaptureRuntime, v2: bool) -> None:
     worker, owner, _graph, _stream, _health = capture_runtime
-    worker._vllm_gr_config.beam_max_decode_steps = 1
+    update_worker_config(worker, beam_max_decode_steps=1)
     entry = (
         capture_multibatch_forward
         if v2
@@ -393,9 +400,11 @@ def test_repeated_startup_rejects_different_hooks_without_recapture(
 def test_decode_graph_capture_failure_falls_back_only_when_recorded() -> None:
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
-        _vllm_gr_config=SimpleNamespace(
-            deployment=DEFAULT_DEPLOYMENT,
-            beam_graph_enabled=True,
+        vllm_config=worker_config(
+            GRConfig(
+                deployment=DEFAULT_DEPLOYMENT,
+                beam_graph_enabled=True,
+            )
         ),
         _gr_async_decode_graph_capture_failed=True,
     )
@@ -420,7 +429,7 @@ def test_startup_batch_plan_is_shared_by_both_runners(
     capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch, v2: bool
 ) -> None:
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0" if v2 else "1")
-    capture_runtime[0]._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(2, 4))
+    update_worker_config(capture_runtime[0], deployment=DeploymentOptions(beam_batch_sizes=(2, 4)))
     worker = capture_runtime[0]
     worker.vllm_config.scheduler_config.max_num_seqs = 4
     capture = Mock(return_value=None)
@@ -445,9 +454,11 @@ def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
     graph.capture = Mock(side_effect=lambda *args, **kwargs: setattr(graph, "ready", True))
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
-        _vllm_gr_config=SimpleNamespace(
-            deployment=DEFAULT_DEPLOYMENT,
-            beam_graph_enabled=True,
+        vllm_config=worker_config(
+            GRConfig(
+                deployment=DEFAULT_DEPLOYMENT,
+                beam_graph_enabled=True,
+            )
         ),
         model=SimpleNamespace(compute_logits=Mock(return_value="logits")),
     )
@@ -486,7 +497,7 @@ def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
 def test_eager_decode_keeps_forward_entry_and_slices_before_logits(v2: bool) -> None:
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=True),
-        _vllm_gr_config=SimpleNamespace(deployment=DEFAULT_DEPLOYMENT, beam_graph_enabled=True),
+        vllm_config=worker_config(GRConfig(deployment=DEFAULT_DEPLOYMENT, beam_graph_enabled=True)),
     )
     owner = SimpleNamespace(
         bindings=(object(),),
@@ -536,7 +547,7 @@ def test_graph_replay_consumes_hidden_through_shared_logits(v2: bool, sliced: bo
     graph = SimpleNamespace(ready=True, replay=Mock(return_value=hidden))
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
-        _vllm_gr_config=SimpleNamespace(deployment=DEFAULT_DEPLOYMENT, beam_graph_enabled=True),
+        vllm_config=worker_config(GRConfig(deployment=DEFAULT_DEPLOYMENT, beam_graph_enabled=True)),
     )
     owner = SimpleNamespace(
         bindings=(object(),),
@@ -608,7 +619,7 @@ def test_v2_decode_captures_only_configured_batches(
 
     worker = capture_runtime[0]
     worker.vllm_config.scheduler_config.max_num_seqs = 8
-    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=sizes)
+    update_worker_config(worker, deployment=DeploymentOptions(beam_batch_sizes=sizes))
     capture = Mock(return_value=None)
     monkeypatch.setattr(startup, "_capture_batch", capture)
     assert capture_multibatch_forward(worker)

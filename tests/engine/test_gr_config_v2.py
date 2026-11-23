@@ -157,9 +157,9 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
 
 def test_common_prefill_grid_and_head_defaults_round_trip() -> None:
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
-    config = load_engine_gr_config(None, {}, {"constraint_mode": "none"})
+    config = load_gr_config(overrides={"constraint_mode": "none"})
     assert config.deployment.prefill_token_buckets == tuple(range(128, 8193, 128))
     assert config.deployment.head_slice == "auto"
     assert config.deployment.unconstrained_head_layout == "transposed"
@@ -167,7 +167,7 @@ def test_common_prefill_grid_and_head_defaults_round_trip() -> None:
         {"prefill_token_buckets": [64, 320], "head_slice": 16384},
         {"prefill_token_buckets": None, "head_slice": 0, "unconstrained_head_layout": None},
     ):
-        custom = load_engine_gr_config(None, {}, {"constraint_mode": "none", **overrides})
+        custom = load_gr_config(overrides={"constraint_mode": "none", **overrides})
         assert gr_config_from_mapping(gr_config_to_mapping(custom)) == custom
         buckets = cast(list[int] | None, overrides["prefill_token_buckets"])
         assert custom.deployment.prefill_token_buckets == (tuple(buckets) if buckets else None)
@@ -181,13 +181,13 @@ def test_file_snapshot_survives_driver_file_removal(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     from vllm_gr.config import GRConfig, write_canonical_gr_config
-    from vllm_gr.config.parser import COMMON_ENGINE_CONFIG, load_engine_gr_config
+    from vllm_gr.config.parser import COMMON_ENGINE_CONFIG, load_gr_config
 
     path = tmp_path / "scenario.yaml"
     path.write_text(json.dumps(_v2_table()))
     driver = SimpleNamespace(additional_config={"other_plugin": 7})
     with patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
-        config = load_engine_gr_config(path, driver.additional_config)
+        config = load_gr_config(path)
         write_canonical_gr_config(driver, config)
         path.unlink()
         assert GRConfig.from_vllm_config(driver) is config
@@ -202,32 +202,32 @@ def test_file_snapshot_survives_driver_file_removal(tmp_path: Path) -> None:
         assert sum(call.args[0] == path for call in opened.call_args_list) == 1
         assert all(call.args[0] in (path, COMMON_ENGINE_CONFIG) for call in opened.call_args_list)
     assert driver.additional_config["other_plugin"] == 7
-    assert load_engine_gr_config(None, {}).constraint.mode is ConstraintMode.NONE
+    assert load_gr_config().constraint.mode is ConstraintMode.NONE
 
 
 @pytest.mark.parametrize("extra", [{"vllm_gr": {}}, {"vllm_gr_beam_max_width": 8}])  # type: ignore[misc]
 def test_driver_rejects_inline_settings(extra: Any) -> None:
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.engine.startup import prepare_engine_settings
 
     with pytest.raises(ValueError, match="--config"):
-        load_engine_gr_config(None, extra)
+        prepare_engine_settings(None, {"additional_config": extra}, {})
 
 
 def test_driver_rejects_mapping_in_place_of_file() -> None:
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
     with pytest.raises(TypeError, match="file path"):
-        load_engine_gr_config(_v2_table(), {})
+        load_gr_config(_v2_table())
 
 
 def test_python_override_can_disable_a_file_constraint(tmp_path: Path) -> None:
     import json
 
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
     path = tmp_path / "scenario.yaml"
     path.write_text(json.dumps(_v2_table()))
-    config = load_engine_gr_config(path, {}, {"constraint_mode": "none"})
+    config = load_gr_config(path, overrides={"constraint_mode": "none"})
     assert config.constraint.mode is ConstraintMode.NONE
     assert config.beam_max_width == 128
 
@@ -237,23 +237,23 @@ def test_python_artifact_override_is_relative_to_caller(
 ) -> None:
     import json
 
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
     scenario = tmp_path / "scenario"
     scenario.mkdir()
     path = scenario / "scenario.yaml"
     path.write_text(json.dumps(_v2_table()))
     monkeypatch.chdir(tmp_path)
-    config = load_engine_gr_config(path, {}, {"constraint_table": {"path": "new.safetensors"}})
+    config = load_gr_config(path, overrides={"constraint_table": {"path": "new.safetensors"}})
     assert config.constraint.table.path == str(tmp_path / "new.safetensors")
 
 
 @pytest.mark.parametrize("overrides", [False, [], "invalid"])  # type: ignore[misc]
 def test_python_gr_requires_a_mapping(overrides: Any) -> None:
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
     with pytest.raises(ValueError, match="gr must be a mapping"):
-        load_engine_gr_config(None, {}, overrides)
+        load_gr_config(overrides=overrides)
 
 
 @pytest.mark.parametrize("mode", ["table", "none"])  # type: ignore[misc]
@@ -293,18 +293,18 @@ def test_v1_candidate_width_cannot_be_silently_ignored() -> None:
 def test_public_beam_steps_and_batch_inheritance(tmp_path: Path) -> None:
     import json
 
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
     table = _v2_table()["gr"]["constraint_table"]
-    defaults = load_engine_gr_config(None, {})
+    defaults = load_gr_config()
     assert defaults.constraint.mode is ConstraintMode.NONE
     assert defaults.constraint.table is None
     assert (
-        load_engine_gr_config(None, {}, {"constraint_table": table}).constraint.mode
+        load_gr_config(overrides={"constraint_table": table}).constraint.mode
         is ConstraintMode.TABLE
     )
     with pytest.raises(ValueError, match="table requires"):
-        load_engine_gr_config(None, {}, {"constraint_mode": "table"})
+        load_gr_config(overrides={"constraint_mode": "table"})
     assert defaults.beam_max_width == resolve_candidate_width(defaults) == 128
     assert defaults.beam_max_decode_steps == 3
     assert defaults.deployment.candidate_width == (128, 128, 128)
@@ -313,7 +313,7 @@ def test_public_beam_steps_and_batch_inheritance(tmp_path: Path) -> None:
     scenario = tmp_path / "scenario.yaml"
     scenario.write_text("import: ./base.yaml\ngr:\n  beam_batch_sizes: [1, 3]\n")
     opts = {"constraint_mode": "none", "beam_width": [8, 16, 4], "candidate_width": [8, 2, 1]}
-    cfg = load_engine_gr_config(scenario, {}, opts)
+    cfg = load_gr_config(scenario, overrides=opts)
     assert cfg.constraint.mode is ConstraintMode.NONE
     assert cfg.deployment.beam_batch_sizes == (1, 3)
     assert cfg.beam_max_width == 16 and resolve_candidate_width(cfg) == 8
@@ -321,28 +321,24 @@ def test_public_beam_steps_and_batch_inheritance(tmp_path: Path) -> None:
     assert cfg.deployment.candidate_width == (8, 2, 1)
     assert gr_config_from_mapping(gr_config_to_mapping(cfg)) == cfg
     with pytest.raises(ValueError, match="Unknown gr settings"):
-        load_engine_gr_config(scenario, {}, {**opts, "online_batch_sizes": [1, 2]})
+        load_gr_config(scenario, overrides={**opts, "online_batch_sizes": [1, 2]})
 
 
 @pytest.mark.parametrize("expanded", [[4], [4, 0], [2, 4], [4, 1]])  # type: ignore[misc]
 def test_public_beam_steps_reject_invalid_expansion(expanded: list[int]) -> None:
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
     with pytest.raises(ValueError, match="candidate"):
-        load_engine_gr_config(
-            None, {}, {"constraint_mode": "none", "beam_width": [4, 8], "candidate_width": expanded}
+        load_gr_config(
+            overrides={"constraint_mode": "none", "beam_width": [4, 8], "candidate_width": expanded}
         )
 
 
 def test_beam_batch_sizes_can_omit_singleton() -> None:
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
-    config = load_engine_gr_config(
-        None,
-        {},
-        {"constraint_mode": "none", "beam_batch_sizes": [2, 4]},
-    )
+    config = load_gr_config(overrides={"constraint_mode": "none", "beam_batch_sizes": [2, 4]})
     assert config.deployment.beam_batch_sizes == (2, 4)
     assert gr_config_from_mapping(gr_config_to_mapping(config)) == config
     with pytest.raises(ValueError, match="strictly increasing"):
-        load_engine_gr_config(None, {}, {"constraint_mode": "none", "beam_batch_sizes": [4, 1]})
+        load_gr_config(overrides={"constraint_mode": "none", "beam_batch_sizes": [4, 1]})

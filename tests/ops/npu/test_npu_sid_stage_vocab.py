@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.gr_config import worker_config
+from vllm_gr.config import ConstraintConfig, GRConfig
 from vllm_gr.ops.npu.sid_stage_vocab import (
     NPUSIDStageVocab,
     build_sid_stage_vocab,
@@ -272,7 +274,13 @@ def _runner(
 ) -> Any:
     runner = object.__new__(NPUEagerBeamStageRunner)
     runner.worker = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(beam_sid_stage_vocab=enabled),
+        vllm_config=worker_config(
+            GRConfig(
+                beam_sid_stage_vocab=enabled,
+                constraint=ConstraintConfig(),
+                beam_worker_decision=True,
+            )
+        ),
         _gr_npu_sid_stage_vocab=stage_vocab,
         _gr_npu_stage_projection=projection,
     )
