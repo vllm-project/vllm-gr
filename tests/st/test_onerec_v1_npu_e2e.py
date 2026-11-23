@@ -27,30 +27,28 @@ from typing import Any, cast
 import pytest
 import torch
 
-from tests.st.npu_beam_diagnostics import NPUForwardTrace
-
-try:
-    import torch_npu  # noqa: F401
-except (ImportError, RuntimeError) as exc:
-    pytest.skip(f"torch-npu is not installed: {exc}", allow_module_level=True)
-
-if not hasattr(torch, "npu") or not torch.npu.is_available():
-    pytest.skip("Ascend NPU is unavailable", allow_module_level=True)
-
 from tests.helpers.paths import REPO_ROOT, TESTS_DIR
-from vllm_gr.ops.npu import beam_ops
-
-if not beam_ops.is_available():
-    pytest.skip(
-        f"xllm Beam operators are unavailable: {beam_ops.unavailable_reason()}",
-        allow_module_level=True,
-    )
+from tests.st.npu_beam_diagnostics import NPUForwardTrace
 
 pytestmark = pytest.mark.npu_test
 
 _BEAM_WIDTH = 8
 _BEGIN_TOKEN = "<|sid_begin|>"
 _END_TOKEN = "<|sid_end|>"
+
+
+def _require_npu_beam_runtime() -> None:
+    try:
+        import torch_npu  # noqa: F401
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"torch-npu is unavailable: {exc}")
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("NPU is unavailable")
+
+    from vllm_gr.ops.npu import beam_ops
+
+    if not beam_ops.is_available():
+        pytest.skip(f"xllm Beam operators are unavailable: {beam_ops.unavailable_reason()}")
 
 
 def _prompt_tokens(tokenizer: Any, length: int) -> list[int]:
@@ -639,6 +637,7 @@ def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
 
 
 def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
+    _require_npu_beam_runtime()
     env = dict(os.environ)
     env.update(
         USE_TF="0",
@@ -668,7 +667,6 @@ def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
                 process.wait()
 
 
-@pytest.mark.npu_test
 @pytest.mark.model_test
 @pytest.mark.slow
 @pytest.mark.timeout(660)
@@ -676,7 +674,6 @@ def test_onerec_v1_npu_public_api_end_to_end(tmp_path: Path) -> None:
     _run_subprocess(tmp_path)
 
 
-@pytest.mark.npu_test
 @pytest.mark.model_test
 @pytest.mark.slow
 @pytest.mark.timeout(660)
@@ -685,4 +682,5 @@ def test_onerec_v1_npu_graph_shape_switch(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
+    _require_npu_beam_runtime()
     _run_npu_e2e(Path(sys.argv[1]), graph="--graph" in sys.argv[2:])

@@ -1,21 +1,77 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Native full-vocabulary candidate baseline for Ascend Beam V1.
+"""Unconstrained candidate selection for NPU Beam V1.
 
-Selection runs outside the model graph. Log probabilities retain the complete
-finite vocabulary denominator, independent of the requested candidate count.
-Stable sorting gives equal logits the same ascending-token-ID order as CUDA.
+Selection runs outside the model graph. The full-vocabulary selector preserves
+the complete finite vocabulary denominator and breaks score ties by token ID.
+The native TopK selector normalizes only its selected scores.
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from vllm_gr.constraints.backend import ConstraintOutput
 
+# An early finite mask needs one additional logits-sized buffer. Limit the
+# device-only path to the smaller tensors where it wins on NPU.
+_EARLY_FINITE_MASK_MAX_BYTES = 192 * 1024**2
+
+
+def _select_and_normalize_topk(
+    logits: torch.Tensor,
+    divisors: torch.Tensor,
+    top_k: int,
+    *,
+    mask_nonfinite_before_topk: bool,
+) -> ConstraintOutput:
+    count = min(top_k, logits.shape[-1])
+    check_selected_values = not mask_nonfinite_before_topk
+    if mask_nonfinite_before_topk:
+        logits = logits.masked_fill(~torch.isfinite(logits), -float("inf"))
+    elif (
+        logits.device.type == "npu"
+        and logits.is_contiguous()
+        and logits.numel() * logits.element_size() <= _EARLY_FINITE_MASK_MAX_BYTES
+    ):
+        logits = torch.nan_to_num(
+            logits, nan=-float("inf"), posinf=-float("inf"), neginf=-float("inf")
+        )
+        check_selected_values = False
+    values, ids = torch.topk(logits, count, dim=-1, sorted=True)
+    # On larger tensors, allocate a vocabulary-sized mask only when an
+    # invalid value displaced a finite candidate.
+    if check_selected_values and (~torch.isfinite(values) & (values != -float("inf"))).any():
+        finite_logits = logits.masked_fill(~torch.isfinite(logits), -float("inf"))
+        values, ids = torch.topk(finite_logits, count, dim=-1, sorted=True)
+
+    scores = values.float()
+    maximum = scores[:, :1]
+    maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
+    large = divisors.clamp_min(1.0)
+    small = divisors.clamp_max(1.0)
+    centered = scores / large - maximum / large
+    scaled = torch.where(centered == 0, 0.0, centered / small)
+    logprobs = torch.log_softmax(scaled, dim=-1)
+    valid = torch.isfinite(logprobs)
+    token_ids = torch.where(valid, ids.to(torch.int32), 0)
+    logprobs = logprobs.masked_fill(~valid, -float("inf"))
+    if count < top_k:
+        padding = (0, top_k - count)
+        token_ids = F.pad(token_ids, padding, value=0)
+        logprobs = F.pad(logprobs, padding, value=-float("inf"))
+        valid = F.pad(valid, padding, value=False)
+    return ConstraintOutput(token_ids, logprobs, valid)
+
 
 def select_unconstrained_candidates(
-    logits: torch.Tensor, temperatures: torch.Tensor, top_k: int
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+    *,
+    normalize_selected: bool = False,
+    mask_nonfinite_before_topk: bool = False,
 ) -> ConstraintOutput:
     """Return device-resident strict TopK without querying a catalog.
 
@@ -28,6 +84,10 @@ def select_unconstrained_candidates(
     NaN and infinite logits have no probability mass. Log probabilities that
     cannot be represented in float32 are also invalid. Missing candidates are
     explicit invalid slots, never sampled-token side-channel entries.
+    With normalize_selected, native TopK determines the tie order and FP32
+    normalization uses the selected logits. Prefill and small contiguous
+    NPU Decode tensors apply the finite mask before native TopK to avoid a
+    device-to-host scalar check.
     """
     if logits.ndim != 2 or min(logits.shape) < 1:
         raise ValueError("logits must be a non-empty two-dimensional tensor")
@@ -45,6 +105,10 @@ def select_unconstrained_candidates(
 
     temperature = temperatures.float().reshape(-1, 1)
     divisors = torch.where(temperature == 0, torch.ones_like(temperature), temperature)
+    if normalize_selected:
+        return _select_and_normalize_topk(
+            logits, divisors, top_k, mask_nonfinite_before_topk=mask_nonfinite_before_topk
+        )
     scores = logits.float()
     scores = scores.masked_fill(~torch.isfinite(scores), -float("inf"))
 

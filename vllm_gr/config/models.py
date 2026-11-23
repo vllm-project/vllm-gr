@@ -446,6 +446,17 @@ class GRConfig:
     )
     """Additional exact NPU Decode input widths to capture at startup."""
 
+    beam_npu_unconstrained_topk_fast_path: bool = field(
+        default=False,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_npu_unconstrained_topk_fast_path",
+                canonical_path=("gr", "npu_unconstrained_topk_fast_path"),
+            )
+        },
+    )
+    """Normalize only selected candidates in the optional native NPU TopK path."""
+
     beam_sid_stage_vocab: bool = field(
         default=False,
         metadata={

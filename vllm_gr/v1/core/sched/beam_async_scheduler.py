@@ -36,6 +36,7 @@ from vllm_gr.v1.core.sched.beam_session import (
     GRStageCompletion,
 )
 from vllm_gr.v1.engine.beam_admission import (
+    has_sync_validation,
     validate_gr_device_config,
     validate_gr_request,
 )
@@ -270,16 +271,17 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     """Validate admission without mutating session, owner or capacity state."""
     if not scheduler.scheduler_config.async_scheduling:
         raise RuntimeError("beam_search requires vLLM async_scheduling")
-    try:
-        config = getattr(scheduler, "vllm_config", None)
-        validate_gr_request(
-            request, config=config, trie_count=getattr(scheduler, "_gr_trie_count", None)
-        )
-        if config is not None:
-            validate_gr_execution_config(config)
-            validate_gr_device_config(config, request)
-    except ValueError as error:
-        raise GRAdmissionError(str(error)) from error
+    config = getattr(scheduler, "vllm_config", None)
+    if not has_sync_validation(scheduler, request):
+        try:
+            validate_gr_request(
+                request, config=config, trie_count=getattr(scheduler, "_gr_trie_count", None)
+            )
+            if config is not None:
+                validate_gr_execution_config(config)
+                validate_gr_device_config(config, request)
+        except ValueError as error:
+            raise GRAdmissionError(str(error)) from error
     session_id = request.batch_id
     engine_requests = tuple(item.request for item in request.items)
     request_ids = tuple(engine_request.request_id for engine_request in engine_requests)
@@ -379,45 +381,47 @@ def can_issue_gr_stage(scheduler: Any, session: GRSessionState) -> bool:
     )
 
 
+def _stage_progress(request_ids, native_requests, scheduled):
+    """Build per-request diagnostics only for an invalid native schedule."""
+    return tuple(
+        {
+            "request_id": request_id,
+            "scheduled_tokens": scheduled[request_id],
+            "num_computed_tokens": request.num_computed_tokens,
+            "num_prompt_tokens": request.num_prompt_tokens,
+            "num_output_placeholders": getattr(request, "num_output_placeholders", None),
+            "is_prefill_chunk": bool(request.is_prefill_chunk),
+        }
+        for request_id, request in zip(request_ids, native_requests, strict=True)
+    )
+
+
 def attach_gr_stage_metadata(
     scheduler: Any, scheduler_output: Any, session: GRSessionState
 ) -> GRStageMetadata | None:
     request_ids = session.request_ids
-    scheduled_ids = tuple(
-        request_id
-        for request_id in request_ids
-        if request_id in scheduler_output.num_scheduled_tokens
-    )
-    if not scheduled_ids:
-        return None
-    if scheduled_ids != request_ids:
-        raise RuntimeError(
-            "native Scheduler split an atomic GR batch stage; all fixed members "
-            "must be scheduled together: "
-            f"session_id={session.session_id!r}, expected_ids={request_ids!r}, "
-            f"scheduled_session_ids={scheduled_ids!r}, "
-            f"scheduled_output_ids={tuple(scheduler_output.num_scheduled_tokens)!r}, "
-            f"scheduled_tokens={dict(scheduler_output.num_scheduled_tokens)!r}"
-        )
+    scheduled = scheduler_output.num_scheduled_tokens
+    if len(scheduled) != len(request_ids) or tuple(scheduled) != request_ids:
+        scheduled_ids = tuple(request_id for request_id in request_ids if request_id in scheduled)
+        if not scheduled_ids:
+            return None
+        if scheduled_ids != request_ids:
+            raise RuntimeError(
+                "native Scheduler split an atomic GR batch stage; all fixed members "
+                "must be scheduled together: "
+                f"session_id={session.session_id!r}, expected_ids={request_ids!r}, "
+                f"scheduled_session_ids={scheduled_ids!r}, "
+                f"scheduled_output_ids={tuple(scheduled)!r}, "
+                f"scheduled_tokens={dict(scheduled)!r}"
+            )
     native_requests = tuple(scheduler.requests.get(request_id) for request_id in request_ids)
     if any(native_request is None for native_request in native_requests):
         raise RuntimeError("native Scheduler lost a GR batch member")
     if not can_issue_gr_stage(scheduler, session):
         raise RuntimeError("native Scheduler selected a blocked Asynchronous scheduling dispatch")
 
-    progress = tuple(
-        {
-            "request_id": request_id,
-            "scheduled_tokens": scheduler_output.num_scheduled_tokens[request_id],
-            "num_computed_tokens": native_request.num_computed_tokens,
-            "num_prompt_tokens": native_request.num_prompt_tokens,
-            "num_output_placeholders": getattr(native_request, "num_output_placeholders", None),
-            "is_prefill_chunk": bool(native_request.is_prefill_chunk),
-        }
-        for request_id, native_request in zip(request_ids, native_requests, strict=True)
-    )
-    prefill_states = tuple(item["is_prefill_chunk"] for item in progress)
-    if any(prefill_states):
+    if any(native_request.is_prefill_chunk for native_request in native_requests):
+        progress = _stage_progress(request_ids, native_requests, scheduled)
         raise RuntimeError(
             "beam_search cannot schedule partial Prefill or recompute: "
             f"session_id={session.session_id!r}, progress={progress!r}"
@@ -430,6 +434,7 @@ def attach_gr_stage_metadata(
         for native_request in native_requests
     )
     if len(set(stage_indices)) != 1:
+        progress = _stage_progress(request_ids, native_requests, scheduled)
         raise RuntimeError(
             "GR batch members crossed the Prefill/Decode stage boundary: "
             f"session_id={session.session_id!r}, dispatch_id={dispatch_id}, "
@@ -438,6 +443,7 @@ def attach_gr_stage_metadata(
         )
     stage_index = stage_indices[0]
     if not 0 <= stage_index < session.total_stages:
+        progress = _stage_progress(request_ids, native_requests, scheduled)
         raise RuntimeError(
             "native GR stage exceeds the effective generation budget: "
             f"session_id={session.session_id!r}, dispatch_id={dispatch_id}, "
@@ -449,6 +455,7 @@ def attach_gr_stage_metadata(
         None if stage_index == 0 else GRDeviceStateRef(session.session_id, stage_index - 1)
     )
     if previous != expected_previous:
+        progress = _stage_progress(request_ids, native_requests, scheduled)
         raise RuntimeError(
             "GR rejects recompute or nonconsecutive native progress: "
             f"session_id={session.session_id!r}, dispatch_id={dispatch_id}, "

@@ -27,7 +27,7 @@ from vllm_gr.config import (
     load_gr_config,
     write_canonical_gr_config,
 )
-from vllm_gr.config.parser import GR_CONFIG_KEY, parse_gr_config
+from vllm_gr.config.parser import COMMON_ENGINE_CONFIG, GR_CONFIG_KEY, parse_gr_config
 from vllm_gr.platforms.legacy import legacy_config_service
 
 CATALOG_PATH_KEY = "vllm_gr_catalog_path"
@@ -59,6 +59,18 @@ def _canonical_mapping(path: str, *, enabled: bool = True) -> dict[str, Any]:
             "candidate_width": [32] * 3,
         }
     }
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_npu_unconstrained_topk_fast_path_config() -> None:
+    assert not GRConfig().beam_npu_unconstrained_topk_fast_path
+    assert not gr_config_from_mapping({"gr": {}}).beam_npu_unconstrained_topk_fast_path
+    assert not load_gr_config(COMMON_ENGINE_CONFIG).beam_npu_unconstrained_topk_fast_path
+    config = gr_config_from_mapping({"gr": {"npu_unconstrained_topk_fast_path": True}})
+    assert config.beam_npu_unconstrained_topk_fast_path
+    assert gr_config_from_mapping(gr_config_to_mapping(config)) == config
+    with pytest.raises(TypeError, match=r"npu_unconstrained_topk_fast_path must be a boolean"):
+        gr_config_from_mapping({"gr": {"npu_unconstrained_topk_fast_path": "true"}})
 
 
 def test_canonical_mapping_round_trip_is_exact(tmp_path: Path) -> None:

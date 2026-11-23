@@ -142,12 +142,14 @@ class BeamSearchClient:
         self.engine = llm.llm_engine
         self._boundary_tokens: tuple[str, tuple[int | None, int | None]] | None = None
         self._original_prompt_token_ids: tuple[tuple[int, ...], ...] | None = None
+        self._flat_output_batch_id: str | None = None
 
     def prepare_request(self, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
         processor = BeamSearchInputProcessor(self.engine)
         request = processor.process_offline_inputs(self.llm, call)
         self._boundary_tokens = (request.batch_id, processor.boundary_token_ids)
         self._original_prompt_token_ids = processor.original_prompt_token_ids
+        self._flat_output_batch_id = request.batch_id if call.output_mode == "flat" else None
         return request
 
     def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
@@ -177,6 +179,8 @@ class BeamSearchClient:
                 raise TypeError("EngineCore returned a non-BeamBatchResult terminal value")
             session.terminal = True
             session.failed = result.failure is not None
+            if session.batch_id == self._flat_output_batch_id:
+                return result
             return materialize_beam_result(result)
         except EngineDeadError:
             raise

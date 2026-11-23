@@ -3,9 +3,7 @@
 # mypy: disable-error-code="misc"
 """CPU-only checks for the opt-in E2E diagnostic observer."""
 
-import ast
 import json
-from collections.abc import Mapping
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
@@ -13,40 +11,23 @@ from typing import Any
 import pytest
 import torch
 
-from tests.helpers.paths import TESTS_DIR
+from tests.st import test_onerec_v1_npu_e2e as npu_e2e
 from tests.st.npu_beam_diagnostics import NPUForwardTrace
 
-
-@pytest.fixture
-def prefill_case_helpers() -> dict[str, Any]:
-    # Exercise the pure case policy without importing NPU runtime dependencies.
-    source = TESTS_DIR / "st/test_onerec_v1_npu_e2e.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    names = {
-        "_padded_prefill_requested",
-        "_graph_test_settings",
-        "_comparison_prompts",
-        "_assert_exact_prefill",
-    }
-    nodes: list[ast.stmt] = [
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names
-    ]
-    namespace: dict[str, Any] = {"Any": Any, "Mapping": Mapping}
-    namespace["_prompt_tokens"] = lambda tokenizer, length: list(range(1000 - length, 1000))
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
-    return namespace
+pytestmark = pytest.mark.cpu_test
 
 
-def test_exact_prefill_inputs_and_opt_in_padding(prefill_case_helpers: dict[str, Any]) -> None:
-    helpers = prefill_case_helpers
-    prompts = helpers["_comparison_prompts"](None, exact_prefill=True)
+def test_exact_prefill_inputs_and_opt_in_padding(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        npu_e2e, "_prompt_tokens", lambda _, length: list(range(1000 - length, 1000))
+    )
+    prompts = npu_e2e._comparison_prompts(None, exact_prefill=True)
     assert [len(prompt) + 1 for prompt in prompts] == [128, 128]
     assert prompts[0] != prompts[1]
-    legacy = helpers["_comparison_prompts"](None, exact_prefill=False)
+    legacy = npu_e2e._comparison_prompts(None, exact_prefill=False)
     assert [len(prompt) + 1 for prompt in legacy] == [129, 161]
-    settings = helpers["_graph_test_settings"]
-    assert settings({}) == {"prefill_token_buckets": [128, 256]}
-    assert settings({"VLLM_GR_TEST_PADDED_PREFILL": "1"}) == {
+    assert npu_e2e._graph_test_settings({}) == {"prefill_token_buckets": [128, 256]}
+    assert npu_e2e._graph_test_settings({"VLLM_GR_TEST_PADDED_PREFILL": "1"}) == {
         "prefill_token_buckets": [384],
     }
 
@@ -61,9 +42,7 @@ def test_exact_prefill_inputs_and_opt_in_padding(prefill_case_helpers: dict[str,
         {"skip_compiled": True},
     ],
 )
-def test_exact_prefill_requires_real_replay(
-    prefill_case_helpers: dict[str, Any], mutation: dict[str, Any] | None
-) -> None:
+def test_exact_prefill_requires_real_replay(mutation: dict[str, Any] | None) -> None:
     prefill = dict(
         actual_tokens=256,
         padded_tokens=256,
@@ -75,7 +54,7 @@ def test_exact_prefill_requires_real_replay(
         skip_compiled=False,
         gr_prefill_replay_delta={"256": 1},
     )
-    check = prefill_case_helpers["_assert_exact_prefill"]
+    check = npu_e2e._assert_exact_prefill
     if mutation:
         with pytest.raises(AssertionError):
             check(dict(prefill, **mutation), "invalid control")
@@ -175,6 +154,3 @@ def test_forward_probe_observes_real_arguments_and_restores(
     assert event["actual_tokens"] == 4 and event["padded_tokens"] == 6
     assert event["gr_prefill_replay_delta"] == {"6": 1}
     json.dumps(events, allow_nan=False)
-
-
-pytestmark = pytest.mark.cpu_test

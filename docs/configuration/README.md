@@ -3,7 +3,7 @@
 `GRLLM` and `vllm serve --gr` use the same startup YAML. Put native vLLM
 options at the top level and vLLM-GR options under `gr`. The
 [packaged defaults](../../vllm_gr/config/default_config.yaml) list the common,
-CUDA and Ascend settings. Native engines started without GR configuration use
+CUDA and NPU settings. Native engines started without GR configuration use
 the upstream vLLM defaults.
 
 GR stores its resolved configuration in `additional_config["vllm_gr"]`.
@@ -115,7 +115,7 @@ The vLLM ModelRunner executes model work on the device. For the library and
 general CLI, set `VLLM_USE_V2_MODEL_RUNNER` before importing vLLM or starting
 the CLI.
 
-| Setting | CUDA | Ascend |
+| Setting | CUDA | NPU |
 | --- | --- | --- |
 | Unset or `0` | ModelRunner V1, the vLLM-GR default | ModelRunner V1, required for Beam search |
 | `1` | Opt-in [ModelRunner V2](../design/module/model_runner_v2.md) for supported Beam workloads | Use `0` for Beam search |
@@ -137,20 +137,21 @@ artifact layout and have their own version identifiers.
 | `gr.beam_width` | Retained beams at each generated step. Set the request's `beam_width` (HTTP `n`) to the maximum of this list, including for a decreasing schedule such as `[8, 4, 2]`. |
 | `gr.candidate_width` | Candidates expanded per parent at each step. Supply one entry per retained width. The first entries must match because the first step has one parent. |
 | `max-logprobs` | Native vLLM setting. Its effective limit must cover the largest configured candidate width. The packaged default is 128. |
-| `gr.constraint_table.max_top_k` | In table mode, this capacity must cover the largest candidate width. CUDA and Ascend table operators support up to 256 candidates per parent. |
+| `gr.constraint_table.max_top_k` | In table mode, this capacity must cover the largest candidate width. CUDA and NPU table operators support up to 256 candidates per parent. |
 | `gr.result_width` | Number of sequences to return, up to the final retained width. The default (`null`) uses the final retained width. |
 | `gr.worker_decision` | `true` enables worker-side Beam selection. `null` uses the platform default. |
 | `gr.max_decode_steps` | Generation capacity, excluding begin and end markers. It must cover the width lists and defaults to 3. |
+| `gr.npu_unconstrained_topk_fast_path` | Defaults to `false`, with full-vocabulary scoring and token-ID tie breaking. Set `true` to normalize only the native TopK candidates for unconstrained NPU Beam without SID-stage vocabulary restriction. |
 
-Unconstrained generation accepts widths from 1 to 1024. On Ascend,
+Unconstrained generation accepts widths from 1 to 1024. On NPU,
 unconstrained generation requires equal candidate and retained widths at each
 step. Independent candidate widths are available with a constraint table.
 
 A dynamic-width request uses a matching prefix of its configured schedule and
 supports one to three effective steps. Fixed-width unconstrained generation on
-Ascend supports up to six steps, subject to the model's KV reorder capacity.
+NPU supports up to six steps, subject to the model's KV reorder capacity.
 CUDA has no corresponding six-step limit. A constraint table requires exactly
-three effective steps on either device. Ascend SID-stage vocabulary execution
+three effective steps on either device. NPU SID-stage vocabulary execution
 also supports at most three steps. See the [device compatibility guide](../user_guide/feature_compatibility.md)
 for related features.
 
@@ -160,7 +161,7 @@ Beam execution requires `async-scheduling: true` and
 `enable-chunked-prefill: false`. Both are packaged defaults. In Python the
 corresponding arguments are `async_scheduling=True` and
 `enable_chunked_prefill=False`. See the [CUDA walkthrough](../user_guide/onerec_quickstart.md)
-or the [Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-python-entry-point).
+or the [NPU Beam example](../user_guide/beam_search_npu.md#configuration-and-python-entry-point).
 
 ### Batch sizes and token budgets
 
@@ -168,13 +169,13 @@ or the [Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-
   multi-prompt HTTP completion. The default is `[1, 2, 4]`. Add `8` to enable
   the maximum size. Separate HTTP requests are not combined to fill a batch.
   Both CUDA model runners use this list for Prefill and Decode graph capture.
-  Ascend has separate Decode graph settings.
+  NPU has separate Decode graph settings.
 - `max-num-seqs` must cover the number of prompts in the Beam batch. For
   example, two prompts at width 128 count as two requests for this check.
 - `max-num-batched-tokens` must cover the total prompt tokens at Prefill.
   With chunked prefill disabled, an omitted budget grows to cover
   `max-model-len`. An explicit budget goes through native validation.
-  On Ascend, a request with a Decode stage must also fit the batch size times
+  On NPU, a request with a Decode stage must also fit the batch size times
   the peak input beam width for those stages. Two prompts at fixed width 128
   therefore require capacity for at least 256 Decode rows.
 

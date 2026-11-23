@@ -135,3 +135,39 @@ def test_npu_extreme_temperatures_preserve_finite_probability_mass(
         )
         assert torch.isneginf(scores[row, count:]).all()
     assert not torch.isnan(scores).any()
+
+
+@pytest.mark.l2
+def test_npu_topk_selected_normalization_is_opt_in(npu_device: torch.device) -> None:
+    logits = torch.tensor(
+        [
+            [5, 4, 3, 2],
+            [float("inf"), float("nan"), 1, 0],
+            [float("-inf"), float("nan"), float("-inf"), float("-inf")],
+        ],
+        device=npu_device,
+        dtype=torch.bfloat16,
+    )
+    temperatures = torch.tensor([0.0, 2.0, 1.0], device=npu_device)
+    exact = select_unconstrained_candidates(logits, temperatures, 2)
+    fast = select_unconstrained_candidates(logits, temperatures, 2, normalize_selected=True)
+    prefill = select_unconstrained_candidates(
+        logits,
+        temperatures,
+        2,
+        normalize_selected=True,
+        mask_nonfinite_before_topk=True,
+    )
+    torch.testing.assert_close(prefill.token_ids.cpu(), fast.token_ids.cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(prefill.valid_mask.cpu(), fast.valid_mask.cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(prefill.logprobs.cpu(), fast.logprobs.cpu(), rtol=0, atol=0)
+    assert fast.token_ids.cpu().tolist() == [[0, 1], [2, 3], [0, 0]]
+    assert fast.valid_mask.cpu().tolist() == [[True, True], [True, True], [False, False]]
+    expected = torch.log_softmax(torch.tensor([[5.0, 4.0], [0.5, 0.0]]), dim=1)
+    torch.testing.assert_close(fast.logprobs.cpu()[:2], expected, atol=2e-6, rtol=1e-5)
+    assert (fast.logprobs.cpu()[0] > exact.logprobs.cpu()[0]).all()
+    assert torch.isneginf(fast.logprobs.cpu()[2]).all()
+
+    padded = select_unconstrained_candidates(logits, temperatures, 5, normalize_selected=True)
+    assert padded.valid_mask.cpu().sum(dim=1).tolist() == [4, 2, 0]
+    assert torch.isneginf(padded.logprobs[:, -1].cpu()).all()

@@ -80,6 +80,23 @@ def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished
         _drain_resources(scheduler, session)
 
 
+def _matches_batch_member(scheduler, batch, request_id, index):
+    from vllm_gr.v1.engine.beam_admission import has_sync_validation
+
+    if has_sync_validation(scheduler, batch):
+        return (
+            type(index) is int
+            and 0 <= index < len(batch.items)
+            and batch.items[index].request.request_id == request_id
+        )
+    matching = tuple(
+        position
+        for position, item in enumerate(batch.items)
+        if item.request.request_id == request_id
+    )
+    return len(matching) == 1 and (index is None or (type(index) is int and index == matching[0]))
+
+
 def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
     original_reset = scheduler_cls.reset_prefix_cache
     if getattr(original_reset, _GR_RESET_PREFIX_CACHE_PATCH_MARKER, False):
@@ -154,15 +171,7 @@ def apply_scheduler_patch():
                 )
             if batch_request is not None:
                 member_index = getattr(request, "gr_batch_member_index", None)
-                matching_indices = tuple(
-                    index
-                    for index, item in enumerate(batch_request.items)
-                    if item.request.request_id == request.request_id
-                )
-                if len(matching_indices) != 1 or (
-                    member_index is not None
-                    and (type(member_index) is not int or member_index != matching_indices[0])
-                ):
+                if not _matches_batch_member(self, batch_request, request.request_id, member_index):
                     raise GRAdmissionError("native request does not match its GR batch member")
                 if request.request_id in self.requests:
                     raise GRAdmissionError(f"GR request already exists: {request.request_id}")

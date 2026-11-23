@@ -26,6 +26,7 @@ from vllm_gr.entrypoints.beam_search.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
+from vllm_gr.outputs import FlatBeamSearchOutput, FlatBeamSearchSequences
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
@@ -37,6 +38,8 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputOptions,
     BeamOutputSequence,
     BeamRequestOutput,
+    BeamSequenceColumns,
+    materialize_beam_result,
 )
 
 
@@ -353,6 +356,65 @@ def test_compact_empty_candidates_and_request_order() -> None:
     assert out[0].sequences == ()
     assert out[1].sequences
     assert tokenizer.decode_calls == 0
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("begin,end", [(None, None), ("begin", "end")])  # type: ignore[misc]
+def test_flat_columns_match_compact_candidates(begin: str | None, end: str | None) -> None:
+    processor, call, request, _, tokenizer = _case(begin, end)
+    tokens = np.array([[3, 4], [5, 6]], dtype="<i4")
+    scores = np.array([-1.25, -2.5], dtype="<f4")
+    columns = BeamSequenceColumns(2, 2, tokens.tobytes(), scores.tobytes(), None)
+    result = BeamBatchResult(
+        BEAM_BATCH_PROTOCOL_VERSION,
+        request.batch_id,
+        BeamBatchOutput((BeamRequestOutput(0, "request-1", columns),)),
+        None,
+    )
+    flat = processor.process_outputs(replace(call, output_mode="flat"), request, result)[0]
+    compact = processor.process_outputs(
+        replace(call, output_mode="compact"), request, materialize_beam_result(result)
+    )[0]
+
+    assert isinstance(flat, FlatBeamSearchOutput)
+    assert isinstance(flat.sequences, FlatBeamSearchSequences)
+    assert flat.prompt_token_ids == (1, 2)
+    assert flat.as_compact() == compact
+    assert flat.sequences[-1] == compact.sequences[-1]
+    assert tuple(flat.sequences[::-1]) == compact.sequences[::-1]
+    assert flat.sequences.cumulative_logprobs.tolist() == [-1.25, -2.5]
+    assert flat.sequences.token_ids.tolist() == [list(s.token_ids) for s in compact.sequences]
+    assert not flat.sequences.token_ids.flags.writeable
+    assert not flat.sequences.cumulative_logprobs.flags.writeable
+    assert tokenizer.decode_calls == 0
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_flat_iterator_materializes_only_the_requested_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    tokens = np.array([[3, 4], [5, 6]], dtype=np.int32)
+    sequences = FlatBeamSearchSequences(tokens, np.array([-1.25, -2.5], dtype=np.float32))
+    expected = sequences[0]
+    getitem = FlatBeamSearchSequences.__getitem__
+    requested: list[int] = []
+
+    def read_row(columns: FlatBeamSearchSequences, index: int) -> Any:
+        requested.append(index)
+        return getitem(columns, index)
+
+    monkeypatch.setattr(FlatBeamSearchSequences, "__getitem__", read_row)
+    assert next(iter(sequences)) == expected
+    assert requested == [0]
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_flat_preserves_stop_metadata_for_tuple_results() -> None:
+    processor, call, request, result, _ = _case(include_stop=False)
+    flat = processor.process_outputs(replace(call, output_mode="flat"), request, result)[0]
+    compact = processor.process_outputs(replace(call, output_mode="compact"), request, result)[0]
+    assert isinstance(flat.sequences, tuple)
+    assert flat.as_compact() == compact
+    assert flat.sequences[1].finish_reason == "stop"
+    assert flat.sequences[1].stop_reason == 20
 
 
 def test_invalid_output_mode_is_rejected_before_execution() -> None:

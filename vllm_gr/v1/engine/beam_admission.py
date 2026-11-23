@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Any
 
 from vllm_gr.config import GRConfig
@@ -67,6 +68,24 @@ def validate_gr_generation_budget(gr_config: GRConfig, max_tokens: int) -> None:
         raise ValueError(
             f"Decode steps {max_tokens} exceed runtime limit {gr_config.beam_max_decode_steps}"
         )
+
+
+# A synchronous Core can pass the checks it already performed to the same
+# Scheduler. The proof never crosses an input queue or an execution boundary.
+_sync_validation: ContextVar[tuple[Any, BeamBatchRequest, Any, int | None] | None] = ContextVar(
+    "_sync_validation", default=None
+)
+
+
+def has_sync_validation(scheduler: Any, request: BeamBatchRequest) -> bool:
+    proof = _sync_validation.get()
+    return (
+        proof is not None
+        and proof[0] is scheduler
+        and proof[1] is request
+        and proof[2] is getattr(scheduler, "vllm_config", None)
+        and proof[3] == getattr(scheduler, "_gr_trie_count", None)
+    )
 
 
 def validate_gr_request(

@@ -14,6 +14,8 @@ import pytest
 
 from tests.helpers.paths import REPO_ROOT
 
+pytestmark = pytest.mark.cpu_test
+
 ROOT = REPO_ROOT
 
 
@@ -179,9 +181,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-pytestmark = pytest.mark.cpu_test
-
-
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash required")  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -242,7 +241,8 @@ def test_install_checks_callable_ops_before_and_after_build(
         PATH=str(tmp_path) + os.pathsep + env["PATH"],
         TEST_PYTHON=Path(sys.executable).as_posix(),
         PYTHONPATH=str(tmp_path),
-        LD_LIBRARY_PATH=tmp_path.as_posix(),
+        # The runner may set loader paths for a relocated Python installation.
+        LD_LIBRARY_PATH=os.pathsep.join(filter(None, (str(tmp_path), env.get("LD_LIBRARY_PATH")))),
         XLLM_OPS_SKIP_NPU_CHECK="1",
         XLLM_OPS_BUILD_SCRIPT=build.as_posix(),
         BUILD_RESULT=after_build,

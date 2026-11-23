@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine.llm_engine import LLMEngine
 
     from vllm_gr.entrypoints.beam_search.protocol import BeamSearchFrontend
-    from vllm_gr.outputs import CompactBeamSearchOutput
+    from vllm_gr.outputs import CompactBeamSearchOutput, FlatBeamSearchOutput
 
 logger = init_logger("vllm_gr.entrypoints.gr")
 
@@ -152,6 +152,7 @@ class GRLLM(LLM):
         output_mode: Literal["compact"],
     ) -> list["CompactBeamSearchOutput"]: ...
 
+    @overload
     def beam_search(
         self,
         prompts: list[Union["TokensPrompt", "TextPrompt"]],
@@ -161,8 +162,20 @@ class GRLLM(LLM):
         concurrency_limit: int | None = None,
         trie_ids: list[int] | tuple[int, ...] | None = None,
         *,
-        output_mode: Literal["full", "compact"] = "full",
-    ) -> list["BeamSearchOutput"] | list["CompactBeamSearchOutput"]:
+        output_mode: Literal["flat"],
+    ) -> list["FlatBeamSearchOutput"]: ...
+
+    def beam_search(
+        self,
+        prompts: list[Union["TokensPrompt", "TextPrompt"]],
+        params: "BeamSearchParams",
+        lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
+        use_tqdm: bool = False,
+        concurrency_limit: int | None = None,
+        trie_ids: list[int] | tuple[int, ...] | None = None,
+        *,
+        output_mode: Literal["full", "compact", "flat"] = "full",
+    ) -> list["BeamSearchOutput"] | list["CompactBeamSearchOutput"] | list["FlatBeamSearchOutput"]:
         """Run persistent Beam Search, keeping upstream ``full`` output by default.
 
         Omitting ``output_mode`` preserves the upstream vLLM contract: callers
@@ -171,7 +184,9 @@ class GRLLM(LLM):
         IDs, cumulative scores and stop metadata, with the accepted original
         prompt stored once per request. It never constructs full prompt-plus-tail
         tokens or text; callers decode the tail if needed. Search, ranking and
-        configured begin/end/stop boundaries are identical.
+        configured begin/end/stop boundaries are identical. Explicit ``flat``
+        exposes eligible token IDs and scores as read-only NumPy columns.
+        Call its ``as_compact()`` method to obtain the ordinary compact result.
         """
         from vllm_gr.config.execution import require_beam_config
 
@@ -189,7 +204,9 @@ class GRLLM(LLM):
             trie_ids=trie_ids,
         )
         return cast(
-            list["BeamSearchOutput"] | list["CompactBeamSearchOutput"],
+            list["BeamSearchOutput"]
+            | list["CompactBeamSearchOutput"]
+            | list["FlatBeamSearchOutput"],
             run_beam_search(self._create_beam_search_client(), call),
         )
 

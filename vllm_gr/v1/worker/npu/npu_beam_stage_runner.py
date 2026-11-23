@@ -601,7 +601,7 @@ class NPUEagerBeamStageRunner:
         logits: torch.Tensor,
         metadata: GRStageMetadata,
     ) -> ConstraintOutput:
-        """Select full-vocabulary candidates without catalog or prefix state."""
+        """Select candidates without catalog or prefix state."""
         from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
 
         plan = self.pending_plan
@@ -617,7 +617,8 @@ class NPUEagerBeamStageRunner:
             _get_gr_config,
         )
 
-        if getattr(_get_gr_config(self.worker), "beam_sid_stage_vocab", False):
+        config = _get_gr_config(self.worker)
+        if getattr(config, "beam_sid_stage_vocab", False):
             from vllm_gr.ops.npu.sid_stage_vocab import select_sid_stage_candidates
 
             stage_vocab = getattr(self.worker, "_gr_npu_sid_stage_vocab", None)
@@ -642,7 +643,13 @@ class NPUEagerBeamStageRunner:
                 stage_vocab,
                 compact_logits=compact,
             )
-        return select_unconstrained_candidates(logits, temperatures, plan.execution.candidate_top_k)
+        return select_unconstrained_candidates(
+            logits,
+            temperatures,
+            plan.execution.candidate_top_k,
+            normalize_selected=getattr(config, "beam_npu_unconstrained_topk_fast_path", False),
+            mask_nonfinite_before_topk=plan.execution.kind == "prefill",
+        )
 
     def _select_constraint_candidates(
         self,
@@ -756,8 +763,7 @@ class NPUEagerBeamStageRunner:
         params = request.beam_params
         stop_ids = set(params.stop_token_ids) if not params.ignore_stop_tokens else set()
         # Reuse the existing wire protocol after the existing packed D2H. Small
-        # results and stop-aware histories keep the row representation. Public
-        # clients still materialize every sequence before returning to callers.
+        # results and stop-aware histories keep the row representation.
         use_columns = (
             min(width, options.num_return_sequences) >= 64
             and not stop_ids
@@ -776,15 +782,61 @@ class NPUEagerBeamStageRunner:
         score_view = (
             packed[score_offset : score_offset + score_words].view(torch.float32).view(batch, width)
         )
-        score_rows = score_view.tolist()
         outputs = []
+        score_rows = score_view.tolist() if not use_columns else None
+        token_columns = sequence_view.numpy() if use_columns else None
+        parent_columns = parent_view.numpy() if use_columns and parent_view is not None else None
+        score_columns = score_view.numpy() if use_columns else None
         for row, item in enumerate(request.items):
-            ranked = []
             prompt_length = (
                 len(item.request.prompt_token_ids)
                 if item.request.prompt_token_ids is not None
                 else 0
             )
+            if score_columns is not None:
+                row_scores = score_columns[row]
+                finite = np.flatnonzero(np.isfinite(row_scores))
+                if finite.size:
+                    # All sequences in a column have the same length. The
+                    # length penalty cannot change the order of finite raw
+                    # scores, and stable sort preserves the lowest beam ID on ties.
+                    # Keep the previous exception for invalid normalizers.
+                    if (
+                        params.length_penalty != 0
+                        and float(prompt_length + steps) ** params.length_penalty == 0.0
+                    ):
+                        raise ZeroDivisionError("float division by zero")
+                    order = np.argsort(-row_scores[finite], kind="stable")
+                    selected = finite[order[: options.num_return_sequences]]
+                    assert token_columns is not None
+                    outputs.append(
+                        BeamRequestOutput(
+                            item.item_index,
+                            item.request.request_id,
+                            BeamSequenceColumns(
+                                count=len(selected),
+                                steps=steps,
+                                token_ids=token_columns[row, selected]
+                                .astype("<i4", copy=False)
+                                .tobytes(),
+                                cumulative_logprobs=row_scores[selected]
+                                .astype("<f4", copy=False)
+                                .tobytes()
+                                if options.include_cumulative_logprob
+                                else None,
+                                parent_beam_indices=parent_columns[row, selected]
+                                .astype("<i4", copy=False)
+                                .tobytes()
+                                if parent_columns is not None
+                                else None,
+                            ),
+                        )
+                    )
+                    continue
+                return self._no_valid_terminal_beams(request.batch_id, item.item_index)
+
+            assert score_rows is not None
+            ranked = []
             normalization = None
             normalizations = {}
             for beam, score in enumerate(score_rows[row]):
@@ -826,32 +878,6 @@ class NPUEagerBeamStageRunner:
                     )
                 )
             ranked.sort(key=lambda value: (value[0], value[1], -value[2]), reverse=True)
-            if use_columns and ranked:
-                selected_indices = [value[2] for value in ranked[: options.num_return_sequences]]
-                outputs.append(
-                    BeamRequestOutput(
-                        item.item_index,
-                        item.request.request_id,
-                        BeamSequenceColumns(
-                            count=len(selected_indices),
-                            steps=steps,
-                            token_ids=sequence_view.numpy()[row, selected_indices]
-                            .astype("<i4", copy=False)
-                            .tobytes(),
-                            cumulative_logprobs=score_view.numpy()[row, selected_indices]
-                            .astype("<f4", copy=False)
-                            .tobytes()
-                            if options.include_cumulative_logprob
-                            else None,
-                            parent_beam_indices=parent_view.numpy()[row, selected_indices]
-                            .astype("<i4", copy=False)
-                            .tobytes()
-                            if parent_view is not None
-                            else None,
-                        ),
-                    )
-                )
-                continue
             selected = []
             for _, score, beam, length, stop_index in ranked[: options.num_return_sequences]:
                 token_ids = sequence_rows[row][beam]
@@ -872,16 +898,7 @@ class NPUEagerBeamStageRunner:
                     )
                 )
             if not selected:
-                return BeamBatchResult(
-                    BEAM_BATCH_PROTOCOL_VERSION,
-                    request.batch_id,
-                    None,
-                    BeamBatchFailure(
-                        "no_valid_beams",
-                        "No valid final Beam candidates",
-                        item.item_index,
-                    ),
-                )
+                return self._no_valid_terminal_beams(request.batch_id, item.item_index)
             outputs.append(
                 BeamRequestOutput(
                     item.item_index,
@@ -894,6 +911,15 @@ class NPUEagerBeamStageRunner:
             request.batch_id,
             BeamBatchOutput(tuple(outputs)),
             None,
+        )
+
+    @staticmethod
+    def _no_valid_terminal_beams(batch_id: str, item_index: int) -> BeamBatchResult:
+        return BeamBatchResult(
+            BEAM_BATCH_PROTOCOL_VERSION,
+            batch_id,
+            None,
+            BeamBatchFailure("no_valid_beams", "No valid final Beam candidates", item_index),
         )
 
     def _release(self) -> None:

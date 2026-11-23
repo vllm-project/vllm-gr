@@ -24,12 +24,12 @@ class OfflineBeamSearchRequest:
     lora_request: Any = None
     use_tqdm: bool = False
     concurrency_limit: int | None = None
-    output_mode: Literal["full", "compact"] = "compact"
+    output_mode: Literal["full", "compact", "flat"] = "compact"
     trie_ids: list[int] | tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.output_mode not in ("full", "compact"):
-            raise ValueError("output_mode must be full or compact")
+        if self.output_mode not in ("full", "compact", "flat"):
+            raise ValueError("output_mode must be full, compact, or flat")
 
 
 @dataclass(frozen=True, slots=True)

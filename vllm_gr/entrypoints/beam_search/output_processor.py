@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, NoReturn, cast
 
+import numpy as np
 from vllm.inputs import tokens_input
 
 from vllm_gr.entrypoints.beam_search.boundary_tokens import boundary_token_id
@@ -17,6 +18,12 @@ from vllm_gr.entrypoints.beam_search.protocol import (
     OnlineBeamSearchRequest,
 )
 from vllm_gr.entrypoints.common.detokenization import fast_batch_decode, fast_decode
+from vllm_gr.outputs import (
+    CompactBeamSearchOutput,
+    CompactBeamSearchSequence,
+    FlatBeamSearchOutput,
+    FlatBeamSearchSequences,
+)
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchOutput,
@@ -24,6 +31,9 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
+    BeamSequenceColumns,
+    materialize_beam_result,
+    sequence_columns,
 )
 
 
@@ -97,6 +107,45 @@ def _output_suffix(sequence: BeamOutputSequence, end_token_id: int | None) -> li
     if sequence.finish_reason == "length" and end_token_id is not None:
         suffix.append(end_token_id)
     return suffix
+
+
+def _compact_sequences(
+    sequences: tuple[BeamOutputSequence, ...],
+    begin: tuple[int, ...],
+    end: tuple[int, ...],
+) -> tuple[CompactBeamSearchSequence, ...]:
+    return tuple(
+        CompactBeamSearchSequence(
+            token_ids=begin
+            + sequence.token_ids
+            + (end if sequence.finish_reason == "length" else ()),
+            cumulative_logprob=float(cast(float, sequence.cumulative_logprob)),
+            finish_reason=sequence.finish_reason,
+            stop_reason=sequence.stop_token_id,
+        )
+        for sequence in sequences
+    )
+
+
+def _flat_sequences(
+    sequences: BeamSequenceColumns,
+    begin: tuple[int, ...],
+    end: tuple[int, ...],
+) -> FlatBeamSearchSequences:
+    tokens, scores, _ = sequence_columns(sequences)
+    if scores is None:
+        raise ValueError("flat Beam output requires cumulative logprobs")
+    if not begin and not end:
+        return FlatBeamSearchSequences(tokens, scores)
+
+    # Boundary IDs can exceed the int32 storage used for sampled token IDs.
+    token_end = len(begin) + tokens.shape[1]
+    rows = np.empty((sequences.count, token_end + len(end)), dtype=np.int64)
+    rows[:, : len(begin)] = begin
+    rows[:, len(begin) : token_end] = tokens
+    rows[:, token_end:] = end
+    tokens_with_boundaries = np.frombuffer(rows.tobytes(), dtype=rows.dtype).reshape(rows.shape)
+    return FlatBeamSearchSequences(tokens_with_boundaries, scores)
 
 
 def _can_share_prompt_decode(tokenizer: Any, prepared_prompt: Sequence[int]) -> bool:
@@ -192,29 +241,29 @@ class BeamSearchOutputProcessor:
                 self.tokenizer, call.params, self._boundary_token_ids
             )
 
-            if call.output_mode == "compact":
-                from vllm_gr.outputs import (
-                    CompactBeamSearchOutput,
-                    CompactBeamSearchSequence,
-                )
-
+            if call.output_mode != "full":
                 begin = () if begin_token_id is None else (begin_token_id,)
                 end = () if end_token_id is None else (end_token_id,)
-                # The trusted terminal result already owns immutable CPU tails.
-                # Do not instantiate lazy full-output objects just to slice them.
+                if call.output_mode == "flat":
+                    if any(not -(1 << 63) <= token < (1 << 63) for token in (*begin, *end)):
+                        # Keep Python integer token IDs outside the array's range.
+                        output = _result_output(materialize_beam_result(result))
+                    return [
+                        FlatBeamSearchOutput(
+                            sequences=(
+                                _flat_sequences(item.sequences, begin, end)
+                                if isinstance(item.sequences, BeamSequenceColumns)
+                                else _compact_sequences(item.sequences, begin, end)
+                            ),
+                            prompt_token_ids=self._accepted_prompt(
+                                request, item.item_index, begin_token_id
+                            ),
+                        )
+                        for item in output.items
+                    ]
                 return [
                     CompactBeamSearchOutput(
-                        sequences=tuple(
-                            CompactBeamSearchSequence(
-                                token_ids=begin
-                                + sequence.token_ids
-                                + (end if sequence.finish_reason == "length" else ()),
-                                cumulative_logprob=float(cast(float, sequence.cumulative_logprob)),
-                                finish_reason=sequence.finish_reason,
-                                stop_reason=sequence.stop_token_id,
-                            )
-                            for sequence in _materialized_sequences(item)
-                        ),
+                        sequences=_compact_sequences(_materialized_sequences(item), begin, end),
                         prompt_token_ids=self._accepted_prompt(
                             request, item.item_index, begin_token_id
                         ),
