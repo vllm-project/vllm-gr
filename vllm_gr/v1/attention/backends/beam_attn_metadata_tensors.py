@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ import torch
 __all__ = [
     "BeamTensorBuffers",
     "BeamTensorContext",
+    "BeamTensorResult",
     "allocate_tensor_buffers",
     "cached_seqlens_views",
     "create_beam_tensors",
@@ -57,6 +58,23 @@ class BeamTensorContext:
     aot_schedule: bool = False
     aot_sliding_window: tuple[int, int] | None = None
     cache_dtype: str = "auto"
+
+
+class BeamTensorResult(NamedTuple):
+    """Named field contract returned by ``create_beam_tensors``."""
+
+    prefix_indices: torch.Tensor | None
+    prefix_seqlens_kv: torch.Tensor | None
+    prefix_max_seq_len: int
+    prefix_cu_seqlens_q: torch.Tensor | None
+    prefix_max_q_len: int
+    prefix_block_table: torch.Tensor | None
+    suffix_seqlens_kv: torch.Tensor | None
+    suffix_max_seq_len: int
+    suffix_cu_seqlens_q: torch.Tensor | None
+    suffix_cu_seqlens_k: torch.Tensor | None
+    suffix_max_q_len: int
+    prefix_scheduler_metadata: torch.Tensor | None
 
 
 def _get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
@@ -183,8 +201,8 @@ def get_schedule(
     max_seq_len: int,
     causal: bool,
     max_num_splits: int,
-    scheduler: Callable[..., dict | None] | None,
-) -> dict | None:
+    scheduler: Callable[..., torch.Tensor | None],
+) -> torch.Tensor | None:
     if not ctx.aot_schedule:
         return None
 
@@ -193,7 +211,6 @@ def get_schedule(
     else:
         qkv_dtype = ctx.kv_cache_dtype
 
-    assert scheduler is not None
     return scheduler(
         batch_size=batch_size,
         max_seqlen_q=max_query_len,
@@ -385,14 +402,14 @@ def create_beam_tensors(
     device,
     max_num_splits: int,
     *,
-    scheduler: Callable[..., dict | None] | None = None,
+    scheduler: Callable[..., torch.Tensor | None],
     geom_key=None,
     decode_step: int | None = None,
     prefix_indices_contiguous: bool | None = None,
     prefix_max_q_len: int | None = None,
     suffix_max_q_len: int | None = None,
     suffix_max_seq_len: int | None = None,
-):
+) -> BeamTensorResult:
     if not prefix_seqlens_q_cpu:
         # Full structured initializations for profiling warm-up model passes
         prefix_indices_tensor = prefix_seqlens_kv_device = prefix_cu_seqlens_q_device = (
@@ -401,20 +418,19 @@ def create_beam_tensors(
         prefix_max_q_len = prefix_max_seq_len = 0
         suffix_cu_seqlens_q_device = suffix_cu_seqlens_k_device = suffix_seqlens_kv_device = None
         suffix_max_q_len = suffix_max_seq_len = 0
-        prefix_scheduler_metadata = None
-        return (
-            prefix_indices_tensor,
-            prefix_seqlens_kv_device,
-            prefix_max_seq_len,
-            prefix_cu_seqlens_q_device,
-            prefix_max_q_len,
-            prefix_block_table,
-            suffix_seqlens_kv_device,
-            suffix_max_seq_len,
-            suffix_cu_seqlens_q_device,
-            suffix_cu_seqlens_k_device,
-            suffix_max_q_len,
-            prefix_scheduler_metadata,
+        return BeamTensorResult(
+            prefix_indices=prefix_indices_tensor,
+            prefix_seqlens_kv=prefix_seqlens_kv_device,
+            prefix_max_seq_len=prefix_max_seq_len,
+            prefix_cu_seqlens_q=prefix_cu_seqlens_q_device,
+            prefix_max_q_len=prefix_max_q_len,
+            prefix_block_table=prefix_block_table,
+            suffix_seqlens_kv=suffix_seqlens_kv_device,
+            suffix_max_seq_len=suffix_max_seq_len,
+            suffix_cu_seqlens_q=suffix_cu_seqlens_q_device,
+            suffix_cu_seqlens_k=suffix_cu_seqlens_k_device,
+            suffix_max_q_len=suffix_max_q_len,
+            prefix_scheduler_metadata=None,
         )
 
     num_prefix = len(prefix_indices)
@@ -622,17 +638,17 @@ def create_beam_tensors(
         if geom_key is not None:
             schedule_cache[geom_key] = prefix_scheduler_metadata
 
-    return (
-        prefix_indices_tensor,
-        prefix_seqlens_kv_device,
-        prefix_max_seq_len,
-        prefix_cu_seqlens_q_device,
-        prefix_max_q_len,
-        prefix_block_table,
-        suffix_seqlens_kv_device,
-        suffix_max_seq_len,
-        suffix_cu_seqlens_q_device,
-        suffix_cu_seqlens_k_device,
-        suffix_max_q_len,
-        prefix_scheduler_metadata,
+    return BeamTensorResult(
+        prefix_indices=prefix_indices_tensor,
+        prefix_seqlens_kv=prefix_seqlens_kv_device,
+        prefix_max_seq_len=prefix_max_seq_len,
+        prefix_cu_seqlens_q=prefix_cu_seqlens_q_device,
+        prefix_max_q_len=prefix_max_q_len,
+        prefix_block_table=prefix_block_table,
+        suffix_seqlens_kv=suffix_seqlens_kv_device,
+        suffix_max_seq_len=suffix_max_seq_len,
+        suffix_cu_seqlens_q=suffix_cu_seqlens_q_device,
+        suffix_cu_seqlens_k=suffix_cu_seqlens_k_device,
+        suffix_max_q_len=suffix_max_q_len,
+        prefix_scheduler_metadata=prefix_scheduler_metadata,
     )
