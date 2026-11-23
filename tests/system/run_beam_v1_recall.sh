@@ -47,7 +47,17 @@ else
 import sys
 from huggingface_hub import snapshot_download
 
-print(snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2]))
+import os
+
+if os.environ.get("VLLM_GR_PREPARE_RECALL_MODEL") == "1":
+    from tests.helpers.artifacts import ensure_model, snapshot_spec
+
+    spec = snapshot_spec("onerec1b7")
+    if (sys.argv[1], sys.argv[2]) != (spec.repo_id, spec.revision):
+        raise SystemExit("Prepared Recall gate requires the reviewed model pin")
+    print(ensure_model(spec))
+else:
+    print(snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2]))
 PY
 )"
   model_revision_args=(--model-revision "$revision")
