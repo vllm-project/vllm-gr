@@ -112,7 +112,7 @@ else
     ./tests/development/test_resource.sh
     # test pre-commit
     set +e
-    idle_gpu=$(get_gpu "$mem_th")
+    idle_gpu=$(get_gpu "$mem_th" 15)
     rc=$?
     set -e
     if [ $rc -ne 0 ] || [ -z "$idle_gpu" ]; then

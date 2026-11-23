@@ -84,7 +84,7 @@ function get_gpu() {
     fi
 
     local mem_gpu=${1:-16}
-    local timeout_secs=${2:-0} # 0 means wait indefinitely
+    local timeout_secs=${2:-15} # seconds to wait; 0 waits indefinitely
 
     local gpu_count
     gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tail -n 1) || return 1
@@ -124,7 +124,7 @@ function get_gpus() {
 
     local num_gpus=${1:-1}
     local mem_gpu=${2:-16}
-    local timeout_secs=${3:-0} # 0 means wait indefinitely
+    local timeout_secs=${3:-15} # seconds to wait; 0 waits indefinitely
 
     local gpu_count
     gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tail -n 1) || return 1

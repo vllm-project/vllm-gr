@@ -154,6 +154,39 @@ def test_ordered_visible_intersection_and_timeout(npu: str) -> None:
     assert "Timeout" in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("npu", ["true", "false"])  # type: ignore[misc]
+@pytest.mark.parametrize("call", ["get_gpu 18", "get_gpus 2 18"])  # type: ignore[misc]
+def test_get_helpers_default_timeout_is_bounded(npu: str, call: str) -> None:
+    # Without an explicit timeout argument the helpers used to poll forever.
+    # A fake clock now advances by the default (15s) each tick so a single
+    # unavailable round-trip trips the timeout instead of hanging.
+    result = run_shell(
+        """
+        npu-smi() { echo 'Total Count : 4'; }
+        source tools/devices/resource.sh
+        npu_state=$1
+        nvidia-smi() { echo 4; }
+        is_available() { return 1; }
+        is_available_npu() { return 1; }
+        unset CUDA_VISIBLE_DEVICES ASCEND_RT_VISIBLE_DEVICES
+        sleep() { :; }
+        fake_now_file=$(mktemp)
+        echo 0 > "$fake_now_file"
+        date() {
+            local n
+            n=$(cat "$fake_now_file")
+            echo "$n"
+            echo $((n + 15)) > "$fake_now_file"
+        }
+        eval "$2"
+        """,
+        npu,
+        call,
+    )
+    assert result.returncode != 0
+    assert "Timeout" in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("stats", "status", "available"),
     [

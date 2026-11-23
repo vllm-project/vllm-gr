@@ -7,7 +7,7 @@ set +x
 set -euo pipefail
 
 source "./tools/devices/resource.sh"
-idle_gpu=$(get_gpu 4)
+idle_gpu=$(get_gpu 4 15)
 
 
 if [ -z "$idle_gpu" ]; then

@@ -103,7 +103,7 @@ function _npu_device_indices() {
 
 function get_npu() {
     local mem_npu=${1:-3000}
-    local timeout_secs=${2:-0} # 0 means wait indefinitely
+    local timeout_secs=${2:-15} # seconds to wait; 0 waits indefinitely
 
     local ncount
     ncount=${NPU_COUNT}
@@ -139,7 +139,7 @@ function get_npu() {
 function get_npus() {
     local num_npus=${1:-1}
     local mem_npu=${2:-16}
-    local timeout_secs=${3:-0} # 0 means wait indefinitely
+    local timeout_secs=${3:-15} # seconds to wait; 0 waits indefinitely
 
     local ncount=${NPU_COUNT}
     local nchip=${CHIP_NUM}
