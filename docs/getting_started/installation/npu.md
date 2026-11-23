@@ -65,6 +65,16 @@ source "${ASCEND_TOOLKIT_HOME}/set_env.sh"
 # same type name, so build only the required operators instead of the full
 # set; the --no-build-* flags skip the unrelated third-party operator
 # libraries.
+#
+# Note: the operator subset selected by -n contains no inner/exclude-class
+# operators, so xllm-ops does not generate their inner/exc ops-info .ini files.
+# Current xllm-ops still lists those .ini files as unconditional dependencies of
+# the ops-info target, so the subset build fails with
+# "No rule to make target .../inner/aic-<soc>-ops-info.ini". Until that fix lands
+# upstream, make the inner/exc .ini dependencies conditional in
+# xllm-ops cmake/func.cmake (gate them on generate_aclnn_inner_srcs and
+# generate_exclude_proto_srcs).
+
 bash build.sh \
   -n "beam_search_group;cache_unshared_kv;select_unshared_kv;x_attention;onerec_final_beam_select;rec_constrained_top_k" \
   --no-build-transformer --no-build-flash
