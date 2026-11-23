@@ -166,19 +166,14 @@ def test_reason_judge_factory_uses_configured_http_endpoint(
                     else [
                         {
                             "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": None
-                                if response_kind == "empty content"
-                                else '{"llm_score": 4}',
-                            },
+                            "text": "" if response_kind == "empty content" else '{"llm_score": 4}',
                             "finish_reason": "stop",
                         }
                     ]
                 )
                 response = {
                     "id": "judge-completion",
-                    "object": "chat.completion",
+                    "object": "text_completion",
                     "created": 1,
                     "model": "Qwen/Qwen3-8B",
                     "choices": choices,
@@ -231,12 +226,12 @@ def test_reason_judge_factory_uses_configured_http_endpoint(
             thread.join()
 
     for request in requests:
-        assert request["path"] == "/v1/chat/completions"
+        assert request["path"] == "/v1/completions"
         assert request["authorization"] == "Bearer test-judge-key"
         payload = request["payload"]
         assert payload["model"] == "Qwen/Qwen3-8B"
-        assert payload["messages"][0]["role"] == "user"
-        assert "prediction" in payload["messages"][0]["content"]
+        assert "messages" not in payload
+        assert "prediction" in payload["prompt"]
 
 
 def test_reason_judge_rejects_client_without_generate(monkeypatch: pytest.MonkeyPatch) -> None:

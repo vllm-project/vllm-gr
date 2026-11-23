@@ -51,11 +51,9 @@ workspace and log-sum-exp buffers are cached per BSND shape in the capture
 metadata (`bsnd_resources`), so their addresses are baked into the graph and
 reused on every replay.
 
-!!! note "Enabling BSND raises the bar for TND"
-
-    When a BSND spec is configured, a TND capture failure is also fatal: BSND
-    graphs are captured first, and the TND capture loop re-raises while a BSND
-    spec is active.
+**TND capture with BSND enabled.** A TND capture failure is fatal when a
+BSND spec is configured. The runner captures BSND first, and the TND capture
+loop re-raises while that spec is active.
 
 ## Configuration
 

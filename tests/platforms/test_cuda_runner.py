@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.helpers.vllm_subprocess import run_vllm_script
 from vllm_gr.config import GRConfig
 from vllm_gr.config.backend_plan import BACKEND_PLAN_KEY
 from vllm_gr.platforms.cuda import CUDA_BACKEND
@@ -93,6 +94,70 @@ def test_each_worker_uses_its_admitted_runner_and_stage(workers: Any) -> None:
         assert adapter.implementation_id == plan.choices.to_dict()["runner"]
         assert adapter.execute_model() == "executed"
     assert all(hooks.install.call_count == 1 for hooks in installers.values())
+
+
+def test_cuda_startup_preserves_native_runner_fallback() -> None:
+    # Isolate native config from vllm-ascend monkey patches in other tests.
+    run_vllm_script(
+        "from tests.platforms.test_cuda_runner import _assert_native_runner_fallback\n"
+        "_assert_native_runner_fallback()"
+    )
+
+
+def _assert_native_runner_fallback() -> None:
+    import os
+    from unittest.mock import patch
+
+    from vllm import platforms
+    from vllm.config import vllm as native
+
+    from vllm_gr.engine.startup import configure_model_runner_default
+
+    class Config(SimpleNamespace):
+        use_v2_model_runner = native.VllmConfig.use_v2_model_runner
+        _get_v2_model_runner_unsupported_features = (
+            native.VllmConfig._get_v2_model_runner_unsupported_features
+        )
+
+    config = Config(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(logits_processors=[]),
+        speculative_config=None,
+        compilation_config=SimpleNamespace(
+            mode=native.CompilationMode.NONE, pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        parallel_config=SimpleNamespace(
+            distributed_executor_backend=None, use_ubatching=False, enable_elastic_ep=False
+        ),
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+    )
+    runner_flag = "VLLM_USE_V2_MODEL_RUNNER"
+    with (
+        patch.dict(os.environ),
+        patch.object(native, "HAS_TRITON", True),
+        patch.object(platforms, "current_platform", SimpleNamespace(is_rocm=lambda: False)),
+        patch("importlib.metadata.entry_points", return_value=()),
+        patch(
+            "vllm_gr.platforms.identity.current_platform_identity",
+            return_value=SimpleNamespace(platform_enum="CUDA", device_type="cuda"),
+        ),
+    ):
+        os.environ.pop(runner_flag, None)
+        configure_model_runner_default()
+        assert config.use_v2_model_runner is True
+        config.model_config.logits_processors = ["example.CustomLogitsProcessor"]
+        assert config.use_v2_model_runner is False
+
+        os.environ[runner_flag] = "1"
+        configure_model_runner_default()
+        assert config.use_v2_model_runner is True
+        with pytest.raises(ValueError, match="custom logits processors"):
+            native.VllmConfig._validate_v2_model_runner(config)
+
+        os.environ[runner_flag] = "0"
+        configure_model_runner_default()
+        config.model_config.logits_processors = []
+        assert config.use_v2_model_runner is False
 
 
 def test_watermark_override_selects_v2_with_the_v1_environment(

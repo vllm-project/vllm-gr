@@ -32,18 +32,10 @@ the fixed `cuda` and `npu` identities are adapted.
 ### Plugin startup
 
 Provider modules defer hardware imports until a method is called, so discovery
-can run without loading either accelerator runtime. The `vllm.general_plugins`
-entry point (`vllm_gr.plugin:register`) then:
-
-1. Calls `configure_model_runner_default()`, which defaults
-   `VLLM_USE_V2_MODEL_RUNNER` to 0.
-2. Validates the environment.
-3. Installs the shared compatibility hooks: the tied-embedding patch and the
-   CUSTOM attention selector patch.
-4. Applies backend patches and installs the common Beam frontend and
-   sliced-logits hooks.
-
-A partial installation failure stops startup.
+can run without loading either accelerator runtime. After selection, the
+general plugin validates the environment and installs the process's patch
+plan. See [patch activation](../runtime_patch_inventory.md#activation-and-maintenance)
+for process roles, initialization ordering, and installation checks.
 
 ## Provider contract
 

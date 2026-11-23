@@ -24,7 +24,7 @@ except ImportError:
 # Must be imported before any vllm.benchmarks module usage.
 import benchmarks.open_one_rec.one_rec_patch  # noqa: F401
 from benchmarks.open_one_rec.base_evaluator import EvaluationError
-from benchmarks.open_one_rec.chat import messages_for_prompt
+from benchmarks.open_one_rec.chat import completion_prompt
 from benchmarks.open_one_rec.open_one_rec_loader import (
     DEFAULT_DATASET_PATH,
     TASK_REGISTRY,
@@ -125,6 +125,7 @@ def run_api_inference(
     *,
     samples: list[tuple[str, dict[str, Any]]] | None = None,
     request_timeout: float = 180.0,
+    tokenizer: Any = None,
 ) -> list[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
@@ -134,6 +135,7 @@ def run_api_inference(
     # Map generation config to API parameters
     api_params = {
         "model": model,
+        "add_special_tokens": False,
         "use_beam_search": True if (gen_config.get("num_beams", 1) > 1) else False,
         "max_tokens": gen_config.get("max_new_tokens", 1024),
         "temperature": gen_config.get("temperature", 0.0),
@@ -150,14 +152,8 @@ def run_api_inference(
         _, sample, prompt = entry
         payload = {
             **api_params,
-            "messages": messages_for_prompt(prompt, sample.get("chat_messages")),
+            "prompt": prompt,
         }
-        template_options = sample.get("chat_template_kwargs")
-        if template_options is not None or chat_template_kwargs is not None:
-            payload["chat_template_kwargs"] = {
-                **(template_options or {}),
-                **(chat_template_kwargs or {}),
-            }
 
         try:
             response = requests.post(
@@ -173,27 +169,16 @@ def run_api_inference(
 
             outputs = []
             for choice in choices:
-                message = choice.get("message") if isinstance(choice, dict) else None
-                if not isinstance(message, dict):
-                    return "choice has no text message"
-                parts = [
-                    message.get(field) for field in ("reasoning", "reasoning_content", "content")
-                ]
-                if any(part is not None and not isinstance(part, str) for part in parts):
-                    return "choice contains non-text message content"
-                reasoning, reasoning_content, content = parts
-                if not reasoning or not reasoning.strip():
-                    reasoning = reasoning_content or ""
-                content = content or ""
-                if not (reasoning.strip() or content.strip()):
-                    return "choice has no text message"
-                if not reasoning.strip():
-                    raw_content = content.lstrip()
-                    if raw_content.startswith("<think>"):
-                        # partition leaves an empty answer if generation stops inside the block.
-                        reasoning, _, content = raw_content.removeprefix("<think>").partition(
-                            "</think>"
-                        )
+                content = choice.get("text") if isinstance(choice, dict) else None
+                if not isinstance(content, str) or not content.strip():
+                    return "choice has no text completion"
+                reasoning = ""
+                raw_content = content.lstrip()
+                if raw_content.startswith("<think>"):
+                    # Keep truncated reasoning separate from the scored final answer.
+                    reasoning, _, content = raw_content.removeprefix("<think>").partition(
+                        "</think>"
+                    )
                 outputs.append(MockCompletionOutput(content, reasoning=reasoning))
             return MockRequestOutput(prompt, outputs)
         except (requests.RequestException, ValueError) as exc:
@@ -203,7 +188,8 @@ def run_api_inference(
     if samples is None:
         samples = [(str(index), {}) for index in range(len(prompts))]
     entries = [
-        (key, sample, prompt) for (key, sample), prompt in zip(samples, prompts, strict=True)
+        (key, sample, completion_prompt(prompt, sample, tokenizer, chat_template_kwargs))
+        for (key, sample), prompt in zip(samples, prompts, strict=True)
     ]
     logger.info("Sending %s requests to %s", len(entries), api_url)
     with ThreadPoolExecutor(max_workers=min(len(entries), worker_limit)) as executor:
@@ -269,7 +255,7 @@ def main() -> int:
     parser.add_argument(
         "--chat-template-kwargs",
         type=json.loads,
-        help='Online chat template JSON object, e.g. {"enable_thinking": false}',
+        help='Client-side prompt template options, e.g. {"enable_thinking": false}',
     )
     parser.add_argument(
         "--batch-size",
@@ -337,6 +323,8 @@ def main() -> int:
         parser.error("--max-concurrency must be positive")
     if args.enforce_eager and args.endpoint:
         parser.error("Online Eager mode requires --enforce-eager on the server")
+    if args.endpoint and args.endpoint != "/v1/completions":
+        parser.error("Online accuracy requires --endpoint /v1/completions")
     if args.chat_template_kwargs is not None:
         if not isinstance(args.chat_template_kwargs, dict):
             parser.error("--chat-template-kwargs must be a JSON object")
@@ -467,6 +455,7 @@ def main() -> int:
                 chat_template_kwargs=args.chat_template_kwargs,
                 samples=list(dataset.items()),
                 request_timeout=args.request_timeout,
+                tokenizer=tokenizer,
             )
         except InferenceError as exc:
             return _report_failure(args, str(exc), sample_errors=exc.failures)

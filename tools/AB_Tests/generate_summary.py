@@ -621,7 +621,7 @@ def main() -> int:
             if offline
             else f"RecIF {task} / beam-{args.beam_width} / input-{args.input_length} / concurrency-{raw['max_concurrency']}",
             "execution_mode": "offline" if offline else "online",
-            "endpoint": offline_api if offline else "/v1/chat/completions",
+            "endpoint": offline_api if offline else "/v1/completions",
             "backend": "vllm-gr-offline" if offline else raw["backend"],
             "num_prompts": num_prompts,
             "max_concurrency": raw["max_concurrency"],

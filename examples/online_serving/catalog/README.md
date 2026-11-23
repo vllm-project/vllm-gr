@@ -63,7 +63,7 @@ For a different raw catalog you already have, place it at
 
 Use the local snapshot for `ONEREC_MODEL` and set `ONEREC_BACKEND` to
 `npu` on Ascend. See the
-[download instructions](../../../docs/user_guide/onerec_quickstart.md#1-check-the-environment)
+[download instructions](../../../docs/getting_started/quickstart.md#download-onerec)
 if you need the model or mapping.
 
 ```bash

@@ -20,7 +20,7 @@ For multiple assigned devices, pass a comma-separated list such as
 `--device-id 0,2`. Add `--wheel` to run the wheel smoke test after the checks
 succeed. For OneRec tests that use a local checkpoint, set
 `VLLM_GR_TEST_MODEL` to the snapshot directory. See the
-[OneRec CUDA example](../../user_guide/onerec_quickstart.md#5-validate-and-troubleshoot)
+[OneRec checkpoint instructions](../../getting_started/quickstart.md#download-onerec)
 or the [Ascend system tests](../../../tests/st/test_onerec_v1_npu_e2e.py).
 
 ## CUDA and Ascend checks
@@ -35,8 +35,8 @@ or the [Ascend system tests](../../../tests/st/test_onerec_v1_npu_e2e.py).
 For local NPU validation, use the [Ascend vendor image](../../getting_started/installation/npu.md#prerequisites)
 and build xllm-ops for its CANN version. If the job activates Conda, check
 that `CONDA_PREFIX`, `PATH` and the CANN environment select that runtime.
-An environment built for vLLM 0.22 needs the current vendor stack before
-it can run the tests for vLLM 0.30.0.
+Use the vendor stack listed in the
+[runtime compatibility table](../../getting_started/installation.md#runtime-compatibility).
 
 From the repository root, check the selected Python against the versions
 declared by the checkout before installing the GR developer extras. The

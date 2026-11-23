@@ -4,7 +4,9 @@
 """Exercise the patched OneRec benchmark HTTP client with real vLLM request types."""
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -14,6 +16,112 @@ import pytest
 from tests.helpers.vllm_subprocess import run_vllm_script
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
+
+
+def test_serving_adapter_is_scoped_to_onerec() -> None:
+    run_vllm_script(
+        "from tests.benchmarks.open_one_rec.test_http_client import _assert_serving_adapter_scope\n"
+        "_assert_serving_adapter_scope()"
+    )
+
+
+def _assert_serving_adapter_scope() -> None:
+    from importlib import import_module
+
+    from vllm.benchmarks.lib.endpoint_request_func import (
+        ASYNC_REQUEST_FUNCS,
+        RequestFuncInput,
+    )
+
+    native_handler = ASYNC_REQUEST_FUNCS["openai"]
+    payloads: list[dict[str, Any]] = []
+    selected_backends: list[str] = []
+
+    class Stream:
+        async def iter_any(self) -> AsyncIterator[bytes]:
+            yield b'data: {"choices":[{"text":"result"}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    @asynccontextmanager
+    async def post(*, url: str, json: dict[str, Any], headers: Any) -> AsyncIterator[Any]:
+        payloads.append(json)
+        yield SimpleNamespace(
+            status=200,
+            content=Stream(),
+            json=mock.AsyncMock(return_value={"choices": [{"text": "result"}]}),
+        )
+
+    def request(**kwargs: Any) -> Any:
+        return RequestFuncInput(
+            api_url="http://localhost/v1/completions",
+            prompt="unrendered random prompt",
+            prompt_len=3,
+            output_len=5,
+            model="test-model",
+            **kwargs,
+        )
+
+    session = SimpleNamespace(post=post)
+    baseline = asyncio.run(native_handler(request(), session))
+    assert baseline.success, baseline.error
+    baseline_payload = payloads.pop()
+
+    from benchmarks.open_one_rec import one_rec_patch
+
+    # Importing the extension must preserve native and third-party handler identity.
+    assert ASYNC_REQUEST_FUNCS["openai"] is native_handler
+    serve = import_module("vllm.benchmarks.serve")
+
+    async def benchmark_driver(*, endpoint_type: str, extra_body: Any = None) -> Any:
+        selected_backends.append(endpoint_type)
+        return await ASYNC_REQUEST_FUNCS[endpoint_type](request(extra_body=extra_body), session)
+
+    def serve_main(args: Any) -> Any:
+        assert args.backend == "openai"
+        return asyncio.run(
+            serve.benchmark(
+                endpoint_type=args.backend,
+                extra_body={"use_beam_search": True} if args.dataset_name == "onerec" else None,
+            )
+        )
+
+    with (
+        mock.patch.object(one_rec_patch, "original_serve_benchmark", benchmark_driver),
+        mock.patch.object(one_rec_patch, "original_serve_main", side_effect=serve_main) as main,
+    ):
+        # Run a native workload before and after OneRec in the same process.
+        for dataset in ("random", "onerec", "random"):
+            args = SimpleNamespace(
+                dataset_name=dataset, backend="openai", endpoint="/v1/completions"
+            )
+            result = serve.main(args)
+            assert result.success, result.error
+            payload = payloads.pop()
+            if dataset == "onerec":
+                assert payload["add_special_tokens"] is False
+                assert payload["vllm_xargs"] == {
+                    "begin_token": "<|sid_begin|>",
+                    "end_token": "<|sid_end|>",
+                }
+                assert payload["use_beam_search"] is True
+                assert payload["stream"] is False
+            else:
+                assert payload == baseline_payload
+                assert "add_special_tokens" not in payload
+                assert "vllm_xargs" not in payload
+        assert selected_backends == ["openai", "onerec-openai", "openai"]
+
+        main.side_effect = RuntimeError("benchmark failed")
+        with pytest.raises(RuntimeError, match="benchmark failed"):
+            serve.main(
+                SimpleNamespace(dataset_name="onerec", backend="openai", endpoint="/v1/completions")
+            )
+        # A failed OneRec run must not affect callers of the native benchmark API.
+        result = asyncio.run(serve.benchmark(endpoint_type="openai"))
+        assert result.success, result.error
+        assert selected_backends[-1] == "openai"
+        assert payloads.pop() == baseline_payload
+    assert ASYNC_REQUEST_FUNCS["openai"] is native_handler
 
 
 def test_fixed_length_prompt_disables_thinking_in_http_payload() -> None:
@@ -71,7 +179,7 @@ def _assert_fixed_length_payload() -> None:
         (sample,) = one_rec_patch.patched_get_samples(args, Tokenizer())
 
     request = one_rec_patch.RequestFuncInput(
-        api_url="http://localhost/v1/chat/completions",
+        api_url="http://localhost/v1/completions",
         prompt=sample.prompt,
         prompt_len=sample.prompt_len,
         output_len=sample.expected_output_len,
@@ -80,15 +188,136 @@ def _assert_fixed_length_payload() -> None:
         extra_body=_merge_overrides(None, sample.request_overrides),
     )
     session = mock.MagicMock()
-    response = SimpleNamespace(status=400, reason="test response")
+    response = SimpleNamespace(
+        status=400, reason="test response", text=mock.AsyncMock(return_value="")
+    )
     session.post.return_value.__aenter__ = mock.AsyncMock(return_value=response)
-    asyncio.run(one_rec_patch.patched_async_request_openai_chat_completions(request, session))
+    asyncio.run(one_rec_patch.patched_async_request_openai_completions(request, session))
     session.post.assert_called_once()
     payload = session.post.call_args.kwargs["json"]
-    assert payload["messages"] == [
-        {"role": "user", "content": [{"type": "text", "text": "rendered"}]}
+    assert payload["prompt"] == "rendered"
+    assert payload["add_special_tokens"] is False
+    assert "messages" not in payload
+    assert "chat_template_kwargs" not in payload
+
+
+def test_beam_completion_passes_native_streaming_guard() -> None:
+    run_vllm_script(
+        "from tests.benchmarks.open_one_rec.test_http_client import _assert_beam_completion\n"
+        "_assert_beam_completion()",
+        "--use-beam-search",
+        "--n",
+        "128",
+    )
+
+
+def _assert_beam_completion() -> None:
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+
+    from benchmarks.open_one_rec import one_rec_patch
+
+    class RenderReached(Exception):
+        """Stop after the real native request guard, before model execution."""
+
+    for extra_body in (None, {"stream": True, "stream_options": {"include_usage": True}}):
+        boundary: Any = SimpleNamespace(
+            create_error_response=lambda message: {"error": {"message": message}},
+            render_completion_request=mock.AsyncMock(side_effect=RenderReached),
+        )
+        captured: list[dict[str, Any]] = []
+
+        @asynccontextmanager
+        async def post(*, url: str, json: dict[str, Any], headers: Any) -> AsyncIterator[Any]:
+            captured.append(json)
+            parsed = CompletionRequest.model_validate(json)
+            try:
+                error = await OpenAIServingCompletion._create_completion(boundary, parsed)
+            except RenderReached:
+                body = {
+                    "choices": [{"text": "<sid-a>"}, {"text": "<sid-b>"}],
+                    "usage": {"completion_tokens": 10, "prompt_tokens": 7},
+                }
+                yield SimpleNamespace(status=200, json=mock.AsyncMock(return_value=body))
+            else:
+                yield SimpleNamespace(
+                    status=400,
+                    reason="Bad Request",
+                    text=mock.AsyncMock(return_value=str(error)),
+                )
+
+        # Import-time CLI flags above match the gate's --use-beam-search --n 128.
+        request = one_rec_patch.RequestFuncInput(
+            api_url="http://localhost/v1/completions",
+            prompt="rendered SID prompt",
+            prompt_len=7,
+            output_len=5,
+            model="test-model",
+            extra_body=extra_body,
+        )
+        with mock.patch.object(one_rec_patch.time, "perf_counter", side_effect=[100.0, 102.0]):
+            result = asyncio.run(
+                one_rec_patch.patched_async_request_openai_completions(
+                    request, SimpleNamespace(post=post)
+                )
+            )
+        assert result.success, result.error
+        boundary.render_completion_request.assert_awaited_once()
+        (payload,) = captured
+        assert payload["use_beam_search"] is True
+        assert payload["n"] == 128
+        assert payload["max_tokens"] == 5
+        assert payload["stream"] is False
+        assert "stream_options" not in payload
+        assert result.generated_text == "<sid-a><sid-b>"
+        assert result.output_tokens == 10
+        assert result.prompt_len == 7
+        assert result.ttft == result.latency == 2.0
+        assert result.itl == []
+
+
+def test_beam_completion_reports_response_errors() -> None:
+    run_vllm_script(
+        "from tests.benchmarks.open_one_rec.test_http_client import _assert_beam_response_errors\n"
+        "_assert_beam_response_errors()"
+    )
+
+
+def _assert_beam_response_errors() -> None:
+    from benchmarks.open_one_rec import one_rec_patch
+
+    cases = [
+        (200, {"choices": []}, "response contains no text output"),
+        (200, {"choices": [{"text": ""}]}, "response contains no text output"),
+        (200, {"choices": [{"text": None}]}, "invalid completion text"),
+        (200, {"error": {"message": "engine failed"}}, "engine failed"),
+        (400, {"error": {"message": "invalid Beam width"}}, "invalid Beam width"),
+        (502, "upstream unavailable", "upstream unavailable"),
     ]
-    assert payload["chat_template_kwargs"]["enable_thinking"] is False
+    for status, body, expected in cases:
+        request = one_rec_patch.RequestFuncInput(
+            api_url="http://localhost/v1/completions",
+            prompt="question",
+            prompt_len=1,
+            output_len=5,
+            model="test-model",
+            extra_body={"use_beam_search": True},
+        )
+        response = SimpleNamespace(
+            status=status,
+            reason="Bad Request" if status == 400 else "Bad Gateway",
+            json=mock.AsyncMock(return_value=body),
+            text=mock.AsyncMock(return_value=body if isinstance(body, str) else json.dumps(body)),
+        )
+        session = mock.MagicMock()
+        session.post.return_value.__aenter__ = mock.AsyncMock(return_value=response)
+        result = asyncio.run(
+            one_rec_patch.patched_async_request_openai_completions(request, session)
+        )
+        assert not result.success
+        assert expected in result.error, result.error
+        if status != 200:
+            assert result.error.startswith(f"HTTP {status} "), result.error
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -97,7 +326,7 @@ def _assert_fixed_length_payload() -> None:
         pytest.param(b"\n", b"\n\n", id="complete-events"),
         pytest.param(b"\n", b"\n\ndata: ", id="split-done-prefix"),
         pytest.param(b"\n", b"hello ", id="split-content-space"),
-        pytest.param(b"\r\n", b"}}]}", id="crlf-after-json"),
+        pytest.param(b"\r\n", b"}]}", id="crlf-after-json"),
         pytest.param(b"\r\n", b"\r", id="split-crlf"),
         pytest.param(b"\r", b"\r", id="split-cr-separator"),
     ],
@@ -106,7 +335,7 @@ def test_streaming_preserves_response_across_network_chunks(
     line_ending: bytes, split_after: bytes
 ) -> None:
     separator = line_ending * 2
-    stream = b'data: {"choices": [{"delta": {"content": "hello world"}}]}' + separator
+    stream = b'data: {"choices": [{"text": "hello world"}]}' + separator
     stream += b"data: [DONE]" + separator
     offset = stream.index(split_after) + len(split_after)
     run_vllm_script(
@@ -126,7 +355,7 @@ def test_streaming_completion() -> None:
 
 
 def _assert_stream_completion() -> None:
-    text = b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+    text = b'data: {"choices":[{"text":"hello"}]}\n\n'
     done = b"data: [DONE]\n\n"
     error = b'data: {"error":{"message":"engine failed"}}\n\n'
     # None raises a connection reset on the next read.
@@ -148,8 +377,8 @@ def _assert_stream_completion() -> None:
             "multiline data and split UTF-8",
             [
                 b'data: {"choices":\r',
-                b'\ndata:[{"delta":{"content":"hello \xc3',
-                b'\xa9"}}]}\n\n',
+                b'\ndata:[{"text":"hello \xc3',
+                b'\xa9"}]}\n\n',
                 done,
             ],
             "hello \u00e9",
@@ -178,15 +407,13 @@ def _assert_stream(chunks: Sequence[bytes | None], expected_text: str, expected_
     session = mock.MagicMock()
     session.post.return_value.__aenter__ = mock.AsyncMock(return_value=response)
     request = one_rec_patch.RequestFuncInput(
-        api_url="http://localhost/v1/chat/completions",
+        api_url="http://localhost/v1/completions",
         prompt="question",
         prompt_len=1,
         output_len=5,
         model="test-model",
     )
-    result = asyncio.run(
-        one_rec_patch.patched_async_request_openai_chat_completions(request, session)
-    )
+    result = asyncio.run(one_rec_patch.patched_async_request_openai_completions(request, session))
     assert result.generated_text == expected_text, repr(result.generated_text)
     assert result.success == (not expected_error), result.error
     error_lines = result.error.splitlines()

@@ -287,19 +287,22 @@ def test_npu_graph_example_requires_replay_only_for_decode(
 @pytest.mark.parametrize(  # type: ignore[misc]
     "backend,override,expected",
     [
-        ("cuda", None, "1"),
-        ("cuda", "", "1"),
+        ("cuda", None, None),
+        ("cuda", "", ""),
         ("cuda", "0", "0"),
+        ("cuda", "1", "1"),
         ("npu", None, "0"),
         ("npu", "1", "0"),
     ],
 )
+@pytest.mark.parametrize("mode", ["beam", "thinking", "cot"])  # type: ignore[misc]
 def test_offline_example_selects_model_runner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     backend: str,
     override: str | None,
-    expected: str,
+    expected: str | None,
+    mode: str,
 ) -> None:
     key = "VLLM_USE_V2_MODEL_RUNNER"
     monkeypatch.setenv(key, "0")
@@ -307,6 +310,15 @@ def test_offline_example_selects_model_runner(
         monkeypatch.delenv(key)
     else:
         monkeypatch.setenv(key, override)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Recommend an item.")
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text("[]")
+    options = {
+        "beam": [],
+        "thinking": ["--enable-thinking"],
+        "cot": ["--cot", "--catalog", str(catalog)],
+    }[mode]
     monkeypatch.setattr(
         sys,
         "argv",
@@ -316,13 +328,17 @@ def test_offline_example_selects_model_runner(
             str(tmp_path),
             "--constraint-backend",
             backend,
+            "--prompt",
+            str(prompt),
+            *options,
         ],
     )
-    monkeypatch.setattr(example, "run", lambda args: None)
+    monkeypatch.setattr(example, "run", lambda *args: None)
+    monkeypatch.setattr(example, "run_thinking", lambda args: None)
 
     example.main()
 
-    assert os.environ[key] == expected
+    assert os.environ.get(key) == expected
 
 
 @pytest.mark.l1  # type: ignore[misc]

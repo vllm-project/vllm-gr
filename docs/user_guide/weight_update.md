@@ -4,6 +4,15 @@ Use a sidecar to roll out model weights or replace a constraint catalog on
 running GR instances in a shared Pod. For validation and recovery behavior,
 see the [sidecar design](../design/feature/weight_update.md).
 
+## Serving prerequisites
+
+This workflow requires a **gRPC inference service with a separate HTTP
+management listener**, enabled by `gr.admin_port`. Point Sidecar at the
+management port. The HTTP `/v1/completions` inference entrypoint does not
+start these update endpoints. Check the
+[gRPC device support](feature_compatibility.md#support-matrix) before choosing
+this deployment path; Ascend-specific gRPC validation remains undocumented.
+
 | Resource | Update behavior |
 | --- | --- |
 | Checkpoint | Pause and drain each group of instances, load compatible weights, then resume. |
@@ -21,49 +30,8 @@ FileSystem, Update Mode, and Update Process implementations are passed as Python
 objects, so users can supply custom implementations directly. A runnable example
 is [examples/sidecar/config.py](../../examples/sidecar/config.py).
 
-```python
-from pathlib import Path
-
-from vllm_gr.sidecar import (
-    HDFSDownloader,
-    Instance,
-    OnlineUpdateProcess,
-    PausedUpdateProcess,
-    RollingUpdate,
-    SidecarConfig,
-    SyncUpdate,
-    UpdateTask,
-)
-
-config = SidecarConfig(
-    instances=[
-        Instance(id=f"node-{i}", control_url=f"http://127.0.0.1:{9100 + i}")
-        for i in range(8)
-    ],
-    tasks=[
-        UpdateTask(
-            name="ckpt",
-            resource_type="checkpoint",
-            filesystem=HDFSDownloader(),
-            address="hdfs://cluster/models/gr/checkpoints",
-            target_dir=Path("/updates/checkpoints"),
-            poll_interval_seconds=30,
-            update_mode=RollingUpdate(max_concurrent_updates=1),
-            update_process=PausedUpdateProcess(),
-        ),
-        UpdateTask(
-            name="trie",
-            resource_type="trie",
-            filesystem=HDFSDownloader(),
-            address="hdfs://cluster/models/gr/tries",
-            target_dir=Path("/updates/tries"),
-            poll_interval_seconds=60,
-            update_mode=SyncUpdate(),
-            update_process=OnlineUpdateProcess(),
-        ),
-    ],
-)
-```
+Copy the linked configuration to your deployment directory and edit the
+instance URLs, HDFS sources, and local cache paths described below.
 
 - `instances` lists service control endpoints; its length is independent of the
   physical GPU count. Tasks can target `all` or a list of instance IDs.
@@ -125,12 +93,11 @@ change the list to the number actually started.
 The control host defaults to `127.0.0.1`, suitable for containers sharing a Pod
 network. `gr.admin_host` overrides it. Set
 `gr.trie_retention_seconds` on each service to override the 60-second old-table
-retention period. The HTTP inference entrypoint does not enable these hot-update
-endpoints; use the gRPC serving path.
+retention period.
 
 ### Start Sidecar
 
-Save the Python configuration above, with your HDFS sources, shared cache paths,
+Save your copy of the example configuration, with your HDFS sources, shared cache paths,
 and actual instance control URLs, for example as `/etc/vllm-gr/sidecar-config.py`.
 Start **one Sidecar process** for those targets:
 
@@ -202,12 +169,6 @@ Status has no query parameters and returns both resources in one response:
   "trie_path": "/updates/tries/trie_20261106_120000/table.safetensors"
 }
 ```
-
-`ServiceState` is an internal enum with only `RUNNING` and `PAUSED`. Core and
-Sidecar business logic use enum members; IPC/HTTP serialize their values as
-`running`/`paused`, and receivers restore the enum at the boundary. `PAUSED`
-indicates a scheduler pause mode; callers still await the pause operation's
-completion before loading weights.
 
 Version and path fields are independent of service state. The status
 contract, including `checkpoint_valid` and which component owns it, is defined

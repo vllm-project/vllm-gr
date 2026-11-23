@@ -26,10 +26,10 @@ _SID_B = "<|sid_begin|><s_a_4><s_b_5><s_c_6><|sid_end|>"
         ("timeout", "Timeout"),
         ("no choices", "no choices"),
         ("too few choices", "expected 2 choices"),
-        ("bad choice", "no text message"),
-        ("null content", "no text message"),
-        ("empty content", "no text message"),
-        ("whitespace only", "no text message"),
+        ("bad choice", "no text completion"),
+        ("null content", "no text completion"),
+        ("empty content", "no text completion"),
+        ("whitespace only", "no text completion"),
     ],
 )
 def test_accuracy_cli_reports_failed_samples(
@@ -47,19 +47,19 @@ def test_accuracy_cli_reports_failed_samples(
         response.status_code = 500 if failure == "http" else 200
         choices = {
             "no choices": [],
-            "too few choices": [{"message": {"content": "short"}}],
+            "too few choices": [{"text": "short"}],
             "bad choice": [{}, {}],
             "null content": [
-                {"message": {"content": "valid answer"}},
-                {"message": {"content": None}},
+                {"text": "valid answer"},
+                {"text": None},
             ],
             "empty content": [
-                {"message": {"content": "", "reasoning_content": None}},
-                {"message": {"content": "valid answer"}},
+                {"text": ""},
+                {"text": "valid answer"},
             ],
             "whitespace only": [
-                {"message": {"content": " ", "reasoning_content": "\n"}},
-                {"message": {"content": "valid answer"}},
+                {"text": " \n"},
+                {"text": "valid answer"},
             ],
         }
         response._content = json.dumps({"choices": choices.get(failure, [])}).encode()
@@ -84,7 +84,7 @@ def test_accuracy_cli_reports_failed_samples(
             "--task-type",
             "video",
             "--endpoint",
-            "/v1/chat/completions",
+            "/v1/completions",
             "--n",
             "2",
             "--request-timeout",
@@ -136,11 +136,13 @@ def test_accuracy_scores_final_sid(
     }
 
     def post(_url: str, **kwargs: Any) -> Any:
-        assert kwargs["json"]["messages"] == messages
-        assert kwargs["json"]["chat_template_kwargs"] == {"enable_thinking": True}
+        assert kwargs["json"]["prompt"] == "rerendered prompt"
+        assert kwargs["json"]["add_special_tokens"] is False
+        assert "messages" not in kwargs["json"]
+        assert "chat_template_kwargs" not in kwargs["json"]
         return SimpleNamespace(
             raise_for_status=lambda: None,
-            json=lambda: {"choices": [{"message": {"reasoning": _SID_A, "content": content}}]},
+            json=lambda: {"choices": [{"text": f"<think>{_SID_A}</think>{content}"}]},
         )
 
     reg = accuracy.TASK_REGISTRY["video"]
@@ -153,7 +155,21 @@ def test_accuracy_scores_final_sid(
         "video",
         SimpleNamespace(config=config, evaluator_class=reg.evaluator_class),
     )
-    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **kw: object())
+
+    def render(turns: Any, **options: Any) -> str:
+        assert turns == messages
+        assert options == {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": True,
+        }
+        return "rerendered prompt"
+
+    monkeypatch.setattr(
+        AutoTokenizer,
+        "from_pretrained",
+        lambda *a, **kw: SimpleNamespace(apply_chat_template=render),
+    )
     load = Mock(return_value=data)
     monkeypatch.setattr(accuracy, "DataLoaderWrapper", lambda **kw: SimpleNamespace(load_data=load))
     monkeypatch.setattr(accuracy.requests, "post", post)
@@ -165,7 +181,7 @@ def test_accuracy_scores_final_sid(
             "--task-type",
             "video",
             "--endpoint",
-            "/v1/chat/completions",
+            "/v1/completions",
             "--n",
             "1",
             "--num-prompts",
@@ -197,8 +213,8 @@ def test_accuracy_keeps_truncated_inline_thinking_at_its_pid_rank(
     mapping = {encode_sid(1, 2, 3): [{"pid": 42, "count_after_downsample": 1}]}
     (tmp_path / "sid2pid.json").write_text(json.dumps(mapping), encoding="utf-8")
     choices = [
-        {"message": {"content": f"<think>maybe {_SID_A}"}},
-        {"message": {"content": _SID_A}},
+        {"text": f"<think>maybe {_SID_A}"},
+        {"text": _SID_A},
     ]
     response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"choices": choices})
     config = accuracy.TASK_REGISTRY["video"].config["evaluation_config"]
@@ -218,7 +234,7 @@ def test_accuracy_keeps_truncated_inline_thinking_at_its_pid_rank(
             "--task-type",
             "video",
             "--endpoint",
-            "/v1/chat/completions",
+            "/v1/completions",
             "--n",
             "2",
             "--dataset-path",
@@ -246,18 +262,18 @@ def test_accuracy_judges_receive_final_answers(
 
     import benchmarks.open_one_rec.one_rec_acc_test as accuracy
 
-    messages = {
-        "both": {"reasoning": "working notes", "content": "final answer"},
-        "reasoning-only": {"reasoning_content": "working notes", "content": None},
-        "content-only": {"content": "plain answer"},
-        "inline": {"content": "<think>the object could be red</think>It is blue"},
+    answers = {
+        "both": "<think>working notes</think>final answer",
+        "reasoning-only": "<think>working notes",
+        "content-only": "plain answer",
+        "inline": "<think>the object could be red</think>It is blue",
     }
-    samples = {key: {"prompt": key, "ground_truth": "reference"} for key in messages}
+    samples = {key: {"prompt": key, "ground_truth": "reference"} for key in answers}
 
     def post(_url: str, **kwargs: Any) -> Any:
-        message = messages[kwargs["json"]["messages"][0]["content"]]
+        answer = answers[kwargs["json"]["prompt"]]
         return SimpleNamespace(
-            raise_for_status=lambda: None, json=lambda: {"choices": [{"message": message}]}
+            raise_for_status=lambda: None, json=lambda: {"choices": [{"text": answer}]}
         )
 
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **kw: object())
@@ -268,7 +284,7 @@ def test_accuracy_judges_receive_final_answers(
     judge = Mock(return_value=({}, {}))
     monkeypatch.setattr(accuracy.TASK_REGISTRY[task].evaluator_class, judge_method, judge)
     monkeypatch.setattr(
-        sys, "argv", ["accuracy", "--task-type", task, "--endpoint", "/v1/chat/completions"]
+        sys, "argv", ["accuracy", "--task-type", task, "--endpoint", "/v1/completions"]
     )
 
     assert accuracy.main() == 0
@@ -282,47 +298,32 @@ def test_accuracy_judges_receive_final_answers(
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "message,expected",
+    "text,expected",
     [
-        ({"reasoning": "a clue", "content": None}, ("a clue", "")),
-        ({"reasoning_content": "old clue", "content": None}, ("old clue", "")),
-        ({"reasoning": "A", "reasoning_content": "A", "content": "B"}, ("A", "B")),
-        (
-            {"reasoning": "new", "reasoning_content": "old", "content": " answer"},
-            ("new", " answer"),
-        ),
-        ({"reasoning": None, "reasoning_content": "old", "content": " answer"}, ("old", " answer")),
-        ({"reasoning": "", "reasoning_content": "old", "content": None}, ("old", "")),
-        ({"content": "answer"}, ("", "answer")),
-        ({"content": "\n  <think>notes</think> answer"}, ("notes", " answer")),
-        ({"content": "<think>notes"}, ("notes", "")),
-        ({"content": "Use <think>notes</think> here."}, ("", "Use <think>notes</think> here.")),
-        (
-            {
-                "reasoning": " ",
-                "reasoning_content": "separate",
-                "content": "<think>example</think>",
-            },
-            ("separate", "<think>example</think>"),
-        ),
-        ({"content": None, "reasoning": None, "reasoning_content": ""}, None),
-        ({"reasoning": 3, "content": "answer"}, None),
-        ({"reasoning_content": [], "content": "answer"}, None),
-        ({"content": {"text": "answer"}}, None),
+        ("<think>a clue", ("a clue", "")),
+        ("<think>A</think>B", ("A", "B")),
+        ("answer", ("", "answer")),
+        ("\n  <think>notes</think> answer", ("notes", " answer")),
+        ("Use <think>notes</think> here.", ("", "Use <think>notes</think> here.")),
+        (None, None),
+        ("", None),
+        (" ", None),
+        (3, None),
+        ({"text": "answer"}, None),
     ],
 )
 def test_accuracy_http_preserves_answer_and_reasoning(
-    monkeypatch: pytest.MonkeyPatch, message: dict[str, Any], expected: tuple[str, str] | None
+    monkeypatch: pytest.MonkeyPatch, text: Any, expected: tuple[str, str] | None
 ) -> None:
     import benchmarks.open_one_rec.one_rec_acc_test as accuracy
 
     response = SimpleNamespace(
         raise_for_status=lambda: None,
-        json=lambda: {"choices": [{"message": message}]},
+        json=lambda: {"choices": [{"text": text}]},
     )
     monkeypatch.setattr(accuracy.requests, "post", lambda *a, **kw: response)
     if expected is None:
-        with pytest.raises(accuracy.InferenceError, match="no text message|non-text"):
+        with pytest.raises(accuracy.InferenceError, match="no text completion|non-text"):
             accuracy.run_api_inference(["prompt"], "model", "http://localhost/unused", "EMPTY", {})
     else:
         outputs = accuracy.run_api_inference(
@@ -378,7 +379,7 @@ def test_accuracy_classification_requires_logprobs_before_loading(
             "--task-type",
             "label_pred",
             "--endpoint",
-            "/v1/chat/completions",
+            "/v1/completions",
             "--result-dir",
             str(tmp_path),
         ],

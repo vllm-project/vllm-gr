@@ -194,28 +194,34 @@ def _pangu_serve_server(
             _terminate_process(proc)
 
 
-def _chat_completion(
+def _completion(
     base_url: str,
     *,
     content: str,
     max_tokens: int = 256,
     temperature: float = 0.0,
+    tokenizer: Any,
 ) -> dict[str, Any]:
     payload = {
         "model": SERVED_MODEL_NAME,
-        "messages": [{"role": "user", "content": content}],
+        "prompt": tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=False,
+            add_generation_prompt=True,
+        ),
+        "add_special_tokens": False,
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
     response = requests.post(
-        f"{base_url}/v1/chat/completions",
+        f"{base_url}/v1/completions",
         json=payload,
         timeout=120,
     )
     response.raise_for_status()
     body = response.json()
     if not body.get("choices"):
-        raise AssertionError(f"chat completion returned no choices: {body}")
+        raise AssertionError(f"completion returned no choices: {body}")
     return body
 
 
@@ -226,11 +232,17 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
     """End-to-end online ST for Pangu LLM passthrough via ``vllm serve MODEL --gr``."""
 
     base_url: str
+    tokenizer: Any
     _server_ctx: AbstractContextManager[str]
 
     @classmethod
     def setUpClass(cls) -> None:
         require_pangu_st_runtime()
+        from transformers import AutoTokenizer
+
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            get_model_path(), trust_remote_code=True, use_fast=False
+        )
         cls._server_ctx = _pangu_serve_server(get_model_path())
         cls.base_url = cls._server_ctx.__enter__()
 
@@ -250,13 +262,13 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
         self.assertIn(SERVED_MODEL_NAME, model_ids)
 
     def test_chat_completions_smoke(self) -> None:
-        body = _chat_completion(
+        body = _completion(
             self.base_url,
+            tokenizer=self.tokenizer,
             content=build_prompt("What is 2 + 2?"),
             max_tokens=64,
         )
-        message = body["choices"][0]["message"]
-        content = message.get("content") or ""
+        content = body["choices"][0].get("text") or ""
         self.assertTrue(content.strip(), f"empty completion: {body}")
 
     def test_recommend_api_disabled_for_llm_mode(self) -> None:
@@ -282,13 +294,14 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
         records = load_dataset(DEFAULT_DATASET, num_prompts=8)
         correct = 0
         for row in records:
-            body = _chat_completion(
+            body = _completion(
                 self.base_url,
+                tokenizer=self.tokenizer,
                 content=build_prompt(str(row["question"])),
                 # Allow the model to finish its reasoning and final answer.
                 max_tokens=512,
             )
-            generated = body["choices"][0]["message"].get("content") or ""
+            generated = body["choices"][0].get("text") or ""
             correct += score_answer(generated, str(row["answer"]))["correct"]
 
         accuracy = correct / len(records)

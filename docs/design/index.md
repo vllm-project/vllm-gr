@@ -35,15 +35,16 @@ settings and supported combinations, see
 
 | Component | Responsibility |
 | --- | --- |
-| [Persistent GPU Beam state](module/beam_state.md) | Candidate history, completion records and buffer lifetime |
+| [Beam state](module/beam_state.md) | CUDA and Ascend NPU candidate state, parent history and buffer lifetime |
 | [Constraint tables](module/constraint_tables.md) | Catalog layout and per-prompt Trie routing |
 | [CUDA ModelRunner V2](module/model_runner_v2.md) | Native request integration, graph ownership and cleanup |
 | [Platform backend](module/platform_backend.md) | Provider discovery, activation and dispatch boundaries |
-| [Runtime patches](module/runtime_patches.md) | Upstream assumptions and the reason for each hook in the [patch inventory](patch_inventory.yaml) |
+| [Runtime patches](runtime_patch_inventory.md#activation-and-maintenance) | Patch activation, process ownership and maintenance |
 
-The [runtime patch inventory](runtime_patch_inventory.md) is the checked index
-of active patch IDs, scope and backend ownership. It is linked here but kept
-out of the site navigation because the contract test reads it as data.
+The [runtime patch inventory](runtime_patch_inventory.md) pairs each hook's
+rationale with the checked patch ID, scope and backend ownership. The
+[machine inventory](patch_inventory.yaml) records native targets, activation
+conditions and validation coverage.
 
 ## Diagram conventions
 

@@ -1,32 +1,34 @@
 # User guide
 
-[Install vLLM-GR](../getting_started/installation/README.md) for your device,
-then run the [OneRec quickstart](../getting_started/quickstart.md).
+For a first request, follow [Getting started](../getting_started/quickstart.md).
+Once your environment is ready, choose a guide for your task.
+
+## Models
+
+[OneRec-1.7B](../models/onerec.md) generates ranked recommendation candidates
+on CUDA and Ascend NPU. A catalog can restrict which items it recommends.
 
 ## Inference and serving
 
 | I want to | Guide |
 | --- | --- |
-| Check which features apply to my device | [Features and compatibility](feature_compatibility.md) |
-| Configure Beam width, candidate selection, or a constraint table | [Configuration](../configuration/README.md) |
-| Build a catalog artifact and select a Trie per request | [Constraint tables](../configuration/constraint_tables.md) |
-| Start a server and send a request | [Serving APIs](../serving/README.md) |
-| Read the candidate SIDs in an HTTP response | [Completions response](../serving/completions.md#response) |
-| Read candidate tokens and cumulative log probabilities from an offline run | [OneRec example output](../../examples/README.md#expected-output) |
-| Decode gRPC binary Beam outputs and optional scores | [Binary Beam results](../serving/grpc.md#binary-beam-results) |
-| Look up `vllm serve`, `bench`, or `check-env` options | [CLI reference](../cli/README.md) |
-| Find a model and its requirements | [Supported models](../models/supported_models.md) |
-| Run an offline inference or online serving example | [Examples](../examples/README.md) |
+| Check device and runner support | [Feature compatibility](feature_compatibility.md) |
+| Configure Beam width and candidate selection | [Configuration](../configuration/README.md#beam-settings) |
+| Recommend items from my catalog | [Constraint tables](../configuration/constraint_tables.md) |
+| Configure Ascend Beam limits or SID token families | [Ascend configuration](../configuration/README.md#ascend-npu-execution-limits) |
+| Start a server and send a request | [Online serving](../serving/README.md) |
+| Look up a command or option | [CLI reference](../cli/README.md) |
 
 ## Deployment and operations
 
-- [Deploy HTTP replicas behind Nginx](../serving/replica_deployment.md).
-- [Update weights or switch catalogs on running instances](weight_update.md).
-- [Monitor serving metrics](../serving/metrics.md) and interpret historical Beam counters.
+| I want to | Guide |
+| --- | --- |
+| Update weights or switch catalogs on running instances | [Weight and catalog updates](weight_update.md) |
+| Monitor a running server | [Serving metrics](../serving/README.md#read-prometheus-metrics) |
+| Measure accuracy or throughput | [Benchmarking](../benchmarking/README.md) |
 
 <a id="related"></a>
 
 ## See also
 
-- [Benchmarking](../benchmarking/README.md) for accuracy and throughput tasks.
-- [Design](../design/index.md) for the mechanisms behind these tasks.
+- [Design documents](../design/index.md) explain the implementation behind these tasks.

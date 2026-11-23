@@ -314,7 +314,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         self._v2_gr_prefill_capture = (
             self._is_cuda
-            and envs.VLLM_USE_V2_MODEL_RUNNER
+            and vllm_config.use_v2_model_runner
             and GRConfig.from_vllm_config(vllm_config).beam_worker_decision
         )
 

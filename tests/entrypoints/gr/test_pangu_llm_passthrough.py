@@ -105,13 +105,29 @@ class TestPanguPluginInitializeRuntime(unittest.TestCase):
 
 
 class TestModelRunnerDefault(unittest.TestCase):
-    def test_defaults_to_v1_when_unset(self):
+    def test_defaults_follow_selected_platform(self):
         from vllm_gr.engine.startup import configure_model_runner_default
 
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
-            configure_model_runner_default()
-            self.assertEqual(os.environ["VLLM_USE_V2_MODEL_RUNNER"], "0")
+        for platform, placement, expected in (
+            ("CUDA", "cuda", None),
+            ("OOT", "npu", "0"),
+            ("ROCM", "cuda", "0"),
+            ("CPU", "cpu", "0"),
+            ("UNSPECIFIED", "", "0"),
+        ):
+            with (
+                self.subTest(platform=platform),
+                mock.patch.dict(os.environ, {}, clear=False),
+                mock.patch(
+                    "vllm_gr.platforms.identity.current_platform_identity",
+                    return_value=SimpleNamespace(platform_enum=platform, device_type=placement),
+                ) as selected_platform,
+            ):
+                os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                configure_model_runner_default()
+                configure_model_runner_default()
+                self.assertEqual(os.environ.get("VLLM_USE_V2_MODEL_RUNNER"), expected)
+                self.assertEqual(selected_platform.call_count, 2 if expected is None else 1)
 
     def test_preserves_explicit_v2_override(self):
         from vllm_gr.engine.startup import configure_model_runner_default

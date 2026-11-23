@@ -124,13 +124,17 @@ def test_async_layout_rejects_over_capacity_block_table() -> None:
 
 
 @pytest.mark.l1  # type: ignore[misc]
-def test_builder_init_allocates_fixed_tensor_buffers(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("use_v2", [False, True])  # type: ignore[misc]
+def test_builder_init_allocates_fixed_tensor_buffers(
+    monkeypatch: pytest.MonkeyPatch, use_v2: bool
+) -> None:
     from vllm.v1.attention.backend import AttentionMetadataBuilder
 
     from vllm_gr.config import GRConfig
     from vllm_gr.v1.attention.backends import beam_attn_metadata as metadata
 
     sentinel = BeamTensorBuffers()
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     monkeypatch.setattr(
         AttentionMetadataBuilder,
         "__init__",
@@ -145,11 +149,12 @@ def test_builder_init_allocates_fixed_tensor_buffers(monkeypatch: pytest.MonkeyP
         classmethod(
             lambda cls, config: SimpleNamespace(
                 beam_max_width=4,
-                beam_worker_decision=False,
+                beam_worker_decision=True,
             )
         ),
     )
     vllm_config = SimpleNamespace(
+        use_v2_model_runner=use_v2,
         model_config=SimpleNamespace(
             get_num_attention_heads=lambda parallel_config: 8,
             get_num_kv_heads=lambda parallel_config: 2,
@@ -172,6 +177,7 @@ def test_builder_init_allocates_fixed_tensor_buffers(monkeypatch: pytest.MonkeyP
     )
 
     assert builder._fixed_buffers is True
+    assert builder._v2_gr_prefill_capture is use_v2
     assert builder._tensor_buffers is sentinel
     assert builder._tensor_context().buffers is sentinel
 

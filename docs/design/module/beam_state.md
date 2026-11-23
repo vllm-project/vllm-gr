@@ -1,12 +1,17 @@
-# Persistent GPU Beam state
+# Persistent Beam state
 
-CUDA Beam search keeps candidate scores, parent indices, history and generation
-counters on the device across Prefill and Decode. See the
+<a id="persistent-gpu-beam-state"></a>
+
+The worker retains candidate scores, parent indices and generation state
+across Prefill and Decode. Both CUDA and Ascend NPU track the same logical
+batch and keep each request's parent indices local to its own rows. See the
 [batch execution contract](../feature/beam_batch_execution.md#scheduling-and-resource-ownership)
 for admission and the [scheduler contract](../feature/async_scheduling.md) for
 dispatch and retirement.
 
 ## Storage and ownership
+
+### CUDA
 
 | Component | Responsibility |
 | --- | --- |
@@ -28,12 +33,22 @@ implements `dynamic_beam_widths`, `per_parent_beam_widths`, `input_width`,
 `output_width` and `candidate_top_k`, and dynamic stages run through
 `GPUDynamicBeam.advance`.
 
+### Ascend NPU
+
+The `NPUEagerBeamStageRunner` keeps the admitted batch, current winners and
+per-request KV ownership across stages. `BeamDecisionBuffers` hold scores
+and sequence history. `BeamSearchSession` and `NPUBeamExecutionBatch` bind the
+logical requests to their physical KV rows. The runner retains additional
+parent history when the caller requests that output.
+
 ## Stage ordering and completion
 
 Prefill adds the first generated token and initializes the Decode counter to
 zero. The first Decode writes KV at position zero. Each Decode stage writes
 current KV, selects successors and applies the parent KV mapping once before
 the next Forward. Masks let fixed physical shapes represent inactive rows.
+
+### CUDA completion
 
 A completion record stores its last token, cumulative score, request-local
 parent index, length, finish reason and tie-break index. For length `n > 1`,
@@ -49,7 +64,19 @@ Session reuse keeps fixed views in `rebind_session`, and `reset_for_session`
 reinitializes state through one Triton kernel with the `-inf` completed-score
 sentinel.
 
+### Ascend NPU completion
+
+The worker starts with one row per request in Prefill and expands each
+request into its retained beam rows for Decode. Candidate selection returns
+the next tokens and their request-local parents. Fixed-width and dynamic
+width execution both apply the needed KV reorder before the next Decode.
+The runner constructs terminal output in request order. See
+[Ascend Beam Decode execution](../feature/npu_decode_execution.md#kv-reorder)
+for the fused and cascade paths.
+
 ## Streams, graphs and retirement
+
+### CUDA
 
 Runner updates execute on the current CUDA stream. Cross-stream producers and
 consumers establish ordering through events. Graph replay reads the current
@@ -62,6 +89,15 @@ Reset and KV slot release follow the drain of outstanding dispatches and final
 consumers. A device error does not roll back KV writes already issued by the
 current model Forward.
 
+### Ascend NPU
+
+The worker retains the request's state across eager stages and eligible
+FULL graph replay. Replay uses a captured shape and the corresponding KV
+buffers. When the batch retires, its dispatch identity and owner generation
+determine which resources the worker can release. See the
+[Ascend stage lifecycle](../feature/async_scheduling.md#ascend-stage-execution)
+and [Decode graph requirements](../feature/npu_decode_execution.md#decode-graph-capture).
+
 ## Validation
 
 | Test | Coverage |
@@ -70,6 +106,7 @@ current model Forward.
 | [CUDA runner tests](../../../tests/kernels/test_beam_search_runner_cuda.py) | Device state updates, ordering, error handling and retirement events. |
 | [Worker lifecycle tests](../../../tests/kernels/test_gpu_beam_stage_lifecycle.py) | Completion and resource retirement. |
 | [Workspace tests](../../../tests/v1/worker/test_gpu_postprocess_workspace.py) | Workspace prewarming, bucket reuse and memory accounting. |
+| [Ascend system tests](../../../tests/st/test_onerec_v1_npu_e2e.py) | OneRec Beam behavior through the Ascend ModelRunner V1 path. |
 
 ## Source map
 
@@ -80,3 +117,5 @@ current model Forward.
 | [Session facade](../../../vllm_gr/v1/beam/session.py) | Per-request view of the worker context. |
 | [Execution batch](../../../vllm_gr/v1/beam/execution_batch.py) | Fixed and dynamic width schedules and cross-stage validation. |
 | [CUDA runner](../../../vllm_gr/v1/worker/cuda/beam_search_runner.py) | Device updates and session reset. |
+| [Ascend stage runner](../../../vllm_gr/v1/worker/npu/npu_beam_stage_runner.py) | Candidate state, width changes, terminal output and retirement. |
+| [Ascend Beam decisions](../../../vllm_gr/v1/worker/npu/beam_decision.py) | Fixed-width candidate selection and same-step KV reorder. |

@@ -145,19 +145,9 @@ new tables can coexist in worker memory during a catalog reload.
 
 ## Configuration
 
-| Setting | Effect |
-| --- | --- |
-| `update_mode` | Selects which instances a task targets and how they are grouped. The output is validated before any download or mutation. |
-| `update_process` | Per-resource rollout: `PausedUpdateProcess` for checkpoints, `OnlineUpdateProcess` for catalogs. |
-| `checker` | Overrides the default staged-file checker for a task. |
-| `max_local_checkpoints` | Number of cached checkpoint versions to keep (default 2). See [cache retention](#cache-retention). |
-| `gr.admin_port` | Enables the instance's HTTP management listener, which owns checkpoint validity and reports the committed version. |
-| `gr.trie_retention_seconds` | Grace period before an unused Trie version can be collected (default 60 seconds). |
-
-The mode and process pairings above are conventions; the sidecar does not
-enforce them. Sidecar and target services must see staged files at the same
-absolute path. For startup and publication steps, see the
-[deployment guide](../../user_guide/weight_update.md).
+The [deployment guide](../../user_guide/weight_update.md#configuration) owns
+sidecar settings and the runnable configuration link. The mode and process
+pairings above are conventions; the sidecar does not enforce them.
 
 ### Cache retention
 

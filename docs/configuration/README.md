@@ -6,43 +6,7 @@ options at the top level and vLLM-GR options under `gr`. The
 CUDA and Ascend settings. Native engines started without GR configuration use
 the upstream vLLM defaults.
 
-GR stores its resolved configuration in `additional_config["vllm_gr"]`.
-Supply settings through `gr=`, `--gr-config`, or the YAML `gr` section.
-EngineArgs resolves the settings on the driver before publishing a JSON-compatible
-snapshot in the vLLM configuration. Step width lists determine the runtime
-capacities when present. A Python `GRConfig` can also describe pool and candidate
-capacities without setting request defaults. Its snapshot carries these scalar
-capacities as `gr.beam_max_width` and `gr.beam_candidate_width`, preserving the
-absence of a step schedule when reloaded. Conflicting capacities and schedules
-are rejected during configuration construction.
-When a `GRConfig` has no constraint setting, its worker snapshot omits both
-constraint keys. An explicit `constraint_mode: none` selects unconstrained
-generation. The packaged GR startup defaults select this mode explicitly.
-Old flat settings such as `additional_config["vllm_gr_beam_max_width"]`
-raise an error on read and write. Move their intended values to the current
-GR settings and remove the flat keys before starting the engine.
-
-Use `gr.constraint_mode: table` with a compiled artifact in `gr.constraint_table`,
-or `gr.constraint_mode: none` for unconstrained generation. The driver resolves
-`backend: auto` before publishing the configuration to workers. On CUDA, each
-worker derives its model's projection window from the token IDs in the loaded
-table. Per-parent candidate counts come from `gr.candidate_width`.
-
-Use a [deployment recipe](../../recipes/README.md) for model-specific overrides.
-
 ## Load and override a configuration
-
-Settings take precedence in this order, from highest to lowest.
-
-1. Explicit CLI or Python arguments
-2. Startup YAML
-3. YAML included with `import: ./base.yaml`
-4. Packaged defaults
-
-Mappings merge by key. Lists replace the entire inherited list. Explicit
-`null`, `false` and empty lists replace inherited values, subject to validation.
-Both entry points use native vLLM converters for values such as
-`max-model-len: 4k` (4000 tokens).
 
 ### Example
 
@@ -86,49 +50,55 @@ llm = GRLLM(
 )
 ```
 
+For Beam inference, call `llm.beam_search()` with `BeamSearchParams` as shown
+in the [offline example](../../examples/offline_inference/beam_search/README.md).
+Its default `output_mode="full"` returns vLLM Beam sequence objects;
+`output_mode="compact"` selects compact results.
+
+### Precedence
+
+Settings take precedence in this order, from highest to lowest.
+
+1. Explicit CLI or Python arguments
+2. Startup YAML
+3. YAML included with `import: ./base.yaml`
+4. Packaged defaults
+
+Mappings merge by key. Lists replace the entire inherited list. Explicit
+`null`, `false` and empty lists replace inherited values, subject to validation.
+Both entry points use native vLLM converters for values such as
+`max-model-len: 4k` (4000 tokens).
+
 ### Path resolution
 
 The driver resolves artifact and calibration paths relative to the YAML file
 that declares them, including imported files. When parsing a public Python
 mapping, the driver also resolves symlinks in absolute artifact and calibration
-paths. Workers use the published paths even if the link changes after startup. Check the startup log for the effective GR settings and restart
+paths. Workers use the published paths even if the link changes after startup.
+Check the startup log for the effective GR settings and restart
 the engine to apply edits to its startup YAML.
-
-## Migrate from `configs/`
-
-- For Pangu, use [the Pangu recipe](../../recipes/Pangu/pangu1b.yaml) in
-  `--config` or Python's `config=` argument in place of `configs/pangu1b.yaml`.
-- For GR's packaged defaults, omit `--config configs/default_config.yaml`
-  or the equivalent Python `config=` argument. To keep the YAML values
-  explicit in a source checkout, pass `vllm_gr/config/default_config.yaml`.
-
-The old default YAML supplied `max-num-batched-tokens: 8192` explicitly.
-With chunked Prefill disabled and `max-model-len: 16384`, omitting the file
-and the budget lets GR derive a budget of 16384. To preserve an explicit
-budget, pass `--max-num-batched-tokens` on the CLI or set
-`max_num_batched_tokens` in Python. When chunked Prefill is disabled,
-vLLM requires an explicit budget at least as large as the model length.
 
 ## ModelRunner selection
 
-The vLLM ModelRunner executes model work on the device. For the library and
-general CLI, set `VLLM_USE_V2_MODEL_RUNNER` before importing vLLM or starting
-the CLI.
+The vLLM ModelRunner executes model work on the device. With
+`VLLM_USE_V2_MODEL_RUNNER` unset, vLLM chooses **ModelRunner V2 on CUDA**
+when the configuration supports it and falls back to **V1** otherwise.
+GR defaults to **ModelRunner V1 on Ascend NPU**. To override the default,
+set the variable before importing vLLM or starting the CLI.
 
-| Setting | CUDA | Ascend |
+| Runner | Environment setting | Beam deployment |
 | --- | --- | --- |
-| Unset or `0` | ModelRunner V1, the vLLM-GR default | ModelRunner V1, required for Beam search |
-| `1` | Opt-in [ModelRunner V2](../design/module/model_runner_v2.md) for supported Beam workloads | Use `0` for Beam search |
+| [ModelRunner V2](../design/module/model_runner_v2.md) | `VLLM_USE_V2_MODEL_RUNNER=1` | Explicit selection on CUDA. Unsupported configurations fail startup. |
+| ModelRunner V1 | `VLLM_USE_V2_MODEL_RUNNER=0` | Required on Ascend NPU and available on CUDA |
 
-The CUDA direct offline Beam, HTTP serving and OneRec gRPC examples select
-ModelRunner V2 when the variable is unset. See the
-[example defaults](../../examples/README.md#choose-a-modelrunner) for the
-offline thinking path and the gRPC smoke test.
+GR normalizes explicit boolean spellings before native parsing.
+An explicitly empty value is equivalent to `0`. Restart the process after
+changing the selection.
 
-Some logs and tests use the name "Beam Search V1" for the Beam execution path.
-The same path can use either ModelRunner on CUDA within the supported scope.
-The [constraint table formats](constraint_tables.md#build) describe the catalog
-artifact layout and have their own version identifiers.
+Some logs and tests call the GR execution path "Beam Search V1". That path
+can use either ModelRunner on CUDA within the supported scope. The names
+`constraint_table_v1` and `constraint_table_v2` refer to the
+[catalog artifact layout](constraint_tables.md#build).
 
 ## Beam settings
 
@@ -159,8 +129,8 @@ for related features.
 Beam execution requires `async-scheduling: true` and
 `enable-chunked-prefill: false`. Both are packaged defaults. In Python the
 corresponding arguments are `async_scheduling=True` and
-`enable_chunked_prefill=False`. See the [CUDA walkthrough](../user_guide/onerec_quickstart.md)
-or the [Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-python-entry-point).
+`enable_chunked_prefill=False`. See the [catalog-constrained example](constraint_tables.md#validate-and-troubleshoot)
+or the [Ascend quickstart](../getting_started/quickstart.md#ascend).
 
 ### Batch sizes and token budgets
 
@@ -178,6 +148,63 @@ or the [Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-
   the peak input beam width for those stages. Two prompts at fixed width 128
   therefore require capacity for at least 256 Decode rows.
 
+## Ascend NPU execution limits
+
+For a first request, use the [Ascend quickstart](../getting_started/quickstart.md#ascend).
+For Python integration, use the [configuration example](#python) and
+`GRLLM.beam_search()` with `BeamSearchParams`. The shared
+[Beam settings](#beam-settings), [runner selection](#modelrunner-selection),
+and [token budgets](#batch-sizes-and-token-budgets) apply.
+
+Use a unimodal recommendation decoder with a uniform layer layout. Run in
+FP16 or BF16 with asynchronous scheduling and TP/PP/DP/DCP/PCP all equal to
+one. The logical Beam batch size is 1 through 8.
+
+### Full-vocabulary generation
+
+Set `gr.constraint_mode: none` and leave `gr.sid_stage_vocab: false` to
+select candidates from the full vocabulary. Use `ignore_eos=True` for this
+experimental Ascend path. For requests longer than three tokens, use a fixed
+Beam width and increase `gr.max_decode_steps` up to 6. A request's `max_tokens`
+selects its length within that capacity; raising the capacity does not lengthen
+shorter requests.
+
+Capacities above three require known positive KV-head geometry that fits the
+native `SelectUnsharedKV` 95 KiB buffer per K/V copy. Startup validates the
+configured maximum even if a request is shorter. For example, 64 KV heads with
+head dimension 128 fit five tokens but not six; eight KV heads fit six.
+Reduce `gr.max_decode_steps` if this check rejects your configuration. See
+[Ascend validation scope](../design/feature/npu_decode_execution.md#validation)
+for the measured model geometry and
+[candidate scores](../design/feature/npu_decode_execution.md#candidate-selection)
+for normalization and tie handling.
+
+### SID token families without a catalog
+
+To restrict successive output tokens to SA, SB, and SC families while allowing
+every combination of them, add this fragment to your startup YAML:
+
+```yaml
+gr:
+  constraint_mode: none
+  sid_stage_vocab: true
+```
+
+Use the checkpoint's SID prompt, including its SID-begin marker when required.
+This option is disabled by default and requires Ascend ModelRunner V1,
+worker decisions, and `gr.max_decode_steps <= 3`. The tokenizer must define
+the `<s_a_N>`, `<s_b_N>`, and `<s_c_N>` token families.
+
+This limits token families; it does not guarantee catalog membership. Use a
+[constraint table](constraint_tables.md) when outputs must match catalog items.
+Stage-family normalization can change cross-parent rankings relative to
+full-vocabulary generation; see [SID stage selection](../design/feature/npu_decode_execution.md#sid-stage-selection).
+
+On eligible models, `gr.npu_stage_lm_head` defaults to `true` and projects only
+the selected family. Set it to `false` to use the full LM head as a reference
+while preserving the same family mask and scoring semantics. Setting it to
+`true` alone does not enable `gr.sid_stage_vocab` or override model eligibility.
+
 ## Constraint table
 
 Use `gr.constraint_mode: none` for unconstrained generation. For catalog
@@ -193,3 +220,23 @@ gr:
 
 See [Constraint tables](constraint_tables.md) to build a single- or multi-Trie
 artifact, write `table.yaml` and select a catalog per prompt.
+
+For driver/worker serialization and resolved capacities, see the
+[configuration lifecycle](../design/architecture_overview.md#configuration-lifecycle).
+
+## Migrate from `configs/`
+
+For GR's packaged defaults, omit `--config configs/default_config.yaml`
+or the equivalent Python `config=` argument. To keep the YAML values
+explicit in a source checkout, pass `vllm_gr/config/default_config.yaml`.
+
+The old default YAML supplied `max-num-batched-tokens: 8192` explicitly.
+With chunked Prefill disabled and `max-model-len: 16384`, omitting the file
+and the budget lets GR derive a budget of 16384. To preserve an explicit
+budget, pass `--max-num-batched-tokens` on the CLI or set
+`max_num_batched_tokens` in Python. When chunked Prefill is disabled,
+vLLM requires an explicit budget at least as large as the model length.
+
+Old flat settings such as `additional_config["vllm_gr_beam_max_width"]`
+raise an error on read and write. Move their intended values to the current
+GR settings and remove the flat keys before starting the engine.

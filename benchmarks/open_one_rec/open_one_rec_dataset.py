@@ -6,6 +6,7 @@ import random
 from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 
+from .chat import completion_prompt
 from .open_one_rec_loader import TASK_REGISTRY, DataLoaderWrapper
 
 # -----------------------------------------------------------------------------
@@ -139,26 +140,15 @@ class OneRecDataset(BenchmarkDataset):
         runtime_template_kwargs = kwargs.get("chat_template_kwargs")
         sampled_requests: list[SampleRequest] = []
         for item in self.data[:num_requests]:
-            prompt = item["prompt"]
-            prompt_len = len(tokenizer(prompt).input_ids)
+            prompt = completion_prompt(item["prompt"], item, tokenizer, runtime_template_kwargs)
+            prompt_len = len(tokenizer(prompt, add_special_tokens=False).input_ids)
             expected_output_len = item["expected_output_len"]
-            template_kwargs = item.get("chat_template_kwargs")
-            request_overrides = None
-            if template_kwargs is not None or runtime_template_kwargs is not None:
-                request_overrides = {
-                    "chat_template_kwargs": {
-                        **(template_kwargs or {}),
-                        **(runtime_template_kwargs or {}),
-                    }
-                }
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=expected_output_len,
                     request_id=f"{request_id_prefix}{item['task_type']}_{item['id']}",
-                    chat_messages=item.get("chat_messages"),
-                    request_overrides=request_overrides,
                 )
             )
 

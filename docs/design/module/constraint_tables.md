@@ -87,13 +87,9 @@ routed through a CPU-resident operator.
 
 ## Reload and retention
 
-A reload rejects a changed Trie count or a changed vocabulary projection.
-Publishers must keep each version's artifact immutable. The management
-endpoint returns success immediately for the committed version. A worker
-loading a candidate checks the artifact digest against a same-named table
-only while that table is retained. Old versions expire lazily on a later
-table operation after `gr.trie_retention_seconds` (default 60). See the
-[versioned table](../../../vllm_gr/constraints/versioned_table.py).
+The [online catalog replacement contract](../feature/weight_update.md#online-catalog-replacement)
+defines compatibility, version immutability, publication, and reclamation.
+The worker implementation is [VersionedConstraintTable](../../../vllm_gr/constraints/versioned_table.py).
 
 ## Validation
 

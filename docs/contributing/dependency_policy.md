@@ -1,6 +1,8 @@
 # Dependency and version policy
 
-Use the dependency files for the target runtime when updating supported versions.
+Use the dependency declaration for the affected runtime when updating a
+requirement. See the [installation compatibility reference](../getting_started/installation.md#runtime-compatibility)
+for supported versions.
 
 ## Changing a dependency
 
@@ -13,17 +15,18 @@ Use the dependency files for the target runtime when updating supported versions
 
 Explain non-obvious pins or bounds next to the requirement. When changing a
 constraint, verify installation and exercise the affected code on each platform
-that uses it. The [installation guides](../getting_started/installation/README.md)
+that uses it. The [installation guides](../getting_started/installation.md)
 describe which dependencies the platform environment supplies.
 
 ## Runtime compatibility and package versions
 
-A vLLM-GR release can keep its existing vLLM requirement. When changing the
-supported vLLM version, update the relevant requirements, the
-[built-in runtime pins](../../vllm_gr/platforms/compat.py), and the tests for
-affected runtime paths together. The built-in checks and CI compare the exact
-public version and allow a local build suffix. Provider-declared ranges use
-PEP 440 specifiers.
+When changing the supported vLLM version, update the relevant requirements,
+the [built-in runtime pins](../../vllm_gr/platforms/compat.py), the
+[installation compatibility reference](../getting_started/installation.md#runtime-compatibility),
+and the tests for the affected runtime paths together. Verify and update the
+[version-specific CLI dispatch patch](../cli/README.md#enable-gr-dispatch).
+The built-in checks and CI compare the exact public version and allow a local
+build suffix. Provider-declared ranges use PEP 440 specifiers.
 
 The installed package metadata and `vllm_gr.__version__` must agree. A wheel
 built from a source distribution must retain that distribution's version.
@@ -44,9 +47,8 @@ python -m pytest --confcutdir=tests/packaging -q tests/packaging/test_install_me
 Check the built wheel's dependency metadata and import it outside the
 checkout using the target you changed (`cpu`, `cuda` or `npu`).
 
-!!! warning "Build artifacts"
-
-    Run the wheel smoke test in a clean checkout. It replaces existing build artifacts.
+Run the wheel smoke test in a clean checkout because it replaces existing
+build artifacts.
 
 ```bash
 VLLM_GR_TARGET_DEVICE=cpu ./tools/packaging/run_wheel_smoke_test.sh --python python3

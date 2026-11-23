@@ -17,9 +17,9 @@ or download the snapshot. On CUDA, use the default backend.
 python examples/offline_inference/beam_search/quickstart.py --model "$ONEREC_MODEL"
 ```
 
-On Ascend, add `--constraint-backend npu --execution eager`. The script uses
-ModelRunner V1 on Ascend and defaults to V2 on CUDA. See
-[ModelRunner selection](../../README.md#choose-a-modelrunner) for the CUDA override.
+On Ascend, add `--constraint-backend npu --execution eager` to use ModelRunner V1.
+On CUDA the script inherits automatic
+[ModelRunner selection](../../README.md#choose-a-modelrunner).
 
 The default prompt is `Recommend the next video.` The script prints
 `request=0 returned_beams=128` for the first request, followed by the five
@@ -113,9 +113,8 @@ beam_search()
   -> release the session
 ```
 
-Execution mode is selected when the engine is initialized. Native non-Beam
-inference remains available in ordinary engine configurations; do not mix it
-with an active V1 Beam session.
+Execution mode is selected when the engine is initialized. Keep other
+inference requests separate from an active V1 Beam session.
 
 ### Current restrictions
 

@@ -37,16 +37,16 @@ class _OpenAIJudge:
         if self.use_async:
             return asyncio.run(self._generate_async(prompt))
         with self.client_type(base_url=self.endpoint, api_key=self.api_key) as client:
-            response = client.chat.completions.create(
-                model=self.model_name, messages=[{"role": "user", "content": prompt}]
+            response = client.completions.create(
+                model=self.model_name, prompt=prompt, max_tokens=1024
             )
         return self._response_text(response)
 
     async def _generate_async(self, prompt: str) -> str:
         # Each worker owns its client and event loop until the request completes.
         async with self.client_type(base_url=self.endpoint, api_key=self.api_key) as client:
-            response = await client.chat.completions.create(
-                model=self.model_name, messages=[{"role": "user", "content": prompt}]
+            response = await client.completions.create(
+                model=self.model_name, prompt=prompt, max_tokens=1024
             )
         return self._response_text(response)
 
@@ -54,7 +54,7 @@ class _OpenAIJudge:
     def _response_text(response) -> str:
         if not response.choices:
             raise ValueError("Judge response contains no choices")
-        content = response.choices[0].message.content
+        content = response.choices[0].text
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Judge response contains no text content")
         return content

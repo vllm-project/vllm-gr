@@ -89,18 +89,11 @@ success and releases the owner before admitting the next batch. See
 
 ## Configuration
 
-The packaged Beam configuration uses these native vLLM options at startup.
-Batch and token budgets are described in the
-[configuration reference](../../configuration/README.md#asynchronous-scheduling).
-
-```yaml
-async-scheduling: true
-enable-chunked-prefill: false
-```
+Use the [asynchronous scheduling settings and token budgets](../../configuration/README.md#asynchronous-scheduling).
 
 ## Performance
 
-Use the [Beam performance workload](../../cli/bench/beam_performance.md) to
+Use the [Beam performance workload](../../benchmarking/throughput.md#controlled-beam-latency) to
 measure a specific scheduler revision. Keep the model, prompt, batch size,
 beam width and Prefill mode fixed across runs. The workload reports JSON
 timings and does not emit a timeline; use an external profiler to check whether
@@ -126,5 +119,5 @@ counts, failure recovery and eager or graph execution.
 | [Ascend stage runner](../../../vllm_gr/v1/worker/npu/npu_beam_stage_runner.py) | Executes and samples a pending stage. |
 
 [Beam batch execution](beam_batch_execution.md#validation-boundaries) defines
-admission. The [OneRec walkthrough](../../user_guide/onerec_quickstart.md) shows
+admission. The [constraint-table example](../../configuration/constraint_tables.md#configure-the-engine) shows
 a complete request.

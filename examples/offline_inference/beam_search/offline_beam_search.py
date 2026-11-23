@@ -920,8 +920,6 @@ def main(*, quickstart: bool = False) -> None:
         raise ValueError("--batch-size must be positive")
     if args.constraint_backend == "npu":
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-    elif not (args.enable_thinking or args.cot) and not os.environ.get("VLLM_USE_V2_MODEL_RUNNER"):
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     if args.enable_thinking:
         if args.catalog is not None:
             print("--catalog is ignored in --enable-thinking mode", file=sys.stderr)

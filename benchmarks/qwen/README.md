@@ -1,8 +1,8 @@
 # Qwen Offline Beam Search V1 Benchmark
 
-This directory contains the Qwen benchmark runner, workload generator, shell
-entry point and usage guide. Model selection is configurable; Qwen3-0.6B
-is the verified example below.
+This directory contains a synthetic Beam runner, workload generator and shell
+entry point for CUDA performance measurements. The examples use Qwen3-0.6B as
+a benchmark fixture.
 
 This benchmark runs the offline `GRLLM.beam_search` API directly from a
 vllm-gr checkout. It does not depend on gr-inference or an API server.
@@ -79,7 +79,7 @@ benchmarks/qwen/run_beam_search_benchmark.sh
 ```
 
 When `CONSTRAINT_TRIPLES` is omitted, the benchmark creates a synthetic
-three-level table so an ordinary Qwen model can exercise the V1 path. The
+three-level table to exercise the V1 Beam path. The
 default `SYNTHETIC_TOKEN_LAYOUT=spread` selects tokens across the shared
 `[TOKEN_ID_START, TOKEN_ID_END)` interval. The same bounds apply to input
 IDs and output constraint tokens. The synthetic table needs at least

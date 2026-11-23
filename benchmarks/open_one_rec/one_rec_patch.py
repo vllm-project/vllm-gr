@@ -11,6 +11,7 @@ import time
 import traceback
 from codecs import BOM_UTF8
 from collections.abc import AsyncIterable, AsyncIterator
+from contextvars import ContextVar
 from importlib import import_module
 from typing import Literal
 
@@ -23,19 +24,18 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     ASYNC_REQUEST_FUNCS,
     RequestFuncInput,
     RequestFuncOutput,
-    _get_chat_content,
     _update_headers_common,
     _update_payload_common,
     _validate_api_url,
 )
 from vllm.benchmarks.serve import add_cli_args as original_serve_add_cli_args
+from vllm.benchmarks.serve import benchmark as original_serve_benchmark
 from vllm.benchmarks.serve import main as original_serve_main
 from vllm.benchmarks.throughput import add_cli_args as original_add_cli_args
 from vllm.benchmarks.throughput import get_requests as original_get_requests
 from vllm.benchmarks.throughput import main as original_main
 from vllm.benchmarks.throughput import validate_args as original_validate_args
 
-from benchmarks.open_one_rec.chat import messages_for_prompt, text_from_message
 from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
 # ============================================================================
@@ -49,6 +49,8 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 HTTP_OK = 200
 DATASET_NAME = "onerec"
+_ONEREC_BACKEND = "onerec-openai"
+_ONEREC_SERVE = ContextVar("onerec_serve", default=False)
 DEFAULT_TASK_TYPES = "ad,product,label_cond,video,interactive,label_pred"
 
 
@@ -264,7 +266,7 @@ async def _iter_sse_data(chunks: AsyncIterable[bytes]) -> AsyncIterator[str]:
                 yield payload.decode("utf-8")
 
 
-async def patched_async_request_openai_chat_completions(
+async def patched_async_request_openai_completions(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
@@ -272,14 +274,7 @@ async def patched_async_request_openai_chat_completions(
 ):
     """Add beam search parameters to request payload."""
     api_url = request_func_input.api_url
-    _validate_api_url(api_url, "OpenAI Chat Completions API", "chat/completions")
-
-    chat_messages = request_func_input.chat_messages
-    content = (
-        _get_chat_content(request_func_input, mm_position=mm_position)
-        if chat_messages is None
-        else None
-    )
+    _validate_api_url(api_url, "OpenAI Completions API", "/v1/completions")
     temperature = 0.0
     if hasattr(request_func_input, "temperature") and request_func_input.temperature is not None:
         temperature = request_func_input.temperature
@@ -293,7 +288,8 @@ async def patched_async_request_openai_chat_completions(
         "model": request_func_input.model_name
         if request_func_input.model_name
         else request_func_input.model,
-        "messages": messages_for_prompt(content, chat_messages, parse_transcript=False),
+        "prompt": request_func_input.prompt,
+        "add_special_tokens": False,
         "use_beam_search": request_func_input.use_beam_search,
         "n": request_func_input.n,
         "temperature": temperature,
@@ -305,6 +301,14 @@ async def patched_async_request_openai_chat_completions(
         "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
     }
     _update_payload_common(payload, request_func_input)
+    # The dataset rendered these options into prompt before measurement.
+    payload.pop("chat_template_kwargs", None)
+    # Native Completions rejects streaming Beam requests. Apply this after
+    # extra_body overrides so benchmark options cannot restore that combination.
+    if payload["use_beam_search"]:
+        payload["stream"] = False
+    if not payload["stream"]:
+        payload.pop("stream_options", None)
 
     headers = {
         "Content-Type": "application/json",
@@ -323,7 +327,23 @@ async def patched_async_request_openai_chat_completions(
     output.start_time = st
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
-            if response.status == HTTP_OK:
+            if response.status == HTTP_OK and not payload["stream"]:
+                data = await response.json()
+                if error := data.get("error"):
+                    message = error.get("message") if isinstance(error, dict) else error
+                    output.error = str(message or error)
+                else:
+                    texts = [choice.get("text", "") for choice in data.get("choices", [])]
+                    if any(not isinstance(text, str) for text in texts):
+                        raise ValueError("invalid completion text")
+                    generated_text = "".join(texts)
+                    output.success = bool(generated_text)
+                    if not output.success:
+                        output.error = "response contains no text output"
+                    if usage := data.get("usage"):
+                        output.output_tokens = usage.get("completion_tokens", output.output_tokens)
+                        output.prompt_len = usage.get("prompt_tokens", output.prompt_len)
+            elif response.status == HTTP_OK:
                 async for chunk in _iter_sse_data(response.content.iter_any()):
                     if chunk == "[DONE]":
                         received_done = True
@@ -340,8 +360,7 @@ async def patched_async_request_openai_chat_completions(
                         continue
 
                     if choices := data.get("choices"):
-                        delta = choices[0]["delta"]
-                        text = text_from_message(delta)
+                        text = choices[0].get("text")
                         if text:
                             timestamp = time.perf_counter()
                             if last_text_timestamp is None:
@@ -364,15 +383,23 @@ async def patched_async_request_openai_chat_completions(
                 elif last_text_timestamp is None:
                     output.error = "response contains no text output"
             else:
-                output.error = response.reason or ""
+                output.error = f"HTTP {response.status} {response.reason or ''}".rstrip()
+                if error_body := (await response.text())[:4096]:
+                    output.error += f": {error_body}"
                 output.success = False
     except Exception:
         output.success = False
         exc_info = sys.exc_info()
-        output.error = stream_error or "".join(traceback.format_exception(*exc_info))
+        output.error = (
+            stream_error or output.error or "".join(traceback.format_exception(*exc_info))
+        )
 
     output.generated_text = generated_text
     output.latency = time.perf_counter() - st
+    if output.success and not payload["stream"]:
+        # An atomic Beam result exposes all candidates at completion. There
+        # are no observable per-token intervals; TTFT is the request latency.
+        output.ttft = output.latency
     if pbar:
         pbar.update(1)
     return output
@@ -614,8 +641,20 @@ def patched_serve_add_cli_args(parser):
     return parser
 
 
+async def patched_serve_benchmark(*args, **kwargs):
+    """Select the OneRec request adapter without changing native backend handlers."""
+    if _ONEREC_SERVE.get() and kwargs.get("endpoint_type") == "openai":
+        kwargs["endpoint_type"] = _ONEREC_BACKEND
+    return await original_serve_benchmark(*args, **kwargs)
+
+
 def patched_serve_main(args):
     """Run the benchmark, optionally reading phase counters from older servers."""
+    if getattr(args, "dataset_name", None) == DATASET_NAME:
+        if getattr(args, "backend", "openai") != "openai":
+            raise ValueError("OneRec online benchmarks require --backend openai")
+        if getattr(args, "endpoint", "/v1/completions") != "/v1/completions":
+            raise ValueError("OneRec online benchmarks require --endpoint /v1/completions")
     metrics_url = _get_metrics_url(args)
     is_beam_search = USE_BEAM_SEARCH or (hasattr(args, "n") and getattr(args, "n", 1) > 1)
 
@@ -623,7 +662,13 @@ def patched_serve_main(args):
     if is_beam_search and metrics_url:
         metrics_before = _fetch_prometheus_metrics(metrics_url)
 
-    result = original_serve_main(args)
+    # Context is inherited by this run's async tasks and isolated from other runs.
+    # Keep args.backend unchanged for native validation and result provenance.
+    token = _ONEREC_SERVE.set(getattr(args, "dataset_name", None) == DATASET_NAME)
+    try:
+        result = original_serve_main(args)
+    finally:
+        _ONEREC_SERVE.reset(token)
 
     if is_beam_search and metrics_url:
         metrics_after = _fetch_prometheus_metrics(metrics_url)
@@ -652,10 +697,11 @@ _throughput_module.main = patched_main
 _serve_module.add_cli_args = patched_serve_add_cli_args
 _serve_module.get_samples = patched_get_samples
 _serve_module.main = patched_serve_main
+_serve_module.benchmark = patched_serve_benchmark
 
 # Also patch the CLI module if it already imported the original reference
 if "vllm.entrypoints.cli.benchmark.serve" in sys.modules:
     sys.modules["vllm.entrypoints.cli.benchmark.serve"].add_cli_args = patched_serve_add_cli_args
     sys.modules["vllm.entrypoints.cli.benchmark.serve"].main = patched_serve_main
 
-ASYNC_REQUEST_FUNCS["openai-chat"] = patched_async_request_openai_chat_completions
+ASYNC_REQUEST_FUNCS[_ONEREC_BACKEND] = patched_async_request_openai_completions

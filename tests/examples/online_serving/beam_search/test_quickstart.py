@@ -91,7 +91,8 @@ def _fake_vllm() -> None:
             sys.exit(0)
 
         signal.signal(signal.SIGTERM, stop)
-        print(f"runner={os.environ['VLLM_USE_V2_MODEL_RUNNER']}", flush=True)
+        runner = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "unset")
+        print(f"runner={runner}", flush=True)
         (run_dir / "port").write_text(str(port), encoding="ascii")
         server.serve_forever()
 
@@ -186,7 +187,7 @@ def test_http_quickstart_verifies_results(
 
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("backend", "override", "runner"),
-    [("cuda", None, "1"), ("cuda", "0", "0"), ("npu", "1", "0")],
+    [("cuda", None, "unset"), ("cuda", "0", "0"), ("cuda", "1", "1"), ("npu", "1", "0")],
 )
 def test_http_quickstart_selects_runner(
     backend: str, override: str | None, runner: str, workdir: Path, monkeypatch: pytest.MonkeyPatch

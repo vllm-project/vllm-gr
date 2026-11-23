@@ -9,12 +9,11 @@ regions served by the same model and tokenizer.
 
 From the repository root, use the [catalog example](../../examples/online_serving/catalog/README.md#extract-constraint-triples-from-the-catalog)
 to convert each catalog into a triples JSON file. The examples below use a
-local model directory. A remote model ID requires `--revision`. Pass
-`--trust-remote-code` if the model requires custom code.
+trusted local OneRec snapshot. When using a remote model ID, specify its
+revision with `--revision`.
 
-!!! important "Match the inference tokenizer"
-
-    Build the table with the same model snapshot and tokenizer used for inference.
+Build the table with the same model snapshot and tokenizer you will use for
+inference. The engine checks the tokenizer digest when it loads the artifact.
 
 ### Single Trie
 
@@ -22,7 +21,7 @@ Compile one triples file to produce a `constraint_table_v1` artifact.
 
 ```bash
 python tools/constraints/build_constraint_table.py --model /models/OneRec \
-  --triples video_triples.json --output video.safetensors
+  --triples video_triples.json --output video.safetensors --trust-remote-code
 ```
 
 ### Multiple Tries
@@ -44,7 +43,7 @@ Compile the manifest to produce a `constraint_table_v2` artifact.
 
 ```bash
 python tools/constraints/build_constraint_table.py --model /models/OneRec \
-  --tries tries.json --output regions.safetensors
+  --tries tries.json --output regions.safetensors --trust-remote-code
 ```
 
 ## Configure the engine
@@ -73,9 +72,10 @@ gr:
 ```
 
 For the two-Trie example below, use `./regions.safetensors` as the path,
-`constraint_table_v2` as the format and the digests from the manifest build.
-`backend: auto` selects the active accelerator. GR Beam inference supports
-CUDA and Ascend. The CPU table backend is a reference implementation.
+`constraint_table_v2` as the format, and the digests from the manifest build.
+
+`backend: auto` selects the active accelerator for Beam inference on CUDA or
+Ascend NPU. The CPU table backend is a reference implementation.
 
 ## Requests
 
@@ -83,6 +83,9 @@ With a single Trie, omit `trie_ids`. With multiple Tries, omission also selects
 Trie 0 for all prompts. To use other catalogs, supply one non-negative ID per
 prompt in input order. IDs are local to the artifact. The caller maps business
 identifiers, such as region names, to these IDs.
+
+Choose a supported [ModelRunner](README.md#modelrunner-selection) before
+starting Python or the server.
 
 ### Python
 
@@ -103,7 +106,7 @@ params = BeamSearchParams(
     end_token="<|sid_end|>",
     ignore_eos=True,
 )
-with GRLLM(model="/models/OneRec", config="table.yaml") as llm:
+with GRLLM(model="/models/OneRec", config="table.yaml", trust_remote_code=True) as llm:
     outputs = llm.beam_search(prompts, params, trie_ids=[0, 1])
 ```
 
@@ -113,26 +116,16 @@ no `trie_id` field.
 
 ### HTTP completions
 
-Start the engine with the same two-Trie configuration.
-
-```bash
-vllm serve /models/OneRec --gr --config table.yaml --served-model-name onerec
-```
-
-Send this JSON body to `POST /v1/completions`.
+Load the two-Trie configuration when you
+[start the server](../serving/README.md#start-and-verify-the-server). In the
+[prompt-list request](../serving/completions.md#batching-several-prompts-in-one-http-request),
+keep the first two prompts and add the `trie_ids` field shown below to the
+existing `vllm_xargs` object alongside `begin_token` and `end_token`.
+Supply exactly one Trie ID per prompt, in the same order as `prompt`.
 
 ```json
 {
-  "model": "onerec",
-  "prompt": ["Recommend a video.", "Recommend a video."],
-  "use_beam_search": true,
-  "n": 128,
-  "temperature": 0,
-  "max_tokens": 5,
-  "ignore_eos": true,
   "vllm_xargs": {
-    "begin_token": "<|sid_begin|>",
-    "end_token": "<|sid_end|>",
     "trie_ids": [0, 1]
   }
 }
@@ -140,12 +133,29 @@ Send this JSON body to `POST /v1/completions`.
 
 Selectors apply only to Beam completions. If the request is processed one
 prompt at a time, each prompt keeps its selector. The engine rejects IDs
-outside the loaded artifact. See the [completions API](../serving/completions.md)
-for response fields.
+outside the loaded artifact.
+
+## Validate and troubleshoot
+
+The [offline sample catalog example](../../examples/offline_inference/beam_search/README.md#run-with-a-constraint-table)
+builds a temporary table and runs a OneRec request. Compare each returned
+`sid_tokens` list with the raw catalog, including the begin and end markers.
+A small catalog can yield fewer candidates than the requested width.
+For HTTP, use the [saved-response verifier](../../examples/online_serving/catalog/README.md#verify-a-saved-response).
+
+| Symptom | Check |
+| --- | --- |
+| Table digest or tokenizer mismatch | Rebuild with the tokenizer used by the inference engine and update both digests. |
+| Generation-step error | Set the request budget to cover three SID tokens plus any requested boundary markers. |
+| Prefill admission error | Fit the full prompt into the [unchunked Prefill budget](README.md#batch-sizes-and-token-budgets). |
+| A prompt list runs as independent Beam sessions | Check the [HTTP batching conditions](../serving/completions.md#batching-several-prompts-in-one-http-request). |
+
+The [CUDA OneRec system test](../../tests/st/test_onerec_v1_scheduler_st.py)
+checks HTTP routing, graph reuse and cleanup across the CUDA model runners.
 
 ## Device behavior and updates
 
-- CUDA and Ascend both select a Trie per prompt. On CUDA, combining catalogs
+- CUDA and Ascend NPU both select a Trie per prompt. On CUDA, combining catalogs
   can widen the vocabulary window used for scoring and change rankings.
   Ascend normalizes over the legal candidates at the current prefix. Raw
   scores from the two backends can differ.

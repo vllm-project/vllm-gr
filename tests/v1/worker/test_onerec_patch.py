@@ -11,7 +11,7 @@ package import from side effects:
    and other tooling import the package without polluting global vllm state.
 
 2. Importing ``benchmarks.open_one_rec.one_rec_patch`` explicitly MUST apply
-   all 7 patches. This is what the entrypoints (``one_rec_main.py``,
+   the benchmark patches. This is what the entrypoints (``one_rec_main.py``,
    ``one_rec_acc_test.py``) rely on.
 
 The tests purge ``sys.modules`` between cases so each case observes a clean
@@ -162,6 +162,9 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
             if not hasattr(_serve_mod, _sym):
                 setattr(_serve_mod, _sym, lambda *a, **k: None)
 
+    serve = _get_or_create("vllm.benchmarks.serve")
+    serve.benchmark = mock.AsyncMock()  # type: ignore[attr-defined]
+
     datasets = _get_or_create("vllm.benchmarks.datasets")
     # Original (unpatched) functions — names must NOT start with "patched_".
     datasets.get_samples = lambda *a, **k: None  # type: ignore[attr-defined]
@@ -235,7 +238,7 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
 
     # endpoint_request_func: patch module imports a batch of names from it
     erf = _get_or_create("vllm.benchmarks.lib.endpoint_request_func")
-    erf.ASYNC_REQUEST_FUNCS = {}  # type: ignore[attr-defined]
+    erf.ASYNC_REQUEST_FUNCS = {"openai": mock.AsyncMock()}  # type: ignore[attr-defined]
     for sym in (
         "RequestFuncInput",
         "RequestFuncOutput",
@@ -331,15 +334,18 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
                 f"throughput.{attr} was patched without an explicit one_rec_patch import",
             )
 
-    def test_explicit_patch_import_applies_all_seven_patches(self) -> None:
-        """Importing one_rec_patch explicitly MUST apply all 7 replacements."""
+    def test_explicit_patch_import_installs_onerec_hooks(self) -> None:
+        """An explicit import installs the hooks and preserves the native handler."""
         # isort: off
+        from vllm.benchmarks.lib.endpoint_request_func import ASYNC_REQUEST_FUNCS
+
+        native_handler = ASYNC_REQUEST_FUNCS["openai"]
+
         # Import order matters: patch must load before we observe vllm state.
         import benchmarks.open_one_rec.one_rec_patch as patch_mod
 
         import vllm.benchmarks.datasets as datasets_mod
         import vllm.benchmarks.throughput as throughput_mod
-        from vllm.benchmarks.lib.endpoint_request_func import ASYNC_REQUEST_FUNCS
         # isort: on
 
         self.assertIs(
@@ -372,10 +378,9 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
             patch_mod.patched_main,
             "throughput.main not patched",
         )
+        self.assertIs(ASYNC_REQUEST_FUNCS["openai"], native_handler)
         self.assertIs(
-            ASYNC_REQUEST_FUNCS["openai-chat"],
-            patch_mod.patched_async_request_openai_chat_completions,
-            "ASYNC_REQUEST_FUNCS['openai-chat'] not patched",
+            ASYNC_REQUEST_FUNCS["onerec-openai"], patch_mod.patched_async_request_openai_completions
         )
 
     def test_explicit_patch_import_does_not_register_atexit_cleanup(self) -> None:
@@ -394,6 +399,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
         serve = sys.modules["vllm.benchmarks.serve"]
         original_get_samples = datasets.get_samples
         original_main = throughput.main
+        original_serve_benchmark = serve.benchmark
 
         # Import hooks or test isolation can retain sys.modules entries
         # without the corresponding attributes on their parent packages.
@@ -404,6 +410,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
         patch_mod = import_module("benchmarks.open_one_rec.one_rec_patch")
         self.assertIs(patch_mod.original_get_samples, original_get_samples)
         self.assertIs(patch_mod.original_main, original_main)
+        self.assertIs(patch_mod.original_serve_benchmark, original_serve_benchmark)
         for module, name, replacement in (
             (datasets, "get_samples", "patched_get_samples"),
             (datasets, "add_dataset_parser", "patched_add_parser"),
@@ -414,6 +421,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
             (serve, "add_cli_args", "patched_serve_add_cli_args"),
             (serve, "get_samples", "patched_get_samples"),
             (serve, "main", "patched_serve_main"),
+            (serve, "benchmark", "patched_serve_benchmark"),
         ):
             with self.subTest(module=module.__name__, name=name):
                 self.assertIs(getattr(module, name), getattr(patch_mod, replacement))
@@ -660,7 +668,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
 
         current_time = 0.0
         messages = [
-            (timestamp, "data: " + json.dumps({"choices": [{"delta": delta}]}))
+            (timestamp, "data: " + json.dumps({"choices": [delta]}))
             for timestamp, delta in timed_deltas
         ]
         end_time = timed_deltas[-1][0]
@@ -688,8 +696,8 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
         session = mock.MagicMock()
         session.post.return_value.__aenter__ = mock.AsyncMock(return_value=response)
         request = types.SimpleNamespace(
-            api_url="http://localhost/v1/chat/completions",
-            chat_messages=[{"role": "user", "content": "question"}],
+            api_url="http://localhost/v1/completions",
+            prompt="question",
             model_name=None,
             model="model",
             use_beam_search=False,
@@ -706,20 +714,18 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
             mock.patch.object(patch_mod, "RequestFuncOutput", return_value=output),
             mock.patch.object(patch_mod.time, "perf_counter", side_effect=lambda: current_time),
         ):
-            return asyncio.run(
-                patch_mod.patched_async_request_openai_chat_completions(request, session)
-            )
+            return asyncio.run(patch_mod.patched_async_request_openai_completions(request, session))
 
     @pytest.mark.l1
     def test_streaming_reads_new_and_legacy_reasoning_fields_once(self) -> None:
         actual = self._stream_result(
             [
-                (0.01, {"role": "assistant"}),
-                (0.10, {"reasoning": "hello"}),
-                (0.15, {"reasoning": " world", "reasoning_content": " world"}),
-                (0.20, {"reasoning": "", "reasoning_content": "!"}),
-                (0.25, {"content": " answer"}),
-                (0.26, {"content": " "}),
+                (0.01, {"text": ""}),
+                (0.10, {"text": "hello"}),
+                (0.15, {"text": " world"}),
+                (0.20, {"text": "!"}),
+                (0.25, {"text": " answer"}),
+                (0.26, {"text": " "}),
             ],
             completion_tokens=5,
         )
@@ -737,8 +743,8 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
     def test_streaming_counts_only_text_chunks_in_token_latencies(self) -> None:
         actual = self._stream_result(
             [
-                (0.01, {"role": "assistant"}),
-                (0.10, {"content": "hello"}),
+                (0.01, {"text": ""}),
+                (0.10, {"text": "hello"}),
                 (0.11, {}),
             ],
             completion_tokens=1,
@@ -753,7 +759,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
     def test_streaming_rejects_a_stream_without_text_output(self) -> None:
         actual = self._stream_result(
             [
-                (0.01, {"role": "assistant"}),
+                (0.01, {"text": ""}),
                 (0.11, {}),
             ],
             completion_tokens=0,
@@ -803,7 +809,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
             "patched_get_requests",
             "patched_validate_args",
             "patched_main",
-            "patched_async_request_openai_chat_completions",
+            "patched_async_request_openai_completions",
         }
         for name in expected:
             self.assertTrue(
@@ -938,7 +944,7 @@ class TestOneRecDatasetInitContract(unittest.TestCase):
 class _FakeTokenizer:
     """Minimal tokenizer stub: returns deterministic input_ids by prompt length."""
 
-    def __call__(self, prompt: str):
+    def __call__(self, prompt: str, **kwargs):
         return type("Encoded", (), {"input_ids": list(range(len(prompt)))})()
 
 
@@ -1008,18 +1014,30 @@ class TestOneRecDatasetSampleContract(unittest.TestCase):
         ds.data[0]["chat_messages"] = turns
         for item in ds.data[:2]:
             item["chat_template_kwargs"] = {"enable_thinking": False, "task_option": "value"}
-        standard, adjusted = ds.sample(
-            tokenizer=_FakeTokenizer(),
-            num_requests=2,
+        tokenizer = mock.Mock(wraps=_FakeTokenizer())
+        tokenizer.apply_chat_template = mock.Mock(return_value="rendered")
+        (standard,) = ds.sample(
+            tokenizer=tokenizer,
+            num_requests=1,
             chat_template_kwargs={"enable_thinking": True},
         )
-        expected_overrides = {
-            "chat_template_kwargs": {"enable_thinking": True, "task_option": "value"}
-        }
-        self.assertEqual(standard.chat_messages, turns)
-        self.assertEqual(standard.request_overrides, expected_overrides)
-        self.assertIsNone(adjusted.chat_messages)
-        self.assertEqual(adjusted.request_overrides, expected_overrides)
+        tokenizer.apply_chat_template.assert_called_once_with(
+            turns,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            task_option="value",
+        )
+        self.assertEqual(standard.prompt, "rendered")
+        self.assertEqual(standard.prompt_len, len("rendered"))
+        self.assertIsNone(standard.chat_messages)
+        self.assertIsNone(standard.request_overrides)
+        standard, adjusted = ds.sample(tokenizer=_FakeTokenizer(), num_requests=2)
+        self.assertEqual(adjusted.prompt, "bb")
+        with self.assertRaisesRegex(ValueError, "require source messages"):
+            ds.sample(
+                tokenizer=tokenizer, num_requests=2, chat_template_kwargs={"enable_thinking": True}
+            )
 
     # -- 5.3: request_id_prefix is honored ----------------------------------
 

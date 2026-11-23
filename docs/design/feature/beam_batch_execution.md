@@ -99,18 +99,10 @@ finish reason `length` with no stop token; it does not validate
 
 ## Configuration
 
-`gr.beam_batch_sizes` selects the prompt counts eligible for grouped HTTP
-completions and the CUDA request counts used to capture FULL Prefill and Beam
-Decode graphs. The packaged list is `[1, 2, 4]`. Add `8` to make eight-prompt
-HTTP completions eligible for grouping. An explicit Beam batch outside the
-list can still pass admission. On CUDA V2, that batch can replay a PIECEWISE
-Prefill graph if its token bucket was captured. PIECEWISE uses the token
-bucket alone and can serve different admitted request counts.
-
-Size `max-num-seqs` for logical requests and `max-num-batched-tokens` for the
-Prefill workload and, on Ascend, the peak Decode row count. See the
-[batch and token budgets](../../configuration/README.md#batch-sizes-and-token-budgets)
-and [OneRec walkthrough](../../user_guide/onerec_quickstart.md).
+The [configuration reference](../../configuration/README.md#batch-sizes-and-token-budgets)
+owns batch eligibility and capacity settings. An explicit Beam batch outside
+the CUDA capture list can still pass admission; its Prefill dispatch follows
+the [FULL and PIECEWISE selection rules](cuda_prefill_graph.md#capture-shape-selection).
 
 ## Performance
 

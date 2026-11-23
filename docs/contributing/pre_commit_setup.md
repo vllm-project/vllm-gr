@@ -1,6 +1,6 @@
 # Pre-commit setup and scope
 
-Install the repository hooks, then choose the checks that cover the files you changed.
+Install the repository hooks, then choose the checks that cover your changes.
 
 ## Install hooks
 
@@ -18,20 +18,19 @@ The [hook configuration](../../.pre-commit-config.yaml) installs both the
 
 | Command | Scope |
 | --- | --- |
-| `pre-commit run` | Run applicable hooks on staged files. |
-| `pre-commit run --all-files` | Run applicable hooks across the checkout. |
-| `pre-commit run markdownlint --files docs/contributing/pre_commit_setup.md` | Run one named hook on the listed file. |
+| `pre-commit run` | Run applicable hooks on staged files |
+| `pre-commit run --all-files` | Run applicable hooks across the checkout |
+| `pre-commit run HOOK_ID --files PATH` | Run the named hook for the selected path |
 
 The regex import, CUDA API, ShellCheck, and Excalidraw PNG hooks honor the
 selected file list. To check tracked shell scripts directly, run
 `bash tools/pre_commit/shellcheck.sh` from the repository root.
 
-!!! warning "Select a named hook for targeted checks"
-
-    `pre-commit run --files` can trigger `run-tests` if you omit the hook ID.
-    The test hook receives no filenames and runs the full pytest suite by
-    default, including slow tests. See [test levels](ci/test_levels.md) and
-    [running tests locally](ci/local_runner.md) to select runtime tests.
+For targeted checks, specify the hook ID. `pre-commit run --files` can trigger
+`run-tests` when the hook ID is omitted. The test hook receives no filenames
+and runs the full pytest suite by default, including slow tests. See
+[test levels](ci/test_levels.md) and [running tests locally](ci/local_runner.md)
+to select runtime tests.
 
 If a hook changes a file, review the diff and rerun that hook.
 
@@ -43,8 +42,8 @@ For standalone Markdown linting, use the repository configuration explicitly.
 markdownlint --config tools/pre_commit/.markdownlint.yaml README.md
 ```
 
-Pass the edited or added Markdown files to each of the six hooks. This Bash
-example checks the contributor guide itself.
+Replace the example path in the Bash array with the Markdown files you
+edited or added.
 
 ```bash
 files=(docs/contributing/pre_commit_setup.md)

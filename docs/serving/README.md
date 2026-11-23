@@ -1,33 +1,46 @@
-# API server
+# Online serving
 
-Choose an API based on the input your client already has and the output it
-needs. OneRec can serve ranked Beam candidates over HTTP or experimental gRPC.
+<a id="api-server"></a>
+<a id="choose-an-endpoint"></a>
+
+Serve OneRec with [HTTP Beam completions](completions.md) via
+`POST /v1/completions` or [experimental gRPC](grpc.md) for tokenized requests.
 
 ## Start and verify the server
 
-For catalog-constrained HTTP serving, [prepare the OneRec catalog and start
-the server](../../examples/online_serving/beam_search/README.md). In a second
-terminal, check readiness and the model name your client should send.
+To launch OneRec HTTP, follow the
+[OneRec server example](../../examples/online_serving/beam_search/README.md#prepare-a-persistent-service)
+for catalog and startup setup. Check readiness and retrieve the model name
+after startup.
 
 ```bash
 curl --fail http://127.0.0.1:8000/health
 curl --fail http://127.0.0.1:8000/v1/models
 ```
 
-For gRPC, follow the [OneRec gRPC example](../../examples/online_serving/grpc/README.md)
-to start a token-input server and check channel readiness. For ordinary text
-generation with public openPangu weights, use the [Pangu model guide](../models/pangu.md).
-
-## Choose an endpoint
-
-| Client input | Endpoint | Output |
-| --- | --- | --- |
-| Text prompt | [`POST /v1/completions`](completions.md#request) | One text choice per returned candidate |
-| Conversation turns | [`POST /v1/chat/completions`](completions.md#chat-completions) | One assistant message per returned candidate |
-| Token IDs | [gRPC `GenerateBatch`](grpc.md) | Token sequences and Beam metadata grouped by input |
-
 ## Deployment and monitoring
 
-- [Route HTTP requests across CUDA replicas](replica_deployment.md).
-- [Inspect serving metrics](metrics.md).
-- [Update model weights or the catalog](../user_guide/weight_update.md).
+- [Inspect serving metrics](#read-prometheus-metrics).
+- [Update model weights or the catalog](../user_guide/weight_update.md#serving-prerequisites)
+  through a gRPC service with an HTTP management listener. The HTTP
+  inference entrypoint does not enable these update endpoints.
+
+### Read Prometheus metrics
+
+After the HTTP server is ready, inspect its native vLLM metrics:
+
+```bash
+curl --fail http://127.0.0.1:8000/metrics
+```
+
+For end-to-end Beam latency and HTTP throughput, use the
+[benchmark guide](../benchmarking/throughput.md). Historical phase counters
+are covered under [benchmark compatibility](../benchmarking/throughput.md#benchmark-compatibility-with-older-servers).
+
+### Independent HTTP replicas
+
+Start each CUDA replica on its own device and port with the same served model
+name and compatible catalog configuration. Each process owns its own engine and
+KV cache. Route requests through your HTTP proxy and send a
+[`POST /v1/completions` request](completions.md#request) through it to verify
+the deployment.

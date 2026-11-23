@@ -2,7 +2,7 @@
 
 Measure offline Beam throughput or HTTP serving latency with the
 [OneRec benchmark](../../benchmarks/open_one_rec/one_rec_main.py). Prepare the
-runtime and data with the [common benchmark setup](common.md).
+runtime and data with the [common benchmark setup](README.md#setup).
 
 ## Offline measurements
 
@@ -11,7 +11,7 @@ runtime and data with the [common benchmark setup](common.md).
 The OneRec offline Beam runner builds a constraint table from the
 [video catalog triples](../../examples/online_serving/catalog/README.md#extract-constraint-triples-from-the-catalog)
 and selects the CUDA constraint-table backend. Use the triples from the
-[common setup](common.md#prerequisites).
+[common setup](README.md#prerequisites).
 
 ```bash
 export ONEREC_TRIPLES="$ONEREC_WORKDIR/constraint_triples.json"
@@ -43,20 +43,28 @@ a separate JSON file for each revision and batch size.
 
 ## Online serving
 
-Start the server as described in [common benchmark setup](common.md#online-server-mode).
+Start the server as described in [common benchmark setup](README.md#online-server-mode).
 The HTTP client works with either a CUDA or an Ascend server. The example
 uses the model snapshot path as the served name and loads the tokenizer from
 that same path.
 
 ### Online metrics
 
-| Metric | Timing boundary |
-| --- | --- |
-| Streaming TTFT | Ends at the first non-empty reasoning or answer fragment. |
-| ITL | Intervals between successive text fragments, including whitespace fragments. |
-| Request latency | Ends when the response stream finishes. |
+| Metric          | Timing boundary                                                              |
+| --------------- | ---------------------------------------------------------------------------- |
+| Streaming TTFT  | Ends at the first non-empty completion text fragment.                        |
+| ITL             | Intervals between successive text fragments, including whitespace fragments. |
+| Request latency | Ends when the response stream finishes.                                      |
 
 A stream with no text output fails the request.
+
+Beam requests use a non-streaming Completions response: the native endpoint
+rejects `use_beam_search: true` with `stream: true`. The client records TTFT
+as the complete request latency and counts output tokens from the response's
+usage across all returned candidates. Beam exposes no token arrival intervals;
+ITL is empty and the benchmark's displayed TPOT is zero, not a measured Decode
+latency. Compare Beam runs using request latency/TTFT and throughput. Ordinary
+sampling continues to use the streaming metrics above.
 
 ### Run the HTTP client
 
@@ -65,8 +73,8 @@ From a second terminal, run the client.
 ```bash
 export ONEREC_MODEL=/absolute/path/to/OneRec-1.7B
 python -m benchmarks.open_one_rec.one_rec_main bench serve \
-  --endpoint /v1/chat/completions \
-  --backend openai-chat \
+  --endpoint /v1/completions \
+  --backend openai \
   --model "$ONEREC_MODEL" --tokenizer "$ONEREC_MODEL" \
   --dataset-name onerec \
   --dataset-path ./data/benchmark_data \
@@ -78,23 +86,30 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 
 ## Command-line arguments
 
+The [CLI dispatcher](../cli/bench.md) exposes the same workload as
+`vllm bench open-one-rec throughput --gr` or `vllm bench serve --gr`.
+Use `--help=all` on the selected command for all installed options.
+`--enable-thinking` and `--disable-thinking` override the task's thinking
+setting. The offline Beam runner excludes `--warmup-requests` (default 10)
+before recording samples.
+
 ### Server options
 
-| Argument         | Type | Default | Description                                                     |
-|------------------|------|---------|-----------------------------------------------------------------|
-| `--model`        | str  | -       | Model ID or path to load                                        |
-| `--max-logprobs` | int  | -       | Max log Probabilities output by model -- to support beam search |
+| Argument           | Type   | Default   | Description                                                       |
+| ------------------ | ------ | --------- | ----------------------------------------------------------------- |
+| `--model`          | str    | -         | Model ID or path to load                                          |
+| `--max-logprobs`   | int    | -         | Max log Probabilities output by model -- to support beam search   |
 
 ### Benchmark options
 
-| Argument             | Type | Default | Description                                             |
-|----------------------|------|---------|---------------------------------------------------------|
-| `--dataset-name`     | str  | -       | Must be `onerec` for OneRec benchmark                   |
-| `--dataset-path`     | str  | -       | Path to benchmark data directory                        |
-| `--num-prompts`      | int  | -       | Number of prompts to sample                             |
-| `--task-types`       | str  | -       | Comma-separated list of task types to run               |
-| `--custom-input-len` | int  | -       | Prompt length; prompts are trimmed or repeated to match |
-| `--output-json`      | str  | -       | Path to save benchmark results as JSON                  |
+| Argument               | Type   | Default   | Description                                               |
+| ---------------------- | ------ | --------- | --------------------------------------------------------- |
+| `--dataset-name`       | str    | -         | Must be `onerec` for OneRec benchmark                     |
+| `--dataset-path`       | str    | -         | Path to benchmark data directory                          |
+| `--num-prompts`        | int    | -         | Number of prompts to sample                               |
+| `--task-types`         | str    | -         | Comma-separated list of task types to run                 |
+| `--custom-input-len`   | int    | -         | Prompt length; prompts are trimmed or repeated to match   |
+| `--output-json`        | str    | -         | Path to save benchmark results as JSON                    |
 
 ### Prompt length
 
@@ -116,50 +131,72 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 
 ### Online options
 
-| Argument            | Type  | Default       | Description                                                                                      |
-|---------------------|-------|---------------|--------------------------------------------------------------------------------------------------|
-| `--endpoint`        | str   | -             | API endpoint URL for online benchmark                                                            |
-| `--backend`         | str   | 'openai-chat' | Must be `openai-chat` for OneRec online benchmark                                                |
-| `--max-concurrency` | int   | `None`        | Maximum number of concurrent requests; if not set, requests are sent as fast as possible         |
-| `--request-rate`    | float | `inf`         | Number of requests per second to send; `inf` means all requests are sent as soon as possible     |
+| Argument              | Type    | Default         | Description                                                                                        |
+| --------------------- | ------- | --------------- | -------------------------------------------------------------------------------------------------- |
+| `--endpoint`          | str     | -               | API endpoint URL for online benchmark                                                              |
+| `--backend`           | str     | 'openai'        | Must be `openai` for OneRec online benchmark                                                       |
+| `--max-concurrency`   | int     | `None`          | Maximum number of concurrent requests; if not set, requests are sent as fast as possible           |
+| `--request-rate`      | float   | `inf`           | Number of requests per second to send; `inf` means all requests are sent as soon as possible       |
 
-## CPU SIMD and latency
+## Controlled Beam latency
 
-On some CPUs, including older Intel Xeon generations, NumPy AVX-512 kernels
-can trigger frequency changes that also slow subsequent scalar CPU work.
-Small token-array reductions may therefore increase end-to-end Beam latency
-despite being fast themselves. One historical comparison found lower offline latency with NumPy AVX-512
-dispatch disabled. CPU frequency was not measured directly. This is CPU- and
-workload-dependent, so keep the default unless an A/B test shows a benefit.
-See Intel's [power level and frequency transition explanation][intel-avx512].
-
-> Measured on Intel Xeon Gold 6133 / date not recorded / NumPy 2.2.6.
-> Not a performance guarantee.
-
-For diagnosis with NumPy 2.2.6, prefix the same benchmark command with the
-setting below. Use your actual dataset directory and constraint JSON path.
+Use `vllm bench beam-performance MODE --gr` on CUDA to prepare one fixed
+workload, record an offline baseline, and replay the same prompts over HTTP.
+Use the same model, triples, prompt file, and output directory for each stage.
+Remote model IDs require an immutable `--revision` during preparation; use
+that revision in every stage and the server.
 
 ```bash
-NPY_DISABLE_CPU_FEATURES=AVX512F,AVX512CD,AVX512_KNL,AVX512_KNM,AVX512_SKX,AVX512_CLX,AVX512_CNL,AVX512_ICL \
-  python -m benchmarks.open_one_rec.one_rec_main bench throughput \
-  --model "$ONEREC_MODEL" --dataset-name onerec --dataset-path ./data/benchmark_data \
-  --task-types video --num-prompts 100 --beam-search --n 128 \
-  --output-len 5 --constraint-triples "$ONEREC_TRIPLES" \
-  --output-json results/throughput-no-avx512.json
+vllm bench beam-performance prepare --gr \
+  --model /models/OneRec --triples /data/triples.json \
+  --prompt /data/prompt.txt --output-dir /results/beam-performance
+vllm bench beam-performance offline --gr \
+  --model /models/OneRec --triples /data/triples.json \
+  --prompt /data/prompt.txt --output-dir /results/beam-performance \
+  --beam-width 32 --batch-sizes 1 2 4 --warmup-runs 2 --measured-runs 5
 ```
 
-Set the variable before NumPy is imported; restart the inference process for
-each setting. For online tests, apply it to the server running inference.
-This limits NumPy dispatch only, not other CPU libraries or GPU execution.
-Feature names vary by NumPy version; check startup warnings and the
-[NumPy runtime dispatch documentation][numpy-dispatch]. Compare default and
-restricted runs using the same inputs, model, warmup, cache protocol, and
-otherwise idle hardware, and verify output agreement. Record the CPU model
-and NumPy version; a result on one machine does not establish a general tuning
-recommendation.
+Start the HTTP server in a separate terminal using the generated configuration.
 
-[intel-avx512]: https://builders.intel.com/docs/networkbuilders/intel-avx-512-instruction-set-for-packet-processing-technology-guide-1645717553.pdf#page=13
-[numpy-dispatch]: https://numpy.org/doc/2.2/reference/simd/build-options.html#runtime-dispatch
+```bash
+vllm serve /models/OneRec --gr --port 7001 \
+  --config /results/beam-performance/gr-config.yaml \
+  --seed 0 --async-scheduling --max-logprobs 32 --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 --max-model-len 8192 \
+  --gpu-memory-utilization 0.7 --no-enable-prefix-caching --no-enable-chunked-prefill
+```
+
+After the server is ready, replay the recorded workload.
+
+```bash
+vllm bench beam-performance online --gr \
+  --model /models/OneRec --triples /data/triples.json \
+  --prompt /data/prompt.txt --output-dir /results/beam-performance --port 7001
+```
+
+This workload requires three generated SID tokens. Offline batch sizes count
+prompts in one Beam call; online batch sizes count concurrent single-prompt
+HTTP requests. Use `vllm bench beam-performance MODE --gr --help` for each
+stage's options and the [benchmark evidence policy](../contributing/ci/benchmark_acceptance.md#changing-a-policy)
+when comparing revisions.
+
+## Benchmark compatibility with older servers
+
+The current exporter lacks the separate `vllm_gr_beam_search_*` phase
+counters that older servers supplied. The OneRec online benchmark can
+calculate historical Prefill, Decode, and sort times from those servers.
+
+- Keep the server isolated from other traffic during the measurement.
+- Use before and after snapshots with complete, matching labels and
+  nondecreasing phase counters and request counts. Check the total-beams
+  counter the same way if the server publishes it.
+- A missing or reset series makes the phase summary unavailable.
+
+For current measurements, use the end-to-end workloads above. Keep the
+model, prompt length, width, cache mode, and warmup constant when comparing
+runs. Offline CUDA timing includes candidate text materialization; online
+timing includes transport and serving overhead. See
+[Serving](../serving/README.md#read-prometheus-metrics) for the metrics endpoint.
 
 ## Example output
 
@@ -191,38 +228,3 @@ Median ITL (ms):                         0.01
 P99 ITL (ms):                            0.03
 ==================================================
 ```
-
-## Historical HTTP and gRPC comparison
-
-> Measured on NVIDIA H20 / date not recorded / ModelRunner V1 eager, FP16
-> (runtime versions not recorded). Not a performance guarantee.
-
-The comparison used revision `2b84265` for HTTP and the same experimental
-gRPC build for both gRPC inputs. The paths shared random Qwen3 MoE weights (4.149B total / 0.311B
-active), batch size 4, 4096 input tokens per prompt and Beam width 256. Each
-request ran one Prefill and three Decode stages. Prefix Cache, Chunked Prefill
-and constraints were disabled. Each path used 10 warmups and 200 measured
-requests, alternating GPU probes. All 600 outputs matched.
-
-| Per batch (ms) | Baseline HTTP/JSON/list | gRPC binary | gRPC repeated |
-| --- | ---: | ---: | ---: |
-| Python frontend, input + output | 16.755 | 1.897 | 2.117 |
-| Model forward, excluding logits | 186.342 | 187.474 | 187.372 |
-| Beam search, including logits | 11.475 | 11.491 | 11.508 |
-| Client RTT minus Python server time | 1.339 | 0.719 | 0.646 |
-| Other server/framework time | 5.465 | 8.345 | 4.836 |
-| Client RTT | 221.375 | 209.925 | 206.479 |
-| RTT median, GPU probes off | 220.944 | 206.324 | 206.476 |
-| RTT P95, GPU probes off | 223.107 | 206.931 | 207.105 |
-
-The first six rows are means from the 100 GPU-probed requests per path; the
-first five sum to RTT. The last two rows use 100 GPU-probe-off controls;
-Python server boundary hooks remain enabled. Client request construction,
-encoding and reply parsing are outside RTT. Model and beam times sum four
-batch forwards/stages, without multiplying again by batch size.
-
-Other framework time is server time minus frontend, model and beam. The
-client/server difference includes transport/runtime scheduling, not just wire
-protocol work. HTTP returns text while gRPC returns token arrays, so frontend
-savings include decoding and response formatting. All samples are retained;
-isolated gRPC wall-time spikes affect means, so median/P95 are also reported.
