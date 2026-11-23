@@ -300,7 +300,7 @@ def test_constrained_prefill_keeps_backend_scores_and_prefix_metadata(batch_size
     metadata = backend.select.call_args.args[1]
     assert metadata.prefix_token_ids.shape == (batch_size, 3)
     assert metadata.current_step == 0 and metadata.top_k == 2
-    torch.testing.assert_close(metadata.temperatures, torch.full((batch_size,), 0.5))
+    torch.testing.assert_close(metadata.temperatures, torch.tensor([0.5], dtype=torch.float32))
     assert stage.prefill_candidates is candidates
 
 

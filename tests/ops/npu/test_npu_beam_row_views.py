@@ -507,10 +507,14 @@ def test_unsupported_shared_kv_keeps_original_gather_dispatch(
     # Real gathering still executes; only the native attention invocation is mocked.
     original_gather = row_module._gather_shared_blocks
     gathered: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    gathered_seqlens: list[torch.Tensor | None] = []
 
-    def gather(*args: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        result = original_gather(*args)
+    def gather(
+        *args: Any, prefix_seqlens: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        result = original_gather(*args, prefix_seqlens=prefix_seqlens)
         gathered.append(result)
+        gathered_seqlens.append(prefix_seqlens)
         return cast(tuple[torch.Tensor, torch.Tensor, torch.Tensor], result)
 
     def attention(*args: Any, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -519,6 +523,7 @@ def test_unsupported_shared_kv_keeps_original_gather_dispatch(
         assert args[1] is gathered[0][0] and args[2] is gathered[0][1]
         assert args[5] is gathered[0][2]
         assert args[5] is not case.metadata.prefix_block_table
+        assert args[6] is gathered_seqlens[0] is case.metadata.prefix_seqlens_kv_device
         return torch.zeros_like(case.output)
 
     monkeypatch.setattr(row_module, "_npu_stream_capturing", lambda: False)
