@@ -52,8 +52,12 @@ def has_vllm() -> bool:
     return True
 
 
-def require_pangu_st_runtime() -> None:
-    """Require Pangu prerequisites, failing instead of skipping in strict CI."""
+def require_pangu_st_runtime(*, require_model: bool = True) -> None:
+    """Check runtime, retaining the legacy local-model guard for direct callers.
+
+    The pangu_model fixture passes require_model=False and prepares validated
+    weights on demand after this runtime check succeeds.
+    """
     import unittest
 
     strict = os.environ.get("PANGU1B_REQUIRE_RUNTIME", "") == "1"
@@ -61,7 +65,7 @@ def require_pangu_st_runtime() -> None:
         if strict:
             raise RuntimeError(SKIP_VLLM)
         raise unittest.SkipTest(SKIP_VLLM)
-    if not model_available():
+    if require_model and not model_available():
         if strict:
             raise RuntimeError(SKIP_MODEL)
         raise unittest.SkipTest(SKIP_MODEL)

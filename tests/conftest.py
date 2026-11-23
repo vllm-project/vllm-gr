@@ -3,6 +3,15 @@
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import pytest
 
+from tests.helpers.artifact_fixtures import (  # noqa: F401
+    gsm8k_mini,
+    onerec_dataset,
+    onerec_iid_constraints,
+    onerec_model,
+    onerec_pid_constraints,
+    pangu_model,
+)
+
 pytest_plugins = ("tests.level_plugin",)
 
 

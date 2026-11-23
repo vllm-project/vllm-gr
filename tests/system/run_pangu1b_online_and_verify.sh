@@ -44,7 +44,7 @@ echo "  threshold: $MIN_ACCURACY ($FAILURE_MODE)"
 PANGU1B_REQUIRE_RUNTIME=1 \
 PANGU1B_MEASURE_ONLY=1 \
 PANGU1B_ONLINE_RESULT_JSON="$result_json" \
-python -m unittest tests.st.test_pangu1b_online_st
+python -m pytest --run-slow --strict-test-levels -m model_test tests/st/test_pangu1b_online_st.py
 execution_status=$?
 if [[ "$execution_status" -ne 0 ]]; then
   echo "Pangu online service/API execution failed with exit code $execution_status." >&2
