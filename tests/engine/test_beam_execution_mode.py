@@ -62,9 +62,6 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
         device="npu",
         model_config=SimpleNamespace(enforce_eager=False),
         vllm_config=worker_vllm_config,
-        _vllm_gr_config=GRConfig(
-            beam_max_width=4, beam_worker_decision=True, constraint=ConstraintConfig()
-        ),
     )
 
     assert gr_startup.capture_async_forward(worker)
@@ -130,9 +127,13 @@ def test_v1_reduction_policy_scope_overrides_and_cache_identity(
         arg_utils_gr, "engine_config_service", lambda: legacy_config_service(device_type)
     )
     args = SimpleNamespace(
-        gr={
-            "beam_width": [4] * 3 if with_beam else None,
-            "candidate_width": [4] * 3 if with_beam else None,
+        additional_config={
+            "vllm_gr": {
+                "gr": {
+                    "beam_width": [4] * 3 if with_beam else None,
+                    "candidate_width": [4] * 3 if with_beam else None,
+                }
+            }
         }
     )
     assert arg_utils_gr.create_engine_config(args) is config

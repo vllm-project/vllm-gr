@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.gr_config import update_worker_config
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     install_decode_model,
@@ -34,9 +35,9 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
     worker = admission_worker()
     worker.model_config.enforce_eager = False
     worker.model_config.max_model_len = 64
-    worker._vllm_gr_config.beam_graph_enabled = True
-    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
-    worker._vllm_gr_config.beam_worker_decision = True
+    update_worker_config(worker, beam_graph_enabled=True)
+    update_worker_config(worker, deployment=DeploymentOptions(beam_batch_sizes=(1,)))
+    update_worker_config(worker, beam_worker_decision=True)
 
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=1)
     for group in worker.kv_cache_config.kv_cache_groups:
@@ -123,10 +124,12 @@ def test_invalidated_decode_capture_aborts_in_isolated_process() -> None:
 def test_v1_startup_graphs_replay_with_their_own_batch_buffers() -> None:
     worker = admission_worker()
     worker.model_config.enforce_eager = False
-    cfg = worker._vllm_gr_config
-    cfg.beam_graph_enabled = cfg.beam_worker_decision = True
-
-    cfg.deployment = DeploymentOptions(beam_batch_sizes=(1, 2))
+    cfg = update_worker_config(
+        worker,
+        beam_graph_enabled=True,
+        beam_worker_decision=True,
+        deployment=DeploymentOptions(beam_batch_sizes=(1, 2)),
+    )
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=2)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
     assert capture_async_forward(worker, hooks_type=CudaStageHooksV1)

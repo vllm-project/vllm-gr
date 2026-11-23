@@ -62,7 +62,7 @@ operations. `platforms/protocol.py` keeps the original imports available.
 
 ## Engine plans
 
-Providers that declare plan API version 2 and an adapter revision can build an
+Providers that declare plan API version 3 and an adapter revision can build an
 engine plan with backend services and runner hooks. The plan is admitted and
 attached to the engine config before worker startup. Each worker then
 re-resolves the plan, creates the declared services after model load, and
@@ -78,8 +78,10 @@ To migrate a planning provider from plan API v1, read the optional
 `table`; in table mode, `constraint["table"]` contains the artifact and its
 placement. An omitted constraint is represented by `None`. Replace reads of
 the old top-level `constraint_backend` and `constraint_table` fields before
-declaring `plan_api_version = 2`. Registration rejects providers declaring v1
-before calling their resolver.
+declaring `plan_api_version = 3`. Providers migrating from plan API v2 must
+also remove reads of `deployment.admin_host` and `deployment.admin_port`.
+GR serve owns those listener settings. Registration rejects v1 and v2 planning
+providers before calling their resolvers.
 
 ## Validation
 

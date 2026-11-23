@@ -63,9 +63,9 @@ integer lists. A missing binding or a mismatched schema triggers reinstallation.
 
 Scope: `core`; backend ID: `null`
 
-EngineArgs registers GR options and serializes the resolved settings for
-explicitly selected GR engines. Its wrappers preserve native descriptor types
-and explicit caller settings when constructing the engine configuration.
+GR serve and GRLLM pass a validated snapshot through native
+`EngineArgs.additional_config`. The GR hook on `create_engine_config` resolves
+device-dependent settings and admits the backend plan before worker startup.
 
 ## GR-PATCH-007 — EngineCore Client and AsyncLLM Extensions
 

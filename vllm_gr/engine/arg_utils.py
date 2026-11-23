@@ -1,23 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-import argparse
-import inspect
 import json
 import logging
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping
+from copy import copy
 from dataclasses import replace
-from typing import Final
+from pathlib import Path
 
-from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
-from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.engine.arg_utils import EngineArgs
 
 from vllm_gr.config import (
     ConstraintBackendKind,
     GRAttentionBackend,
     GRConfig,
-    GRConfigInput,
+    gr_config_from_mapping,
     gr_config_to_mapping,
+    load_gr_config,
     write_canonical_gr_config,
 )
 from vllm_gr.config.models import (
@@ -25,105 +24,12 @@ from vllm_gr.config.models import (
 )
 from vllm_gr.config.parser import (
     GR_CONFIG_KEY,
-    load_engine_gr_config,
-    merge_gr_settings,
-    read_settings,
+    validate_additional_keys,
 )
-from vllm_gr.engine.startup import resolve_native_settings
 from vllm_gr.platforms.config import BackendConfigService, engine_config_service
 
-origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
-origin_from_cli_args = EngineArgs.from_cli_args.__func__
-origin_engine_args_init = EngineArgs.__init__
-origin_async_engine_args_init = AsyncEngineArgs.__init__
 logger = logging.getLogger(__name__)
-_ORIGIN_ENGINE_ARG_POSITIONAL_NAMES: Final = tuple(
-    list(inspect.signature(origin_engine_args_init).parameters)[1:]
-)
-
-
-def _has_gr_additional_config(additional: object) -> bool:
-    return isinstance(additional, Mapping) and any(
-        key == GR_CONFIG_KEY or isinstance(key, str) and key.startswith("vllm_gr_")
-        for key in additional
-    )
-
-
-def _gr_engine_args_init(original):
-    def initialize(
-        self: EngineArgs,
-        *args: object,
-        config: GRConfigInput | None = None,
-        _gr_startup_document: Mapping | None = None,
-        _gr_mode: bool = False,
-        _gr_explicit_native_fields: set[str] | None = None,
-        gr: Mapping | None = None,
-        **kwargs: object,
-    ) -> None:
-        """Forward the GR file path to the shared driver startup path."""
-        additional = kwargs.get("additional_config")
-        selected = (
-            _gr_mode
-            or config is not None
-            or _gr_startup_document is not None
-            or gr is not None
-            or _has_gr_additional_config(additional)
-        )
-        if not selected:
-            original(self, *args, **kwargs)
-            self._gr_selected = False
-            return
-        document = _gr_startup_document
-        if document is None and config is not None:
-            document = read_settings(config)
-        positional = dict(zip(_ORIGIN_ENGINE_ARG_POSITIONAL_NAMES, args))
-        values = resolve_native_settings(
-            document, {**positional, **kwargs}, explicit_fields=_gr_explicit_native_fields
-        )
-        original(
-            self, *args, **{name: value for name, value in values.items() if name not in positional}
-        )
-        self.config = config
-        self._gr_startup_document = document
-        self.gr = gr
-        self._gr_selected = True
-
-    return initialize
-
-
-def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
-    parser = origin_add_cli_args(parser)
-    model_group = parser.add_argument_group(title="vLLM-GR")
-    model_group.add_argument(
-        "--gr-config",
-        dest="gr",
-        type=json.loads,
-        action="append",
-        default=None,
-        help="GR settings as JSON, or use --gr.beam_width '[128,64,32]'.",
-    )
-    return parser
-
-
-def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
-    selected = bool(getattr(args, "_gr_mode", False) or getattr(args, "gr", None))
-    explicit = getattr(args, "_gr_explicit_native_fields", None)
-    if selected:
-        args = argparse.Namespace(
-            **resolve_native_settings(None, vars(args), explicit_fields=explicit)
-        )
-    engine_args = origin_from_cli_args(cls, args)
-    engine_args._gr_selected = selected
-    # --config was expanded by GRArgumentParser before EngineArgs construction.
-    engine_args.config = None
-    overrides = None
-    for block in getattr(args, "gr", None) or ():
-        if not isinstance(block, dict):
-            raise ValueError("--gr-config requires a JSON object")
-        overrides = merge_gr_settings(overrides or {}, block)
-    engine_args.gr = overrides
-    return engine_args
 
 
 def _resolve_constraint_backend(config: GRConfig) -> GRConfig:
@@ -157,38 +63,35 @@ def create_engine_config(self, usage_context=None, headless=False):
     if requested_backend is None:
         requested_backend = getattr(getattr(self, "attention_config", None), "backend", None)
     requested_backend_name = getattr(requested_backend, "name", requested_backend)
-    config = origin_create_engine_config(self, usage_context, headless)
-    if (
-        not getattr(self, "_gr_selected", False)
-        and not _has_gr_additional_config(getattr(config, "additional_config", None))
-        and not any(
-            getattr(self, name, None) is not None
-            for name in ("config", "gr", "_gr_startup_document")
-        )
+    additional = getattr(self, "additional_config", None)
+    if not isinstance(additional, Mapping) or not any(
+        key == GR_CONFIG_KEY or isinstance(key, str) and key.startswith("vllm_gr_")
+        for key in additional
     ):
-        return config
+        return origin_create_engine_config(self, usage_context, headless)
+    # Upstream can add kernel selectors to its dictionary during construction.
+    # Give each creation its own copy, including when creation raises.
+    validate_additional_keys(additional)
+    native_args = copy(self)
+    native_args.additional_config = dict(additional)
+    if GR_CONFIG_KEY in additional:
+        effective_gr_config = gr_config_from_mapping(
+            native_args.additional_config.pop(GR_CONFIG_KEY), base_dir=Path.cwd()
+        )
+    else:
+        from vllm_gr.platforms.planning import BACKEND_OPTIONS_KEY
+
+        if BACKEND_OPTIONS_KEY in additional:
+            raise ValueError(
+                'vllm_gr_backend_options requires additional_config["vllm_gr"]. '
+                "Pass gr_config_to_mapping(gr) alongside the backend options. For Beam, set "
+                "async_scheduling=True, enable_chunked_prefill=False, and max_num_batched_tokens "
+                "at least as large as max_model_len, or use GRLLM or vllm serve --gr."
+            )
+        effective_gr_config = load_gr_config()
+    config = origin_create_engine_config(native_args, usage_context, headless)
     service = engine_config_service()
     service.apply_native_defaults(config)
-    path = getattr(self, "config", None)
-    overrides = getattr(self, "gr", None)
-    additional = getattr(config, "additional_config", None)
-    if (
-        additional is not None
-        and not isinstance(additional, Mapping)
-        and path is None
-        and overrides is None
-    ):
-        # Preserve opaque upstream plugin state when this engine has no GR input.
-        return config
-    effective_gr_config = load_engine_gr_config(
-        path,
-        additional,
-        overrides,
-        startup_document=getattr(self, "_gr_startup_document", None),
-        worker_decision_default=_beam_worker_decision_default(
-            service, beam_width_configured=True, worker_decision=None
-        ),
-    )
     attention = getattr(config, "attention_config", None)
     backend = getattr(attention, "backend", None)
     # Ascend resets the native selector to auto during VllmConfig creation.
@@ -216,13 +119,7 @@ def create_engine_config(self, usage_context=None, headless=False):
 
     service.validate_engine(config, effective_gr_config)
 
-    # vLLM also allows opaque, hashable objects for other plugins. They
-    # cannot carry GR state, but a plain engine needs no transport override.
-    if (
-        isinstance(getattr(config, "additional_config", None), MutableMapping)
-        or effective_gr_config != GRConfig()
-    ):
-        write_canonical_gr_config(config, effective_gr_config)
+    write_canonical_gr_config(config, effective_gr_config)
 
     if effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM:
         attention_config = getattr(config, "attention_config", None)
@@ -248,25 +145,11 @@ def create_engine_config(self, usage_context=None, headless=False):
     return config
 
 
-_init_engine_args = _gr_engine_args_init(origin_engine_args_init)
-_init_async_engine_args = _gr_engine_args_init(origin_async_engine_args_init)
-
-
-def patch_add_cli_args() -> None:
-    EngineArgs.add_cli_args = staticmethod(add_cli_args)
+def patch_create_engine_config() -> None:
     EngineArgs.create_engine_config = create_engine_config
-    EngineArgs.from_cli_args = classmethod(from_cli_args)
-    EngineArgs.__init__ = _init_engine_args
-    AsyncEngineArgs.__init__ = _init_async_engine_args
 
 
 def validate_engine_args_patch() -> str | None:
-    if (
-        EngineArgs.add_cli_args is add_cli_args
-        and EngineArgs.create_engine_config is create_engine_config
-        and EngineArgs.from_cli_args.__func__ is from_cli_args
-        and EngineArgs.__init__ is _init_engine_args
-        and AsyncEngineArgs.__init__ is _init_async_engine_args
-    ):
+    if EngineArgs.create_engine_config is create_engine_config:
         return None
-    return "EngineArgs GR integration is incomplete"
+    return "EngineArgs.create_engine_config GR integration is incomplete"

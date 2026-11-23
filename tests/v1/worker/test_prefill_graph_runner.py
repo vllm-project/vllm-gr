@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import torch
 
-from tests.helpers.gr_config import engine_config
+from tests.helpers.gr_config import engine_config, worker_config
 from vllm_gr.v1.worker import prefill_graph_common
 from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 
@@ -1157,8 +1157,10 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
 
     events: list[str] = []
 
+    from vllm_gr.config import GRConfig
+
     class Runner:
-        _vllm_gr_config = SimpleNamespace(beam_max_width=128)
+        vllm_config = worker_config(GRConfig(beam_max_width=128))
 
         def execute_model(self) -> None:
             pass

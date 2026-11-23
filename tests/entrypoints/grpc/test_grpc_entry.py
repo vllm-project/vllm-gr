@@ -1178,8 +1178,10 @@ def test_inherited_metadata_rpcs_work_with_extended_protocol() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("enable_management", [False, True])  # type: ignore[misc]
 def test_upstream_startup_keeps_health_reflection_stats_and_cleanup_order(
     monkeypatch: pytest.MonkeyPatch,
+    enable_management: bool,
 ) -> None:
     """Exercise upstream serve_grpc with real listeners and an observable engine."""
     import signal
@@ -1259,10 +1261,20 @@ def test_upstream_startup_keeps_health_reflection_stats_and_cleanup_order(
             enable_log_requests=False,
             disable_log_stats=False,
         )
-        with patch_grpc_server():
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            admin_port = reservation.getsockname()[1]
+        with patch_grpc_server(admin_port=admin_port if enable_management else None):
             task = asyncio.create_task(upstream.serve_grpc(args))
             try:
                 await asyncio.wait_for(signals_ready.wait(), timeout=5)
+                if enable_management:
+                    _, writer = await asyncio.open_connection("127.0.0.1", admin_port)
+                    writer.close()
+                    await writer.wait_closed()
+                else:
+                    with pytest.raises(ConnectionRefusedError):
+                        await asyncio.open_connection("127.0.0.1", admin_port)
                 async with grpc.aio.insecure_channel(
                     f"127.0.0.1:{port}", options=(("grpc.enable_http_proxy", 0),)
                 ) as channel:

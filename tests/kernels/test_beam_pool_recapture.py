@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.gr_config import update_worker_config
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     install_decode_model,
@@ -37,9 +38,9 @@ def test_recapture_after_last_graph_retired_with_live_output(
     gc.collect()
     worker = admission_worker(max_rows=32)
     worker.model_config.enforce_eager = False
-    worker._vllm_gr_config.beam_graph_enabled = True
-    worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
+    update_worker_config(worker, beam_graph_enabled=True)
+    update_worker_config(worker, beam_worker_decision=True)
+    update_worker_config(worker, deployment=DeploymentOptions(beam_batch_sizes=(1,)))
 
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
@@ -91,9 +92,9 @@ def test_recapture_preserves_other_live_geometry(
     gc.collect()
     worker = admission_worker(max_rows=32)
     worker.model_config.enforce_eager = False
-    worker._vllm_gr_config.beam_graph_enabled = True
-    worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1, 2))
+    update_worker_config(worker, beam_graph_enabled=True)
+    update_worker_config(worker, beam_worker_decision=True)
+    update_worker_config(worker, deployment=DeploymentOptions(beam_batch_sizes=(1, 2)))
 
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))

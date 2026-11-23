@@ -11,6 +11,8 @@ from unittest.mock import Mock, call
 
 import pytest
 
+from tests.helpers.gr_config import update_worker_config, worker_config
+from vllm_gr.config import GRConfig
 from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.v1.worker import gr_gc as _gc_runtime
 from vllm_gr.v1.worker import model_runner_contracts as _patch_contracts
@@ -198,7 +200,7 @@ def test_capture_order_and_failure_propagation(
     from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
 
     worker = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(beam_max_width=4 if beam_enabled else None),
+        vllm_config=worker_config(GRConfig(beam_max_width=4 if beam_enabled else None)),
         cudagraph_manager=None,
     )
     events = Mock()
@@ -241,10 +243,10 @@ def test_repeated_capture_preserves_published_decode_failure(
 
     worker = SimpleNamespace(
         device="cuda",
-        _vllm_gr_config=SimpleNamespace(
-            beam_max_width=4, deployment=DeploymentOptions(beam_batch_sizes=(1,))
+        vllm_config=worker_config(
+            GRConfig(beam_max_width=4, deployment=DeploymentOptions(beam_batch_sizes=(1,))),
+            SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1)),
         ),
-        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1)),
         cudagraph_manager=object(),
     )
     reason = "Decode capture refused"
@@ -307,7 +309,7 @@ def test_profile_capture_includes_decode_without_freezing(
     samples: list[int] = []
     manager._capture_mem_samples = samples
     worker = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(beam_max_width=128),
+        vllm_config=worker_config(GRConfig(beam_max_width=128)),
         cudagraph_manager=manager,
     )
     native = Mock(return_value=4096)
@@ -347,7 +349,7 @@ def test_profile_decode_failure_restores_native_capture_state(
     from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
 
     worker = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(beam_max_width=128),
+        vllm_config=worker_config(GRConfig(beam_max_width=128)),
         cudagraph_manager=object(),
     )
     error = RuntimeError("Decode capture failed")
@@ -393,9 +395,8 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
         _capture_descs={Mode.FULL: list(range(7))},
     )
     worker = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(beam_max_width=128),
+        vllm_config=worker_config(GRConfig(beam_max_width=128)),
         compilation_config=SimpleNamespace(cudagraph_mode=Mode.FULL),
-        vllm_config=object(),
     )
     graph = Mock()
     events: list[str] = []
@@ -472,7 +473,7 @@ def test_profile_rejects_bound_runtime_and_preserves_non_beam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worker = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(beam_max_width=128),
+        vllm_config=worker_config(GRConfig(beam_max_width=128)),
         _beam_decode_graph=object(),
     )
     original = Mock(return_value=42)
@@ -481,7 +482,7 @@ def test_profile_rejects_bound_runtime_and_preserves_non_beam(
     with pytest.raises(RuntimeError, match="unbound GR runtime"):
         profile(worker)
     original.assert_not_called()
-    worker._vllm_gr_config.beam_max_width = None
+    update_worker_config(worker, beam_max_width=None)
     assert profile(worker) == 42
     original.assert_called_once_with(worker)
 

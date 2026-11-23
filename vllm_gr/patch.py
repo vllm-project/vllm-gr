@@ -173,7 +173,7 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
         _module_patch(
             "engine_args",
             "vllm_gr.engine.arg_utils",
-            "patch_add_cli_args",
+            "patch_create_engine_config",
             "validate_engine_args_patch",
         ),
         BeamPatch(

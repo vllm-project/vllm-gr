@@ -13,7 +13,8 @@ import pytest
 import torch
 from vllm.v1.core.sched.output import NewRequestData
 
-from tests.helpers.gr_config import table_constraint
+from tests.helpers.gr_config import table_constraint, worker_config
+from vllm_gr.config import GRConfig
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
 from vllm_gr.v1.attention.backends.npu_cache_layout import restore_npu_cache_pool_layout
 from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
@@ -1535,7 +1536,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
         positions=torch.zeros(6, dtype=torch.int64),
         input_batch=SimpleNamespace(req_ids=list(logical.num_scheduled_tokens)),
         execute_model_state=None,
-        _vllm_gr_config=SimpleNamespace(beam_graph_enabled=False),
+        vllm_config=worker_config(GRConfig(beam_graph_enabled=False)),
     )
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker, stage.previous = worker, prefill.execution
@@ -2424,7 +2425,7 @@ def test_npu_parent_history_follows_output_options_through_session(
 
     worker = SimpleNamespace(
         device=torch.device("cpu"),
-        _vllm_gr_config=SimpleNamespace(constraint=table_constraint()),
+        vllm_config=worker_config(GRConfig(constraint=table_constraint())),
         _gr_npu_graph_context=context,
         _gr_npu_beam_graph_shapes={(batch_size, 3)},
         constraint_backend=SimpleNamespace(
@@ -2819,22 +2820,15 @@ pytestmark = pytest.mark.cpu_test
 def test_dynamic_npu_cases_use_public_engine_configuration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from vllm.engine.arg_utils import EngineArgs
-
-    from tests.helpers.gr_config import npu_dynamic_engine_args
-    from vllm_gr.config.parser import load_engine_gr_config
-    from vllm_gr.engine.arg_utils_gr import (
-        _gr_engine_args_init,
-        origin_engine_args_init,
-    )
+    from tests.helpers.gr_config import npu_dynamic_engine_args, prepared_engine_args
+    from vllm_gr.config import GRConfig
 
     observed: list[Any] = []
 
     def probe(**kwargs: Any) -> None:
-        args = EngineArgs.__new__(EngineArgs)
-        _gr_engine_args_init(origin_engine_args_init)(args, **kwargs)
+        args = prepared_engine_args(**kwargs)
         assert args.dtype == "float16"
-        config = load_engine_gr_config(None, {}, args.gr)
+        config = GRConfig.from_vllm_config(args)
         assert args.attention_config.backend.name == "CUSTOM"
         assert args.enforce_eager is not config.beam_graph_enabled
         assert config.beam_max_width == 32

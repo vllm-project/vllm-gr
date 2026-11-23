@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.helpers.gr_config import worker_config
 from vllm_gr.v1.worker.cuda import gpu_postprocess_workspace as workspace_support
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
@@ -120,10 +121,12 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
     runner = SimpleNamespace(
         device=torch.device("cuda"),
         model_config=SimpleNamespace(dtype=torch.float16),
-        _vllm_gr_config=GRConfig(
-            beam_worker_decision=True,
-            beam_max_width=4,
-            beam_max_decode_steps=3,
+        vllm_config=worker_config(
+            GRConfig(
+                beam_worker_decision=True,
+                beam_max_width=4,
+                beam_max_decode_steps=3,
+            )
         ),
     )
 
