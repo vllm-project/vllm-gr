@@ -116,7 +116,7 @@ else
     rc=$?
     set -e
     if [ $rc -ne 0 ] || [ -z "$idle_gpu" ]; then
-        echo "No device matched the selection criteria (memory threshold: ${mem_th} MiB; exit code: $rc)."
+        echo "Automatic device selection failed (memory threshold: ${mem_th} in backend units; exit code: $rc)." >&2
         exit 1
     fi
 fi
