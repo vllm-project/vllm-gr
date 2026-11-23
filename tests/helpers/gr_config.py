@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from vllm_gr.config import (
+    CONSTRAINT_TABLE_FORMAT,
     ConstraintBackendKind,
     ConstraintConfig,
     ConstraintMode,
@@ -19,6 +20,57 @@ from vllm_gr.config import (
     GRConfig,
 )
 from vllm_gr.config.models import DeploymentOptions
+
+
+def config_host(additional_config: object | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        additional_config={} if additional_config is None else additional_config,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+    )
+
+
+class OpaqueAdditionalConfig:
+    """Upstream-compatible non-mapping additional configuration."""
+
+    def compute_hash(self) -> str:
+        return "opaque-config"
+
+
+def fixed_beam_mapping(path: str, *, enabled: bool = True) -> dict[str, Any]:
+    return {
+        "gr": {
+            "beam_graph_enabled": True,
+            "beam_width": [32] * 3,
+            "candidate_width": [32] * 3,
+            "max_decode_steps": 3,
+            "constraint_mode": "table" if enabled else "none",
+            "constraint_table": {
+                "path": path,
+                "backend": "cpu",
+                "format": CONSTRAINT_TABLE_FORMAT,
+                "max_top_k": 128,
+                "digests": {"artifact": "sha256:" + "a" * 64, "tokenizer": "sha256:" + "b" * 64},
+            }
+            if enabled
+            else None,
+        }
+    }
+
+
+def stepped_table_mapping() -> dict[str, Any]:
+    return {
+        "gr": {
+            "beam_width": [64, 128, 128],
+            "candidate_width": [64] * 3,
+            "constraint_mode": "table",
+            "constraint_table": {
+                "path": "/tmp/constraint_table.safetensors",
+                "backend": "auto",
+                "max_top_k": 128,
+                "digests": {"artifact": "sha256:" + "a" * 64, "tokenizer": "sha256:" + "b" * 64},
+            },
+        }
+    }
 
 
 def table_constraint(*, max_top_k: int = 128) -> ConstraintConfig:

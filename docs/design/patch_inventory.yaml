@@ -108,7 +108,7 @@ patches:
       - vllm_gr.engine.arg_utils.validate_engine_args_patch
       - tests/engine/test_backend_plan_engine_args.py
       - tests/v1/attention/test_attention_backend_custom.py
-      - tests/engine/test_gr_config_v1.py
+      - tests/engine/test_gr_config.py::test_canonical_inputs_produce_identical_worker_configuration
     process_roles: [main, api_server]
     target: vllm.engine.arg_utils.EngineArgs.create_engine_config
     risk: high
@@ -405,7 +405,7 @@ retired_patches:
     reason: Legacy Catalog serving patch and its tests were removed; canonical V1 constraints load in the worker
     replacement_coverage:
       - tests/constraints/test_cuda_backend.py::test_canonical_worker_enables_vocab_slice_before_first_forward
-      - tests/engine/test_gr_config_v1.py
+      - tests/engine/test_gr_config_transport.py::test_file_snapshot_survives_driver_file_removal
   - id: GR-PATCH-014
     historical_target: LMCache RequestTracker, ReqMeta, and LMCacheConnectorV1Impl
     reason: Experimental LMCache integration removed; no supported version pin or vLLM 0.30 validation
