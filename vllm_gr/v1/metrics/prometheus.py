@@ -12,13 +12,14 @@ import atexit
 import logging
 import math
 import os
-import regex as re
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from time import monotonic
 from typing import Any
 from weakref import WeakKeyDictionary
+
+import regex as re
 
 from vllm_gr.v1.metrics.telemetry import TELEMETRY_KEY, metrics_config
 
@@ -69,7 +70,6 @@ _COUNT_BUCKETS = (
     32768,
     65536,
 )
-_SCORE_BUCKETS = (0, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128)
 
 # Keys remain identical to the telemetry's existing metric names. The wire
 # names replace punctuation with underscores; Counter adds its standard _total.
@@ -110,11 +110,6 @@ HISTOGRAMS = {
         ("model",),
         _COUNT_BUCKETS,
     ),
-    "sid.score.nll": (
-        "Negative raw model log probability of valid selected SID candidates.",
-        ("model", "sid_level", "population", "score_kind"),
-        _SCORE_BUCKETS,
-    ),
 }
 COUNTERS = {
     "prompt.samples": ("Input rows entering the first GR stage.", ("model",)),
@@ -125,14 +120,6 @@ COUNTERS = {
         ("model", "source"),
     ),
     "stage.device_samples": ("Received sampled SID device batches.", ("model", "sid_level")),
-    "sid.score.count": (
-        "Valid candidates observed in each SID score distribution.",
-        ("model", "sid_level", "population", "score_kind"),
-    ),
-    "token_code": (
-        "Selected valid SID token occurrences, with a bounded token label budget.",
-        ("model", "sid_level", "population", "token_code"),
-    ),
     "beam.invalid.result_count": ("Invalid final SID records by reason.", ("model", "reason")),
     "batch.failures": ("Published GR batch failures by bounded reason.", ("model", "reason")),
     "metrics.dropped": ("Telemetry frames dropped by the bounded frontend queue.", ("reason",)),
@@ -182,7 +169,8 @@ class PrometheusClient:
         self._labels: dict[str, tuple[str, ...]] = {}
 
     def _metric(self, kind: str, name: str):
-        from prometheus_client import Counter as PrometheusCounter, Histogram
+        from prometheus_client import Counter as PrometheusCounter
+        from prometheus_client import Histogram
 
         if name in self._metrics:
             return self._metrics[name]
@@ -253,7 +241,6 @@ class PrometheusMetricsCollector:
         self.client = client
         self.emission_errors = 0
         self._seen: OrderedDict[tuple, None] = OrderedDict()
-        self._codes: dict[tuple[str, str], set[int]] = {}
 
     def _emit(self, kind: str, name: str, value: float, tags: dict) -> None:
         if not math.isfinite(value):
@@ -334,34 +321,8 @@ class PrometheusMetricsCollector:
                     seconds * 1000,
                     {**stage_tags, "component": component, "clock": clock},
                 )
-        population = device.get("population", "retained")
-        population_tags = {**stage_tags, "population": population}
-        codes = self._codes.setdefault((model, level), set())
-        limit = metrics_config().token_code_limit
-        token_counts: Counter[str] = Counter()
-        score_counts: Counter[str] = Counter()
-        for row in device.get("rows", ()):
-            valid = [v for v in row if v[3] and v[0] >= 0 and math.isfinite(v[1])]
-            self._timer("beam.width", len(valid), {**stage_tags, "kind": "effective"})
-            for token, cumulative, local, _ in valid:
-                for kind, score in (("cumulative", cumulative), ("local", local)):
-                    if math.isfinite(score) and score <= 0:
-                        self._timer(
-                            "sid.score.nll", -score, {**population_tags, "score_kind": kind}
-                        )
-                        score_counts[kind] += 1
-                if limit:
-                    token = int(token)
-                    if token in codes or len(codes) < limit:
-                        codes.add(token)
-                        label = str(token)
-                    else:
-                        label = "other"
-                    token_counts[label] += 1
-        for kind, n in score_counts.items():
-            self._counter("sid.score.count", n, {**population_tags, "score_kind": kind})
-        for token, n in token_counts.items():
-            self._counter("token_code", n, {**population_tags, "token_code": token})
+        for width in device.get("effective_widths", ()):
+            self._timer("beam.width", width, {**stage_tags, "kind": "effective"})
 
 
 class PrometheusMetricsReporter:

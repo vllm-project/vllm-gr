@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Real CUDA stream/fence tests for metrics, also runnable through unittest."""
 
-import unittest
-from typing import Any
 import os
+import unittest
 from types import SimpleNamespace as NS
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -13,7 +13,6 @@ import torch
 
 from vllm_gr.v1.metrics.gpu import GPUStageMetrics
 from vllm_gr.v1.metrics.telemetry import metrics_config
-
 
 pytestmark = [pytest.mark.gpu_test, pytest.mark.l2]
 
@@ -42,16 +41,11 @@ class CUDAStageMetricsTests(unittest.TestCase):
         state = NS(
             beam_width=width,
             device="cuda",
-            beam_scores=torch.full((batch, width), -2.0, device="cuda"),
-            input_ids=torch.arange(batch * width, device="cuda", dtype=torch.int32).view(
-                batch, width
-            ),
-            parent_ids=torch.zeros((batch, width), device="cuda", dtype=torch.int32),
-            active_mask=torch.ones((batch, width), device="cuda", dtype=torch.bool),
+            num_active_beams=torch.full((batch,), width, dtype=torch.int32, device="cuda"),
         )
         return NS(beam=NS(state=state), bindings=tuple(range(batch)), dynamic=None)
 
-    def test_copy_fence_covers_events_and_survivor_snapshot(self) -> None:
+    def test_copy_fence_covers_events_and_effective_counts(self) -> None:
         owner = self.owner()
         metrics = GPUStageMetrics(owner, 2)
         copy_stream = torch.cuda.Stream()
@@ -59,7 +53,7 @@ class CUDAStageMetricsTests(unittest.TestCase):
         copy_done = torch.Event()
         metadata = NS(owner_generation=2, stage_index=1, is_last_stage=False)
         metrics.begin(0, metadata, owner)
-        owner.beam.state.beam_scores.fill_(-3.0)
+        owner.beam.state.num_active_beams.copy_(torch.tensor([3, 1], device="cuda"))
         metrics.stop("forward")
         metrics.snapshot(owner, NS(output_width=4))
         produced.record()
@@ -71,7 +65,7 @@ class CUDAStageMetricsTests(unittest.TestCase):
         copy_done.synchronize()
         result = metrics.consume(0)
         self.assertGreaterEqual(result["timings"]["forward"], 0)
-        self.assertEqual(result["rows"][1][0], (4, -3.0, -1.0, 1))
+        self.assertEqual(result["effective_widths"], [3, 1])
 
     def test_forward_timer_matches_independent_cuda_events(self) -> None:
         owner = self.owner(batch=1)
@@ -102,18 +96,12 @@ class CUDAStageMetricsTests(unittest.TestCase):
         self.assertGreater(reference_ms, 0)
         self.assertLessEqual(abs(actual_ms - reference_ms), max(0.15, 0.1 * reference_ms))
 
-    def test_terminal_uses_packed_count_and_ranked_rows(self) -> None:
+    def test_terminal_uses_packed_count_instead_of_active_width(self) -> None:
         owner = self.owner(batch=1)
         metrics = GPUStageMetrics(owner, 2)
         # Same layout as GPUBeamFinalOutput: 3 controls, count, W*(2*steps+4).
         payload = torch.zeros(4 + 4 * 10, dtype=torch.int32, device="cuda")
         payload[3] = 2
-        rows = payload[4:].view(4, 10)
-        rows[:2, :3] = torch.tensor([[1, 2, 8], [1, 2, 9]], device="cuda")
-        rows[:2, 5] = 0
-        # A business-ranked payload can put a lower model-score row first.
-        rows[:2, 6] = torch.tensor([-4.0, -3.0], device="cuda").view(torch.int32)
-        rows[:2, 7] = 3
         owner.final_output = NS(
             device=payload,
             options=NS(num_return_sequences=3),
@@ -128,9 +116,7 @@ class CUDAStageMetricsTests(unittest.TestCase):
         done.record()
         done.synchronize()
         result = metrics.consume(0)
-        self.assertEqual(result["population"], "returned")
-        self.assertEqual(sum(v[3] for v in result["rows"][0]), 2)
-        self.assertEqual(result["rows"][0][0][:3], (8, -4.0, -2.0))
+        self.assertEqual(result["effective_widths"], [2])
 
 
 if __name__ == "__main__":

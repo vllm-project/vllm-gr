@@ -9,10 +9,10 @@ These tests do not claim to exercise a checkpoint or a running vLLM engine.
 import json
 import math
 import os
-from pathlib import Path
 import time
-from types import SimpleNamespace as NS
 import unittest
+from pathlib import Path
+from types import SimpleNamespace as NS
 from typing import Any
 from unittest.mock import patch
 
@@ -20,8 +20,12 @@ import msgspec
 import pytest
 
 from vllm_gr.v1.metrics import prometheus as prom
-from vllm_gr.v1.metrics.telemetry import metrics_config, stage_finished, stage_started
-from vllm_gr.v1.metrics.telemetry import terminal_metrics
+from vllm_gr.v1.metrics.telemetry import (
+    metrics_config,
+    stage_finished,
+    stage_started,
+    terminal_metrics,
+)
 from vllm_gr.v1.metrics.timer import WallTimer
 
 PREFIX = "vllm_gr.local_validation"
@@ -53,7 +57,6 @@ class LocalValidationTests(unittest.TestCase):
             {
                 "VLLM_GR_METRICS_ENABLED": "1",
                 "VLLM_GR_METRICS_SAMPLE_EVERY": "1",
-                "VLLM_GR_METRICS_TOKEN_CODE_LIMIT": "2",
                 "VLLM_GR_METRICS_PREFIX": PREFIX,
                 "VLLM_GR_METRICS_QUEUE_SIZE": "256",
             },
@@ -161,8 +164,9 @@ class LocalValidationTests(unittest.TestCase):
 
     def test_three_stage_native_transport_and_exact_prometheus_records(self) -> None:
         from vllm.v1.engine import EngineCoreOutputs
-        from vllm_gr.v1.engine.output_processor import make_patched_process_outputs
+
         from vllm_gr.v1.core.sched.scheduler_patch import _attach_gr_metrics
+        from vllm_gr.v1.engine.output_processor import make_patched_process_outputs
 
         params = NS(beam_width=3, max_tokens=3, dynamic_beam_widths=None)
         s = NS(
@@ -187,18 +191,13 @@ class LocalValidationTests(unittest.TestCase):
                     "lineage_kv": 0.000125,
                     "output_materialize": 0.00025,
                 },
-                "population": "retained",
-                "rows": [
-                    [(7, -3.0, -1.0, 1), (8, -math.inf, -1.0, 0), (9, math.nan, -1.0, 1)],
-                    [(7, -4.0, -2.0, 1), (10, -5.0, -3.0, 1), (12, -6.0, -4.0, 1)],
-                ],
+                "effective_widths": [1, 3],
             },
             {"sampled": False, "candidate_width": 17},
             {
                 "sampled": True,
                 "timings": {"final_pack": 0.00075},
-                "population": "returned",
-                "rows": [[(11, -6.0, -2.0, 1)], [(7, -7.0, -1.0, 1)]],
+                "effective_widths": [1, 1],
             },
         ]
         result: dict[Any, Any] = {}
@@ -279,55 +278,11 @@ class LocalValidationTests(unittest.TestCase):
             add("rate_counter", "cache.prefix.tokens", work, status="miss")
             add("rate_counter", "prompt.tokens_by_source", work, source="local_compute")
             add("rate_counter", "prompt.tokens_by_source", hit, source="local_cache_hit")
-        for level, population, effective, scores, tokens in (
-            (
-                1,
-                "retained",
-                (1, 3),
-                ((3, 1), (4, 2), (5, 3), (6, 4)),
-                {"7": 2, "10": 1, "other": 1},
-            ),
-            (3, "returned", (1, 1), ((6, 2), (7, 1)), {"11": 1, "7": 1}),
-        ):
+        for level, effective in ((1, (1, 3)), (3, (1, 1))):
             tags = {"sid_level": str(level)}
             add("rate_counter", "stage.device_samples", 1, **tags)
             for width in effective:
                 add("timer", "beam.width", width, **tags, kind="effective")
-            for cumulative, local in scores:
-                add(
-                    "timer",
-                    "sid.score.nll",
-                    cumulative,
-                    **tags,
-                    population=population,
-                    score_kind="cumulative",
-                )
-                add(
-                    "timer",
-                    "sid.score.nll",
-                    local,
-                    **tags,
-                    population=population,
-                    score_kind="local",
-                )
-            for kind in ("cumulative", "local"):
-                add(
-                    "rate_counter",
-                    "sid.score.count",
-                    len(scores),
-                    **tags,
-                    population=population,
-                    score_kind=kind,
-                )
-            for token, count in tokens.items():
-                add(
-                    "rate_counter",
-                    "token_code",
-                    count,
-                    **tags,
-                    population=population,
-                    token_code=token,
-                )
         add("timer", "stage.forward.ms", 0.5, sid_level="1")
         add(
             "timer",

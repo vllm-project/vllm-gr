@@ -6,13 +6,13 @@ import ast
 import json
 import math
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import unittest
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace as NS
-import unittest
 from typing import Any
 from unittest.mock import patch
 
@@ -21,17 +21,16 @@ import pytest
 import torch
 
 from vllm_gr.v1.metrics import prometheus as prom
-from vllm_gr.v1.metrics.gpu import GPUStageMetrics, pack_survivors, unpack_survivors
-from vllm_gr.v1.metrics.telemetry import metrics_config
+from vllm_gr.v1.metrics.gpu import GPUStageMetrics
 from vllm_gr.v1.metrics.telemetry import (
     TELEMETRY_KEY,
     invalid_sequence_reason,
+    metrics_config,
     stage_finished,
     stage_started,
     terminal_metrics,
 )
 from vllm_gr.v1.metrics.timer import WallTimer
-
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
@@ -121,7 +120,7 @@ class CollectorTests(unittest.TestCase):
             all(k == "rate_counter" for k, n, _, _ in self.client.events if n == "prompt.tokens")
         )
 
-    def test_device_timer_nll_and_padding_population(self) -> None:
+    def test_device_timer_and_effective_width(self) -> None:
         self.collector.observe(
             "m",
             (1,),
@@ -133,36 +132,13 @@ class CollectorTests(unittest.TestCase):
                 "device": {
                     "sampled": True,
                     "timings": {"forward": 0.00125, "lineage_kv": 0.000125},
-                    "population": "retained",
-                    "rows": [[(7, -3.0, -1.0, 1), (8, -math.inf, -1.0, 0), (9, math.nan, -1.0, 1)]],
+                    "effective_widths": [1],
                 },
             },
         )
         self.assertEqual(self.values("stage.forward.ms"), [1.25])
         self.assertEqual(self.values("gr.processing.ms", component="lineage_kv"), [0.125])
-        self.assertEqual(self.values("sid.score.nll", score_kind="cumulative"), [3.0])
-        self.assertEqual(self.values("sid.score.count", score_kind="local"), [1])
         self.assertEqual(self.values("beam.width", kind="effective"), [1])
-        self.assertEqual(self.values("token_code", token_code="7"), [1])
-        self.assertEqual(self.values("token_code", token_code="8"), [])
-
-    def test_token_counts_aggregate_and_bound_labels(self) -> None:
-        with patch.dict(os.environ, {"VLLM_GR_METRICS_TOKEN_CODE_LIMIT": "2"}):
-            metrics_config.cache_clear()
-            self.collector.observe(
-                "m",
-                (1,),
-                {
-                    "version": 1,
-                    "sid_level": 1,
-                    "batch_size": 1,
-                    "stage_seconds": 0,
-                    "device": {"rows": [[(i, -1.0, -1.0, 1) for i in (10, 11, 12, 13, 10)]]},
-                },
-            )
-        self.assertEqual(self.values("token_code", token_code="10"), [2])
-        self.assertEqual(self.values("token_code", token_code="other"), [2])
-        self.assertEqual(self.values("token_code", token_code="12"), [])
 
     def test_unsampled_geometry_has_no_device_sample(self) -> None:
         self.collector.observe(
@@ -381,21 +357,42 @@ class TimerTelemetryTests(unittest.TestCase):
 
 
 class GPUWireTests(unittest.TestCase):
-    def test_token_bits_parent_order_and_padding(self) -> None:
-        output = torch.empty((1, 3, 4), dtype=torch.int32)
-        pack_survivors(
-            output,
-            torch.tensor([[2**25 + 1, 7, 0]], dtype=torch.int32),
-            torch.tensor([[-4.0, -3.0, -math.inf]]),
-            torch.tensor([[1, 0, 0]]),
-            torch.tensor([[-2.0, -3.0, -5.0]]),
-            torch.tensor([[True, True, False]]),
-            first=False,
+    def test_final_width_uses_packed_count_without_candidate_fields(self) -> None:
+        class EventStub:
+            def record(self) -> None:
+                pass
+
+            def elapsed_time(self, end: Any) -> Any:
+                return 2.0
+
+        # Two members with three-token, four-slot final output layouts.
+        payload = torch.zeros(3 + 2 * 41, dtype=torch.int32)
+        payload[3], payload[44] = 2, 0
+        owner = NS(
+            beam=NS(state=NS(device="cpu")),
+            bindings=(0, 1),
+            final_output=NS(
+                device=payload,
+                options=NS(num_return_sequences=3),
+                layout=NS(member_stride=41),
+            ),
         )
-        rows = unpack_survivors(output, 3)
-        self.assertEqual(rows[0][0], (2**25 + 1, -4.0, -1.0, 1))
-        self.assertEqual(rows[0][1], (7, -3.0, -1.0, 1))
-        self.assertEqual(rows[0][2][3], 0)
+        original_empty = torch.empty
+
+        def empty(*args: Any, **kwargs: Any) -> Any:
+            kwargs.pop("pin_memory", None)
+            return original_empty(*args, **kwargs)
+
+        with (
+            patch("torch.Event", side_effect=lambda **kwargs: EventStub()),
+            patch("torch.empty", empty),
+        ):
+            timer = GPUStageMetrics(owner, 2)
+        timer.begin(0, NS(owner_generation=0), owner)
+        timer.stop("forward")
+        timer.snapshot(owner, None, final=True)
+        timer.enqueue_copy(0)
+        self.assertEqual(timer.consume(0)["effective_widths"], [2, 0])
 
     def test_slot_sampling_and_auxiliary_timing(self) -> None:
         class EventStub:
@@ -409,12 +406,8 @@ class GPUWireTests(unittest.TestCase):
                 raise AssertionError("Metrics must reuse the owner's existing fence")
 
         state = NS(
-            beam_width=4,
             device="cpu",
-            beam_scores=torch.tensor([[-1.0, -2.0, -3.0, -4.0]]),
-            input_ids=torch.tensor([[5, 6, 7, 0]]),
-            parent_ids=torch.tensor([[0, 1, 2, 0]]),
-            active_mask=torch.tensor([[True, True, True, False]]),
+            num_active_beams=torch.tensor([3], dtype=torch.int32),
         )
         owner = NS(beam=NS(state=state), bindings=(0,), dynamic=None)
         original_empty = torch.empty
@@ -444,7 +437,7 @@ class GPUWireTests(unittest.TestCase):
         sampled = timer.consume(0)
         self.assertEqual(sampled["timings"]["forward"], 0.002)
         self.assertEqual(sampled["timings"]["constraint_select"], 0.002)
-        self.assertEqual(sampled["rows"][0][0][:3], (5, -1.0, 0.0))
+        self.assertEqual(sampled["effective_widths"], [3])
         self.assertEqual(timer.consume(1), {"sampled": False, "candidate_width": 17})
         metrics_config.cache_clear()
 
@@ -568,7 +561,7 @@ class PrometheusExportTests(unittest.TestCase):
                 "device": {
                     "sampled": True,
                     "timings": {"forward": 0.0005},
-                    "rows": [[(7, -3.0, -1.0, 1)]],
+                    "effective_widths": [1],
                 },
             },
         )
@@ -581,12 +574,10 @@ class PrometheusExportTests(unittest.TestCase):
         self.assertEqual(
             self.value("cache_prefix_tokens_total", model="test-model", status="hit"), 7
         )
-        self.assertEqual(
-            self.value(
-                "sid_score_nll_sum", **stage, population="retained", score_kind="cumulative"
-            ),
-            3,
-        )
+        self.assertEqual(self.value("beam_width_sum", **stage, kind="effective"), 1)
+        self.assertNotIn("sid.score.nll", prom.HISTOGRAMS)
+        self.assertNotIn("sid.score.count", prom.COUNTERS)
+        self.assertNotIn("token_code", prom.COUNTERS)
 
     def test_shared_registry_reuses_families_without_reset(self) -> None:
         second = prom.PrometheusClient("vllm_gr", registry=self.registry)

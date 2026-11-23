@@ -23,7 +23,6 @@ TELEMETRY_KEY = "gr_metrics"
 class MetricsConfig:
     enabled: bool = True
     sample_every: int = 1
-    token_code_limit: int = 512
     prefix: str = "vllm_gr"
     queue_size: int = 256
     prometheus_port: int | None = None
@@ -37,9 +36,8 @@ def metrics_config() -> MetricsConfig:
     if enabled not in ("0", "1"):
         raise ValueError("VLLM_GR_METRICS_ENABLED must be 0 or 1")
     every = int(os.environ.get("VLLM_GR_METRICS_SAMPLE_EVERY", "1"))
-    limit = int(os.environ.get("VLLM_GR_METRICS_TOKEN_CODE_LIMIT", "512"))
-    if every < 1 or not 0 <= limit <= 4096:
-        raise ValueError("metrics sample interval must be >=1 and token code limit in [0,4096]")
+    if every < 1:
+        raise ValueError("metrics sample interval must be >=1")
     prefix = os.environ.get("VLLM_GR_METRICS_PREFIX", "vllm_gr").rstrip(".")
     queue_size = int(os.environ.get("VLLM_GR_METRICS_QUEUE_SIZE", "256"))
     if not prefix or not 1 <= queue_size <= 4096:
@@ -49,7 +47,7 @@ def metrics_config() -> MetricsConfig:
     addr = os.environ.get("VLLM_GR_METRICS_ADDR", "127.0.0.1")
     if (port is not None and not 0 <= port <= 65535) or not addr:
         raise ValueError("metrics port must be in [0,65535] and address must be nonempty")
-    return MetricsConfig(enabled == "1", every, limit, prefix, queue_size, port, addr)
+    return MetricsConfig(enabled == "1", every, prefix, queue_size, port, addr)
 
 
 def stage_started(session: Any, metadata: Any, scheduler_output: Any) -> None:
