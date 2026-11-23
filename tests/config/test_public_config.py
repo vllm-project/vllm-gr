@@ -25,7 +25,6 @@ from vllm_gr.config.parser import (
     COMMON_ENGINE_CONFIG,
     CONFIG_ATTRIBUTES,
     OPTION_KEYS,
-    load_engine_gr_config,
     read_settings,
 )
 from vllm_gr.platforms import planning
@@ -56,7 +55,7 @@ def test_decode_gate_configuration_reaches_public_loader(
         ["gate", str(tmp_path / "model"), str(tmp_path / "triples"), str(artifact), backend, "128"],
     )
     exec(compile(producer, str(script), "exec"), {"__name__": "__main__"})
-    config = load_engine_gr_config(None, {}, json.loads(capsys.readouterr().out))
+    config = load_gr_config(overrides=json.loads(capsys.readouterr().out))
     assert config.constraint is not None and config.constraint.table is not None
     assert config.constraint.table.backend.value == backend
     assert config.constraint.table.artifact_digest == digests[0]
@@ -66,9 +65,22 @@ def test_decode_gate_configuration_reaches_public_loader(
     assert config.beam_graph_enabled is (backend == "cuda")
 
 
+def test_native_sid_stage_config_requires_explicit_worker_decision(tmp_path: Path) -> None:
+    path = tmp_path / "sid.yaml"
+    path.write_text(
+        "gr:\n  sid_stage_vocab: true\n  constraint_mode: none\n  worker_decision: null\n"
+    )
+    with pytest.raises(ValueError, match="worker_decision=True"):
+        load_gr_config(path)
+    config = load_gr_config(path, overrides={"worker_decision": True})
+    assert config.beam_sid_stage_vocab and config.beam_worker_decision is True
+
+
 def test_default_document_declares_every_public_option() -> None:
     settings = read_settings(COMMON_ENGINE_CONFIG)["gr"]
     # The packaged schedules determine both capacities.
+    assert settings.pop("admin_host") == "127.0.0.1"
+    assert settings.pop("admin_port") is None
     assert set(settings) == (set(CONFIG_ATTRIBUTES) - set(CAPACITY_FIELDS)) | OPTION_KEYS | {
         "constraint_mode",
         "constraint_table",
@@ -119,6 +131,18 @@ def test_performance_gate_emits_server_config(
     assert (
         read_settings(config_path)["gr"] == json.loads((tmp_path / "setup.json").read_text())["gr"]
     )
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("field", "value"), [("admin_host", "127.0.0.1"), ("admin_port", None), ("admin_port", 9100)]
+)
+def test_runtime_snapshot_rejects_listener_settings(field: str, value: object) -> None:
+    snapshot = {"gr": {field: value}}
+    with pytest.raises(ValueError, match=rf"Unknown gr settings: .*{field}"):
+        gr_config_from_mapping(snapshot)
+    worker = SimpleNamespace(additional_config={"vllm_gr": snapshot})
+    with pytest.raises(ValueError, match=rf"Unknown gr settings: .*{field}"):
+        GRConfig.from_vllm_config(worker)
 
 
 def test_public_snapshot_round_trip_without_file_io(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,7 +213,6 @@ def test_resolved_widths_survive_worker_transport(config: GRConfig) -> None:
 @pytest.mark.parametrize(  # type: ignore[misc]
     "kwargs, message",
     [
-        ({"admin_port": 70000}, "admin_port"),
         ({"beam_width": (8, 4)}, "candidate_width"),
         ({"prefill_token_buckets": (256, 128)}, "strictly increasing"),
         ({"prefix_calibration_path": "relative.yaml"}, "absolute"),
@@ -332,9 +355,6 @@ def test_invalid_gr_settings_fail_with_field_names(
 def test_cli_and_python_apply_one_document_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from vllm.engine.arg_utils import EngineArgs
-
-    from vllm_gr.engine import arg_utils_gr
     from vllm_gr.entrypoints.cli.serve import GRServeSubcommand
     from vllm_gr.entrypoints.cli.serve_config import GRArgumentParser
 
@@ -345,24 +365,19 @@ def test_cli_and_python_apply_one_document_once(
         "max-model-len: 4096\ngr:\n  beam_width: [8, 8, 8]\n  candidate_width: [8, 8, 8]\n"
         "  dense_prefill: fa2\n  prefix_min_chain_us: 12\n"
     )
-    args = EngineArgs.__new__(EngineArgs)
-    with patch.object(arg_utils_gr, "read_settings", wraps=read_settings) as read:
-        arg_utils_gr._init_engine_args(args, model=str(model), config=path)
-        assert args.max_model_len == 4096
-        assert read.call_count == 1
-        path.unlink()
-        config = arg_utils_gr.load_engine_gr_config(
-            args.config, None, startup_document=args._gr_startup_document
-        )
-        assert config.beam_max_width == 8
-        assert config.deployment.dense_prefill == "fa2"
-        assert config.deployment.prefix_min_chain_us == 12
-        assert read.call_count == 1
+    from tests.helpers.gr_config import prepared_engine_args
+
+    args = prepared_engine_args(model=str(model), config=path)
+    path.unlink()
+    config = GRConfig.from_vllm_config(args)
+    assert args.max_model_len == 4096
+    assert config.beam_max_width == 8
+    assert config.deployment.dense_prefill == "fa2"
+    assert config.deployment.prefix_min_chain_us == 12
 
     path.write_text(
         "max-model-len: 4096\ngr:\n  beam_width: [8, 8, 8]\n  candidate_width: [8, 8, 8]\n"
     )
-    monkeypatch.setattr(EngineArgs, "add_cli_args", staticmethod(arg_utils_gr.add_cli_args))
     parser = GRArgumentParser()
     GRServeSubcommand().subparser_init(parser.add_subparsers(dest="subparser"))
     cli = parser.parse_args(["serve", str(model), "--config", str(path)])
@@ -370,16 +385,13 @@ def test_cli_and_python_apply_one_document_once(
 
 
 def test_python_explicit_arguments_override_file(tmp_path: Path) -> None:
-    from vllm.engine.arg_utils import EngineArgs
-
-    from vllm_gr.engine import arg_utils_gr
-
     model = tmp_path / "model"
     model.mkdir()
     path = tmp_path / "scenario.yaml"
     path.write_text("max-model-len: 4096\ngr: {}\n")
-    args = EngineArgs.__new__(EngineArgs)
-    arg_utils_gr._init_engine_args(args, model=str(model), config=path, max_model_len=2048)
+    from tests.helpers.gr_config import prepared_engine_args
+
+    args = prepared_engine_args(model=str(model), config=path, max_model_len=2048)
     assert args.max_model_len == 2048
 
 
@@ -406,7 +418,12 @@ def test_startup_logs_the_complete_public_snapshot(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(arg_utils_gr, "engine_config_service", BackendConfigService)
     monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)
     with patch.object(arg_utils_gr.logger, "info") as info:
-        assert arg_utils_gr.create_engine_config(SimpleNamespace(_gr_selected=True)) is host
+        assert (
+            arg_utils_gr.create_engine_config(
+                SimpleNamespace(additional_config={"vllm_gr": {"gr": {}}})
+            )
+            is host
+        )
     info.assert_called_once()
     assert json.loads(info.call_args.args[1]) == gr_config_to_mapping(
         GRConfig.from_vllm_config(host)
@@ -427,5 +444,16 @@ def test_native_attention_backend_reaches_worker_snapshot(monkeypatch: pytest.Mo
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: host)
     monkeypatch.setattr(arg_utils_gr, "engine_config_service", BackendConfigService)
     monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)
-    arg_utils_gr.create_engine_config(SimpleNamespace(_gr_selected=True))
+    arg_utils_gr.create_engine_config(SimpleNamespace(additional_config={"vllm_gr": {"gr": {}}}))
     assert GRConfig.from_vllm_config(host).attention_backend is GRAttentionBackend.CUSTOM
+
+
+def test_existing_runner_reads_republished_config() -> None:
+    from vllm_gr.v1.worker.gr_context import _get_gr_config
+
+    host = SimpleNamespace(additional_config={})
+    runner = SimpleNamespace(vllm_config=host)
+    for width in (4, 8):
+        cfg = GRConfig(beam_max_width=width)
+        cfg.write_to_vllm_config(host)
+        assert _get_gr_config(runner) is cfg

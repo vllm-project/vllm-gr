@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from vllm_gr.config import gr_config_from_mapping, load_gr_config
-from vllm_gr.config.parser import load_engine_gr_config
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
@@ -39,6 +38,6 @@ def test_removed_options_fail_without_mutating_shared_defaults(
             path.write_text("gr:\n  " + key + ": true\n")
             load_gr_config(path)
         else:
-            load_engine_gr_config(None, {}, {key: True})
-    config = load_engine_gr_config(None, {})
+            load_gr_config(overrides={key: True})
+    config = load_gr_config()
     assert config.beam_max_width == 128

@@ -407,8 +407,10 @@ def capture_beam_decode_graph(runner) -> bool:
     )
 
     gr_cfg = _get_gr_config(runner)
+    width = gr_cfg.beam_max_width
     if (
-        not gr_cfg.beam_graph_active
+        width is None
+        or not gr_cfg.beam_graph_enabled
         or runner.model_config.enforce_eager
         or 1 not in gr_cfg.deployment.beam_batch_sizes
     ):
@@ -444,7 +446,6 @@ def capture_beam_decode_graph(runner) -> bool:
     # width, do NOT rebuild the beam context (a new context moves every
     # buffer's data_ptr, so the existing graph would silently read/write the
     # OLD pool while the runtime refreshes the NEW one).
-    width = int(gr_cfg.beam_max_width)
     if _beam_full_graph_ready(runner, width):
         return True
 

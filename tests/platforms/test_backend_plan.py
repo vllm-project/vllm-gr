@@ -85,7 +85,7 @@ class Service:
 class Provider:
     backend_id = "test-backend"
     api_version = 2
-    plan_api_version: int | None = 2
+    plan_api_version: int | None = 3
     adapter_revision = "test-adapter-v1"
 
     def __init__(self) -> None:
@@ -197,7 +197,7 @@ def test_service_requirements_extend_existing_wire_plans() -> None:
     legacy = BackendPlan(
         "fixture", 2, BackendRequest(empty, empty, empty, empty), PlanData({"stage": "old"})
     )
-    assert legacy.fingerprint == "6d51588d8f2980d7d836452746c6dc20cbb871d4a9d9f41e21ec15b41859c043"
+    assert legacy.fingerprint == "f880bb8af6a14cd99c38a21ba54208c71037f11bb7bf07921698a31d748c3255"
     assert "requirements" not in legacy.to_dict()
     assert BackendPlan.from_wire(legacy.to_wire()) == legacy
     plan = replace(legacy, requirements=ServiceRequirements(stage="external.stage"))
@@ -293,7 +293,7 @@ def test_canonical_table_reports_its_identity_and_keeps_its_native_owner(
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "field,value", [("schema_version", 2), ("schema_version", True), ("plan_api_version", 3)]
+    "field,value", [("schema_version", 2), ("schema_version", True), ("plan_api_version", 2)]
 )
 def test_wire_rejects_unsupported_schema(provider: Provider, field: str, value: Any) -> None:
     plan = admit_backend_plan(config())
@@ -529,11 +529,11 @@ def test_legacy_provider_never_infers_a_planning_extension(provider: Provider) -
 
 
 def test_bad_planning_version_and_missing_methods_fail_registration() -> None:
-    for version in (True, 1, 3, "2"):
+    for version in (True, 1, 2, "3"):
         with pytest.raises(ValueError, match="plan_api_version"):
             validate_planning_api(SimpleNamespace(plan_api_version=version))
     with pytest.raises(ValueError, match="missing methods"):
-        validate_planning_api(SimpleNamespace(plan_api_version=2))
+        validate_planning_api(SimpleNamespace(plan_api_version=3))
 
 
 def test_resolver_cannot_change_request_identity(

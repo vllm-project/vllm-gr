@@ -61,11 +61,10 @@ def argument_parsers(parser: argparse.ArgumentParser) -> Iterator[argparse.Argum
 
 @lru_cache(maxsize=1)
 def _native_parser() -> argparse.ArgumentParser:
+    from vllm.engine.arg_utils import EngineArgs
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    from vllm_gr.engine.arg_utils import origin_add_cli_args
-
-    return origin_add_cli_args(FlexibleArgumentParser(add_help=False))
+    return EngineArgs.add_cli_args(FlexibleArgumentParser(add_help=False))
 
 
 def native_settings(
@@ -144,3 +143,36 @@ def resolve_native_settings(
     ):
         values["max_num_batched_tokens"] = max(budget, model_len)
     return values
+
+
+def prepare_engine_settings(
+    document: Mapping | None,
+    overrides: Mapping[str, Any],
+    gr: Mapping | None,
+    *,
+    explicit_fields: set[str] | None = None,
+) -> tuple[dict[str, Any], str, int | None]:
+    """Prepare native arguments and a validated snapshot in an engine-owned mapping."""
+    from vllm_gr.config.parser import (
+        GR_CONFIG_KEY,
+        gr_config_to_mapping,
+        resolve_startup_config,
+        validate_additional_keys,
+    )
+    from vllm_gr.platforms.config import engine_config_service
+
+    values = resolve_native_settings(document, overrides, explicit_fields=explicit_fields)
+    additional = values.get("additional_config")
+    if additional is not None and not isinstance(additional, Mapping):
+        raise ValueError("GR startup requires mapping additional_config")
+    additional = additional or {}
+    validate_additional_keys(additional)
+    if GR_CONFIG_KEY in additional:
+        raise ValueError("Supply GR settings with gr=..., --gr-config, or --config")
+    cfg, host, port = resolve_startup_config(
+        document or {},
+        gr,
+        worker_decision_default=engine_config_service().default_worker_decision or None,
+    )
+    values["additional_config"] = {**additional, GR_CONFIG_KEY: gr_config_to_mapping(cfg)}
+    return values, host, port

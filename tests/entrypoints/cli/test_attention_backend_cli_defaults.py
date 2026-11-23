@@ -29,15 +29,11 @@ class TestServeAttentionBackendDefault(unittest.TestCase):
         self.assertEqual(args.attention_backend, "CUSTOM")
 
     def test_canonical_config_does_not_add_legacy_backend_default(self) -> None:
-        from vllm.engine.arg_utils import EngineArgs
-
-        from vllm_gr.engine import arg_utils_gr
         from vllm_gr.entrypoints.cli.serve_config import GRArgumentParser
 
-        with mock.patch.object(EngineArgs, "add_cli_args", staticmethod(arg_utils_gr.add_cli_args)):
-            parser = GRArgumentParser()
-            self.subcmd.subparser_init(parser.add_subparsers(dest="subparser"))
-            args = parser.parse_args(["serve", "--gr-config", "{}"])
+        parser = GRArgumentParser()
+        self.subcmd.subparser_init(parser.add_subparsers(dest="subparser"))
+        args = parser.parse_args(["serve", "--gr-config", "{}"])
         self.assertIsNotNone(args.gr)
         native_backend = args.attention_backend
         with mock.patch("vllm_gr.entrypoints.cli.serve.validate_parsed_serve_args"):

@@ -9,6 +9,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.helpers.gr_config import worker_config
+from vllm_gr.config import GRConfig
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.v1.beam import BEAM_DATA_VAR
 from vllm_gr.v1.beam.attention_context import BeamAttentionContext
@@ -66,7 +68,7 @@ def _stage(*, dynamic: bool = False) -> tuple[Any, Any, Any, BeamAttentionContex
         _current_scheduler_output=scheduled,
         _gr_npu_graph_context=context,
         _gr_npu_beam_graph_shapes={(2, 4)},
-        _vllm_gr_config=SimpleNamespace(beam_graph_widths=None),
+        vllm_config=worker_config(GRConfig(beam_graph_widths=None)),
         _beam_context=None,
         _beam_sessions={},
         execute_model_state=None,

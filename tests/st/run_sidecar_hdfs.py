@@ -15,8 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from vllm_gr.config.models import deployment_for
-
 
 def install_control_trace() -> None:
     from fastapi.responses import JSONResponse
@@ -28,7 +26,6 @@ def install_control_trace() -> None:
     def control_app(engine: Any) -> Any:
         app = original(engine)
         root = Path(os.environ["GR_SIDECAR_TEST_OUTPUT"])
-        port = deployment_for(engine.vllm_config).admin_port
 
         @app.middleware("http")  # type: ignore[misc]
         async def trace(request: Any, call_next: Any) -> Any:
@@ -41,7 +38,7 @@ def install_control_trace() -> None:
                             dict(
                                 event=event,
                                 ns=time.monotonic_ns(),
-                                port=port,
+                                port=request.url.port,
                                 path=request.url.path,
                                 body=body,
                                 status=status,
@@ -51,7 +48,7 @@ def install_control_trace() -> None:
                     )
 
             log("begin")
-            fault = root / f"{port}.fail"
+            fault = root / f"{request.url.port}.fail"
             if fault.exists() and fault.read_text() == request.url.path:
                 fault.unlink()
                 log("end", 503)

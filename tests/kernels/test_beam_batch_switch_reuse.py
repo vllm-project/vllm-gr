@@ -11,13 +11,14 @@ import msgspec
 import pytest
 import torch
 
+from tests.helpers.gr_config import update_worker_config
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
     install_decode_model,
     metadata,
 )
-from vllm_gr.config import ConstraintConfig
+from vllm_gr.config import ConstraintConfig, GRConfig
 from vllm_gr.v1.beam.dispatch import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
@@ -33,14 +34,17 @@ pytestmark = [
 def make_worker(dtype: torch.dtype, graph: bool, constrained: bool) -> tuple[Any, torch.Tensor]:
     worker = admission_worker(dtype=dtype, max_rows=16)
     worker.model_config.enforce_eager = not graph
-    worker._vllm_gr_config.beam_graph_enabled = graph
-    worker._vllm_gr_config.beam_adapter_cache_enabled = True
-    worker._vllm_gr_config.deployment = replace(
-        worker._vllm_gr_config.deployment, beam_batch_sizes=(1, 2, 3, 4)
+    update_worker_config(worker, beam_graph_enabled=graph)
+    update_worker_config(worker, beam_adapter_cache_enabled=True)
+    update_worker_config(
+        worker,
+        deployment=replace(
+            GRConfig.from_vllm_config(worker.vllm_config).deployment, beam_batch_sizes=(1, 2, 3, 4)
+        ),
     )
     if not constrained:
         worker.constraint_backend = None
-        worker._vllm_gr_config.constraint = ConstraintConfig()
+        update_worker_config(worker, constraint=ConstraintConfig())
     base = torch.tensor([0.1, 0.7, -0.3, 0.2, 0.5, -0.9], device="cuda", dtype=dtype)
     weights = torch.arange(6, device="cuda", dtype=dtype) * 0.031
     install_decode_model(
@@ -232,13 +236,18 @@ def test_cache_disabled_keeps_latest_adapter_and_cuda_graphs(
     worker, base = make_worker(torch.float16, True, True)
     # V1 retains adapters for multiple configured capture batches even with
     # the optional cache off. Exercise a single captured B and eager fallback.
-    worker._vllm_gr_config.deployment = replace(
-        worker._vllm_gr_config.deployment, beam_batch_sizes=(1,)
+    update_worker_config(
+        worker,
+        deployment=replace(
+            GRConfig.from_vllm_config(worker.vllm_config).deployment, beam_batch_sizes=(1,)
+        ),
     )
     if explicit_false:
-        worker._vllm_gr_config.beam_adapter_cache_enabled = False
+        update_worker_config(worker, beam_adapter_cache_enabled=False)
     else:
-        del worker._vllm_gr_config.beam_adapter_cache_enabled
+        update_worker_config(
+            worker, beam_adapter_cache_enabled=GRConfig().beam_adapter_cache_enabled
+        )
     reference, reference_base = make_worker(torch.float16, False, True)
     captures: list[Any] = []
     original = BeamDecodeGraph.capture
