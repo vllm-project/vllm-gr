@@ -77,7 +77,7 @@ def _eligible_beam_layer(layer: Any, vllm_config: Any, spec: Any) -> bool:
     gr = config_module.GRConfig.from_vllm_config(vllm_config)
     if (
         gr.attention_backend is not config_module.GRAttentionBackend.CUSTOM
-        or gr.beam_execution_mode is not config_module.BeamExecutionMode.V1
+        or gr.beam_max_width is None
         or type(gr.beam_max_width) is not int
         or gr.beam_max_width <= 0
         or (

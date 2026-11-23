@@ -17,7 +17,7 @@ from tests.kernels.beam_stage_test_utils import (
     install_decode_model,
     metadata,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
+from vllm_gr.v1.beam.dispatch import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
@@ -34,6 +34,9 @@ def make_worker(dtype: torch.dtype, graph: bool, constrained: bool) -> tuple[Any
     worker.model_config.enforce_eager = not graph
     worker._vllm_gr_config.beam_graph_enabled = graph
     worker._vllm_gr_config.beam_adapter_cache_enabled = True
+    worker._vllm_gr_config.deployment = replace(
+        worker._vllm_gr_config.deployment, beam_batch_sizes=(1, 2, 3, 4)
+    )
     if not constrained:
         worker.constraint_backend = None
         worker._vllm_gr_config.constrained_generation = False
@@ -226,6 +229,11 @@ def test_cache_disabled_keeps_latest_adapter_and_cuda_graphs(
     monkeypatch: pytest.MonkeyPatch, explicit_false: bool
 ) -> None:
     worker, base = make_worker(torch.float16, True, True)
+    # V1 retains adapters for multiple configured capture batches even with
+    # the optional cache off. Exercise a single captured B and eager fallback.
+    worker._vllm_gr_config.deployment = replace(
+        worker._vllm_gr_config.deployment, beam_batch_sizes=(1,)
+    )
     if explicit_false:
         worker._vllm_gr_config.beam_adapter_cache_enabled = False
     else:
@@ -241,13 +249,16 @@ def test_cache_disabled_keeps_latest_adapter_and_cuda_graphs(
 
     monkeypatch.setattr(BeamDecodeGraph, "capture", capture)
     previous = None
-    for i, (batch, expected_captures) in enumerate(((1, 2), (1, 2), (2, 4), (1, 6))):
+    for i, (batch, expected_captures) in enumerate(((1, 2), (1, 2), (2, 2), (1, 4))):
         owner, output = run(worker, base, batch, i, (2, 3, 4))
         _, expected = run(reference, reference_base, batch, i, (2, 3, 4))
         assert output == expected
         assert len(captures) == expected_captures
         assert not getattr(worker, "_gr_gpu_stage_runner_cache", {})
-        assert owner.graph is not None and owner.graph.ready
+        if batch == 1:
+            assert owner.graph is not None and owner.graph.ready
+        else:
+            assert owner.graph is None
         if i == 1:
             assert owner is previous  # Same-B reuse is independent of the new cache.
         previous = owner

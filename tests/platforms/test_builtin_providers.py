@@ -10,8 +10,9 @@ from unittest import mock
 
 import pytest
 
-from vllm_gr.platforms import cuda, npu
-from vllm_gr.platforms.builtins import register_builtin_backends
+from vllm_gr.platforms.ascend import provider as npu
+from vllm_gr.platforms.cuda import provider as cuda
+from vllm_gr.platforms.loader import load_backend_plugins
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     resolve_backend,
@@ -27,33 +28,35 @@ def teardown_function() -> None:
 
 
 def test_builtin_providers_register_idempotently() -> None:
-    register_builtin_backends()
-    register_builtin_backends()
+    load_backend_plugins()
+    load_backend_plugins()
 
     assert resolve_backend("cuda") is cuda.CUDA_BACKEND
-    assert resolve_backend("npu") is npu.NPU_BACKEND
+    assert resolve_backend("ascend") is npu.NPU_BACKEND
 
 
 def test_cuda_provider_lazily_returns_platform_modules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gpu_runner = object()
+    envs = ModuleType("vllm.envs")
+    setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+    monkeypatch.setitem(sys.modules, "vllm.envs", envs)
+    from vllm_gr.v1.worker.cuda import runner_installer as runner
+
     gpu_attention = object()
     imported: list[str] = []
 
     def import_module(name: str) -> object:
         imported.append(name)
         return {
-            "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch": gpu_runner,
             "vllm_gr.v1.attention.backends.beam_attn_gpu": gpu_attention,
         }[name]
 
     monkeypatch.setattr(cuda, "import_module", import_module)
 
-    assert cuda.CUDA_BACKEND.get_model_runner_hooks() is gpu_runner
+    assert cuda.CUDA_BACKEND.get_model_runner_hooks() is runner
     assert cuda.CUDA_BACKEND.get_attention_execution() is gpu_attention
     assert imported == [
-        "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
         "vllm_gr.v1.attention.backends.beam_attn_gpu",
     ]
 
@@ -82,6 +85,42 @@ def test_npu_provider_lazily_returns_platform_modules(
     ]
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("mode", ["cascade", "xllm"])  # type: ignore[misc]
+def test_ascend_binding_uses_resolved_decode_implementation(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    from dataclasses import replace
+
+    from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
+    from vllm_gr.v1.attention.backends import beam_attn
+
+    module = ModuleType("beam_attn_npu" if mode == "cascade" else "beam_attn_npu_xllm")
+    monkeypatch.setattr(module, "is_available", lambda: True, raising=False)
+    monkeypatch.setattr(beam_attn, "_get_npu_decode_execution", lambda: mode)
+
+    def load(name: str) -> ModuleType:
+        assert name.rsplit(".", 1)[-1] == module.__name__
+        return module
+
+    monkeypatch.setattr(npu, "import_module", load)
+    provider = npu.NPU_BACKEND
+    empty = PlanData({})
+    plan = BackendPlan(
+        provider.backend_id,
+        provider.api_version,
+        BackendRequest(empty, empty, empty, empty),
+        PlanData({"decode_attention": "auto"}),
+    )
+    assert provider.create_attention_executor(plan=plan, device="npu") is module
+    assert provider.get_attention_execution() is module
+    plan = replace(
+        plan, choices=PlanData({"decode_attention": "xllm" if mode == "cascade" else "cascade"})
+    )
+    with pytest.raises(RuntimeError, match="Ascend attention mode"):
+        provider.create_attention_executor(plan=plan, device="npu")
+
+
 def test_cuda_runtime_patch_is_noop() -> None:
     assert cuda.CUDA_BACKEND.apply_runtime_patches() == 0
     assert cuda.CUDA_BACKEND.apply_runtime_patches(force=True) == 0
@@ -90,7 +129,8 @@ def test_cuda_runtime_patch_is_noop() -> None:
 def test_npu_runtime_patches_preserve_order_and_sum_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import npu_spawn_patch, v1
+    from vllm_gr import v1
+    from vllm_gr.platforms.ascend import spawn_patch
 
     events: list[tuple[str, bool | None]] = []
 
@@ -106,7 +146,7 @@ def test_npu_runtime_patches_preserve_order_and_sum_counts(
         patch_npu_worker_init_device=patch_worker,
     )
     monkeypatch.setattr(v1, "ascend_compat", ascend_compat, raising=False)
-    monkeypatch.setattr(npu_spawn_patch, "apply_npu_spawn_patch", apply_spawn)
+    monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", apply_spawn)
 
     assert npu.NPU_BACKEND.apply_runtime_patches(force=True) == 4
     assert events == [("spawn", None), ("worker", None)]
@@ -115,18 +155,17 @@ def test_npu_runtime_patches_preserve_order_and_sum_counts(
 def test_cuda_environment_check_validates_platform_and_versions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import _env_check
+    from vllm_gr.platforms import compat
 
-    vllm_module = ModuleType("vllm")
     platforms = ModuleType("vllm.platforms")
-    platforms.current_platform = SimpleNamespace(device_type="cuda")  # type: ignore[attr-defined]
-    vllm_module.platforms = platforms  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    platforms.current_platform = SimpleNamespace(  # type: ignore[attr-defined]
+        _enum="CUDA", device_type="cuda", device_name="cuda"
+    )
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
 
     report = {"vllm": "0.30.0"}
     check_versions = mock.Mock(return_value=report)
-    monkeypatch.setattr(_env_check, "check_runtime_versions", check_versions)
+    monkeypatch.setattr(compat, "check_vllm_runtime", check_versions)
 
     assert cuda.CUDA_BACKEND.check_environment() == {
         "vllm": "0.30.0",
@@ -134,20 +173,22 @@ def test_cuda_environment_check_validates_platform_and_versions(
     }
     check_versions.assert_called_once_with()
 
-    platforms.current_platform.device_type = "cpu"
-    with pytest.raises(RuntimeError, match="requires the CUDA platform"):
+    platforms.current_platform = SimpleNamespace(  # type: ignore[attr-defined]
+        _enum="ROCM", device_type="cuda", device_name="cuda"
+    )
+    with pytest.raises(RuntimeError, match="requires the native CUDA platform"):
         cuda.CUDA_BACKEND.check_environment()
 
 
 def test_npu_environment_check_delegates_complete_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import _env_check
+    from vllm_gr.platforms.ascend import environment
 
     expected = {"platform": "npu"}
     check_ascend = mock.Mock(return_value=expected)
     monkeypatch.setattr(
-        _env_check,
+        environment,
         "check_ascend_environment",
         check_ascend,
     )

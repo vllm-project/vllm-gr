@@ -21,9 +21,9 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.version import Version
 
+from tests.helpers.paths import REPO_ROOT
 from tools.ci.resolve_runtime import check_versions, package_version
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 COMMON_FILE = REPO_ROOT / "requirements" / "common.txt"
 
 
@@ -267,7 +267,10 @@ def package_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     shutil.copytree(REPO_ROOT / "requirements", source / "requirements")
     (source / "vllm_gr").mkdir()
     (source / "vllm_gr" / "__init__.py").write_text("from ._version import __version__\n")
-    shutil.copy2(REPO_ROOT / "vllm_gr/_env_check.py", source / "vllm_gr/_env_check.py")
+    for name in ("vllm_gr/platforms/compat.py", "vllm_gr/platforms/ascend/environment.py"):
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / name, target)
     (source / ".gitignore").write_text("vllm_gr/_version.py\n*.egg-info/\ndist/\nbuild/\n")
     _init_git(source)
     _git(source, "add", ".")

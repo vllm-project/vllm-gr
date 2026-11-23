@@ -10,7 +10,7 @@ __all__ = ["GRLLM"]
 
 def __getattr__(name: str) -> Any:
     if name == "GRLLM":
-        from vllm_gr.entrypoints.gr import GRLLM
+        from vllm_gr.entrypoints.llm import GRLLM
 
         return GRLLM
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

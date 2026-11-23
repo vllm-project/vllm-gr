@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Parity tests for ``vllm_gr.tokenizer_fast``.
+"""Parity tests for ``vllm_gr.entrypoints.common.detokenization``.
 
 The raw Rust backend bypass must stay byte-identical to the HuggingFace
 wrapper.  Added-token handling is covered by the singleton probe in
@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from vllm_gr.tokenizer_fast import (
+from vllm_gr.entrypoints.common.detokenization import (
     _rust_backend,
     _rust_decode_verified,
     fast_batch_decode,

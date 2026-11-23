@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -12,9 +13,16 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-import tools.build_constraint_table as build_constraint_table_module
-from tools.build_constraint_table import _resolve_model_revision, build_constraint_table
+import tools.constraints.build_constraint_table as build_constraint_table_module
+from tools.constraints.build_constraint_table import (
+    _resolve_model_revision,
+    build_constraint_table,
+)
 from vllm_gr.constraints.artifact import load_constraint_table_artifact
+from vllm_gr.constraints.artifact_builder import (
+    build_single_trie_artifact,
+    load_triples,
+)
 from vllm_gr.constraints.json_compiler import compile_relations_json
 
 
@@ -36,6 +44,86 @@ def _tokenizer() -> MagicMock:
     }.items():
         setattr(tokenizer, name, value)
     return tokenizer
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_legacy_triples_build_matches_strict_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    tokenizer = _tokenizer()
+    transformers = ModuleType("transformers")
+    auto_tokenizer = MagicMock(return_value=tokenizer)
+    auto_config = MagicMock(return_value=SimpleNamespace(vocab_size=20))
+    transformers.AutoTokenizer = SimpleNamespace(from_pretrained=auto_tokenizer)  # type: ignore[attr-defined]
+    transformers.AutoConfig = SimpleNamespace(from_pretrained=auto_config)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(
+        json.dumps({"triples": [{"a": 1, "b": 4, "c": 5}, {"a": 1, "b": 2, "c": 3}]}),
+        encoding="utf-8",
+    )
+    rows = [["1", "2", "3"], ["1", "4", "5"]]
+    assert load_triples(legacy) == rows
+    output = tmp_path / "legacy.safetensors"
+    artifact_digest, tokenizer_digest = build_single_trie_artifact(model, legacy, output)
+    auto_tokenizer.assert_called_once_with(model, trust_remote_code=True)
+    auto_config.assert_called_once_with(model, trust_remote_code=True)
+
+    canonical = tmp_path / "canonical.json"
+    document = compile_relations_json(rows)
+    canonical.write_text(json.dumps(document), encoding="utf-8")
+    reference = tmp_path / "canonical.safetensors"
+    build_strict = partial(
+        build_constraint_table, model=str(model), revision=None, output_path=reference
+    )
+    assert build_strict(triples_path=canonical) == (
+        artifact_digest,
+        tokenizer_digest,
+        20,
+    )
+    assert output.read_bytes() == reference.read_bytes()
+    loaded = load_constraint_table_artifact(
+        output,
+        expected_digest=artifact_digest,
+        expected_tokenizer_digest=tokenizer_digest,
+        expected_vocab_size=20,
+    )
+    assert loaded.first_token_ids.tolist() == [1]
+    assert loaded.prefix1_values.tolist() == [2, 4]
+    assert loaded.prefix2_values.tolist() == [3, 5]
+
+    with pytest.raises(ValueError, match="Unsupported constraint triples format_version"):
+        build_strict(triples_path=legacy)
+    inconsistent = tmp_path / "inconsistent.json"
+    inconsistent.write_text(
+        json.dumps({**document, "relations": {**document["relations"], "first": []}}),
+        encoding="utf-8",
+    )
+    rebuilt = tmp_path / "rebuilt.safetensors"
+    assert build_single_trie_artifact(model, inconsistent, rebuilt) == (
+        artifact_digest,
+        tokenizer_digest,
+    )
+    assert rebuilt.read_bytes() == output.read_bytes()
+    with pytest.raises(ValueError, match="relations.first is inconsistent"):
+        build_strict(triples_path=inconsistent)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("triples", "error"),
+    [([], "not a nonempty Constraint Table"), ([{"a": 1, "b": 2}], "invalid triples row 0")],
+)
+def test_legacy_triples_rejects_invalid_rows(
+    tmp_path: Path, triples: list[dict[str, int]], error: str
+) -> None:
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps({"triples": triples}), encoding="utf-8")
+    with pytest.raises(ValueError, match=error):
+        load_triples(path)
 
 
 def test_build_tool_uses_one_revision_and_writes_loadable_artifact(

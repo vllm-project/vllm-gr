@@ -14,7 +14,6 @@ Skip when the model path is unavailable (CI without weights).
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import subprocess
@@ -26,15 +25,21 @@ from unittest import mock
 
 import pytest
 
-from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
+from tests.helpers.paths import REPO_ROOT
+from tests.st import pangu_generate
+from tests.st.pangu1b_st_common import (
+    GSM8K_MINI,
+    get_model_path,
+    require_pangu_st_runtime,
+    score_answer,
+)
 
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATASET = ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
+ROOT = REPO_ROOT
+DEFAULT_DATASET = ROOT / GSM8K_MINI
 DEFAULT_MIN_ACCURACY = os.environ.get(
     "PANGU1B_OFFLINE_ACCURACY_THRESHOLD",
     os.environ.get("PANGU1B_MIN_ACCURACY", "0.5"),
 )
-PANGU_EXAMPLE = ROOT / "examples" / "offline_inference" / "pangu1b" / "pangu_generate.py"
 
 
 def _parse_cli_summary(stdout: str) -> dict:
@@ -56,7 +61,7 @@ def _parse_cli_summary(stdout: str) -> dict:
 @pytest.mark.npu_test
 @pytest.mark.model_test
 class TestPangu1bAccuracyST(unittest.TestCase):
-    """End-to-end accuracy ST for Pangu via offline inference example."""
+    """End-to-end accuracy ST for the Pangu offline evaluation CLI."""
 
     def setUp(self) -> None:
         require_pangu_st_runtime()
@@ -71,7 +76,7 @@ class TestPangu1bAccuracyST(unittest.TestCase):
 
         cmd = [
             sys.executable,
-            str(PANGU_EXAMPLE),
+            str(Path(__file__).with_name("pangu_generate.py")),
             "--model",
             model_path,
             "--dataset-path",
@@ -104,7 +109,7 @@ class TestPangu1bAccuracyST(unittest.TestCase):
                     summary = _parse_cli_summary(proc.stdout)
                 except json.JSONDecodeError as exc:
                     self.fail(
-                        "Failed to parse example JSON summary\n"
+                        "Failed to parse evaluation JSON summary\n"
                         f"stdout:\n{proc.stdout}\n"
                         f"stderr:\n{proc.stderr}\n"
                         f"parse error: {exc}"
@@ -133,47 +138,42 @@ class TestPangu1bAccuracyUnitHooks(unittest.TestCase):
                     require_pangu_st_runtime()
 
     def test_extract_final_answer(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "pangu_generate_test",
-            PANGU_EXAMPLE,
-        )
-        assert spec is not None and spec.loader is not None
-        pangu_generate = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(pangu_generate)
-        extract_final_answer = pangu_generate.extract_final_answer
-
-        self.assertEqual(extract_final_answer("Step by step ... answer is 42."), "42")
-        self.assertEqual(extract_final_answer("She ate 3/8 of the pizza."), "3/8")
+        for generated, reference, expected, predicted, correct in (
+            ("Step by step ... answer is 42.", "42.0", "42", "42", True),
+            (r"She ate \boxed{3/8} and left 5 pieces.", "6/16", "3/8", "3/8", True),
+            (r"The answer was \boxed{1,2}.", "12", "12", "1", False),
+            ("The total was 1,020.", "1,021", "1021", "1020", False),
+            ("I cannot tell.", "0", "0", None, False),
+        ):
+            with self.subTest(generated=generated):
+                self.assertEqual(
+                    score_answer(generated, reference),
+                    {"expected": expected, "predicted": predicted, "correct": correct},
+                )
 
     def test_npu_defaults_to_compatible_block_size(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "pangu_generate_npu_block_size_test",
-            PANGU_EXAMPLE,
-        )
-        assert spec is not None and spec.loader is not None
-        pangu_generate = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(pangu_generate)
-
         with mock.patch.object(pangu_generate, "_is_npu_platform", return_value=True):
             kwargs = pangu_generate._pangu_engine_kwargs()
 
         self.assertEqual(kwargs["block_size"], 128)
 
     def test_explicit_block_size_override_is_preserved(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "pangu_generate_block_size_override_test",
-            PANGU_EXAMPLE,
-        )
-        assert spec is not None and spec.loader is not None
-        pangu_generate = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(pangu_generate)
-
         with mock.patch.object(pangu_generate, "_is_npu_platform", return_value=True):
             kwargs = pangu_generate._pangu_engine_kwargs(64)
 
         self.assertEqual(kwargs["block_size"], 64)
 
+    @pytest.mark.l1
+    def test_offline_configuration_keeps_native_generation(self) -> None:
+        from vllm_gr.config import load_gr_config
+
+        config = load_gr_config(pangu_generate._pangu_engine_kwargs()["config"])
+        self.assertIsNone(config.beam_max_width)
+        self.assertFalse(config.beam_graph_enabled)
+        self.assertFalse(config.deployment.prefill_graph_enabled)
+
     def test_default_dataset_exists(self) -> None:
+        self.assertEqual(pangu_generate._DEFAULT_DATASET, DEFAULT_DATASET)
         self.assertTrue(DEFAULT_DATASET.is_file())
         raw = DEFAULT_DATASET.read_text(encoding="utf-8").strip()
         self.assertTrue(raw, f"Dataset is empty: {DEFAULT_DATASET}")

@@ -10,8 +10,7 @@ This makes the kernel compatible with CUDA Graph capture/replay: the
 ``decode_step`` value can change between replays via ``decode_step_buf.fill_()``
 without re-capturing the graph.
 
-The original pure-Python ``cache_unshared_kv`` (in beam_kernels.py) is
-retained as a fallback and for non-Graph eager paths.
+The eager path uses ``write_eager_step`` in beam_attention_pool.py.
 """
 
 from __future__ import annotations

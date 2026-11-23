@@ -7,7 +7,7 @@ syntax = "proto3";
 package vllm.grpc.engine;
 
 // GR extensions (original package, service, field numbers and methods retained).
-// This block is below the header on purpose: tools/generate_grpc_proto.py copies
+// This block is below the header on purpose: tools/codegen/generate_grpc_proto.py copies
 // only the leading comment block into the bindings, so the generated files carry
 // attribution alone.
 // - TokenizedInput.input_ids_i64_le = 3: optional binary int64 prompt.

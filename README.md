@@ -1,113 +1,84 @@
-# vllm-gr
+<!-- markdownlint-disable-file MD041 -->
 
-<div align="center">
-  <img src="docs/assets/vLLM-GR.png" alt="vllm-gr logo" width="60%">
-</div>
+<p align="center">
+  <img src="docs/assets/vLLM-GR.png" alt="vLLM-GR" width="55%">
+</p>
 
-vLLM-based Generative Recommender Inference Engine
+<h3 align="center">vLLM-GR brings generative recommendation models to vLLM.</h3>
 
-This repository focuses on vLLM-based generative recommendation inference, including the OneRec beam-search / catalog-constrained generation pipeline, the Pangu LLM passthrough path, example scripts, test suites, and GPU / NPU runtime adaptation code.
+## About
 
-## Runtime version contract
+[vLLM](https://github.com/vllm-project/vllm) was originally built to serve
+large language models that generate text autoregressively. vLLM-GR extends
+that foundation to recommendation, where a model uses a person's interaction
+history to predict which items will interest them. vLLM-GR is an independent
+extension of vLLM.
 
-**vLLM-GR 0.30.0 supports vLLM 0.30.0 only.** GR patches depend on vLLM
-internals, and runtime initialization rejects a different public vLLM version.
-Local build suffixes do not change that compatibility requirement.
+- **Recommendation inputs.** Views, clicks and other interactions describe a
+  user's history. A prompt can ask the model to recommend the next item.
+- **Model architectures.** The current implementation focuses on inference
+  for autoregressive generative recommendation models.
+- **Recommendation outputs.** Generation returns candidate item IDs, such as
+  semantic IDs (SIDs), ordered by sequence likelihood. Ranking a supplied
+  candidate set is planned.
 
-| Target | Required runtime | Installation source |
-| --- | --- | --- |
-| CUDA | vLLM 0.30.0 | Pinned by `requirements/cuda.txt` |
-| Ascend NPU | vLLM 0.30.0, vLLM-Ascend 0.30.0rc2, Triton-Ascend 3.6.0 | Prepared vendor image; see the [Ascend guide](docs/quickstart-ascend.md) |
+![Recommendation model architecture for generating ranked item IDs, with a separate planned path for scoring supplied candidates.](docs/assets/framework-overview.svg)
 
-The `+npu` and `+cpu` package suffixes identify build targets. A CPU package
-does not provide a production Beam inference runtime. See the
-[dependency and version policy](docs/dependency_version_policy.md) for release
-tags, build overrides, and dependency constraints.
+### vLLM-GR is fast with
 
-## Current Scope
+- **One submission for the entire beam search.** The frontend submits the
+  request to EngineCore once. The engine drives prefill and every decode step,
+  then returns the ranked candidates and their scores in one response.
+- **BeamAttn and KV cache reuse.** All beams attend to the same cached prompt.
+  The beam KV cache carries each selected parent's suffix into the next step.
+  Across requests, vLLM's prefix cache skips prefill for matching prompt blocks.
+- **Asynchronous scheduling.** While the device executes one step, the
+  host can prepare and submit the next. This overlaps host preparation with
+  device execution across prefill and decode.
+- **On-device beam postprocessing.** Device kernels apply catalog constraints
+  and select the highest-scoring valid continuations. The next decode step
+  uses the selected tokens directly on the device, avoiding a host round trip
+  for each beam decision.
 
-The current implementation targets inference scenarios and does not aim for full training-phase feature coverage.
+### vLLM-GR is flexible and easy to use with
 
-## Repository Contents
+- Generate candidate SIDs directly or, for compatible models, run an offline
+  reasoning step before catalog-constrained SID generation.
+- Choose full-vocabulary or catalog-constrained search, set candidate and beam
+  widths at each stage, and specify how many results to return.
+- Use the same `gr` configuration for offline Python inference, the
+  OpenAI-compatible HTTP completions endpoint and experimental gRPC serving.
+- Roll out new model weights and switch item catalogs independently on
+  running service instances. Online catalog replacement requires asynchronous
+  Beam execution on CUDA.
+- Extend device support through backend providers that validate the environment,
+  apply runtime patches, and implement catalog-constrained top-k selection.
 
-- `vllm_gr/` — GRLLM (offline beam search), beam-search/catalog patches, NPU runtime utils, ops
-- [`examples/`](examples/README.md) — HTTP serving, catalog constraints, and offline inference
-- `tools/` — unified test runner and local development utilities
-- `scripts/` — wheel-build and device lifecycle helpers used by CI
-- `tests/` — unit, contract, and Pangu system tests
-- `requirements/` — platform dependency lists (auto-selected by `setup.py` as `cuda` / `npu` / `cpu`)
+### vLLM-GR supports the following models
 
-## Installation
+- **Generative recommendation.** [OneRec-1.7B](https://huggingface.co/OpenOneRec/OneRec-1.7B)
+  generates a ranked list of candidate SIDs for a user's history.
+- **Text generation.** See the [supported models](docs/models/supported_models.md)
+  for openPangu passthrough and device-specific guidance.
 
-Use the [CUDA quickstart](docs/quickstart.md) or the
-[Ascend installation guide](docs/quickstart-ascend.md) to prepare the matching
-runtime. Set `VLLM_GR_TARGET_DEVICE` explicitly when installing from source or
-building wheels; `setup.py` selects the platform dependencies. No `[gpu]` extra
-is needed.
+## Getting Started
 
-For service security boundaries and vulnerability reporting, see the
-[security policy](SECURITY.md) and the upstream
-[vLLM security guide](https://docs.vllm.ai/en/latest/usage/security.html).
+- [Installation](docs/getting_started/installation/README.md) — Install vLLM-GR
+  from source on NVIDIA GPUs or Ascend NPUs.
+- [OneRec quickstart](docs/getting_started/quickstart.md) — Generate ranked
+  recommendations with OneRec-1.7B offline or serve the model over HTTP.
+- [Feature compatibility](docs/user_guide/feature_compatibility.md) — Check
+  which beam search and serving features are supported on each platform.
 
-## Unified self-validation
+## Contributing
 
-For code changes, start with [Contributing](CONTRIBUTING.md) and the
-[development navigation](docs/development.md). Use the
-[validation guide](docs/tools/README.md#validation-levels) to select checks.
-For full local runtime validation in a prepared accelerator environment:
+We welcome and value any contributions and collaborations.
+Please check out [Contributing to vLLM-GR](./CONTRIBUTING.md) for how to get involved.
 
-```bash
-./tools/run_test.sh
-```
+## Security
 
-The runner selects an available accelerator and runs the platform-specific
-validation path. See [Development utilities](docs/tools/README.md) for CUDA/NPU
-behavior, environment prerequisites, and model-cache options.
+See the [security policy](SECURITY.md) for reporting and deployment guidance.
 
-Refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark-related test cases.
-The standalone offline `beam_search_v1` performance and timeline benchmark is
-documented in [benchmarks/qwen/README.md](benchmarks/qwen/README.md).
+## License
 
-Shared AI coding instructions are in [AGENTS.md](AGENTS.md), imported by
-[CLAUDE.md](CLAUDE.md). See [AI tool integration](docs/agent_instructions.md)
-for loading checks and guidance maintenance.
-
-## Executing
-
-- [Run OneRec offline](examples/README.md#run-onerec-offline) with a local
-  model snapshot.
-- [Constrain SIDs to a catalog](examples/offline_inference/beam_search/README.md#run-with-a-constraint-table).
-  See the [asynchronous scheduling quickstart](docs/onerec_v1_async_quickstart.md)
-  for the full configuration.
-- [Serve OneRec over HTTP](examples/online_serving/beam_search/README.md) or
-  [gRPC](examples/online_serving/grpc/README.md).
-
-## NPU Serving
-
-The following is the serving configuration contract for the validated NPU
-stack (vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2).
-
-Use a canonical `--vllm-gr-config` file with `beam.execution_mode: v1` and
-`constraint_table.backend: npu`. Build the `.safetensors` artifact with the
-same model/tokenizer snapshot used by the server and include the printed
-artifact and tokenizer digests in the configuration.
-
-Use the [HTTP example](examples/online_serving/beam_search/README.md) to
-compile the table and verify the deployment.
-The old frontend `--catalog-path` injection flow is retired; a triples JSON
-is an artifact build input, not a replacement for the canonical configuration.
-
-The [NPU installation guide](docs/quickstart-ascend.md) records the runtime
-requirements and execution choices. Benchmark gates additionally require local dataset and
-catalog paths plus a resolved benchmark policy; see
-[benchmark instructions](docs/benchmarks/README.md).
-
-For catalog-free Beam selection over the full vocabulary or opt-in SA/SB/SC
-token families on this stack, see
-[unconstrained Beam Search V1 on NPU](docs/npu_unconstrained_beam.md).
-
-## Uninstall
-
-```bash
-pip uninstall vllm-gr
-```
+Apache License 2.0, as found in the [LICENSE](./LICENSE) file.

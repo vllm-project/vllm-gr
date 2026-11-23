@@ -160,19 +160,19 @@ def close_v2_runtime(runner: Any) -> None:
 
 def capture_multibatch_forward(worker: Any, *, allow_eager_fallback: bool = True) -> bool:
     """Publish configured V2 Decode shapes, with shape-local fallback."""
-    with torch.inference_mode():
-        from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
-        from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-        from vllm_gr.v1.worker.gr_context import (
-            _get_gr_config,
-        )
-        from vllm_gr.v1.worker.gr_startup import _capture_batch, _capture_enabled
+    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
+    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+    from vllm_gr.v1.worker.gr_context import _get_gr_config
+    from vllm_gr.v1.worker.gr_startup import _capture_batch, _capture_enabled
 
+    with torch.inference_mode():
         if not _capture_enabled(worker) or str(worker.device).split(":")[0] != "cuda":
             return False
         cfg = _get_gr_config(worker)
         max_reqs = worker.vllm_config.scheduler_config.max_num_seqs
-        batches = tuple(b for b in cfg.beam_online_batch_sizes if b <= max_reqs)
+        batches = tuple(b for b in cfg.deployment.beam_batch_sizes if b <= max_reqs)
+        if not batches:
+            return False
         runtime = get_v2_runtime(worker)
         if runtime.startup_failures is not None:
             owner = getattr(worker, "_gr_gpu_stage_runner", None)

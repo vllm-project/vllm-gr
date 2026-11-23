@@ -38,12 +38,10 @@ def main() -> None:
     os.environ["REVIEW_PROJECTION"] = args.projection
     from transformers import AutoTokenizer
 
+    from benchmarks.metrics import distribution_ms
     from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
-        build_artifact,
-    )
-    from tools.AB_Tests.run_offline_benchmark import distribution_ms
-    from vllm_gr.entrypoints.beam_search_v1.output_processor import (
+    from vllm_gr.constraints.artifact_builder import build_single_trie_artifact
+    from vllm_gr.entrypoints.beam_search.output_processor import (
         BeamSearchOutputProcessor,
     )
     from vllm_gr.entrypoints.gr import GRLLM
@@ -65,28 +63,23 @@ def main() -> None:
     assert all(len(tokenizer.encode(x, add_special_tokens=False)) == 1023 for x in prompts)
     artifact = Path(args.output).resolve().with_suffix(".safetensors")
     artifact.parent.mkdir(parents=True, exist_ok=True)
-    digest, tokenizer_digest = build_artifact(
+    digest, tokenizer_digest = build_single_trie_artifact(
         model, Path(args.constraint_triples).resolve(), artifact
     )
     cfg = {
-        "schema_version": 1,
-        "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": args.mode == "graph",
-            "worker_decision": True,
-            "max_width": 128,
-            "max_decode_steps": 3,
-        },
+        "beam_graph_enabled": args.mode == "graph",
+        "worker_decision": True,
+        "beam_width": [128] * 3,
+        "max_decode_steps": 3,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "path": str(artifact),
             "format": "constraint_table_v1",
-            "artifact_digest": digest,
-            "tokenizer_digest": tokenizer_digest,
             "max_top_k": 128,
+            "digests": {"artifact": digest, "tokenizer": tokenizer_digest},
         },
+        "candidate_width": [128] * 3,
     }
     last: dict[str, Any] = {}
     original = BeamSearchOutputProcessor.process_outputs
@@ -110,7 +103,7 @@ def main() -> None:
     def request(llm: Any, index: int) -> dict[str, Any]:
         assert llm.reset_prefix_cache()
         start = time.perf_counter_ns()
-        outputs = llm.beam_search_v1([{"prompt": prompts[index]}], params, output_mode="full")
+        outputs = llm.beam_search([{"prompt": prompts[index]}], params, output_mode="full")
         for s in outputs[0].sequences:
             _ = s.text
         elapsed = (time.perf_counter_ns() - start) / 1e6
@@ -131,22 +124,25 @@ def main() -> None:
             ],
         }
 
-    with GRLLM(
-        model=str(model),
-        trust_remote_code=True,
-        vllm_gr_config=cfg,
-        async_scheduling=True,
-        enable_prefix_caching=True,
-        enable_chunked_prefill=False,
-        max_model_len=8192,
-        max_num_batched_tokens=8192,
-        max_num_seqs=128,
-        max_logprobs=128,
-        gpu_memory_utilization=0.9,
-        enforce_eager=args.mode == "eager",
-        seed=0,
-        worker_cls="vocab_slice_review_worker.ReviewWorker",
-    ) as llm:
+    with (
+        GRLLM(
+            model=str(model),
+            trust_remote_code=True,
+            attention_config={"backend": "CUSTOM"},
+            gr=cfg,
+            async_scheduling=True,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=False,
+            max_model_len=8192,
+            max_num_batched_tokens=8192,
+            max_num_seqs=128,
+            max_logprobs=128,
+            gpu_memory_utilization=0.9,
+            enforce_eager=args.mode == "eager",
+            seed=0,
+            worker_cls="vocab_slice_review_worker.ReviewWorker",
+        ) as llm,
+    ):
         for i in range(args.warmup):
             request(llm, i)
         llm.collective_rpc("review_control", args=("measure",))

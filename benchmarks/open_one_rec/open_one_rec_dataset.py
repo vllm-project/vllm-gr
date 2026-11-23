@@ -106,6 +106,8 @@ class OneRecDataset(BenchmarkDataset):
                 self.data.append(
                     {
                         "prompt": data["prompt"],
+                        "chat_messages": data.get("chat_messages"),
+                        "chat_template_kwargs": data.get("chat_template_kwargs"),
                         "expected_output_len": expected_output_len,
                         "ground_truth": data["ground_truth"],
                         "task_type": task_type,
@@ -134,17 +136,29 @@ class OneRecDataset(BenchmarkDataset):
         throughput numbers via spurious KV-cache hits — see the patched
         get_samples / get_requests entrypoints.
         """
+        runtime_template_kwargs = kwargs.get("chat_template_kwargs")
         sampled_requests: list[SampleRequest] = []
         for item in self.data[:num_requests]:
             prompt = item["prompt"]
             prompt_len = len(tokenizer(prompt).input_ids)
             expected_output_len = item["expected_output_len"]
+            template_kwargs = item.get("chat_template_kwargs")
+            request_overrides = None
+            if template_kwargs is not None or runtime_template_kwargs is not None:
+                request_overrides = {
+                    "chat_template_kwargs": {
+                        **(template_kwargs or {}),
+                        **(runtime_template_kwargs or {}),
+                    }
+                }
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=expected_output_len,
                     request_id=f"{request_id_prefix}{item['task_type']}_{item['id']}",
+                    chat_messages=item.get("chat_messages"),
+                    request_overrides=request_overrides,
                 )
             )
 

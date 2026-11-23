@@ -41,13 +41,42 @@ def test_patch_plans_preserve_process_responsibilities() -> None:
     assert set(frontend_patches).isdisjoint(engine_core_patches)
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_flat_logprobs_patch_preserves_offsets_and_optional_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from itertools import repeat
+
+    from vllm.logprobs import FlatLogprobs
+
+    from vllm_gr.v1.engine.logprobs_patch import (
+        patch_flat_logprobs,
+        validate_flat_logprobs_patch,
+    )
+
+    monkeypatch.setattr(FlatLogprobs, "append_fast", FlatLogprobs.append_fast)
+    patch_flat_logprobs()
+    assert validate_flat_logprobs_patch() is None
+
+    flat = FlatLogprobs()
+    flat.append_fast([], [], iter(()), iter(()))
+    flat.append_fast([2, 3], [-0.25, -0.5], repeat(1), iter(["b", "c"]))
+    flat.append_fast([7], [-1.0], None, None)
+
+    assert flat.start_indices == [0, 0, 2]
+    assert flat.end_indices == [0, 2, 3]
+    assert flat.token_ids == [2, 3, 7]
+    assert flat.logprobs == [-0.25, -0.5, -1.0]
+    assert flat.ranks == [1, 1, None]
+    assert flat.decoded_tokens == ["b", "c", None]
+
+
 def test_runtime_patch_order_preserves_ascend_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
-    from vllm_gr import npu_spawn_patch
     from vllm_gr.platforms import loader
-    from vllm_gr.platforms.npu import NPU_BACKEND
+    from vllm_gr.platforms.ascend import NPU_BACKEND, spawn_patch
     from vllm_gr.v1 import ascend_compat
 
     monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
@@ -69,7 +98,7 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         call_order.append("npu_worker")
         return 1
 
-    def apply_beam(force: bool = False) -> int:
+    def apply_beam() -> int:
         call_order.append("beam")
         return 1
 
@@ -79,7 +108,7 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_pangu,
     )
     monkeypatch.setattr(
-        npu_spawn_patch,
+        spawn_patch,
         "apply_npu_spawn_patch",
         apply_npu_spawn,
     )
@@ -218,7 +247,6 @@ def test_engine_core_child_uses_minimal_authoritative_initialization_path(
 def test_model_runner_verifier_checks_shared_discovery_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vllm_gr.patch as runtime_patch
     from vllm_gr.v1.worker import model_runner_patch
 
     class PatchedRunner:
@@ -237,18 +265,18 @@ def test_model_runner_verifier_checks_shared_discovery_set(
     )
     monkeypatch.setattr(
         model_runner_patch,
-        "is_worker_runner_patched",
+        "is_active_worker_runner_patched",
         lambda runner: runner is PatchedRunner,
     )
 
     assert (
-        runtime_patch._validate_model_runner_patch()
+        model_runner_patch.validate_model_runner_patch()
         == "MissingRunner beam execution hooks are not installed"
     )
 
     monkeypatch.setattr(model_runner_patch, "discover_active_worker_runners", lambda: ())
     assert (
-        runtime_patch._validate_model_runner_patch()
+        model_runner_patch.validate_model_runner_patch()
         == "No supported active-platform ModelRunner is available"
     )
 
@@ -256,13 +284,15 @@ def test_model_runner_verifier_checks_shared_discovery_set(
 def test_plugin_exposes_simple_per_patch_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    env_check = import_module("vllm_gr._env_check")
+    startup = import_module("vllm_gr.engine.startup")
+    loader = import_module("vllm_gr.platforms.loader")
     plugin = import_module("vllm_gr.plugin")
     runtime_patch = import_module("vllm_gr.patch")
 
     report = BeamPatchReport((BeamPatchResult("flat_logprobs", BeamPatchStatus.APPLIED),))
-    monkeypatch.setattr(env_check, "configure_model_runner_default", mock.Mock())
-    monkeypatch.setattr(env_check, "check_environment", mock.Mock())
+    provider = mock.Mock()
+    monkeypatch.setattr(startup, "configure_model_runner_default", mock.Mock())
+    monkeypatch.setattr(loader, "activate_current_backend", mock.Mock(return_value=provider))
     reapply = mock.Mock(return_value=1)
     monkeypatch.setattr(runtime_patch, "re_apply_patches", reapply)
     monkeypatch.setattr(
@@ -273,7 +303,8 @@ def test_plugin_exposes_simple_per_patch_status(
 
     state = plugin.initialize_runtime()
 
-    reapply.assert_called_once_with()
+    provider.check_environment.assert_called_once_with()
+    reapply.assert_called_once_with(provider=provider)
     assert state == {
         "patch_count": 1,
         "patches": {"flat_logprobs": "applied"},
@@ -292,7 +323,7 @@ def test_kv_hash_memo_patch_equivalence_and_hits() -> None:
 
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_gr.v1.engine import engine_core_patch
+    from vllm_gr.v1.core import kv_cache_utils as gr_kv_cache_utils
 
     # NONE_HASH is lazily initialized by init_none_hash; the hashing path
     # needs it for first-block (parent=None) calls.
@@ -307,7 +338,7 @@ def test_kv_hash_memo_patch_equivalence_and_hits() -> None:
     # Snapshot the module attribute so the test can restore even if the
     # wrapper was already installed by an earlier plan run.
     try:
-        engine_core_patch.apply_kv_hash_memo_patch()
+        gr_kv_cache_utils.apply_kv_hash_memo_patch()
         wrapped = kv_cache_utils.hash_block_tokens
         assert getattr(wrapped, "_gr_hash_memo", False)
 
@@ -328,12 +359,89 @@ def test_kv_hash_memo_patch_equivalence_and_hits() -> None:
         # Parent hash participates in the key.
         assert wrapped(sha_fn, first, tokens, None) != first
         # Idempotent re-apply keeps the same wrapper.
-        engine_core_patch.apply_kv_hash_memo_patch()
+        gr_kv_cache_utils.apply_kv_hash_memo_patch()
         assert kv_cache_utils.hash_block_tokens is wrapped
     finally:
         kv_cache_utils.hash_block_tokens = original
         kv_cache_utils.get_request_block_hasher = orig_core_factory
         _vllm_engine.core.get_request_block_hasher = orig_core_factory
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("missing", "intact"),
+    [("update_from_output", "schedule"), ("schedule", "update_from_output")],
+)
+def test_scheduler_plan_repairs_partial_install(
+    monkeypatch: pytest.MonkeyPatch, missing: str, intact: str
+) -> None:
+    from inspect import unwrap
+
+    from vllm.v1.core.sched import scheduler as native
+
+    from vllm_gr import patch
+
+    class IsolatedScheduler(native.Scheduler):  # type: ignore[misc]
+        pass
+
+    original = {name: unwrap(getattr(native.Scheduler, name)) for name in (missing, intact)}
+    for name, method in original.items():
+        monkeypatch.setattr(IsolatedScheduler, name, method)
+    monkeypatch.setattr(native, "Scheduler", IsolatedScheduler)
+    monkeypatch.setattr(patch, "_LAST_BEAM_PATCH_REPORT", None)
+    scheduler_patch = next(p for p in patch._engine_core_beam_patches() if p.name == "scheduler")
+
+    def install() -> BeamPatchStatus:
+        return patch._initialize_beam_patch_plan((scheduler_patch,)).results[0].status
+
+    assert install() is BeamPatchStatus.APPLIED
+    surviving_wrapper = getattr(IsolatedScheduler, intact)
+    monkeypatch.setattr(IsolatedScheduler, missing, original[missing])
+    assert scheduler_patch.verify() is not None
+    assert install() is BeamPatchStatus.APPLIED
+    assert getattr(IsolatedScheduler, missing).__wrapped__ is original[missing]
+    assert getattr(IsolatedScheduler, intact) is surviving_wrapper
+    assert install() is BeamPatchStatus.ALREADY_APPLIED
+
+
+def test_kv_hash_memo_plan_repairs_partial_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.engine import core
+
+    from vllm_gr import patch
+
+    # Isolate all three process-wide bindings even if an earlier test installed them.
+    def native_factory(*args: object) -> object:
+        raise AssertionError("unexpected native factory call")
+
+    monkeypatch.setattr(kv_cache_utils, "hash_block_tokens", lambda *_: None)
+    monkeypatch.setattr(kv_cache_utils, "get_request_block_hasher", native_factory)
+    monkeypatch.setattr(core, "get_request_block_hasher", native_factory)
+    monkeypatch.setattr(patch, "_LAST_BEAM_PATCH_REPORT", None)
+    (kv_patch,) = [p for p in patch._engine_core_beam_patches() if p.name == "kv_hash_memo"]
+
+    def install() -> BeamPatchStatus:
+        return patch._initialize_beam_patch_plan((kv_patch,)).results[0].status
+
+    assert install() is BeamPatchStatus.APPLIED
+    block = kv_cache_utils.hash_block_tokens
+    cached_hash = block(sha256, b"parent", [1, 2], None)
+
+    # The block wrapper survived, but the chain factory and its alias are native.
+    monkeypatch.setattr(kv_cache_utils, "get_request_block_hasher", native_factory)
+    monkeypatch.setattr(core, "get_request_block_hasher", native_factory)
+    assert install() is BeamPatchStatus.APPLIED
+    assert kv_cache_utils.hash_block_tokens is block
+    assert block(sha256, b"parent", [1, 2], None) is cached_hash
+    chain = kv_cache_utils.get_request_block_hasher
+    assert core.get_request_block_hasher is chain
+
+    # Repair only the stale EngineCore alias, retaining the existing chain memo.
+    monkeypatch.setattr(core, "get_request_block_hasher", native_factory)
+    assert install() is BeamPatchStatus.APPLIED
+    assert core.get_request_block_hasher is kv_cache_utils.get_request_block_hasher is chain
+    assert install() is BeamPatchStatus.ALREADY_APPLIED
 
 
 def test_block_hash_chain_memo_replays_full_chain() -> None:
@@ -350,7 +458,7 @@ def test_block_hash_chain_memo_replays_full_chain() -> None:
 
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_gr.v1.engine import engine_core_patch
+    from vllm_gr.v1.core import kv_cache_utils as gr_kv_cache_utils
 
     if "NONE_HASH" not in dir(kv_cache_utils) or kv_cache_utils.NONE_HASH is None:
         kv_cache_utils.init_none_hash(
@@ -363,7 +471,7 @@ def test_block_hash_chain_memo_replays_full_chain() -> None:
 
     orig_core_factory = _vllm_engine.core.get_request_block_hasher
     try:
-        engine_core_patch.apply_kv_hash_memo_patch()
+        gr_kv_cache_utils.apply_kv_hash_memo_patch()
         assert getattr(kv_cache_utils.get_request_block_hasher, "_gr_chain_memo", False)
         # core.py binds the factory via from-import: it must hold the SAME
         # memoizing wrapper, not the original, or Requests keep using the
@@ -496,7 +604,7 @@ def test_hash_memos_survive_varied_traffic_beyond_capacity(
     from vllm.v1 import engine as _vllm_engine
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_gr.v1.engine import engine_core_patch
+    from vllm_gr.v1.core import kv_cache_utils as gr_kv_cache_utils
 
     if "NONE_HASH" not in dir(kv_cache_utils) or kv_cache_utils.NONE_HASH is None:
         kv_cache_utils.init_none_hash(
@@ -506,15 +614,15 @@ def test_hash_memos_survive_varied_traffic_beyond_capacity(
     orig_hash = kv_cache_utils.hash_block_tokens
     orig_factory = kv_cache_utils.get_request_block_hasher
     orig_core_factory = _vllm_engine.core.get_request_block_hasher
-    orig_block_limit = engine_core_patch._KV_HASH_MEMO_LIMIT
-    orig_chain_limit = engine_core_patch._CHAIN_MEMO_LIMIT
+    orig_block_limit = gr_kv_cache_utils._KV_HASH_MEMO_LIMIT
+    orig_chain_limit = gr_kv_cache_utils._CHAIN_MEMO_LIMIT
     try:
         # Count real block digests; the configured function is only a namespace.
-        block_digest = mock.Mock(wraps=engine_core_patch._hash_block_bytes)
-        monkeypatch.setattr(engine_core_patch, "_hash_block_bytes", block_digest)
-        engine_core_patch._KV_HASH_MEMO_LIMIT = 8
-        engine_core_patch._CHAIN_MEMO_LIMIT = 4
-        engine_core_patch.apply_kv_hash_memo_patch()
+        block_digest = mock.Mock(wraps=gr_kv_cache_utils._hash_block_bytes)
+        monkeypatch.setattr(gr_kv_cache_utils, "_hash_block_bytes", block_digest)
+        gr_kv_cache_utils._KV_HASH_MEMO_LIMIT = 8
+        gr_kv_cache_utils._CHAIN_MEMO_LIMIT = 4
+        gr_kv_cache_utils.apply_kv_hash_memo_patch()
         wrapped = kv_cache_utils.hash_block_tokens
         assert getattr(wrapped, "_gr_hash_memo", False)
         block_store = wrapped._gr_hash_memo_entries
@@ -561,8 +669,8 @@ def test_hash_memos_survive_varied_traffic_beyond_capacity(
         kv_cache_utils.hash_block_tokens = orig_hash
         kv_cache_utils.get_request_block_hasher = orig_factory
         _vllm_engine.core.get_request_block_hasher = orig_core_factory
-        engine_core_patch._KV_HASH_MEMO_LIMIT = orig_block_limit
-        engine_core_patch._CHAIN_MEMO_LIMIT = orig_chain_limit
+        gr_kv_cache_utils._KV_HASH_MEMO_LIMIT = orig_block_limit
+        gr_kv_cache_utils._CHAIN_MEMO_LIMIT = orig_chain_limit
 
 
 def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
@@ -582,7 +690,7 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
     from vllm.v1 import engine as _vllm_engine
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_gr.v1.engine import engine_core_patch
+    from vllm_gr.v1.core import kv_cache_utils as gr_kv_cache_utils
 
     if "NONE_HASH" not in dir(kv_cache_utils) or kv_cache_utils.NONE_HASH is None:
         kv_cache_utils.init_none_hash(
@@ -593,7 +701,7 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
     orig_factory = kv_cache_utils.get_request_block_hasher
     orig_core_factory = _vllm_engine.core.get_request_block_hasher
     try:
-        engine_core_patch.apply_kv_hash_memo_patch()
+        gr_kv_cache_utils.apply_kv_hash_memo_patch()
         wrapped = kv_cache_utils.hash_block_tokens
         assert getattr(wrapped, "_gr_hash_memo", False)
         block_store = wrapped._gr_hash_memo_entries
@@ -658,7 +766,7 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
         grown = len(block_store)
         assert wrapped(sha_fn, None, probe, None) == first_probe
         assert len(block_store) == grown
-        assert engine_core_patch._CHAIN_FALLBACK_ACTIVE is False
+        assert gr_kv_cache_utils._CHAIN_FALLBACK_ACTIVE is False
     finally:
         kv_cache_utils.hash_block_tokens = orig_hash
         kv_cache_utils.get_request_block_hasher = orig_factory
@@ -671,7 +779,7 @@ def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
     import vllm.utils.system_utils as system_utils
     import vllm.v1.executor.multiproc_executor as multiproc_executor
 
-    from vllm_gr import npu_spawn_patch
+    from vllm_gr.platforms.ascend import spawn_patch
 
     upstream_calls: list[str] = []
 
@@ -681,46 +789,46 @@ def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
     monkeypatch.setattr(system_utils, "_maybe_force_spawn", upstream)
     monkeypatch.setattr(multiproc_executor, "_maybe_force_spawn", upstream)
 
-    assert npu_spawn_patch.apply_npu_spawn_patch() is True
+    assert spawn_patch.apply_npu_spawn_patch() is True
     wrapped = system_utils._maybe_force_spawn
     assert multiproc_executor._maybe_force_spawn is wrapped
     assert hasattr(wrapped, "_vllm_gr_npu_spawn_original")
 
-    monkeypatch.setattr(npu_spawn_patch, "_npu_is_initialized", lambda: False)
+    monkeypatch.setattr(spawn_patch, "_npu_is_initialized", lambda: False)
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
     wrapped()
     assert upstream_calls == ["upstream"]
     assert "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ
 
     # Re-applying over the wrapped target must not stack another layer.
-    assert npu_spawn_patch.apply_npu_spawn_patch() is False
+    assert spawn_patch.apply_npu_spawn_patch() is False
     assert system_utils._maybe_force_spawn is wrapped
 
     # A later native import can restore the directly imported executor alias.
     monkeypatch.setattr(multiproc_executor, "_maybe_force_spawn", upstream)
-    assert npu_spawn_patch.apply_npu_spawn_patch() is True
+    assert spawn_patch.apply_npu_spawn_patch() is True
     assert system_utils._maybe_force_spawn is wrapped
     assert multiproc_executor._maybe_force_spawn is wrapped
-    assert npu_spawn_patch.apply_npu_spawn_patch() is False
+    assert spawn_patch.apply_npu_spawn_patch() is False
 
 
 def test_npu_spawn_patch_forces_spawn_only_when_npu_initialized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr import npu_spawn_patch
+    from vllm_gr.platforms.ascend import spawn_patch
 
-    monkeypatch.setattr(npu_spawn_patch, "_npu_is_initialized", lambda: True)
+    monkeypatch.setattr(spawn_patch, "_npu_is_initialized", lambda: True)
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
-    npu_spawn_patch._force_spawn_if_npu_initialized()
+    spawn_patch._force_spawn_if_npu_initialized()
     assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
 
     # An explicit spawn choice or an uninitialized NPU leaves the env alone.
-    npu_spawn_patch._force_spawn_if_npu_initialized()
+    spawn_patch._force_spawn_if_npu_initialized()
     assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
 
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
-    monkeypatch.setattr(npu_spawn_patch, "_npu_is_initialized", lambda: False)
-    npu_spawn_patch._force_spawn_if_npu_initialized()
+    monkeypatch.setattr(spawn_patch, "_npu_is_initialized", lambda: False)
+    spawn_patch._force_spawn_if_npu_initialized()
     assert "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ
 
 
@@ -741,13 +849,15 @@ def test_client_validator_rejects_missing_client_patch(
 ) -> None:
     from vllm.v1.engine import core_client
 
-    from vllm_gr.patch import _validate_engine_clients_patch
-    from vllm_gr.v1.engine.core_client_patch import apply_engine_client_patches
+    from vllm_gr.v1.engine.core_client_patch import (
+        apply_engine_client_patches,
+        validate_engine_clients_patch,
+    )
 
     apply_engine_client_patches()
-    assert _validate_engine_clients_patch() is None
+    assert validate_engine_clients_patch() is None
     monkeypatch.delattr(getattr(core_client, class_name), method_name)
-    assert _validate_engine_clients_patch() == "EngineCore client methods are not fully installed"
+    assert validate_engine_clients_patch() == "EngineCore client methods are not fully installed"
 
 
 @pytest.mark.parametrize(
@@ -764,14 +874,16 @@ def test_async_llm_validator_rejects_missing_merged_submission(
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.v1.engine.llm_engine import LLMEngine
 
-    from vllm_gr.patch import _validate_async_llm_patch
-    from vllm_gr.v1.engine.core_client_patch import apply_async_llm_patches
+    from vllm_gr.v1.engine.core_client_patch import (
+        apply_async_llm_patches,
+        validate_async_llm_patch,
+    )
 
     apply_async_llm_patches()
-    assert _validate_async_llm_patch() is None
+    assert validate_async_llm_patch() is None
     owner = {"AsyncLLM": AsyncLLM, "LLMEngine": LLMEngine}[class_name]
     monkeypatch.delattr(owner, method_name)
-    assert _validate_async_llm_patch() == "GR frontend lifecycle methods are not fully installed"
+    assert validate_async_llm_patch() == "GR frontend lifecycle methods are not fully installed"
 
 
 pytestmark = pytest.mark.cpu_test

@@ -9,7 +9,6 @@ Only successfully captured candidates become visible to serving dispatch.
 
 from __future__ import annotations
 
-import os
 from bisect import bisect_left
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -24,14 +23,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     ModelCudaGraphManager,
 )
 
-from vllm_gr.v1.attention.backends.beam_dense_prefill import (
-    fresh_prefill_capture,
-    requires_fresh_prefill_replay,
-)
+from vllm_gr.config.models import deployment_for
+from vllm_gr.v1.forward_context import fresh_prefill_capture
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
-    ENV_PREFILL_GRAPH_BUCKET_STEP,
-    ENV_PREFILL_GRAPH_MAX_BUCKET,
     get_default_buckets,
     get_max_context_len,
     get_prefill_graph_capture_num_reqs,
@@ -42,21 +37,19 @@ logger = init_logger(__name__)
 
 
 def get_gpu_prefill_buckets(runner: Any) -> list[int]:
-    """Use native capture sizes unless the legacy GR grid is explicitly set.
+    """Use the GR token buckets, or native capture sizes when the list is unset.
 
     Native config has already resolved its default/list/maximum precedence.
     Do not union in extra sizes or capacity endpoints: capacity is not a
     capture budget. An empty native list must stay empty. The KV-bound knob
     changes attention coverage, not an explicitly configured native list.
     """
-    if any(
-        name in os.environ for name in (ENV_PREFILL_GRAPH_BUCKET_STEP, ENV_PREFILL_GRAPH_MAX_BUCKET)
-    ):
-        logger.info(
-            "Explicit GR Prefill bucket grid overrides native cudagraph_capture_sizes; "
-            "unset the GR bucket step/max variables to use native capture configuration."
-        )
-        return get_default_buckets()
+    from vllm_gr.config import GRConfig
+
+    host = getattr(runner, "vllm_config", None)
+    settings = GRConfig.from_vllm_config(host).deployment
+    if settings.prefill_token_buckets is not None:
+        return get_default_buckets(host)
     compilation = getattr(runner, "compilation_config", None)
     if compilation is None:
         compilation = getattr(getattr(runner, "vllm_config", None), "compilation_config", None)
@@ -65,7 +58,7 @@ def get_gpu_prefill_buckets(runner: Any) -> list[int]:
             getattr(runner, "cudagraph_manager", None), "compilation_config", None
         )
     sizes = getattr(compilation, "cudagraph_capture_sizes", None)
-    return list(sizes) if sizes is not None else get_default_buckets()
+    return list(sizes) if sizes is not None else get_default_buckets(host)
 
 
 def is_prefill_phase_batch_v2(
@@ -182,6 +175,7 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
         native = runner.cudagraph_manager
         self.plan = plan
         self.runner = runner
+        self._require_fresh = deployment_for(runner.vllm_config).dense_prefill != "off"
         self._prefill_scope: Any = None
         self._capture_finished = False
         self._successful: set[BatchExecutionDescriptor] = set()
@@ -311,7 +305,7 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
                     and is_prefill_phase_batch_v2(
                         self.runner,
                         self._prefill_scope,
-                        require_fresh=requires_fresh_prefill_replay(),
+                        require_fresh=self._require_fresh,
                     )
                     and full in self._successful
                     and full in self.graphs
@@ -343,7 +337,7 @@ def install_prefill_graph_manager_v2(runner: Any) -> None:
     if isinstance(native, GRPrefillCudaGraphManager):
         return
     if (
-        not is_prefill_graph_enabled()
+        not is_prefill_graph_enabled(runner)
         or runner.model_config.enforce_eager
         or native is None
         or not native.cudagraph_mode

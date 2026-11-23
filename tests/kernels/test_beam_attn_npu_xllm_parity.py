@@ -46,14 +46,14 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (  # noqa: E402
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
 )
-from vllm_gr.v1.beam import (  # noqa: E402
-    BeamAttentionContext,
-    BeamAttentionPool,
-    BeamSearchSession,
-)
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR  # noqa: E402
+from vllm_gr.v1.beam import BEAM_DATA_VAR  # noqa: E402
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext  # noqa: E402
+from vllm_gr.v1.beam.attention_pool import BeamAttentionPool  # noqa: E402
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView  # noqa: E402
-from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch  # noqa: E402
+from vllm_gr.v1.beam.session import BeamSearchSession  # noqa: E402
+from vllm_gr.v1.worker.npu.beam_execution_batch import (  # noqa: E402
+    NPUBeamExecutionBatch,
+)
 
 DEVICE = torch.device("npu")
 DTYPE = torch.bfloat16
@@ -217,6 +217,7 @@ def _build_incremental_metadata(
     token = BEAM_DATA_VAR.set(beam_info)
     try:
         builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
+        builder.vllm_config = SimpleNamespace(speculative_config=None)
         builder.device = DEVICE
         builder.block_size = BLOCK_SIZE
         builder.aot_schedule = False
@@ -666,9 +667,9 @@ def test_xllm_mixed_std_beam_batch_falls_back_to_cascade() -> None:
 
     The fused x_attention kernel only encodes beam rows, so a mixed batch is
     delegated to beam_attn_npu.cascade_attention (std rows via paged
-    attention, beam rows via the pool-slice incremental path).  This is the
-    documented fallback (docs/quickstart-ascend.md): a std request sharing a
-    batch with beam decode must succeed, not raise.
+    attention, beam rows via the pool-slice incremental path). This fallback
+    is described in docs/design/feature/npu_decode_execution.md. A standard
+    request sharing a batch with beam decode must succeed.
     """
     beam_width, prefix_len, decode_step = 2, 256, 1
     scale = 1.0 / math.sqrt(HEAD_DIM)

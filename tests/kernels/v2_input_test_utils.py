@@ -11,11 +11,7 @@ from unittest.mock import Mock
 import torch
 
 from vllm_gr.v1.beam.batch_contracts import BeamBatchParams, BeamOutputOptions
-from vllm_gr.v1.engine.beam_search_v1 import (
-    GRDeviceStateRef,
-    GRStageKind,
-    GRStageMetadata,
-)
+from vllm_gr.v1.beam.dispatch import GRDeviceStateRef, GRStageKind, GRStageMetadata
 
 
 def make_prefill_metadata() -> GRStageMetadata:

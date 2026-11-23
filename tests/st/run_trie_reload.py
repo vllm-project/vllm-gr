@@ -4,7 +4,6 @@
 
 import argparse
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -21,10 +20,10 @@ A: set[tuple[int, ...]] = {(0, 10, 127), (0, 11, 126), (1, 10, 126), (1, 11, 127
 B: set[tuple[int, ...]] = {(0, 10, 126), (0, 11, 127), (1, 10, 127), (1, 11, 126)}
 
 
-def prepare(output: Path) -> tuple[Path, Path, Path, Path]:
+def prepare(output: Path) -> tuple[Path, dict[str, Any], Path, Path]:
     from transformers import AutoTokenizer
 
-    model, config_path = prepare_model(output, context_length=128)
+    model, config = prepare_model(output, context_length=128)
     tokenizer = AutoTokenizer.from_pretrained(model)
     digest = compute_tokenizer_digest(tokenizer)
     compiler = ConstraintTableArtifactCompiler(tokenizer, 128, tokenizer_digest=digest)
@@ -38,13 +37,16 @@ def prepare(output: Path) -> tuple[Path, Path, Path, Path]:
         digests.append(save_constraint_table_artifact(table, path))
         paths.append(path)
     assert A.isdisjoint(B) and default_trie_checker(*paths)
-    config = json.loads(config_path.read_text())
-    config["constrained_generation"] = True
-    config["constraint_table"].update(
-        enabled=True, path=str(paths[0]), artifact_digest=digests[0], tokenizer_digest=digest
+    config.update(
+        constraint_mode="table",
+        constraint_table={
+            "backend": "cuda",
+            "max_top_k": max(config["candidate_width"]),
+            "path": str(paths[0]),
+            "digests": {"artifact": digests[0], "tokenizer": digest},
+        },
     )
-    config_path.write_text(json.dumps(config, indent=2))
-    return model, config_path, paths[0], paths[1]
+    return model, config, paths[0], paths[1]
 
 
 def candidates(reply: Any) -> list[list[tuple[int, ...]]]:
@@ -63,7 +65,6 @@ def main() -> None:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     model, config, first, second = prepare(output)
-    os.environ["VLLM_GR_TRIE_RETENTION_SECONDS"] = "1"
     result: dict[str, Any] = {
         "cases": [],
         "retention_seconds": 1,
@@ -72,7 +73,10 @@ def main() -> None:
         "graph": args.graph,
     }
 
-    with server(output, model, config, "trie-reload", graph=args.graph) as (stub, control):
+    with server(output, model, config, "trie-reload", graph=args.graph, retention_seconds=1) as (
+        stub,
+        control,
+    ):
 
         def generate(allowed: set[tuple[int, ...]]) -> list[list[tuple[int, ...]]]:
             actual = candidates(stub.GenerateBatch(request(), timeout=120))

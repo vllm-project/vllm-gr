@@ -9,6 +9,16 @@ Apache License, Version 2.0 is in the LICENSE file. The MIT and BSD-3-Clause
 license texts that apply to some of the material below are reproduced in this
 file, so they are available in every distribution.
 
+Octicons documentation icon
+---------------------------
+Upstream: https://github.com/primer/octicons
+Revision: e6626e159c4ba786d512e252182b62617014c752
+Copyright (c) 2026 GitHub Inc.
+License: MIT (included in the stylesheet)
+
+The important admonition icon in docs/mkdocs/stylesheets/content.css is
+icons/stop-16.svg, embedded as a CSS data URL.
+
 vLLM
 -----
 Upstream: https://github.com/vllm-project/vllm

@@ -45,7 +45,7 @@ echo "  dataset: $DATASET_PATH"
 echo "  num_prompts: $NUM_PROMPTS"
 echo "  threshold: $MIN_ACCURACY ($FAILURE_MODE)"
 
-python examples/offline_inference/pangu1b/pangu_generate.py \
+python tests/st/pangu_generate.py \
   --model "$MODEL_PATH" \
   --dataset-path "$DATASET_PATH" \
   --num-prompts "$NUM_PROMPTS" \

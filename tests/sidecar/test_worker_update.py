@@ -11,8 +11,9 @@ import pytest
 import torch
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-from vllm_gr.ops.lm_head_cache import install_lm_head_cache_reload_hooks
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.ops.sliced_logits import compute_sliced_logits
+from vllm_gr.v1.worker.lm_head_cache import install_lm_head_cache_reload_hooks
 
 
 def _head(input_size: int, output_size: int, *, bias: bool = False, device: str = "cpu") -> Any:
@@ -86,7 +87,6 @@ def test_reload_trie_switches_then_releases_old_table_on_expiry(
 
     now = [0.0]
     monkeypatch.setattr(versioned_table, "time", SimpleNamespace(monotonic=lambda: now[0]))
-    monkeypatch.setenv("VLLM_GR_TRIE_RETENTION_SECONDS", "5")
     old_path, new_path = tmp_path / "old.safetensors", tmp_path / "new.safetensors"
     old_digest = save_constraint_table_artifact(make_table(), old_path)
     save_constraint_table_artifact(
@@ -102,7 +102,9 @@ def test_reload_trie_switches_then_releases_old_table_on_expiry(
         constraint_backend=old,
         model_config=SimpleNamespace(get_vocab_size=lambda: 6, dtype=torch.float32),
         vllm_config=SimpleNamespace(
-            _vllm_gr_parsed_config=SimpleNamespace(constraint_table=config)
+            _vllm_gr_parsed_config=SimpleNamespace(
+                constraint_table=config, deployment=DeploymentOptions(trie_retention_seconds=5)
+            )
         ),
     )
     runner.constraint_backend = versioned_constraint_table(runner, old)
@@ -192,13 +194,23 @@ def test_sliced_cache_survives_native_layerwise_reload(
 
 @pytest.mark.l1
 @pytest.mark.parametrize("bias", [False, True])
-def test_sliced_reload_hook_tracks_window_changes_without_rewrapping(bias: bool) -> None:
+def test_sliced_reload_hook_tracks_window_changes_without_rewrapping(
+    bias: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
     )
 
     head = _head(4, 16, bias=bias)
     head.quant_method = UnquantizedEmbeddingMethod()
+    # Keep the reload contract independent of platform GEMM initialization.
+    monkeypatch.setattr(
+        head.quant_method,
+        "apply",
+        lambda layer, hidden_states, bias=None: torch.nn.functional.linear(
+            hidden_states, layer.weight, bias
+        ),
+    )
     processed: list[Any] = []
 
     def original_process(layer: Any) -> None:

@@ -20,7 +20,7 @@ from vllm_gr.update_status import ServiceStatus
 
 from .contracts import Instance, UpdateContext, UpdateError
 
-_STATUS_ADAPTER = TypeAdapter(ServiceStatus)
+_STATUS_ADAPTER: TypeAdapter[ServiceStatus] = TypeAdapter(ServiceStatus)
 
 
 class ControlClient:

@@ -38,13 +38,18 @@ class GRServeSubcommand(ServeSubcommand):
         ServeSubcommand.cmd(args)
 
     def validate(self, args: argparse.Namespace) -> None:
-        # A canonical config owns the attention-backend choice. For legacy
-        # serve invocations retain the historical CUSTOM default, but apply it
-        # here (after parsing) so it is not mistaken for an explicit legacy
-        # CLI override and rejected alongside --vllm-gr-config.
+        # vLLM rejects specifying both native forms of the attention backend.
+        attention = getattr(args, "attention_config", None)
+        backend = (
+            attention.get("backend")
+            if isinstance(attention, dict)
+            else getattr(attention, "backend", None)
+        )
         if (
-            getattr(args, "vllm_gr_config", None) is None
+            getattr(args, "config", None) is None
+            and getattr(args, "gr", None) is None
             and getattr(args, "attention_backend", None) is None
+            and backend is None
         ):
             args.attention_backend = "CUSTOM"
         validate_parsed_serve_args(args)

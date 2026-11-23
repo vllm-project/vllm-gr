@@ -77,13 +77,13 @@ def process_json(input_file_path: str, output_file_path: str) -> int:
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Convert data/sid2pid.json to vllm-gr catalog format."
+        description="Convert an OpenOneRec SID mapping to vllm-gr catalog format."
     )
     parser.add_argument(
         "--dataset-path",
         "-d",
-        default="data",
-        help="Dataset root path containing sid2pid.json. Default: data.",
+        default="./data/benchmark_data",
+        help="Dataset root path containing sid2pid.json. Default: %(default)s.",
     )
     parser.add_argument(
         "--mapping-file",

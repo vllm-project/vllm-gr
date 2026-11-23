@@ -9,16 +9,17 @@ Evaluates model predictions on Item Understand task using WIP (LLM-as-Judge).
 """
 
 import logging
-import os
 from typing import Any, Dict, List, Tuple
 
-from benchmarks.open_one_rec.base_evaluator import BaseEval
+from benchmarks.open_one_rec.base_evaluator import BaseEval, EvaluationError
 
 logger = logging.getLogger(__name__)
 
 
 class ItemUnderstandEvaluator(BaseEval):
     """Item Understand task evaluator"""
+
+    reuse_cached_metrics = False
 
     @property
     def required_metrics(self) -> List[str]:
@@ -116,18 +117,13 @@ class ItemUnderstandEvaluator(BaseEval):
 
             from benchmarks.open_one_rec.tasks.item_understand.utils import evaluate_wip
         except ImportError as e:
-            logger.info(f"[red]Failed to import WIP evaluation modules: {e}[/red]")
-            return {}, {}
+            raise EvaluationError(f"WIP Judge dependencies are unavailable: {e}") from e
 
         # Get WIP config
         wip_judge_model = eval_config.get("wip_judge_model", "deepseek")
         wip_max_workers = eval_config.get("wip_max_workers", 5)
         wip_max_samples = eval_config.get("wip_max_samples", 100)
         wip_core_threshold = eval_config.get("wip_core_threshold", 5)
-        wip_gt_cache_dir = os.path.join(
-            self.data_dir, self.task_name
-        )  # Use data_dir / task_name as GT cache directory
-
         # Use BERTScore config from evaluation_config (not separate wip config)
         bertscore_model = eval_config.get("bertscore_model_type", "bert-base-chinese")
         bertscore_num_layers = eval_config.get("bertscore_num_layers", 9)
@@ -137,8 +133,10 @@ class ItemUnderstandEvaluator(BaseEval):
             llm_client = get_client_from_config(wip_judge_model)
             logger.info(f"[green]Using {wip_judge_model} as WIP judge[/green]")
         except Exception as e:
-            logger.info(f"[red]Failed to create LLM client for WIP evaluation: {e}[/red]")
-            return {}, {}
+            raise EvaluationError(f"Cannot initialize WIP Judge: {e}") from e
+
+        if not callable(getattr(llm_client, "generate", None)):
+            raise EvaluationError(f"{self.task_name}: Judge client must provide generate(prompt)")
 
         # Prepare data as dicts
         predictions_dict = {id: pred for id, pred in zip(sample_ids, predictions)}
@@ -156,7 +154,6 @@ class ItemUnderstandEvaluator(BaseEval):
                 llm_client=llm_client,
                 max_workers=wip_max_workers,
                 max_samples=wip_max_samples,
-                gt_cache_dir=wip_gt_cache_dir,
                 model_name=model_name,
                 save_dir=self.predictions_dir,
                 bertscore_model=bertscore_model,
@@ -164,17 +161,15 @@ class ItemUnderstandEvaluator(BaseEval):
                 core_threshold=wip_core_threshold,
             )
 
-            logger.info(
-                f"WIP evaluation completed: {wip_metrics.get('wip_num_samples', 0)} samples evaluated"
-            )
-            return wip_metrics, wip_per_sample
-
+        except EvaluationError:
+            raise
         except Exception as e:
-            logger.info(f"[red]WIP evaluation failed: {e}[/red]")
-            import traceback
+            raise EvaluationError(f"{self.task_name}: Judge evaluation failed: {e}") from e
 
-            traceback.print_exc()
-            return {}, {}
+        self._require_judge_metrics(
+            wip_metrics, "macro_wip_double_weighted_f1", "wip_num_samples", 0, 1
+        )
+        return wip_metrics, wip_per_sample
 
     def _save_debug_info(
         self,

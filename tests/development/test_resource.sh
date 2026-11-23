@@ -23,7 +23,48 @@ else
 fi
 
 # Source the target library
-source "./tools/resource.sh"
+source "./tools/devices/resource.sh"
+
+lock_pid_state() {
+    local pid=$1 stat rc
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || { echo "Invalid lock PID: $pid" >&2; return 1; }
+    if stat=$(ps -p "$pid" -o stat=); then
+        if [[ $stat =~ ^[[:space:]]*([^[:space:]]+)[[:space:]]*$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    else
+        rc=$?
+        if [[ $rc == 1 && -z $stat ]]; then
+            echo gone
+            return 0
+        fi
+    fi
+    echo "Could not read STAT for lock PID $pid" >&2
+    return 1
+}
+
+wait_for_unlock() {
+    local pid state previous attempt
+    for pid in "$@"; do
+        previous=""
+        # A container's init may leave an exited lock holder as a zombie.
+        # Poll each exact holder for up to five seconds and record state changes.
+        for ((attempt=0; attempt<=20; attempt++)); do
+            state=$(lock_pid_state "$pid") || return 1
+            if [[ $state != "$previous" ]]; then
+                echo "PID $pid STAT=$state after unlock"
+                previous=$state
+            fi
+            [[ $state == gone || $state == Z* ]] && break
+            if (( attempt == 20 )); then
+                echo "FAILED (lock PID $pid remains active with STAT=$state)" >&2
+                return 1
+            fi
+            sleep 0.25
+        done
+    done
+}
 
 echo "Running tests for resource.sh..."
 
@@ -35,7 +76,7 @@ if ! python3 - <<'PY'
 import importlib.util
 import os
 
-spec = importlib.util.spec_from_file_location("lock_gpu", "tools/lock_gpu.py")
+spec = importlib.util.spec_from_file_location("lock_gpu", "tools/devices/lock_gpu.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
@@ -86,12 +127,7 @@ echo "PASSED (Locked with PID: $LOCK_PID)"
 
 echo -n "Testing unlock_gpu... "
 unlock_gpu "$LOCK_PID"
-sleep 1
-if ps -p "$LOCK_PID" > /dev/null; then
-    echo "FAILED (Background process $LOCK_PID is still running)"
-    kill -9 "$LOCK_PID" 2>/dev/null || true # Cleanup
-    exit 1
-fi
+wait_for_unlock "$LOCK_PID"
 echo "PASSED (Device unlocked)"
 
 # 3. Test get_gpus
@@ -139,27 +175,26 @@ echo "PASSED (Locked with PIDs: $LOCK_PIDS)"
 
 echo -n "Testing unlock_gpus... "
 unlock_gpus "$LOCK_PIDS"
-sleep 1
-if pgrep -P "$$" -f "import ctypes" > /dev/null; then
-    echo "WARNING (Some Python lock processes might still be lingering)"
-fi
+wait_for_unlock "${PID_ARRAY[@]}"
 echo "PASSED (Devices unlocked)"
 
 # 5. Selection + lock under a nonzero single-device mask (CUDA, needs >=2 GPUs).
 if ! command -v npu-smi > /dev/null && [ "$GPU_COUNT" -ge 2 ]; then
-    echo -n "Testing selection+lock under CUDA_VISIBLE_DEVICES=1... "
+    mask_id=${ID_ARRAY[0]}
+    [[ $mask_id != 0 ]] || mask_id=${ID_ARRAY[1]}
+    echo -n "Testing selection+lock under CUDA_VISIBLE_DEVICES=$mask_id... "
     set +e
-    MASKED_ID=$(CUDA_VISIBLE_DEVICES=1 get_gpu "$mem_th" 15)
+    MASKED_ID=$(CUDA_VISIBLE_DEVICES="$mask_id" get_gpu "$mem_th" 15)
     rc=$?
     set -e
     if [ $rc -ne 0 ] || [ -z "$MASKED_ID" ]; then
         echo "SKIP (no device visible under the mask)"
-    elif [ "$MASKED_ID" != "1" ]; then
-        echo "FAILED (expected device 1, got '$MASKED_ID')"
+    elif [ "$MASKED_ID" != "$mask_id" ]; then
+        echo "FAILED (expected device $mask_id, got '$MASKED_ID')"
         exit 1
     else
         set +e
-        MASKED_PID=$(CUDA_VISIBLE_DEVICES=1 lock_gpu "$MASKED_ID")
+        MASKED_PID=$(CUDA_VISIBLE_DEVICES="$mask_id" lock_gpu "$MASKED_ID")
         rc=$?
         set -e
         if [ $rc -ne 0 ] || [ -z "$MASKED_PID" ]; then
@@ -167,6 +202,7 @@ if ! command -v npu-smi > /dev/null && [ "$GPU_COUNT" -ge 2 ]; then
             exit 1
         fi
         unlock_gpu "$MASKED_PID"
+        wait_for_unlock "$MASKED_PID"
         echo "PASSED"
     fi
 fi

@@ -9,7 +9,6 @@ so expanding storage capacity does not implicitly enable concurrent scratch use.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Condition, Lock
@@ -21,6 +20,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gr.config import resolve_candidate_width
+from vllm_gr.config.models import deployment_for
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
@@ -39,17 +39,18 @@ from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     unconstrained_topk_mcap_out as unconstrained_topk_out,
 )
+from vllm_gr.v1.attention.backends.beam_prefix_policy import configured_fa_version
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     SUPPORTED_BEAM_BATCH_SIZES,
     BeamBatchFailure,
     BeamBatchResult,
 )
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
-from vllm_gr.v1.beam.beam_state import BeamSearchState
-from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.beam.gpu_beam_postprocess_workspace import BeamPostprocessWorkspaceKey
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.beam.dispatch import (
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_RETIRE_RESULT_ATTR,
+    GR_STAGE_OUTPUT_ATTR,
+    GR_WORKER_RESULT_ATTR,
     GRDispatchSession,
     GRExecutionCapacity,
     GRRetireMetadata,
@@ -60,18 +61,16 @@ from vllm_gr.v1.engine.beam_search_v1 import (
     validate_dispatch,
     validate_dispatch_session,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GR_RETIRE_OUTPUT_ATTR,
-    GR_RETIRE_RESULT_ATTR,
-    GR_STAGE_OUTPUT_ATTR,
-    GR_WORKER_RESULT_ATTR,
-)
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.beam.session import BeamSearchSession
+from vllm_gr.v1.beam.state import BeamSearchState
 from vllm_gr.v1.worker.cuda.beam_final_output import GPUBeamFinalOutput
 from vllm_gr.v1.worker.cuda.beam_search_runner import (
     BeamBatchSearchRunner,
     BeamCandidateBatch,
     BeamSearchRunner,
 )
+from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import (
     CudaStageHooks,
     CudaStageHooksType,
@@ -284,7 +283,8 @@ def _get_unconstrained_head_layout(
     worker: Any,
 ) -> tuple[torch.Tensor, torch.Event] | None:
     """Cache a read-only, vocabulary-contiguous Qwen3 head for Decode."""
-    if os.environ.get("VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT") != "transposed":
+    settings = deployment_for(getattr(worker, "vllm_config", None))
+    if settings.unconstrained_head_layout != "transposed":
         return None
     if (
         worker.parallel_config.tensor_parallel_size != 1
@@ -340,7 +340,7 @@ def _get_unconstrained_head_layout(
         return transposed, ready
 
 
-# ``VLLM_GR_HEAD_SLICE`` values: 0 disables slicing, -1 decides per stage.
+# ``gr.head_slice`` values: 0 disables slicing, -1 decides per stage.
 SLICE_AUTO = -1
 # Measured on L20 (V=176,256, K=256): blocks narrower than this only add
 # launches, and wider than ``HEAD_SLICE_MAX_COLS`` only add memory.
@@ -434,34 +434,6 @@ class _HeadLogits:
     def release_slice(self) -> None:
         """Drop the slice logits buffer after its last reader."""
         self.slice = None
-
-
-def _head_slice_request() -> int:
-    """``VLLM_GR_HEAD_SLICE``: 0 off, ``auto`` per stage, otherwise forced cols."""
-
-    raw = os.environ.get("VLLM_GR_HEAD_SLICE", "0").strip().lower()
-    if raw in ("", "0", "off", "false"):
-        return 0
-    if raw == "auto":
-        return SLICE_AUTO
-    try:
-        cols = int(raw)
-    except ValueError as error:
-        raise ValueError(
-            f"VLLM_GR_HEAD_SLICE must be 0, 'auto' or a column count, got {raw!r}"
-        ) from error
-    return max(0, cols)
-
-
-def _head_slice_min_rows() -> int:
-    return max(int(os.environ.get("VLLM_GR_HEAD_SLICE_MIN_ROWS", "1024") or 0), 0)
-
-
-def _head_slice_max_bytes() -> int:
-    """Per-selection slice budget; 0 means unlimited."""
-
-    megabytes = float(os.environ.get("VLLM_GR_HEAD_SLICE_MAX_MB", "128") or 0)
-    return max(int(megabytes * 2**20), 0)
 
 
 def _stage_hidden(owner: GPUBeamStageRunner, hidden: torch.Tensor) -> torch.Tensor:
@@ -585,9 +557,15 @@ class GPUBeamStageRunner:
         self.logits: torch.Tensor | None = None
         batch_size = len(bindings)
         rows = batch_size * beam.state.beam_width
-        slice_request = (
-            _head_slice_request() if backend is None and self.hooks.supports_transposed_head else 0
-        )
+        host = getattr(worker, "vllm_config", None)
+        self.gr_settings = deployment_for(host)
+        self.explicit_fa_version = configured_fa_version(host)
+        settings = self.gr_settings
+        slice_request = 0
+        if backend is None and self.hooks.supports_transposed_head:
+            slice_request = (
+                SLICE_AUTO if settings.head_slice == "auto" else cast(int, settings.head_slice)
+            )
         # The transposed copy is only consumed by the opt-in sliced-head path.
         # Gate before creating it: the worker cache retains this allocation.
         self._head_layout = _get_unconstrained_head_layout(worker) if slice_request else None
@@ -600,8 +578,8 @@ class GPUBeamStageRunner:
         self._hidden_staging: torch.Tensor | None = None
         self._head_buffers = _HeadLogits(self._head_layout, beam.state.device)
         self._head_slice_request = slice_request if self._head_layout is not None else 0
-        self._head_slice_min_rows = _head_slice_min_rows()
-        self._head_slice_max_bytes = _head_slice_max_bytes()
+        self._head_slice_min_rows = settings.head_slice_min_rows
+        self._head_slice_max_bytes = int(settings.head_slice_max_mb * 2**20)
         self._active_slice_cols = 0
         self.input_ids: torch.Tensor
         self.positions: torch.Tensor
@@ -738,7 +716,7 @@ class GPUBeamStageRunner:
         from vllm_gr.v1.attention.backends.beam_attn_gpu import (
             GPUBeamAttentionBatch,
         )
-        from vllm_gr.v1.attention.backends.beam_attn_metadata_async import (
+        from vllm_gr.v1.attention.backends.beam_attn_metadata import (
             build_async,
         )
 
@@ -750,6 +728,10 @@ class GPUBeamStageRunner:
         views = self.inputs.upload(self.prepared)
         self.device_positions = views["positions"]
         self.metadata = build_async(
+            prefix_policy=self.gr_settings.prefix_policy,
+            prefix_min_chain_us=self.gr_settings.prefix_min_chain_us,
+            explicit_fa_version=self.explicit_fa_version,
+            prefix_calibrations=getattr(self.worker, "_gr_prefix_calibrations", None),
             layout=self.prepared.layout,
             views=views,
             session=GPUBeamAttentionBatch(
@@ -1016,6 +998,8 @@ class GPUBeamStageRunner:
                             vocab_size=vocab_size,
                             top_k=layout.candidate_top_k,
                             device=device,
+                            keep_limit=self.gr_settings.topk_keep,
+                            select=self.gr_settings.topk_select,
                         )
                     if sliced:
                         self._select_from_hidden_slices(
@@ -1425,7 +1409,10 @@ def get_stage_runner(
     # adapter per B instead of replacing those addresses on every B transition.
     # A new schedule or resource binding invalidates the whole bounded cache.
     cache_enabled = (
-        getattr(cfg, "beam_adapter_cache_enabled", False)
+        (
+            getattr(cfg, "beam_adapter_cache_enabled", False)
+            or (hooks_type.persistent_graph_install and len(cfg.deployment.beam_batch_sizes) > 1)
+        )
         and not getattr(worker.model_config, "enforce_eager", False)
         and getattr(cfg, "beam_graph_enabled", False)
     )
@@ -1579,7 +1566,11 @@ def get_stage_runner(
     }
     worker._gr_gpu_stage_runner = adapter
     if cache_enabled:
-        cache[view.batch_size] = adapter
+        if (
+            getattr(cfg, "beam_adapter_cache_enabled", False)
+            or view.batch_size in cfg.deployment.beam_batch_sizes
+        ):
+            cache[view.batch_size] = adapter
         worker._gr_gpu_stage_runner_cache = cache
         worker._gr_gpu_stage_runner_cache_key = cache_key
     elif hasattr(worker, "_gr_gpu_stage_runner_cache_key"):

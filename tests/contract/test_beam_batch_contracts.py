@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import msgspec
 import pytest
 import torch
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -16,6 +17,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 import vllm_gr.v1.beam as beam_package
 import vllm_gr.v1.beam.batch_contracts as contracts
 from vllm_gr.config import MAX_BEAM_WIDTH, MAX_CANDIDATE_WIDTH
+from vllm_gr.sampling_params import BeamSearchParams
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
@@ -34,8 +36,8 @@ from vllm_gr.v1.beam.batch_contracts import (
     validate_beam_batch_request_limits,
     validate_beam_batch_result,
 )
+from vllm_gr.v1.engine.beam_session_client import _terminal_result
 from vllm_gr.v1.engine.codec import build_engine_core_decoders
-from vllm_gr.v1.engine.gr_session_client import _terminal_result
 
 
 def _engine_request(
@@ -177,7 +179,7 @@ def test_request_uses_engine_request_identity_and_beam_params_authority() -> Non
 
 
 def test_request_rejects_embedding_only_prompt() -> None:
-    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+    from vllm_gr.v1.engine.beam_admission import validate_gr_request
 
     engine_request = _engine_request("request-0", None)
     engine_request.prompt_embeds = torch.ones((2, 8), dtype=torch.float32)
@@ -267,6 +269,51 @@ def test_per_parent_beam_widths_require_matching_bootstrap_width() -> None:
         )
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("widths", "candidate_widths", "valid"),
+    [
+        (None, (4, 1, 1), True),
+        ((4, 1, 4), (4, 1, 4), True),
+        ((4, 1, 4), (4, 1, 3), False),
+    ],
+)
+def test_public_and_batch_params_share_candidate_capacity(
+    widths: tuple[int, ...] | None, candidate_widths: tuple[int, ...], valid: bool
+) -> None:
+    # Public max_tokens also counts the reserved begin and end tokens.
+    def public_params() -> BeamSearchParams:
+        return BeamSearchParams(
+            beam_width=4,
+            max_tokens=5,
+            begin_token="<begin>",
+            end_token="<end>",
+            dynamic_beam_widths=list(widths) if widths is not None else None,
+            per_parent_beam_widths=list(candidate_widths),
+        )
+
+    request = _request(
+        beam_params=_params(
+            beam_width=4,
+            dynamic_beam_widths=widths,
+            per_parent_beam_widths=candidate_widths,
+        )
+    )
+
+    if valid:
+        public_params()
+        validate_beam_batch_request(request)
+        return
+
+    message = "each retained width must not exceed"
+    with pytest.raises(VLLMValidationError, match=message) as exc_info:
+        public_params()
+    assert exc_info.value.parameter == "per_parent_beam_widths"
+    assert exc_info.value.value == list(candidate_widths)
+    with pytest.raises(BeamContractError, match=message):
+        validate_beam_batch_request(request)
+
+
 def test_per_parent_beam_widths_override_the_configured_candidate_width() -> None:
     """A per-stage K schedule replaces the scalar K and its stage-width bound.
 
@@ -306,25 +353,15 @@ def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() 
         validate_beam_batch_request(_request(output_options=_options(num_return_sequences=3)))
 
 
-def test_request_beam_width_above_the_candidate_ceiling_requires_an_explicit_k() -> None:
-    """A wide Beam needs an explicit K, because K follows W when unset.
+def test_unconstrained_request_accepts_wide_beam_and_candidates() -> None:
+    """Wide unconstrained requests accept both implicit and explicit K."""
+    for width in (257, 512, MAX_BEAM_WIDTH):
+        for candidate_width in (None, width):
+            validate_beam_batch_request(
+                _request(beam_params=_params(beam_width=width, candidate_width=candidate_width))
+            )
 
-    ``MAX_BEAM_WIDTH`` (1024) is higher than ``MAX_CANDIDATE_WIDTH`` (256).  An
-    unset K implies the candidate count at the Beam width, which the operators
-    cannot take, so the request is rejected here rather than at the first
-    workspace lookup.  Stating K independently makes the wide Beam valid.
-    """
-    assert MAX_BEAM_WIDTH > MAX_CANDIDATE_WIDTH
-
-    validate_beam_batch_request(_request(beam_params=_params(beam_width=MAX_CANDIDATE_WIDTH)))
-    with pytest.raises(BeamContractError, match="candidate_width is unset"):
-        validate_beam_batch_request(
-            _request(beam_params=_params(beam_width=MAX_CANDIDATE_WIDTH + 1))
-        )
-    with pytest.raises(BeamContractError, match="candidate_width is unset"):
-        validate_beam_batch_request(_request(beam_params=_params(beam_width=512)))
-
-    # Stating K lifts the restriction: a wide Beam with a legal K is admitted.
+    # Independent K remains supported.
     validate_beam_batch_request(
         _request(
             beam_params=_params(beam_width=512, candidate_width=MAX_CANDIDATE_WIDTH),
@@ -346,7 +383,7 @@ def test_explicit_candidate_width_may_differ_from_the_beam_width() -> None:
     # K still has its own operator ceiling.
     with pytest.raises(BeamContractError, match="candidate_width must be <="):
         validate_beam_batch_request(
-            _request(beam_params=_params(beam_width=512, candidate_width=1024))
+            _request(beam_params=_params(beam_width=512, candidate_width=MAX_CANDIDATE_WIDTH + 1))
         )
 
 

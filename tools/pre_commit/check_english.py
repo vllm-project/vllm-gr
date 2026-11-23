@@ -21,9 +21,7 @@ EXCEPT_STRING = "█—▀▄–📚🎉✅❌💡🙏🚀🐛⚠️⚡✗🛠�
 EXCEPT_PATHS = [
     "benchmarks/open_one_rec",
     "trc",
-    "docs/quickstart.md",
-    "docs/hot_update_tests.zh-CN.md",
-    "docs/weight_update_sidecar_design.zh-CN.md",
+    "docs/getting_started/installation/gpu.md",
     "tests/resources/single_one_rec_prompt.txt",
 ]
 

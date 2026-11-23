@@ -11,11 +11,23 @@ class InvalidBackendProviderError(BackendRegistryError):
     pass
 
 
+class InvalidBackendVersionError(BackendRegistryError):
+    pass
+
+
 class DuplicateBackendRegistrationError(BackendRegistryError):
     pass
 
 
 class UnsupportedBackendError(BackendRegistryError):
+    pass
+
+
+class AmbiguousBackendError(BackendRegistryError):
+    pass
+
+
+class IncompatibleBackendError(BackendRegistryError):
     pass
 
 
@@ -25,3 +37,7 @@ class BackendNotActiveError(BackendRegistryError):
 
 class BackendAlreadyActiveError(BackendRegistryError):
     pass
+
+
+class GRDeviceRequestError(ValueError):
+    """A request cannot run on an otherwise supported device configuration."""

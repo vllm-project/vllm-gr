@@ -13,10 +13,12 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import regex as re
 from tqdm import tqdm
 
+from benchmarks.open_one_rec.base_evaluator import EvaluationError
 from benchmarks.open_one_rec.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,10 @@ def extract_json_from_response(response: str) -> Optional[Dict]:
         return None
 
 
+def _valid_sample_score(score: Any) -> bool:
+    return type(score) is int and 1 <= score <= 5
+
+
 def evaluate_single(
     gt_reasoning: str, model_reasoning: str, llm_client
 ) -> Tuple[Optional[Dict], Optional[str]]:
@@ -119,11 +125,10 @@ def evaluate_single(
         response = llm_client.generate(prompt)
         result = extract_json_from_response(response)
 
-        if result is not None and "llm_score" in result:
-            # Ensure score is in valid range
+        if isinstance(result, dict) and "llm_score" in result:
             score = result["llm_score"]
-            if not isinstance(score, (int, float)) or score < 1 or score > 5:
-                result["llm_score"] = 3  # Default to middle score if invalid
+            if not _valid_sample_score(score):
+                return None, f"Invalid Judge score: {score!r}; expected an integer in [1, 5]"
             return result, None
 
         return None, f"Failed to parse JSON or missing 'llm_score': {response[:100]}"
@@ -155,9 +160,7 @@ def evaluate_batch(
     results = {}
     errors = {}
 
-    # Only evaluate samples that have both GT and model reasoning
-    common_ids = set(gt_reasonings.keys()) & set(model_reasonings.keys())
-    common_ids = {id for id in common_ids if gt_reasonings[id] and model_reasonings[id]}
+    common_ids = gt_reasonings.keys() & model_reasonings.keys()
 
     def process_single(sample_id: str):
         gt = gt_reasonings[sample_id]
@@ -197,26 +200,22 @@ def calculate_metrics(eval_results: Dict[str, Dict]) -> Dict[str, Any]:
     if not eval_results:
         return {}
 
-    # Collect scores
     scores = []
     for sample_id, result in eval_results.items():
-        if "llm_score" in result:
-            score = result["llm_score"]
-            if isinstance(score, (int, float)) and 1 <= score <= 5:
-                scores.append(score)
+        score = result.get("llm_score")
+        if not _valid_sample_score(score):
+            raise EvaluationError(
+                f"{sample_id}: Invalid Judge score: {score!r}; expected an integer in [1, 5]"
+            )
+        scores.append(score)
 
-    metrics = {}
-
-    if scores:
-        # micro and macro are the same for single score
-        avg_score = sum(scores) / len(scores)
-        metrics["micro_llm_score"] = avg_score
-        metrics["macro_llm_score"] = avg_score
-        metrics["llm_score"] = avg_score
-
-    metrics["llm_eval_num_samples"] = len(eval_results)
-
-    return metrics
+    avg_score = sum(scores) / len(scores)
+    return {
+        "micro_llm_score": avg_score,
+        "macro_llm_score": avg_score,
+        "llm_score": avg_score,
+        "llm_eval_num_samples": len(scores),
+    }
 
 
 def get_per_sample_metrics(eval_results: Dict[str, Dict]) -> Dict[str, Dict[str, Any]]:
@@ -246,39 +245,8 @@ def get_per_sample_metrics(eval_results: Dict[str, Dict]) -> Dict[str, Dict[str,
 
 
 def get_cache_path(save_dir: str, model_name: str) -> str:
-    """Get the path for evaluation results cache file."""
-    return os.path.join(save_dir, f"llm_eval_{model_name}.json")
-
-
-def load_eval_cache(cache_path: str) -> Optional[Dict[str, Dict]]:
-    """
-    Load evaluation results from cache.
-
-    Args:
-        cache_path: Path to cache file
-
-    Returns:
-        Dict of {sample_id: evaluation_result} or None if not found
-    """
-    if not os.path.exists(cache_path):
-        return None
-
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Extract evaluation results
-        eval_results = {}
-        for sample_id, sample_data in data.items():
-            if "eval_result" in sample_data and sample_data["eval_result"]:
-                eval_results[sample_id] = sample_data["eval_result"]
-
-        logger.info(f"Loaded {len(eval_results)} cached evaluation results")
-        return eval_results
-
-    except Exception as e:
-        logger.info(f"Failed to load evaluation cache: {e}")
-        return None
+    """Get the diagnostic path with the model name encoded as one filename."""
+    return os.path.join(save_dir, f"llm_eval_{quote(model_name, safe='')}.json")
 
 
 def save_eval_results(
@@ -352,45 +320,31 @@ def evaluate_reasoning(
         sample_ids = all_sample_ids
         logger.info(f"Evaluating all {len(sample_ids)} samples")
 
-    # Extract refined reasoning from both GT and model outputs
+    if not sample_ids:
+        raise EvaluationError("Recommendation-reason Judge produced zero valid scores")
+
     logger.info("Extracting refined reasoning...")
     gt_reasonings = {}
     model_reasonings = {}
-
     for sample_id in sample_ids:
-        # Extract from reference (GT)
-        gt_text = references.get(sample_id, "")
-        gt_reasonings[sample_id] = extract_refined_reasoning(gt_text)
+        reference = extract_refined_reasoning(references[sample_id])
+        prediction = extract_refined_reasoning(extract_after_think(predictions[sample_id]))
+        if not reference:
+            raise EvaluationError(f"{sample_id}: empty reference for recommendation-reason Judge")
+        if not prediction:
+            raise EvaluationError(f"{sample_id}: empty prediction for recommendation-reason Judge")
+        gt_reasonings[sample_id] = reference
+        model_reasonings[sample_id] = prediction
 
-        # Extract from prediction (model output)
-        pred_text = predictions.get(sample_id, "")
-        pred_text = extract_after_think(pred_text)  # Remove  comprehend tags first
-        model_reasonings[sample_id] = extract_refined_reasoning(pred_text)
-
-    # Load cached results if available
-    eval_results = {}
-    if save_dir:
-        cache_path = get_cache_path(save_dir, model_name)
-        cached_results = load_eval_cache(cache_path)
-        if cached_results:
-            eval_results = {k: v for k, v in cached_results.items() if k in sample_ids}
-
-    # Find samples that need evaluation
-    missing_ids = set(sample_ids) - set(eval_results.keys())
-    missing_ids = {id for id in missing_ids if gt_reasonings.get(id) and model_reasonings.get(id)}
-
-    if missing_ids:
-        logger.info(f"Evaluating {len(missing_ids)} samples with LLM...")
-        missing_gt = {id: gt_reasonings[id] for id in missing_ids}
-        missing_model = {id: model_reasonings[id] for id in missing_ids}
-
-        new_results, errors = evaluate_batch(missing_gt, missing_model, llm_client, max_workers)
-        eval_results.update(new_results)
-
-        if errors:
-            logger.info(f"Evaluation errors: {len(errors)} samples")
-    else:
-        logger.info(f"All {len(sample_ids)} samples already evaluated (from cache)")
+    # Previous score files contain diagnostics only. Sample IDs do not identify
+    # the prediction or reference used in an earlier run.
+    eval_results, errors = evaluate_batch(gt_reasonings, model_reasonings, llm_client, max_workers)
+    if missing_scores := [sample_id for sample_id in sample_ids if sample_id not in eval_results]:
+        sample_id = missing_scores[0]
+        reason = errors.get(sample_id, "missing Judge score")
+        raise EvaluationError(
+            f"Judge failed for {len(missing_scores)} sample(s); {sample_id}: {reason}"
+        )
 
     # Calculate metrics
     metrics = calculate_metrics(eval_results)

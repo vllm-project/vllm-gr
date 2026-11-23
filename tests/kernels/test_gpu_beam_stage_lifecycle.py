@@ -19,10 +19,9 @@ from tests.kernels.beam_stage_test_utils import (
     runtime,
 )
 from tests.kernels.v2_input_test_utils import make_native_v2_worker
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GR_STAGE_OUTPUT_ATTR,
-    GR_WORKER_RESULT_ATTR,
-)
+from vllm_gr.config import GRConfig
+from vllm_gr.config.models import DeploymentOptions
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR, GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import AsyncGPUBeamOutput
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
@@ -192,6 +191,11 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
     warm_stage_kernels(dtype)
     owner = runtime(dtype)
     worker = owner.worker
+    GRConfig(
+        beam_max_width=4,
+        beam_graph_enabled=graph,
+        deployment=DeploymentOptions(beam_batch_sizes=(1,)),
+    ).write_to_vllm_config(worker.vllm_config)
     pinned = torch.zeros(1, pin_memory=True, dtype=torch.int32)
     copied = torch.empty(1, device="cuda", dtype=torch.int32)
     positions = torch.empty(7, device="cuda", dtype=torch.int64)
@@ -252,8 +256,6 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
     if graph:
         worker.device = owner.beam.state.device
         worker._beam_context = owner.beam.session.context
-        worker.vllm_config = SimpleNamespace()
-        worker._vllm_gr_config = SimpleNamespace(beam_max_width=4)
         install_decode_model(worker, lambda ids, pos: decode_logits + ids[:, None].to(dtype))
         owner.prepared = owner.prepare_cpu(metadata(1), 0)
         owner._bind_attention(metadata(1))
@@ -262,10 +264,6 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
     monkeypatch.setattr(
         "vllm.v1.worker.gpu_model_runner.get_pp_group",
         lambda: SimpleNamespace(is_last_rank=True),
-    )
-    monkeypatch.setattr(
-        "vllm_gr.v1.worker.gr_context._get_gr_config",
-        lambda _: SimpleNamespace(beam_graph_enabled=graph),
     )
 
     def update(scheduled):

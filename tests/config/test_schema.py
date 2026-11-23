@@ -9,13 +9,11 @@ import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, dataclass, field
-from types import SimpleNamespace
 
 import pytest
 
 from vllm_gr.config import (
-    ConstraintBackend,
-    ConstraintTableConfig,
+    ConstraintTableSpec,
     GRConfig,
     gr_config_from_mapping,
     validation,
@@ -25,7 +23,7 @@ from vllm_gr.config.schema import ConfigFieldSpec, config_default, config_fields
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
 
-@pytest.mark.parametrize("source", ["python", "legacy", "canonical"])  # type: ignore[misc]
+@pytest.mark.parametrize("source", ["python", "canonical"])  # type: ignore[misc]
 def test_field_validation_runs_once_at_each_ingress(
     monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
@@ -39,27 +37,22 @@ def test_field_validation_runs_once_at_each_ingress(
     monkeypatch.setattr(validation, "validate_beam_max_width", record)
     if source == "python":
         config = GRConfig(beam_max_width=32)
-    elif source == "legacy":
-        config = GRConfig.from_vllm_config(
-            SimpleNamespace(additional_config={"vllm_gr_beam_max_width": 32})
-        )
     else:
         config = gr_config_from_mapping(
-            {"schema_version": 1, "beam": {"max_width": 32}, "constraint_table": {"max_top_k": 32}}
+            {"gr": {"beam_width": [32] * 3, "candidate_width": [32] * 3}}
         )
     assert config.beam_max_width == 32
     assert calls == [32]
 
 
 def test_existing_positional_constructor_and_frozen_slots_contract() -> None:
-    config = GRConfig("catalog.json", ConstraintBackend.TRIE, None, None, None, False, 16, 2)
-    assert config.catalog_path == "catalog.json"
+    config = GRConfig(None, False, 16, 2)
     assert config.beam_max_width == 16
     assert config.beam_max_decode_steps == 2
     assert not config.beam_graph_active
     with pytest.raises(FrozenInstanceError):
         setattr(config, "beam_max_width", 32)
-    table = ConstraintTableConfig(32)
+    table = ConstraintTableSpec(max_top_k=32)
     assert table.max_top_k == 32
     assert not hasattr(table, "__dict__")
 
@@ -110,7 +103,7 @@ def test_default_factory_values_are_not_shared() -> None:
     class FactoryConfig:
         sizes: list[int] = field(
             default_factory=list,
-            metadata={"gr": ConfigFieldSpec("validate_beam_online_batch_sizes")},
+            metadata={"gr": ConfigFieldSpec("validate_beam_graph_widths")},
         )
 
     first = config_default(FactoryConfig, "sizes")

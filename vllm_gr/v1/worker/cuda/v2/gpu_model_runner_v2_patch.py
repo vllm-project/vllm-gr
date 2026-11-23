@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""ModelRunner V2 GPU wrappers for beam_search_v1 (persistent GR stage path).
+"""ModelRunner V2 GPU wrappers for beam_search (persistent GR stage path).
 
 The V2 runner (``vllm.v1.worker.gpu.model_runner.GPUModelRunner``) replaces the
 V1 ``_prepare_inputs``/``_bookkeeping_sync``/``_sample`` trio with
 ``prepare_inputs``/``sample``/``sample_tokens`` and a mutable ``InputBatch``
-dataclass.  Under V2 the beam surface is the beam_search_v1 persistent GR
-stage path (``execution_mode=v1``); the LEGACY ``beam_data`` frame stack has
+dataclass.  Under V2 the beam surface is the beam_search persistent GR
+stage path; the LEGACY ``beam_data`` frame stack has
 been removed, so this module installs only the slim hook set:
 
 - ``execute_model``: the local slim wrapper (retirement/stage dispatch and
@@ -42,6 +42,7 @@ from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
     _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
     make_load_model_with_beam_postprocess_workspace,
 )
+from vllm_gr.v1.worker.cuda.runner_installer import V2_RUNNER
 from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_resources as v2_resources
 from vllm_gr.v1.worker.cuda.v2.gpu_prefill_v2 import (
     try_add_gr_prefill_requests,
@@ -100,7 +101,7 @@ def discover_worker_runners() -> tuple[tuple[str, type[Any]], ...]:
 def make_patched_execute_model_v2(
     _orig_execute_model: Callable[..., Any],
 ) -> Callable[..., Any]:
-    """Slim execute_model wrapper for the V2 ModelRunner (beam_search_v1 only).
+    """Slim execute_model wrapper for the V2 ModelRunner (beam_search only).
 
     Refactor design §4.2: under V2 the beam surface is the persistent GR
     stage path; the LEGACY ``beam_data`` frame stack (M1 remap / M2 inline
@@ -111,7 +112,7 @@ def make_patched_execute_model_v2(
     - FAILS FAST on a ``beam_data`` frame — the historical alternative was a
       silent wrong-beam-results mode when the V1/V2 flag resolved differently
       than the patch layer assumed (ISSUES §1.1); a loud error names both
-      remediations (execution_mode=v1, or unset the V2 flag);
+      remediations (configure gr.beam_width, or unset the V2 flag);
 
     Everything else is the untouched native ``execute_model``.
     """
@@ -142,7 +143,7 @@ def make_patched_execute_model_v2(
         if getattr(scheduler_output, "beam_data", {}):
             raise ValueError(
                 "legacy beam_data frames are not supported under ModelRunnerV2; "
-                "use beam.execution_mode='v1' or unset VLLM_USE_V2_MODEL_RUNNER"
+                "configure gr.beam_width or unset VLLM_USE_V2_MODEL_RUNNER"
             )
 
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)
@@ -172,7 +173,7 @@ def make_patched_sample_tokens_v2(
 
     @wraps(_orig_sample_tokens)
     def patched_sample_tokens(self: Any, grammar_output: Any, *args: Any, **kwargs: Any) -> Any:
-        # Persistent GR stage execution (beam_search_v1 contract): the stage
+        # Persistent GR stage execution (beam_search contract): the stage
         # runner produced the dispatch's outputs on the compute stream and
         # owns the async D2H; bypass the native sampler entirely (V1 parity
         # with make_patched_sample_tokens_gpu).
@@ -286,7 +287,7 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
     @wraps(_orig_capture_model)
     def patched_capture_model(self: Any, *args: Any, **kwargs: Any) -> Any:
         profile_only = kwargs.get("profile_only", False)
-        # The Engine admits only beam_search_v1 for V2 Beam engines. The
+        # The Engine admits only beam_search for V2 Beam engines. The
         # execution layer checks whether Beam is enabled, not its protocol.
         if _get_gr_config(self).beam_max_width is not None:
             from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
@@ -354,15 +355,14 @@ def _apply_v2_runner_patches() -> None:
     Backend load wrapper last, so the final ``load_model`` carries the
     constraint marker that the V2 validation gate checks.
     """
-    runners_to_patch = [
-        (runner_name, runner_class)
-        for runner_name, runner_class in discover_worker_runners()
-        if not is_worker_runner_v2_patched(runner_class)
-    ]
+    from vllm_gr.v1.worker.runner_binding import bind_after_model_load
+    from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
-    for runner_name, runner_type in runners_to_patch:
-        # Native classes expose dynamically patched methods outside this boundary.
+    for runner_name, runner_type in discover_worker_runners():
         runner_class = cast(Any, runner_type)
+        if is_worker_runner_v2_patched(runner_class):
+            install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
+            continue
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(
             load_model, _BEAM_POSTPROCESS_LOAD_PATCH_MARKER, False
@@ -374,7 +374,6 @@ def _apply_v2_runner_patches() -> None:
             runner_class.load_model = make_load_model_with_constraint_backend(
                 load_model,
                 max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
-                close_runtime=v2_resources.close_v2_runtime,
                 prepare_backend=_warmup_constraint_backend,
             )
 
@@ -408,11 +407,33 @@ def _apply_v2_runner_patches() -> None:
                 profile_cudagraph_memory
             )
 
+        runner_class.load_model = bind_after_model_load(
+            runner_class.load_model, close_runtime=v2_resources.close_v2_runtime
+        )
+        install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
         logger.info("%s V2 hooks patched successfully.", runner_name)
+
+
+def install() -> None:
+    """Install shared CUDA Worker utilities before patching the V2 runner."""
+    from vllm_gr.v1.worker.cuda.runner_installer import install_worker_hooks
+
+    install_worker_hooks()
+    _apply_v2_runner_patches()
+
+
+def is_patched(runner_class: type) -> bool:
+    from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle
+
+    return is_worker_runner_v2_patched(runner_class) and has_runner_lifecycle(
+        runner_class, V2_RUNNER
+    )
 
 
 __all__ = [
     "_apply_v2_runner_patches",
+    "install",
+    "is_patched",
     "discover_worker_runners",
     "make_patched_execute_model_v2",
     "make_patched_add_requests_v2",

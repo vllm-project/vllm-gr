@@ -6,10 +6,8 @@ from typing import Any
 
 _WORKER_EXECUTE_PATCH_MARKER = "_vllm_gr_beam_execute_patch"
 _WORKER_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_patch"
-_WORKER_BOOKKEEPING_PATCH_MARKER = "_vllm_gr_beam_bookkeeping_patch"
 # Optional: only installed when the runner exposes ``_sample`` (NPU builds may
 # not).  is_worker_runner_patched() deliberately does not require it.
-_WORKER_SAMPLE_PATCH_MARKER = "_vllm_gr_beam_sample_patch"
 _WORKER_SAMPLE_TOKENS_PATCH_MARKER = "_vllm_gr_beam_sample_tokens_patch"
 _WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
 _WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
@@ -39,7 +37,7 @@ def is_worker_runner_v2_patched(runner_class: Any) -> bool:
     ``sample_tokens`` instead of the V1 ``_bookkeeping_sync`` surface. The
     required V2 method set is the slim ``execute_model`` and ``sample_tokens``
     stage bypass plus the canonical Constraint Backend load/shutdown markers.
-    Native ``sample`` remains untouched: V2 supports only beam_search_v1,
+    Native ``sample`` remains untouched: V2 supports only beam_search,
     whose stage runner owns constrained sampling. The optional ``prepare_inputs``
     specialization preserves the native InputBatch contract. ``add_requests``
     optionally skips unused sampler state for admitted GR Prefill;
@@ -74,8 +72,7 @@ def is_worker_runner_patched(runner_class: Any) -> bool:
         getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)
         and getattr(runner_class._prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False)
         and (
-            getattr(runner_class._bookkeeping_sync, _WORKER_BOOKKEEPING_PATCH_MARKER, False)
-            or runner_class._bookkeeping_sync
+            runner_class._bookkeeping_sync
             is getattr(runner_class, "_vllm_gr_native_bookkeeping", None)
         )
         and (

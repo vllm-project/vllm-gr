@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_fused
 from vllm_gr.ops.cuda.beam_selection import (
     allocate_beam_selection_scratch,
     beam_search_group_cuda,
@@ -20,10 +21,7 @@ from vllm_gr.ops.onerec_decode import (
     _beam_search_group_torch,
     beam_search_group,
 )
-from vllm_gr.v1.attention.backends.beam_kernels import (
-    select_unshared_kv,
-    select_unshared_kv_fused,
-)
+from vllm_gr.v1.beam.reorder import select_unshared_kv
 
 # pytest parametrization decorators are untyped under strict mypy.
 # mypy: disable-error-code="misc"

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from vllm_gr.pangu_compat import (
+from vllm_gr.config.pangu_patch import (
     _PATCH_MARKER,
     _make_patched_maybe_untie,
     apply_pangu_tied_embeddings_patch,

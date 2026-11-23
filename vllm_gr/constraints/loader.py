@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -16,9 +15,10 @@ import torch
 from numpy.typing import NDArray
 
 from vllm_gr.config.models import (
-    MAX_CANDIDATE_WIDTH,
+    DEFAULT_DEPLOYMENT,
+    MAX_CONSTRAINT_CANDIDATE_WIDTH,
     ConstraintTableBackendEnum,
-    ConstraintTableConfig,
+    ConstraintTableSpec,
 )
 from vllm_gr.constraints.artifact import load_constraint_table_artifact
 from vllm_gr.constraints.backend import (
@@ -30,8 +30,11 @@ from vllm_gr.constraints.backend import (
 from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
-from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab, build_npu_stage_vocab
-from vllm_gr.constraints.npu_tables import npu_trie_arrays
+from vllm_gr.constraints.npu_tables import (
+    NPUStageVocab,
+    build_npu_stage_vocab,
+    npu_trie_arrays,
+)
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
@@ -206,6 +209,7 @@ def _upload_npu_backend(
     max_top_k: int,
     max_rows: int,
     enable_npu_stage_vocab: bool = False,
+    stage_lm_head: bool = DEFAULT_DEPLOYMENT.npu_stage_lm_head,
 ) -> tuple[NPUConstraintBackend, tuple[_ReadyCase, ...]]:
     cases = tuple(
         case
@@ -227,7 +231,7 @@ def _upload_npu_backend(
             trie_tables.append(
                 tuple(upload(array, device) for array in npu_trie_arrays(table, trie_id))
             )
-        if enable_npu_stage_vocab and os.environ.get("VLLM_GR_NPU_STAGE_LM_HEAD", "1") == "1":
+        if enable_npu_stage_vocab and stage_lm_head:
             stage_vocab = build_npu_stage_vocab(table, device, upload)
             if stage_vocab is not None:
                 device_tables.update(stage_vocab.owned_tensors())
@@ -570,18 +574,24 @@ def _run_npu_readiness(
 
 
 def load_constraint_backend(
-    config: ConstraintTableConfig,
+    config: ConstraintTableSpec,
     *,
     device: torch.device,
     vocab_size: int,
     dtype: torch.dtype,
     max_rows: int,
     enable_npu_stage_vocab: bool = False,
+    stage_lm_head: bool = DEFAULT_DEPLOYMENT.npu_stage_lm_head,
 ) -> ConstraintBackend | None:
     """Load exactly one independent Backend, or return ``None`` when disabled."""
 
     if not config.enabled:
         return None
+    backend_kind = (
+        ConstraintTableBackendEnum.CUDA
+        if config.backend is ConstraintTableBackendEnum.AUTO
+        else config.backend
+    )
     _validate_loader_inputs(
         device=device,
         vocab_size=vocab_size,
@@ -591,22 +601,22 @@ def load_constraint_backend(
     if config.path is None or config.artifact_digest is None or config.tokenizer_digest is None:
         raise ValueError("enabled constraint table configuration is incomplete")
 
+    max_top_k = config.max_top_k
+    assert max_top_k is not None
     op: NPUConstraintOp | None = None
-    if config.backend is ConstraintTableBackendEnum.CUDA:
-        if config.max_top_k > MAX_CANDIDATE_WIDTH:
+    if backend_kind is ConstraintTableBackendEnum.CUDA:
+        if max_top_k > MAX_CONSTRAINT_CANDIDATE_WIDTH:
             raise ValueError(
-                f"CUDA constraint max_top_k must be <= {MAX_CANDIDATE_WIDTH}, "
-                f"got {config.max_top_k}"
+                f"CUDA constraint max_top_k must be <= {MAX_CONSTRAINT_CANDIDATE_WIDTH}, "
+                f"got {max_top_k}"
             )
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(f"CUDA constraint logits must be fp16/bf16, got {dtype}")
         if device.type != "cuda":
             raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
-    if config.backend is ConstraintTableBackendEnum.NPU:
-        if config.max_top_k > MAX_TOP_K:
-            raise ValueError(
-                f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {config.max_top_k}"
-            )
+    if backend_kind is ConstraintTableBackendEnum.NPU:
+        if max_top_k > MAX_TOP_K:
+            raise ValueError(f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {max_top_k}")
         if device.type != "npu":
             raise RuntimeError(f"NPU constraint backend requires an NPU device, got {device}")
         op = resolve_rec_constrained_topk_npu()
@@ -618,21 +628,21 @@ def load_constraint_backend(
         expected_vocab_size=vocab_size,
         expected_format=config.format,
     )
-    if config.backend is ConstraintTableBackendEnum.CPU:
+    if backend_kind is ConstraintTableBackendEnum.CPU:
         info = _backend_info(
             table,
             backend=ConstraintTableBackendEnum.CPU,
-            max_top_k=config.max_top_k,
+            max_top_k=max_top_k,
             max_rows=max_rows,
             host_memory_bytes=table.total_bytes,
             device_memory_bytes=0,
         )
         return CPUConstraintBackend(table, info)
-    if config.backend is ConstraintTableBackendEnum.CUDA:
+    if backend_kind is ConstraintTableBackendEnum.CUDA:
         backend, cases = _upload_cuda_backend(
             table,
             device=device,
-            max_top_k=config.max_top_k,
+            max_top_k=max_top_k,
             max_rows=max_rows,
         )
         del table
@@ -649,33 +659,34 @@ def load_constraint_backend(
         except BaseException:
             backend.close()
             raise
-    if config.backend is not ConstraintTableBackendEnum.NPU or op is None:
-        raise RuntimeError(f"unsupported constraint table backend {config.backend!r}")
+    if backend_kind is not ConstraintTableBackendEnum.NPU or op is None:
+        raise RuntimeError(f"unsupported constraint table backend {backend_kind!r}")
 
     _reject_unsupported_last_vocab_prefix(table)
-    backend, cases = _upload_npu_backend(
+    npu_backend, cases = _upload_npu_backend(
         table,
         device=device,
         op=op,
-        max_top_k=config.max_top_k,
+        max_top_k=max_top_k,
         max_rows=max_rows,
         enable_npu_stage_vocab=enable_npu_stage_vocab,
+        stage_lm_head=stage_lm_head,
     )
     # Each root's readiness case retains only bounded Python token tuples,
     # never NumPy views. Drop the full Host table before launching readiness.
     del table
     try:
         _run_npu_readiness(
-            backend,
+            npu_backend,
             cases=cases,
             device=device,
             dtype=dtype,
             max_rows=max_rows,
         )
-        backend._mark_ready()  # noqa: SLF001
-        return backend
+        npu_backend._mark_ready()  # noqa: SLF001
+        return npu_backend
     except BaseException:
-        backend.close()
+        npu_backend.close()
         raise
 
 

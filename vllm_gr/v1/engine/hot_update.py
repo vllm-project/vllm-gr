@@ -12,7 +12,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from vllm_gr.config import BeamExecutionMode, GRConfig
+from vllm_gr.config import GRConfig
+from vllm_gr.config.models import runtime_constraint_table
 from vllm_gr.constraints.versioned_table import INITIAL_CONSTRAINT_VERSION
 from vllm_gr.update_status import ServiceState, ServiceStatus
 
@@ -22,7 +23,7 @@ def _resources(core: Any) -> dict[str, tuple[str | None, str | None]]:
     resources = getattr(core, "_gr_serving_resources", None)
     if resources is None:
         model = str(core.vllm_config.model_config.model)
-        table = GRConfig.from_vllm_config(core.vllm_config).constraint_table
+        table = runtime_constraint_table(GRConfig.from_vllm_config(core.vllm_config))
         path = table.path if table and table.enabled else None
         resources = core._gr_serving_resources = {
             "checkpoint": (Path(model).name, model),
@@ -84,9 +85,9 @@ def resume(core: Any) -> Any:
 def _reload_trie(core: Any, path: str, version: str) -> dict[str, Any]:
     _validate_target(path, version)
     config = GRConfig.from_vllm_config(core.vllm_config)
-    if config.beam_execution_mode is not BeamExecutionMode.V1:
-        raise ValueError("Online Trie reload requires beam_search_v1 execution")
-    table = config.constraint_table
+    if config.beam_max_width is None:
+        raise ValueError("Online Trie reload requires beam_search execution")
+    table = runtime_constraint_table(config)
     if table is None or not table.enabled:
         raise ValueError("Online Trie reload requires an enabled canonical constraint table")
     if table.backend.value != "cuda":

@@ -11,9 +11,10 @@ Functions for PID extraction and recommendation metrics computation using PIDs.
 import json
 import logging
 import random
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+import regex as re
 
 logger = logging.getLogger(__name__)
 
@@ -309,86 +310,6 @@ def compute_recall_at_k(predicted_ids: List[int], ground_truth_ids: Set[int], k:
     recall = hit_count / len(ground_truth_ids)
 
     return recall
-
-
-def get_unique_generations(
-    generations: List[str],
-    max_count: int,
-    code_to_pid: Dict[int, List[Dict[str, int]]],
-    strategy: str = "most_popular_originally",
-    logprobs: List[float] = None,
-    exclude_ids: Set[int] = None,
-    sources: List[str] = None,
-):
-    """
-    Get first N unique PIDs from generations, optionally sorted by logprobs
-
-    This function extracts unique PIDs, optionally sorting by logprobs first.
-    Useful for merging results from multiple generation runs.
-
-    Args:
-        generations: List of model generation strings containing SID patterns
-        max_count: Maximum number of unique PIDs to return
-        code_to_pid: Mapping dictionary {encoded_sid: [{"pid": pid, "count": ..., "count_after_downsample": ...}, ...]}
-        strategy: Strategy for selecting PID ("most_popular_originally", "most_popular_after_downsampling", or "random")
-        logprobs: Optional list of log probabilities (same length as generations)
-        exclude_ids: Optional set of PIDs to exclude from results
-        sources: Optional list of source labels (same length as generations)
-
-    Returns:
-        List of unique PIDs (up to max_count), sorted by logprobs if provided
-        If sources provided, returns tuple (List[int], List[str]) of (unique_pids, corresponding_sources)
-    """
-    # Track sources if provided
-    track_sources = sources is not None and len(sources) == len(generations)
-
-    # If logprobs provided, sort generations by logprobs (descending)
-    if logprobs is not None and len(logprobs) == len(generations):
-        # Create tuples and sort by logprob (descending)
-        if track_sources:
-            gen_data = list(zip(generations, logprobs, sources))
-            gen_data.sort(key=lambda x: x[1], reverse=True)
-            sorted_generations = [gen for gen, _, _ in gen_data]
-            sorted_sources = [src for _, _, src in gen_data]
-        else:
-            gen_logprob_pairs = list(zip(generations, logprobs))
-            gen_logprob_pairs.sort(key=lambda x: x[1], reverse=True)
-            sorted_generations = [gen for gen, _ in gen_logprob_pairs]
-            sorted_sources = None
-    else:
-        sorted_generations = generations
-        sorted_sources = sources if track_sources else None
-
-    seen = set()
-    unique_pids = []
-    unique_sources = [] if track_sources else None
-    exclude = exclude_ids or set()
-
-    for i, gen in enumerate(sorted_generations):
-        # Skip empty strings
-        if not gen or not gen.strip():
-            continue
-
-        # Extract PID from generation text
-        pid = extract_id_from_generation(gen, code_to_pid, strategy)
-
-        # Skip if PID is 0 (not found), already seen, or in exclude list
-        if pid == 0 or pid in seen or pid in exclude:
-            continue
-
-        unique_pids.append(pid)
-        seen.add(pid)
-
-        if track_sources:
-            unique_sources.append(sorted_sources[i])
-
-        # Stop if we've collected enough unique PIDs
-        if len(unique_pids) >= max_count:
-            break
-
-    if track_sources:
-        return unique_pids, unique_sources
-    return unique_pids
 
 
 def get_debug_info(

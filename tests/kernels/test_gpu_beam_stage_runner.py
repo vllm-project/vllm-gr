@@ -9,7 +9,6 @@ import subprocess
 import sys
 from abc import abstractmethod
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -19,6 +18,8 @@ import pytest
 import torch
 from torch.cuda.streams import Event as CUDAEvent
 
+from tests.helpers.beam_requests import make_batch_request
+from tests.helpers.paths import REPO_ROOT
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
@@ -26,18 +27,15 @@ from tests.kernels.beam_stage_test_utils import (
     prepare_binding,
     runtime,
 )
-from tests.test_gr_async_scheduler import _batch_request
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
     cache_unshared_kv_graph,
     copy_suffix_kv_graph,
 )
-from vllm_gr.v1.engine.beam_search_v1 import (
-    GRDeviceStateRef,
-)
-from vllm_gr.v1.engine.gr_async_scheduler import (
+from vllm_gr.v1.beam.dispatch import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
+    GRDeviceStateRef,
 )
 from vllm_gr.v1.worker import gr_context as _gr_context
 from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
@@ -387,7 +385,7 @@ def test_native_identity_and_extent_rejected_before_admission():
 def test_session_init_binding_rejected_before_writes(fault):
     owner = runtime()
     m = metadata()
-    request = _batch_request()
+    request = make_batch_request()
     request.items[0].request.prompt_token_ids = np.full(m.num_prompt_tokens, 1, dtype=np.int64)
     request = msgspec.structs.replace(request, beam_params=m.beam_params)
     if fault == "protocol":
@@ -792,16 +790,11 @@ def test_head_logits_buffers_are_allocated_lazily_per_mode() -> None:
 
 
 @pytest.mark.parametrize("runner_version", ["v1", "v2"])
-@pytest.mark.parametrize("slice_setting", [None, "0", "off", "auto", "16384"])
+@pytest.mark.parametrize("slice_setting", [0, "auto", 16384])
 def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version, slice_setting):
     from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stage_runner
     from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
-    monkeypatch.setenv("VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT", "transposed")
-    if slice_setting is None:
-        monkeypatch.delenv("VLLM_GR_HEAD_SLICE", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_GR_HEAD_SLICE", slice_setting)
     # Isolate the head-allocation boundary from V2's native input storage.
     monkeypatch.setattr(
         CudaStageHooksV2,
@@ -813,9 +806,10 @@ def test_transposed_head_allocation_requires_slicing(monkeypatch, runner_version
     monkeypatch.setattr(stage_runner, "_get_unconstrained_head_layout", get_layout)
     owner = runtime(
         unconstrained=True,
+        gr_options={"unconstrained_head_layout": "transposed", "head_slice": slice_setting},
         hooks_cls=CudaStageHooksV2 if runner_version == "v2" else CudaStageHooksV1,
     )
-    if slice_setting in (None, "0", "off"):
+    if slice_setting == 0:
         get_layout.assert_not_called()
         assert owner._head_layout is None
         assert owner._head_slice_request == 0
@@ -885,7 +879,7 @@ def test_sliced_head_non_divisible_vocab_peak_allocation():
     )
     result = subprocess.run(
         [sys.executable, "-c", command],
-        cwd=Path(__file__).resolve().parents[2],
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         timeout=120,

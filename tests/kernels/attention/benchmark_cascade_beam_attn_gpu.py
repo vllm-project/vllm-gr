@@ -8,8 +8,8 @@ by pytest (the project's pre-commit hook runs `pytest --run-slow tests`,
 which would otherwise execute it as an ordinary test on every commit).
 
 Run directly, e.g.:
-    python benchmark_cascade_beam_attn_gpu.py
-    python benchmark_cascade_beam_attn_gpu.py --iter-num 200 --beam-widths 16 32 128
+    python -m tests.kernels.attention.benchmark_cascade_beam_attn_gpu
+    python -m tests.kernels.attention.benchmark_cascade_beam_attn_gpu --iter-num 200 --beam-widths 16 32 128
 """
 
 from __future__ import annotations
@@ -18,13 +18,14 @@ import argparse
 import itertools
 
 import torch
-from cascade_beam_attn_utils import (
+from vllm.utils.torch_utils import set_random_seed
+
+from tests.kernels.attention.cascade_beam_attn_utils import (
     NUM_HEADS,
     build_beam_attn_metadata,
     prepare_inputs,
     run_cascade_beam_attention,
 )
-from vllm.utils.torch_utils import set_random_seed
 
 try:
     from vllm.vllm_flash_attn import (

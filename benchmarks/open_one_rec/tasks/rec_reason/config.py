@@ -36,7 +36,7 @@ REC_REASON_CONFIG = {
         "metrics": ["avg_score"],
         # LLM multi-dimensional evaluation config
         "llm_eval_enabled": True,  # Whether to enable LLM evaluation
-        "llm_judge_model": "gemini",  # Judge LLM type: gemini/deepseek/claude
+        "llm_judge_model": "gemini",  # Model name exposed by the configured Judge endpoint.
         "llm_max_workers": 1,  # Concurrent workers for LLM calls
         "llm_max_samples": 470,  # Max samples to evaluate (None for all)
     },

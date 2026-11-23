@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +12,7 @@ from typing import Any
 
 import torch
 
+from vllm_gr.config.models import deployment_for, runtime_constraint_table
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 
 
@@ -26,11 +26,12 @@ def _load_trie(runner: Any, path: str) -> Any:
     from vllm_gr.config import GRConfig
     from vllm_gr.constraints.loader import load_constraint_backend
 
-    config = GRConfig.from_vllm_config(runner.vllm_config).constraint_table
+    config = runtime_constraint_table(GRConfig.from_vllm_config(runner.vllm_config))
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+    assert config is not None
     config = replace(config, path=path, artifact_digest="sha256:" + digest.hexdigest())
     backend = load_constraint_backend(
         config,
@@ -62,10 +63,11 @@ def versioned_constraint_table(
             raise
         return candidate
 
+    settings = deployment_for(getattr(runner, "vllm_config", None))
     return VersionedConstraintTable(
         backend,
         loader=load,
-        retention_seconds=float(os.environ.get("VLLM_GR_TRIE_RETENTION_SECONDS", "60")),
+        retention_seconds=settings.trie_retention_seconds,
         before_release=lambda: _sync(runner),
     )
 

@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="337" viewBox="0 0 940 337" role="img" aria-labelledby="title desc">
+  <title id="title">BSND capture selection for four prompts</title>
+  <desc id="desc">Four prompts of 128 tokens fit 512 total slots. Moving one token to the first prompt requires a 1024-slot capture because the per-request capacity is fixed. Cyan marks real tokens and gray marks padding.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 9 4 L 1 7" fill="none" stroke="#252627" stroke-width="1.6" stroke-linejoin="round" />
+    </marker>
+  </defs>
+  <rect width="940" height="337" fill="#ffffff" />
+  <g font-family="Arial, Helvetica, sans-serif" fill="#252627">
+    <rect x="18" y="16" width="438" height="45" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="237.0" y="44.44" font-size="18" font-weight="600" text-anchor="middle">T = 512, B = 4 (128 slots per row)</text>
+    <text x="28" y="105.28" font-size="16" font-weight="400" text-anchor="start">Prompt 1</text>
+    <rect x="119" y="84" width="327" height="33" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="0" />
+    <rect x="119" y="84" width="327.0" height="33" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="0" />
+    <text x="282.5" y="105.28" font-size="16" font-weight="400" text-anchor="middle">128</text>
+    <text x="28" y="153.28" font-size="16" font-weight="400" text-anchor="start">Prompt 2</text>
+    <rect x="119" y="132" width="327" height="33" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="0" />
+    <rect x="119" y="132" width="327.0" height="33" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="0" />
+    <text x="282.5" y="153.28" font-size="16" font-weight="400" text-anchor="middle">128</text>
+    <text x="28" y="201.28" font-size="16" font-weight="400" text-anchor="start">Prompt 3</text>
+    <rect x="119" y="180" width="327" height="33" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="0" />
+    <rect x="119" y="180" width="327.0" height="33" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="0" />
+    <text x="282.5" y="201.28" font-size="16" font-weight="400" text-anchor="middle">128</text>
+    <text x="28" y="249.28" font-size="16" font-weight="400" text-anchor="start">Prompt 4</text>
+    <rect x="119" y="228" width="327" height="33" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="0" />
+    <rect x="119" y="228" width="327.0" height="33" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="0" />
+    <text x="282.5" y="249.28" font-size="16" font-weight="400" text-anchor="middle">128</text>
+    <text x="237" y="304.61" font-size="17" font-weight="400" text-anchor="middle">512 real tokens, 0 padding slots</text>
+    <rect x="484" y="16" width="438" height="45" fill="#e3f1d9" stroke="#252627" stroke-width="1.5" rx="6" />
+    <text x="703.0" y="44.44" font-size="18" font-weight="600" text-anchor="middle">T = 1024, B = 4 (256 slots per row)</text>
+    <text x="494" y="105.28" font-size="16" font-weight="400" text-anchor="start">Prompt 1</text>
+    <rect x="585" y="84" width="327" height="33" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="0" />
+    <rect x="585" y="84" width="164.78" height="33" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="0" />
+    <text x="667.39" y="105.28" font-size="16" font-weight="400" text-anchor="middle">129</text>
+    <text x="830.89" y="104.95" font-size="15" font-weight="400" text-anchor="middle">127 pad</text>
+    <text x="494" y="153.28" font-size="16" font-weight="400" text-anchor="start">Prompt 2</text>
+    <rect x="585" y="132" width="327" height="33" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="0" />
+    <rect x="585" y="132" width="162.22" height="33" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="0" />
+    <text x="666.11" y="153.28" font-size="16" font-weight="400" text-anchor="middle">127</text>
+    <text x="829.61" y="152.95" font-size="15" font-weight="400" text-anchor="middle">129 pad</text>
+    <text x="494" y="201.28" font-size="16" font-weight="400" text-anchor="start">Prompt 3</text>
+    <rect x="585" y="180" width="327" height="33" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="0" />
+    <rect x="585" y="180" width="163.5" height="33" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="0" />
+    <text x="666.75" y="201.28" font-size="16" font-weight="400" text-anchor="middle">128</text>
+    <text x="830.25" y="200.95" font-size="15" font-weight="400" text-anchor="middle">128 pad</text>
+    <text x="494" y="249.28" font-size="16" font-weight="400" text-anchor="start">Prompt 4</text>
+    <rect x="585" y="228" width="327" height="33" fill="#efefed" stroke="#252627" stroke-width="1.5" rx="0" />
+    <rect x="585" y="228" width="163.5" height="33" fill="#d7f1f1" stroke="#252627" stroke-width="1.5" rx="0" />
+    <text x="666.75" y="249.28" font-size="16" font-weight="400" text-anchor="middle">128</text>
+    <text x="830.25" y="248.95" font-size="15" font-weight="400" text-anchor="middle">128 pad</text>
+    <text x="703" y="304.61" font-size="17" font-weight="400" text-anchor="middle">512 real tokens, 512 padding slots</text>
+  </g>
+</svg>

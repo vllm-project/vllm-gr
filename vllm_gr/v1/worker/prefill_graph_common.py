@@ -4,27 +4,26 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_gr.config import (
-    DEFAULT_ONLINE_BATCH_SIZES,
-    SUPPORTED_BEAM_BATCH_SIZES,
-    BeamExecutionMode,
     GRConfig,
+)
+from vllm_gr.config.models import (
+    DEFAULT_BEAM_BATCH_SIZES,
+    DEFAULT_PREFILL_TOKEN_BUCKETS,
+    deployment_for,
 )
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 
 logger = init_logger(__name__)
 
-PREFILL_GRAPH_BUCKET_STEP_DEFAULT = 128
-PREFILL_GRAPH_MAX_BUCKET_DEFAULT = 8192
 # Default capture policy is deliberately narrower than engine capability.
 # Static buffer capacity remains independent of the selected capture grid.
-PREFILL_GRAPH_CAPTURE_NUM_REQS = DEFAULT_ONLINE_BATCH_SIZES
+PREFILL_GRAPH_CAPTURE_NUM_REQS = DEFAULT_BEAM_BATCH_SIZES
 # Small exact buckets, available as an opt-in extension of the configured
 # grid (see get_default_buckets). A prefix-cache hit schedules only the
 # uncached tail ((((N - 1) mod block_size) + 1) <= 16 tokens at block_size
@@ -37,20 +36,14 @@ PREFILL_GRAPH_CAPTURE_NUM_REQS = DEFAULT_ONLINE_BATCH_SIZES
 # bit-identical to eager.
 #
 # They are NOT part of the default grid: a small bucket only pays off
-# together with a widened KV bound (VLLM_GR_PREFILL_GRAPH_KV_BOUND), because
+# together with a widened KV bound (gr.prefill_kv_bound), because
 # 2 * bucket alone would bake a *tighter* attention extent than the step grid
 # baked for the same request and would drop replays the previous grid
 # admitted (128-token and 17-token cache hits). Opting in keeps the default
 # grid byte-identical to the pre-extension behaviour.
-# See docs/prefill_graph_hit_replay.md section 8 for the measurements.
+# See docs/design/feature/cuda_prefill_graph.md for the capture and replay contract.
 SMALL_PREFILL_BUCKETS = (1, 16)
-DEFAULT_PREFILL_BUCKETS = list(
-    range(
-        PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
-        PREFILL_GRAPH_MAX_BUCKET_DEFAULT + 1,
-        PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
-    )
-)
+DEFAULT_PREFILL_BUCKETS = list(DEFAULT_PREFILL_TOKEN_BUCKETS)
 # Public compatibility alias. Both platforms use the configured bucket range.
 NPU_DEFAULT_PREFILL_BUCKETS = list(DEFAULT_PREFILL_BUCKETS)
 
@@ -59,49 +52,8 @@ NPU_DEFAULT_PREFILL_BUCKETS = list(DEFAULT_PREFILL_BUCKETS)
 # request counts declared by PREFILL_GRAPH_CAPTURE_NUM_REQS above.
 SUPPORTED_NUM_REQS = tuple(range(1, 9))
 
-ENV_ENABLE_PREFILL_GRAPH = "VLLM_ENABLE_PREFILL_CUDAGRAPH"
-ENV_PREFILL_GRAPH_BUCKET_STEP = "VLLM_GR_PREFILL_GRAPH_BUCKET_STEP"
-ENV_PREFILL_GRAPH_MAX_BUCKET = "VLLM_GR_PREFILL_GRAPH_MAX_BUCKET"
-ENV_PREFILL_GRAPH_KV_BOUND = "VLLM_GR_PREFILL_GRAPH_KV_BOUND"
-ENV_PREFILL_GRAPH_BUCKETS = "VLLM_GR_PREFILL_GRAPH_BUCKETS"
-ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS = "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS"
 
-
-def _read_positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from exc
-    if value <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
-    return value
-
-
-def _read_env_flag(name: str, default: bool) -> bool:
-    """Parse a boolean-style env flag once (truthy/falsy strings, else default)."""
-    val = os.getenv(name, "").strip().lower()
-    if val in ("1", "true", "yes", "on"):
-        return True
-    if val in ("0", "false", "no", "off"):
-        return False
-    return default
-
-
-class PrefillGraphEnv:
-    """Process-wide prefill-graph environment switch, read once at import.
-
-    Every process (main / EngineCore / worker) initializes this class at
-    plugin load with the environment it was spawned with, and the switch
-    never changes afterwards, so per-call ``os.getenv`` reads are wasted work.
-    """
-
-    enabled: bool = _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True)
-
-
-def get_default_buckets() -> list[int]:
+def get_default_buckets(vllm_config: object | None = None) -> list[int]:
     """Build the configured prefill graph buckets for either platform.
 
     The small exact buckets are added only when the KV-bound override is set:
@@ -110,56 +62,16 @@ def get_default_buckets() -> list[int]:
     baked for the same request and would drop replays the previous grid
     admitted. Opting in with the bound keeps the default grid unchanged.
     """
-    custom = os.getenv(ENV_PREFILL_GRAPH_BUCKETS)
-    if custom is not None:
-        buckets = _parse_int_list_env(ENV_PREFILL_GRAPH_BUCKETS, custom)
-        if get_kv_capture_bound() is not None:
-            buckets = sorted(set(buckets) | {b for b in SMALL_PREFILL_BUCKETS if b <= buckets[-1]})
-        return buckets
-    step = _read_positive_int_env(ENV_PREFILL_GRAPH_BUCKET_STEP, PREFILL_GRAPH_BUCKET_STEP_DEFAULT)
-    max_bucket = _read_positive_int_env(
-        ENV_PREFILL_GRAPH_MAX_BUCKET, PREFILL_GRAPH_MAX_BUCKET_DEFAULT
-    )
-    if max_bucket < step:
-        raise ValueError(
-            f"{ENV_PREFILL_GRAPH_MAX_BUCKET} ({max_bucket}) must be at least "
-            f"{ENV_PREFILL_GRAPH_BUCKET_STEP} ({step})"
-        )
-    if max_bucket % step:
-        raise ValueError(
-            f"{ENV_PREFILL_GRAPH_MAX_BUCKET} ({max_bucket}) must be divisible by "
-            f"{ENV_PREFILL_GRAPH_BUCKET_STEP} ({step})"
-        )
-    buckets = set(range(step, max_bucket + 1, step))
-    if get_kv_capture_bound() is not None:
-        # Opt-in together with the widened bound. Entries beyond a
-        # deliberately tiny configured maximum stay out so the override keeps
-        # its meaning.
-        buckets.update(b for b in SMALL_PREFILL_BUCKETS if b <= max_bucket)
-    return sorted(buckets)
-
-
-def _parse_int_list_env(name: str, raw: str) -> list[int]:
-    try:
-        values = [int(part.strip()) for part in raw.split(",")]
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a comma-separated list of positive integers") from exc
-    if not values or any(value <= 0 for value in values) or values != sorted(set(values)):
-        raise ValueError(f"{name} must be a strictly increasing list of positive integers")
-    return values
+    settings = deployment_for(vllm_config)
+    buckets = list(settings.prefill_token_buckets or DEFAULT_PREFILL_BUCKETS)
+    if settings.prefill_kv_bound is not None:
+        buckets = sorted(set(buckets) | {b for b in SMALL_PREFILL_BUCKETS if b <= buckets[-1]})
+    return buckets
 
 
 def get_prefill_graph_capture_num_reqs(vllm_config: object | None = None) -> tuple[int, ...]:
-    """Use the batch policy unless an explicit Prefill-only grid overrides it."""
-    raw = os.getenv(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS)
-    if raw is None:
-        return GRConfig.from_vllm_config(vllm_config).beam_online_batch_sizes
-    values = _parse_int_list_env(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS, raw)
-    if any(value not in SUPPORTED_BEAM_BATCH_SIZES for value in values):
-        raise ValueError(
-            f"{ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS} must contain only {SUPPORTED_BEAM_BATCH_SIZES}"
-        )
-    return tuple(values)
+    config = GRConfig.from_vllm_config(vllm_config)
+    return config.deployment.beam_batch_sizes
 
 
 def get_max_context_len(runner: Any) -> int:
@@ -175,51 +87,6 @@ def get_max_context_len(runner: Any) -> int:
         model_config = getattr(vllm_config, "model_config", None)
     max_model_len = getattr(model_config, "max_model_len", 0)
     return int(max_model_len or 0)
-
-
-def get_kv_capture_bound() -> int | None:
-    """Capture-time KV bound override; None keeps the shipped ``2 * bucket``.
-
-    The default bound couples the replay-eligible KV length to the bucket,
-    which only holds when a batch schedules roughly its own KV length. A
-    prefix-cache hit schedules just the uncached tail, so it matches the
-    smallest bucket while its real KV length is the whole context and every
-    such replay is rejected by the check in ``execute_model_prefill``.
-
-    Setting this variable enables the shape-identical cache-hit replay path,
-    in two coupled ways:
-
-    * it widens the bound to at least this value for every bucket that would
-      otherwise bake less -- the bucket still sizes the query extent, while
-      this value raises the captured attention extent (``max_seq_len`` ->
-      flash-attention ``max_seqlen_k``). Buckets whose default bound is
-      already larger keep it, so miss-path graphs stay byte-identical to the
-      default. ``max_seq_len`` feeds nothing else, so no other buffer changes
-      size with it;
-    * it adds the small exact buckets (see ``SMALL_PREFILL_BUCKETS``) to the
-      grid, because on their own their ``2 * bucket`` bound would be tighter
-      than the step grid's and would drop replays the default grid admitted.
-
-    A value below the context a caller wants to replay still falls back to
-    eager -- the replay gate is unchanged; this knob only raises the captured
-    extent. Size it to the longest context that must replay (e.g.
-    ``max_model_len``, or the workload's N).
-
-    Read once per captured bucket, i.e. once per process at capture time, and
-    once per grid build by ``get_default_buckets``.
-    """
-    raw = os.getenv(ENV_PREFILL_GRAPH_KV_BOUND)
-    if raw is None or not raw.strip():
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"{ENV_PREFILL_GRAPH_KV_BOUND} must be a positive integer, got {raw!r}"
-        ) from exc
-    if value <= 0:
-        raise ValueError(f"{ENV_PREFILL_GRAPH_KV_BOUND} must be a positive integer, got {raw!r}")
-    return value
 
 
 def _get_block_table_cols(runner: Any) -> int | None:
@@ -252,9 +119,8 @@ def is_npu_platform() -> bool:
     return str(current_platform.device_type).lower() == "npu"
 
 
-def is_prefill_graph_enabled() -> bool:
-    """Return True if prefill CUDA/NPU graph capture is enabled (cached env)."""
-    return PrefillGraphEnv.enabled
+def is_prefill_graph_enabled(runner: Any = None) -> bool:
+    return deployment_for(getattr(runner, "vllm_config", None)).prefill_graph_enabled
 
 
 def is_prefill_phase_batch(runner: Any, scheduler_output: Any) -> bool:
@@ -417,14 +283,19 @@ class BasePrefillGraphRunner:
         buckets: list[int] | None = None,
     ) -> None:
         self.model_runner = model_runner
+        self.gr_settings = GRConfig.from_vllm_config(
+            getattr(model_runner, "vllm_config", None)
+        ).deployment
         self.device = getattr(
             model_runner, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
-        self.buckets = sorted(buckets or get_default_buckets())
+        self.buckets = sorted(
+            buckets or get_default_buckets(getattr(model_runner, "vllm_config", None))
+        )
 
-        # The default grid is bounded by max_model_len. An explicitly
-        # configured multi-request grid counts tokens across all requests,
-        # so the per-request model limit must not clamp its total length.
+        # GPU V1 treats every configured grid (including the packaged
+        # default) as total tokens. None retains the per-context V1 grid.
+        # Feasible request counts are planned before allocating buffers.
         scheduler_config = getattr(model_runner, "scheduler_config", None)
         if scheduler_config is None:
             vllm_config = getattr(model_runner, "vllm_config", None)
@@ -435,11 +306,9 @@ class BasePrefillGraphRunner:
         # larger than one model context. Other runners keep the model limit.
         supports_total_buckets = (
             self.supports_multi_request_total_buckets
-            and GRConfig.from_vllm_config(
-                getattr(model_runner, "vllm_config", None)
-            ).beam_execution_mode
-            is BeamExecutionMode.V1
-            and os.getenv(ENV_PREFILL_GRAPH_BUCKETS) is not None
+            and GRConfig.from_vllm_config(getattr(model_runner, "vllm_config", None)).beam_max_width
+            is not None
+            and self.gr_settings.prefill_token_buckets is not None
         )
         limits = (
             (max_num_batched_tokens,)
@@ -465,6 +334,19 @@ class BasePrefillGraphRunner:
             None,
         )
         max_seqs = getattr(max_num_seqs_cfg, "max_num_seqs", 256) if max_num_seqs_cfg else 256
+
+        if self.supports_multi_request_total_buckets:
+            from vllm_gr.v1.worker.prefill_capture_plan import plan_prefill_capture
+
+            self.capture_plan = plan_prefill_capture(
+                self.buckets,
+                self.gr_settings.beam_batch_sizes,
+                max_num_seqs=int(getattr(scheduler_config, "max_num_seqs", max_seqs)),
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_model_len=max_model_len,
+                total_token_buckets=supports_total_buckets,
+            )
+            self.buckets = list(self.capture_plan)
 
         # Block-table column count from the model config (used to pre-size the
         # per-bucket staging buffers); None when the config is unavailable.

@@ -19,10 +19,11 @@ from tests.kernels.beam_stage_test_utils import (
     install_decode_model,
     metadata,
 )
+from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
-from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
+from vllm_gr.v1.beam.dispatch import GRStageKind
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     get_stage_runner,
 )
@@ -46,7 +47,7 @@ def test_runtime_recapture_refusal_preserves_live_request(monkeypatch):
     worker.model_config.enforce_eager = False
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.beam_online_batch_sizes = (1,)
+    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
@@ -93,7 +94,7 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     worker.model_config.enforce_eager = False
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.beam_online_batch_sizes = (1,)
+    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
@@ -186,14 +187,12 @@ def test_all_batches_capture_at_startup_and_reuse_storage(
     # Reclaim cycles from the previous parametrized worker before capture.
     # CUDAGraph destruction during another graph's capture invalidates CUDA.
     gc.collect()
-    # The V1 startup override must not replace any of the V2 capture shapes.
-    monkeypatch.setenv("VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE", "4")
     worker = admission_worker(max_rows=32)
+    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=sizes)
     del worker.use_async_scheduling  # V2 reads the resolved scheduler config.
     worker.model_config.enforce_eager = False
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.beam_online_batch_sizes = sizes
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))

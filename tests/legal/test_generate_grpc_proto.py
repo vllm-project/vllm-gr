@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Behaviour of tools/generate_grpc_proto.py."""
+"""Behaviour of tools/codegen/generate_grpc_proto.py."""
 
 import importlib.util
 import tempfile
@@ -10,11 +10,13 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[2] / "tools/generate_grpc_proto.py"
+from tests.helpers.paths import REPO_ROOT
+
+SCRIPT = REPO_ROOT / "tools/codegen/generate_grpc_proto.py"
 
 
 def load_generator() -> types.ModuleType:
-    """Import the generator by path; tools is not a package."""
+    """Load the generation script from its source checkout."""
     spec = importlib.util.spec_from_file_location("generate_grpc_proto", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
+from vllm_gr.v1.attention.backends.npu_cache_layout import (
     interleaved_pool_base,
 )
 

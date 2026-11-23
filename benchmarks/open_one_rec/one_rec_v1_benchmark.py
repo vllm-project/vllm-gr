@@ -8,18 +8,48 @@ import json
 import subprocess
 import tempfile
 import time
+from importlib import import_module
 from pathlib import Path
 
-from tools.AB_Tests.run_offline_benchmark import distribution_ms
+from benchmarks.metrics import distribution_ms
+
+
+def _resolve_beam_search(llm):
+    """Select the public Beam method exposed by the loaded runtime.
+
+    The documented A/B workflow runs this harness against both the pre-rename
+    and the renamed checkout. Pre-rename runtimes expose ``beam_search_v1``
+    while ``beam_search`` is a retired stub; the renamed runtime exposes only
+    ``beam_search``.
+    """
+    method = getattr(llm, "beam_search_v1", None)
+    return method if method is not None else llm.beam_search
+
+
+def _load_build_artifact():
+    """Load the selected runtime's builder when using a common A/B harness."""
+    for module_name, builder_name in (
+        ("vllm_gr.constraints.artifact_builder", "build_single_trie_artifact"),
+        ("examples.offline_inference.beam_search.offline_beam_search", "build_artifact"),
+        ("examples.offline_inference.beam_search.offline_beam_search_v1", "build_artifact"),
+    ):
+        try:
+            module = import_module(module_name)
+        except ModuleNotFoundError as error:
+            missing = error.name
+            if missing and (missing == module_name or module_name.startswith(f"{missing}.")):
+                continue
+            raise
+        return getattr(module, builder_name)
+    raise ImportError("no constraint artifact builder found in the checkout")
 
 
 def run_v1_benchmark(args, tokenizer, requests):
     import vllm_gr
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
-        build_artifact,
-    )
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
+
+    build_artifact = _load_build_artifact()
 
     if args.num_prompts < 1 or args.warmup_requests < 0 or args.n < 1:
         raise ValueError("invalid request, warmup or beam count")
@@ -35,7 +65,9 @@ def run_v1_benchmark(args, tokenizer, requests):
     lengths = [len(tokenizer.encode(prompt, add_special_tokens=False)) + 1 for prompt in prompts]
     if args.custom_input_len and any(length != args.custom_input_len + 1 for length in lengths):
         raise ValueError("text round-trip changed the requested input length")
-    model_len = args.max_model_len or 8192
+    from vllm_gr.config.parser import common_engine_defaults
+
+    model_len = args.max_model_len or common_engine_defaults()["max_model_len"]
     if max(lengths) + steps + 1 > model_len:
         raise ValueError("input plus output exceeds max_model_len")
     params = BeamSearchParams(
@@ -50,8 +82,6 @@ def run_v1_benchmark(args, tokenizer, requests):
     )
     engine_config = dict(
         async_scheduling=True,
-        enable_prefix_caching=True,
-        enable_chunked_prefill=False,
         max_model_len=model_len,
         max_num_batched_tokens=args.max_num_batched_tokens or model_len,
         max_num_seqs=args.n,
@@ -67,27 +97,25 @@ def run_v1_benchmark(args, tokenizer, requests):
             Path(args.model).resolve(), Path(args.constraint_triples).resolve(), artifact
         )
         config = {
-            "schema_version": 1,
-            "attention_backend": "CUSTOM",
-            "beam": {
-                "execution_mode": "v1",
-                "graph_enabled": True,
-                "worker_decision": True,
-                "max_width": args.n,
-                "max_decode_steps": steps,
-            },
+            "worker_decision": True,
+            "beam_width": [args.n] * steps,
+            "max_decode_steps": steps,
+            "constraint_mode": "table",
             "constraint_table": {
-                "enabled": True,
                 "backend": "cuda",
                 "max_top_k": args.n,
-                "path": str(artifact),
+                "path": str(artifact.resolve()),
                 "format": "constraint_table_v1",
-                "artifact_digest": artifact_digest,
-                "tokenizer_digest": tokenizer_digest,
+                "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
             },
+            "candidate_width": [args.n] * steps,
         }
         with GRLLM(
-            model=args.model, trust_remote_code=True, vllm_gr_config=config, **engine_config
+            model=args.model,
+            trust_remote_code=True,
+            attention_config={"backend": "CUSTOM"},
+            gr=config,
+            **engine_config,
         ) as llm:
             for index in range(args.warmup_requests + args.num_prompts):
                 measured = index >= args.warmup_requests
@@ -95,7 +123,9 @@ def run_v1_benchmark(args, tokenizer, requests):
                 if not llm.reset_prefix_cache():
                     raise RuntimeError(f"prefix cache reset failed before request {index}")
                 start = time.perf_counter_ns()
-                outputs = llm.beam_search_v1([{"prompt": prompts[row]}], params, output_mode="full")
+                outputs = _resolve_beam_search(llm)(
+                    [{"prompt": prompts[row]}], params, output_mode="full"
+                )
                 # V1 materializes tokens/text lazily: force every beam before stopping the timer.
                 for output in outputs:
                     for sequence in output.sequences:
@@ -122,7 +152,7 @@ def run_v1_benchmark(args, tokenizer, requests):
     latencies = [sample["e2e_ms"] for sample in samples]
     repo = Path(vllm_gr.__file__).resolve().parents[1]
     result = {
-        "api": "GRLLM.beam_search_v1",
+        "api": "GRLLM.beam_search",
         "commit": subprocess.check_output(
             ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
         ).strip(),

@@ -3,13 +3,13 @@
 """Scoped GR bindings for the upstream vLLM gRPC server lifecycle."""
 
 import asyncio
-import os
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 
 from google.protobuf import descriptor_pool
 
-from vllm_gr.entrypoints.beam_search_v1.client import _ASYNC_CLEANUP_TASKS
+from vllm_gr.config.models import deployment_for
+from vllm_gr.entrypoints.beam_search.client import _ASYNC_CLEANUP_TASKS
 
 from .generated import vllm_engine_pb2 as pb
 from .generated import vllm_engine_pb2_grpc as rpc
@@ -49,12 +49,15 @@ def patch_grpc_server():
         def register(servicer, server):
             stop = server.stop
             admin = None
-            port = os.environ.get("VLLM_GR_ADMIN_PORT")
+            settings = deployment_for(getattr(servicer.engine, "vllm_config", None))
+            port = settings.admin_port
             if port is not None:
-                from vllm_gr.entrypoints.management import AdminServer
+                from vllm_gr.entrypoints.serve.management import AdminServer
 
                 admin = AdminServer(
-                    servicer.engine, int(port), os.environ.get("VLLM_GR_ADMIN_HOST", "127.0.0.1")
+                    servicer.engine,
+                    int(port),
+                    settings.admin_host,
                 )
                 start = server.start
 

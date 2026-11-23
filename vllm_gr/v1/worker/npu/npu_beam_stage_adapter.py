@@ -14,12 +14,11 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
 )
-
-GR_STAGE_OUTPUT_ATTR = "gr_stage_metadata"
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +190,7 @@ def validate_npu_eager_capabilities(worker: object) -> None:
         raise ValueError("NPU eager Beam execution requires an NPU worker")
     config = getattr(worker, "vllm_config", None)
     if config is not None:
-        from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
+        from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
         validate_gr_device_config(config)
     if not bool(getattr(worker, "use_async_scheduling", False)):

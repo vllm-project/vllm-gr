@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Shared error classification for optional GR CUDA graph capture."""
+"""Error classification for GR CUDA graph capture."""
 
 
 def is_recoverable_capture_error(error: RuntimeError) -> bool:

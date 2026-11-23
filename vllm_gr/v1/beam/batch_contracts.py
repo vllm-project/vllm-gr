@@ -14,16 +14,23 @@ import array
 import math
 import sys
 from dataclasses import dataclass
-from typing import Annotated, Literal, NoReturn, TypeGuard
+from itertools import repeat
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, TypeGuard
 
 import msgspec
 import numpy as np
+from numpy.typing import NDArray
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import (
     MAX_BEAM_WIDTH,
     MAX_CANDIDATE_WIDTH,
     SUPPORTED_BEAM_BATCH_SIZES,
+)
+from vllm_gr.config.beam_widths import (
+    SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS,
+    final_retained_width,
+    per_parent_width_error,
 )
 
 BEAM_BATCH_PROTOCOL_VERSION = 2
@@ -38,6 +45,10 @@ ADMISSION_REJECTED_CODE = "admission_rejected"
 GR_BATCH_RESULT_PARAM = "gr_batch_result"
 
 
+class GRAdmissionError(ValueError):
+    """An expected request rejection before Scheduler/Worker registration."""
+
+
 class BeamContractError(ValueError):
     """Raised when a Beam batch value violates the contract."""
 
@@ -46,6 +57,9 @@ class BeamEngineCoreRequest(EngineCoreRequest):
     """GR native request with one canonical ndarray prompt wire field."""
 
     prompt_token_ids: np.ndarray  # type: ignore[assignment,type-arg]
+
+    if TYPE_CHECKING:
+        external_req_id: str | None
 
     def __post_init__(self) -> None:
         if self.external_req_id is None:
@@ -372,7 +386,7 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
     widths = params.dynamic_beam_widths
     if widths is not None:
         if (
-            params.max_tokens not in (1, 2, 3)
+            params.max_tokens not in SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
             or not isinstance(widths, tuple)
             or len(widths) != params.max_tokens
         ):
@@ -384,12 +398,11 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
     per_parent_beam_widths = params.per_parent_beam_widths
     if per_parent_beam_widths is not None:
         if (
-            params.max_tokens not in (1, 2, 3)
+            params.max_tokens not in SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
             or not isinstance(per_parent_beam_widths, tuple)
             or len(per_parent_beam_widths) != params.max_tokens
         ):
             _fail("beam_params.per_parent_beam_widths must contain one immutable value per step")
-        retained_widths = widths or (beam_width,) * params.max_tokens
         for index, per_parent_beam_width in enumerate(per_parent_beam_widths):
             per_parent_beam_width = _positive_int(
                 f"beam_params.per_parent_beam_widths[{index}]", per_parent_beam_width
@@ -398,15 +411,9 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
                 _fail(
                     f"beam_params.per_parent_beam_widths entries must be <= {MAX_CANDIDATE_WIDTH}"
                 )
-        if per_parent_beam_widths[0] != retained_widths[0]:
-            _fail("the first per-parent beam width must equal the first retained width")
-        input_width = retained_widths[0]
-        for per_parent_beam_width, output_width in zip(
-            per_parent_beam_widths[1:], retained_widths[1:]
-        ):
-            if output_width > input_width * per_parent_beam_width:
-                _fail("each retained width must not exceed input_width * per_parent_beam_width")
-            input_width = output_width
+        error = per_parent_width_error(beam_width, widths, per_parent_beam_widths)
+        if error is not None:
+            _fail(error)
     if (
         isinstance(params.temperature, bool)
         or not isinstance(params.temperature, (int, float))
@@ -493,10 +500,8 @@ def validate_beam_batch_request(request: BeamBatchRequest) -> None:
     _validate_beam_params(request.beam_params)
     _validate_output_options(
         request.output_options,
-        beam_width=(
-            request.beam_params.beam_width
-            if request.beam_params.dynamic_beam_widths is None
-            else request.beam_params.dynamic_beam_widths[-1]
+        beam_width=final_retained_width(
+            request.beam_params.beam_width, request.beam_params.dynamic_beam_widths
         ),
     )
     if not request.items:
@@ -613,6 +618,85 @@ def validate_beam_batch_request_limits(
     )
 
 
+def sequence_columns(
+    sequences: BeamSequenceColumns,
+) -> tuple[NDArray[np.int32], NDArray[np.float32] | None, NDArray[np.int32] | None]:
+    shape = (sequences.count, sequences.steps)
+    tokens = np.frombuffer(sequences.token_ids, dtype="<i4").reshape(shape)
+    scores = (
+        None
+        if sequences.cumulative_logprobs is None
+        else np.frombuffer(sequences.cumulative_logprobs, dtype="<f4").reshape(sequences.count)
+    )
+    parents = (
+        None
+        if sequences.parent_beam_indices is None
+        else np.frombuffer(sequences.parent_beam_indices, dtype="<i4").reshape(shape)
+    )
+    return tokens, scores, parents
+
+
+def validate_complete_sequences(
+    sequences: BeamSequenceColumns, request: BeamBatchRequest | None = None
+) -> None:
+    """Validate both the owned column shapes and request-dependent semantics."""
+    if type(sequences.count) is not int or type(sequences.steps) is not int:
+        raise ValueError("Beam column dimensions must be integers")
+    if sequences.count < 1 or sequences.steps < 1:
+        raise ValueError("Beam column dimensions must be positive")
+    for value in (
+        sequences.token_ids,
+        sequences.cumulative_logprobs,
+        sequences.parent_beam_indices,
+    ):
+        if value is not None and type(value) is not bytes:
+            raise ValueError("Beam columns must be immutable bytes")
+    tokens, scores, parents = sequence_columns(sequences)
+    if np.any(tokens < 0) or (scores is not None and not np.isfinite(scores).all()):
+        raise ValueError("Beam columns contain negative tokens or non-finite scores")
+    if parents is not None and np.any(parents < 0):
+        raise ValueError("Beam columns contain negative parent indices")
+    if request is None:
+        return
+    options, params = request.output_options, request.beam_params
+    if sequences.count > options.num_return_sequences or sequences.steps != params.max_tokens:
+        raise ValueError("terminal Beam columns violate the result count or effective budget")
+    if (scores is not None) != options.include_cumulative_logprob:
+        raise ValueError("terminal Beam score presence differs from requested options")
+    if (parents is not None) != options.include_parent_beam_indices:
+        raise ValueError("terminal Beam parent presence differs from requested options")
+    if parents is not None:
+        widths = params.dynamic_beam_widths
+        bounds = params.beam_width if widths is None else np.asarray((1, *widths[:-1]))
+        if np.any(parents >= bounds):
+            raise ValueError("terminal Beam result has invalid parent indices")
+
+
+def materialize_beam_result(result: BeamBatchResult) -> BeamBatchResult:
+    """Keep the public tuple-of-sequences API for HTTP and offline consumers."""
+    if result.output is None or not any(
+        isinstance(item.sequences, BeamSequenceColumns) for item in result.output.items
+    ):
+        return result
+    items = []
+    for item in result.output.items:
+        sequences = item.sequences
+        if isinstance(sequences, BeamSequenceColumns):
+            tokens, scores, parents = sequence_columns(sequences)
+            sequences = tuple(
+                BeamOutputSequence(tuple(t), score, tuple(p), "length", None)
+                for t, score, p in zip(
+                    tokens.tolist(),
+                    repeat(None) if scores is None else scores.tolist(),
+                    repeat(()) if parents is None else parents.tolist(),
+                )
+            )
+        items.append(BeamRequestOutput(item.item_index, item.request_id, sequences))
+    return BeamBatchResult(
+        result.protocol_version, result.batch_id, BeamBatchOutput(tuple(items)), result.failure
+    )
+
+
 def _validate_output_sequence(sequence: BeamOutputSequence, *, name: str) -> None:
     if not isinstance(sequence, BeamOutputSequence):
         _fail(f"{name} must be BeamOutputSequence")
@@ -679,8 +763,6 @@ def validate_beam_batch_result(
                 _fail("output request_id values must be unique")
             request_ids.add(request_id)
             if isinstance(item.sequences, BeamSequenceColumns):
-                from vllm_gr.v1.beam.output_columns import validate_complete_sequences
-
                 try:
                     validate_complete_sequences(item.sequences)
                 except (TypeError, ValueError) as exc:
@@ -694,6 +776,7 @@ def validate_beam_batch_result(
 
 
 __all__ = [
+    "ADMISSION_REJECTED_CODE",
     "BEAM_BATCH_PROTOCOL_VERSION",
     "DEFAULT_CONSTRAINT_RESOURCE_ID",
     "SUPPORTED_BEAM_BATCH_SIZES",
@@ -710,7 +793,11 @@ __all__ = [
     "BeamOutputOptions",
     "BeamOutputSequence",
     "BeamRequestOutput",
+    "GRAdmissionError",
+    "materialize_beam_result",
+    "sequence_columns",
     "to_int64_tokens",
+    "validate_complete_sequences",
     "validate_beam_batch_limits",
     "validate_beam_batch_request",
     "validate_beam_batch_request_limits",

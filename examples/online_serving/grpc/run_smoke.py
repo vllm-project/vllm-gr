@@ -40,9 +40,9 @@ def main():
         "-m",
         "vllm_gr.entrypoints.cli.main",
         "serve",
-        "--gr",
         str(model),
-        "--vllm-gr-config",
+        "--gr",
+        "--config",
         str(config),
         "--dtype",
         "float16",
@@ -63,13 +63,17 @@ def main():
         "--gpu-memory-utilization",
         "0.1",
         "--enforce-eager",
+        "--kernel-config",
+        '{"enable_jit_warmup": false, "enable_flashinfer_autotune": false}',
     ]
     (output / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     log_path = output / "server.log"
     with log_path.open("w") as log:
         process = subprocess.Popen(command, cwd=root, env=env, stdout=log, stderr=log)
         try:
-            with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+            with grpc.insecure_channel(
+                f"127.0.0.1:{port}", options=(("grpc.enable_http_proxy", 0),)
+            ) as channel:
                 ready = grpc.channel_ready_future(channel)
                 deadline = time.monotonic() + args.timeout
                 while True:

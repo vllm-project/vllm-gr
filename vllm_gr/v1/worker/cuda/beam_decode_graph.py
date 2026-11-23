@@ -156,7 +156,7 @@ class BeamDecodeGraph:
         # V1 replays beam FULL graphs through the native execute_model FULL
         # branch calling ``worker.model`` — the wrapper must STAY installed
         # for the engine's lifetime (uninstalled only by shutdown).  V2
-        # (beam_search_v1 stage path) replays explicitly through
+        # (beam_search stage path) replays explicitly through
         # ``BeamDecodeGraph.replay()`` and never routes via ``worker.model``,
         # so the wrapper is scoped to the capture window there.
         if persistent_install:

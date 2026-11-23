@@ -10,7 +10,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR, GRStageKind
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
@@ -160,7 +160,7 @@ def try_add_gr_prefill_requests(worker: Any, scheduler_output: "SchedulerOutput"
     initialized nor flushed. Decline before mutation for ordinary or mixed
     batches and for features requiring the native sampling path.
     """
-    stages = getattr(scheduler_output, "gr_stage_metadata", None)
+    stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
     current_output = getattr(worker, "_current_scheduler_output", None)
     if not stages or current_output is None or current_output is not scheduler_output:
         return False
@@ -246,7 +246,7 @@ def try_prepare_gr_prefill_inputs_v2(
     attention preparation and computed-token updates retain native ownership.
     Graph input addresses are the native persistent buffers.
     """
-    stages = getattr(scheduler_output, "gr_stage_metadata", None)
+    stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
     scheduled_tokens = scheduler_output.num_scheduled_tokens
     if (
         not stages

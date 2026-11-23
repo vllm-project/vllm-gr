@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.helpers.paths import REPO_ROOT
+
 pytestmark = [
     pytest.mark.gpu_test,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
@@ -68,7 +70,7 @@ def test_unmarked_successor_does_not_restore_stale_handle():
 """,
         encoding="utf-8",
     )
-    root = Path(__file__).resolve().parents[2]
+    root = REPO_ROOT
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
     # The child checks only this fixture. Parent-specific selection plugins or

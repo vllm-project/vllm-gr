@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.helpers.paths import REPO_ROOT
 from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runtime
 
 _SESSIONS = ((1024, 3), (900, 3), (900, 3), (1024, 3))
@@ -158,18 +159,21 @@ def _run_arm(work_dir: Path, arm: str) -> None:
         _inputs,
         _params,
     )
-    from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
+    from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
     from vllm_gr.entrypoints.gr import GRLLM
 
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
-    config["beam"]["graph_enabled"] = arm != "eager"
+    config["beam_graph_enabled"] = arm != "eager"
     kwargs = _engine_kwargs(model, config)
     kwargs["shutdown_timeout"] = 10
     kwargs["worker_extension_cls"] = _EXTENSIONS[arm]
     decode_graph = arm in ("graph", "prefill_fallback")
     results: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
-    with GRLLM(vllm_gr_config=config, **kwargs) as llm, _decode_path_probe(llm):
+    with (
+        GRLLM(attention_config={"backend": "CUSTOM"}, gr=config, **kwargs) as llm,
+        _decode_path_probe(llm),
+    ):
         processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
         previous = {"replay": 0, "eager": 0, "full": 0, "piecewise": 0}
         state_address = None
@@ -178,7 +182,7 @@ def _run_arm(work_dir: Path, arm: str) -> None:
             if index in (0, 3):
                 assert llm.reset_prefix_cache()
             ids = (newline * length + source)[-(length - 1) :]
-            public = llm.beam_search_v1(
+            public = llm.beam_search(
                 [{"prompt_token_ids": ids}], _params(steps), output_mode="full"
             )[0]
             snapshot = llm.collective_rpc("onerec_v2_parity_snapshot", timeout=30)[0]
@@ -239,7 +243,7 @@ def _run_arm(work_dir: Path, arm: str) -> None:
                     with pytest.raises(
                         BeamSearchRequestError, match="must equal constraint_table_v1 depth"
                     ):
-                        llm.beam_search_v1(
+                        llm.beam_search(
                             [{"prompt_token_ids": ids}], _params(invalid_steps), output_mode="full"
                         )
                     assert not llm.llm_engine.has_unfinished_requests()
@@ -272,7 +276,6 @@ def test_modelrunner_v2_stage_parity(tmp_path: Path) -> None:
         VLLM_USE_V2_MODEL_RUNNER="1",
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
-        VLLM_ENABLE_PREFILL_CUDAGRAPH="1",
         VLLM_GR_TEST_WIDTH="128",
         VLLM_GR_TEST_EAGER="0",
         VLLM_GR_TEST_DTYPE="bfloat16",
@@ -289,9 +292,7 @@ def test_modelrunner_v2_stage_parity(tmp_path: Path) -> None:
             str(work_dir),
             arm,
         ]
-        with subprocess.Popen(
-            command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-        ) as process:
+        with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
             try:
                 assert process.wait(timeout=900) == 0, f"V2 {arm} arm failed"
             finally:

@@ -37,7 +37,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    for level in sorted(LEVELS):
+    registered = {str(line).split(":", 1)[0].strip() for line in config.getini("markers")}
+    for level in sorted(LEVELS - registered):
         config.addinivalue_line("markers", f"{level}: vllm-gr {level.upper()} CI test level")
 
 
@@ -78,7 +79,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                     raise ClassificationError(
                         f"Unclassified test {key}; assign exactly one @pytest.mark.l1 through "
                         "@pytest.mark.l5, or add a parameter rule to tests/level_inventory.json. "
-                        "See docs/tools/README.md#test-levels-and-ci-selection."
+                        "See docs/contributing/ci/test_levels.md#test-levels-and-ci-selection."
                     )
                 else:
                     continue

@@ -29,10 +29,11 @@ from vllm_gr.v1.attention.backends.beam_attn import (
 )
 from vllm_gr.v1.attention.backends.beam_attn_gpu import reshape_and_cache
 from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
-from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
+from vllm_gr.v1.beam.attention_context import BeamAttentionContext
+from vllm_gr.v1.beam.session import BeamSearchSession
 
 try:
-    from cascade_beam_attn_utils import (
+    from tests.kernels.attention.cascade_beam_attn_utils import (
         GPU_CASES,
         NUM_HEADS,
         BeamAttnInputs,
@@ -429,8 +430,7 @@ def test_incremental_forward_append_reorder_matches_dense(
     """Cache writes and repeated-parent reorder agree with independent dense history."""
     from types import SimpleNamespace
 
-    from cascade_beam_attn_utils import build_beam_attn_metadata
-
+    from tests.kernels.attention.cascade_beam_attn_utils import build_beam_attn_metadata
     from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
 
     if not torch.cuda.is_available() or not is_fa_version_supported(2):

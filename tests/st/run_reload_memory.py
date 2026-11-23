@@ -216,19 +216,30 @@ def main() -> None:
     for p in paths:
         p.parent.mkdir(exist_ok=True)
     digests = [large_table(p, bool(i)) for i, p in enumerate(paths)]
-    conf = json.loads(config.read_text())
-    conf["constrained_generation"] = True
-    conf["constraint_table"].update(
-        enabled=True,
-        path=str(paths[0]),
-        artifact_digest=digests[0],
-        tokenizer_digest=compute_tokenizer_digest(AutoTokenizer.from_pretrained(model)),
+    config.update(
+        constraint_mode="table",
+        constraint_table={
+            "backend": "cuda",
+            "max_top_k": max(config["candidate_width"]),
+            "path": str(paths[0]),
+            "digests": {
+                "artifact": digests[0],
+                "tokenizer": compute_tokenizer_digest(AutoTokenizer.from_pretrained(model)),
+            },
+        },
     )
-    config.write_text(json.dumps(conf))
     trie_log = root / "trie-memory.jsonl"
     trie_log.write_text("")
-    os.environ.update(GR_RELOAD_MEMORY_LOG=str(trie_log), VLLM_GR_TRIE_RETENTION_SECONDS="0.5")
-    with server(root, model, config, "tries", Path(__file__).resolve(), graph=args.graph) as (
+    os.environ["GR_RELOAD_MEMORY_LOG"] = str(trie_log)
+    with server(
+        root,
+        model,
+        config,
+        "tries",
+        Path(__file__).resolve(),
+        graph=args.graph,
+        retention_seconds=0.5,
+    ) as (
         stub,
         control,
     ):

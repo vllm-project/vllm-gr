@@ -34,6 +34,8 @@ class LabelPredEvaluator(BaseEval):
     - AUC: Area Under ROC Curve
     """
 
+    reuse_cached_metrics = False
+
     @property
     def required_metrics(self) -> List[str]:
         """Define required overall metrics for label prediction evaluation"""
@@ -89,10 +91,8 @@ class LabelPredEvaluator(BaseEval):
                     )
                 continue
 
-            labels[sample_id] = label
-
             # Get model prediction (logprobs dictionary)
-            # For label_pred, generations contains {token: probability} dict
+            # Each generation contains a JSON mapping of label tokens to weights.
             generations = sample.get("generations", {})
 
             # Variables to store probability extraction results
@@ -143,6 +143,7 @@ class LabelPredEvaluator(BaseEval):
                     # Skip this sample - don't include in predictions
                     continue
 
+            labels[sample_id] = label
             predictions[sample_id] = predicted_prob
 
             # Store per-sample metrics (both in return dict and in self.samples for caching)
@@ -192,8 +193,13 @@ class LabelPredEvaluator(BaseEval):
             "auc": auc,
             "total_samples": total_samples,
             "valid_samples": len(labels),
-            "invalid_samples": len(debug_info["invalid_samples"]) if self.debug else 0,
+            "invalid_samples": total_samples - len(labels),
         }
+
+        if auc is None:
+            metrics["auc_unavailable_reason"] = (
+                "single_class" if labels else "no_valid_probabilities"
+            )
 
         # Save debug information if requested
         if self.debug and self.predictions_dir:
@@ -245,7 +251,7 @@ class LabelPredEvaluator(BaseEval):
 
         # Print metrics
         logger.info("\nMetrics:")
-        logger.info(f"  AUC: {metrics['auc']:.4f}")
+        logger.info("  AUC: %s", metrics["auc"])
 
         # Show some invalid sample examples
         if debug_info["invalid_samples"]:

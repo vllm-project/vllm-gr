@@ -11,13 +11,11 @@ failure path degrades to "no calibration" instead of failing start-up.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from vllm.logger import init_logger
 
 from vllm_gr.v1.attention.backends.beam_prefix_policy import (
-    ENV_CALIBRATION,
     PrefixCalibration,
     device_fingerprint,
     load_calibration,
@@ -237,7 +235,15 @@ def ensure_prefix_calibration(worker: Any) -> PrefixCalibration | None:
 
 
 def _initialize_prefix_calibration(worker: Any) -> PrefixCalibration | None:
-    if (os.environ.get(ENV_CALIBRATION) or "").strip().lower() == "off":
+    from vllm_gr.config.models import deployment_for
+
+    settings = deployment_for(getattr(worker, "vllm_config", None))
+    calibrations: dict[str, PrefixCalibration] = {}
+    worker._gr_prefix_calibrations = calibrations
+    host = getattr(worker, "vllm_config", None)
+    if host is not None:
+        host._gr_prefix_calibrations = calibrations
+    if not settings.prefix_calibration:
         return None
     try:
         import torch
@@ -261,10 +267,9 @@ def _initialize_prefix_calibration(worker: Any) -> PrefixCalibration | None:
             "dtype": str(dtype),
             "block_size": block_size,
         }
-        remember_calibration(fingerprint, geometry, None)
-        cached = load_calibration(fingerprint, geometry)
+        cached = load_calibration(fingerprint, geometry, settings=settings)
         if cached is not None:
-            remember_calibration(fingerprint, geometry, cached)
+            remember_calibration(calibrations, fingerprint, geometry, cached)
             return cached
         calibration = calibrate_prefix_device(
             num_heads=heads,
@@ -277,8 +282,8 @@ def _initialize_prefix_calibration(worker: Any) -> PrefixCalibration | None:
         )
         # Match the persisted precision formerly read back on serving requests.
         calibration = PrefixCalibration(**calibration.as_mapping())
-        store_calibration(fingerprint, geometry, calibration)
-        remember_calibration(fingerprint, geometry, calibration)
+        store_calibration(fingerprint, geometry, calibration, settings=settings)
+        remember_calibration(calibrations, fingerprint, geometry, calibration)
         return calibration
     except Exception as error:  # noqa: BLE001 - start-up must stay alive
         logger.warning("vllm_gr: prefix calibration skipped (%s)", error)

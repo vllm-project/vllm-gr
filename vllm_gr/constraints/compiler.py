@@ -33,7 +33,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -42,17 +42,31 @@ from vllm_gr.constraints.json_compiler import (
     FORMAT_VERSION_KEY,
     RELATIONS_KEY,
     TRIPLES_KEY,
+    ConstraintTriple,
+    build_relations,
 )
-from vllm_gr.constraints.triples import ConstraintTriple, build_relations
+from vllm_gr.constraints.table import (
+    CONSTRAINT_TABLE_TENSOR_NAMES,
+    MAX_CONSTRAINT_TABLE_BYTES,
+)
 from vllm_gr.ops.npu.rec_constrained_topk import MAX_TOP_K as MAX_TOP_K
 
 # ``MAX_TOP_K`` remains importable from this legacy module, but the NPU
 # operator boundary is its single source of truth.
 
 # Upper bound on the total device-table bytes a constraint resource may occupy.
-# Guards against a pathological catalog compiling into a multi-GiB resource that
-# would be broadcast to and duplicated on every worker.
-MAX_RESOURCE_BYTES = 512 * 1024 * 1024
+MAX_RESOURCE_BYTES = MAX_CONSTRAINT_TABLE_BYTES
+
+
+class TrieArrays(NamedTuple):
+    """Single-root CSR arrays before the output format takes ownership."""
+
+    first_token_ids: np.ndarray
+    prefix1_offsets: np.ndarray
+    prefix1_values: np.ndarray
+    prefix1_pair_keys: np.ndarray
+    prefix2_value_offsets: np.ndarray
+    prefix2_values: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -76,20 +90,10 @@ class ConstraintTableResource:
     vocab_size: int
     digest: str = ""
 
-    # The six ndarrays whose bytes travel to the device tables.
-    _ARRAY_NAMES = (
-        "first_token_ids",
-        "prefix1_offsets",
-        "prefix1_values",
-        "prefix1_pair_keys",
-        "prefix2_value_offsets",
-        "prefix2_values",
-    )
-
     @property
     def total_elements(self) -> int:
         """Total element count across the six device tables (read-only)."""
-        return sum(int(getattr(self, name).size) for name in self._ARRAY_NAMES)
+        return sum(int(getattr(self, name).size) for name in CONSTRAINT_TABLE_TENSOR_NAMES)
 
     @property
     def total_bytes(self) -> int:
@@ -98,7 +102,7 @@ class ConstraintTableResource:
         Read-only and independent of the array bytes, so it cannot affect the
         content digest.
         """
-        return sum(int(getattr(self, name).nbytes) for name in self._ARRAY_NAMES)
+        return sum(int(getattr(self, name).nbytes) for name in CONSTRAINT_TABLE_TENSOR_NAMES)
 
     def __post_init__(self) -> None:
         # Freeze every array over an immutable bytes buffer.  ``frozen=True``
@@ -107,118 +111,12 @@ class ConstraintTableResource:
         # Building the array over an immutable ``bytes`` buffer makes both
         # reassignment and in-place mutation impossible, so a caller cannot
         # corrupt a table without the digest changing.
-        for field_name in (
-            "first_token_ids",
-            "prefix1_offsets",
-            "prefix1_values",
-            "prefix1_pair_keys",
-            "prefix2_value_offsets",
-            "prefix2_values",
-        ):
+        for field_name in CONSTRAINT_TABLE_TENSOR_NAMES:
             array = getattr(self, field_name)
             frozen = np.frombuffer(array.tobytes(), dtype=array.dtype).reshape(array.shape)
             object.__setattr__(self, field_name, frozen)
 
         object.__setattr__(self, "digest", compute_resource_digest(self))
-
-
-# Fields whose ndarrays travel over the wire as (bytes, dtype, shape).
-_ARRAY_FIELDS = (
-    "first_token_ids",
-    "prefix1_offsets",
-    "prefix1_values",
-    "prefix1_pair_keys",
-    "prefix2_value_offsets",
-    "prefix2_values",
-)
-
-
-def to_wire(resource: ConstraintTableResource) -> dict:
-    """Serialize a resource to a wire-safe dict.
-
-    vLLM v1 RPC decodes utility/collective payloads with an *untyped*
-    ``MsgpackDecoder``, so a pickled dataclass would arrive as a plain ``dict``
-    with numpy arrays as nested lists.  This payload uses only base types
-    (``bytes``, ``int``, ``str``) so it survives the msgpack round trip exactly.
-
-    Returns a dict with keys: ``array_fields`` (name -> {"data", "dtype",
-    "shape"}), ``max_prefix1_degree``, ``max_prefix2_degree``, ``vocab_size``,
-    ``digest``.
-    """
-    array_fields = {}
-    for name in _ARRAY_FIELDS:
-        array = getattr(resource, name)
-        array_fields[name] = {
-            "data": np.ascontiguousarray(array).tobytes(),
-            "dtype": str(array.dtype),
-            "shape": list(array.shape),
-        }
-    return {
-        "array_fields": array_fields,
-        "max_prefix1_degree": resource.max_prefix1_degree,
-        "max_prefix2_degree": resource.max_prefix2_degree,
-        "vocab_size": resource.vocab_size,
-        "digest": resource.digest,
-    }
-
-
-def from_wire(payload: dict) -> ConstraintTableResource:
-    """Rebuild a resource from a :func:`to_wire` payload.
-
-    The reconstructed resource re-freezes its arrays (pickle/msgpack would
-    otherwise make them writable) and recomputes the digest.  The digest in the
-    payload is verified against the recomputed value so corruption is caught.
-
-    Raises:
-        ValueError: if ``payload`` is malformed or its digest does not match
-            the recomputed digest.
-    """
-    try:
-        array_fields = payload["array_fields"]
-        max_prefix1_degree = int(payload["max_prefix1_degree"])
-        max_prefix2_degree = int(payload["max_prefix2_degree"])
-        vocab_size = int(payload["vocab_size"])
-        wire_digest = payload["digest"]
-    except (KeyError, TypeError) as exc:
-        raise ValueError(f"malformed constraint table wire payload: {exc}") from exc
-
-    arrays = {}
-    for name in _ARRAY_FIELDS:
-        try:
-            field = array_fields[name]
-            data = field["data"]
-            dtype = np.dtype(field["dtype"])
-            shape = tuple(field["shape"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"malformed wire payload for array {name!r}: {exc}") from exc
-        if isinstance(data, bytes):
-            arr = np.frombuffer(data, dtype=dtype).reshape(shape)
-        else:
-            arr = np.asarray(data, dtype=dtype).reshape(shape)
-        arrays[name] = arr
-
-    resource = ConstraintTableResource(
-        first_token_ids=arrays["first_token_ids"],
-        prefix1_offsets=arrays["prefix1_offsets"],
-        prefix1_values=arrays["prefix1_values"],
-        prefix1_pair_keys=arrays["prefix1_pair_keys"],
-        prefix2_value_offsets=arrays["prefix2_value_offsets"],
-        prefix2_values=arrays["prefix2_values"],
-        max_prefix1_degree=max_prefix1_degree,
-        max_prefix2_degree=max_prefix2_degree,
-        vocab_size=vocab_size,
-        digest=wire_digest,
-    )
-    # Validate the full table contract (dtypes, CSR, pair-key ordering, token
-    # range, degree consistency) and verify the digest covers everything the
-    # operator depends on.
-    validate_resource_tables(resource)
-    if resource.digest != wire_digest:
-        raise ValueError(
-            f"constraint table wire payload digest mismatch: expected "
-            f"{wire_digest}, recomputed {resource.digest}"
-        )
-    return resource
 
 
 def compute_resource_digest(resource: ConstraintTableResource) -> str:
@@ -229,14 +127,8 @@ def compute_resource_digest(resource: ConstraintTableResource) -> str:
     would truncate candidates without changing any array bytes.
     """
     hasher = hashlib.sha256()
-    for array in (
-        resource.first_token_ids,
-        resource.prefix1_offsets,
-        resource.prefix1_values,
-        resource.prefix1_pair_keys,
-        resource.prefix2_value_offsets,
-        resource.prefix2_values,
-    ):
+    for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+        array = getattr(resource, name)
         # Include dtype and shape so a reshape (e.g. [N] -> [N, 1]) changes the
         # digest even though the underlying bytes are identical.  The digest
         # must represent the full device-table layout the ABI depends on.
@@ -268,8 +160,7 @@ def derive_degrees(
 def validate_resource_tables(resource: ConstraintTableResource) -> None:
     """Validate the full table contract of a resource.
 
-    Shared by the compiler (after build) and ``from_wire`` (after rebuild) so a
-    wire payload cannot smuggle in an invalid table layout.  Checks:
+    Used after compilation and before uploading a resource to a device. Checks:
 
     - dtype contract: five int32 tables, one int64 pair-key table;
     - CSR offset monotonicity / bounds;
@@ -392,7 +283,6 @@ def validate_resource_tables(resource: ConstraintTableResource) -> None:
                 "prefix1_pair_keys must equal a_id * vocab_size + b_id for their owning CSR bucket"
             )
 
-    # Total resource size cap (covers the compiler path and from_wire).
     if resource.total_bytes > MAX_RESOURCE_BYTES:
         raise ValueError(
             f"constraint table resource total_bytes {resource.total_bytes} exceeds "
@@ -421,6 +311,18 @@ class ConstraintTableCompiler:
             ValueError: on a wrong ``format_version``, unknown token, an
                 out-of-range token ID, or an empty / inconsistent document.
         """
+        arrays, max_prefix1_degree, max_prefix2_degree = self.compile_arrays(document)
+        resource = ConstraintTableResource(
+            **arrays._asdict(),
+            max_prefix1_degree=max_prefix1_degree,
+            max_prefix2_degree=max_prefix2_degree,
+            vocab_size=self.vocab_size,
+        )
+        validate_resource_tables(resource)
+        return resource
+
+    def compile_arrays(self, document: dict) -> tuple[TrieArrays, int, int]:
+        """Compile one triples document into CSR arrays and its two maximum degrees."""
         self._validate_format_version(document)
 
         relations = document.get(RELATIONS_KEY)
@@ -518,19 +420,15 @@ class ConstraintTableCompiler:
         prefix2_values = np.asarray(prefix2_values_list, dtype=np.int32)
         first_token_ids = np.asarray(first_ids, dtype=np.int32)
 
-        resource = ConstraintTableResource(
+        arrays = TrieArrays(
             first_token_ids=first_token_ids,
             prefix1_offsets=prefix1_offsets,
             prefix1_values=prefix1_values,
             prefix1_pair_keys=prefix1_pair_keys,
             prefix2_value_offsets=prefix2_value_offsets,
             prefix2_values=prefix2_values,
-            max_prefix1_degree=max_prefix1_degree,
-            max_prefix2_degree=max_prefix2_degree,
-            vocab_size=self.vocab_size,
         )
-        validate_resource_tables(resource)
-        return resource
+        return arrays, max_prefix1_degree, max_prefix2_degree
 
     def _validate_format_version(self, document: dict) -> None:
         version = document.get(FORMAT_VERSION_KEY)

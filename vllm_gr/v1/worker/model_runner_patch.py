@@ -6,14 +6,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
-from importlib import import_module
-from types import ModuleType
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 
-from vllm_gr.config import ConstraintTableBackendEnum
+from vllm_gr.config import ConstraintMode, ConstraintTableBackendEnum
+from vllm_gr.config.models import runtime_constraint_table
+from vllm_gr.platforms.interface import ModelRunnerInstaller, ModelRunnerPatchHooks
 from vllm_gr.v1.worker.gr_context import (
+    _get_gr_config,
     get_beam_graph_runtime_stats,
 )
 from vllm_gr.v1.worker.gr_gc import (
@@ -29,19 +30,20 @@ from vllm_gr.v1.worker.model_runner_contracts import (
 )
 
 if TYPE_CHECKING:
+    from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
 
 logger = init_logger(__name__)
 
-_GPU_PATCH_MODULE = "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch"
-_NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu.npu_model_runner_patch"
-_V2_GPU_PATCH_MODULE = "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch"
 _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 
 
 def close_constraint_backend(runner: object) -> None:
     """Detach and idempotently close the runner-owned canonical Backend."""
 
+    from vllm_gr.v1.worker.runner_binding import close_backend_binding
+
+    close_backend_binding(runner)
     backend = getattr(runner, "constraint_backend", None)
     # Detach first so no concurrent observer can discover a Backend while it is
     # being closed, and so repeated shutdown/load calls are naturally idempotent.
@@ -103,7 +105,7 @@ def make_load_model_with_constraint_backend(
 
     @wraps(original)
     def load_model_with_constraint_backend(self: Any, *args: Any, **kwargs: Any) -> Any:
-        from vllm_gr.config import BeamExecutionMode, GRConfig
+        from vllm_gr.config import GRConfig
 
         # A complete load replaces the model runtime. Release the previous
         # Backend before loading weights so a failed reload cannot leave stale
@@ -112,19 +114,19 @@ def make_load_model_with_constraint_backend(
             close_runtime(self)
         close_constraint_backend(self)
         gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
-        table_config = gr_config.constraint_table
+        table_config = runtime_constraint_table(gr_config)
         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
         result = original(self, *args, **kwargs)
 
-        from vllm_gr.ops.lm_head_cache import install_lm_head_cache_reload_hooks
+        from vllm_gr.v1.worker.lm_head_cache import install_lm_head_cache_reload_hooks
 
         install_lm_head_cache_reload_hooks(self.model)
         backend = None
         try:
             gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
-            if gr_config.constrained_generation is False:
+            if gr_config.constraint_config.mode is ConstraintMode.NONE:
                 return result
-            table_config = gr_config.constraint_table
+            table_config = runtime_constraint_table(gr_config)
             if table_config is None or not table_config.enabled:
                 return result
 
@@ -140,7 +142,9 @@ def make_load_model_with_constraint_backend(
             from vllm_gr.config import resolve_candidate_width
 
             candidate_width = resolve_candidate_width(gr_config)
-            if candidate_width > table_config.max_top_k:
+            max_top_k = table_config.max_top_k
+            assert max_top_k is not None
+            if candidate_width > max_top_k:
                 raise ValueError(
                     "candidate_width must be <= constraint_table.max_top_k "
                     f"for canonical constraint sampling, got {candidate_width} > "
@@ -152,16 +156,17 @@ def make_load_model_with_constraint_backend(
             stage_options = {}
             if (
                 table_config.backend is ConstraintTableBackendEnum.NPU
-                and gr_config.beam_execution_mode is BeamExecutionMode.V1
+                and gr_config.beam_max_width is not None
                 and gr_config.beam_max_decode_steps <= 3
             ):
-                from vllm_gr.ops.npu_stage_logits import (
+                from vllm_gr.v1.worker.npu.stage_projection import (
                     can_install_npu_stage_projection,
                 )
 
                 # Check the loaded model before allocating compact tables.
                 if can_install_npu_stage_projection(self):
                     stage_options["enable_npu_stage_vocab"] = True
+                    stage_options["stage_lm_head"] = gr_config.deployment.npu_stage_lm_head
             backend = load_constraint_backend(
                 config=table_config,
                 device=getattr(self, "device", None),
@@ -181,11 +186,12 @@ def make_load_model_with_constraint_backend(
                 # Import GPU layers only after selecting the CUDA backend.
                 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-                window = backend.vocab_slice
+                cuda_backend = cast("CUDAConstraintBackend", backend)
+                window = cuda_backend.vocab_slice
                 if getattr(parallel, "tensor_parallel_size", 1) != 1:
                     # All ranks must retain the original full-logits collective path.
                     window = None
-                    backend.vocab_slice = None
+                    cuda_backend.vocab_slice = None
                     logger.info(
                         "vllm-gr: canonical CUDA vocabulary slicing disabled for TP>1; "
                         "using full-vocabulary projection"
@@ -204,7 +210,9 @@ def make_load_model_with_constraint_backend(
                 and getattr(backend, "stage_vocab", None) is not None
             ):
                 # Keep NPU projection imports isolated from CPU/CUDA startup.
-                from vllm_gr.ops.npu_stage_logits import install_npu_stage_projection
+                from vllm_gr.v1.worker.npu.stage_projection import (
+                    install_npu_stage_projection,
+                )
 
                 projection = install_npu_stage_projection(self, backend)
                 if projection is not None:
@@ -266,49 +274,34 @@ def make_shutdown_with_constraint_backend(
     return shutdown_with_constraint_backend
 
 
-def _active_platform_module_name() -> str:
-    """Return the patch module for the platform selected by vLLM."""
-    from vllm.platforms import current_platform
+def get_runner_hooks() -> ModelRunnerInstaller | ModelRunnerPatchHooks:
+    """Use the process-local provider, also for a fresh EngineCore child."""
+    from vllm_gr.platforms.errors import BackendNotActiveError
+    from vllm_gr.platforms.loader import activate_current_backend
+    from vllm_gr.platforms.registry import get_active_backend
 
-    if str(current_platform.device_type).lower() == "npu":
-        return _NPU_PATCH_MODULE
-    return _GPU_PATCH_MODULE
-
-
-def _active_runner_module_name() -> str:
-    """Select the platform first; only CUDA can opt into the V2 patches."""
-    from vllm.platforms import current_platform
-
-    platform_module = _active_platform_module_name()
-    if str(current_platform.device_type).lower() == "cuda" and _use_v2_model_runner():
-        return _V2_GPU_PATCH_MODULE
-    return platform_module
-
-
-def _use_v2_model_runner() -> bool:
-    """Read the V2 opt-in at patch installation, never during execution."""
-    from vllm.envs import VLLM_USE_V2_MODEL_RUNNER
-
-    return bool(VLLM_USE_V2_MODEL_RUNNER)
-
-
-def _get_active_platform_module() -> ModuleType:
-    return import_module(_active_runner_module_name())
+    try:
+        backend = get_active_backend()
+    except BackendNotActiveError:
+        backend = activate_current_backend()
+    return backend.get_model_runner_hooks()
 
 
 def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
-    """Discover ModelRunner targets for only the active platform."""
-    return cast(
-        tuple[tuple[str, type], ...], _get_active_platform_module().discover_worker_runners()
-    )
+    return cast(tuple[tuple[str, type], ...], get_runner_hooks().discover_worker_runners())
+
+
+def is_active_worker_runner_patched(runner_class: type) -> bool:
+    hooks = get_runner_hooks()
+    if isinstance(hooks, ModelRunnerInstaller):
+        return bool(hooks.is_patched(runner_class))
+    return is_worker_runner_patched(runner_class)
 
 
 def install_worker_utility_hooks(worker_cls: type) -> None:
     """Install named utility RPCs shared by CUDA and NPU Worker classes."""
-    from vllm_gr.constraints.worker_inject import install_worker_resource_hook
     from vllm_gr.v1.worker.hot_update import install_worker_hot_update_hooks
 
-    install_worker_resource_hook(worker_cls)
     install_worker_hot_update_hooks(worker_cls)
     if not getattr(worker_cls, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
         # Utility RPC dispatch resolves named Worker methods. Keep these
@@ -318,88 +311,42 @@ def install_worker_utility_hooks(worker_cls: type) -> None:
         setattr(worker_cls, _BEAM_GRAPH_STATS_HOOK_MARKER, True)
 
 
-def _install_active_worker_resource_hook() -> None:
-    """Mount named vllm-gr utility RPCs on the active CUDA Worker class."""
-
-    if _active_platform_module_name() != _GPU_PATCH_MODULE:
-        # NPUWorker installs this hook from its delayed init_device wrapper in
-        # ascend_compat, after vllm-ascend has finished resolving its class.
-        return
-    from vllm.v1.worker.gpu_worker import Worker
-
-    install_worker_utility_hooks(Worker)
-
-
-def _install_numpy_token_staging() -> None:
-    """Bulk NumPy token staging is shared by the V1 and V2 GPU runners.
-
-    ``StagedWriteTensor.stage_write`` and ``async_tensor_h2d`` are the same
-    objects on both runners, so the patch is runner-agnostic; installing it
-    from the common entry point gives V1 the bulk ``np.copyto`` path too.
-    NPU workers stage tokens through their own adapter.
-    """
-    if _active_platform_module_name() != _GPU_PATCH_MODULE:
-        return
-    from vllm_gr.v1.worker.cuda.numpy_staging import install_numpy_staging
-
-    install_numpy_staging()
-
-
 def apply_worker_patches() -> None:
-    """Install grouped-Beam hooks on active-platform ModelRunner targets."""
+    """Install the shared async guard and the selected provider's runner hooks."""
     from vllm_gr.v1.worker.gr_async_output import install_async_output_guard
 
     install_async_output_guard()
-    logger.info("vllm-gr: apply_worker_patches called")
-    # collective_rpc targets the Worker, not its ModelRunner.  Install this
-    # even when all runner hooks were already present (idempotent) so canonical
-    # Constraint Tables can be injected in both uniproc and multiproc engines.
-    _install_active_worker_resource_hook()
-    # Runner-agnostic: V1 and V2 both write prompt tokens through the same
-    # StagedWriteTensor, so install the NumPy staging patch before dispatch.
-    _install_numpy_token_staging()
+    hooks = get_runner_hooks()
+    if isinstance(hooks, ModelRunnerInstaller):
+        hooks.install()
+    else:
+        # Existing providers can continue to supply V1 wrapper factories.
+        install_v1_worker_hooks(hooks)
 
-    if _active_runner_module_name() == _V2_GPU_PATCH_MODULE:
-        # V2 runner exposes ``prepare_inputs``/``sample``/``sample_tokens`` and
-        # no ``_prepare_inputs``/``_bookkeeping_sync``; the V1 body below does
-        # unguarded attribute access that V2 lacks, so dispatch to the
-        # V2-specific installer instead.
-        from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
 
-        v2._apply_v2_runner_patches()
-        return
-
+def install_v1_worker_hooks(
+    platform_module: Any,
+    *,
+    cuda_hooks_type: CudaStageHooksType | None = None,
+    workspace_load_patcher: Callable[..., Any] | None = None,
+    constraint_max_batch: int = 1,
+    implementation_id: str | None = None,
+) -> None:
+    """Apply the V1 wrapper factories to the native classes supplied by a provider."""
     from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
 
-    platform_module = _get_active_platform_module()
-    # Bind both execution and startup to the installed runner, not a dispatch-time flag.
-    cuda_hooks_type: CudaStageHooksType | None = None
-    workspace_load_patcher = getattr(
-        platform_module, "make_load_model_with_beam_postprocess_workspace", None
-    )
-    if _active_platform_module_name() == _GPU_PATCH_MODULE:
-        from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
-            make_load_model_with_beam_postprocess_workspace,
+    if workspace_load_patcher is None:
+        workspace_load_patcher = getattr(
+            platform_module, "make_load_model_with_beam_postprocess_workspace", None
         )
-        from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+    from vllm_gr.v1.worker.runner_binding import bind_after_model_load
+    from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
-        cuda_hooks_type = CudaStageHooksV1
-        workspace_load_patcher = make_load_model_with_beam_postprocess_workspace
-    constraint_max_batch = 1
-    if _active_platform_module_name() == _NPU_PATCH_MODULE:
-        from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
-
-        # A Decode stage contains B*W rows. Let the canonical NPU Backend
-        # process the supported logical batch in one call instead of W-row
-        # chunks; the GPU V1 row bound stays unchanged.
-        constraint_max_batch = max(SUPPORTED_BEAM_BATCH_SIZES)
-    runners_to_patch = [
-        (runner_name, runner_class)
-        for runner_name, runner_class in platform_module.discover_worker_runners()
-        if not is_worker_runner_patched(runner_class)
-    ]
-
-    for runner_name, runner_class in runners_to_patch:
+    for runner_name, runner_class in platform_module.discover_worker_runners():
+        if is_worker_runner_patched(runner_class):
+            if implementation_id is not None:
+                install_runner_lifecycle(runner_class, implementation_id, prepare="_prepare_inputs")
+            continue
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
             runner_class.load_model = make_load_model_with_constraint_backend(
@@ -441,23 +388,14 @@ def apply_worker_patches() -> None:
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )
-        bookkeeping_patch = getattr(platform_module, "make_patched_bookkeeping_sync", None)
-        if bookkeeping_patch is not None:
-            runner_class._bookkeeping_sync = bookkeeping_patch(runner_class._bookkeeping_sync)
-        else:
-            # CUDA V1 stages produce their own final output. Keep native
-            # bookkeeping intact for ordinary inference and verify its identity.
-            runner_class._vllm_gr_native_bookkeeping = runner_class._bookkeeping_sync
+        # V1 stages own their results; ordinary inference retains native bookkeeping.
+        runner_class._vllm_gr_native_bookkeeping = runner_class._bookkeeping_sync
         # Pure-prefill graph interception: replays captured prefill graphs for
         # prompt batches inside _model_forward (installed on both platforms;
         # the vLLM 0.30 runner classes expose this method).
         model_forward_patch = getattr(platform_module, "make_patched_model_forward", None)
         if model_forward_patch is not None and hasattr(runner_class, "_model_forward"):
             runner_class._model_forward = model_forward_patch(runner_class._model_forward)
-        sample_patch = getattr(platform_module, "make_patched_sample", None)
-        if sample_patch is not None and hasattr(runner_class, "_sample"):
-            runner_class._sample = sample_patch(runner_class._sample)
-
         # Async V1 stages own sampling after execute_model returns.
         sample_tokens_patch = getattr(platform_module, "make_patched_sample_tokens", None)
         if sample_tokens_patch is not None and hasattr(runner_class, "sample_tokens"):
@@ -484,13 +422,9 @@ def apply_worker_patches() -> None:
                 @wraps(_orig)
                 def patched_capture_model(self: Any, *args: Any, **kwargs: Any) -> Any:
                     res = _orig(self, *args, **kwargs)
-                    from vllm_gr.config import BeamExecutionMode
-                    from vllm_gr.v1.worker.gr_context import (
-                        _get_gr_config,
-                    )
                     from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
-                    if _get_gr_config(self).beam_execution_mode is BeamExecutionMode.V1:
+                    if _get_gr_config(self).beam_max_width is not None:
                         capture_async_forward(self, hooks_type=hooks_type)
                     elif _beam_capture is not None:
                         try:
@@ -557,5 +491,22 @@ def apply_worker_patches() -> None:
                     runner_class._determine_batch_execution_and_padding
                 )
 
+        if callable(getattr(runner_class, "load_model", None)):
+            runner_class.load_model = bind_after_model_load(runner_class.load_model)
+        if implementation_id is not None:
+            install_runner_lifecycle(runner_class, implementation_id, prepare="_prepare_inputs")
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)
+
+
+def validate_model_runner_patch() -> str | None:
+    runners = discover_active_worker_runners()
+    if not runners:
+        return "No supported active-platform ModelRunner is available"
+
+    failures = [
+        f"{runner_name} beam execution hooks are not installed"
+        for runner_name, runner_class in runners
+        if not is_active_worker_runner_patched(runner_class)
+    ]
+    return "; ".join(failures) or None

@@ -19,6 +19,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_gr.config import GRConfig
+from vllm_gr.config.models import DEFAULT_DEPLOYMENT
 from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
     _build_beam_mappings,
     _build_std_mappings,
@@ -33,7 +35,8 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import (
     create_beam_tensors,
     create_std_tensors,
 )
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.attention.backends.beam_prefix_policy import configured_fa_version
+from vllm_gr.v1.beam import BEAM_DATA_VAR
 
 logger = init_logger(__name__)
 
@@ -72,7 +75,6 @@ class BeamAttentionMetadata:
     std_seqlens_q_cpu: list | None = None
     std_cu_seqlens_q_cpu: list | None = None
     std_seqlens_kv_cpu: list | None = None
-    std_cu_seqlens_kv_cpu: list | None = None
 
     # Shared prefix context arrays
     prefix_indices: torch.Tensor | None = None
@@ -85,7 +87,6 @@ class BeamAttentionMetadata:
     prefix_seqlens_q_cpu: list | None = None
     prefix_cu_seqlens_q_cpu: list | None = None
     prefix_seqlens_kv_cpu: list | None = None
-    prefix_cu_seqlens_kv_cpu: list | None = None
 
     # Per-beam incremental suffix lengths
     suffix_cu_seqlens_q_device: torch.Tensor | None = None
@@ -137,11 +138,15 @@ class BeamAttentionMetadata:
     # parameter to ``cascade_attention``.  This field is kept only for
     # backward compatibility with callers that have not yet migrated.
     beam_layer_idx: int = 0
-    beam_pool_slots: list = None  # Per beam-request slot index (for max_batch>1)
+    beam_pool_slots: list[int] | None = None  # Per-request slot IDs in the Beam partition.
     incremental_suffix_kv_len: int = 0  # decode_step + 1
     # Host proof that the current NPU batch routes every row in order. Graph
     # dispatch must preserve this layout: replay does not re-run Python guards.
     npu_prefix_rows_are_identity: bool = False
+    prefix_policy: str = DEFAULT_DEPLOYMENT.prefix_policy
+    prefix_min_chain_us: float = DEFAULT_DEPLOYMENT.prefix_min_chain_us
+    prefix_calibrations: dict | None = None
+    explicit_fa_version: int | None = None
 
 
 def require_beam_decode_session(metadata: BeamAttentionMetadata) -> Any:
@@ -164,6 +169,122 @@ def resolve_beam_pool(metadata: BeamAttentionMetadata, beam_pool: Any = None) ->
     if not 0 <= layer_idx < len(pools) or pools[layer_idx] is None:
         raise RuntimeError("Beam decode requires a KV pool for the attention layer")
     return pools[layer_idx]
+
+
+def build_async(
+    *,
+    layout: dict[str, list[int]],
+    views: dict[str, torch.Tensor],
+    session: Any,
+    mask: torch.Tensor,
+    slots: torch.Tensor,
+    block_size: int,
+    max_model_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    prefix_policy: str = DEFAULT_DEPLOYMENT.prefix_policy,
+    prefix_min_chain_us: float = DEFAULT_DEPLOYMENT.prefix_min_chain_us,
+    prefix_calibrations: dict | None = None,
+    explicit_fa_version: int | None = None,
+) -> BeamAttentionMetadata:
+    """Build a fresh metadata description over stable device storage each step.
+
+    Native execution uses block-aligned model/pool bounds. A matching
+    measured profile enables bounded prefix-length graph buckets.
+    """
+    if session is None or not session.is_active:
+        raise RuntimeError("Beam decode requires an active beam session and KV pool")
+    rows = len(layout["positions"])
+    batch = len(layout["prefix_lengths"])
+    width = rows // batch
+    blocks = views["blocks"].view(batch, -1)
+    from vllm_gr.v1.attention.backends.beam_prefix_policy import (
+        PrefixShape,
+        available_prefix_versions,
+        device_fingerprint,
+        multi_processor_count,
+        prefix_bucket,
+        resolve_prefix_plan,
+    )
+
+    bucket = 0
+    if not envs.VLLM_BATCH_INVARIANT and prefix_policy != "off":
+        candidate = prefix_bucket(max(layout["prefix_lengths"]), block_size, max_model_len)
+        versions = available_prefix_versions(blocks.device.index)
+        explicit = explicit_fa_version
+        plan = None
+        if versions:
+            plan = resolve_prefix_plan(
+                PrefixShape(
+                    batch=batch,
+                    width=width,
+                    length=candidate,
+                    heads=num_heads,
+                    kv_heads=num_kv_heads,
+                    dim=session.context.pools[0].unshared_key.shape[-1],
+                    dtype=str(session.context.dtype),
+                    block_size=block_size,
+                ),
+                # An explicit choice decides the backend; otherwise the best
+                # supported one (FA3/FA4) keeps its own split-K heuristic and
+                # does not need a length-scoped graph bound.
+                default_version=explicit if explicit is not None else max(versions),
+                fingerprint=device_fingerprint(blocks.device.index),
+                supported_versions=versions,
+                sm_count=multi_processor_count(blocks.device.index),
+                explicit_version=explicit,
+                policy=prefix_policy,
+                min_chain_us=prefix_min_chain_us,
+                calibrations=prefix_calibrations,
+            )
+        if plan is not None and plan.segments > 1:
+            pages = (candidate + block_size - 1) // block_size
+            chunk = max(1, (pages + plan.segments - 1) // plan.segments)
+            if chunk * plan.segments <= blocks.shape[1]:
+                bucket = candidate
+    return BeamAttentionMetadata(
+        num_actual_tokens=rows,
+        prefix_policy=prefix_policy,
+        prefix_min_chain_us=prefix_min_chain_us,
+        explicit_fa_version=explicit_fa_version,
+        prefix_calibrations=prefix_calibrations,
+        num_reqs=batch,
+        max_query_len=width,
+        query_start_loc=views["query"],
+        query_start_loc_cpu=list(layout["query"]),
+        max_seq_len=max_model_len,
+        seq_lens=views["sequence"],
+        seq_lens_cpu=list(layout["sequence"]),
+        block_table=blocks,
+        slot_mapping=slots,
+        is_beam_decode=True,
+        beam_session=session,
+        beam_active_mask=mask,
+        prefix_indices=views["logits"],
+        num_prefix_indices=rows,
+        prefix_cu_seqlens_q_device=views["query"],
+        prefix_seqlens_kv_device=views["prefix_lengths"],
+        prefix_max_q_len=width,
+        prefix_max_seq_len=bucket or ((max_model_len + block_size - 1) // block_size) * block_size,
+        prefix_length_bucket=bucket,
+        prefix_block_table=blocks,
+        prefix_seqlens_q_cpu=[width] * batch,
+        prefix_cu_seqlens_q_cpu=list(layout["query"]),
+        prefix_seqlens_kv_cpu=list(layout["prefix_lengths"]),
+        suffix_cu_seqlens_q_device=views["suffix_query"],
+        suffix_cu_seqlens_k_device=views["suffix_offsets"],
+        suffix_seqlens_kv_device=views["suffix_lengths"],
+        suffix_max_q_len=1,
+        suffix_max_seq_len=session.context.max_decode_steps,
+        suffix_seqlens_q_cpu=[1] * rows,
+        suffix_cu_seqlens_q_cpu=list(layout["suffix_query"]),
+        suffix_seqlens_kv_cpu=list(layout["suffix_lengths"]),
+        suffix_cu_seqlens_kv_cpu=list(layout["suffix_offsets"]),
+        incremental_suffix_kv_len=layout["suffix_lengths"][0],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+    )
 
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
@@ -190,7 +311,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
-        from vllm_gr.config import GRConfig
 
         self._v2_gr_prefill_capture = (
             self._is_cuda
@@ -238,8 +358,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self._fixed_buffers = self._is_cuda or self._is_npu
         self._tensor_buffers = BeamTensorBuffers()
         if self._fixed_buffers:
-            from vllm_gr.config import GRConfig
-
             max_beams = GRConfig.from_vllm_config(vllm_config).beam_max_width
             if max_beams is None:
                 self._fixed_buffers = False
@@ -362,8 +480,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             num_reqs,
             req_ids,
             beam_data,
-            q_starts,
-            seq_lens_cpu_list,
             is_incremental,
             self.block_size,
         )
@@ -407,7 +523,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 suffix_seqlens_q_cpu,
                 prefix_req_idxs_cpu,
                 prefix_cu_seqlens_q_cpu,
-                prefix_cu_seqlens_kv_cpu,
                 suffix_cu_seqlens_q_cpu,
                 max_prefix_blocks_count,
                 prefix_indices_contiguous,
@@ -426,10 +541,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # Step-derived suffix lists (analytic; no numpy, no per-beam loop).
             s = decode_step + 1 if decode_step is not None else 1
             suffix_seqlens_kv_cpu = [s] * w_total
-            suffix_cu_seqlens_kv_cpu = list(range(s, (w_total + 1) * s, s))
+            suffix_cu_seqlens_kv_cpu: list[int] | None = list(range(s, (w_total + 1) * s, s))
             suffix_max_seq_len = s if w_total else 0
             # Query-start-dependent prefix indices (one range per request).
-            prefix_indices = []
+            prefix_indices: list[int] = []
             for _b_idx, _req_idx in enumerate(beam_req_idxs):
                 q_offset = beam_q_start_offsets[_b_idx]
                 w = beam_widths[_b_idx]
@@ -440,7 +555,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_seqlens_kv_cpu = []
             std_req_idxs = []
             std_cu_seqlens_q_cpu = None
-            std_cu_seqlens_kv_cpu = None
         else:
             (
                 std_reqs,
@@ -493,7 +607,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 std_seqlens_kv_cpu,
                 std_req_idxs,
                 std_cu_seqlens_q_cpu,
-                std_cu_seqlens_kv_cpu,
             ) = _build_std_mappings(std_reqs, q_starts)
 
             mappings = _build_beam_mappings(
@@ -514,7 +627,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_seqlens_kv_cpu = mappings.suffix_seqlens_kv
             prefix_req_idxs_cpu = mappings.prefix_req_idxs
             prefix_cu_seqlens_q_cpu = mappings.prefix_cu_seqlens_q
-            prefix_cu_seqlens_kv_cpu = mappings.prefix_cu_seqlens_kv
             suffix_cu_seqlens_q_cpu = mappings.suffix_cu_seqlens_q
             suffix_cu_seqlens_kv_cpu = mappings.suffix_cu_seqlens_kv
             max_prefix_blocks_count = mappings.max_prefix_blocks_count
@@ -538,7 +650,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     suffix_seqlens_q_cpu,
                     prefix_req_idxs_cpu,
                     prefix_cu_seqlens_q_cpu,
-                    prefix_cu_seqlens_kv_cpu,
                     suffix_cu_seqlens_q_cpu,
                     max_prefix_blocks_count,
                     prefix_indices_contiguous,
@@ -621,7 +732,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             and all(index == row for row, index in enumerate(prefix_indices))
         )
 
+        deployment = GRConfig.from_vllm_config(self.vllm_config).deployment
         meta = BeamAttentionMetadata(
+            explicit_fa_version=configured_fa_version(self.vllm_config),
+            prefix_policy=deployment.prefix_policy,
+            prefix_min_chain_us=deployment.prefix_min_chain_us,
+            prefix_calibrations=getattr(self.vllm_config, "_gr_prefix_calibrations", None),
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
@@ -640,7 +756,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_seqlens_q_cpu=std_seqlens_q_cpu,
             std_cu_seqlens_q_cpu=std_cu_seqlens_q_cpu,
             std_seqlens_kv_cpu=std_seqlens_kv_cpu,
-            std_cu_seqlens_kv_cpu=std_cu_seqlens_kv_cpu,
             std_req_idxs_cpu=std_req_idxs,
             prefix_req_idxs_cpu=prefix_req_idxs_cpu,
             max_prefix_blocks_count=max_prefix_blocks_count,
@@ -653,7 +768,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_seqlens_q_cpu=prefix_seqlens_q_cpu,
             prefix_cu_seqlens_q_cpu=prefix_cu_seqlens_q_cpu,
             prefix_seqlens_kv_cpu=prefix_seqlens_kv_cpu,
-            prefix_cu_seqlens_kv_cpu=prefix_cu_seqlens_kv_cpu,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             suffix_cu_seqlens_q_device=suffix_cu_seqlens_q_device,
             suffix_cu_seqlens_k_device=suffix_cu_seqlens_k_device,
@@ -728,7 +842,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 num_std_blocks = (
                     metadata.std_block_table.shape[1] if metadata.std_block_table is not None else 0
                 )
-                std_block_table = self._tensor_buffers.std_block_table[:num_std, :num_std_blocks]
+                std_buffer = self._tensor_buffers.std_block_table
+                assert std_buffer is not None
+                std_block_table = std_buffer[:num_std, :num_std_blocks]
                 std_block_table.copy_(blk_table[metadata.std_req_idxs_cpu, :num_std_blocks])
                 new_metadata.std_block_table = std_block_table
             else:
@@ -738,7 +854,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 num_prefix = len(metadata.prefix_req_idxs_cpu)
                 # G1: full-width view (must match the view used at capture time
                 # so the replayed graph reads the same tensor geometry).
-                prefix_block_table = self._tensor_buffers.prefix_block_table[:num_prefix]
+                prefix_buffer = self._tensor_buffers.prefix_block_table
+                assert prefix_buffer is not None
+                prefix_block_table = prefix_buffer[:num_prefix]
                 prefix_block_table[:, : metadata.max_prefix_blocks_count].copy_(
                     blk_table[metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count]
                 )

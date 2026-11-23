@@ -57,7 +57,6 @@ def upload_npu_tries(
     op: Callable[..., tuple[torch.Tensor, torch.Tensor]] = _candidate_set_op,
 ) -> NPUConstraintBackend:
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
-    monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
     backend, _ = loader._upload_npu_backend(  # noqa: SLF001
         table,
         device=torch.device("cpu"),
@@ -247,7 +246,6 @@ def test_readiness_covers_every_root_and_both_projection_domains(
 ) -> None:
     table = make_npu_tries()
     observed: list[tuple[int, int, bool]] = []
-    monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
     backend, cases = loader._upload_npu_backend(  # noqa: SLF001
         table,
@@ -347,7 +345,6 @@ def test_multi_root_partial_upload_releases_owned_tensors_with_original_error(
 
     monkeypatch.setattr(loader, "_upload_table_tensor", upload)
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
-    monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
     with pytest.raises(RuntimeError) as raised:
         loader._upload_npu_backend(  # noqa: SLF001
             table,

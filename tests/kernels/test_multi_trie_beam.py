@@ -11,16 +11,16 @@ import pytest
 import torch
 
 from tests.constraints.test_multi_trie import SIDS, make_tries
+from tests.helpers.beam_requests import make_multi_batch_request
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
     install_decode_model,
     metadata,
 )
-from tests.test_gr_async_scheduler import _multi_batch_request
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
-from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
+from vllm_gr.v1.beam.dispatch import GR_WORKER_RESULT_ATTR
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unav
 
 def root_dispatch(stage, roots, widths=None, factors=None):
     m = metadata(stage)
-    request = _multi_batch_request()
+    request = make_multi_batch_request()
     params = msgspec.structs.replace(
         m.beam_params, dynamic_beam_widths=widths, per_parent_beam_widths=factors
     )

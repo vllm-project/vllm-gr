@@ -1,0 +1,7 @@
+# Pangu uses native vLLM sampling and attention.
+gr:
+  beam_width: null
+  candidate_width: null
+  worker_decision: false
+  beam_graph_enabled: false
+  prefill_graph_enabled: false

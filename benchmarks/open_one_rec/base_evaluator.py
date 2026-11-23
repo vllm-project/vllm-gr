@@ -17,8 +17,14 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+class EvaluationError(RuntimeError):
+    """An evaluation failed to produce trustworthy metrics."""
+
+
 class BaseEval(ABC):
     """Base class for all task evaluators"""
+
+    reuse_cached_metrics = True
 
     def __init__(
         self,
@@ -84,7 +90,7 @@ class BaseEval(ABC):
             return self._compute_metrics_from_scratch()
 
         # If cached overall metrics exist, use them
-        if self._has_all_required_metrics():
+        if self.reuse_cached_metrics and self._has_all_required_metrics():
             logger.info("Using existing overall metrics from eval_results...")
             # Return cached metrics with empty per_sample_metrics (not needed when using cache)
             return self.cached_metrics, {}
@@ -93,13 +99,14 @@ class BaseEval(ABC):
         logger.info("Computing metrics from scratch...")
         return self._compute_metrics_from_scratch()
 
-    def _all_samples_have_keys(self, required_keys: List[str]) -> bool:
-        """Check if all samples have required keys"""
-        for sample in self.samples.values():
-            for key in required_keys:
-                if key not in sample:
-                    return False
-        return True
+    def _require_judge_metrics(
+        self, metrics: Dict[str, Any], metric: str, count: str, minimum: float, maximum: float
+    ) -> None:
+        if not metrics.get(count):
+            raise EvaluationError(f"{self.task_name}: Judge produced zero valid scores")
+        value = metrics.get(metric)
+        if type(value) not in (int, float) or not minimum <= value <= maximum:
+            raise EvaluationError(f"{self.task_name}: missing or invalid Judge metric {metric}")
 
     @property
     def required_metrics(self) -> Optional[List[str]]:

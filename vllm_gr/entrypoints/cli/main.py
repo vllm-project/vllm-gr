@@ -44,17 +44,11 @@ def dispatch_main() -> None:
 
 
 def _add_mode_option(parser: argparse.ArgumentParser) -> None:
-    # The public configuration resolver uses dest="gr" for its JSON mapping.
-    # Keep that action and its conversion/defaults, giving it an unambiguous
-    # spelling when the standalone --gr token selects the command mode.
-    action = parser._option_string_actions.pop("--gr", None)
-    if action is not None:
-        action.option_strings = [
-            "--gr-config" if name == "--gr" else name for name in action.option_strings
-        ]
-        parser._option_string_actions["--gr-config"] = action
+    from vllm_gr.config.parser import common_engine_defaults
+
+    parser.set_defaults(**common_engine_defaults())
     parser.add_argument(
-        "--gr", action="store_true", dest="_gr_mode", help="Use the vLLM-GR command."
+        "--gr", action="store_true", dest="_gr_mode", default=True, help="Use the vLLM-GR command."
     )
 
 
@@ -73,7 +67,7 @@ def _serving_parser_type():
 
 
 def _gr_main(argv: list[str]) -> None:
-    from vllm_gr._env_check import configure_model_runner_default
+    from vllm_gr.engine.startup import configure_model_runner_default
 
     configure_model_runner_default()
     from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
@@ -84,7 +78,7 @@ def _gr_main(argv: list[str]) -> None:
     # Workload-owned arguments must not undergo serve-specific normalization.
     parser_type = FlexibleArgumentParser
     if command == "serve":
-        from vllm_gr.entrypoints.utils import patch_banner
+        from vllm_gr.entrypoints.cli.serve_banner import patch_banner
 
         patch_banner()
         parser_type = _serving_parser_type()

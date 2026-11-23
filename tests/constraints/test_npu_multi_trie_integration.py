@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from tests.constraints.test_npu_multi_trie import TRIPLES, make_npu_tries
-from vllm_gr.config import ConstraintTableConfig
+from vllm_gr.config import ConstraintBackendKind, ConstraintTableSpec
 from vllm_gr.config.models import MULTI_TRIE_CONSTRAINT_TABLE_FORMAT
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.backend import INVALID_LOGIT, ConstraintMetadata
@@ -43,13 +43,12 @@ def test_native_mixed_tries_match_independent_legal_set_reference(
     dtype: torch.dtype,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
     path = tmp_path / "multi.safetensors"
     digest = save_constraint_table_artifact(make_npu_tries(), path)
     backend = load_constraint_backend(
-        ConstraintTableConfig(
+        ConstraintTableSpec(
             enabled=True,
-            backend="npu",
+            backend=ConstraintBackendKind.NPU,
             format=MULTI_TRIE_CONSTRAINT_TABLE_FORMAT,
             path=str(path),
             artifact_digest=digest,

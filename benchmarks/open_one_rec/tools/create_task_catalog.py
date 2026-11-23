@@ -15,6 +15,7 @@ import pandas as pd
 import regex as re
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_DATASET_PATH = "./data/benchmark_data"
 
 SID_BEGIN_TOKEN = "<|sid_begin|>"
 SID_END_TOKEN = "<|sid_end|>"
@@ -133,7 +134,7 @@ def _resolve_data_file(task_name: str, split: str, data_dir: str) -> Path:
 def create_task_sid_catalog(
     task_name: str,
     split: str = "test",
-    data_dir: str = "data",
+    data_dir: str = DEFAULT_DATASET_PATH,
     output_path: Optional[str] = None,
     deduplicate: bool = True,
 ) -> tuple[Path, int]:
@@ -183,8 +184,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-path",
         "-d",
-        default="data",
-        help="Data root directory containing task parquet files. Default: data.",
+        default=DEFAULT_DATASET_PATH,
+        help="Data root directory containing task parquet files. Default: %(default)s.",
     )
     parser.add_argument(
         "--output-path",

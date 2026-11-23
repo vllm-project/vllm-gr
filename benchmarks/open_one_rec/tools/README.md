@@ -3,7 +3,9 @@
 ## Dataset prerequisite
 
 Before using these tools, download the OpenOneRec dataset as described in
-[docs/benchmarks/README.md#get-dataset](../../../docs/benchmarks/README.md#get-dataset).
+[the dataset guide](../../../docs/benchmarking/README.md#download-the-dataset).
+For a custom dataset layout, set `ONEREC_DATA` to the directory containing the
+task parquet files and catalog mappings.
 
 ## create_task_catalog.py
 
@@ -23,16 +25,17 @@ Output format:
 From repository root:
 
 ```bash
+export ONEREC_DATA="$PWD/data/benchmark_data"
 python benchmarks/open_one_rec/tools/create_task_catalog.py \
   --task-type interactive \
-  --dataset-path ./data \
+  --dataset-path "$ONEREC_DATA" \
   --output-path interactive_catalog.json
 ```
 
 ### CLI flags
 
 - `--task-type`, `-t` (required): task type, e.g. `interactive`, `video`, `label_cond`, `product`, `ad`.
-- `--dataset-path`, `-d`: data root directory (default: `data`).
+- `--dataset-path`, `-d`: data root directory (default: `./data/benchmark_data`).
 - `--output-path`, `-o`: output JSON path (default: `<task_type>_test_sid_catalog.json`).
 - `--log-level`: `DEBUG|INFO|WARNING|ERROR` (default: `INFO`).
 
@@ -40,9 +43,8 @@ python benchmarks/open_one_rec/tools/create_task_catalog.py \
 
 - The tool reads answers from `metadata["answer"]` (falls back to top-level `answer` if present).
 - The output is deduplicated (unique SID sequences only).
-- Input parquet is searched in:
-    - `data/<task>/<task>_test.parquet`
-    - `data/<task>_test.parquet`
+- The tool searches `<dataset-path>/<task>/<task>_test.parquet` and
+  `<dataset-path>/<task>_test.parquet`.
 
 ## convert_catalog.py
 
@@ -53,14 +55,15 @@ Convert OpenOneRec `sid2pid.json` keys into SID token sequences for vllm-gr cata
 From repository root:
 
 ```bash
+export ONEREC_DATA="$PWD/data/benchmark_data"
 python benchmarks/open_one_rec/tools/convert_catalog.py \
-  --dataset-path ./data \
+  --dataset-path "$ONEREC_DATA" \
   --output-path catalog.json
 ```
 
 ### CLI flags
 
-- `--dataset-path`, `-d`: data root directory containing `sid2pid.json` (default: `data`).
+- `--dataset-path`, `-d`: data root directory containing `sid2pid.json` (default: `./data/benchmark_data`).
 - `--output-path`, `-o`: output catalog JSON path (default: `catalog.json`).
 - `--log-level`: `DEBUG|INFO|WARNING|ERROR` (default: `INFO`).
 

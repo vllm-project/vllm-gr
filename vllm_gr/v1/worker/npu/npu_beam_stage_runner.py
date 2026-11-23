@@ -32,22 +32,23 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamRequestOutput,
     BeamSequenceColumns,
 )
-from vllm_gr.v1.beam.beam_decision import run_beam_decision_candidates
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
-from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
-from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.beam.decision import run_beam_decision_candidates
+from vllm_gr.v1.beam.dispatch import (
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_RETIRE_RESULT_ATTR,
+    GR_STAGE_OUTPUT_ATTR,
+    GR_WORKER_RESULT_ATTR,
     GRRetireMetadata,
     GRRetireResult,
     GRStageMetadata,
     GRWorkerResult,
 )
-from vllm_gr.v1.engine.gr_async_scheduler import (
-    GR_RETIRE_OUTPUT_ATTR,
-    GR_RETIRE_RESULT_ATTR,
-    GR_STAGE_OUTPUT_ATTR,
-    GR_WORKER_RESULT_ATTR,
+from vllm_gr.v1.beam.execution_batch import (
+    BeamBatchExecutionView,
+    BeamExecutionContractError,
 )
+from vllm_gr.v1.beam.session import BeamSearchSession
+from vllm_gr.v1.worker.npu.beam_execution_batch import NPUBeamExecutionBatch
 from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
@@ -60,7 +61,7 @@ class NPUEagerBeamStageRunner:
     def __init__(self, worker: Any) -> None:
         validate_npu_eager_capabilities(worker)
         self.worker = worker
-        self.previous = None
+        self.previous: BeamBatchExecutionView | None = None
         self.pending_plan: NPUEagerStagePlan | None = None
         self.execution_error: Exception | None = None
         self.logical_scheduler_output: Any = None
@@ -175,11 +176,11 @@ class NPUEagerBeamStageRunner:
                 if getattr(
                     config, "beam_graph_widths", None
                 ) is not None or self._uses_dynamic_state(plan):
-                    from vllm_gr.v1.beam.npu_dynamic_beam import (
-                        initialize_npu_packed_stage_pools,
+                    from vllm_gr.v1.beam.dynamic_width import (
+                        initialize_packed_stage_pools,
                     )
 
-                    initialize_npu_packed_stage_pools(context)
+                    initialize_packed_stage_pools(context)
                 self.worker._gr_npu_eager_context = context
         if required_steps > context.decision.sequence.shape[2]:
             raise ValueError("NPU Beam history exceeds the configured Decode capacity")
@@ -188,7 +189,7 @@ class NPUEagerBeamStageRunner:
             # batch must own the complete context before initializing slots.
             raise RuntimeError("cannot initialize an NPU Beam batch in an active attention context")
         if self._uses_dynamic_state(plan):
-            from vllm_gr.v1.beam.npu_dynamic_beam import prune_npu_stage_pools
+            from vllm_gr.v1.beam.dynamic_width import prune_stage_pools
 
             widths = execution.dynamic_beam_widths or (execution.beam_width,) * required_steps
             keep_widths = set(widths[:-1])
@@ -196,7 +197,7 @@ class NPUEagerBeamStageRunner:
                 keep_widths.update(
                     width for batch, width in captured_shapes if batch == execution.batch_size
                 )
-            prune_npu_stage_pools(context, keep_widths)
+            prune_stage_pools(context, keep_widths)
         sessions = []
         allocated_request_ids = []
         dynamic_state = None
@@ -219,11 +220,11 @@ class NPUEagerBeamStageRunner:
                 sessions.append(session)
             attention_batch = NPUBeamExecutionBatch(execution, sessions)
             if self._uses_dynamic_state(plan):
-                from vllm_gr.v1.beam.npu_dynamic_beam import NPUDynamicBeamState
+                from vllm_gr.v1.beam.dynamic_width import DynamicBeamState
 
                 if self.previous is None or self.previous.kind != "prefill":
                     raise RuntimeError("dynamic NPU Beam state requires the preceding Prefill")
-                dynamic_state = NPUDynamicBeamState(context, execution.batch_size, required_steps)
+                dynamic_state = DynamicBeamState(context, execution.batch_size, required_steps)
                 dynamic_state.initialize(self.prefill_candidates, self.previous.output_width)
             else:
                 width = execution.beam_width
@@ -362,7 +363,7 @@ class NPUEagerBeamStageRunner:
                         device=self.worker.device,
                     )
                 )
-                from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+                from vllm_gr.v1.beam import BEAM_DATA_VAR
 
                 token = BEAM_DATA_VAR.set(beam_info)
             else:
@@ -385,7 +386,7 @@ class NPUEagerBeamStageRunner:
             raise
         finally:
             if token is not None:
-                from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+                from vllm_gr.v1.beam import BEAM_DATA_VAR
 
                 BEAM_DATA_VAR.reset(token)
 
@@ -960,10 +961,9 @@ class NPUEagerBeamStageRunner:
 def get_npu_stage_runner(worker: Any, scheduler_output: Any) -> NPUEagerBeamStageRunner:
     """Return the exclusive local NPU persistent execution owner."""
 
-    from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.config.execution import require_beam_execution_mode
+    from vllm_gr.config.execution import require_beam_config
 
-    require_beam_execution_mode(worker.vllm_config, BeamExecutionMode.V1)
+    require_beam_config(worker.vllm_config)
     existing = getattr(worker, "_gr_npu_stage_runner", None)
     if existing is not None and not existing.closed:
         return existing

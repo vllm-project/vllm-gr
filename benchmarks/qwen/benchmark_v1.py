@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Benchmark the offline ``GRLLM.beam_search_v1`` API.
+"""Benchmark the offline ``GRLLM.beam_search`` API.
 
 The benchmark is self-contained within the vllm-gr repository. It consumes a
 JSONL workload produced by ``benchmarks/qwen/make_workload.py``, builds a
@@ -22,6 +22,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Direct script invocation also needs the source checkout's shared statistics.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmarks.metrics import linear_percentile_sorted
 
 MAX_BEAM_STEPS = 3
 
@@ -87,8 +93,7 @@ def _percentile(values: list[float], quantile: float) -> float | None:
     if not values:
         return None
     ordered = sorted(float(value) for value in values)
-    index = min(len(ordered) - 1, int(quantile * (len(ordered) - 1)))
-    return ordered[index]
+    return linear_percentile_sorted(ordered, quantile)
 
 
 def _metric_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -314,23 +319,21 @@ def build_constraint_artifact(
 
 def canonical_gr_config(args: argparse.Namespace, artifact: ConstraintArtifact) -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": not args.disable_beam_graph,
-            "max_width": args.beam_width,
-            "max_decode_steps": args.beam_steps,
-        },
+        "beam_graph_enabled": not args.disable_beam_graph,
+        "beam_width": [args.beam_width] * args.beam_steps,
+        "max_decode_steps": args.beam_steps,
+        "constraint_mode": "table",
         "constraint_table": {
-            "enabled": True,
             "backend": "cuda",
             "path": str(artifact.path),
             "format": "constraint_table_v1",
-            "artifact_digest": artifact.artifact_digest,
-            "tokenizer_digest": artifact.tokenizer_digest,
             "max_top_k": args.beam_width,
+            "digests": {
+                "artifact": artifact.artifact_digest,
+                "tokenizer": artifact.tokenizer_digest,
+            },
         },
-        "attention_backend": args.attention_backend or None,
+        "candidate_width": [args.beam_width] * args.beam_steps,
     }
 
 
@@ -350,13 +353,13 @@ def _normalize_output(
     outputs = list(output_rows)
     if len(outputs) != 1:
         raise RuntimeError(
-            f"beam_search_v1 returned {len(outputs)} request outputs; expected exactly 1"
+            f"beam_search returned {len(outputs)} request outputs; expected exactly 1"
         )
     prompt_ids = [int(token) for token in row["input_ids"]]
     sequences = list(getattr(outputs[0], "sequences", ()))
     if len(sequences) != expected_beam_width:
         raise RuntimeError(
-            f"beam_search_v1 returned {len(sequences)} beams; expected {expected_beam_width}"
+            f"beam_search returned {len(sequences)} beams; expected {expected_beam_width}"
         )
     beams = []
     for rank, sequence in enumerate(sequences):
@@ -395,7 +398,7 @@ def _run_once(
     for row in workload:
         request_started = time.perf_counter()
         # Beam Search V1 currently accepts exactly one prompt per offline call.
-        outputs = llm.beam_search_v1(
+        outputs = llm.beam_search(
             [{"prompt_token_ids": row["input_ids"]}],
             params,
             use_tqdm=False,
@@ -565,7 +568,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         ignore_eos=args.ignore_eos,
         length_penalty=args.length_penalty,
     )
-    max_prompt_len = max(len(row["input_ids"]) for row in workload)
+    input_token_lengths = [len(row["input_ids"]) for row in workload]
+    max_prompt_len = max(input_token_lengths)
     max_model_len = args.max_model_len or max_prompt_len + args.beam_steps
     max_num_batched_tokens = args.max_num_batched_tokens or max(
         max_prompt_len, args.beam_width, max_model_len
@@ -581,10 +585,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     )
     timeline_trace_dir = Path(timeline_temp.name) if timeline_temp is not None else None
     engine_kwargs: dict[str, Any] = {
+        **(
+            {"attention_config": {"backend": args.attention_backend}}
+            if args.attention_backend
+            else {}
+        ),
         "model": args.model,
         "trust_remote_code": args.trust_remote_code,
         "max_logprobs": args.beam_width,
-        "vllm_gr_config": gr_config,
         "async_scheduling": True,
         "enable_prefix_caching": args.enable_prefix_caching,
         "max_num_seqs": 1,
@@ -600,7 +608,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     timeline_run = None
     try:
-        with GRLLM(**engine_kwargs) as llm:
+        with GRLLM(gr=gr_config, **engine_kwargs) as llm:
             for _ in range(args.warmup_runs):
                 _run_once(
                     llm,
@@ -637,7 +645,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[2]
     return {
         "framework": "vllm-gr",
-        "api": "GRLLM.beam_search_v1",
+        "api": "GRLLM.beam_search",
         "execution_mode": "offline_sequential_single_prompt",
         "model": args.model,
         "vllm_gr_repo": str(repo_root),
@@ -651,7 +659,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "synthetic_token_layout": (
             args.synthetic_token_layout if args.generate_constraint_triples else None
         ),
-        "context_len": args.context_len,
+        "context_len": max_prompt_len if min(input_token_lengths) == max_prompt_len else None,
+        "declared_context_len": args.context_len,
+        "input_token_lengths": input_token_lengths,
         "token_id_start": args.token_id_start,
         "token_id_end_exclusive": args.token_id_end,
         "beam_steps": args.beam_steps,
@@ -660,21 +670,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "requests": len(workload),
         "warmup_runs": args.warmup_runs,
         "repeat": args.repeat,
-        "timeline": (
-            {
-                "output": str(timeline_target),
-                "requests": args.timeline_requests,
-                "repeat": args.timeline_repeat,
-                "profile_run_excluded_from_metrics": True,
-                "wall_ms_samples": timeline_run["wall_ms_samples"],
-                "phase_semantics": (
-                    "stage 0 is Prefill and emits the first Beam result; "
-                    f"stages 1..{args.beam_steps - 1} are Decode"
-                ),
-            }
-            if timeline_target is not None and timeline_run is not None
-            else None
-        ),
+        "timeline": {
+            "output": str(timeline_target),
+            "requests": args.timeline_requests,
+            "repeat": args.timeline_repeat,
+            "profile_run_excluded_from_metrics": True,
+            "wall_ms_samples": timeline_run["wall_ms_samples"],
+            "phase_semantics": f"stage 0 is Prefill and emits the first Beam result; stages 1..{args.beam_steps - 1} are Decode",
+        }
+        if timeline_target is not None and timeline_run is not None
+        else None,
         "sampling_params": {
             "beam_width": args.beam_width,
             "max_tokens": args.beam_steps,

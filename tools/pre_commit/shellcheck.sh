@@ -3,17 +3,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 # Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm
-set -e
+set -eo pipefail
 
 scversion="v0.11.0"
+rcfile="$(dirname -- "${BASH_SOURCE[0]}")/.shellcheckrc"
+shellcheck_bin="$(command -v shellcheck || true)"
 
-if [ -d "shellcheck-${scversion}" ]; then
-    export PATH="$PATH:$(pwd)/shellcheck-${scversion}"
+# ShellCheck 0.10.0 and newer support an explicit rcfile.
+if [ -z "$shellcheck_bin" ] || ! "$shellcheck_bin" --rcfile="$rcfile" --version >/dev/null 2>&1; then
+    shellcheck_bin="$PWD/shellcheck-${scversion}/shellcheck"
 fi
 
-if ! [ -x "$(command -v shellcheck)" ]; then
+if [ ! -x "$shellcheck_bin" ]; then
     if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
-        echo "Please install shellcheck: https://github.com/koalaman/shellcheck?tab=readme-ov-file#installing"
+        echo "Please install ShellCheck 0.10.0 or newer: https://github.com/koalaman/shellcheck?tab=readme-ov-file#installing" >&2
         exit 1
     fi
 
@@ -23,9 +26,13 @@ if ! [ -x "$(command -v shellcheck)" ]; then
     echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $tarball" | sha256sum -c -
     tar -xJvf "$tarball"
     rm "$tarball"
-
-    export PATH="$PATH:$(pwd)/shellcheck-${scversion}"
 fi
 
+if (( $# )); then
+    exec "$shellcheck_bin" -s bash --rcfile="$rcfile" -- "$@"
+fi
 
-find . -name "*.sh" -not -path "./trc/*" -print0 | xargs -0 -I {} sh -c 'git check-ignore -q "{}" || shellcheck -s bash "{}"'
+# Manual full-tree check. Untracked output and ignored local tools are out of scope.
+git ls-files -z -- '*.sh' ':(exclude)trc/**' | while IFS= read -r -d '' file; do
+    "$shellcheck_bin" -s bash --rcfile="$rcfile" -- "$file" || exit $?
+done

@@ -208,11 +208,11 @@ def compute_sliced_logits(
             logger.info(
                 "vllm_gr: Quantized lm_head detected (%s). Sliced weight optimization "
                 "is disabled for quantized models; using safe output-logits slicing fallback.",
-                getattr(getattr(lm_head, "quant_method", None), "__class__", {}).__name__,
+                type(getattr(lm_head, "quant_method", None)).__name__,
             )
             lm_head._quant_slice_fallback_warned = True
 
-        if use_processor:
+        if logits_processor is not None and orig_get_logits is not None:
             full_logits = orig_get_logits(
                 logits_processor, hidden_states, lm_head, embedding_bias, skip_gather
             )
@@ -250,7 +250,7 @@ def compute_sliced_logits(
     proxy = _get_sliced_head(
         lm_head, embedding_bias, (off, sz, rank_start, rank_end), quant_group_size
     )
-    if use_processor:
+    if logits_processor is not None and orig_get_logits is not None:
         # This projection is local even when the original head is TP-sharded.
         # Let upstream _apply_head honor head_dtype, then remove our alignment
         # padding below rather than trimming against the original vocabulary.

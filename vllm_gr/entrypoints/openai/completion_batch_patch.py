@@ -9,7 +9,7 @@ though the V1 engine runs the members of one logical batch in a single forward.
 
 This module claims that case for the batch sizes the engine supports. Every
 other request -- non-beam, streaming, embedded prompts, a single prompt, an
-unsupported count, insufficient capacity, mismatched budgets, a LEGACY engine --
+unsupported count, insufficient capacity, mismatched budgets, an engine without Beam capacity --
 delegates to the original handler. Each such decline is logged with its reason,
 because a list that did not batch is otherwise indistinguishable from one that
 did: the response shape is identical either way.
@@ -31,7 +31,7 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 from vllm.renderers.inputs.preprocess import prompt_to_seq
 
-from vllm_gr.config import BeamExecutionMode, GRConfig
+from vllm_gr.config import GRConfig
 from vllm_gr.logger import init_logger
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 
@@ -67,9 +67,8 @@ def _batch_size(serving, request: CompletionRequest) -> int | None:
     if request.prompt_embeds is not None:
         return None
     vllm_config = getattr(serving.engine_client, "vllm_config", None)
-    # A LEGACY config means this engine was not built for the persistent V1
-    # sessions this route runs on.
-    if GRConfig.from_vllm_config(vllm_config).beam_execution_mode is not BeamExecutionMode.V1:
+    # Only Beam-configured engines own persistent sessions.
+    if GRConfig.from_vllm_config(vllm_config).beam_max_width is None:
         return None
     try:
         count = len(prompt_to_seq(request.prompt))
@@ -281,6 +280,7 @@ async def _delegate_completion(serving, request, raw_request):
     trie_ids = (getattr(request, "vllm_xargs", None) or {}).get("trie_ids")
     token = _COMPLETION_TRIE_IDS.set(None if trie_ids is None else iter(trie_ids))
     try:
+        assert _original_create_completion is not None
         return await _original_create_completion(serving, request, raw_request)
     finally:
         _COMPLETION_TRIE_IDS.reset(token)
@@ -296,7 +296,7 @@ async def create_completion_batch_dispatch(
         if (
             not request.use_beam_search
             or request.prompt_embeds is not None
-            or config.beam_execution_mode is not BeamExecutionMode.V1
+            or config.beam_max_width is None
         ):
             return self.create_error_response(
                 "trie_ids require GR Beam completion with token or text prompts",
@@ -316,15 +316,14 @@ async def create_completion_batch_dispatch(
     count = _batch_size(self, request)
     if count is None:
         return await _delegate_completion(self, request, raw_request)
-    sizes = GRConfig.from_vllm_config(self.engine_client.vllm_config).beam_online_batch_sizes
+    sizes = GRConfig.from_vllm_config(self.engine_client.vllm_config).deployment.beam_batch_sizes
     if count not in sizes:
         return await _decline(
             self,
             request,
             raw_request,
             count,
-            f"prompt count {count} is not one of the supported fixed batch sizes "
-            f"{[size for size in sizes if size > 1]}",
+            f"prompt count {count} is not one of the configured Beam batch sizes {list(sizes)}",
         )
 
     result = await self.render_completion_request(request)
@@ -377,7 +376,7 @@ def patch_completion_batch() -> None:
     OpenAIServingCompletion._create_completion = create_completion_batch_dispatch
 
 
-def _validate_completion_batch_patch() -> str | None:
+def validate_completion_batch_patch() -> str | None:
     """Verify the batch route is installed and the upstream seam still exists.
 
     Fail-closed on the surface the batch path calls. Instance attributes set by
