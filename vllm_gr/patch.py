@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from vllm_gr.config import pangu_patch as pangu_compat
 from vllm_gr.v1.attention import selector_patch
 from vllm_gr.v1.worker import sliced_logits_patch
 
@@ -40,7 +39,6 @@ CORE_PATCH_IDS = (
     "GR-PATCH-010",
     "GR-PATCH-013",
     "GR-PATCH-015",
-    "GR-PATCH-020",
     "GR-PATCH-022",
 )
 
@@ -295,9 +293,6 @@ def _apply_patches(force: bool = False, *, provider: "GRBackendProvider | None" 
 
         # Fresh workers can call this before provider activation.
         provider = activate_current_backend()
-    # ModelConfig construction happens before model loading, so preserve the
-    # official Pangu tied-weight layout at the earliest runtime boundary.
-    pangu_count = int(pangu_compat.apply_pangu_tied_embeddings_patch())
     # CUSTOM selection is shared by CUDA and Ascend. Install it before a
     # provider imports its native worker; it must not become an NPU-only hook.
     attention_count = selector_patch.apply_custom_attention_backend_patch(force=force)
@@ -311,7 +306,7 @@ def _apply_patches(force: bool = False, *, provider: "GRBackendProvider | None" 
             "initialization may be partial, restart the process"
         ) from exc
     beam_count = _apply_gr_beam_patches()
-    return pangu_count + attention_count + backend_count + beam_count
+    return attention_count + backend_count + beam_count
 
 
 def re_apply_patches(*, provider: "GRBackendProvider | None" = None) -> int:

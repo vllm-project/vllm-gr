@@ -26,19 +26,6 @@ failure_modes:
     offline_elapsed_seconds: warning
   online_non_accuracy: blocking
 
-pangu1b:
-  thresholds:
-    offline_accuracy_min: 1.00
-    online_accuracy_min: 1.00
-  failure_modes:
-    offline_accuracy: blocking
-    online_accuracy: blocking
-  device_overrides:
-    npu:
-      thresholds:
-        offline_accuracy_min: 0.875
-        online_accuracy_min: 0.875
-
 device_overrides:
   gpu:
     boards:

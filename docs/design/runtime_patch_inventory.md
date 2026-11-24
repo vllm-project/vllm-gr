@@ -197,16 +197,6 @@ Installer: `vllm_gr.platforms.ascend.config_patch.apply_engine_core_config_sanit
 
 Risk: `high`; process roles: `main`, `engine_core`, `worker`
 
-### GR-PATCH-020 — Pangu Tied Embeddings
-
-Scope: `core`; backend ID: `null`
-
-Owner: `vllm_gr/config/pangu_patch.py`
-
-Installer: `vllm_gr.config.pangu_patch.apply_pangu_tied_embeddings_patch`
-
-Risk: `high`; process roles: `main`, `engine_core`, `worker`
-
 ### GR-PATCH-021 — Contiguous Beam Prefix KV
 
 Scope: `backend`; backend ID: `ascend`
@@ -227,3 +217,4 @@ installer and no entry in the checked list above.
 | `GR-PATCH-006` | `OpenAIServingModels.__init__` | Legacy Catalog serving patch and its tests were removed; canonical V1 constraints load in the worker |
 | `GR-PATCH-014` | `LMCache RequestTracker, ReqMeta, and LMCacheConnectorV1Impl` | Experimental LMCache integration removed; no supported version pin or vLLM 0.30 validation |
 | `GR-PATCH-017` | `NPUWorker.profile_memory in vllm_ascend.worker.worker or vllm_ascend.worker.worker_v1` | Removal condition met by the 0.30 upgrade; vllm-ascend 0.30.0rc2 replaced profile_memory with log_memory_stats, which reads the two allocator counters directly, and the installer found no native method to wrap on that runtime |
+| `GR-PATCH-020` | `vllm.config.ModelConfig.maybe_untie_word_embeddings` | Model-specific tied-embedding compatibility was retired with its deployment recipe |

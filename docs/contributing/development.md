@@ -13,7 +13,6 @@ Use this table to find the implementation, tests and design guide for the area y
 | Workers, attention and kernels | [Workers](../../vllm_gr/v1/worker/), [attention backends](../../vllm_gr/v1/attention/backends/), [operators](../../vllm_gr/ops/) | [Workers](../../tests/v1/worker/), [attention](../../tests/v1/attention/), [kernels](../../tests/kernels/) | [ModelRunner V2](../design/module/model_runner_v2.md), [CUDA prefill](../design/feature/cuda_prefill_graph.md), [NPU prefill](../design/feature/npu_prefill_bsnd.md) |
 | Constraint artifacts and candidate scoring | [Constraints](../../vllm_gr/constraints/), [table builder](../../tools/constraints/build_constraint_table.py) | [Constraint tests](../../tests/constraints/) | [Constraint tables](../design/module/constraint_tables.md) |
 | Platform registration and runtime compatibility | [Platform providers](../../vllm_gr/platforms/), [runtime compatibility](../../vllm_gr/platforms/compat.py) | [Platform tests](../../tests/platforms/) | [Platform backend](../design/module/platform_backend.md) |
-| Model compatibility | [Pangu compatibility fixes](../../vllm_gr/config/pangu_patch.py) | [Pangu compatibility tests](../../tests/config/test_pangu_compat.py) | [Pangu evaluation and serving](../models/pangu.md) |
 
 ## Validate a change
 

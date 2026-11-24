@@ -105,10 +105,6 @@ CUDA Prefill and Decode capture policies differ by runner. See the
 [V2 integration guide](../docs/design/module/model_runner_v2.md) and
 [Prefill capture guide](../docs/design/feature/cuda_prefill_graph.md#configuration).
 
-## Run Pangu offline
-
-Follow the [Pangu evaluation guide](../docs/models/pangu.md#run-the-offline-accuracy-evaluation) to run GSM8K-mini with the local checkpoint.
-
 ## Measure performance
 
 - [Measure offline Beam Search latency](offline_inference/beam_search/README.md#measure-latency-without-profiling)

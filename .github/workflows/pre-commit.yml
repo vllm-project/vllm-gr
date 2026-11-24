@@ -832,241 +832,6 @@ jobs:
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
 
-  pangu-offline:
-    name: Pangu offline accuracy
-    # Accuracy remains independently required; the GPU concurrency group
-    # prevents this job from overlapping other accelerator jobs.
-    needs: [benchmark-policy, pre-commit]
-    if: >-
-      ${{ !cancelled() &&
-      needs.benchmark-policy.result == 'success' &&
-      needs.pre-commit.result == 'success' }}
-    runs-on: self-hosted
-    concurrency:
-      group: vllm-gr-accelerator-${{ github.repository }}
-      queue: max
-      cancel-in-progress: false
-    env:
-      BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
-      PANGU1B_OFFLINE_ACCURACY_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_OFFLINE_ACCURACY_THRESHOLD }}
-      PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE }}
-      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v1
-
-      - name: Resolve candidate runtime
-        id: runtime
-        env:
-          RUNTIME_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
-        run: >-
-          python tools/ci/resolve_runtime.py resolve
-          --device "$RUNTIME_DEVICE"
-          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
-          --github-output "$GITHUB_OUTPUT"
-          --github-env "$GITHUB_ENV"
-
-      - name: Restore virtual environment
-        uses: corca-ai/local-cache@v2
-        id: cache-venv
-        with:
-          path: .venv
-          base: /data/actions/cache
-          key: ${{ steps.runtime.outputs.cache-key }}
-
-      - name: Create virtual environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: |
-          if [[ "$VLLM_GR_TARGET_DEVICE" == "npu" ]]; then
-            uv venv --seed --system-site-packages .venv
-          else
-            uv venv --seed .venv
-          fi
-
-      - name: Set up virtual environment
-        run: |
-          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          {
-            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
-            echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
-          } >> "$GITHUB_ENV"
-
-      - name: Install CUDA base environment
-        if: >-
-          steps.cache-venv.outputs.cache-hit != 'true' &&
-          env.VLLM_GR_TARGET_DEVICE == 'cuda'
-        run: uv pip install "$CI_VLLM_REQUIREMENT"
-
-      - name: Refresh editable installation
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install --reinstall-package vllm-gr -e ".[dev]"
-
-      - name: Verify installed runtime identity
-        run: >-
-          python tools/ci/resolve_runtime.py verify
-          --spec "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
-          --venv "$VIRTUAL_ENV"
-          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/installed.json"
-          --cache-root "$RUNNER_TEMP/gr-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
-          --github-env "$GITHUB_ENV"
-
-      - name: Verify CUDA device mapping before cleanup
-        id: cuda-mapping
-        run: |
-          python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-      - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh --yes
-
-      - name: Cache Pangu 1B model
-        uses: corca-ai/local-cache@v2
-        id: cache-pangu1b
-        with:
-          path: openPangu-Embedded-1B-V1.1
-          base: /data/actions/cache
-          key: pangu1b-model-${{ runner.os }}
-
-      - name: Download Pangu 1B model
-        if: steps.cache-pangu1b.outputs.cache-hit != 'true'
-        run: |
-          pip install modelscope
-          modelscope download \
-            --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
-            --local_dir "$PANGU1B_MODEL_PATH"
-
-      - name: Run Pangu offline accuracy gate
-        run: ./tests/system/run_pangu1b_acc_and_verify.sh
-
-      - name: Check clear device
-        if: always() && steps.cuda-mapping.outcome == 'success'
-        run: bash ./scripts/check_vllm_on_device.sh
-
-  pangu-online:
-    name: Pangu online accuracy and API contract
-    # Accuracy remains independently required and shares the GPU lock.
-    needs: [benchmark-policy, pre-commit]
-    if: >-
-      ${{ !cancelled() &&
-      needs.benchmark-policy.result == 'success' &&
-      needs.pre-commit.result == 'success' }}
-    runs-on: self-hosted
-    concurrency:
-      group: vllm-gr-accelerator-${{ github.repository }}
-      queue: max
-      cancel-in-progress: false
-    env:
-      BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
-      PANGU1B_ONLINE_ACCURACY_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_ONLINE_ACCURACY_THRESHOLD }}
-      PANGU1B_ONLINE_ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_ONLINE_ACCURACY_FAILURE_MODE }}
-      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v1
-
-      - name: Resolve candidate runtime
-        id: runtime
-        env:
-          RUNTIME_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
-        run: >-
-          python tools/ci/resolve_runtime.py resolve
-          --device "$RUNTIME_DEVICE"
-          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
-          --github-output "$GITHUB_OUTPUT"
-          --github-env "$GITHUB_ENV"
-
-      - name: Restore virtual environment
-        uses: corca-ai/local-cache@v2
-        id: cache-venv
-        with:
-          path: .venv
-          base: /data/actions/cache
-          key: ${{ steps.runtime.outputs.cache-key }}
-
-      - name: Create virtual environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: |
-          if [[ "$VLLM_GR_TARGET_DEVICE" == "npu" ]]; then
-            uv venv --seed --system-site-packages .venv
-          else
-            uv venv --seed .venv
-          fi
-
-      - name: Set up virtual environment
-        run: |
-          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          {
-            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
-            echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
-          } >> "$GITHUB_ENV"
-
-      - name: Install CUDA base environment
-        if: >-
-          steps.cache-venv.outputs.cache-hit != 'true' &&
-          env.VLLM_GR_TARGET_DEVICE == 'cuda'
-        run: uv pip install "$CI_VLLM_REQUIREMENT"
-
-      - name: Refresh editable installation
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install --reinstall-package vllm-gr -e ".[dev]"
-
-      - name: Verify installed runtime identity
-        run: >-
-          python tools/ci/resolve_runtime.py verify
-          --spec "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
-          --venv "$VIRTUAL_ENV"
-          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/installed.json"
-          --cache-root "$RUNNER_TEMP/gr-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
-          --github-env "$GITHUB_ENV"
-
-      - name: Verify CUDA device mapping before cleanup
-        id: cuda-mapping
-        run: |
-          python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-      - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh --yes
-
-      - name: Cache Pangu 1B model
-        uses: corca-ai/local-cache@v2
-        id: cache-pangu1b
-        with:
-          path: openPangu-Embedded-1B-V1.1
-          base: /data/actions/cache
-          key: pangu1b-model-${{ runner.os }}
-
-      - name: Download Pangu 1B model
-        if: steps.cache-pangu1b.outputs.cache-hit != 'true'
-        run: |
-          pip install modelscope
-          modelscope download \
-            --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
-            --local_dir "$PANGU1B_MODEL_PATH"
-
-      - name: Run Pangu online accuracy and API contract gate
-        run: ./tests/system/run_pangu1b_online_and_verify.sh
-
-      - name: Check clear device
-        if: always() && steps.cuda-mapping.outcome == 'success'
-        run: bash ./scripts/check_vllm_on_device.sh
-
   benchmark-blocking:
     # Ignored label events must not replace the required check with a skipped one.
     name: >-
@@ -1094,8 +859,6 @@ jobs:
       - pre-commit
       - decode-benchmark
       - beam-performance-ab-only
-      - pangu-offline
-      - pangu-online
     if: >-
       always() &&
       !(needs.docs-scope.outputs.docs-only == 'true' &&
@@ -1176,8 +939,6 @@ jobs:
           POLICY_RESULT: ${{ needs.benchmark-policy.result }}
           PRE_COMMIT_RESULT: ${{ needs.pre-commit.result }}
           DECODE_RESULT: ${{ needs.decode-benchmark.result }}
-          PANGU_OFFLINE_RESULT: ${{ needs.pangu-offline.result }}
-          PANGU_ONLINE_RESULT: ${{ needs.pangu-online.result }}
         run: |
           if [[ "$ABTEST_ONLY" == true ]]; then
             echo "ABTEST_RESULT=$ABTEST_RESULT"
@@ -1201,16 +962,14 @@ jobs:
           fi
           # A skipped required check still fails the gate: an unrun check is not
           # a pass. Report the jobs that actually failed first and mark the rest
-          # as blocked by them, so one root-cause failure does not read as six
-          # separate validation failures.
+          # as blocked by them to distinguish failures from checks that could
+          # not run.
           failed_jobs=()
           skipped_jobs=()
           for result_name in \
             POLICY_RESULT \
             PRE_COMMIT_RESULT \
-            DECODE_RESULT \
-            PANGU_OFFLINE_RESULT \
-            PANGU_ONLINE_RESULT; do
+            DECODE_RESULT; do
             result="${!result_name}"
             echo "$result_name=$result"
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then

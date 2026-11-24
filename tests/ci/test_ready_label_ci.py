@@ -321,8 +321,6 @@ class TestReadyLabelCI(unittest.TestCase):
         gpu_jobs = (
             "pre-commit",
             "decode-benchmark",
-            "pangu-offline",
-            "pangu-online",
             "beam-performance-ab-only",
         )
         for job_name in gpu_jobs:
@@ -383,7 +381,7 @@ class TestReadyLabelCI(unittest.TestCase):
     def test_blocking_gate_names_the_root_cause_not_every_blocked_check(self) -> None:
         # One failing prerequisite skips the rest. The gate must point at the
         # job that actually failed, and describe the others as blocked by it,
-        # otherwise a single root cause reads as six independent failures and
+        # otherwise a single root cause looks like several failures and
         # sends reviewers after the wrong thing.
         job = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]
         success = dict.fromkeys(job["needs"], "success")
@@ -393,8 +391,6 @@ class TestReadyLabelCI(unittest.TestCase):
             "benchmark-policy": "failure",
             "pre-commit": "skipped",
             "decode-benchmark": "skipped",
-            "pangu-offline": "skipped",
-            "pangu-online": "skipped",
         }
         # A/B can also fail when no cached result exists. Report the failed
         # prerequisite before the A/B freshness check in either case.
@@ -410,8 +406,6 @@ class TestReadyLabelCI(unittest.TestCase):
             for blocked in (
                 "PRE_COMMIT_RESULT",
                 "DECODE_RESULT",
-                "PANGU_OFFLINE_RESULT",
-                "PANGU_ONLINE_RESULT",
             ):
                 self.assertNotIn(
                     f"{blocked} did not pass",
@@ -662,8 +656,6 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                 self.assertIn("benchmark-policy", running)
                 self.assertIn("pre-commit", running)
                 self.assertIn("decode-benchmark", running)
-                self.assertIn("pangu-offline", running)
-                self.assertIn("pangu-online", running)
                 self.assertEqual("beam-performance-ab-only" in running, not fresh)
                 results = {
                     need: "success" if need in running else "skipped" for need in gate["needs"]
@@ -747,71 +739,26 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                 result = self.run_gate(results)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
-    def test_cancellation_stops_pangu_but_keeps_cleanup_and_gate(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
-        jobs = workflow["jobs"]
-        # A cancellation can arrive while a Pangu job is already running, after
-        # its prerequisites have succeeded. GitHub re-evaluates the job guard.
-        results = dict.fromkeys(jobs["benchmark-blocking"]["needs"], "success")
-        for name in ("pangu-offline", "pangu-online"):
-            with self.subTest(job=name):
-                self.assertTrue(evaluate(jobs[name]["if"], context(), results))
-                self.assertFalse(evaluate(jobs[name]["if"], context(), results, cancelled=True))
-        # Benchmark failures must still allow the other accuracy checks to
-        # run, and must not hide a failed final gate.
-        for failed in ("decode-benchmark", "pangu-offline"):
-            with self.subTest(failed=failed):
-                running = self.scheduled(workflow, context(), failed)
-                self.assertIn("pangu-offline", running)
-                self.assertIn("pangu-online", running)
-                self.assertIn("benchmark-blocking", running)
-        self.assertEqual(
-            self.scheduled(workflow, context(), cancelled=True), ["benchmark-blocking"]
-        )
-        reject_cancelled = jobs["benchmark-blocking"]["steps"][-1]
-        self.assertFalse(evaluate(reject_cancelled["if"], context()))
-        self.assertTrue(evaluate(reject_cancelled["if"], context(), cancelled=True))
-        rejected = run_workflow_command(
-            ["bash", "-eu", "-o", "pipefail", "-c", reject_cancelled["run"]],
-        )
-        self.assertEqual(rejected.returncode, 1)
-        for name in ("decode-benchmark", "pangu-offline", "pangu-online"):
-            cleanup = next(
-                step for step in jobs[name]["steps"] if step.get("name") == "Check clear device"
-            )
-            # Evaluate the guard after successful device mapping, even during
-            # cancellation. Failed mapping must still prevent unsafe cleanup.
-            for outcome in ("success", "failure", "skipped"):
-                condition = cleanup["if"].replace("steps.cuda-mapping.outcome", repr(outcome))
-                self.assertEqual(
-                    bool(evaluate(condition, context(), cancelled=True)), outcome == "success"
-                )
-
     @pytest.mark.l1  # type: ignore[misc]
     def test_benchmark_jobs_wait_for_successful_precommit_and_policy(self) -> None:
         workflow = self.workflows["pre-commit.yml"]
-        jobs = workflow["jobs"]
-        benchmark_jobs = ("decode-benchmark", "pangu-offline", "pangu-online")
-        for name in benchmark_jobs:
-            job = jobs[name]
-            self.assertEqual(set(job["needs"]), {"benchmark-policy", "pre-commit"})
-            for policy in ("success", "failure", "cancelled", "skipped"):
-                for precommit in ("success", "failure", "cancelled", "skipped"):
-                    for cancelled in (False, True):
-                        with self.subTest(
-                            job=name, policy=policy, precommit=precommit, cancelled=cancelled
-                        ):
-                            results = {"benchmark-policy": policy, "pre-commit": precommit}
-                            expected = policy == precommit == "success" and not cancelled
-                            self.assertEqual(
-                                bool(evaluate(job["if"], context(), results, cancelled=cancelled)),
-                                expected,
-                            )
+        job = workflow["jobs"]["decode-benchmark"]
+        self.assertEqual(set(job["needs"]), {"benchmark-policy", "pre-commit"})
+        for policy in ("success", "failure", "cancelled", "skipped"):
+            for precommit in ("success", "failure", "cancelled", "skipped"):
+                for cancelled in (False, True):
+                    with self.subTest(policy=policy, precommit=precommit, cancelled=cancelled):
+                        results = {"benchmark-policy": policy, "pre-commit": precommit}
+                        expected = policy == precommit == "success" and not cancelled
+                        self.assertEqual(
+                            bool(evaluate(job["if"], context(), results, cancelled=cancelled)),
+                            expected,
+                        )
 
         for failed in ("benchmark-policy", "pre-commit"):
             with self.subTest(failed=failed):
                 running = self.scheduled(workflow, context(), failed=failed)
-                self.assertTrue(set(benchmark_jobs).isdisjoint(running))
+                self.assertNotIn("decode-benchmark", running)
                 self.assertIn("benchmark-blocking", running)
 
     def test_level_workflow_schedule_and_resource_safety(self) -> None:
@@ -888,7 +835,6 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             condition = step["if"]
             condition = condition.replace("steps.accelerator.outputs.run", repr(runner))
             condition = condition.replace("steps.cache-venv.outputs.cache-hit", repr(hit))
-            condition = condition.replace("steps.cache-pangu.outputs.cache-hit", repr(hit))
             condition = condition.replace("steps.cache-dataset.outputs.cache-hit", repr(hit))
             condition = condition.replace("env.TEST_LEVEL", repr(level))
             condition = condition.replace("env.VLLM_GR_TARGET_DEVICE", "'cuda'")
@@ -935,8 +881,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         )
         self.assertEqual(probe["run"], "bash tools/ci/run_resource_level.sh")
         self.assertTrue(
-            {"pre-commit", "decode-benchmark", "pangu-offline", "pangu-online"}
-            <= set(jobs["benchmark-blocking"]["needs"])
+            {"pre-commit", "decode-benchmark"} <= set(jobs["benchmark-blocking"]["needs"])
         )
         self.assertIn("beam-performance-ab-only", jobs)
         local_runner = (ROOT / "tools/pre_commit/run_tests.sh").read_text()
@@ -956,54 +901,51 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
     @pytest.mark.l1  # type: ignore[misc]
     def test_parallel_benchmark_jobs_provision_on_cache_miss(self) -> None:
         jobs = self.workflows["pre-commit.yml"]["jobs"]
-        for name in ("decode-benchmark", "pangu-offline", "pangu-online"):
-            steps = jobs[name]["steps"]
-            names = [step.get("name") for step in steps]
-            create = steps[names.index("Create virtual environment")]
-            install = steps[names.index("Install CUDA base environment")]
-            self.assertLess(names.index("Restore virtual environment"), names.index(create["name"]))
-            self.assertLess(names.index(create["name"]), names.index("Set up virtual environment"))
-            self.assertLess(names.index("Set up virtual environment"), names.index(install["name"]))
-            self.assertLess(
-                names.index(install["name"]), names.index("Refresh editable installation")
-            )
-            for hit in ("true", "false"):
-                for device in ("cuda", "npu"):
-                    with self.subTest(job=name, cache_hit=hit, device=device):
-                        commands = []
-                        for step in (create, install):
-                            guard = (
-                                step["if"]
-                                .replace("steps.cache-venv.outputs.cache-hit", repr(hit))
-                                .replace("env.VLLM_GR_TARGET_DEVICE", repr(device))
+        steps = jobs["decode-benchmark"]["steps"]
+        names = [step.get("name") for step in steps]
+        create = steps[names.index("Create virtual environment")]
+        install = steps[names.index("Install CUDA base environment")]
+        self.assertLess(names.index("Restore virtual environment"), names.index(create["name"]))
+        self.assertLess(names.index(create["name"]), names.index("Set up virtual environment"))
+        self.assertLess(names.index("Set up virtual environment"), names.index(install["name"]))
+        self.assertLess(names.index(install["name"]), names.index("Refresh editable installation"))
+        for hit in ("true", "false"):
+            for device in ("cuda", "npu"):
+                with self.subTest(cache_hit=hit, device=device):
+                    commands = []
+                    for step in (create, install):
+                        guard = (
+                            step["if"]
+                            .replace("steps.cache-venv.outputs.cache-hit", repr(hit))
+                            .replace("env.VLLM_GR_TARGET_DEVICE", repr(device))
+                        )
+                        if evaluate(guard, context()):
+                            result = run_workflow_command(
+                                [
+                                    shutil.which("bash") or "bash",
+                                    "-eu",
+                                    "-o",
+                                    "pipefail",
+                                    "-c",
+                                    "uv() { printf '%s\\n' \"$*\"; }\n" + step["run"],
+                                ],
+                                env={
+                                    "VLLM_GR_TARGET_DEVICE": device,
+                                    "CI_VLLM_REQUIREMENT": "vllm==test",
+                                },
                             )
-                            if evaluate(guard, context()):
-                                result = run_workflow_command(
-                                    [
-                                        shutil.which("bash") or "bash",
-                                        "-eu",
-                                        "-o",
-                                        "pipefail",
-                                        "-c",
-                                        "uv() { printf '%s\\n' \"$*\"; }\n" + step["run"],
-                                    ],
-                                    env={
-                                        "VLLM_GR_TARGET_DEVICE": device,
-                                        "CI_VLLM_REQUIREMENT": "vllm==test",
-                                    },
-                                )
-                                self.assertEqual(result.returncode, 0, result.stderr)
-                                commands.extend(result.stdout.splitlines())
-                        expected = []
-                        if hit == "false":
-                            expected.append(
-                                "venv --seed --system-site-packages .venv"
-                                if device == "npu"
-                                else "venv --seed .venv"
-                            )
-                            if device == "cuda":
-                                expected.append("pip install vllm==test")
-                        self.assertEqual(commands, expected)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            commands.extend(result.stdout.splitlines())
+                    expected = []
+                    if hit == "false":
+                        expected.append(
+                            "venv --seed --system-site-packages .venv"
+                            if device == "npu"
+                            else "venv --seed .venv"
+                        )
+                        if device == "cuda":
+                            expected.append("pip install vllm==test")
+                    self.assertEqual(commands, expected)
 
 
 @pytest.mark.l1  # type: ignore[misc]

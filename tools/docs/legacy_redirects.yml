@@ -44,13 +44,6 @@ contributing/tools/README.md:
     contributing/ci/local_runner.md#select-devices-and-test-levels: [resource-helper]
     contributing/ci/local_runner.md#cuda-process-inspection-and-cleanup: [cuda-process-inspection-and-cleanup]
     contributing/ci/pr_merge_loop.md#pull-request-ci: [github-actions-tester]
-contributing/tools/pangu1b.md:
-  page: examples/pangu_sid.md
-  sections:
-    examples/pangu_sid.md#download-and-prepare-a-public-snapshot: [download-the-model]
-    models/pangu.md#run-the-offline-accuracy-evaluation: [run-the-offline-accuracy-evaluation]
-    models/pangu.md#online-serving: [online-serving]
-    examples/pangu_sid.md#build-a-matching-catalog-and-run-beam-search: [prepare-public-weights-for-constrained-sid-beam-search]
 design/main-arch.md:
   page: design/architecture_overview.md
   sections:

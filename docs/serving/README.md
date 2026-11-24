@@ -15,8 +15,7 @@ curl --fail http://127.0.0.1:8000/v1/models
 ```
 
 For gRPC, follow the [OneRec gRPC example](../../examples/online_serving/grpc/README.md)
-to start a token-input server and check channel readiness. For ordinary text
-generation with public openPangu weights, use the [Pangu model guide](../models/pangu.md).
+to start a token-input server and check channel readiness.
 
 ## Choose an endpoint
 

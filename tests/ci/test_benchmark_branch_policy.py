@@ -113,7 +113,7 @@ printf '%s\\n' "$device" "$board_id"
                 expected = (0.05, 0.21, 0.03) if device == "npu" or enabled else (0.09, 0.29, 0.04)
                 self.assertEqual(tuple(float(values[key]) for key in keys), expected)
                 self.assertEqual(values["ACCURACY_FAILURE_MODE"], "blocking")
-                # Preserve all existing performance and Pangu settings.
+                # Preserve the existing performance settings for this device.
                 for key in values:
                     if key not in (*keys, "BENCHMARK_BOARD_ID"):
                         self.assertEqual(values[key], baseline[key], key)
@@ -145,47 +145,9 @@ printf '%s\\n' "$device" "$board_id"
                         float(values["P99_TTFT_THRESHOLD"]),
                         280 if board in {"Ascend910_9362", "decode_graph_Ascend910_9362"} else 300,
                     )
-                    self.assertEqual(
-                        values["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"],
-                        physical["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"],
-                    )
-                    self.assertEqual(
-                        values["PANGU1B_ONLINE_ACCURACY_THRESHOLD"],
-                        physical["PANGU1B_ONLINE_ACCURACY_THRESHOLD"],
-                    )
             with patch.dict(os.environ, {"CHANGE_TARGET": "main", "GITHUB_BASE_REF": "feature"}):
                 values = resolve_policy(policy, "npu", board)
                 self.assertEqual(tuple(float(values[key]) for key in keys), (0.05, 0.21, 0.03))
-
-    def test_all_npu_profiles_preserve_custom_performance_and_pangu(self) -> None:
-        root = REPO_ROOT
-        policy = load_policy(root / ".github/benchmark-gate.yaml")
-        policy["device_overrides"]["npu"]["boards"]["CustomNPU"] = {
-            "thresholds": {
-                "accuracy": {"pass_at_1_min": 0.8},
-                "performance": {"p99_ttft_max": 123, "offline_elapsed_seconds_max": 42},
-            }
-        }
-        for branch in ("main", "feature", ""):
-            with self.subTest(branch=branch), patch.dict(os.environ, {"CHANGE_TARGET": branch}):
-                values = resolve_policy(policy, "npu", "CustomNPU")
-                self.assertEqual(
-                    tuple(
-                        float(values[key])
-                        for key in (
-                            "PASS_AT_1_THRESHOLD",
-                            "PASS_AT_32_THRESHOLD",
-                            "RECALL_AT_32_THRESHOLD",
-                        )
-                    ),
-                    (0.05, 0.21, 0.03),
-                )
-                self.assertEqual(float(values["P99_TTFT_THRESHOLD"]), 123)
-                self.assertEqual(float(values["ELAPSED_TIME_OFFLINE_THRESHOLD"]), 42)
-                self.assertEqual(float(values["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"]), 0.875)
-                self.assertEqual(values["PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE"], "blocking")
-                gpu = resolve_policy(policy, "gpu", "unknown")
-                self.assertEqual(float(gpu["PASS_AT_1_THRESHOLD"]), 0.09)
 
     def test_resolver_cli_unified_npu_and_strict_fallback(self) -> None:
         root = REPO_ROOT
@@ -464,7 +426,7 @@ printf '%s\\n' "$device" "$board_id"
                     self.assertEqual(values["BENCHMARK_BOARD_ID"], board)
                     baseline = resolve_policy(policy, device, board)
                     for key in baseline:
-                        if key not in (*keys, "BENCHMARK_POLICY_NAME", "PANGU1B_POLICY_SOURCE"):
+                        if key not in (*keys, "BENCHMARK_POLICY_NAME"):
                             self.assertEqual(values[key], baseline[key], key)
 
 

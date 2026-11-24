@@ -9,7 +9,7 @@ Worker subprocess), which discovers and executes this entry point.
 
 This module is the formal runtime initialization boundary for vllm-gr.
 It checks runtime compatibility and installs the patches for Beam Search,
-sliced vocabulary projection, Ascend integration, and Pangu weight loading.
+sliced vocabulary projection, and Ascend integration.
 """
 
 import logging

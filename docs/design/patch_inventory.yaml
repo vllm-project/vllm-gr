@@ -368,21 +368,6 @@ patches:
     contract: ascend-config-additional-config-keys
     removal_condition: vllm-ascend's AscendConfig accepts unknown additional_config keys, or vllm-gr stops carrying its configuration in additional_config
 
-  - id: GR-PATCH-020
-    scope: core
-    backend_id: null
-    owner: vllm_gr/config/pangu_patch.py
-    installer: vllm_gr.config.pangu_patch.apply_pangu_tied_embeddings_patch
-    activation: runtime initialization; wrapper preserves ties only for PanguEmbeddedForCausalLM with tie_word_embeddings enabled
-    validator_or_test:
-      - tests/config/test_pangu_compat.py
-      - tests/patch/test_patch_initialization.py::test_runtime_patch_order_preserves_ascend_initialization
-    process_roles: [main, engine_core, worker]
-    target: vllm.config.ModelConfig.maybe_untie_word_embeddings
-    risk: high
-    contract: pangu-tied-embeddings
-    removal_condition: upstream distinguishes Pangu's zero-filled lm_head placeholder from an independent projection weight
-
   - id: GR-PATCH-021
     scope: backend
     backend_id: ascend
@@ -415,6 +400,10 @@ retired_patches:
     reason: Removal condition met by the 0.30 upgrade; vllm-ascend 0.30.0rc2 replaced profile_memory with log_memory_stats, which reads the two allocator counters directly, and the installer found no native method to wrap on that runtime
     replacement_coverage:
       - tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+  - id: GR-PATCH-020
+    historical_target: vllm.config.ModelConfig.maybe_untie_word_embeddings
+    reason: Model-specific tied-embedding compatibility was retired with its deployment recipe
+    replacement_coverage: []
 
 # Retired: Beam _sample/_bookkeeping_sync and set_gr_constraint_resources RPC.
 # V1 stage runners own sampling; constraint artifacts load during worker startup.

@@ -45,7 +45,6 @@ jobs:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       VLLM_GR_RUN_MODEL_SMOKE: '1'
       VLLM_GR_ISOLATED_RUNNER: ${{ vars.VLLM_GR_ISOLATED_RUNNER || 'false' }}
-      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
     steps:
       - name: Detect runner accelerator
         id: accelerator
@@ -146,23 +145,6 @@ jobs:
           else
             python -c 'import torch; assert torch.cuda.is_available()'
           fi
-
-      - name: Cache Pangu model
-        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4'
-        uses: corca-ai/local-cache@v2
-        id: cache-pangu
-        with:
-          path: openPangu-Embedded-1B-V1.1
-          base: /data/actions/cache
-          key: pangu1b-model-${{ runner.os }}
-
-      - name: Download Pangu model
-        if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l4' && steps.cache-pangu.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          uv pip install modelscope
-          modelscope download --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
-            --local_dir "$PANGU1B_MODEL_PATH"
 
       - name: Run selected level
         if: steps.accelerator.outputs.run == 'true'

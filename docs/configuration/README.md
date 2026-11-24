@@ -28,8 +28,6 @@ or `gr.constraint_mode: none` for unconstrained generation. The driver resolves
 worker derives its model's projection window from the token IDs in the loaded
 table. Per-parent candidate counts come from `gr.candidate_width`.
 
-Use a [deployment recipe](../../recipes/README.md) for model-specific overrides.
-
 ## Load and override a configuration
 
 Settings take precedence in this order, from highest to lowest.
@@ -96,11 +94,9 @@ the engine to apply edits to its startup YAML.
 
 ## Migrate from `configs/`
 
-- For Pangu, use [the Pangu recipe](../../recipes/Pangu/pangu1b.yaml) in
-  `--config` or Python's `config=` argument in place of `configs/pangu1b.yaml`.
-- For GR's packaged defaults, omit `--config configs/default_config.yaml`
-  or the equivalent Python `config=` argument. To keep the YAML values
-  explicit in a source checkout, pass `vllm_gr/config/default_config.yaml`.
+For GR's packaged defaults, omit `--config configs/default_config.yaml`
+or the equivalent Python `config=` argument. To keep the YAML values
+explicit in a source checkout, pass `vllm_gr/config/default_config.yaml`.
 
 The old default YAML supplied `max-num-batched-tokens: 8192` explicitly.
 With chunked Prefill disabled and `max-model-len: 16384`, omitting the file

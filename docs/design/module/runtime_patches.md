@@ -174,14 +174,6 @@ retains GR settings while filtering keys passed to the native configuration
 reader. Fresh EngineCore processes install the common plan before native
 construction. Worker startup also refreshes the filter's native bindings.
 
-## GR-PATCH-020 — Pangu Tied Embeddings
-
-Scope: `core`; backend ID: `null`
-
-For tied Pangu embeddings, a placeholder checkpoint projection must not replace
-the shared input weight. An independent zero-filled output head would produce
-zero logits.
-
 ## GR-PATCH-021 — Contiguous Beam Prefix KV
 
 Scope: `backend`; backend ID: `ascend`
@@ -202,6 +194,7 @@ installer.
 | `GR-PATCH-006` | `OpenAIServingModels.__init__` | Legacy Catalog serving patch and its tests were removed; canonical V1 constraints load in the worker. |
 | `GR-PATCH-014` | LMCache request tracking | Experimental LMCache integration removed; no supported version pin or vLLM 0.30 validation. |
 | `GR-PATCH-017` | `NPUWorker.profile_memory` | vllm-ascend 0.30.0rc2 replaced the method with `log_memory_stats`; no native method remained to wrap. |
+| `GR-PATCH-020` | `vllm.config.ModelConfig.maybe_untie_word_embeddings` | Model-specific tied-embedding compatibility was retired with its deployment recipe. |
 
 ## Maintenance rules
 

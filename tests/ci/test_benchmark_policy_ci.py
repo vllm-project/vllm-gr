@@ -103,14 +103,14 @@ def read_output(output: Path) -> dict[str, str]:
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "device,board,pangu,ttft",
+    "device,board,ttft",
     [
-        ("gpu", "unknown", "1.0", "300"),
-        ("npu", "Ascend910_9362", "0.875", "280"),
+        ("gpu", "unknown", "300"),
+        ("npu", "Ascend910_9362", "280"),
     ],
 )
 def test_policy_job_emits_every_consumer_field(
-    checkout: Path, tmp_path: Path, device: str, board: str, pangu: str, ttft: str
+    checkout: Path, tmp_path: Path, device: str, board: str, ttft: str
 ) -> None:
     result, output, summary = run_policy(checkout, tmp_path, device=device, board=board)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -124,10 +124,7 @@ def test_policy_job_emits_every_consumer_field(
     assert values["PASS_AT_32_THRESHOLD"] == "0.21"
     assert values["RECALL_AT_32_THRESHOLD"] == "0.03"
     assert values["P99_TTFT_THRESHOLD"] == ttft
-    assert values["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"] == pangu
-    assert values["PANGU1B_ONLINE_ACCURACY_THRESHOLD"] == pangu
     assert values["ACCURACY_FAILURE_MODE"] == "blocking"
-    assert values["PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE"] == "blocking"
     assert values["ONLINE_NON_ACCURACY_FAILURE_MODE"] == "blocking"
     assert values["P99_TTFT_FAILURE_MODE"] == "warning"
     assert git(checkout, "rev-parse", "HEAD") in summary.read_text()
@@ -140,7 +137,7 @@ def test_policy_uses_the_pinned_merge_even_after_base_advances(
 ) -> None:
     policy = checkout / POLICY
     original = policy.read_text()
-    policy.write_text(original.replace("offline_accuracy_min: 1.00", "offline_accuracy_min: 0.90"))
+    policy.write_text(original.replace("pass_at_1_min: 0.05", "pass_at_1_min: 0.04"))
     ancestor = commit(checkout, "Old accuracy floor")
     policy.write_text(original)
     commit(checkout, "Base raises accuracy floor")
@@ -162,9 +159,7 @@ def test_policy_uses_the_pinned_merge_even_after_base_advances(
     )
     merge = git(checkout, "rev-parse", "HEAD")
     # A queued run still tests this merge after the base advances again.
-    policy.write_text(
-        policy.read_text().replace("offline_accuracy_min: 1.00", "offline_accuracy_min: 0.80")
-    )
+    policy.write_text(policy.read_text().replace("pass_at_1_min: 0.05", "pass_at_1_min: 0.03"))
     commit(checkout, "Later base update")
     git(checkout, "checkout", "-q", "--detach", merge)
 
@@ -172,17 +167,18 @@ def test_policy_uses_the_pinned_merge_even_after_base_advances(
     assert result.returncode == 0, result.stdout + result.stderr
     values = read_output(output)
     assert values["BENCHMARK_POLICY_NAME"] == "candidate-policy"
-    assert values["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"] == "1.0"
+    assert values["PASS_AT_1_THRESHOLD"] == "0.05"
     assert merge in summary.read_text()
-    # The real gate must reject 95%, which incorrectly passed with the head policy.
+    # The gate uses the merged 5% floor. The ancestor and the later base would
+    # both accept this 4.5% result.
     gate = subprocess.run(
         [
             "bash",
             "-c",
-            'source "$1"; validate_accuracy_metric Pangu 0.95 "$2" blocking gpu 90',
+            'source "$1"; validate_accuracy_metric pass@1 0.045 "$2" blocking gpu 90',
             "gate",
             str(ROOT / "tools/ci/benchmark_gate_helpers.sh"),
-            values["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"],
+            values["PASS_AT_1_THRESHOLD"],
         ],
         capture_output=True,
         text=True,
@@ -216,7 +212,6 @@ def test_shell_and_job_outputs_agree_for_supported_schemas(
         policy = yaml.safe_load(policy_path.read_text())
         policy["version"] = 1
         policy["failure_modes"]["performance"] = "warning"
-        del policy["pangu1b"]
         policy_path.write_text(yaml.safe_dump(policy))
     env_file, output, summary = (tmp_path / name for name in ("env", "output", "summary"))
     subprocess.run(
@@ -245,10 +240,9 @@ def test_shell_and_job_outputs_agree_for_supported_schemas(
     )
     values = read_output(output)
     assert values == dict(line.split("=", 1) for line in env_file.read_text().splitlines())
-    assert values["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"] == "1.0"
-    assert values["PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE"] == "blocking"
+    assert values["PASS_AT_1_THRESHOLD"] == "0.05"
+    assert values["ACCURACY_FAILURE_MODE"] == "blocking"
     assert values["P99_TTFT_FAILURE_MODE"] == "warning"
-    assert values["PANGU1B_POLICY_SOURCE"] == ("strict-bootstrap" if version == 1 else "policy")
 
 
 def test_all_jobs_checkout_the_same_workflow_commit() -> None:

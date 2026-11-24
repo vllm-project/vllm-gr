@@ -35,14 +35,6 @@ PERFORMANCE_MODE_KEYS = (
     "online_elapsed_seconds",
     "offline_elapsed_seconds",
 )
-PANGU_THRESHOLD_KEYS = (
-    "offline_accuracy_min",
-    "online_accuracy_min",
-)
-PANGU_FAILURE_MODE_KEYS = (
-    "offline_accuracy",
-    "online_accuracy",
-)
 
 STRICT_BOOTSTRAP_POLICY: dict[str, Any] = {
     "version": 2,
@@ -69,24 +61,6 @@ STRICT_BOOTSTRAP_POLICY: dict[str, Any] = {
             "offline_elapsed_seconds": "warning",
         },
         "online_non_accuracy": "blocking",
-    },
-    "pangu1b": {
-        "thresholds": {
-            "offline_accuracy_min": 1.0,
-            "online_accuracy_min": 1.0,
-        },
-        "failure_modes": {
-            "offline_accuracy": "blocking",
-            "online_accuracy": "blocking",
-        },
-        "device_overrides": {
-            "npu": {
-                "thresholds": {
-                    "offline_accuracy_min": 0.875,
-                    "online_accuracy_min": 0.875,
-                }
-            }
-        },
     },
     "device_overrides": {
         "npu": {
@@ -224,56 +198,6 @@ def _validate_failure_modes(value: object, version: int) -> dict[str, Any]:
     }
 
 
-def _validate_pangu(value: object) -> dict[str, Any]:
-    pangu = _mapping(value, "policy.pangu1b")
-    required = {"thresholds", "failure_modes"}
-    allowed = required | {"device_overrides"}
-    missing = sorted(required - set(pangu))
-    extra = sorted(set(pangu) - allowed)
-    if missing:
-        raise PolicyError("policy.pangu1b is missing required keys: " + ", ".join(missing))
-    if extra:
-        raise PolicyError("policy.pangu1b has unsupported keys: " + ", ".join(extra))
-    thresholds = _validate_threshold_group(
-        pangu["thresholds"], PANGU_THRESHOLD_KEYS, "policy.pangu1b.thresholds"
-    )
-    modes = _mapping(pangu["failure_modes"], "policy.pangu1b.failure_modes")
-    _require_exact_keys(modes, set(PANGU_FAILURE_MODE_KEYS), "policy.pangu1b.failure_modes")
-    device_overrides = _mapping(
-        pangu.get("device_overrides", {}), "policy.pangu1b.device_overrides"
-    )
-    extra_devices = sorted(set(device_overrides) - {"gpu", "npu"})
-    if extra_devices:
-        raise PolicyError(
-            "policy.pangu1b.device_overrides has unsupported devices: " + ", ".join(extra_devices)
-        )
-    validated_overrides: dict[str, Any] = {}
-    for device, raw_override in device_overrides.items():
-        override = _mapping(raw_override, f"policy.pangu1b.device_overrides.{device}")
-        _require_exact_keys(
-            override,
-            {"thresholds"},
-            f"policy.pangu1b.device_overrides.{device}",
-        )
-        validated_overrides[device] = {
-            "thresholds": _validate_threshold_group(
-                override["thresholds"],
-                PANGU_THRESHOLD_KEYS,
-                f"policy.pangu1b.device_overrides.{device}.thresholds",
-                partial=True,
-            )
-        }
-
-    return {
-        "thresholds": thresholds,
-        "failure_modes": {
-            key: _failure_mode(modes[key], f"policy.pangu1b.failure_modes.{key}")
-            for key in PANGU_FAILURE_MODE_KEYS
-        },
-        "device_overrides": validated_overrides,
-    }
-
-
 def _validate_policy(raw_policy: object) -> dict[str, Any]:
     policy = _mapping(raw_policy, "policy")
     version = policy.get("version")
@@ -283,9 +207,8 @@ def _validate_policy(raw_policy: object) -> dict[str, Any]:
     version = cast(int, version)
 
     required = {"version", "name", "thresholds", "failure_modes", "device_overrides"}
-    allowed = required | ({"pangu1b"} if version == 2 else set())
     missing = sorted(required - set(policy))
-    extra = sorted(set(policy) - allowed)
+    extra = sorted(set(policy) - required)
     if missing:
         raise PolicyError(f"policy is missing required keys: {', '.join(missing)}")
     if extra:
@@ -331,16 +254,13 @@ def _validate_policy(raw_policy: object) -> dict[str, Any]:
             }
         validated_overrides[device] = {"boards": validated_boards}
 
-    validated_policy = {
+    return {
         "version": version,
         "name": policy["name"].strip(),
         "thresholds": thresholds,
         "failure_modes": failure_modes,
         "device_overrides": validated_overrides,
     }
-    if "pangu1b" in policy:
-        validated_policy["pangu1b"] = _validate_pangu(policy["pangu1b"])
-    return validated_policy
 
 
 def load_policy(path: Path) -> dict[str, Any]:
@@ -401,25 +321,6 @@ def resolve_policy(policy: dict[str, Any], device: str, board_id: str) -> dict[s
     }
     if validated["version"] == 1:
         values["PERFORMANCE_FAILURE_MODE"] = failure_modes["performance"]
-
-    pangu = validated.get("pangu1b")
-    if pangu is None:
-        pangu = _validate_pangu(STRICT_BOOTSTRAP_POLICY["pangu1b"])
-        values["PANGU1B_POLICY_SOURCE"] = "strict-bootstrap"
-    else:
-        pangu = deepcopy(pangu)
-        values["PANGU1B_POLICY_SOURCE"] = "policy"
-    pangu_override = pangu["device_overrides"].get(device)
-    if pangu_override:
-        pangu["thresholds"].update(pangu_override["thresholds"])
-    values.update(
-        {
-            "PANGU1B_OFFLINE_ACCURACY_THRESHOLD": str(pangu["thresholds"]["offline_accuracy_min"]),
-            "PANGU1B_ONLINE_ACCURACY_THRESHOLD": str(pangu["thresholds"]["online_accuracy_min"]),
-            "PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE": pangu["failure_modes"]["offline_accuracy"],
-            "PANGU1B_ONLINE_ACCURACY_FAILURE_MODE": pangu["failure_modes"]["online_accuracy"],
-        }
-    )
     return values
 
 
@@ -462,9 +363,6 @@ def write_summary(
         ("Offline elapsed maximum", values["ELAPSED_TIME_OFFLINE_THRESHOLD"] + "s"),
         ("P99 TTFT maximum", values["P99_TTFT_THRESHOLD"]),
         ("P99 TPOT maximum", values["P99_TPOT_THRESHOLD"]),
-        ("Pangu policy source", values["PANGU1B_POLICY_SOURCE"]),
-        ("Pangu offline accuracy minimum", values["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"]),
-        ("Pangu online accuracy minimum", values["PANGU1B_ONLINE_ACCURACY_THRESHOLD"]),
     )
     stream.write("| Setting | Effective value |\n| --- | --- |\n")
     stream.writelines(f"| {label} | `{value}` |\n" for label, value in rows)
@@ -507,8 +405,6 @@ def main() -> int:
         raise PolicyError("resolution requires --github-env or --github-output")
 
     values = resolve_policy(policy, args.device, args.board_id)
-    if args.bootstrap_strict:
-        values["PANGU1B_POLICY_SOURCE"] = "strict-bootstrap"
     if args.github_env:
         with args.github_env.open("a", encoding="utf-8") as env_stream:
             write_github_env(values, env_stream)

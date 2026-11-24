@@ -11,7 +11,6 @@ time. The repository's `examples/` directory contains the runnable scripts.
 - [Run with a constraint table](../../examples/offline_inference/beam_search/README.md#run-with-a-constraint-table) to generate candidates from a catalog.
 - [OneRec asynchronous Beam search on CUDA](../user_guide/onerec_quickstart.md) walks through a catalog-constrained run with ModelRunner V1.
 - [Full-vocabulary Beam search on Ascend](../user_guide/beam_search_npu.md) covers the Python API and supported execution modes.
-- [Prepare public openPangu weights for a SID smoke test](pangu_sid.md).
 
 ## Online serving
 

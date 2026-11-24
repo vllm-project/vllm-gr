@@ -69,9 +69,6 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
     npu_check = hook("npu_environment", {})
     monkeypatch.setattr(compat, "check_vllm_runtime", cuda_check)
     monkeypatch.setattr(environment, "check_ascend_environment", npu_check)
-    monkeypatch.setattr(
-        patch.pangu_compat, "apply_pangu_tied_embeddings_patch", hook("pangu", True)
-    )
     attention = hook("attention", 1)
     monkeypatch.setattr(patch.selector_patch, "apply_custom_attention_backend_patch", attention)
     spawn = hook("spawn", True)
@@ -95,12 +92,11 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
         assert events == [
             "defaults",
             f"{device_type}_environment",
-            "pangu",
             "attention",
             *backend_events,
             "beam",
         ]
-        assert state == {"patch_count": 5 if device_type == "npu" else 3, "patches": {}}
+        assert state == {"patch_count": 4 if device_type == "npu" else 2, "patches": {}}
         attention.assert_called_with(force=True)
         beam.assert_called_with()
 
@@ -136,7 +132,6 @@ def test_partial_provider_failure_stops_common_plan_and_retains_cause(
 
     # Exercise the direct entry used by a fresh worker, before any env dispatch.
     monkeypatch.setattr(vllm.platforms, "current_platform", _synthetic_platform("npu"))
-    monkeypatch.setattr(patch.pangu_compat, "apply_pangu_tied_embeddings_patch", lambda: False)
     monkeypatch.setattr(
         patch.selector_patch, "apply_custom_attention_backend_patch", lambda **kw: 0
     )
