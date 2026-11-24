@@ -1,10 +1,10 @@
 # CUDA Beam Decode attention
 
-At Decode, each beam attends to two histories: the paged prompt KV shared by
-all beams of that prompt, and the suffix KV for its own selected tokens. CUDA
-can split a long prefix across GPU work or fuse a short suffix with the final
-merge. The two decisions are independent: a step can use a segmented prefix
-with either suffix path.
+During Decode, beams from the same prompt share its paged KV. Each beam also
+keeps suffix KV for the tokens it has selected. CUDA computes attention over
+the two parts separately and merges their results. Splitting a long prefix
+exposes more parallel work, and fusing a short suffix with the merge avoids
+packing its KV. Either suffix path can use the result of a segmented prefix.
 
 ![Block diagram: shared prompt pages feed native or segmented prefix attention, which produces prefix output and FP32 LSE; both suffix paths combine the prefix state with per-beam suffix KV to produce per-beam output.](../../assets/cuda_decode_attention.svg)
 
@@ -20,87 +20,88 @@ with either suffix path.
 
 ### Shared prompt prefix
 
-Native FlashAttention reads the prompt pages. Prefix segmentation is opt-in:
-it runs only with `prefix_policy: auto` (the default is `off`). For eligible
-FA2 shapes, the prefix planner divides the pages into segments when device
-calibration predicts a gain. A plan is accepted only when all of these hold:
+With the default `off` policy, native FlashAttention reads the shared prompt
+pages. Set `prefix_policy: auto` to let the planner use device calibration
+to segment eligible FA2 prefixes. A segmented plan must meet all of the
+following conditions.
 
-- Calibration data is present, and the predicted plan needs at least two
+- A matching calibration profile is available and predicts at least two
   segments.
-- The split saves at least 5% over the unsplit chain
-  (`native / predicted >= 1.05`) and leaves at least 1.5x headroom.
-- The unsplit chain takes at least `prefix_min_chain_us`.
-- The page count divides evenly by the segment count.
-- Attention metadata allows splitting (`max_num_splits == 0`) and the block
-  table is wide enough for the segment layout.
+- The predicted speedup is at least 1.05x (`native / predicted >= 1.05`).
+- The predicted time for the unsplit chain is at least `prefix_min_chain_us`
+  and at least 1.5x the larger of the estimated compute and memory costs.
+- The bucket's page count divides evenly by the segment count.
+- The attention metadata allows splitting (`max_num_splits == 0`), and the
+  block table can hold the segment layout.
 
-The planner builds a virtual batch of page ranges for one FA call and merges
-the partial results in FP32. Empty segments are masked and the final segment
-can be shorter. Both prefix paths produce attention output in the activation
-dtype and its natural-log normalizer (LSE) in FP32.
+The segmented path builds a virtual batch of page ranges for one
+FlashAttention call, then merges the partial results in FP32. It masks empty
+segments and supports a shorter final segment. Both prefix paths return
+attention output in the activation dtype and the softmax log-sum-exp (LSE)
+in FP32.
 
 ### Per-beam suffix and final merge
 
-The fused path applies to pure incremental Decode with one query per beam and a
-live, eligible pool. It reads the beam's suffix KV, computes attention and
-combines it with the prefix state in one launch. Eligible shapes use a fused
-Gluon kernel; other shapes use the generic Triton kernel. The packed path
-copies suffix KV into a packed layout, runs suffix attention and merges the
-partial outputs. Both paths handle an empty prefix.
+The fused path serves pure incremental Decode with one query per beam and a
+live, eligible pool. It reads suffix KV directly from the pool, computes
+suffix attention and merges it with the prefix state in one launch. Eligible
+shapes use Gluon, and the remaining fused shapes use the generic Triton
+kernel. The packed path copies suffix KV into a packed buffer before running
+suffix attention and merging the partial outputs. Both paths handle an empty
+prefix.
 
-A valid mixed standard/Beam batch uses the packed path. A missing session or
-multiple queries per incremental beam is an input error, detected before
-attention or cache writes.
+Valid batches that mix standard and Beam rows use the packed path. The
+backend rejects a missing Beam session or multiple queries per incremental
+beam before attention or cache writes.
 
-Fusion can be enabled only when the attention backend and model support it:
-a configured maximum width, a positive pool capacity, an integral
-query-to-KV head ratio, at least one KV head, a head size in `(0, 256]` that is
-a multiple of 8, an available FA2/FA3/FA4 backend, a CUDA device, and a model
-dtype of FP16, BF16 or FP32. The attention must be unwindowed and without
-ALiBi, softcap or sinks. Invalid static configurations fail at initialization.
+Fusion requires a CUDA device, a configured maximum width, a positive pool
+capacity and a model dtype of FP16, BF16 or FP32. The attention layer needs
+an available FA2/FA3/FA4 backend, at least one KV head, an integral query-to-KV
+head ratio and a head size in `(0, 256]` that is a multiple of 8. It also
+requires unwindowed attention without ALiBi, softcap or sinks. Invalid static
+configurations fail at initialization.
 
 ### Decode graphs and fallback
 
-For eligible segmented shapes, the async metadata builder derives a prefix
-bucket from host metadata. The bucket is a value on the 1024-token ladder,
-block-size aligned only for lengths up to 1024; the generic builder leaves the
-bucket at zero. The graph key includes batch size, beam width and prefix
-bucket.
+For eligible segmented shapes, the async metadata builder chooses a prefix
+bucket from the longest prefix in the batch. It rounds lengths up to 1024
+tokens to a multiple of the block size and rounds longer lengths to a
+multiple of 1024, capped at the block-aligned model limit. The generic
+builder leaves the bucket at zero. The graph key includes batch size, beam
+width and prefix bucket.
 
-Replay updates lengths, page IDs and active rows at stable addresses. The
-startup graph is captured at model capacity with the bucket reset to zero, and
-length-bucket graphs are captured lazily on first use; a new bucket can
-therefore incur capture time and graph memory. Calibration stays fixed while
-serving. The suffix kernel reads the current step and active mask from device
-buffers during replay.
+The worker captures the startup graph at model capacity with a bucket of
+zero. It captures length-bucket graphs on first use, so a new bucket can add
+capture time and graph memory. During replay, the worker updates lengths,
+page IDs and active rows in buffers at stable addresses. The suffix kernel
+reads the current step and active mask from device buffers. Calibration stays
+fixed while serving. Decode can run eagerly if graph replay is unavailable.
 
 ## Configuration
 
 | GR setting | Effect |
 | --- | --- |
 | `prefix_policy` | `off` (default) keeps native prefix attention. `auto` allows calibrated segmentation of eligible paged FA2 shapes. |
-| `prefix_calibration` | `false` disables segmentation outright, not only measurement. |
+| `prefix_calibration` | Set to `false` to disable calibration and keep native prefix attention. |
 | `prefix_calibration_path`, `prefix_min_chain_us` | Select the calibration profile and the minimum predicted unsplit chain time for segmentation. |
 | `enable_short_suffix_attention` | Defaults to `true` on eligible CUDA CUSTOM engines. Set to `false` under `gr` at startup to use the packed path. |
 
-`attention_config.flash_attn_version` affects segmentation; the
-`gr.prefill_flash_attn_version` option is resolved for Prefill only. An
-explicit FA2 still allows segmentation, while FA3 and FA4 suppress it and keep
-their native splitting heuristics. Batch-invariant mode disables splitting.
-The calibrated path requires plain paged FP16 or BF16 attention without
-windows, ALiBi, softcap or sinks. See the
+`attention_config.flash_attn_version` affects Decode prefix segmentation.
+An explicit FA2 selection allows segmentation for eligible shapes. FA3 and
+FA4 keep their native splitting heuristics. `gr.prefill_flash_attn_version`
+applies only to Prefill. Batch-invariant mode disables splitting. The
+calibrated path requires plain paged FP16 or BF16 attention without windows,
+ALiBi, softcap or sinks. See the
 [startup configuration](../../configuration/README.md).
 
 ## Performance
 
 Measure with the [Beam performance workload](../../cli/bench/beam_performance.md).
 Keep the model, prompt, batch size, beam width and Prefill mode fixed across
-runs, and record the revision, device, model dtype, runner, decode length,
-warmup count and measured runs with the results. An earlier revision of this
-page quoted packed-versus-fused latency numbers, but they could not be tied to
-a revision in this checkout and were removed. See the
+runs. Record the revision, device, model dtype, runner, Decode length, warmup
+count and measured runs with the results. Follow the
 [benchmark acceptance policy](../../contributing/ci/benchmark_acceptance.md)
-before treating a comparison as evidence.
+when comparing the paths.
 
 ## Validation
 
