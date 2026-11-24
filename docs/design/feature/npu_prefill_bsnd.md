@@ -1,61 +1,64 @@
 # Ascend BSND Prefill graphs
 
-Ascend can replay Prefill for a batch of complete prompts using BSND
-(batch, sequence, head, head dimension) layout. Each request gets a fixed
-region along the sequence dimension, so replay only updates input buffers and
-reuses the fused attention parameters captured for every layer.
+Ascend Prefill can use an optional graph for complete prompts in BSND
+(batch, sequence, head, head dimension) layout. The runner pads each prompt
+to a fixed number of sequence slots. On replay, it fills the input buffers
+and reuses the fused attention parameters captured for each layer.
 
 ![Two four-prompt batches each total 512 tokens. A 129-token row exceeds the 128 slots per row in the smaller BSND capture.](../../assets/npu_bsnd_layout.svg)
 
 ## Capture selection
 
-A capture shape `(T, B)` reserves `T` token slots for exactly `B` requests, so
-each request gets `T / B` slots. The runner selects the smallest ready BSND
-capture that satisfies both conditions:
+A capture shape `(T, B)` divides `T` token slots evenly among exactly `B`
+requests. The runner chooses the smallest ready capture whose request count
+and per-request capacity fit the batch.
 
-- `B` equals the batch's request count. A `(512, 4)` capture cannot serve two
-  requests.
-- `T / B` is at least the longest scheduled prompt length
-  (`num_prompt_tokens`) in the batch.
+- `B` must equal the number of requests. A `(512, 4)` capture serves a batch
+  of exactly four requests.
+- `T / B` must fit the longest prompt (`num_prompt_tokens`) in the batch.
 
-`B` may be 1, 2 or 4; `T` must be positive, divisible by `B` and present in the
-runner's Prefill buckets.
+Allowed request counts for `B` are 1, 2, and 4. `T` must be a positive
+multiple of `B` and match one of the runner's Prefill buckets.
 
 ## Replay and fallback
 
-1. **Place prompts.** Write complete prompts in native input-batch order and
-   pad each region on the right. A padding slot maps to token slot `-1` and
-   skips the KV write.
-2. **Replay.** Fused attention reads Q/K/V for this Prefill, materializing
-   contiguous tensors when the inputs are not contiguous. The causal mask
-   protects real-token results, and the model writes real K/V to the paged
-   cache for Decode.
-3. **Compact.** Gather the real hidden states in the order expected by the
-   logits indices.
+1. **Place prompts.** The runner copies complete prompts in native
+   input-batch order and pads each request's slots on the right. Padding has
+   slot mapping `-1`, which skips the paged KV write.
+2. **Replay.** Fused attention reads the layer's Q/K/V, making the tensors
+   contiguous when needed. The causal mask keeps prompt tokens from attending
+   to the right padding. The model writes real-token K/V to the paged cache
+   for Decode.
+3. **Compact.** The runner gathers the real-token hidden states in the order
+   expected by the logits indices.
 
-Per-call input tensors can change between requests. The runner copies their
-contents into the input buffers bound at capture. If one of those captured
-buffers is replaced, replay raises a `RuntimeError` with `recapture is required`.
+The runner copies each call's token IDs, positions, and slot mapping into
+the buffers bound at capture. If a captured buffer changes identity or its
+tensor descriptor changes, replay raises a `RuntimeError` with
+`recapture is required`.
+
+A TND graph packs the batch onto one token axis and updates the per-layer
+attention parameters on each replay.
 
 | Dispatch condition | Action |
 | --- | --- |
-| All prompts fully scheduled, zero computed tokens, batch shape matches a ready BSND capture | Replay BSND and compact the real outputs. |
-| A prefix-cache hit introduces history, no shape fits, or the batch carries `intermediate_tensors`, `inputs_embeds` or extra model kwargs | Skip BSND and try the TND graph or native Prefill. |
-| A required per-call tensor is missing, its dimensions are incompatible, or token counts do not fit the capture | Fall through to TND. |
+| All prompts are fully scheduled with zero computed tokens, and the batch fits a ready BSND capture | Replay BSND and compact the real-token outputs. |
+| A prompt has cached history, only part of a prompt is scheduled, or no BSND capture fits | Try a TND graph. Use native Prefill if TND cannot replay. |
+| The batch carries `intermediate_tensors`, `inputs_embeds`, or extra model kwargs | Use native Prefill. |
+| A required per-call tensor is missing, its dimensions are incompatible, or the token counts exceed the capture's limits | Decline BSND and try TND. |
 | The captured-buffer identity check fails, or the capture itself fails on an eligible backend | Propagate the error. |
 
-Every attention group must use the Beam/CUSTOM metadata builder for Beam
-Prefill capture; native or mixed-backend models skip these captures. BSND
-rejects KV sharing, sliding windows, softcap, sinks, ALiBi and FP8 KV. FIA
-workspace and log-sum-exp buffers are cached per BSND shape in the capture
-metadata (`bsnd_resources`), so their addresses are baked into the graph and
-reused on every replay.
+Beam Prefill capture requires the Beam/CUSTOM metadata builder in every
+attention group. Models with native or mixed attention backends skip these
+captures. BSND rejects KV sharing, sliding windows, softcap, sinks, ALiBi, and
+FP8 KV. The runner keeps the FIA workspace and log-sum-exp buffers for each
+BSND shape in the capture metadata (`bsnd_resources`). Replays reuse the
+captured buffer addresses.
 
 !!! note "Enabling BSND raises the bar for TND"
 
-    When a BSND spec is configured, a TND capture failure is also fatal: BSND
-    graphs are captured first, and the TND capture loop re-raises while a BSND
-    spec is active.
+    The runner captures BSND graphs before TND graphs. When a BSND spec is
+    active, the runner propagates a TND capture failure and aborts startup.
 
 ## Configuration
 
@@ -65,25 +68,27 @@ gr:
   npu_bsnd_capture_specs: "512,4;1024,4"
 ```
 
-`gr.npu_bsnd_capture_specs` is a semicolon-separated string. An empty string
-or an absent key disables BSND; YAML `null` is rejected. Shapes are parsed and
-validated when the Prefill graph runner initializes, so invalid shapes fail
-initialization only when `gr.prefill_graph_enabled` is true.
+Enter capture shapes in `gr.npu_bsnd_capture_specs` as a semicolon-separated
+string. An empty string or an omitted key disables BSND. The configuration
+rejects YAML `null`. The Prefill graph runner validates shapes at
+initialization, so invalid shapes surface when `gr.prefill_graph_enabled`
+is true.
 
 ## Performance
 
-BSND trades per-layer parameter updates for padding. The longest prompt in the
-batch determines how much sequence space every request needs: four prompts of
-length 128 fit a 512-slot capture, but moving one token from the second prompt
-to the first keeps the total at 512 while requiring a 1024-slot capture.
+BSND saves per-layer attention parameter updates at the cost of padding. In
+the figure, four 128-token prompts fill the 512-slot capture. Moving one
+token from the second prompt to the first keeps the total at 512. The
+129-token prompt exceeds the 128 slots available per request, so the runner
+uses the 1024-slot capture shown in the figure.
 
 ## Validation
 
 The [BSND tests](../../../tests/v1/worker/test_npu_prefill_bsnd.py) cover shape
-selection, row order, compaction, fallback, buffer identity and the decline
-path; padding writes are checked indirectly through the compaction destination
-and the slot buffer. Run `python tools/pre_commit/mypy.py 3.12 tests/v1/worker/test_npu_prefill_bsnd.py`
-for the host regression file.
+selection, row order, output compaction, buffer identity, and when dispatch
+uses a fallback. They check padding indirectly through the compaction
+destination and the slot buffer. To type-check the host regression file, run
+`python tools/pre_commit/mypy.py 3.12 tests/v1/worker/test_npu_prefill_bsnd.py`.
 
 ## Source map
 
