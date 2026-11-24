@@ -42,24 +42,21 @@ extension of vLLM.
 
 ### vLLM-GR is flexible and easy to use with
 
-- Generate candidate SIDs directly or, for compatible models, run an offline
-  reasoning step before catalog-constrained SID generation.
-- Choose full-vocabulary or catalog-constrained search, set candidate and beam
-  widths at each stage, and specify how many results to return.
-- Use the same `gr` configuration for offline Python inference, the
-  OpenAI-compatible HTTP completions endpoint and experimental gRPC serving.
-- Roll out new model weights and switch item catalogs independently on
-  running service instances. Online catalog replacement requires asynchronous
+- Generate candidate SIDs with full-vocabulary or catalog-constrained Beam
+  search. Set per-step candidate and beam widths and the result count.
+- Reuse the same `gr` configuration for offline Python inference,
+  OpenAI-compatible HTTP completions, and experimental gRPC serving.
+- Roll out model weights and replace item catalogs independently. Weight updates
+  pause and drain instances. Online catalog replacement requires asynchronous
   Beam execution on CUDA.
-- Extend device support through backend providers that validate the environment,
-  apply runtime patches, and implement catalog-constrained top-k selection.
+- Reuse vLLM's platform abstraction to support CUDA GPUs and Ascend NPUs with
+  device-specific worker and ModelRunner optimizations, and extend support to
+  other hardware backends.
 
 ### vLLM-GR supports the following models
 
 - **Generative recommendation.** [OneRec-1.7B](https://huggingface.co/OpenOneRec/OneRec-1.7B)
   generates a ranked list of candidate SIDs for a user's history.
-- **Text generation.** See the [supported models](docs/models/supported_models.md)
-  for openPangu passthrough and device-specific guidance.
 
 ## Getting Started
 
