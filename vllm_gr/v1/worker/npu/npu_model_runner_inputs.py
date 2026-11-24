@@ -86,11 +86,8 @@ class Mock2DArray:
             raise e
 
 
-# Per-request sampling tensors remapped onto per-beam logits rows by
-# InputBatchProxy. Shared across the remap pass so one cached device index
-# tensor serves every attribute (instead of one host->device list transfer
-# per attribute, the `aten::index` + `aten::to/copy_` pairs in profiling
-# bw128_1k_t3).
+# Reuse one device index tensor across all sampling attributes when
+# remapping per-request tensors to per-beam logits rows.
 _SAMPLING_META_ATTRS = (
     "temperature",
     "top_p",
@@ -294,24 +291,14 @@ class InputBatchProxy:
 
 
 def _materialize_logits_indices(runner: Any, indices: list[int]) -> torch.Tensor:
-    """Copy per-beam ``logits_indices`` into a runner-owned reusable buffer.
+    """Materialize logits indices in a runner-owned reusable int32 device buffer.
 
-    The legacy path built a fresh ``torch.tensor(list, device=...)`` on every
-    beam step, paying a device allocation + host->device transfer each time.
-    This keeps one int32 device buffer on the runner (sized to the first
-    request's footprint) and reuses it in place, so repeated decode steps only
-    pay the host->device ``copy_`` of the newly expanded indices.
+    The buffer grows when needed. A nonempty index list equal to ``range(n)`` is
+    materialized with a device-side ``arange``; other lists are copied from the
+    host. The input Python list is still constructed and checked by this path.
 
-    Fully incremental beam decode fills ``indices`` as the contiguous range
-    ``[0, num_logits)``; that shape is materialized directly on the device with
-    ``torch.arange``, eliminating the host->device copy (and the Python list
-    itself) entirely. A non-contiguous index list (chunked prefill or mixed
-    standard/beam rows) falls back to the host copy path.
-
-    Returns a view of the buffer containing exactly the given indices.  The
-    caller must consume the value before the next call to this helper (the
-    buffer is intentionally overwritten on the next beam step), matching the
-    one-step lifetime of ``logits_indices`` inside ``execute_model``.
+    The returned view must be consumed before the next call, which may overwrite
+    the buffer.
     """
     n = len(indices)
     buffer = getattr(runner, "_gr_logits_indices_buffer", None)
