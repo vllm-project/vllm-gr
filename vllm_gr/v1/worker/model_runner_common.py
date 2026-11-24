@@ -18,7 +18,7 @@ from vllm_gr.v1.worker import gr_execution, gr_gc
 from vllm_gr.v1.worker import model_runner_contracts as contracts
 
 if TYPE_CHECKING:
-    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
+    from vllm_gr.v1.worker.gpu.stage_hooks import CudaStageHooksType
 
 
 def make_patched_execute_model(

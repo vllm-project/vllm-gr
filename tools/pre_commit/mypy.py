@@ -30,10 +30,10 @@ GENERATED_GRPC_PREFIX = "vllm_gr/entrypoints/grpc/generated/"
 # internals outside this boundary remain dynamically typed.
 CUDA_STAGE_GROUP = "cuda-stage"
 CUDA_STAGE_FILES = [
-    "vllm_gr/v1/worker/cuda/gpu_stage_hooks.py",
-    "vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py",
-    "vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py",
-    "vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py",
+    "vllm_gr/v1/worker/gpu/stage_hooks.py",
+    "vllm_gr/v1/worker/gpu/beam_stage_runner.py",
+    "vllm_gr/v1/worker/gpu/v1/beam_stage_runner_v1.py",
+    "vllm_gr/v1/worker/gpu/v2/beam_stage_runner_v2.py",
     "vllm_gr/v1/worker/gr_execution.py",
     "vllm_gr/v1/worker/gr_startup.py",
     "vllm_gr/v1/worker/model_runner_common.py",
@@ -41,10 +41,10 @@ CUDA_STAGE_FILES = [
     "vllm_gr/v1/worker/gr_gc.py",
     "vllm_gr/v1/worker/gr_context.py",
     "vllm_gr/v1/worker/model_runner_patch.py",
-    "vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py",
-    "vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py",
-    "vllm_gr/v1/worker/cuda/gr_inputs.py",
-    "vllm_gr/v1/worker/cuda/beam_decode_graph.py",
+    "vllm_gr/v1/worker/gpu/v2/model_runner_v2_patch.py",
+    "vllm_gr/v1/worker/gpu/v2/model_runner_v2_resources.py",
+    "vllm_gr/v1/worker/gpu/gr_inputs.py",
+    "vllm_gr/v1/worker/gpu/beam_decode_graph.py",
     "tests/tools/cuda_stage_typing_cases.py",
 ]
 

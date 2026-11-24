@@ -226,12 +226,12 @@ def test_external_provider_cannot_override_builtin(
 def test_disable_switch_lets_an_external_provider_replace_a_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(loader.DISABLE_BUILTIN_ENV, "ascend")
-    replacement = FakeProvider(backend_id="ascend", device_type="npu")
-    _install_entry_points(monkeypatch, FakeEntryPoint("ascend", replacement))
+    monkeypatch.setenv(loader.DISABLE_BUILTIN_ENV, "npu")
+    replacement = FakeProvider(backend_id="npu", device_type="npu")
+    _install_entry_points(monkeypatch, FakeEntryPoint("npu", replacement))
     loader.load_backend_plugins()
 
-    assert resolve_backend("ascend") is replacement
+    assert resolve_backend("npu") is replacement
 
 
 def test_core_distribution_is_discovered_once_and_disabled_before_import(
@@ -271,18 +271,18 @@ def test_duplicate_ids_are_still_rejected_after_a_disable_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The switch removes one built-in; it never suppresses duplicate checks."""
-    monkeypatch.setenv(loader.DISABLE_BUILTIN_ENV, "ascend")
+    monkeypatch.setenv(loader.DISABLE_BUILTIN_ENV, "npu")
     _install_entry_points(
         monkeypatch,
-        FakeEntryPoint("ascend", FakeProvider(backend_id="ascend", device_type="npu")),
-        FakeEntryPoint("ascend_dup", FakeProvider(backend_id="ascend", device_type="npu")),
+        FakeEntryPoint("npu", FakeProvider(backend_id="npu", device_type="npu")),
+        FakeEntryPoint("npu_dup", FakeProvider(backend_id="npu", device_type="npu")),
     )
 
     with pytest.raises(InvalidBackendProviderError) as exc_info:
         loader.load_backend_plugins()
 
     message = str(exc_info.value)
-    assert "entrypoint_name='ascend_dup'" in message
+    assert "entrypoint_name='npu_dup'" in message
 
 
 def test_plugin_batch_failure_does_not_partially_register(
@@ -330,13 +330,13 @@ def test_activate_current_backend_rejects_unknown_platform(
 
     message = str(exc_info.value)
     assert "device_type='cpu'" in message
-    assert "available=('ascend', 'cuda')" in message
+    assert "available=('cuda', 'npu')" in message
 
 
-def test_activate_current_backend_requires_an_ascend_identity_for_ascend(
+def test_activate_current_backend_requires_an_npu_identity_for_npu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Device placement alone does not select the Ascend provider."""
+    """Device placement alone does not select the NPU provider."""
     _fake_current_platform(
         monkeypatch,
         SimpleNamespace(_enum="OOT", device_type="npu", device_name="npu"),
@@ -369,13 +369,13 @@ def test_activate_current_backend_selects_the_vendor_subclass(
     _fake_current_platform(monkeypatch, DerivedVendorPlatform())
     _install_entry_points(monkeypatch)
 
-    assert loader.activate_current_backend().backend_id == "ascend"
+    assert loader.activate_current_backend().backend_id == "npu"
 
 
 def test_explicit_request_cannot_switch_the_native_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(loader.REQUESTED_BACKEND_ENV, "ascend")
+    monkeypatch.setenv(loader.REQUESTED_BACKEND_ENV, "npu")
     _fake_current_platform(monkeypatch, _nvidia_platform())
     _install_entry_points(monkeypatch)
 
@@ -383,7 +383,7 @@ def test_explicit_request_cannot_switch_the_native_platform(
         loader.activate_current_backend()
 
     message = str(exc_info.value)
-    assert "requested_origin='builtin:ascend [backend_id=ascend]'" in message
+    assert "requested_origin='builtin:npu [backend_id=npu]'" in message
 
 
 def test_explicit_request_selects_the_matching_backend(
@@ -440,11 +440,11 @@ def test_legacy_entry_point_for_an_unknown_device_type_is_rejected(
 
 
 def test_legacy_npu_entry_point_keeps_its_installed_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(loader.DISABLE_BUILTIN_ENV, "ascend")
+    monkeypatch.setenv(loader.DISABLE_BUILTIN_ENV, "npu")
     _install_entry_points(monkeypatch, FakeEntryPoint("npu", FakeLegacyProvider("npu")))
     _fake_current_platform(monkeypatch, SimpleNamespace(device_type="npu"))
 
-    assert loader.activate_current_backend() is resolve_backend("ascend")
+    assert loader.activate_current_backend() is resolve_backend("npu")
 
 
 def _nvidia_identity() -> PlatformIdentity:

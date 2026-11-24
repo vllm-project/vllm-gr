@@ -10,20 +10,20 @@ from typing import Any
 import torch
 import triton
 
-from vllm_gr.ops.cuda import beam_state as ops
-from vllm_gr.ops.cuda.beam_kv_reorder import (
+from vllm_gr.ops.gpu import beam_state as ops
+from vllm_gr.ops.gpu.beam_kv_reorder import (
     _select_kv_gather_kernel,
     _select_kv_scatter_kernel,
 )
-from vllm_gr.ops.cuda.beam_selection import (
+from vllm_gr.ops.gpu.beam_selection import (
     _group_beam_outputs_kernel,
     _hierarchical_topk_out,
     bootstrap_beam_outputs_out,
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.beam.session import BeamSearchSession
-from vllm_gr.v1.worker.cuda.beam_state import BeamSearchState
-from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspace
+from vllm_gr.v1.worker.gpu.beam_state import BeamSearchState
+from vllm_gr.v1.worker.gpu.postprocess_workspace import BeamPostprocessWorkspace
 
 try:
     from torch._C._dynamo.guards import TensorGuards as _TensorGuards

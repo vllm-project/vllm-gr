@@ -11,12 +11,12 @@ import numpy.typing as npt
 import pytest
 import torch
 
-from vllm_gr.ops.cuda.beam_state import FINISH_LENGTH, FINISH_STOP
+from vllm_gr.ops.gpu.beam_state import FINISH_LENGTH, FINISH_STOP
 from vllm_gr.v1.beam.batch_contracts import BeamOutputOptions
-from vllm_gr.v1.worker.cuda.beam_final_output import _build_batch_result, _PayloadLayout
+from vllm_gr.v1.worker.gpu.beam_final_output import _build_batch_result, _PayloadLayout
 
 if TYPE_CHECKING:
-    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import BeamRequestBinding
+    from vllm_gr.v1.worker.gpu.beam_stage_runner import BeamRequestBinding
 
 
 def bindings(batch_size: int) -> tuple["BeamRequestBinding", ...]:

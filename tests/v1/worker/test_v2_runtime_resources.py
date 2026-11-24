@@ -11,8 +11,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import GPUBeamStageRunner
-from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+from vllm_gr.v1.worker.gpu.beam_stage_runner import GPUBeamStageRunner
+from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import (
     close_v2_runtime,
     get_v2_runtime,
 )
@@ -241,8 +241,8 @@ def test_shutdown_invalidates_before_native_call_even_on_failure(native_fails: b
 def test_new_shape_capture_cannot_rebind_a_stale_generation(
     monkeypatch: pytest.MonkeyPatch, replacement: str
 ) -> None:
-    from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
-    from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+    from vllm_gr.v1.worker.gpu.beam_decode_graph import BeamDecodeGraph
+    from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import (
         V2BeamDecodeGraph,
         V2RuntimeState,
     )

@@ -8,7 +8,7 @@ import torch
 
 from tests.constraints.test_table import make_table
 from vllm_gr.constraints.scoring import score_selected_tokens
-from vllm_gr.ops.cuda.rec_constrained_topk import (
+from vllm_gr.ops.gpu.rec_constrained_topk import (
     _rec_constrained_topk_cuda_out_unchecked,
     rec_constrained_topk_cuda,
     rec_constrained_topk_cuda_out,

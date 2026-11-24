@@ -16,15 +16,15 @@ import triton.language as tl
 from numpy.typing import NDArray
 
 from tests.kernels.beam_runner_test_utils import make_request_runner as _runtime
-from vllm_gr.ops.cuda.beam_kv_reorder import (
+from vllm_gr.ops.gpu.beam_kv_reorder import (
     _select_kv_gather_kernel,
     _select_kv_scatter_kernel,
 )
-from vllm_gr.ops.cuda.beam_selection import (
+from vllm_gr.ops.gpu.beam_selection import (
     _hierarchical_topk_out,
     allocate_beam_selection_scratch,
 )
-from vllm_gr.ops.cuda.beam_state import (
+from vllm_gr.ops.gpu.beam_state import (
     ERROR_ALREADY_INITIALIZED,
     ERROR_CAPACITY,
     ERROR_INVALID_CANDIDATE,
@@ -41,8 +41,8 @@ from vllm_gr.v1.beam.cpu_reference import (
     select_next_beams,
 )
 from vllm_gr.v1.beam.session import BeamSearchSession
-from vllm_gr.v1.worker.cuda.beam_final_output import _PayloadLayout
-from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
+from vllm_gr.v1.worker.gpu.beam_final_output import _PayloadLayout
+from vllm_gr.v1.worker.gpu.beam_search_runner import BeamSearchRunner
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 # Test fixtures and Triton DSL functions intentionally use untyped values.

@@ -90,10 +90,10 @@ if not origin.is_relative_to(install_dir):
 worker_package = "vllm_gr.v1.worker"
 for module in (
     "model_runner_patch",
-    "cuda.gpu_stage_hooks",
-    "cuda.v1.gpu_model_runner_patch",
-    "cuda.v2.gpu_model_runner_v2_patch",
-    "cuda.v2.gpu_model_runner_v2_resources",
+    "gpu.stage_hooks",
+    "gpu.v1.model_runner_patch",
+    "gpu.v2.model_runner_v2_patch",
+    "gpu.v2.model_runner_v2_resources",
     "npu.npu_model_runner_patch",
 ):
     spec = find_spec(f"{worker_package}.{module}")

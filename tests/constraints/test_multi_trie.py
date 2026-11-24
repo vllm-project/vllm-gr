@@ -29,7 +29,7 @@ from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
 from vllm_gr.constraints.json_compiler import compile_relations_json
 from vllm_gr.constraints.loader import _upload_cuda_backend, load_constraint_backend
 from vllm_gr.constraints.table import ConstraintTable, validate_constraint_table
-from vllm_gr.ops.cuda.rec_constrained_topk import rec_constrained_topk_cuda
+from vllm_gr.ops.gpu.rec_constrained_topk import rec_constrained_topk_cuda
 
 SIDS = (
     ((1, 2, 0), (1, 2, 1), (1, 4, 3), (3, 5, 1), (3, 5, 4)),

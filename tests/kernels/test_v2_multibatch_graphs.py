@@ -24,13 +24,13 @@ from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.beam.dispatch import GRStageKind
-from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+from vllm_gr.v1.worker.gpu.beam_stage_runner import (
     get_stage_runner,
 )
-from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import (
+from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import (
     CudaStageHooksV2,
 )
-from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import (
     capture_multibatch_forward,
     close_v2_runtime,
     get_v2_runtime,

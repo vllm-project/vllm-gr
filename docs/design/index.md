@@ -19,12 +19,12 @@ settings and supported combinations, see
 
 ### Prefill execution
 
-- [CUDA Prefill graph capture](feature/cuda_prefill_graph.md) covers token buckets in both model runners, padded replay and the fresh-prompt requirement for dense attention.
+- [CUDA Prefill graph capture](feature/gpu_prefill_graph.md) covers token buckets in both model runners, padded replay and the fresh-prompt requirement for dense attention.
 - [Ascend BSND Prefill graphs](feature/npu_prefill_bsnd.md) describes how complete prompts fit into fixed per-request regions and when the worker falls back.
 
 ### Decode attention
 
-- [CUDA Beam Decode attention](feature/cuda_decode_attention.md) follows the shared prompt pages and per-beam suffix KV through attention and the final merge.
+- [CUDA Beam Decode attention](feature/gpu_decode_attention.md) follows the shared prompt pages and per-beam suffix KV through attention and the final merge.
 - [Ascend Beam Decode execution](feature/npu_decode_execution.md) covers xllm and cascade selection, parent KV reordering and caller-owned XAttention output.
 
 ### Online updates

@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_gr.platforms.ascend import provider as npu
 from vllm_gr.platforms.cuda import provider as cuda
+from vllm_gr.platforms.npu import provider as npu
 
 
 def test_npu_provider_passes_device() -> None:

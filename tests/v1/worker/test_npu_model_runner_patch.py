@@ -1422,14 +1422,14 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler(
 def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner
+    from vllm_gr.v1.worker.gpu import beam_stage_runner
     from vllm_gr.v1.worker.npu import npu_beam_stage_runner
 
     output = object()
     stage = SimpleNamespace(execute=Mock(return_value=output))
     cuda = Mock(return_value=stage)
     npu = Mock(return_value=stage)
-    monkeypatch.setattr(gpu_beam_stage_runner, "get_stage_runner", cuda)
+    monkeypatch.setattr(beam_stage_runner, "get_stage_runner", cuda)
     monkeypatch.setattr(npu_beam_stage_runner, "get_npu_stage_runner", npu)
     hooks = object()
     worker = SimpleNamespace(device=device)

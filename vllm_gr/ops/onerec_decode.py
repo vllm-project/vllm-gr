@@ -465,7 +465,7 @@ def _beam_search_rec_final_select_cuda_dispatch(
     current_step: int,
     result_width: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    from vllm_gr.ops.cuda.beam_selection import beam_search_rec_final_select_cuda
+    from vllm_gr.ops.gpu.beam_selection import beam_search_rec_final_select_cuda
 
     return beam_search_rec_final_select_cuda(
         log_probs,
@@ -495,7 +495,7 @@ def _beam_search_group_cuda_dispatch(
     current_step: int,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    from vllm_gr.ops.cuda.beam_selection import (
+    from vllm_gr.ops.gpu.beam_selection import (
         _validate_beam_inputs,
         beam_search_group_cuda,
     )

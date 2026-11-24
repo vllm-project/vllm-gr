@@ -9,11 +9,11 @@ from typing import Any
 import pytest
 
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
-from vllm_gr.platforms.ascend import provider as npu
 from vllm_gr.platforms.cuda import CUDA_BACKEND
+from vllm_gr.platforms.npu import provider as npu
 from vllm_gr.v1.worker import model_runner_patch
-from vllm_gr.v1.worker.cuda import runner_installer as cuda
-from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
+from vllm_gr.v1.worker.gpu import runner_installer as cuda
+from vllm_gr.v1.worker.gpu.v1 import model_runner_patch as gpu_model_runner_patch
 
 
 @pytest.mark.l1  # type: ignore[misc]
@@ -294,7 +294,7 @@ def test_dispatcher_routes_platform_before_v2_flag(
         setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", use_v2)
     monkeypatch.setitem(sys.modules, "vllm.envs", envs)
     provider = CUDA_BACKEND if device_type == "cuda" else npu.NPU_BACKEND
-    from vllm_gr.v1.worker.cuda import runner_installer as runner
+    from vllm_gr.v1.worker.gpu import runner_installer as runner
 
     target = (("selected", object),)
     monkeypatch.setattr(runner, "discover_worker_runners", lambda: target)
@@ -322,7 +322,7 @@ def test_numpy_token_staging_installs_for_cuda_runners_only(
     expected: list[str],
 ) -> None:
     """V1 and V2 share StagedWriteTensor, so staging is runner-agnostic."""
-    from vllm_gr.v1.worker.cuda import numpy_staging
+    from vllm_gr.v1.worker.gpu import numpy_staging
     from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
     runner_hooks = gpu_model_runner_patch if device_type == "cuda" else npu_model_runner_patch
@@ -342,7 +342,7 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
     unguarded _prepare_inputs access the V2 runner does not expose."""
     called: list[str] = []
 
-    import vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch as v2_patch_module
+    import vllm_gr.v1.worker.gpu.v2.model_runner_v2_patch as v2_patch_module
 
     monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: v2_patch_module)
     monkeypatch.setattr(cuda, "install_worker_hooks", lambda: called.append("staging"))
@@ -394,16 +394,18 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     monkeypatch.setattr(
         gr_startup,
         "capture_async_forward",
-        lambda _, *, hooks_type: events.append("stages")
-        if hooks_type is None
-        else pytest.fail("NPU received CUDA hooks"),
+        lambda _, *, hooks_type: (
+            events.append("stages")
+            if hooks_type is None
+            else pytest.fail("NPU received CUDA hooks")
+        ),
     )
     monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
 
     original_import = builtins.__import__
 
     def without_cuda_hooks(name: str, *args: Any, **kwargs: Any) -> Any:
-        assert name != "vllm_gr.v1.worker.cuda" and not name.startswith("vllm_gr.v1.worker.cuda.")
+        assert name != "vllm_gr.v1.worker.gpu" and not name.startswith("vllm_gr.v1.worker.gpu.")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", without_cuda_hooks)
@@ -425,8 +427,8 @@ def test_public_installer_owns_numpy_staging_once(
 
     from vllm_gr.v1.worker import gr_async_output
     from vllm_gr.v1.worker import model_runner_patch as installer
-    from vllm_gr.v1.worker.cuda import numpy_staging
-    from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
+    from vllm_gr.v1.worker.gpu import numpy_staging
+    from vllm_gr.v1.worker.gpu.v2 import model_runner_v2_patch as v2
 
     install = Mock()
     discover = Mock(return_value=())

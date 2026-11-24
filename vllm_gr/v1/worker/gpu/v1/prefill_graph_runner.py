@@ -11,8 +11,8 @@ from vllm.logger import init_logger
 
 from vllm_gr.utils.npu_adapter import is_cuda_available
 from vllm_gr.v1.forward_context import fresh_prefill_capture
-from vllm_gr.v1.worker.cuda.v1.prefill_capture_plan import plan_prefill_capture
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+from vllm_gr.v1.worker.gpu.v1.prefill_capture_plan import plan_prefill_capture
 from vllm_gr.v1.worker.prefill_graph_common import (
     SUPPORTED_NUM_REQS,
     BasePrefillGraphRunner,

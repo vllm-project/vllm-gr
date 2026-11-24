@@ -103,7 +103,7 @@ for library and CLI use.
 Both runners use the same Beam Search API and `gr` configuration.
 CUDA Prefill and Decode capture policies differ by runner. See the
 [V2 integration guide](../docs/design/module/model_runner_v2.md) and
-[Prefill capture guide](../docs/design/feature/cuda_prefill_graph.md#configuration).
+[Prefill capture guide](../docs/design/feature/gpu_prefill_graph.md#configuration).
 
 ## Run Pangu offline
 

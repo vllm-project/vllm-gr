@@ -15,11 +15,11 @@ from tests.kernels.beam_stage_test_utils import (
     install_decode_model,
 )
 from vllm_gr.config.models import DeploymentOptions
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import (
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import (
     should_replay_decode_graph_v2,
 )
-from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import (
     capture_multibatch_forward,
     get_v2_runtime,
 )

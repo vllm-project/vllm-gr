@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_gr.ops.cuda.beam_selection import (
+from vllm_gr.ops.gpu.beam_selection import (
     allocate_beam_selection_scratch,
     beam_search_rec_final_select_cuda,
     beam_search_rec_final_select_cuda_out,

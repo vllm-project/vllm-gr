@@ -580,7 +580,7 @@ for width in (4, 8):
     assert report["fingerprint"] == plan.fingerprint
     assert runner.execute_model(42) == (width, 42)
 assert not any(f"vllm_gr.v1.worker.{name}" in sys.modules for name in
-               ("cuda.v1.gpu_model_runner_patch", "cuda.v2.gpu_model_runner_v2_patch", "npu.npu_model_runner_patch"))
+               ("gpu.v1.model_runner_patch", "gpu.v2.model_runner_v2_patch", "npu.npu_model_runner_patch"))
 """,
         site_packages=site_packages,
         project_root=Path(__file__).resolve().parents[2],

@@ -13,7 +13,7 @@ from vllm_gr.config.backend_plan import BACKEND_PLAN_KEY
 from vllm_gr.platforms.cuda import CUDA_BACKEND
 from vllm_gr.platforms.planning import normalize_backend_request
 from vllm_gr.platforms.services import LegacyPlanningProvider
-from vllm_gr.v1.worker.cuda import runner_installer as runner
+from vllm_gr.v1.worker.gpu import runner_installer as runner
 from vllm_gr.v1.worker.runner_lifecycle import (
     NativeRunnerAdapter,
     has_runner_lifecycle,
@@ -42,12 +42,12 @@ def workers(monkeypatch: pytest.MonkeyPatch) -> Any:
             discover_worker_runners=lambda native=native: ((native.__name__, native),),
             is_patched=lambda cls, identity=identity: has_runner_lifecycle(cls, identity),
             install=Mock(
-                side_effect=lambda native=native,
-                identity=identity,
-                name=name: install_runner_lifecycle(
-                    native,
-                    identity,
-                    prepare="prepare_inputs",
+                side_effect=lambda native=native, identity=identity, name=name: (
+                    install_runner_lifecycle(
+                        native,
+                        identity,
+                        prepare="prepare_inputs",
+                    )
                 )
             ),
         )

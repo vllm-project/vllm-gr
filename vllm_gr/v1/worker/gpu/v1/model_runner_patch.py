@@ -15,8 +15,8 @@ from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
 )
-from vllm_gr.v1.worker.cuda.runner_installer import V1_RUNNER
-from vllm_gr.v1.worker.cuda.v1.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
+from vllm_gr.v1.worker.gpu.runner_installer import V1_RUNNER
+from vllm_gr.v1.worker.gpu.v1.prefill_inputs import try_prepare_gr_prefill_inputs
 from vllm_gr.v1.worker.gr_context import (
     _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
@@ -401,7 +401,7 @@ def capture_beam_decode_graph(runner) -> bool:
 
     Returns True if a graph was captured.
     """
-    from vllm_gr.v1.worker.cuda.beam_decode_graph import get_beam_decode_graph
+    from vllm_gr.v1.worker.gpu.beam_decode_graph import get_beam_decode_graph
     from vllm_gr.v1.worker.gr_context import (
         _get_gr_config,
     )
@@ -723,11 +723,11 @@ def is_patched(runner_class: type) -> bool:
 
 def install() -> None:
     """Install CUDA Worker utilities and the V1 native runner wrappers."""
-    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+    from vllm_gr.v1.worker.gpu.postprocess_workspace import (
         make_load_model_with_beam_postprocess_workspace,
     )
-    from vllm_gr.v1.worker.cuda.runner_installer import install_worker_hooks
-    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+    from vllm_gr.v1.worker.gpu.runner_installer import install_worker_hooks
+    from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
     from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
 
     install_worker_hooks()

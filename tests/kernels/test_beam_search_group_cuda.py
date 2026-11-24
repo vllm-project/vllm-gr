@@ -9,8 +9,8 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_fused
-from vllm_gr.ops.cuda.beam_selection import (
+from vllm_gr.ops.gpu.beam_kv_reorder import select_unshared_kv_fused
+from vllm_gr.ops.gpu.beam_selection import (
     allocate_beam_selection_scratch,
     beam_search_group_cuda,
     beam_search_group_cuda_out,

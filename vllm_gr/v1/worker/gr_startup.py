@@ -26,7 +26,7 @@ from vllm_gr.v1.beam.dispatch import (
 from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
 if TYPE_CHECKING:
-    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
+    from vllm_gr.v1.worker.gpu.stage_hooks import CudaStageHooksType
 
 logger = init_logger(__name__)
 
@@ -58,11 +58,11 @@ def capture_async_forward(
             return False
         if hooks_type is None:
             raise ValueError("CUDA GR startup capture requires explicit stage hooks")
-        from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
-        from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
+        from vllm_gr.v1.worker.gpu.stage_hooks import validate_stage_hooks_type
+        from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
 
         if hooks_type is CudaStageHooksV2:
-            from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+            from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import (
                 capture_multibatch_forward,
             )
 
@@ -153,8 +153,8 @@ def _capture_batch(
     allow_eager_fallback: bool,
 ) -> str | None:
     """Capture the explicit batch selected by the V1 or V2 entry point."""
-    from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
-    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+    from vllm_gr.v1.worker.gpu.beam_decode_graph import BeamDecodeCaptureUnsupported
+    from vllm_gr.v1.worker.gpu.beam_stage_runner import (
         get_stage_runner,
     )
     from vllm_gr.v1.worker.gr_context import (

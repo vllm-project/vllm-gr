@@ -60,7 +60,7 @@ def try_prepare_gr_prefill_inputs(
     ):
         return None
 
-    from vllm_gr.ops.cuda.gr_prefill_inputs import prepare_gr_prefill_metadata
+    from vllm_gr.ops.gpu.gr_prefill_inputs import prepare_gr_prefill_metadata
 
     batch.block_table.commit_block_table(1)
     # A single Prefill row is contiguous, including prefix-cache hits and

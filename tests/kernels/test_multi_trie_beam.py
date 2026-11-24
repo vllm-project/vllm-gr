@@ -21,8 +21,8 @@ from tests.kernels.beam_stage_test_utils import (
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.beam.dispatch import GR_WORKER_RESULT_ATTR
-from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import get_stage_runner
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.beam_stage_runner import get_stage_runner
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 

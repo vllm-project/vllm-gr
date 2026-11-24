@@ -14,12 +14,12 @@ import torch
 from tests.helpers.gr_config import table_constraint
 from vllm_gr.config.models import DEFAULT_DEPLOYMENT, DeploymentOptions
 from vllm_gr.v1.worker import gr_startup as startup
-from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
-from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
-from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
+from vllm_gr.v1.worker.gpu import beam_stage_runner as stages
+from vllm_gr.v1.worker.gpu.beam_decode_graph import BeamDecodeCaptureUnsupported
+from vllm_gr.v1.worker.gpu.stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
+from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import (
     capture_multibatch_forward,
     get_v2_runtime,
 )
@@ -602,7 +602,7 @@ def test_mode_switch_releases_the_inactive_logits_buffer() -> None:
 def test_v2_decode_captures_only_configured_batches(
     capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch, sizes: tuple[int, ...]
 ) -> None:
-    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import (
+    from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import (
         should_replay_decode_graph_v2,
     )
 
@@ -626,7 +626,7 @@ def test_v2_decode_captures_only_configured_batches(
 def test_startup_failure_is_local_to_batch(
     capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import (
+    from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import (
         should_replay_decode_graph_v2 as should_replay_decode_graph,
     )
 

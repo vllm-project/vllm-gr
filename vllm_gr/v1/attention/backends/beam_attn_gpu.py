@@ -739,7 +739,7 @@ def cascade_attention(
         # graph captured at step=1 would forever copy only 2 KV rows.
         decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
         if decode_step_buf is not None and decode_step_buf.is_cuda:
-            from vllm_gr.ops.cuda.beam_kv_cache import copy_suffix_kv_graph
+            from vllm_gr.ops.gpu.beam_kv_cache import copy_suffix_kv_graph
 
             copy_suffix_kv_graph(
                 pool.unshared_key,

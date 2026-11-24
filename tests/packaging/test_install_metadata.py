@@ -296,7 +296,7 @@ def package_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     shutil.copytree(REPO_ROOT / "requirements", source / "requirements")
     (source / "vllm_gr").mkdir()
     (source / "vllm_gr" / "__init__.py").write_text("from ._version import __version__\n")
-    for name in ("vllm_gr/platforms/compat.py", "vllm_gr/platforms/ascend/environment.py"):
+    for name in ("vllm_gr/platforms/compat.py", "vllm_gr/platforms/npu/environment.py"):
         target = source / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO_ROOT / name, target)

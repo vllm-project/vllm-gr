@@ -28,18 +28,18 @@ from vllm_gr.v1.beam.dispatch import (
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.beam.session import BeamSearchSession
-from vllm_gr.v1.worker.cuda.beam_search_runner import (
+from vllm_gr.v1.worker.gpu.beam_search_runner import (
     BeamBatchSearchRunner,
     BeamSearchRunner,
 )
-from vllm_gr.v1.worker.cuda.beam_state import BeamSearchState
-from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+from vllm_gr.v1.worker.gpu.beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
 )
-from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import BeamPostprocessWorkspace
-from vllm_gr.v1.worker.cuda.gr_inputs import GRInputBuffers
-from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
+from vllm_gr.v1.worker.gpu.beam_state import BeamSearchState
+from vllm_gr.v1.worker.gpu.gr_inputs import GRInputBuffers
+from vllm_gr.v1.worker.gpu.postprocess_workspace import BeamPostprocessWorkspace
+from vllm_gr.v1.worker.gpu.v1.beam_stage_runner_v1 import CudaStageHooksV1
 
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 

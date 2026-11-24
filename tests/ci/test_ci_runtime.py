@@ -259,6 +259,22 @@ class TestRuntimeResolution(unittest.TestCase):
         self.assertEqual(spec["expected"], {"vllm": "0.29.0", "vllm-gr": "0.29.0"})
         self.assertEqual(spec, runtime.resolve(self.repo, "cuda"))
 
+    def test_pre_rename_ascend_layout_uses_compat_declarations(self) -> None:
+        environment = self.repo / "vllm_gr/platforms/ascend/environment.py"
+        environment.parent.mkdir(parents=True)
+        environment.touch()
+        legacy = self.repo / "vllm_gr/_env_check.py"
+        compat = self.repo / "vllm_gr/platforms/compat.py"
+        compat.write_text(legacy.read_text().replace("_SUPPORTED_", "SUPPORTED_"))
+        legacy.write_text('"""OpenCV preflight."""\n')
+
+        spec = runtime.resolve(self.repo, "cuda")
+
+        self.assertEqual(spec["expected"], {"vllm": "0.29.0", "vllm-gr": "0.29.0"})
+        self.assertEqual(runtime.declarations(self.repo, "npu")["vllm-ascend"], "0.29.0rc1")
+        environment.write_text('"""Updated Ascend environment check."""\n')
+        self.assertNotEqual(runtime.resolve(self.repo, "cuda")["cache_key"], spec["cache_key"])
+
     def test_npu_requires_and_fingerprints_vendor_image(self) -> None:
         packages = {
             "vllm": "0.29.0+npu",

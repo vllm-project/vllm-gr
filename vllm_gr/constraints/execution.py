@@ -325,7 +325,7 @@ class CUDAConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
     """CUDA constrained Top-K backed by the Triton lookup/gather kernel."""
 
     def load_tables(self, resource: "ConstraintTableResource") -> None:
-        from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
+        from vllm_gr.ops.gpu.rec_constrained_topk import validate_cuda_sort_capacity
 
         if self._digest == resource.digest:
             return
@@ -373,7 +373,7 @@ class CUDAConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
         current_step: int,
         top_k: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm_gr.ops.cuda.rec_constrained_topk import rec_constrained_topk_cuda
+        from vllm_gr.ops.gpu.rec_constrained_topk import rec_constrained_topk_cuda
 
         vocab_offset, table_vocab_size = self._vocab_window(logits)
         tokens, logprobs, _, _ = rec_constrained_topk_cuda(

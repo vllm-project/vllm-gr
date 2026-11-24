@@ -120,9 +120,9 @@ counts, failure recovery and eager or graph execution.
 | File | Responsibility |
 | --- | --- |
 | [GR scheduler](../../../vllm_gr/v1/core/sched/beam_async_scheduler.py) | Stage issue, ownership filtering, acknowledgements and retirement. |
-| [CUDA stage runner](../../../vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py) | Orders device work and status copies. |
-| [V1 hooks](../../../vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py) | Implements the pinned-host-buffer fence after Prefill. |
-| [V2 hooks](../../../vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py) | Reuses no host buffers, so its fence is a no-op. |
+| [CUDA stage runner](../../../vllm_gr/v1/worker/gpu/beam_stage_runner.py) | Orders device work and status copies. |
+| [V1 hooks](../../../vllm_gr/v1/worker/gpu/v1/beam_stage_runner_v1.py) | Implements the pinned-host-buffer fence after Prefill. |
+| [V2 hooks](../../../vllm_gr/v1/worker/gpu/v2/beam_stage_runner_v2.py) | Reuses no host buffers, so its fence is a no-op. |
 | [Ascend stage runner](../../../vllm_gr/v1/worker/npu/npu_beam_stage_runner.py) | Executes and samples a pending stage. |
 
 [Beam batch execution](beam_batch_execution.md#validation-boundaries) defines

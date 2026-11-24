@@ -6,7 +6,7 @@ import logging
 import sys
 from typing import Any
 
-from vllm_gr.platforms.ascend.config_patch import (
+from vllm_gr.platforms.npu.config_patch import (
     install_ascend_config_filter,
     is_npu_platform,
 )

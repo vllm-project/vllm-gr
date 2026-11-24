@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Thin Ascend provider with lazy NPU-specific imports."""
+"""Thin NPU provider with lazy vendor-specific imports."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ _ASCEND_PLATFORM_CLASS = "vllm_ascend.platform.NPUPlatform"
 
 @dataclass(frozen=True)
 class NPUBackendProvider(BuiltinPlanSupport):
-    backend_id: str = "ascend"
+    backend_id: str = "npu"
     #: Tensor placement of the platform this provider implements.
     device_type: str = "npu"
     # Semantic ownership includes deferred hooks and existing shared dispatch.
@@ -53,7 +53,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
     vendor_distribution: ClassVar[str | None] = "vllm-ascend"
 
     def matches(self, identity: PlatformIdentity) -> bool:
-        """Match the supported Ascend platform identity and ``npu`` placement.
+        """Match the supported NPU platform identity and ``npu`` placement.
 
         The vendor platform enum is ``OOT``, which a future out-of-tree provider
         could share, so the qualified class lineage is required as well.
@@ -61,9 +61,9 @@ class NPUBackendProvider(BuiltinPlanSupport):
         return identity.device_type == "npu" and identity.has_lineage(_ASCEND_PLATFORM_CLASS)
 
     def resolve(self, request: BackendRequest) -> BackendPlan:
-        """Keep Ascend's V1 runner and its existing auto-decode policy."""
+        """Keep the NPU V1 runner and its existing auto-decode policy."""
         if request.options.to_dict():
-            raise ValueError("Ascend currently accepts no additional backend options")
+            raise ValueError("NPU currently accepts no additional backend options")
         gr = request.config.to_dict()
         constraint = "canonical" if request.has_constraint_table else "none"
         return BackendPlan(
@@ -74,12 +74,12 @@ class NPUBackendProvider(BuiltinPlanSupport):
                 {
                     "runner": "vllm_gr.v1.worker.npu.npu_model_runner_patch",
                     "attention": "vllm_gr.v1.attention.backends.beam_attn_npu",
-                    "prefill_attention": "ascend.cascade",
+                    "prefill_attention": "npu.cascade",
                     "decode_attention": gr["npu_decode_execution"] or "auto",
                     "requires_attention": gr["attention_backend"] == "CUSTOM",
                     "constraint": constraint,
                     "constraint_implementation": "npu" if constraint != "none" else None,
-                    "stage": "ascend.v1",
+                    "stage": "npu.v1",
                     "graph": "capture-with-eager-fallback" if gr["beam_graph_enabled"] else "eager",
                 }
             ),
@@ -106,18 +106,18 @@ class NPUBackendProvider(BuiltinPlanSupport):
         return module
 
     def matches_legacy_identity(self, identity: PlatformIdentity) -> bool:
-        """API v1 selected Ascend by its original tensor placement."""
+        """API v1 selected the NPU backend by its original tensor placement."""
         return identity.device_type == self.device_type
 
     def create_config_service(self) -> BackendConfigService:
-        from .config import AscendConfigService
+        from .config import NPUConfigService
 
-        return AscendConfigService()
+        return NPUConfigService()
 
     def check_environment(self) -> dict[str, str]:
-        from .environment import check_ascend_environment
+        from .environment import check_npu_environment
 
-        return check_ascend_environment(require_npu_platform=True)
+        return check_npu_environment(require_npu_platform=True)
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
         del force  # Installers inspect their current targets on every call.

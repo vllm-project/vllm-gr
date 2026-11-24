@@ -67,7 +67,7 @@ def install_probes() -> None:
                     start = max(offset - rank_start, 0) - head._sliced_rel_start
                     expected = head.weight[start : start + cache.shape[0]]
                 else:
-                    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
+                    from vllm_gr.v1.worker.gpu.beam_stage_runner import (
                         _get_unconstrained_head_layout,
                     )
 
@@ -85,7 +85,7 @@ def install_probes() -> None:
         worker_cls.reload_weights = reload_weights
 
     model_runner_patch.install_worker_utility_hooks = install
-    from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
+    from vllm_gr.v1.worker.gpu.beam_decode_graph import BeamDecodeGraph
 
     original_replay = BeamDecodeGraph.replay
 
@@ -97,7 +97,7 @@ def install_probes() -> None:
 
     BeamDecodeGraph.replay = replay
 
-    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+    from vllm_gr.v1.worker.gpu.v1.prefill_graph_runner import GPUPrefillGraphRunner
 
     original_prefill = GPUPrefillGraphRunner.execute_model_prefill
 

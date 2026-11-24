@@ -66,10 +66,10 @@ nav:
           - design/feature/beam_batch_execution.md
           - design/feature/async_scheduling.md
         - Prefill Execution:
-          - design/feature/cuda_prefill_graph.md
+          - design/feature/gpu_prefill_graph.md
           - design/feature/npu_prefill_bsnd.md
         - Decode Attention:
-          - design/feature/cuda_decode_attention.md
+          - design/feature/gpu_decode_attention.md
           - design/feature/npu_decode_execution.md
         - Online Updates:
           - design/feature/weight_update.md

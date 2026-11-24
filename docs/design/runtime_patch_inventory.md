@@ -39,7 +39,7 @@ Risk: `critical`; process roles: `engine_core`, `worker`
 
 ### GR-PATCH-002 — NPUWorker Initialization Hook
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 Owner: `vllm_gr/v1/worker/npu/startup_patch.py`
 
@@ -131,7 +131,7 @@ Risk: `high`; process roles: `engine_core`
 
 Scope: `backend`; backend ID: `cuda`
 
-Owner: `vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py and vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py`
+Owner: `vllm_gr/v1/worker/gpu/runner_installer.py, vllm_gr/v1/worker/gpu/v1/model_runner_patch.py and vllm_gr/v1/worker/gpu/v2/model_runner_v2_patch.py`
 
 Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
@@ -139,7 +139,7 @@ Risk: `critical`; process roles: `gpu_worker`
 
 ### GR-PATCH-012 — NPU ModelRunner Override
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 Owner: `vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/stage_projection.py`
 
@@ -169,17 +169,17 @@ Risk: `medium`; process roles: `worker`
 
 ### GR-PATCH-016 — NPU-aware Spawn Start Method
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
-Owner: `vllm_gr/platforms/ascend/spawn_patch.py`
+Owner: `vllm_gr/platforms/npu/spawn_patch.py`
 
-Installer: `vllm_gr.platforms.ascend.spawn_patch.apply_npu_spawn_patch`
+Installer: `vllm_gr.platforms.npu.spawn_patch.apply_npu_spawn_patch`
 
 Risk: `medium`; process roles: `main`, `engine_core`
 
 ### GR-PATCH-018 — Ascend Penalties Warmup OOM Guard
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 Owner: `vllm_gr/v1/worker/npu/startup_patch.py`
 
@@ -189,11 +189,11 @@ Risk: `medium`; process roles: `npu_worker`
 
 ### GR-PATCH-019 — Ascend additional_config Sanitizer
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
-Owner: `vllm_gr/platforms/ascend/config_patch.py`
+Owner: `vllm_gr/platforms/npu/config_patch.py`
 
-Installer: `vllm_gr.platforms.ascend.config_patch.apply_engine_core_config_sanitizer and install_ascend_config_filter`
+Installer: `vllm_gr.platforms.npu.config_patch.apply_engine_core_config_sanitizer and install_ascend_config_filter`
 
 Risk: `high`; process roles: `main`, `engine_core`, `worker`
 
@@ -209,7 +209,7 @@ Risk: `high`; process roles: `main`, `engine_core`, `worker`
 
 ### GR-PATCH-021 — Contiguous Beam Prefix KV
 
-Scope: `backend`; backend ID: `ascend`
+Scope: `backend`; backend ID: `npu`
 
 Owner: `vllm_gr/v1/worker/npu/kv_layout_patch.py`
 

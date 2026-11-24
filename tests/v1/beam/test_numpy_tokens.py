@@ -21,7 +21,7 @@ from vllm_gr.v1.token_buffer import (
     install_numpy_request_factory,
     install_numpy_scheduler_data,
 )
-from vllm_gr.v1.worker.cuda.numpy_staging import (
+from vllm_gr.v1.worker.gpu.numpy_staging import (
     NumpyStagedContents,
     array_h2d,
     install_numpy_staging,

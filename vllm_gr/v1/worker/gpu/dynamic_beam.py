@@ -13,7 +13,7 @@ import torch
 
 from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.v1.beam.dynamic_width import DynamicBeamState, prune_stage_pools
-from vllm_gr.v1.worker.cuda.gr_inputs import GRInputBuffers
+from vllm_gr.v1.worker.gpu.gr_inputs import GRInputBuffers
 
 
 def uses_dynamic_beam(params: Any) -> bool:

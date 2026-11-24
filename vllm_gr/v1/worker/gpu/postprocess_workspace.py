@@ -14,7 +14,7 @@ from vllm.logger import init_logger
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 
 if TYPE_CHECKING:
-    from vllm_gr.ops.cuda.beam_state import BeamStateScratch
+    from vllm_gr.ops.gpu.beam_state import BeamStateScratch
 
 logger = init_logger(__name__)
 
@@ -115,12 +115,12 @@ class BeamPostprocessWorkspace:
         _validate_positive_int("max_decode_steps", max_decode_steps)
 
         resolved_device = torch.device(device)
-        from vllm_gr.ops.cuda.beam_selection import allocate_beam_selection_scratch
+        from vllm_gr.ops.gpu.beam_selection import allocate_beam_selection_scratch
 
         key = BeamPostprocessWorkspaceKey(beam_width, top_k, logits_dtype)
         flash_logits = None
         if flash_logits_rows > 0 and flash_logits_vocab_size > 0:
-            from vllm_gr.ops.cuda.unconstrained_topk_mcap import allocate_flash_logits
+            from vllm_gr.ops.gpu.unconstrained_topk_mcap import allocate_flash_logits
 
             flash_logits = allocate_flash_logits(
                 flash_logits_rows, flash_logits_vocab_size, logits_dtype, resolved_device
@@ -246,7 +246,7 @@ def initialize_beam_postprocess_workspaces(
 
     from vllm_gr.config import resolve_candidate_width
     from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
-    from vllm_gr.ops.cuda.unconstrained_topk_mcap import flash_logits_rows
+    from vllm_gr.ops.gpu.unconstrained_topk_mcap import flash_logits_rows
     from vllm_gr.v1.worker.gr_context import (
         _get_gr_config,
     )

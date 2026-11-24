@@ -9,9 +9,9 @@ from unittest import mock
 
 import pytest
 
-from vllm_gr.platforms.ascend.environment import check_ascend_environment
 from vllm_gr.platforms.compat import check_vllm_runtime, require_runtime_version
 from vllm_gr.platforms.loader import activate_current_backend
+from vllm_gr.platforms.npu.environment import check_npu_environment
 
 
 class _FakeAscendPlatform:
@@ -47,7 +47,7 @@ def test_environment_checks_only_vllm_on_non_npu(backend_registry: None) -> None
         mock.patch(
             "vllm_gr.platforms.compat.check_vllm_runtime", return_value={"vllm": "0.30.0"}
         ) as check_versions,
-        mock.patch("vllm_gr.platforms.ascend.environment.check_ascend_environment") as check_ascend,
+        mock.patch("vllm_gr.platforms.npu.environment.check_npu_environment") as check_ascend,
     ):
         assert activate_current_backend().check_environment() == {
             "vllm": "0.30.0",
@@ -60,7 +60,7 @@ def test_environment_checks_only_vllm_on_non_npu(backend_registry: None) -> None
 
 
 def test_environment_checks_ascend_runtime_on_npu(backend_registry: None) -> None:
-    from vllm_gr.platforms.ascend import NPU_BACKEND
+    from vllm_gr.platforms.npu import NPU_BACKEND
     from vllm_gr.platforms.registry import get_active_backend
 
     platform = _FakeAscendPlatform()
@@ -69,7 +69,7 @@ def test_environment_checks_ascend_runtime_on_npu(backend_registry: None) -> Non
         mock.patch("vllm.platforms.current_platform", platform),
         mock.patch("vllm_gr.platforms.compat.check_vllm_runtime") as check_versions,
         mock.patch(
-            "vllm_gr.platforms.ascend.environment.check_ascend_environment", return_value=expected
+            "vllm_gr.platforms.npu.environment.check_npu_environment", return_value=expected
         ) as check_ascend,
     ):
         assert activate_current_backend().check_environment() is expected
@@ -180,9 +180,9 @@ def test_ascend_environment_checks_active_triton_backend() -> None:
             "vllm_gr.platforms.compat.metadata.version",
             side_effect=distribution_version,
         ),
-        mock.patch("vllm_gr.platforms.ascend.environment.import_module", side_effect=import_module),
+        mock.patch("vllm_gr.platforms.npu.environment.import_module", side_effect=import_module),
     ):
-        report = check_ascend_environment()
+        report = check_npu_environment()
 
     assert report["triton-ascend"] == "3.6.0+dev20261027"
     assert report["triton-ascend-backend"] == "available"
@@ -204,10 +204,10 @@ def test_ascend_environment_rejects_overwritten_triton_namespace() -> None:
             "vllm_gr.platforms.compat.metadata.version",
             side_effect=_ascend_distribution_version,
         ),
-        mock.patch("vllm_gr.platforms.ascend.environment.import_module", side_effect=import_module),
+        mock.patch("vllm_gr.platforms.npu.environment.import_module", side_effect=import_module),
     ):
         with pytest.raises(RuntimeError, match="standard Triton wheel overwrote"):
-            check_ascend_environment()
+            check_npu_environment()
 
 
 @pytest.mark.parametrize("version", ["3.2.1", "3.6.0rc1", "3.7.0"])  # type: ignore[misc]
@@ -227,7 +227,7 @@ def test_ascend_environment_rejects_wrong_triton_ascend_version(version: str) ->
         ),
         pytest.raises(RuntimeError, match="required 3.6.0"),
     ):
-        check_ascend_environment()
+        check_npu_environment()
 
 
 @pytest.mark.l1  # type: ignore[misc]
@@ -250,7 +250,7 @@ def test_check_env_cli_uses_shared_runtime_checks(
     with (
         mock.patch("vllm.platforms.current_platform", platform),
         mock.patch("vllm_gr.platforms.compat.metadata.version", side_effect=version),
-        mock.patch("vllm_gr.platforms.ascend.environment.import_module") as import_vendor,
+        mock.patch("vllm_gr.platforms.npu.environment.import_module") as import_vendor,
     ):
         CheckEnvSubcommand.cmd(Namespace(npu=False))
 

@@ -55,6 +55,7 @@
     "tests/ci/test_ci_runtime.py::TestRuntimeResolution::test_missing_vendor_declaration_does_not_prevent_cuda_resolution": "l1",
     "tests/ci/test_ci_runtime.py::TestRuntimeResolution::test_npu_requires_and_fingerprints_vendor_image": "l1",
     "tests/ci/test_ci_runtime.py::TestRuntimeResolution::test_partial_pin_updates_fail": "l1",
+    "tests/ci/test_ci_runtime.py::TestRuntimeResolution::test_pre_rename_ascend_layout_uses_compat_declarations": "l1",
     "tests/ci/test_ci_runtime.py::TestRuntimeResolution::test_resolve_accepts_scm_config_without_duplicate_fallback": "l1",
     "tests/ci/test_ci_runtime.py::TestRuntimeResolution::test_resolve_does_not_execute_setup": "l1",
     "tests/ci/test_ci_runtime.py::TestRuntimeResolution::test_resolve_supports_base_commit_that_predates_runtime_tool": "l1",

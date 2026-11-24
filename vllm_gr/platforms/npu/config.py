@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from vllm_gr.config import GRConfig
 
 
-class AscendConfigService(BackendConfigService):
+class NPUConfigService(BackendConfigService):
     default_worker_decision = True
 
     def apply_native_defaults(self, config: Any) -> None:
@@ -32,7 +32,7 @@ class AscendConfigService(BackendConfigService):
 
     def validate_engine(self, config: Any, gr: GRConfig) -> None:
         if configured_constraint_mode(gr) is ConstraintMode.NONE and gr.beam_max_width is not None:
-            from vllm_gr.platforms.ascend.admission import (
+            from vllm_gr.platforms.npu.admission import (
                 validate_npu_unconstrained_runner,
             )
 

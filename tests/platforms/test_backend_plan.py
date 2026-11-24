@@ -23,8 +23,8 @@ from vllm_gr.config.backend_plan import (
 )
 from vllm_gr.config.parser import parse_gr_config
 from vllm_gr.platforms import loader
-from vllm_gr.platforms.ascend import NPU_BACKEND
 from vllm_gr.platforms.cuda import CUDA_BACKEND
+from vllm_gr.platforms.npu import NPU_BACKEND
 from vllm_gr.platforms.planning import (
     admit_backend_plan,
     normalize_backend_request,
@@ -503,7 +503,7 @@ def test_builtin_plans_are_pure_and_preserve_runner_and_decode_policy() -> None:
     assert CUDA_BACKEND.resolve(request).choices.to_dict()["stage"] == "cuda.v2"
     npu_request = normalize_backend_request(native, NPU_BACKEND)
     choices = NPU_BACKEND.resolve(npu_request).choices.to_dict()
-    assert choices["stage"] == "ascend.v1"
+    assert choices["stage"] == "npu.v1"
     assert choices["decode_attention"] == "auto"
     with pytest.raises(ValueError, match="xllm"):
         CUDA_BACKEND.resolve(

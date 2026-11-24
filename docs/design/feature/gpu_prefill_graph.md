@@ -1,4 +1,4 @@
-# CUDA Prefill graph capture
+# GPU Prefill graph capture
 
 CUDA workers capture Prefill at selected request counts and token budgets. A
 later batch can replay a captured graph even when its prompt lengths differ
@@ -22,7 +22,7 @@ exist and execution stays native.
 
 The diagram follows V2 dispatch when its GR Prefill plan is installed.
 
-![Flow: an eligible batch selects the smallest token bucket; a FULL miss tries PIECEWISE at that bucket, then eager execution.](../../assets/cuda_prefill_dispatch.svg)
+![Flow: an eligible batch selects the smallest token bucket; a FULL miss tries PIECEWISE at that bucket, then eager execution.](../../assets/gpu_prefill_dispatch.svg)
 
 | Color or shape | Meaning |
 | --- | --- |
@@ -101,10 +101,10 @@ compare attention outputs on CUDA.
 
 | File | Responsibility |
 | --- | --- |
-| [V1 Prefill graph runner](../../../vllm_gr/v1/worker/cuda/v1/gpu_prefill_graph_runner.py) | Owns V1 capture buffers, KV bounds and replay gates. |
-| [V2 Prefill graph runner](../../../vllm_gr/v1/worker/cuda/v2/gpu_prefill_graph_runner_v2.py) | Builds the FULL and PIECEWISE plan and selects a descriptor at dispatch. |
-| [V1 capture planner](../../../vllm_gr/v1/worker/cuda/v1/prefill_capture_plan.py) | Filters feasible token buckets and request counts before buffer allocation. |
+| [V1 Prefill graph runner](../../../vllm_gr/v1/worker/gpu/v1/prefill_graph_runner.py) | Owns V1 capture buffers, KV bounds and replay gates. |
+| [V2 Prefill graph runner](../../../vllm_gr/v1/worker/gpu/v2/prefill_graph_runner_v2.py) | Builds the FULL and PIECEWISE plan and selects a descriptor at dispatch. |
+| [V1 capture planner](../../../vllm_gr/v1/worker/gpu/v1/prefill_capture_plan.py) | Filters feasible token buckets and request counts before buffer allocation. |
 | [Shared Prefill graph utilities](../../../vllm_gr/v1/worker/prefill_graph_common.py) | Resolves bucket limits and KV bounds, allocates buffers and matches live token counts. |
 | [Dense Prefill attention](../../../vllm_gr/v1/attention/backends/beam_attn_gpu.py) | Checks whether attention can use projected KV. |
 
-The next generation stage uses [CUDA Decode attention](cuda_decode_attention.md).
+The next generation stage uses [CUDA Decode attention](gpu_decode_attention.md).

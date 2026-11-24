@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tests.kernels.test_rec_constrained_topk_cuda import _wide_window_inputs
-from vllm_gr.ops.cuda.rec_constrained_topk import (
+from vllm_gr.ops.gpu.rec_constrained_topk import (
     _rec_constrained_topk_cuda_out_unchecked as select,
 )
 
@@ -141,7 +141,7 @@ def test_stage_warmup_covers_request_variants(
 ):
     from vllm_gr.constraints.backend import ConstraintMetadata
     from vllm_gr.constraints.loader import _upload_cuda_backend
-    from vllm_gr.ops.cuda.rec_constrained_topk import _stage_topk_kernel
+    from vllm_gr.ops.gpu.rec_constrained_topk import _stage_topk_kernel
 
     backend, _ = _upload_cuda_backend(
         _stage_tries(prefix1_degree, trie_count),

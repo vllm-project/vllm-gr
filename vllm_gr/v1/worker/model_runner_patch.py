@@ -31,7 +31,7 @@ from vllm_gr.v1.worker.model_runner_contracts import (
 
 if TYPE_CHECKING:
     from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
-    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
+    from vllm_gr.v1.worker.gpu.stage_hooks import CudaStageHooksType
 
 logger = init_logger(__name__)
 

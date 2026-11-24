@@ -25,7 +25,7 @@ from unittest.mock import patch
 import pytest
 
 from tests.helpers.paths import REPO_ROOT
-from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runtime
+from vllm_gr.v1.worker.gpu.v2.model_runner_v2_resources import get_v2_runtime
 
 _SESSIONS = ((1024, 3), (900, 3), (900, 3), (1024, 3))
 _EXTENSIONS = {
@@ -49,10 +49,10 @@ class OneRecV2ParityWorkerExtension:
         from vllm.config import CUDAGraphMode
         from vllm.forward_context import get_forward_context
 
-        from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
-        from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import GPUBeamStageRunner
-        from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-        from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
+        from vllm_gr.v1.worker.gpu.beam_decode_graph import BeamDecodeGraph
+        from vllm_gr.v1.worker.gpu.beam_stage_runner import GPUBeamStageRunner
+        from vllm_gr.v1.worker.gpu.v2.beam_stage_runner_v2 import CudaStageHooksV2
+        from vllm_gr.v1.worker.gpu.v2.prefill_graph_runner_v2 import (
             GRPrefillCudaGraphManager,
         )
 

@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 
 from vllm_gr.config.models import MAX_BEAM_WIDTH, MAX_CANDIDATE_WIDTH
-from vllm_gr.ops.cuda.topk_sort_key import unpack_score
+from vllm_gr.ops.gpu.topk_sort_key import unpack_score
 
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
