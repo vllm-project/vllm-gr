@@ -385,7 +385,7 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         self.capture_bsnd_graphs(runner)
         graph_pool = torch.npu.graph_pool_handle()
         sorted_buckets = sorted(self.buckets, reverse=True)
-        for bucket in tqdm(sorted_buckets, desc="Capturing CUDA graphs (prefill, FULL)"):
+        for bucket in tqdm(sorted_buckets, desc="Capturing NPU graphs (prefill, FULL)"):
             try:
                 # Per-bucket setup (buffer preparation and dummy metadata
                 # allocation) lives inside the same guard as the capture:
