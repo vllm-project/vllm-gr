@@ -18,7 +18,16 @@ from pydantic import TypeAdapter, ValidationError
 
 from vllm_gr.update_status import ServiceStatus
 
-from .contracts import Instance, UpdateContext, UpdateError
+from .contracts import (
+    PAUSE_PATH,
+    RELOAD_TRIE_PATH,
+    RELOAD_WEIGHTS_PATH,
+    RESUME_PATH,
+    STATUS_PATH,
+    Instance,
+    UpdateContext,
+    UpdateError,
+)
 
 _STATUS_ADAPTER: TypeAdapter[ServiceStatus] = TypeAdapter(ServiceStatus)
 
@@ -69,24 +78,24 @@ class ControlClient:
         }
 
     async def pause_and_drain(self, instance: Instance, context: UpdateContext) -> None:
-        await self._request(instance, "/pause?mode=wait", self._body(context))
+        await self._request(instance, f"{PAUSE_PATH}?mode=wait", self._body(context))
 
     async def reload(self, instance: Instance, context: UpdateContext) -> None:
         """The server completes loading before replying successfully."""
         body = self._body(context)
         if context.resource_type == "checkpoint":
             body["weights_path"] = str(context.local_path)
-            route = "/reload_weights"
+            route = RELOAD_WEIGHTS_PATH
         else:
             body["trie_path"] = str(context.local_path)
-            route = "/reload_trie"
+            route = RELOAD_TRIE_PATH
         await self._request(instance, route, body)
 
     async def resume(self, instance: Instance, context: UpdateContext) -> None:
-        await self._request(instance, "/resume", self._body(context))
+        await self._request(instance, RESUME_PATH, self._body(context))
 
     async def status(self, instance: Instance) -> ServiceStatus:
-        value = await self._request(instance, "/service/status")
+        value = await self._request(instance, STATUS_PATH)
         try:
             return _STATUS_ADAPTER.validate_python(value)
         except ValidationError as exc:

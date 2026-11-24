@@ -279,6 +279,22 @@ def test_invalid_download_never_calls_server(tmp_path: Path) -> None:
     assert not list((tmp_path / "weights/.partial").iterdir())
 
 
+def test_symlinked_published_version_is_rejected(tmp_path: Path) -> None:
+    fs, control = Files(), Control()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "config.json").write_text("{}")
+    (outside / "model.bin").write_bytes(b"v1")
+    root = tmp_path / "weights"
+    root.mkdir()
+    (root / "v1").symlink_to(outside, target_is_directory=True)
+    cfg = config(tmp_path, [task(tmp_path, fs, PausedUpdateProcess(control), RollingUpdate())])
+    with pytest.raises(UpdateError, match="symlink"):
+        asyncio.run(Sidecar(cfg).run_once("weights"))
+    assert not control.events
+    assert fs.downloads == []
+
+
 def test_invalid_mode_is_rejected_before_mutation(tmp_path: Path) -> None:
     class IncompleteMode:
         def groups(self, instances: Any) -> Any:

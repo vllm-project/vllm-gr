@@ -33,6 +33,8 @@ def default_ckpt_checker(old_path: Path | None, new_path: Path) -> bool:
 def trie_file(path: Path) -> Path:
     """Accept an artifact file or a directory containing exactly one artifact."""
     if path.is_file() and path.suffix == ".safetensors":
+        if not path.resolve().is_relative_to(path.parent.resolve()):
+            raise UpdateError("Trie artifact points outside the resource directory")
         return path
     if path.is_dir():
         artifacts = list(path.glob("*.safetensors"))

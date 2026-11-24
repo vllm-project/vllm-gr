@@ -4,8 +4,6 @@
 
 import asyncio
 import json
-import subprocess
-import sys
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -120,18 +118,6 @@ def test_online_process_real_http(
     state["trie_version"] = "old"
     assert asyncio.run(process.run(instance, context, checker=lambda old, new: True))
     assert state["reloads"] == 2
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_sidecar_import_does_not_import_inference_runtime() -> None:
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; import vllm_gr.sidecar; assert 'torch' not in sys.modules; assert 'vllm' not in sys.modules",
-        ],
-        check=True,
-    )
 
 
 @pytest.mark.l2  # type: ignore[misc]

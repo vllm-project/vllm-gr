@@ -9,9 +9,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from vllm_gr.update_status import ResourceType, ServiceStatus
+from vllm_gr.update_status import ResourceType as ResourceType
+from vllm_gr.update_status import ServiceStatus as ServiceStatus
 
 Checker = Callable[[Path | None, Path], bool | Awaitable[bool]]
+
+# Client-side paths for the control contract implemented by the serving process.
+# tests/sidecar/test_contracts.py asserts they match the production router.
+STATUS_PATH = "/service/status"
+PAUSE_PATH = "/pause"
+RESUME_PATH = "/resume"
+RELOAD_WEIGHTS_PATH = "/reload_weights"
+RELOAD_TRIE_PATH = "/reload_trie"
+CONTROL_PATHS = frozenset(
+    {STATUS_PATH, PAUSE_PATH, RESUME_PATH, RELOAD_WEIGHTS_PATH, RELOAD_TRIE_PATH}
+)
 
 
 class UpdateError(RuntimeError):
