@@ -10,6 +10,11 @@ steps:
 
   - label: "Upload ready pipeline"
     key: upload-ready-pipeline
+    if: >-
+      build.branch != "main" &&
+      build.pull_request.id != null &&
+      build.pull_request.draft == false &&
+      build.pull_request.labels includes "ready"
     depends_on: image-build
     agents:
       queue: medium_cpu_queue_premerge
