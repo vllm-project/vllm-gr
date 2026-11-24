@@ -528,6 +528,26 @@ def test_legacy_provider_never_infers_a_planning_extension(provider: Provider) -
         adapted.resolve(replace(request, options=PlanData({"tiles": [32]})))
 
 
+@pytest.mark.parametrize("key", ["", 42, "vllm_gr", BACKEND_PLAN_KEY, "vllm_gr_other"])  # type: ignore[misc]
+def test_provider_planning_key_must_be_a_private_namespace(key: Any) -> None:
+    provider = Provider()
+    setattr(provider, "additional_config_key", key)
+    with pytest.raises(ValueError, match="additional_config_key"):
+        validate_planning_api(provider)
+
+
+def test_provider_planning_options_require_a_json_object(provider: Provider) -> None:
+    setattr(provider, "additional_config_key", "acme_beam")
+    native = config()
+    plan = admit_backend_plan(native)
+    assert plan is not None and plan.request.options.to_dict() == {}
+    invalid_values: tuple[Any, ...] = (None, [], {"tile": float("nan")})
+    for value in invalid_values:
+        native.additional_config["acme_beam"] = value
+        with pytest.raises(ValueError, match="JSON"):
+            admit_backend_plan(native)
+
+
 def test_bad_planning_version_and_missing_methods_fail_registration() -> None:
     for version in (True, 1, 2, "3"):
         with pytest.raises(ValueError, match="plan_api_version"):

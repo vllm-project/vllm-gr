@@ -231,11 +231,22 @@ args = AsyncEngineArgs(
 vllm_config = args.create_engine_config()
 ```
 
-If you previously passed only `additional_config["vllm_gr_backend_options"]`,
-supply `additional_config["vllm_gr"]` alongside your backend options and set
-the native Beam arguments as shown above. This also applies to an empty options
-dictionary. GR serve and `GRLLM` can prepare both sets of defaults from a
-startup file.
+When migrating from `additional_config["vllm_gr_backend_options"]`, remove
+the key even if its value is `{}`. The built-in CUDA and Ascend providers
+need no replacement. For a third-party provider with planning options,
+move the object to the key documented by that provider. For example, a
+provider declaring `additional_config_key = "acme_beam"` receives:
+
+```python
+additional_config = {
+    "vllm_gr": gr_config_to_mapping(gr),
+    "acme_beam": {"tile": 32},
+}
+```
+
+Pass this mapping to the same `AsyncEngineArgs` constructor above. The
+`vllm_gr` entry selects GR settings; a provider entry on its own follows
+native vLLM startup and does not enable Beam.
 
 For NPU SID-stage vocabulary execution through this native API, set
 `gr.worker_decision: true` explicitly in the YAML passed to `load_gr_config()`,

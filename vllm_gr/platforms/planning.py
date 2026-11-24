@@ -19,8 +19,6 @@ from vllm_gr.config.backend_plan import (
 
 from .loader import external_provider_entry_points
 
-BACKEND_OPTIONS_KEY = "vllm_gr_backend_options"
-
 # Only settings common to every rank belong in the engine fingerprint. Native
 # allocation results, device ordinals, rank IDs and handles deliberately do not.
 _NATIVE_FIELDS = {
@@ -118,7 +116,8 @@ def normalize_backend_request(config: Any, provider: Any) -> BackendRequest:
         )
     }
     additional = getattr(config, "additional_config", None)
-    options = additional.get(BACKEND_OPTIONS_KEY, {}) if isinstance(additional, Mapping) else {}
+    key = getattr(provider, "additional_config_key", None)
+    options = additional.get(key, {}) if key is not None and isinstance(additional, Mapping) else {}
     gr = GRConfig.from_vllm_config(config)
     gr_fields = asdict(gr)
     gr_fields["beam_execution_mode"] = "v1" if gr.beam_max_width is not None else None
@@ -180,8 +179,6 @@ def admit_backend_plan(config: Any) -> BackendPlan | None:
     gr = GRConfig.from_vllm_config(config)
     if not gr.enabled and gr.beam_max_width is None:
         additional = getattr(config, "additional_config", None)
-        if isinstance(additional, Mapping) and additional.get(BACKEND_OPTIONS_KEY):
-            raise ValueError("Backend options require an enabled GR engine")
         if isinstance(additional, Mapping) and BACKEND_PLAN_KEY in additional:
             config.additional_config = {
                 key: value for key, value in additional.items() if key != BACKEND_PLAN_KEY

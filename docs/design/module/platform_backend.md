@@ -83,6 +83,23 @@ also remove reads of `deployment.admin_host` and `deployment.admin_port`.
 GR serve owns those listener settings. Registration rejects v1 and v2 planning
 providers before calling their resolvers.
 
+### Provider-specific planning options
+
+A planning provider can declare a class attribute such as
+`additional_config_key = "acme_beam"`. Choose a namespace owned by your
+plugin and accepted by its native vLLM platform. Reserve it for values that
+affect the plan. Native platforms retain their own option validation.
+Callers put a finite JSON object at that key in vLLM's `additional_config`.
+Inside `resolve(request)`, read `request.options.to_dict()`. A missing key
+or a provider without the attribute yields an empty object.
+
+Both driver admission and worker binding read the active provider's key.
+Changing its value changes the GR plan fingerprint, and a worker with
+different options fails before it creates services. Other entries stay in
+`additional_config` for their owners and do not enter `request.options`.
+vLLM handles its compilation hash separately. The plan API version and wire
+format are unchanged. See the [caller migration example](../../configuration/README.md#native-engineargs).
+
 ## Validation
 
 | Test | Coverage |

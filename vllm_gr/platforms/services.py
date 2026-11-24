@@ -65,6 +65,19 @@ def validate_required_services(
 
 def validate_planning_api(provider: Any) -> None:
     version = getattr(provider, "plan_api_version", None)
+    key = getattr(provider, "additional_config_key", None)
+    if key is not None and (
+        version is None
+        or not isinstance(key, str)
+        or not key.strip()
+        or key != key.strip()
+        or key == "vllm_gr"
+        or key.startswith("vllm_gr_")
+    ):
+        raise ValueError(
+            "additional_config_key requires a planning provider and a non-empty, "
+            "provider-owned key outside the vllm_gr namespace"
+        )
     if version is None:
         return  # API-v1/v2 did not declare a planning extension.
     if type(version) is not int or version != PLAN_API_VERSION:
@@ -132,7 +145,7 @@ class LegacyPlanningProvider:
     def resolve(self, request: BackendRequest) -> BackendPlan:
         if request.options.to_dict():
             raise ValueError(
-                "Legacy providers cannot admit typed backend options; implement planning API 1"
+                "Legacy providers cannot admit typed backend options; implement the current planning API"
             )
         gr = request.config.to_dict()
         return BackendPlan(

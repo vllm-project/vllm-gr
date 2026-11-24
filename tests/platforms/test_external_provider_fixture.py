@@ -327,6 +327,7 @@ class Attention:
         self.closed = True
 
 class PlannedProvider(HostOnlyProvider):
+    additional_config_key = "host_beam"
     plan_api_version = PLAN_VERSION
     adapter_revision = "host-only-v1"
 
@@ -405,21 +406,32 @@ loader.current_platform_identity = lambda: PlatformIdentity("CPU", "cpu", "cpu",
 provider = loader.activate_current_backend()
 engines = []
 for tile in (16, 32):
-    config = SimpleNamespace(additional_config={"vllm_gr_backend_options": {"tile": tile}})
+    config = SimpleNamespace(additional_config={"host_beam": {"tile": tile}, "other": True})
     constraint = table_constraint()
     constraint = replace(constraint, table=replace(constraint.table, backend=ConstraintBackendKind.CPU))
-    GRConfig(beam_max_width=tile, constraint=constraint).write_to_vllm_config(config)
+    GRConfig(beam_max_width=8, constraint=constraint).write_to_vllm_config(config)
     plan = admit_backend_plan(config)
     assert plan == BackendPlan.from_wire(json.loads(json.dumps(plan.to_wire())))
     assert ["vllm-gr-host-planned", "1.0.0"] in plan.request.compatibility.to_dict()["provider_distributions"]
-    runner = SimpleNamespace(vllm_config=config, device="cpu:0")
+    assert plan.request.options.to_dict() == {"tile": tile}
+    # Simulate the worker receiving the published config over a JSON boundary.
+    worker = SimpleNamespace(additional_config=json.loads(json.dumps(config.additional_config)))
+    worker.additional_config["other"] = False
+    runner = SimpleNamespace(vllm_config=worker, device="cpu:0")
     services = bind_backend_services(runner)
     assert services.runner_adapter.owner is runner
     assert services.runner_adapter.plan == services.attention_executor.plan == plan
     assert services.attention_executor.device == "cpu:0"
     assert plan.choices.to_dict()["tile"] == tile
     engines.append(services)
-assert engines[0].plan != engines[1].plan
+assert engines[0].plan.fingerprint != engines[1].plan.fingerprint
+drifted = SimpleNamespace(additional_config={**worker.additional_config, "host_beam": {"tile": 16}})
+try:
+    bind_backend_services(SimpleNamespace(vllm_config=drifted, device="cpu:0"))
+except RuntimeError as exc:
+    assert "Worker backend plan mismatch" in str(exc), exc
+else:
+    raise AssertionError("worker accepted planning options different from the driver's")
 assert not hasattr(provider, "current_plan")
 assert not any(name in sys.modules for name in ("torch", "torch_npu", "vllm", "vllm_ascend"))
 print("planned")

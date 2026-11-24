@@ -79,15 +79,6 @@ def create_engine_config(self, usage_context=None, headless=False):
             native_args.additional_config.pop(GR_CONFIG_KEY), base_dir=Path.cwd()
         )
     else:
-        from vllm_gr.platforms.planning import BACKEND_OPTIONS_KEY
-
-        if BACKEND_OPTIONS_KEY in additional:
-            raise ValueError(
-                'vllm_gr_backend_options requires additional_config["vllm_gr"]. '
-                "Pass gr_config_to_mapping(gr) alongside the backend options. For Beam, set "
-                "async_scheduling=True, enable_chunked_prefill=False, and max_num_batched_tokens "
-                "at least as large as max_model_len, or use GRLLM or vllm serve --gr."
-            )
         effective_gr_config = load_gr_config()
     config = origin_create_engine_config(native_args, usage_context, headless)
     service = engine_config_service()

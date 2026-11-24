@@ -216,14 +216,14 @@ def test_canonical_writer_uses_primitive_mapping(tmp_path: Path) -> None:
     stale = GRConfig.from_vllm_config(vllm_config)
     assert stale.beam_max_width is None
 
-    vllm_config.additional_config["vllm_gr_backend_options"] = {"provider": "example"}
+    vllm_config.additional_config["acme_beam"] = {"provider": "example"}
     write_canonical_gr_config(vllm_config, config)
 
     payload = vllm_config.additional_config[GR_CONFIG_KEY]
     assert json.loads(json.dumps(payload)) == payload
     assert GRConfig.from_vllm_config(vllm_config) == config
     assert vllm_config.additional_config["unrelated"] == 1
-    assert vllm_config.additional_config["vllm_gr_backend_options"] == {"provider": "example"}
+    assert vllm_config.additional_config["acme_beam"] == {"provider": "example"}
 
 
 @pytest.mark.parametrize("version", [True, 1.0, "1", None])  # type: ignore[misc]

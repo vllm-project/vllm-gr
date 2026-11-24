@@ -61,19 +61,31 @@ def test_native_engine_args_example(
 
 
 @pytest.mark.parametrize("options", [{}, {"tile": 4}])  # type: ignore[misc]
-def test_backend_options_require_explicit_gr_config(
-    model_path: str, options: dict[str, int]
+@pytest.mark.parametrize("explicit_gr", [False, True])  # type: ignore[misc]
+def test_removed_backend_options_fail_at_engine_creation(
+    model_path: str, options: dict[str, int], explicit_gr: bool
 ) -> None:
     from vllm.engine.arg_utils import EngineArgs
 
-    args = EngineArgs(model=model_path, additional_config={"vllm_gr_backend_options": options})
-    with pytest.raises(
-        ValueError, match=r'vllm_gr_backend_options.*additional_config\["vllm_gr"\]'
-    ):
+    additional: dict[str, Any] = {"vllm_gr_backend_options": options}
+    if explicit_gr:
+        additional["vllm_gr"] = gr_config_to_mapping(GRConfig())
+    args = EngineArgs(model=model_path, additional_config=additional)
+    with pytest.raises(ValueError, match="vllm_gr_backend_options was removed.*provider"):
         args.create_engine_config()
 
 
-def test_backend_options_with_explicit_gr_config(model_path: str) -> None:
+def test_provider_config_alone_uses_native_engine(model_path: str) -> None:
+    from vllm.engine.arg_utils import EngineArgs
+
+    args = EngineArgs(model=model_path, additional_config={"acme_beam": {"tile": 32}})
+    config = args.create_engine_config()
+    assert config.additional_config["acme_beam"] == {"tile": 32}
+    assert not GRConfig.from_vllm_config(config).enabled
+    assert read_backend_plan(config) is None
+
+
+def test_cuda_preserves_unrelated_provider_config(model_path: str) -> None:
     from vllm.engine.arg_utils import EngineArgs
 
     gr = load_gr_config(overrides={"beam_width": [4], "candidate_width": [4]})
@@ -83,12 +95,12 @@ def test_backend_options_with_explicit_gr_config(model_path: str) -> None:
         enable_chunked_prefill=False,
         max_model_len=4096,
         max_num_batched_tokens=4096,
-        additional_config={"vllm_gr_backend_options": {}, "vllm_gr": gr_config_to_mapping(gr)},
+        additional_config={"acme_beam": {"tile": 32}, "vllm_gr": gr_config_to_mapping(gr)},
     )
     config = args.create_engine_config()
     assert GRConfig.from_vllm_config(config).beam_max_width == 4
     assert config.scheduler_config.enable_chunked_prefill is False
     assert config.scheduler_config.max_num_batched_tokens == 4096
-    assert config.additional_config["vllm_gr_backend_options"] == {}
+    assert config.additional_config["acme_beam"] == {"tile": 32}
     plan = read_backend_plan(config)
     assert plan is not None and plan.request.options.to_dict() == {}

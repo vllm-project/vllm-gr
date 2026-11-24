@@ -15,6 +15,7 @@ from typing import Any, Final, TypeAlias
 
 import yaml
 
+from vllm_gr.config.backend_plan import BACKEND_PLAN_KEY
 from vllm_gr.config.models import (
     OPTION_KEYS,
     ConstraintConfig,
@@ -117,7 +118,6 @@ def _read_settings(path: Path, parents: tuple[Path, ...]) -> dict:
 
 
 GR_CONFIG_KEY: Final = "vllm_gr"
-BACKEND_TRANSPORT_KEYS: Final = frozenset({"vllm_gr_backend_plan", "vllm_gr_backend_options"})
 GRConfigInput: TypeAlias = str | Path
 CAPACITY_FIELDS = ("beam_max_width", "beam_candidate_width")
 CONFIG_ATTRIBUTES = {
@@ -315,8 +315,14 @@ def validate_additional_keys(additional: Mapping) -> None:
     invalid = sorted(
         key
         for key in additional
-        if isinstance(key, str) and key.startswith("vllm_gr_") and key not in BACKEND_TRANSPORT_KEYS
+        if isinstance(key, str) and key.startswith("vllm_gr_") and key != BACKEND_PLAN_KEY
     )
+    if "vllm_gr_backend_options" in invalid:
+        raise ValueError(
+            "vllm_gr_backend_options was removed. Drop empty options or move planning "
+            "options to the provider's documented additional_config key. To enable GR, "
+            'also supply additional_config["vllm_gr"].'
+        )
     if invalid:
         raise ValueError(
             f"Removed vLLM-GR configuration keys: {invalid}. "
