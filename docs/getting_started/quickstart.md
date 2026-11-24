@@ -1,6 +1,7 @@
 # Quickstart
 
-Run Beam search offline with OneRec-1.7B or serve the same model over HTTP.
+Run Beam search offline with [OneRec-1.7B](https://huggingface.co/OpenOneRec/OneRec-1.7B)
+or serve the same model over HTTP.
 Offline inference searches the full vocabulary using the model and tokenizer.
 
 ## Prerequisites
@@ -27,6 +28,24 @@ python examples/offline_inference/beam_search/quickstart.py --model "$ONEREC_MOD
 ```
 
 ### Ascend
+
+Beam Decode graph replay requires the fused operators from
+[xllm-ops](installation/npu.md#install-xllm-ops). Run the command in the
+shell where you loaded the CANN and custom operator environments.
+
+```bash
+python examples/offline_inference/beam_search/quickstart.py \
+  --model "$ONEREC_MODEL" --constraint-backend npu --execution graph
+```
+
+On success, the `npu_beam_graph` output shows a positive `full_dispatches`
+count, confirming FULL Beam Decode replay.
+
+#### Retry in eager mode
+
+If the graph command reports `NPU Beam graph capture/replay was not observed`,
+retry in eager mode on an Ascend installation that supports Beam search.
+Use the [candidate output](#expected-output) to verify inference.
 
 ```bash
 python examples/offline_inference/beam_search/quickstart.py \

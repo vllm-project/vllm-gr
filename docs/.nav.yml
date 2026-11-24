@@ -18,7 +18,7 @@ nav:
       - Weight and Catalog Updates: user_guide/weight_update.md
       - Serving Metrics: serving/metrics.md
     - Beam guides:
-      - user_guide/onerec_quickstart.md
+      - user_guide/beam_search_cuda.md
       - user_guide/beam_search_npu.md
     - Features & Compatibility: user_guide/feature_compatibility.md
     - Configuration:

@@ -29,10 +29,8 @@ python examples/offline_inference/beam_search/quickstart.py --model "$ONEREC_MOD
 
 ### Ascend
 
-```bash
-python examples/offline_inference/beam_search/quickstart.py \
-  --model "$ONEREC_MODEL" --constraint-backend npu --execution eager
-```
+Follow the [Ascend Quickstart](../docs/getting_started/quickstart.md#ascend)
+to run with graph execution and verify FULL Decode replay.
 
 ### Expected output
 

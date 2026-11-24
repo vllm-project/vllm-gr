@@ -159,7 +159,7 @@ for related features.
 Beam execution requires `async-scheduling: true` and
 `enable-chunked-prefill: false`. Both are packaged defaults. In Python the
 corresponding arguments are `async_scheduling=True` and
-`enable_chunked_prefill=False`. See the [CUDA walkthrough](../user_guide/onerec_quickstart.md)
+`enable_chunked_prefill=False`. See the [CUDA walkthrough](../user_guide/beam_search_cuda.md#run-with-a-constraint-table)
 or the [Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-python-entry-point).
 
 ### Batch sizes and token budgets

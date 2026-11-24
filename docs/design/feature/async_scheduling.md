@@ -126,5 +126,5 @@ counts, failure recovery and eager or graph execution.
 | [Ascend stage runner](../../../vllm_gr/v1/worker/npu/npu_beam_stage_runner.py) | Executes and samples a pending stage. |
 
 [Beam batch execution](beam_batch_execution.md#validation-boundaries) defines
-admission. The [OneRec walkthrough](../../user_guide/onerec_quickstart.md) shows
+admission. The [CUDA walkthrough](../../user_guide/beam_search_cuda.md#run-with-a-constraint-table) shows
 a complete request.

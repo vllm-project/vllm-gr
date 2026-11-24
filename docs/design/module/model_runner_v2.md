@@ -5,7 +5,7 @@ retains a native request, and the worker produces one `GRWorkerResult` per
 session (batch) carrying the per-item results. The scheduler counts logical
 requests; the worker allocates the expanded Decode rows. See
 [Beam batch execution](../feature/beam_batch_execution.md) for admission,
-widths and generation limits; the [OneRec walkthrough](../../user_guide/onerec_quickstart.md)
+widths and generation limits; the [CUDA walkthrough](../../user_guide/beam_search_cuda.md#run-with-a-constraint-table)
 covers engine setup. Set `VLLM_USE_V2_MODEL_RUNNER=1` before importing vLLM to
 select V2 explicitly.
 

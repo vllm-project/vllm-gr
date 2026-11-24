@@ -20,7 +20,7 @@ For multiple assigned devices, pass a comma-separated list such as
 `--device-id 0,2`. Add `--wheel` to run the wheel smoke test after the checks
 succeed. For OneRec tests that use a local checkpoint, set
 `VLLM_GR_TEST_MODEL` to the snapshot directory. See the
-[OneRec CUDA example](../../user_guide/onerec_quickstart.md#5-validate-and-troubleshoot)
+[CUDA walkthrough](../../user_guide/beam_search_cuda.md#5-validate-and-troubleshoot)
 or the [Ascend system tests](../../../tests/st/test_onerec_v1_npu_e2e.py).
 
 ## CUDA and Ascend checks

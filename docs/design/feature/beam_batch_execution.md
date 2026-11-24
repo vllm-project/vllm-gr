@@ -110,7 +110,7 @@ bucket alone and can serve different admitted request counts.
 Size `max-num-seqs` for logical requests and `max-num-batched-tokens` for the
 Prefill workload and, on Ascend, the peak Decode row count. See the
 [batch and token budgets](../../configuration/README.md#batch-sizes-and-token-budgets)
-and [OneRec walkthrough](../../user_guide/onerec_quickstart.md).
+and [CUDA HTTP batching example](../../user_guide/beam_search_cuda.md#batching-several-prompts-in-one-http-request).
 
 ## Performance
 

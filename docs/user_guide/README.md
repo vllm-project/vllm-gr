@@ -1,12 +1,11 @@
 # User guide
 
-[Install vLLM-GR](../getting_started/installation/README.md) for your device,
-then run the [OneRec quickstart](../getting_started/quickstart.md).
-
 ## Inference and serving
 
 | I want to | Guide |
 | --- | --- |
+| Run Beam search with or without a constraint table on CUDA | [Beam search on CUDA](beam_search_cuda.md) |
+| Run Beam search without a constraint table on Ascend | [Unconstrained Beam search on Ascend](beam_search_npu.md) |
 | Check which features apply to my device | [Features and compatibility](feature_compatibility.md) |
 | Configure Beam width, candidate selection, or a constraint table | [Configuration](../configuration/README.md) |
 | Build a catalog artifact and select a Trie per request | [Constraint tables](../configuration/constraint_tables.md) |

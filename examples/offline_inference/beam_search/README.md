@@ -17,7 +17,9 @@ or download the snapshot. On CUDA, use the default backend.
 python examples/offline_inference/beam_search/quickstart.py --model "$ONEREC_MODEL"
 ```
 
-On Ascend, add `--constraint-backend npu --execution eager`. The script uses
+On Ascend, add `--constraint-backend npu --execution graph`. Follow the
+[Ascend quickstart](../../../docs/getting_started/quickstart.md#ascend) for
+the xllm-ops requirement and expected graph output. The script uses
 ModelRunner V1 on Ascend and defaults to V2 on CUDA. See
 [ModelRunner selection](../../README.md#choose-a-modelrunner) for the CUDA override.
 
@@ -56,7 +58,11 @@ python tools/constraints/build_constraint_triples.py \
 ```
 
 With `ONEREC_MODEL` set as above, run both commands with the same prompt.
-On Ascend, append `--constraint-backend npu --execution eager` to both commands.
+On Ascend, append `--constraint-backend npu --execution graph` to both commands.
+If graph replay is unavailable, use the
+[eager fallback](../../../docs/getting_started/quickstart.md#retry-in-eager-mode)
+for both commands, keeping the input arguments shown below. The catalog run
+requires the Ascend constraint table operators in either mode.
 
 ```bash
 python examples/offline_inference/beam_search/quickstart.py \

@@ -1,15 +1,13 @@
 # Unconstrained Beam search on Ascend
 
-<a id="unconstrained-beam-search-v1-on-npu"></a>
-
 Use `GRLLM.beam_search()` on Ascend to rank candidates from the model's
 full output vocabulary. The example uses the Beam API with no catalog artifact.
 
-!!! note "Catalog membership"
+!!! note "Results are not limited to your catalog"
 
-    The optional SID stage domain restricts token families. Use a
-    [constraint table](../configuration/constraint_tables.md) when a SID must
-    correspond to an item in your catalog.
+    Without a constraint table, a returned SID might not match any item in
+    your catalog. To return catalog items only, use a
+    [constraint table](../configuration/constraint_tables.md).
 
 ## Configuration and Python entry point
 

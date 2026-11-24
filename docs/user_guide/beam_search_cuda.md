@@ -1,13 +1,21 @@
-# OneRec asynchronous Beam search on CUDA
+# Beam search on CUDA
 
-<a id="onerec-v1-asynchronous-scheduling-on-cuda"></a>
+Run Beam search over the model's full output vocabulary, or add a constraint
+table to limit results to items in your catalog. Both examples use OneRec-1.7B.
 
-Run a catalog-constrained OneRec-1.7B request with ModelRunner V1 and
-asynchronous scheduling. The offline `GRLLM.beam_search()` example covers
-Prefill, Decode and candidate selection on CUDA. To start a server, use
-the [OneRec serving example](../../examples/online_serving/beam_search/README.md).
+## Run without a constraint table
 
-## 1. Check the environment
+Omit `--catalog` to search the model's full vocabulary on CUDA.
+Follow the [CUDA Quickstart](../getting_started/quickstart.md#cuda).
+
+## Run with a constraint table
+
+This walkthrough builds a constraint table from the OneRec catalog and runs
+`GRLLM.beam_search()` with ModelRunner V1 and asynchronous scheduling. To
+start a server, use the
+[OneRec serving example](../../examples/online_serving/beam_search/README.md).
+
+### 1. Check the environment
 
 Use a CUDA GPU, Python 3.11, 3.12, or 3.13, vLLM 0.30.0, and the matching
 `vllm-gr` installation. Follow the [CUDA installation guide](../getting_started/installation/gpu.md).
@@ -48,9 +56,7 @@ hf download OpenOneRec/OpenOneRec-RecIF benchmark_data/sid2pid.json \
   --repo-type dataset --local-dir "$ONEREC_DATA"
 ```
 
-<a id="2-build-the-v1-constraint-table-inputs"></a>
-
-## 2. Prepare the constraint table inputs
+### 2. Prepare the constraint table inputs
 
 Convert `sid2pid.json` to a SID catalog, then extract the triples used to
 compile the CUDA Constraint Table.
@@ -86,9 +92,7 @@ a temporary artifact and does not read this persisted file. See the
 [artifact configuration reference](../../examples/offline_inference/beam_search/README.md#constraint-table-artifact)
 for the full configuration.
 
-<a id="3-run-the-minimal-v1-reproduction"></a>
-
-## 3. Run offline Beam search
+### 3. Run offline Beam search
 
 Save the following text as a UTF-8 prompt file.
 
@@ -118,7 +122,7 @@ prints `returned_beams=128` followed by the first five candidates. Each
 marker. Scores and ranking can differ across GPU, CUDA, weights, and prompts;
 do not use one fixed score as the pass condition.
 
-## 4. Why these values are fixed
+### 4. Why these values are fixed
 
 Use these settings for the initial request.
 
@@ -197,8 +201,6 @@ width or `result_width` reduces the count.
 A list that is not batched logs the reason at INFO level. Search the server log
 for `Beam batch declined` to see the prompt count and which condition applied.
 
-#### Ownership
-
 The HTTP list is a response boundary; the session formed here is the GPU
 execution-batch boundary. `GRExecutionCapacity.active_sessions` remains 1: the
 session fixes its members before it starts, no members join or leave it, and the
@@ -211,7 +213,7 @@ separate B=1 calls. GPU batch shapes and prefix-cache execution paths can produc
 different candidates or scores. Validate model quality for the batch sizes you
 deploy.
 
-## 5. Validate and troubleshoot
+### 5. Validate and troubleshoot
 
 With real model weights, run the system test for offline and online Beam
 search on both CUDA model runners. It covers three generated tokens,
@@ -256,8 +258,6 @@ when comparing runs.
 | Online Beam validation is needed | The system test calls `OpenAIServing.beam_search()` with an asynchronous multiprocess engine. |
 | EOS or Prefill admission error | Set `ignore_eos=True`, disable Chunked Prefill and allow the complete prompt in `max_num_batched_tokens`. |
 | A prompt list did not batch | Check `Beam batch declined`: the count must be in `gr.beam_batch_sizes`, and sequence capacity, the token budget and equal generation budgets must all allow it. |
-
-<a id="further-reading"></a>
 
 ## See also
 

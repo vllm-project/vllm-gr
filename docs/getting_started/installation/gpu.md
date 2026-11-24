@@ -87,8 +87,8 @@ The command validates the vLLM version and reports the selected platform. See
   local model snapshot and the CUDA example command.
 - [Serve OneRec over HTTP](../../../examples/online_serving/beam_search/README.md)
   to start `vllm serve MODEL --gr` and send an OpenAI-compatible request.
-- [OneRec asynchronous Beam search](../../user_guide/onerec_quickstart.md)
-  covers catalog compilation and `GRLLM.beam_search()` with ModelRunner V1.
+- [Beam search on CUDA](../../user_guide/beam_search_cuda.md)
+  shows how to run Beam search with or without a constraint table.
 - [Beam configuration reference](../../../examples/offline_inference/beam_search/README.md):
   device selection, graph policy, and generation limits.
 
