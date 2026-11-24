@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+steps:
+  - label: "Build CI image"
+    key: image-build
+    agents:
+      queue: medium_cpu_queue_premerge
+    command: bash .buildkite/common/scripts/build-ci-image.sh
+
+  - label: "Upload ready pipeline"
+    key: upload-ready-pipeline
+    depends_on: image-build
+    agents:
+      queue: medium_cpu_queue_premerge
+    command: python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/test-ready.yml

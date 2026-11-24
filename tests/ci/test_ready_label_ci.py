@@ -923,7 +923,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
     def test_level_ci_preserves_existing_benchmark_gates(self) -> None:
         workflow = self.workflows["pre-commit.yml"]
         jobs = workflow["jobs"]
-        self.assertEqual(jobs["pre-commit"]["env"]["VLLM_GR_TEST_LEVEL"], "pr")
+        self.assertEqual(jobs["pre-commit"]["env"]["VLLM_GR_TEST_LEVEL"], "l2")
         self.assertIn(
             "vars.VLLM_GR_ISOLATED_RUNNER",
             jobs["pre-commit"]["env"]["VLLM_GR_ISOLATED_RUNNER"],
@@ -941,7 +941,10 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         self.assertIn("beam-performance-ab-only", jobs)
         local_runner = (ROOT / "tools/pre_commit/run_tests.sh").read_text()
         self.assertIn("VLLM_GR_TEST_LEVEL", local_runner)
-        self.assertIn("python3 -m pytest -x --run-slow --durations=10 -s tests", local_runner)
+        self.assertIn(
+            "python3 -m pytest -x --run-slow --strict-test-levels --durations=10 -s tests",
+            local_runner,
+        )
         level_runner = (ROOT / "tools/ci/run_test_level.sh").read_text()
         self.assertIn("--strict-test-levels", level_runner)
         self.assertIn("--run-slow", level_runner)

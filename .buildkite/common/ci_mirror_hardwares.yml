@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+mirror_hardwares:
+  l4_1:
+    agents:
+      queue: gpu_1_queue
+    plugins:
+      - docker#v5.2.0:
+          image: "${VLLM_GR_CI_IMAGE_REPOSITORY:-public.ecr.aws/q9t5s3a7/vllm-ci-test-repo}:vllm-gr-${BUILDKITE_COMMIT?}"
+          entrypoint: ""
+          gpus: all
+          shm-size: 8g
+          chown: true

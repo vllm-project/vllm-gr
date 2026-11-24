@@ -10,4 +10,4 @@ if [[ -n "${VLLM_GR_TEST_LEVEL:-}" ]]; then
   exec bash tools/ci/run_test_level.sh "$VLLM_GR_TEST_LEVEL" "$@"
 fi
 
-exec python3 -m pytest -x --run-slow --durations=10 -s tests "$@"
+exec python3 -m pytest -x --run-slow --strict-test-levels --durations=10 -s tests "$@"

@@ -339,7 +339,7 @@ jobs:
     if: needs.benchmark-policy.result == 'success'
     runs-on: self-hosted
     env:
-      VLLM_GR_TEST_LEVEL: pr
+      VLLM_GR_TEST_LEVEL: l2
       VLLM_GR_ISOLATED_RUNNER: ${{ vars.VLLM_GR_ISOLATED_RUNNER || 'false' }}
       # Activate the opt-in tiny-model smoke tests (graph/eager parity and the
       # dynamic-beam CPU-oracle comparison) that L2 now collects per PR.
