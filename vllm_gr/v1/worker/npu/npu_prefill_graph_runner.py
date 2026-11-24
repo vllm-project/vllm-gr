@@ -30,11 +30,12 @@ CAPTURE_DUMMY_NUM_REQS = SUPPORTED_NUM_REQS[-1]
 def build_update_lists(token_counts: list[int], bucket: int) -> tuple[list[int], list[int]]:
     """Fresh per-request host seq-lens lists for a task-group update.
 
-    ``qlen_list`` is the per-request query-token count (cumsum without the
-    leading zero, the FIA-v2 convention); ``kvlen_list`` is the per-request
-    KV length. The last request absorbs the padding so both lists always sum
-    to the bucket (GPU-parity semantics: padded positions are causal-sandboxed
-    behind the real tokens of the last request).
+    ``qlen_list`` contains cumulative query-token counts without a leading
+    zero; ``kvlen_list`` contains per-request KV lengths. For nonempty
+    ``token_counts`` and a bucket at least as large as their total, padding
+    is added to the last request so ``qlen_list[-1] == bucket`` and
+    ``sum(kvlen_list) == bucket``. Padded positions follow the real tokens
+    of the last request.
 
     Fallback when the current batch's metadata lists are unavailable: assumes
     no cached tokens, so KV length equals the scheduled chunk length.

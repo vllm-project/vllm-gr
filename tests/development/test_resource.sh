@@ -4,7 +4,7 @@
 
 #
 # Integration test for resource.sh
-# This script verifies GPU allocation and locking mechanisms.
+# This script exercises device selection and lock/unlock interfaces.
 set -euo pipefail
 mem_th=18
 if command -v npu-smi &> /dev/null; then

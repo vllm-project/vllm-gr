@@ -37,7 +37,7 @@ class NPUEagerStagePlan:
         mapping = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
         if not isinstance(mapping, Mapping) or len(mapping) != 1:
             raise BeamExecutionContractError(
-                "NPU eager execution requires exactly one fixed Batch Session"
+                "NPU Beam execution requires exactly one fixed Batch Session"
             )
         session_id, metadata = next(iter(mapping.items()))
         execution = BeamBatchExecutionView.from_stage_metadata(metadata)
@@ -46,7 +46,7 @@ class NPUEagerStagePlan:
                 "GR stage map key does not match the Batch Session identity"
             )
         if getattr(scheduler_output, "beam_data", None):
-            raise BeamExecutionContractError("NPU eager execution cannot mix legacy Beam metadata")
+            raise BeamExecutionContractError("NPU Beam execution cannot mix legacy Beam metadata")
         scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
         if not isinstance(scheduled, Mapping):
             raise BeamExecutionContractError(
@@ -68,7 +68,7 @@ class NPUEagerStagePlan:
         if execution.kind == "prefill":
             if not execution.produces_output:
                 raise BeamExecutionContractError(
-                    "NPU eager execution requires a complete output-producing Prefill"
+                    "NPU Beam execution requires a complete output-producing Prefill"
                 )
             # Native new-request data snapshots the cached prefix before this
             # dispatch. Only the remaining prompt tokens have hidden-state rows.
@@ -187,7 +187,7 @@ def validate_npu_eager_capabilities(worker: object) -> None:
     )
     model = getattr(worker, "model_config", None)
     if device_type != "npu":
-        raise ValueError("NPU eager Beam execution requires an NPU worker")
+        raise ValueError("NPU Beam execution requires an NPU worker")
     config = getattr(worker, "vllm_config", None)
     if config is not None:
         from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
@@ -200,11 +200,11 @@ def validate_npu_eager_capabilities(worker: object) -> None:
         int(getattr(parallel, "prefill_context_parallel_size", 1)),
     )
     if parallel_sizes != (1, 1, 1) or context_parallel != (1, 1):
-        raise ValueError("initial NPU Multi-Batch execution requires TP/PP/DP/DCP/PCP=1")
+        raise ValueError("NPU Beam Batch Session execution requires TP/PP/DP/DCP/PCP=1")
     if getattr(worker, "speculative_config", None) is not None:
-        raise ValueError("initial NPU Multi-Batch execution does not support speculative decode")
+        raise ValueError("NPU Beam Batch Session execution does not support speculative decode")
     if getattr(model, "dtype", None) not in (torch.float16, torch.bfloat16):
-        raise ValueError("initial NPU Multi-Batch execution requires FP16 or BF16")
+        raise ValueError("NPU Beam Batch Session execution requires FP16 or BF16")
     if (
         bool(getattr(model, "is_encoder_decoder", False))
         or bool(getattr(model, "is_hybrid", False))
@@ -212,7 +212,7 @@ def validate_npu_eager_capabilities(worker: object) -> None:
         or getattr(worker, "lora_config", None) is not None
         or getattr(getattr(worker, "vllm_config", None), "kv_transfer_config", None) is not None
     ):
-        raise ValueError("initial NPU Multi-Batch execution requires a plain text decoder")
+        raise ValueError("NPU Beam Batch Session execution requires a plain text decoder")
 
 
 __all__ = [
