@@ -232,8 +232,19 @@ def test_union_stage_vocabulary_contains_every_root_and_keeps_separate_edges(
         owned = vocab.owned_tensors()
         expected = sum(t.untyped_storage().nbytes() for t in owned.values())
         assert loader._unique_storage_bytes(owned) == expected  # noqa: SLF001
+        rank_positions = backend._rank_positions  # noqa: SLF001
+        assert rank_positions is not None
+        assert rank_positions.shape == (3,) and rank_positions.dtype == torch.int64
+        rank_bytes = rank_positions.untyped_storage().nbytes()
+        assert rank_bytes == 24
+        assert (
+            loader._unique_storage_bytes(  # noqa: SLF001
+                {**owned, "rank_positions": rank_positions, "rank_alias": rank_positions[:1]}
+            )
+            == expected + rank_bytes
+        )
         canonical = [tensor for root in range(3) for tensor in backend._tables(root)]  # noqa: SLF001
-        assert backend.info.device_memory_bytes == expected + sum(
+        assert backend.info.device_memory_bytes == expected + rank_bytes + sum(
             t.untyped_storage().nbytes() for t in canonical
         )
     finally:

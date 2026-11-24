@@ -52,15 +52,35 @@ def constraint_candidate_counts(
     return torch.where(prefix_valid & found, counts, torch.zeros_like(counts)).to(torch.int64)
 
 
-def valid_mask_from_counts(counts: torch.Tensor, top_k: int) -> torch.Tensor:
-    """Expand per-row counts into the fixed-width valid-prefix mask."""
+def valid_mask_from_counts(
+    counts: torch.Tensor,
+    top_k: int,
+    *,
+    positions: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Expand per-row counts into the fixed-width valid-prefix mask.
+
+    A Backend may supply its immutable ``arange(top_k)`` view to avoid a device
+    allocation and fill on every selection. Its values are established when the
+    Backend is built; checking the static tensor metadata here never synchronizes.
+    """
 
     if counts.dim() != 1:
         raise ValueError(f"candidate counts must be 1-D, got shape {tuple(counts.shape)}")
     if top_k <= 0:
         raise ValueError(f"top_k must be positive, got {top_k}")
-    positions = torch.arange(top_k, dtype=torch.int64, device=counts.device)
-    return positions.unsqueeze(0).lt(counts.clamp(min=0, max=top_k).unsqueeze(1)).contiguous()
+    if positions is None:
+        positions = torch.arange(top_k, dtype=torch.int64, device=counts.device)
+    elif (
+        positions.shape != (top_k,)
+        or positions.dtype != torch.int64
+        or positions.device != counts.device
+        or not positions.is_contiguous()
+    ):
+        raise ValueError("positions must be contiguous int64 [top_k] on counts.device")
+    # All positions already lie in [0, top_k). Negative counts select nothing
+    # and oversized counts select everything, so clamping counts is redundant.
+    return positions.unsqueeze(0).lt(counts.unsqueeze(1)).contiguous()
 
 
 __all__ = ["constraint_candidate_counts", "valid_mask_from_counts"]

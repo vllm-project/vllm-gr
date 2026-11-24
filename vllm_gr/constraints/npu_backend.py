@@ -43,6 +43,7 @@ class NPUConstraintBackend:
         "_prefix1_values",
         "_prefix2_value_offsets",
         "_prefix2_values",
+        "_rank_positions",
         "_stage_vocab",
         "_state",
         "_trie_tables",
@@ -68,7 +69,14 @@ class NPUConstraintBackend:
         self._prefix1_pair_keys: torch.Tensor | None = prefix1_pair_keys
         self._prefix2_value_offsets: torch.Tensor | None = prefix2_value_offsets
         self._prefix2_values: torch.Tensor | None = prefix2_values
-        self._info = info
+        self._rank_positions: torch.Tensor | None = torch.arange(
+            info.max_top_k, dtype=torch.int64, device=first_token_ids.device
+        )
+        self._info = replace(
+            info,
+            device_memory_bytes=info.device_memory_bytes
+            + self._rank_positions.numel() * self._rank_positions.element_size(),
+        )
         self._op: NPUConstraintOp | None = op
         self._stage_vocab = stage_vocab
         self._trie_tables = trie_tables
@@ -170,7 +178,11 @@ class NPUConstraintBackend:
             current_step=metadata.current_step,
             vocab_size=self._info.table_metadata.vocab_size,
         )
-        valid_mask = valid_mask_from_counts(valid_counts, metadata.top_k)
+        if self._rank_positions is None:
+            raise RuntimeError("NPU constraint backend is closed")
+        valid_mask = valid_mask_from_counts(
+            valid_counts, metadata.top_k, positions=self._rank_positions[: metadata.top_k]
+        )
         output = build_constraint_output(
             token_ids,
             logprobs,
@@ -299,6 +311,7 @@ class NPUConstraintBackend:
         self._prefix1_pair_keys = None
         self._prefix2_value_offsets = None
         self._prefix2_values = None
+        self._rank_positions = None
         self._op = None
         self._stage_vocab = None
         self._trie_tables = None

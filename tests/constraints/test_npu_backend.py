@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import cast
 
 import numpy as np
 import pytest
@@ -145,8 +146,36 @@ def test_npu_close_is_idempotent_preserves_info_and_releases_owned_state() -> No
     assert backend.info == info
     assert backend._op is None  # noqa: SLF001
     assert backend._first_token_ids is None  # noqa: SLF001
+    assert backend._rank_positions is None  # noqa: SLF001
     with pytest.raises(RuntimeError, match="closed"):
         backend.select(torch.zeros(1, 6), _metadata())
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l2
+def test_npu_backend_reuses_rank_positions_for_different_candidate_widths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def op(*args: object) -> tuple[torch.Tensor, torch.Tensor]:
+        width = int(cast(int, args[10]))
+        return torch.tensor([[1, 3, 0, 0]], dtype=torch.int32)[:, :width].contiguous(), torch.zeros(
+            1, width
+        )
+
+    backend = _backend(op)
+    positions = backend._rank_positions  # noqa: SLF001
+    assert positions is not None
+    assert backend.info.device_memory_bytes == make_table().total_bytes + 4 * 8
+
+    def unexpected_rank_allocation(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("selection must reuse startup rank positions")
+
+    monkeypatch.setattr(torch, "arange", unexpected_rank_allocation)
+    for width, expected in [(1, [[True]]), (4, [[True, True, False, False]]), (2, [[True, True]])]:
+        output = backend._select_for_readiness(  # noqa: SLF001
+            torch.zeros(1, 6), _metadata(step=0, top_k=width)
+        )
+        assert output.valid_mask.tolist() == expected
+        assert backend._rank_positions is positions  # noqa: SLF001

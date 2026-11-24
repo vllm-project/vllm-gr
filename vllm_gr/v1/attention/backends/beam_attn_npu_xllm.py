@@ -199,6 +199,7 @@ def _gather_shared_blocks(
     value_cache: torch.Tensor,
     block_table: torch.Tensor,
     max_valid_cols: int,
+    prefix_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gather only the shared-prefix blocks the block table references.
 
@@ -225,8 +226,19 @@ def _gather_shared_blocks(
 
     The remapped table ``row * width + col`` matches the flatten order of
     the gather, so the kernel sees exactly the blocks the original table
-    named.
+    named. The device-length mask skips unread tail copies without
+    changing the captured output geometry or the remapped table.
     """
+    from vllm_gr.v1.attention.backends.npu_shared_kv_gather import (
+        try_fused_shared_kv_gather,
+    )
+
+    fused = try_fused_shared_kv_gather(
+        key_cache, value_cache, block_table, max_valid_cols, prefix_seqlens
+    )
+    if fused is not None:
+        return fused
+
     width = block_table.shape[1]
     active = block_table[:, :max_valid_cols] if 0 < max_valid_cols < width else block_table
     flat = active.reshape(-1)
@@ -354,6 +366,7 @@ def _xllm_incremental_decode(
             value_cache,
             shared_table,
             max_valid_cols,
+            prefix_seqlens=seqlens_kv,
         )
     else:
         # No paged shared prefix in this batch: the kernel still needs

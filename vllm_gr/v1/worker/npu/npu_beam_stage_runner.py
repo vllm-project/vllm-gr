@@ -472,12 +472,7 @@ class NPUEagerBeamStageRunner:
         else:
             metadata = ConstraintMetadata(
                 prefix_token_ids=self._constraint_prefixes(plan),
-                temperatures=torch.full(
-                    (plan.execution.num_execution_rows,),
-                    float(stage_metadata.beam_params.temperature),
-                    dtype=torch.float32,
-                    device=self.logits.device,
-                ),
+                temperatures=self._constraint_temperatures(),
                 current_step=plan.execution.stage_index,
                 top_k=plan.execution.candidate_top_k,
             )
@@ -943,7 +938,19 @@ class NPUEagerBeamStageRunner:
 
     def _constraint_prefixes(self, plan: NPUEagerStagePlan) -> torch.Tensor:
         rows = plan.execution.num_execution_rows
-        prefixes = torch.zeros((rows, 3), dtype=torch.int32, device=self.logits.device)
+        # Each Worker owns one exclusive persistent NPU runner. Separate the
+        # immutable Prefill zeros from Decode scratch so repeated requests do
+        # not reallocate or clear inactive prefix columns at each stage.
+        cache_name = (
+            "_gr_npu_constraint_prefill_prefixes"
+            if plan.execution.kind == "prefill"
+            else "_gr_npu_constraint_decode_prefixes"
+        )
+        cached = getattr(self.worker, cache_name, None)
+        if cached is None or cached.device != self.logits.device or cached.shape[0] < rows:
+            cached = torch.zeros((rows, 3), dtype=torch.int32, device=self.logits.device)
+            setattr(self.worker, cache_name, cached)
+        prefixes = cached[:rows]
         if plan.execution.kind == "decode":
             if self.attention_batch is None:
                 raise RuntimeError("Decode constraint selection has no Beam state")
@@ -957,6 +964,18 @@ class NPUEagerBeamStageRunner:
                 ]
             prefixes[:, :steps].copy_(sequence.reshape(rows, steps))
         return prefixes
+
+    def _constraint_temperatures(self) -> torch.Tensor:
+        """Reuse one immutable scalar for this session's shared temperature."""
+        temperature = float(
+            self._metadata(self.worker._current_scheduler_output).beam_params.temperature
+        )
+        cached = getattr(self.worker, "_gr_npu_constraint_temperature", None)
+        if cached is None or cached[0] != temperature or cached[1].device != self.logits.device:
+            tensor = torch.full((1,), temperature, dtype=torch.float32, device=self.logits.device)
+            cached = (temperature, tensor)
+            self.worker._gr_npu_constraint_temperature = cached
+        return cached[1]
 
 
 def get_npu_stage_runner(worker: Any, scheduler_output: Any) -> NPUEagerBeamStageRunner:

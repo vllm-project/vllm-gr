@@ -193,13 +193,17 @@ def helper_namespace(monkeypatch: Any) -> Any:
         if isinstance(n, ast.FunctionDef) and n.name in names
     ]  # type: list[ast.stmt]
     assert {n.name if isinstance(n, ast.FunctionDef) else "unexpected" for n in nodes} == names
+
+    def gather(key: Any, value: Any, table: Any, cols: Any, *, prefix_seqlens: Any) -> Any:
+        return key, value, table
+
     namespace = {
         "math": math,
         "torch": SimpleNamespace(Tensor=Tensor, float16="fp16", bfloat16="bf16"),
         # Keep output contracts on the shared-gather path; direct shared-KV
         # routing is covered by test_npu_beam_row_views.py.
         "_can_use_direct_shared_kv": lambda *args: False,
-        "_gather_shared_blocks": lambda key, value, table, cols: (key, value, table),
+        "_gather_shared_blocks": Mock(side_effect=gather),
         "_npu_stream_capturing": lambda: False,
         "select_beam_rows": lambda query, metadata: query,
         "BeamAttentionMetadata": SimpleNamespace,
@@ -248,6 +252,11 @@ def test_backend_direct_leading_view_or_original_mixed_scatter(
         session,
         pool,
         8 ** (-0.5),
+    )
+    assert (
+        ns["_gather_shared_blocks"].call_args.kwargs["prefix_seqlens"]
+        is operation.call_args.args[6]
+        is metadata.prefix_seqlens_kv_device
     )
     target = operation.call_args.kwargs["out"]
     if mixed:

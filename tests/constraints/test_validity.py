@@ -68,3 +68,23 @@ def test_valid_mask_is_a_contiguous_prefix_independent_of_scores() -> None:
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_cached_mask_positions_preserve_empty_and_oversized_counts() -> None:
+    counts = torch.tensor([-7, 0, 1, 3, 4, 1000], dtype=torch.int64)
+    positions = torch.arange(8, dtype=torch.int64)
+    expected = positions[:4].unsqueeze(0) < counts.clamp(min=0, max=4).unsqueeze(1)
+    actual = valid_mask_from_counts(counts, 4, positions=positions[:4])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.is_contiguous()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "positions",
+    [torch.arange(3), torch.arange(4, dtype=torch.int32), torch.arange(8)[::2]],
+)
+def test_cached_mask_positions_reject_incompatible_views(positions: torch.Tensor) -> None:
+    with pytest.raises(ValueError, match="positions"):
+        valid_mask_from_counts(torch.tensor([2]), 4, positions=positions)
