@@ -838,59 +838,36 @@ def beam_search_group_cuda_out(
             compact_input=cumulative_logprobs.shape[0] == batch_size,
             num_warps=8 if block >= 128 else 4,
         )
-        _parent_count_prefix_kernel[(batch_size, beam_width)](
-            out_parent_indices,
-            out_parent_count_prefix,
+    else:
+        selected_scores, selected_indices, scratch_stride = _hierarchical_topk_out(
+            cumulative_logprobs,
+            top_logprobs,
+            candidate_valid_mask,
+            batch_size,
             beam_width,
-            BLOCK=block,
-            num_warps=8 if block >= 128 else 4,
+            candidate_width,
+            beam_width,
+            scratch,
         )
-        step_block = triton.next_power_of_2(max_steps)
-        _write_beam_sequence_kernel[(batch_size, beam_width)](
-            sequence,
-            out_token_ids,
-            out_parent_indices,
-            out_sequence,
-            beam_width,
-            beam_width,
-            max_steps,
-            current_step,
-            BLOCK_STEPS=step_block,
-            num_warps=4,
-        )
-        return (
+        _group_beam_outputs_kernel[(batch_size,)](
+            selected_scores,
+            selected_indices,
+            top_tokens,
             out_token_ids,
             out_parent_indices,
             out_scores,
-            out_parent_count_prefix,
-            out_sequence,
+            (
+                out_grouped_flat_indices
+                if out_grouped_flat_indices is not None
+                else out_parent_indices
+            ),
+            beam_width,
+            candidate_width,
+            scratch_stride,
+            WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
+            BLOCK=block,
+            num_warps=8 if block >= 128 else 4,
         )
-
-    selected_scores, selected_indices, scratch_stride = _hierarchical_topk_out(
-        cumulative_logprobs,
-        top_logprobs,
-        candidate_valid_mask,
-        batch_size,
-        beam_width,
-        candidate_width,
-        beam_width,
-        scratch,
-    )
-    _group_beam_outputs_kernel[(batch_size,)](
-        selected_scores,
-        selected_indices,
-        top_tokens,
-        out_token_ids,
-        out_parent_indices,
-        out_scores,
-        (out_grouped_flat_indices if out_grouped_flat_indices is not None else out_parent_indices),
-        beam_width,
-        candidate_width,
-        scratch_stride,
-        WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
-        BLOCK=block,
-        num_warps=8 if block >= 128 else 4,
-    )
     _parent_count_prefix_kernel[(batch_size, beam_width)](
         out_parent_indices,
         out_parent_count_prefix,
