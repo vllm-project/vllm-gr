@@ -131,6 +131,8 @@ Risk: `high`; process roles: `engine_core`
 
 Scope: `backend`; backend ID: `cuda`
 
+Also activated by backend ID `rocm`, whose provider subclasses the CUDA provider and installs the same hooks.
+
 Owner: `vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py and vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py`
 
 Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`

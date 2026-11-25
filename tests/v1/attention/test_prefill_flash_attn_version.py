@@ -19,6 +19,14 @@ from vllm_gr.config import (
 from vllm_gr.v1.attention.backends import beam_attn, beam_attn_gpu
 
 
+@pytest.fixture(autouse=True)
+def _simulate_nvidia_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These host tests model NVIDIA CUDA; keep a ROCm host from leaking in."""
+    from vllm_gr.utils import accelerator
+
+    monkeypatch.setattr(accelerator, "is_rocm", lambda: False)
+
+
 @pytest.fixture
 def flash_backend(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     # These tests exercise policy selection without loading CUDA extensions on NPU.

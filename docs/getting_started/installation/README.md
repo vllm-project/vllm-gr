@@ -8,6 +8,7 @@ and vendor runtime you will use.
 | Device | Guide |
 | --- | --- |
 | NVIDIA GPU (CUDA) | [CUDA installation](gpu.md) |
+| AMD Instinct and Radeon GPU (ROCm) | [ROCm installation](rocm.md) |
 | Ascend NPU | [Ascend installation](npu.md) |
 
 ## Shared steps

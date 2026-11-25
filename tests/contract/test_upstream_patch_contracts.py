@@ -57,7 +57,7 @@ _SyntheticAscendPlatform.__qualname__ = "NPUPlatform"
 
 
 @pytest.mark.l1
-@pytest.mark.parametrize("backend_id", ["cuda", "ascend"])
+@pytest.mark.parametrize("backend_id", ["cuda", "rocm", "ascend"])
 def test_common_and_selected_provider_patch_ownership_is_unique(
     monkeypatch: pytest.MonkeyPatch, backend_id: str
 ) -> None:
@@ -78,6 +78,7 @@ def test_common_and_selected_provider_patch_ownership_is_unique(
     )
     platforms = {
         "cuda": SimpleNamespace(_enum="CUDA", device_type="cuda", device_name="cuda"),
+        "rocm": SimpleNamespace(_enum="ROCM", device_type="cuda", device_name="cuda"),
         "ascend": _SyntheticAscendPlatform(),
     }
     monkeypatch.setattr(vllm.platforms, "current_platform", platforms[backend_id])
@@ -86,7 +87,9 @@ def test_common_and_selected_provider_patch_ownership_is_unique(
     try:
         provider = loader.activate_current_backend()
         core_ids = {p["id"] for p in patches if p["scope"] == "core"}
-        backend_ids = {p["id"] for p in patches if p["backend_id"] == backend_id}
+        # The ROCm provider subclasses the CUDA provider and shares its patches.
+        owner = {"rocm": "cuda"}.get(backend_id, backend_id)
+        backend_ids = {p["id"] for p in patches if p["backend_id"] == owner}
         assert set(CORE_PATCH_IDS) == core_ids
         assert set(provider.patch_ids) == backend_ids
         claimed = (*CORE_PATCH_IDS, *provider.patch_ids)
