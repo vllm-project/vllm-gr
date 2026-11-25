@@ -29,6 +29,8 @@ from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     LOCAL_TILE_SIZE,
+    repair_emit,
+    stream_slice,
 )
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     MCarryTopKScratch as UnconstrainedTopKScratch,
@@ -37,12 +39,9 @@ from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     allocate_mcap_topk_scratch as allocate_unconstrained_topk_scratch,
 )
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
-    repair_emit,
-    stream_slice,
-)
-from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     unconstrained_topk_mcap_out as unconstrained_topk_out,
 )
+from vllm_gr.ops.unconstrained_topk_torch import select_stage_candidates
 from vllm_gr.v1.attention.backends.beam_prefix_policy import configured_fa_version
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
@@ -497,6 +496,7 @@ class GPUBeamStageRunner:
         backend: CUDAConstraintBackend | None,
         hooks: CudaStageHooks,
         trie_ids: tuple[int, ...] | None = None,
+        stage_token_ids: tuple[torch.Tensor, ...] = (),
     ):
         expected = tuple(range(len(bindings)))
         if not bindings or (
@@ -563,11 +563,12 @@ class GPUBeamStageRunner:
         rows = batch_size * beam.state.beam_width
         host = getattr(worker, "vllm_config", None)
         self.gr_settings = deployment_for(host)
+        self.stage_token_ids = stage_token_ids
         self._unit_temperature = True
         self.explicit_fa_version = configured_fa_version(host)
         settings = self.gr_settings
         slice_request = 0
-        if backend is None and self.hooks.supports_transposed_head:
+        if backend is None and not stage_token_ids and self.hooks.supports_transposed_head:
             slice_request = (
                 SLICE_AUTO if settings.head_slice == "auto" else cast(int, settings.head_slice)
             )
@@ -988,6 +989,17 @@ class GPUBeamStageRunner:
                         device_step=self.constraint_steps,
                         specialize_steps=self.hooks.specialize_constraint_steps,
                     )
+                elif self.stage_token_ids:
+                    result = select_stage_candidates(
+                        model_output[:rows],
+                        self.temperatures[:rows],
+                        candidate_width,
+                        self.stage_token_ids[layout.stage_index],
+                    )
+                    candidates[0].copy_(result.token_ids)
+                    candidates[1].copy_(result.logprobs)
+                    candidates[2].copy_(result.valid_mask)
+                    self.counts[:rows].copy_(result.valid_mask.sum(dim=1, dtype=torch.int32))
                 else:
                     sliced = self.hidden is not None
                     logits = None if sliced else model_output[:rows]
@@ -1260,6 +1272,20 @@ def get_stage_runner(
     )
 
     cfg = _get_gr_config(worker)
+    stage_ids: tuple[torch.Tensor, ...] = ()
+    if cfg.beam_sid_stage_token_ids is not None:
+        stage_ids = getattr(worker, "_gr_stage_token_ids", ())
+        if not stage_ids:
+            vocab_size = worker.model_config.get_vocab_size()
+            if any(max(ids) >= vocab_size for ids in cfg.beam_sid_stage_token_ids):
+                raise ValueError(
+                    "gr.sid_stage_token_ids contains an ID outside the model vocabulary"
+                )
+            stage_ids = tuple(
+                torch.tensor(sorted(ids), dtype=torch.int64, device=worker.device)
+                for ids in cfg.beam_sid_stage_token_ids
+            )
+            worker._gr_stage_token_ids = stage_ids
     capacity = GRExecutionCapacity(cfg.beam_max_width)
     capacity.validate(m.beam_params)
     if m.execution_capacity is not None and m.execution_capacity != capacity:
@@ -1559,7 +1585,13 @@ def get_stage_runner(
         assert hooks is not None
         hooks.prepare_new_adapter(view)
         adapter = GPUBeamStageRunner(
-            worker, beam, binding_tuple, backend, hooks=hooks, trie_ids=trie_ids
+            worker,
+            beam,
+            binding_tuple,
+            backend,
+            hooks=hooks,
+            trie_ids=trie_ids,
+            stage_token_ids=stage_ids,
         )
     if dynamic_requested:
         if adapter.dynamic is None:

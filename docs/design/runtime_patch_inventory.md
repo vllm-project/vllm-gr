@@ -137,6 +137,9 @@ Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
 Risk: `critical`; process roles: `gpu_worker`
 
+With `gr.sid_stage_token_ids`, CUDA ModelRunner V1 selects candidates from
+the current stage's token IDs after the native model produces logits.
+
 ### GR-PATCH-012 — NPU ModelRunner Override
 
 Scope: `backend`; backend ID: `ascend`

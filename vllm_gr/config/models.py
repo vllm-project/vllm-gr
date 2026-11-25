@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
+from functools import cached_property
 from pathlib import Path
 
 from vllm_gr.config.schema import ConfigFieldSpec
@@ -459,6 +460,17 @@ class GRConfig:
     )
     """Opt into catalog-free NPU SA/SB/SC domains and stage-local probabilities."""
 
+    beam_sid_stage_token_ids: tuple[tuple[int, ...], ...] | None = field(
+        default=None,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_beam_sid_stage_token_ids",
+                canonical_path=("gr", "sid_stage_token_ids"),
+            ),
+        },
+    )
+    """Explicit catalog-free CUDA token IDs for each Beam generation stage."""
+
     beam_adapter_cache_enabled: bool = field(
         default=False,
         metadata={
@@ -520,6 +532,22 @@ class GRConfig:
                 "gr.worker_decision=True, and "
                 "gr.max_decode_steps <= 3"
             )
+        if (stage_ids := self.beam_sid_stage_token_ids) is not None:
+            if not unconstrained or self.beam_worker_decision is not True:
+                raise ValueError(
+                    "gr.sid_stage_token_ids requires gr.constraint_mode=none "
+                    "and gr.worker_decision=True"
+                )
+            if self.beam_sid_stage_vocab:
+                raise ValueError(
+                    "gr.sid_stage_token_ids cannot be combined with gr.sid_stage_vocab"
+                )
+            if len(stage_ids) > self.beam_max_decode_steps:
+                raise ValueError(
+                    "gr.max_decode_steps must cover every gr.sid_stage_token_ids stage"
+                )
+            if len(self.deployment.beam_width or ()) > len(stage_ids):
+                raise ValueError("gr.sid_stage_token_ids must cover every gr.beam_width stage")
 
     def _resolve_beam_widths(self) -> None:
         widths = self.deployment.beam_width
@@ -573,6 +601,7 @@ class GRConfig:
             or self.npu_decode_execution is not None
             or self.beam_worker_decision is not None
             or self.beam_sid_stage_vocab
+            or self.beam_sid_stage_token_ids is not None
         )
 
     @property
@@ -582,6 +611,11 @@ class GRConfig:
             if self.constraint is not None
             else ConstraintConfig(ConstraintMode.NONE)
         )
+
+    @cached_property
+    def beam_sid_max_token_id(self) -> int | None:
+        stages = self.beam_sid_stage_token_ids
+        return None if stages is None else max(map(max, stages))
 
     @classmethod
     def from_vllm_config(cls, vllm_config: object | None) -> GRConfig:

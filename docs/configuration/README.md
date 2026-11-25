@@ -150,6 +150,42 @@ three effective steps on either device. Ascend SID-stage vocabulary execution
 also supports at most three steps. See the [device compatibility guide](../user_guide/feature_compatibility.md)
 for related features.
 
+## Explicit CUDA SID stage token IDs
+
+On CUDA ModelRunner V1, set `gr.sid_stage_token_ids` to one to three nonempty
+lists of global model token IDs. Prefill selects from the first list, and each
+Decode step uses the next list. All parents use the same list for a given step.
+Lists may differ in size and contain sparse IDs. Each ID must be a
+nonnegative integer within the model vocabulary, with no duplicates within a
+stage. For example, a model that accepts any combination of A, B, and C can use
+this configuration.
+
+```yaml
+attention-config:
+  backend: CUSTOM
+gr:
+  constraint_mode: none
+  worker_decision: true
+  beam_width: [3, 2, 2]
+  candidate_width: [3, 2, 2]
+  sid_stage_token_ids:
+    - [101, 108, 147]
+    - [201, 209]
+    - [301, 318, 322]
+```
+
+The request uses the configured Beam width and generates at most the number of
+listed stages, excluding begin and end markers. Supply shorter `gr.beam_width`
+and `gr.candidate_width` schedules when configuring fewer than three stages.
+Each parent's logits are normalized in FP32 over all legal IDs at its current
+step before Top-K selection. This allows independent stage domains without
+enumerating every A/B/C triple. Use a constraint table for catalogs where a
+token's legality depends on the selected prefix.
+
+Set `VLLM_USE_V2_MODEL_RUNNER=0` for examples that default to ModelRunner V2.
+The setting is opt-in and applies to Beam execution. The tokenizer-derived
+`gr.sid_stage_vocab` option applies to Ascend.
+
 ## Asynchronous scheduling
 
 Beam execution requires `async-scheduling: true` and

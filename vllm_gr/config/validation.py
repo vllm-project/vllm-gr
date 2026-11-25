@@ -8,6 +8,7 @@ from typing import cast
 
 import regex as re
 
+from vllm_gr.config.beam_widths import SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_FORMAT,
     MAX_BEAM_WIDTH,
@@ -211,6 +212,30 @@ def validate_beam_sid_stage_vocab(value: object) -> bool:
     if not isinstance(value, bool):
         raise TypeError("beam.sid_stage_vocab must be a boolean")
     return value
+
+
+def validate_beam_sid_stage_token_ids(value: object) -> tuple[tuple[int, ...], ...] | None:
+    """Validate the syntax shared by public mappings and the worker snapshot."""
+    if value is None:
+        return None
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) not in SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
+    ):
+        raise ValueError("gr.sid_stage_token_ids must contain one to three stages")
+    stages = []
+    for index, stage in enumerate(value):
+        name = f"gr.sid_stage_token_ids[{index}]"
+        if (
+            not isinstance(stage, (list, tuple))
+            or not stage
+            or any(type(token) is not int or token < 0 for token in stage)
+        ):
+            raise ValueError(f"{name} must be a nonempty list of nonnegative integer token IDs")
+        if len(set(stage)) != len(stage):
+            raise ValueError(f"{name} must not contain duplicate token IDs")
+        stages.append(tuple(stage))
+    return tuple(stages)
 
 
 def validate_beam_graph_enabled(value: object) -> bool:
