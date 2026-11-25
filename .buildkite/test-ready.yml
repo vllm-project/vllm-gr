@@ -12,27 +12,17 @@ steps:
       -n 4 --durations=10 -sv
       -m '(l1) and (cpu_test and not gpu_test and not npu_test)' tests
 
-  - label: "Kernels Attention Test"
-    key: l2-gpu-attention
-    depends_on: upload-ready-pipeline
-    timeout_in_minutes: 35
-    mirror_hardwares: l4_1
-    command: >-
-      python3 -m pytest
-      --run-slow --durations=10 -sv -m 'l2 and gpu_test'
-      tests/kernels/attention
-
   - label: "Kernels Test"
     key: l2-gpu-kernels
     depends_on: upload-ready-pipeline
-    timeout_in_minutes: 40
+    timeout_in_minutes: 75
     mirror_hardwares: l4_1
     env:
       VLLM_GR_INPROC_TEST_SELECTION: exclude
     command: >-
       python3 -m pytest -p tools.ci.inproc_test_selection
       --run-slow --durations=10 -sv -m 'l2 and gpu_test'
-      tests/kernels --ignore=tests/kernels/attention
+      tests/kernels
 
   - label: "Kernels Test (in-process)"
     key: l2-gpu-inproc
@@ -46,7 +36,7 @@ steps:
     command: >-
       python3 -m pytest -p tools.ci.inproc_test_selection
       --run-slow --durations=10 -sv -m 'l2 and gpu_test'
-      tests/kernels --ignore=tests/kernels/attention
+      tests/kernels
 
   - label: "Constraints Test"
     key: l2-gpu-constraints
