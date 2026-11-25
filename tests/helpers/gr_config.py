@@ -35,13 +35,46 @@ def table_constraint(*, max_top_k: int = 128) -> ConstraintConfig:
 
 
 def engine_args_from_file(tmp_path: Path, mapping: Mapping[str, object]) -> SimpleNamespace:
-    """Pass deployment input through the same path accepted by EngineArgs."""
+    """Prepare native EngineArgs transport from a scenario file."""
     import json
-    from types import SimpleNamespace
+
+    from vllm_gr.config import gr_config_to_mapping, load_gr_config
 
     path = tmp_path / "scenario.yaml"
     path.write_text(json.dumps(mapping), encoding="utf-8")
-    return SimpleNamespace(config=path)
+
+    return SimpleNamespace(
+        additional_config={"vllm_gr": gr_config_to_mapping(load_gr_config(path))}
+    )
+
+
+def prepared_engine_args(
+    *, config: Path | None = None, gr: Mapping[str, Any] | None = None, **kwargs: Any
+) -> Any:
+    from vllm.engine.arg_utils import EngineArgs
+
+    from vllm_gr.config.parser import read_settings
+    from vllm_gr.engine.startup import prepare_engine_settings
+
+    document = read_settings(config) if config else None
+    values, _, _ = prepare_engine_settings(document, kwargs, gr)
+    return EngineArgs(**values)
+
+
+def worker_config(config: GRConfig, host: Any = None) -> Any:
+    """Publish one worker fixture through the same snapshot used by the driver."""
+    if host is None:
+        host = SimpleNamespace()
+    if not hasattr(host, "additional_config"):
+        host.additional_config = {}
+    config.write_to_vllm_config(host)
+    return host
+
+
+def update_worker_config(worker: Any, **changes: Any) -> GRConfig:
+    config = replace(GRConfig.from_vllm_config(worker.vllm_config), **changes)
+    config.write_to_vllm_config(worker.vllm_config)
+    return config
 
 
 def engine_config(**options: object) -> SimpleNamespace:
@@ -114,6 +147,8 @@ def serving_beam_engine_args(
     model: str, config: dict[str, Any], gpu_memory_utilization: float
 ) -> dict[str, Any]:
     """Build the serving regression's real engine inputs from width schedules."""
+    from vllm_gr.config.parser import gr_config_to_mapping, load_gr_config
+
     return dict(
         model=model,
         trust_remote_code=True,
@@ -128,6 +163,6 @@ def serving_beam_engine_args(
         shutdown_timeout=10,
         max_logprobs=2 * max(config["candidate_width"]),
         gpu_memory_utilization=gpu_memory_utilization,
-        gr=config,
+        additional_config={"vllm_gr": gr_config_to_mapping(load_gr_config(overrides=config))},
         attention_config={"backend": "CUSTOM"},
     )

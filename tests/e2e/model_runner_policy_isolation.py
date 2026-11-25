@@ -138,9 +138,9 @@ def startup_expectations(
     *, runner: str, config: dict[str, Any], max_num_seqs: int, enforce_eager: bool
 ) -> tuple[int, list[int]]:
     """Keep persistent Backend capacity separate from the selected graph set."""
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
-    cfg = load_engine_gr_config(None, {}, config)
+    cfg = load_gr_config(overrides=config)
     assert cfg.beam_max_width is not None
     if runner == "v2":
         from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES

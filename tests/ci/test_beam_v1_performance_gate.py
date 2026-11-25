@@ -363,7 +363,7 @@ def test_prepare_propagates_missing_builder_dependency(monkeypatch: pytest.Monke
 def test_ab_driver_prepares_equivalent_startup_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_config: bool
 ) -> None:
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
     from vllm_gr.entrypoints import gr
 
     class EngineReached(Exception):
@@ -411,7 +411,7 @@ def test_ab_driver_prepares_equivalent_startup_settings(
     setup = json.loads((tmp_path / "setup.json").read_text())
     assert setup["beam_width"] == 128
     settings = setup["gr"]
-    worker = load_engine_gr_config(None, {}, settings)
+    worker = load_gr_config(overrides=settings)
     assert worker.beam_max_width == 128
     assert worker.beam_max_decode_steps == 3
     assert worker.deployment.beam_batch_sizes == (1, 2, 4)

@@ -72,8 +72,6 @@ class DeploymentOptions:
     prefix_calibration: bool = True
     prefix_calibration_path: str | None = None
     trie_retention_seconds: float = 60
-    admin_host: str = "127.0.0.1"
-    admin_port: int | None = None
 
     @classmethod
     def from_mapping(cls, data: Mapping) -> DeploymentOptions:
@@ -126,12 +124,6 @@ class DeploymentOptions:
         for key in ("prefill_graph_enabled", "npu_stage_lm_head", "prefix_calibration"):
             if type(getattr(self, key)) is not bool:
                 raise ValueError(f"gr.{key} requires a boolean")
-        if self.admin_port is not None and (
-            type(self.admin_port) is not int or not 1 <= self.admin_port <= 65535
-        ):
-            raise ValueError("gr.admin_port must be in 1..65535")
-        if not isinstance(self.admin_host, str) or not self.admin_host:
-            raise ValueError("gr.admin_host requires a hostname or address")
         if self.head_slice != "auto" and (type(self.head_slice) is not int or self.head_slice < 0):
             raise ValueError("gr.head_slice requires auto or a nonnegative integer")
         if type(self.head_slice_min_rows) is not int or self.head_slice_min_rows < 0:

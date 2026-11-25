@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 from google.protobuf import descriptor_pool
 
-from vllm_gr.config.models import deployment_for
 from vllm_gr.entrypoints.beam_search.client import drain_async_cleanup
 
 from .generated import vllm_engine_pb2 as pb
@@ -16,7 +15,7 @@ from .serving import BeamVllmEngineServicer
 
 
 @contextmanager
-def patch_grpc_server():
+def patch_grpc_server(*, admin_host: str = "127.0.0.1", admin_port: int | None = None):
     """Replace protocol/servicer references only while upstream serving runs.
 
     The CLI owns one server per process. Upstream retains engine construction,
@@ -48,15 +47,13 @@ def patch_grpc_server():
         def register(servicer, server):
             stop = server.stop
             admin = None
-            settings = deployment_for(getattr(servicer.engine, "vllm_config", None))
-            port = settings.admin_port
-            if port is not None:
+            if admin_port is not None:
                 from vllm_gr.entrypoints.serve.management import AdminServer
 
                 admin = AdminServer(
                     servicer.engine,
-                    int(port),
-                    settings.admin_host,
+                    admin_port,
+                    admin_host,
                 )
                 start = server.start
 

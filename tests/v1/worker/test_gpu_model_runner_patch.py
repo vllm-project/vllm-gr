@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.gr_config import worker_config
 from vllm_gr.config import GRConfig
 from vllm_gr.v1.beam.dispatch import GRStageKind
 from vllm_gr.v1.worker import gr_context as _gr_context
@@ -445,9 +446,9 @@ def test_patched_determine_pure_beam_batch_grants_full() -> None:
 
 
 def test_beam_graph_runtime_stats_reports_capture_and_dispatch_state() -> None:
-    config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
+    config = GRConfig(beam_graph_enabled=True, beam_max_width=128)
     runner = SimpleNamespace(
-        _vllm_gr_config=config,
+        vllm_config=worker_config(config),
         _beam_graph_keys={128},
         _beam_graph_full_dispatch_count=2,
     )
@@ -589,8 +590,8 @@ def test_patched_determine_width_mismatch_no_full() -> None:
 
 
 def test_capture_beam_decode_graph_disabled_returns_false() -> None:
-    """When beam_graph_active is False, capture returns False immediately."""
-    gr_cfg = SimpleNamespace(beam_graph_active=False)
+    """Without a Beam width, capture returns False immediately."""
+    gr_cfg = SimpleNamespace(beam_max_width=None, beam_graph_enabled=True)
 
     original_fn = _gr_context._get_gr_config
 
@@ -611,7 +612,7 @@ def test_capture_beam_decode_graph_disabled_returns_false() -> None:
 def test_capture_beam_decode_graph_tp_gt1_returns_false() -> None:
     """With TP > 1, capture must refuse and return False."""
     gr_cfg = SimpleNamespace(
-        beam_graph_active=True,
+        beam_graph_enabled=True,
         beam_max_width=4,
         beam_max_decode_steps=3,
         deployment=SimpleNamespace(beam_batch_sizes=(1,)),
@@ -637,7 +638,7 @@ def test_capture_beam_decode_graph_tp_gt1_returns_false() -> None:
 def test_capture_beam_decode_graph_ubatching_returns_false() -> None:
     """With DP ubatching, capture must refuse and return False."""
     gr_cfg = SimpleNamespace(
-        beam_graph_active=True,
+        beam_graph_enabled=True,
         beam_max_width=4,
         beam_max_decode_steps=3,
         deployment=SimpleNamespace(beam_batch_sizes=(1,)),
@@ -673,7 +674,7 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
         _gr_context,
         "_get_gr_config",
         lambda _: SimpleNamespace(
-            beam_graph_active=True,
+            beam_graph_enabled=True,
             beam_max_width=4,
             beam_max_decode_steps=3,
             deployment=SimpleNamespace(beam_batch_sizes=(1,)),

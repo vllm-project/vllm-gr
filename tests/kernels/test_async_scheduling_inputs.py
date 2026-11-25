@@ -13,6 +13,7 @@ import msgspec
 import pytest
 import torch
 
+from tests.helpers.gr_config import update_worker_config
 from tests.kernels.beam_stage_test_utils import (
     dispatch,
     metadata,
@@ -291,8 +292,8 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
     worker.prepare_inputs_event = None
     worker.model_config.enforce_eager = False
     worker.model_config.max_model_len = 64
-    worker._vllm_gr_config.beam_graph_enabled = True
-    worker._vllm_gr_config.beam_worker_decision = True
+    update_worker_config(worker, beam_graph_enabled=True)
+    update_worker_config(worker, beam_worker_decision=True)
 
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=1)
     worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec = SimpleNamespace(block_size=16)

@@ -337,9 +337,9 @@ def test_batch_policy_selects_fixed_http_sizes(
         engine_inputs=list(range(count)), prompt_lengths=dict.fromkeys(range(count), 10)
     )
     from vllm_gr.config import gr_config_to_mapping
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
-    config = load_engine_gr_config(None, {}, {"beam_batch_sizes": sizes or [1, 2, 4]})
+    config = load_gr_config(overrides={"beam_batch_sizes": sizes or [1, 2, 4]})
     serving.engine_client.vllm_config.additional_config = {"vllm_gr": gr_config_to_mapping(config)}
     request = make_request(prompt=["a"] * count)
     result = asyncio.run(create_completion_batch_dispatch(serving, request))

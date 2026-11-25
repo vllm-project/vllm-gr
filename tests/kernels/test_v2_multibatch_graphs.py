@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
+from tests.helpers.gr_config import update_worker_config
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
@@ -22,7 +23,6 @@ from tests.kernels.beam_stage_test_utils import (
 from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.loader import _upload_cuda_backend
-from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.beam.dispatch import GRStageKind
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     get_stage_runner,
@@ -45,9 +45,9 @@ def test_runtime_recapture_refusal_preserves_live_request(monkeypatch):
     gc.collect()
     worker = admission_worker(max_rows=32)
     worker.model_config.enforce_eager = False
-    worker._vllm_gr_config.beam_graph_enabled = True
-    worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
+    update_worker_config(worker, beam_graph_enabled=True)
+    update_worker_config(worker, beam_worker_decision=True)
+    update_worker_config(worker, deployment=DeploymentOptions(beam_batch_sizes=(1,)))
 
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
@@ -92,9 +92,9 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     gc.collect()
     worker = admission_worker(max_rows=32)
     worker.model_config.enforce_eager = False
-    worker._vllm_gr_config.beam_graph_enabled = True
-    worker._vllm_gr_config.beam_worker_decision = True
-    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=(1,))
+    update_worker_config(worker, beam_graph_enabled=True)
+    update_worker_config(worker, beam_worker_decision=True)
+    update_worker_config(worker, deployment=DeploymentOptions(beam_batch_sizes=(1,)))
 
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
@@ -152,17 +152,16 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     loaded: list[Any] = []
 
     def native_load(runner: Any) -> None:
-        fresh, _ = _upload_cuda_backend(
-            make_table(), device=runner.device, max_top_k=4, max_rows=32
-        )
-        fresh._mark_ready()
-        runner.constraint_backend = VersionedConstraintTable(fresh, loader=lambda _: fresh)
         loaded.append(runner)
 
-    monkeypatch.setattr(
-        "vllm_gr.constraints.loader.load_constraint_backend",
-        lambda **kwargs: pytest.fail(f"this runner configures no constraint table: {kwargs}"),
-    )
+    def load_table(**kwargs: Any) -> Any:
+        fresh, _ = _upload_cuda_backend(
+            make_table(), device=kwargs["device"], max_top_k=4, max_rows=32
+        )
+        fresh._mark_ready()
+        return fresh
+
+    monkeypatch.setattr("vllm_gr.constraints.loader.load_constraint_backend", load_table)
     make_load_model_with_constraint_backend(native_load, close_runtime=close_v2_runtime)(worker)
     assert loaded == [worker]
     assert isinstance(worker.constraint_backend.get(), CUDAConstraintBackend)
@@ -188,11 +187,11 @@ def test_all_batches_capture_at_startup_and_reuse_storage(
     # CUDAGraph destruction during another graph's capture invalidates CUDA.
     gc.collect()
     worker = admission_worker(max_rows=32)
-    worker._vllm_gr_config.deployment = DeploymentOptions(beam_batch_sizes=sizes)
+    update_worker_config(worker, deployment=DeploymentOptions(beam_batch_sizes=sizes))
     del worker.use_async_scheduling  # V2 reads the resolved scheduler config.
     worker.model_config.enforce_eager = False
-    worker._vllm_gr_config.beam_graph_enabled = True
-    worker._vllm_gr_config.beam_worker_decision = True
+    update_worker_config(worker, beam_graph_enabled=True)
+    update_worker_config(worker, beam_worker_decision=True)
 
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))

@@ -5,6 +5,7 @@
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -40,7 +41,15 @@ def test_engine_args_round_trip_keeps_the_admitted_backend_plan(
     )
     monkeypatch.setattr(loader, "activate_current_backend", lambda: CUDA_BACKEND)
     args = SimpleNamespace(
-        gr={"beam_width": [32] * 3, "candidate_width": [32] * 3, "constraint_mode": "none"}
+        additional_config={
+            "vllm_gr": {
+                "gr": {
+                    "beam_width": [32] * 3,
+                    "candidate_width": [32] * 3,
+                    "constraint_mode": "none",
+                }
+            }
+        }
     )
     first = arg_utils_gr.create_engine_config(args)
     plan = read_backend_plan(first)
@@ -124,10 +133,91 @@ def test_external_policy_defaults_reach_engine_plan(monkeypatch: pytest.MonkeyPa
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: native)
     args = SimpleNamespace(
-        gr={"beam_width": [32] * 3, "candidate_width": [32] * 3, "constraint_mode": "none"}
+        additional_config={
+            "vllm_gr": {
+                "gr": {
+                    "beam_width": [32] * 3,
+                    "candidate_width": [32] * 3,
+                    "constraint_mode": "none",
+                }
+            }
+        }
     )
     plan = read_backend_plan(arg_utils_gr.create_engine_config(args))
     assert events == ["defaults", "validate", "finalize"]
     assert plan is not None and plan.backend_id == provider.backend_id
     assert plan.request.native.to_dict()["cache_config"]["block_size"] == 64
     assert plan.request.config.to_dict()["beam_worker_decision"] is True
+
+
+def test_frontend_settings_are_isolated_from_snapshot_plan_and_graph_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
+
+    from vllm_gr.config.parser import gr_config_to_mapping, resolve_startup_config
+    from vllm_gr.platforms.planning import admit_backend_plan
+
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: CUDA_BACKEND)
+
+    def build(host: str, port: int | None, width: int) -> tuple[dict[str, Any], str, str]:
+        config, bind_host, bind_port = resolve_startup_config(
+            {"gr": {"admin_port": 7999}},
+            {
+                "admin_host": host,
+                "admin_port": port,
+                "beam_width": [width],
+                "candidate_width": [width],
+            },
+        )
+        assert (bind_host, bind_port) == (host, port)
+        native = VllmConfig()
+        native.kernel_config.ir_op_priority = IrOpPriorityConfig(
+            rms_norm=["native"], fused_add_rms_norm=["native"], gelu_and_mul_sparse=["native"]
+        )
+        config.write_to_vllm_config(native)
+        plan = admit_backend_plan(native)
+        assert plan is not None
+        return gr_config_to_mapping(config), plan.fingerprint, native.compute_hash()
+
+    original = build("localhost", None, 4)
+    assert original == build("127.0.0.1", 9100, 4)
+    assert original[-1] != build("127.0.0.1", 9100, 8)[-1]
+    for field, value in (("admin_port", True), ("admin_port", 65536), ("admin_host", "")):
+        with pytest.raises(ValueError, match=field):
+            resolve_startup_config({}, {field: value})
+
+
+def test_reusing_engine_args_after_failure_preserves_input_and_native_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.config import gr_config_to_mapping
+    from vllm_gr.platforms import planning
+
+    attrs = {
+        "attention_backend": None,
+        "additional_config": {"other": {"value": 3}, "vllm_gr": gr_config_to_mapping(GRConfig())},
+    }
+    args = SimpleNamespace(**attrs)
+    original = json.loads(json.dumps(args.additional_config))
+    attempts: list[Any] = []
+
+    def create(current: Any, *unused: Any) -> SimpleNamespace:
+        assert current.additional_config == {"other": {"value": 3}}
+        current.additional_config["native_key"] = len(attempts)
+        attempts.append(current)
+        if len(attempts) == 1:
+            raise RuntimeError("native startup failed")
+        return SimpleNamespace(additional_config=current.additional_config)
+
+    monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", create)
+    monkeypatch.setattr(arg_utils_gr, "engine_config_service", BackendConfigService)
+    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        arg_utils_gr.create_engine_config(args)
+    first = arg_utils_gr.create_engine_config(args)
+    second = arg_utils_gr.create_engine_config(args)
+    assert first.additional_config == {**original, "native_key": 1}
+    assert second.additional_config == {**original, "native_key": 2}
+    assert args.additional_config == original
