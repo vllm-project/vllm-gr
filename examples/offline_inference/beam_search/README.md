@@ -572,7 +572,8 @@ The first stage requires `K_1=W_1`. Each later stage must satisfy
 up to 1024; current constraint-table operators cap K at 256.
 
 An explicit `per_parent_beam_widths` overrides the startup
-`constraint_table.candidate_width`, subject to backend `max_top_k` capacity.
+`gr.beam_candidate_width` (resolved from `gr.candidate_width`), subject to
+backend `max_top_k` capacity.
 Without it, existing behavior and startup configuration restrictions remain.
 Each configured per-parent K is an upper bound: the shared execution policy uses
 `min(K, W_out)` candidates per parent because no parent can supply more than
@@ -587,7 +588,7 @@ selection, even when its widths happen to match.
 HTTP clients can pass the schedule in `vllm_xargs` through Completion or Chat;
 native non-GR Beam rejects an explicit schedule.
 
-`beam_width` remains the engine capacity in `[1, 256]` and must equal
+`beam_width` remains the engine capacity in `[1, 1024]` and must equal
 the maximum value in `gr.beam_width`.
 The schedule has exactly one integer in `[1, beam_width]` per effective generated
 step N, which must equal 3 when the constraint table is enabled. Without

@@ -38,8 +38,9 @@ entry point (`vllm_gr.plugin:register`) then:
 1. Calls `configure_model_runner_default()`, which defaults
    `VLLM_USE_V2_MODEL_RUNNER` to 0.
 2. Validates the environment.
-3. Installs the shared compatibility hooks: the tied-embedding patch and the
-   CUSTOM attention selector patch.
+3. Installs the shared compatibility hooks: the CUSTOM attention selector
+   patch, shared by CUDA and Ascend before any provider imports its native
+   worker.
 4. Applies backend patches and installs the common Beam frontend and
    sliced-logits hooks.
 
