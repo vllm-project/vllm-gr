@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+steps:
+  - label: "Kernels Test"
+    key: l3-gpu-kernels
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 35
+    mirror_hardwares: l4_1
+    command: >-
+      python3 -m pytest
+      --durations=10 -sv -m 'l3 and gpu_test'
+      tests/kernels
+
+  - label: "System Test"
+    key: l3-gpu-system
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 90
+    mirror_hardwares: l4_1
+    command: >-
+      python3 -m pytest
+      --run-slow --durations=10 -sv -m 'l3 and gpu_test'
+      tests/st
+
+  - label: "Entrypoints Test"
+    key: l3-gpu-entrypoints
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 35
+    mirror_hardwares: l4_1
+    command: >-
+      python3 -m pytest
+      --run-slow --durations=10 -sv -m 'l3 and gpu_test'
+      tests/entrypoints

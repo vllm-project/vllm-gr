@@ -148,6 +148,8 @@ jobs:
 
       - name: Run selected level
         if: steps.accelerator.outputs.run == 'true'
+        env:
+          VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS: "1"
         run: bash tools/ci/run_test_level.sh "$TEST_LEVEL"
 
       - name: Run L2 resource probe if isolated
