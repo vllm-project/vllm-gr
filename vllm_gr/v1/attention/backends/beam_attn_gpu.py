@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 
+from vllm_gr.utils import accelerator
 from vllm_gr.v1.attention.backends.beam_attention_state import (
     AttentionState,
     clear_empty_prefix_states,
@@ -42,6 +43,12 @@ if is_flash_attn_varlen_func_available():
         reshape_and_cache_flash,
     )
     from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+
+    if accelerator.is_rocm():
+        # fa_utils exports upstream ROCm flash_attn; keep the vLLM call contract.
+        from vllm_gr.v1.attention.backends.rocm_flash_attn import (
+            flash_attn_varlen_func,
+        )
 else:
 
     def _flash_attn_varlen_unavailable(
@@ -124,11 +131,19 @@ def is_available() -> bool:
     return bool(is_flash_attn_varlen_func_available())
 
 
+def short_suffix_attention_supported() -> bool:
+    """The fused short-suffix kernel uses NVIDIA Gluon MMA instructions."""
+    return not accelerator.is_rocm()
+
+
 def get_flash_attn_version(
     *,
     requires_alibi: bool = False,
     head_size: int | None = None,
 ) -> int | None:
+    if accelerator.is_rocm():
+        # ROCm FlashAttention implements FA2 semantics (vLLM reports None).
+        return 2 if is_available() else None
     return cast(
         int | None,
         _get_flash_attn_version(
@@ -164,7 +179,9 @@ def resolve_prefill_flash_attn_version(
 
     target = 3 if requested == "auto" else int(requested)
     reason = None
-    if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+    if accelerator.is_rocm():
+        reason = "ROCm provides FlashAttention 2 only"
+    elif kv_cache_dtype not in ("auto", "float16", "bfloat16"):
         reason = "independent prefill selection requires unquantized KV"
     elif batch_invariant:
         reason = "independent prefill selection is not enabled with batch invariance"
@@ -188,6 +205,8 @@ def resolve_prefill_flash_attn_version(
 
 
 def supports_sinks() -> bool:
+    if accelerator.is_rocm():
+        return False
     return bool(is_available() and flash_attn_supports_sinks())
 
 

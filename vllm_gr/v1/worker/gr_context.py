@@ -129,6 +129,15 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
         )
     from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 
+    short_suffix = runner.device.type == "cuda" and gr_cfg.enable_short_suffix_attention
+    if short_suffix:
+        # The fused kernel is NVIDIA-only; ROCm keeps the generic cascade.
+        from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+            short_suffix_attention_supported,
+        )
+
+        short_suffix = short_suffix_attention_supported()
+
     model_config = runner.model_config
     parallel_config = runner.parallel_config
 
@@ -141,7 +150,5 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
         num_layers=model_config.get_num_layers(parallel_config),
         device=runner.device,
         dtype=model_config.dtype,
-        enable_short_suffix_attention=(
-            runner.device.type == "cuda" and gr_cfg.enable_short_suffix_attention
-        ),
+        enable_short_suffix_attention=short_suffix,
     )

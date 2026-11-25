@@ -91,6 +91,14 @@ def _get_npu_decode_execution() -> str:
     return mode
 
 
+def _short_suffix_attention_supported() -> bool:
+    from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+        short_suffix_attention_supported,
+    )
+
+    return short_suffix_attention_supported()
+
+
 def _get_platform_execution_module() -> Any:
     from vllm_gr.platforms.errors import BackendNotActiveError
     from vllm_gr.platforms.registry import get_active_backend
@@ -323,6 +331,7 @@ class BeamAttentionImpl(AttentionImpl):
             CUDA_DEVICE
             and config.beam_max_width is not None
             and config.enable_short_suffix_attention
+            and _short_suffix_attention_supported()
         )
         if short_suffix_attention:
             from vllm_gr.v1.attention.backends.beam_attn_gpu import (
@@ -707,6 +716,15 @@ class BeamAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        from vllm_gr.utils import accelerator
+
+        if CUDA_DEVICE and accelerator.is_rocm():
+            from vllm_gr.v1.attention.backends.rocm_flash_attn import (
+                ROCM_PAGED_KV_BLOCK_SIZE,
+            )
+
+            # ROCm CK paged FlashAttention requires 128-token KV blocks.
+            return [MultipleOf(ROCM_PAGED_KV_BLOCK_SIZE)]
         return [MultipleOf(16)]
 
     @classmethod
@@ -840,8 +858,8 @@ class BeamAttentionBackend(AttentionBackend):
             return f"Unsupported head_size={head_size}."
         if not NPU_DEVICE and not cls.supports_kv_cache_dtype(kv_cache_dtype):
             return f"Unsupported kv_cache_dtype={kv_cache_dtype}."
-        if block_size is not None and block_size % 16 != 0:
-            return f"block_size={block_size} not multiple of 16."
+        if block_size is not None and not cls.supports_block_size(block_size):
+            return f"block_size={block_size} is not supported on this device."
         if not cls.supports_compute_capability(device_capability):
             return "Requires GPU compute capability >= 8.0."
         if not NPU_DEVICE and has_sink and not cls.supports_sink():

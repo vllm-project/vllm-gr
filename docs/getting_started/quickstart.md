@@ -5,7 +5,8 @@ Offline inference searches the full vocabulary using the model and tokenizer.
 
 ## Prerequisites
 
-- A [CUDA](installation/gpu.md) or [Ascend](installation/npu.md) installation.
+- A [CUDA](installation/gpu.md), [ROCm](installation/rocm.md) or [Ascend](installation/npu.md) installation.
+  On ROCm, run the CUDA commands below.
 - A local OneRec-1.7B snapshot, or the Hugging Face CLI to download it.
 
 ## Offline inference
