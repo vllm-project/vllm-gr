@@ -26,10 +26,8 @@ def _device_type(config: Any, *, default: str | None = None) -> str | None:
 def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
     """Check execution support without importing a device runtime."""
     device = _device_type(config)
-    if device not in (None, "cuda", "npu"):
-        raise ValueError(
-            "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
-        )
+    if device not in (None, "cuda", "npu", "cpu"):
+        raise ValueError("Asynchronous scheduling requires a CUDA, NPU or CPU ModelRunner V1")
     gr_config = GRConfig.from_vllm_config(config)
     if gr_config.beam_sid_stage_vocab and device != "npu":
         raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
@@ -73,12 +71,14 @@ def validate_frontend_constraint_mode(
 ) -> None:
     device = _device_type(config, default="cuda")
     if configured_constraint_mode(gr_config) is ConstraintMode.NONE:
-        if device not in ("cuda", "npu"):
-            raise ValueError("unconstrained beam_search requires CUDA or NPU")
+        if device not in ("cuda", "npu", "cpu"):
+            raise ValueError("unconstrained beam_search requires CUDA, NPU or CPU")
         return
 
     table = runtime_constraint_table(gr_config)
-    backend = ConstraintBackendKind.NPU if device == "npu" else ConstraintBackendKind.CUDA
+    backend = {"npu": ConstraintBackendKind.NPU, "cpu": ConstraintBackendKind.CPU}.get(
+        device, ConstraintBackendKind.CUDA
+    )
     if table is None or not table.enabled or table.backend is not backend:
         raise ValueError(
             f"beam_search requires an enabled canonical {backend.value.upper()} constraint table"

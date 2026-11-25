@@ -13,6 +13,7 @@ backend and demonstrates no accelerator execution.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -151,6 +152,8 @@ platforms.current_platform = SimpleNamespace(
     return subprocess.run(
         [sys.executable, "-c", preamble + code, device_type],
         cwd=project_root,
+        # The built-in CPU backend also matches a CPU platform; select the fixture.
+        env={**os.environ, **({"VLLM_GR_BACKEND": "host_only"} if device_type == "cpu" else {})},
         capture_output=True,
         text=True,
         timeout=120,
@@ -477,6 +480,7 @@ assert layer.impl.execution is not bad
         capture_output=True,
         text=True,
         timeout=120,
+        env={**os.environ, "VLLM_GR_BACKEND": "host_only"},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "planned" in result.stdout

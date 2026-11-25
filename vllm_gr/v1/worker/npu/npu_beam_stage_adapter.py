@@ -186,8 +186,8 @@ def validate_npu_eager_capabilities(worker: object) -> None:
         int(getattr(parallel, "data_parallel_size", 1)),
     )
     model = getattr(worker, "model_config", None)
-    if device_type != "npu":
-        raise ValueError("NPU eager Beam execution requires an NPU worker")
+    if device_type not in ("npu", "cpu"):
+        raise ValueError("NPU eager Beam execution requires an NPU or CPU worker")
     config = getattr(worker, "vllm_config", None)
     if config is not None:
         from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
@@ -203,7 +203,8 @@ def validate_npu_eager_capabilities(worker: object) -> None:
         raise ValueError("initial NPU Multi-Batch execution requires TP/PP/DP/DCP/PCP=1")
     if getattr(worker, "speculative_config", None) is not None:
         raise ValueError("initial NPU Multi-Batch execution does not support speculative decode")
-    if getattr(model, "dtype", None) not in (torch.float16, torch.bfloat16):
+    dtypes = (torch.float16, torch.bfloat16) + ((torch.float32,) if device_type == "cpu" else ())
+    if getattr(model, "dtype", None) not in dtypes:
         raise ValueError("initial NPU Multi-Batch execution requires FP16 or BF16")
     if (
         bool(getattr(model, "is_encoder_decoder", False))
