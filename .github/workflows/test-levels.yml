@@ -36,7 +36,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        device: [gpu, npu]
+        # Buildkite runs the CUDA and CPU coverage for main-branch L3.
+        device: ${{ fromJSON((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.level == 'l2' || inputs.level == 'l3'))) && '["npu"]' || '["gpu", "npu"]') }}
     runs-on: self-hosted
     timeout-minutes: 360
     env:
@@ -149,7 +150,7 @@ jobs:
       - name: Run selected level
         if: steps.accelerator.outputs.run == 'true'
         env:
-          VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS: "1"
+          VLLM_GR_NPU_TESTS_ONLY: ${{ (env.TEST_LEVEL == 'l2' || env.TEST_LEVEL == 'l3') && '1' || '0' }}
         run: bash tools/ci/run_test_level.sh "$TEST_LEVEL"
 
       - name: Run L2 resource probe if isolated

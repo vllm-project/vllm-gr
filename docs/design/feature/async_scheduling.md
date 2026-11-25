@@ -108,11 +108,11 @@ host preparation overlaps the previous GPU stage.
 
 ## Validation
 
-The [OneRec scheduler system test](../../../tests/st/test_onerec_v1_scheduler_st.py)
+The [OneRec scheduler system test](../../../tests/e2e/test_onerec_v1_scheduler_st.py)
 covers offline and online execution on both CUDA runners, including retirement
 at result delivery; on Ascend, the [worker](../../../tests/v1/worker/test_npu_model_runner_patch.py),
 [cleanup](../../../tests/v1/worker/test_npu_stage_preparation_rollback.py) and
-[dynamic-width](../../../tests/st/test_npu_dynamic_beam_st.py) tests cover row
+[dynamic-width](../../../tests/e2e/test_npu_dynamic_beam_st.py) tests cover row
 counts, failure recovery and eager or graph execution.
 
 ## Source map

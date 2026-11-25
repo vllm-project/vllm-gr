@@ -441,7 +441,7 @@ On a configured Ascend server, run the opt-in public-API regression:
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
   python -m pytest --run-slow -s -v --tb=short \
-  tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
+  tests/e2e/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
 ```
 
 This test uses W=8, N=3 and a small catalog, loads eager, native-without-Beam-FULL
@@ -473,7 +473,7 @@ Run the strict padded comparison explicitly:
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
 VLLM_GR_TEST_PADDED_PREFILL=1 \
   python -m pytest --run-slow -s -v --tb=short \
-  tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
+  tests/e2e/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
 ```
 
 The padded test sets `gr.prefill_token_buckets: [384]`.

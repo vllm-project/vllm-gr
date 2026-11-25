@@ -33,6 +33,11 @@ if [[ "${VLLM_GR_TARGET_DEVICE:-}" == cuda &&
   expression="($expression) and not ((l2 or l3) and gpu_test)"
 fi
 
+if [[ "${VLLM_GR_TARGET_DEVICE:-}" == npu &&
+      "${VLLM_GR_NPU_TESTS_ONLY:-}" == 1 ]]; then
+  expression="($expression) and npu_test"
+fi
+
 pytest_args=(-x --run-slow --strict-test-levels --durations=10 -s -m "$expression")
 
 # The opt-in tiny-model tests inspect the in-process vLLM engine directly.

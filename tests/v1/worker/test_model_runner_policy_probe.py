@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from tests.st.model_runner_policy_isolation import startup_expectations
-from tests.st.test_modelrunner_v2_stage_parity_st import _SESSIONS
+from tests.e2e.model_runner_policy_isolation import startup_expectations
+from tests.e2e.test_modelrunner_v2_stage_parity_st import _SESSIONS
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -54,10 +54,10 @@ def test_probe_separates_capture_policy_from_backend_capacity(
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("length,steps", _SESSIONS)  # type: ignore[misc]
 def test_v2_parity_sessions_pass_constrained_request_validation(length: int, steps: int) -> None:
+    from tests.e2e.test_onerec_v1_scheduler_st import _params
     from tests.entrypoints.beam_search.test_beam_search_input_processor import (
         _make_engine,
     )
-    from tests.st.test_onerec_v1_scheduler_st import _params
     from vllm_gr.entrypoints.beam_search.input_processor import (
         _create_request_params,
     )

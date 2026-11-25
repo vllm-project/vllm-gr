@@ -1731,19 +1731,19 @@
     "tests/platforms/test_runtime_versions.py::test_environment_checks_only_vllm_on_non_npu": "l1",
     "tests/platforms/test_runtime_versions.py::test_rejects_wrong_ascend_version": "l1",
     "tests/platforms/test_runtime_versions.py::test_requires_ascend_distribution_on_npu": "l1",
-    "tests/st/test_engine_entrypoint_startup.py::test_engine_entrypoint_startup": "l3",
-    "tests/st/test_modelrunner_v2_stage_parity_st.py::test_modelrunner_v2_stage_parity": "l4",
-    "tests/st/test_multibatch_accuracy_checks.py::test_exact_ties_are_reported_without_claiming_exact_equality": "l1",
-    "tests/st/test_multibatch_accuracy_checks.py::test_invalid_results_fail": "l1",
-    "tests/st/test_multibatch_accuracy_checks.py::test_lower_scoring_top1_is_not_accepted_as_a_tie": "l1",
-    "tests/st/test_multibatch_accuracy_checks.py::test_score_drift_remains_visible_when_candidates_match": "l1",
-    "tests/st/test_npu_beam_diagnostics.py::test_exact_prefill_inputs_and_opt_in_padding": "l1",
-    "tests/st/test_npu_beam_diagnostics.py::test_exact_prefill_requires_real_replay": "l1",
-    "tests/st/test_npu_beam_diagnostics.py::test_forward_probe_observes_real_arguments_and_restores": "l1",
-    "tests/st/test_npu_dynamic_beam_st.py::test_npu_dynamic_beam_full_model_eager_graph": "l4",
-    "tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch": "l4",
-    "tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_public_api_end_to_end": "l3",
-    "tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_async_scheduling": {
+    "tests/e2e/test_engine_entrypoint_startup.py::test_engine_entrypoint_startup": "l3",
+    "tests/e2e/test_modelrunner_v2_stage_parity_st.py::test_modelrunner_v2_stage_parity": "l4",
+    "tests/e2e/test_multibatch_accuracy_checks.py::test_exact_ties_are_reported_without_claiming_exact_equality": "l1",
+    "tests/e2e/test_multibatch_accuracy_checks.py::test_invalid_results_fail": "l1",
+    "tests/e2e/test_multibatch_accuracy_checks.py::test_lower_scoring_top1_is_not_accepted_as_a_tie": "l1",
+    "tests/e2e/test_multibatch_accuracy_checks.py::test_score_drift_remains_visible_when_candidates_match": "l1",
+    "tests/e2e/test_npu_beam_diagnostics.py::test_exact_prefill_inputs_and_opt_in_padding": "l1",
+    "tests/e2e/test_npu_beam_diagnostics.py::test_exact_prefill_requires_real_replay": "l1",
+    "tests/e2e/test_npu_beam_diagnostics.py::test_forward_probe_observes_real_arguments_and_restores": "l1",
+    "tests/e2e/test_npu_dynamic_beam_st.py::test_npu_dynamic_beam_full_model_eager_graph": "l4",
+    "tests/e2e/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch": "l4",
+    "tests/e2e/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_public_api_end_to_end": "l3",
+    "tests/e2e/test_onerec_v1_scheduler_st.py::test_onerec_v1_async_scheduling": {
       "default": "l3",
       "rules": [
         {
@@ -1763,7 +1763,7 @@
         }
       ]
     },
-    "tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online": {
+    "tests/e2e/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online": {
       "default": "l3",
       "rules": [
         {

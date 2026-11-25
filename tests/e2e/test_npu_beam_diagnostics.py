@@ -13,8 +13,8 @@ from typing import Any
 import pytest
 import torch
 
+from tests.e2e.npu_beam_diagnostics import NPUForwardTrace
 from tests.helpers.paths import TESTS_DIR
-from tests.st.npu_beam_diagnostics import NPUForwardTrace
 
 
 @pytest.fixture

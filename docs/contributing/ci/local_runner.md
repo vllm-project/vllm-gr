@@ -21,7 +21,7 @@ For multiple assigned devices, pass a comma-separated list such as
 succeed. For OneRec tests that use a local checkpoint, set
 `VLLM_GR_TEST_MODEL` to the snapshot directory. See the
 [OneRec CUDA example](../../user_guide/onerec_quickstart.md#5-validate-and-troubleshoot)
-or the [Ascend system tests](../../../tests/st/test_onerec_v1_npu_e2e.py).
+or the [Ascend system tests](../../../tests/e2e/test_onerec_v1_npu_e2e.py).
 
 ## CUDA and Ascend checks
 

@@ -2,6 +2,35 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 steps:
+  - label: "Beam V1 performance baseline"
+    key: beam-v1-performance-baseline
+    if: build.branch == "main" && build.pull_request.id == null
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 180
+    mirror_hardwares: l4_1
+    command: |-
+      set -euo pipefail
+      commit_sha="$${BUILDKITE_COMMIT:?Buildkite commit is required}"
+      repository="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo"
+      export V1_PERF_OUTPUT_DIR="beam-v1-baselines/$$commit_sha"
+      python3 -m pytest --run-slow -sv \
+        'tests/e2e/test_beam_v1_performance.py::test_beam_v1_performance[baseline]'
+      cd "$$V1_PERF_OUTPUT_DIR/public"
+      aws ecr-public get-login-password --region us-east-1 |
+        oras push --username AWS --password-stdin \
+          "$$repository:vllm-gr-beam-v1-baseline-$$commit_sha" \
+          baseline.tar.gz:application/gzip
+
+  - label: "L3 CPU Test"
+    key: l3-cpu-tests
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    command: >-
+      python3 -m pytest
+      --run-slow --durations=10 -sv
+      -m 'l3 and cpu_test and not gpu_test and not npu_test' tests
+
   - label: "Kernels Test"
     key: l3-gpu-kernels
     depends_on: upload-merge-pipeline
@@ -20,7 +49,7 @@ steps:
     command: >-
       python3 -m pytest
       --run-slow --durations=10 -sv -m 'l3 and gpu_test'
-      tests/st
+      tests/e2e
 
   - label: "Entrypoints Test"
     key: l3-gpu-entrypoints

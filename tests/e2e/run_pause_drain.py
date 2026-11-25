@@ -98,7 +98,7 @@ if os.environ.get("GR_PAUSE_DRAIN_EVENTS"):
 
 
 def main() -> None:
-    from tests.st.run_checkpoint_reload import outputs, prepare, request, server
+    from tests.e2e.run_checkpoint_reload import outputs, prepare, request, server
     from vllm_gr.sidecar import (
         ControlClient,
         Instance,
