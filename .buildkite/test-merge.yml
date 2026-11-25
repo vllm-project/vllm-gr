@@ -4,7 +4,6 @@
 steps:
   - label: "Beam V1 performance baseline"
     key: beam-v1-performance-baseline
-    if: build.branch == "main" && build.pull_request.id == null
     depends_on: upload-merge-pipeline
     timeout_in_minutes: 180
     mirror_hardwares: l4_1
@@ -13,7 +12,7 @@ steps:
       commit_sha="$${BUILDKITE_COMMIT:?Buildkite commit is required}"
       repository="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo"
       export V1_PERF_OUTPUT_DIR="beam-v1-baselines/$$commit_sha"
-      python3 -m pytest --run-slow -sv \
+      pytest --run-slow -sv \
         'tests/e2e/test_beam_v1_performance.py::test_beam_v1_performance[baseline]'
       cd "$$V1_PERF_OUTPUT_DIR/public"
       aws ecr-public get-login-password --region us-east-1 |
@@ -21,15 +20,15 @@ steps:
           "$$repository:vllm-gr-beam-v1-baseline-$$commit_sha" \
           baseline.tar.gz:application/gzip
 
-  - label: "L3 CPU Test"
-    key: l3-cpu-tests
+  - label: "Unit tests"
+    key: merge-unit-tests
     depends_on: upload-merge-pipeline
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
-      --run-slow --durations=10 -sv
-      -m 'l3 and cpu_test and not gpu_test and not npu_test' tests
+      pytest
+      -n 4 --durations=10 -sv
+      -m '(l1) and (cpu_test and not gpu_test and not npu_test)' tests
 
   - label: "Kernels Test"
     key: l3-gpu-kernels
@@ -37,19 +36,32 @@ steps:
     timeout_in_minutes: 35
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       --durations=10 -sv -m 'l3 and gpu_test'
       tests/kernels
 
-  - label: "System Test"
+  - group: "E2E Test"
     key: l3-gpu-system
-    depends_on: upload-merge-pipeline
-    timeout_in_minutes: 90
-    mirror_hardwares: l4_1
-    command: >-
-      python3 -m pytest
-      --run-slow --durations=10 -sv -m 'l3 and gpu_test'
-      tests/e2e
+    steps:
+      - label: "Engine Entrypoint Startup Test"
+        key: l3-gpu-engine-entrypoint-startup
+        depends_on: upload-merge-pipeline
+        timeout_in_minutes: 30
+        mirror_hardwares: l4_1
+        command: >-
+          pytest
+          --run-slow --durations=10 -sv -m 'l3 and gpu_test'
+          tests/e2e/test_engine_entrypoint_startup.py
+
+      - label: "OneRec V1 Scheduler Test"
+        key: l3-gpu-onerec-v1-scheduler
+        depends_on: upload-merge-pipeline
+        timeout_in_minutes: 30
+        mirror_hardwares: l4_1
+        command: >-
+          pytest
+          --run-slow --durations=10 -sv -m 'l3 and gpu_test'
+          tests/e2e/test_onerec_v1_scheduler_st.py
 
   - label: "Entrypoints Test"
     key: l3-gpu-entrypoints
@@ -57,6 +69,6 @@ steps:
     timeout_in_minutes: 35
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       --run-slow --durations=10 -sv -m 'l3 and gpu_test'
       tests/entrypoints

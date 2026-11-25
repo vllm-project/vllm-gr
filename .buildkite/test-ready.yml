@@ -13,7 +13,7 @@ steps:
       set -euo pipefail
       V1_PERF_BASELINE_DIR="$(python3 .buildkite/common/scripts/find-beam-v1-baseline.py /tmp)"
       export V1_PERF_BASELINE_DIR
-      python3 -m pytest --run-slow -sv \
+      pytest --run-slow -sv \
         'tests/e2e/test_beam_v1_performance.py::test_beam_v1_performance[compare]'
     artifact_paths: "v1_performance_results/**/*"
 
@@ -25,7 +25,7 @@ steps:
     env:
       V1_RECALL_OUTPUT_DIR: v1_recall_results
     command: >-
-      python3 -m pytest --run-slow -sv
+      pytest --run-slow -sv
       tests/e2e/test_beam_v1_recall.py
     artifact_paths: "v1_recall_results/**/*"
 
@@ -35,19 +35,20 @@ steps:
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       -n 4 --durations=10 -sv
       -m '(l1) and (cpu_test and not gpu_test and not npu_test)' tests
 
   - label: "Kernels Test"
     key: l2-gpu-kernels
     depends_on: upload-ready-pipeline
-    timeout_in_minutes: 75
+    timeout_in_minutes: 35
     mirror_hardwares: l4_1
     env:
+      PYTHONPATH: "."
       VLLM_GR_INPROC_TEST_SELECTION: exclude
     command: >-
-      python3 -m pytest -p tools.ci.inproc_test_selection
+      pytest -p tools.ci.inproc_test_selection
       --run-slow --durations=10 -sv -m 'l2 and gpu_test'
       tests/kernels
 
@@ -57,11 +58,12 @@ steps:
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     env:
+      PYTHONPATH: "."
       VLLM_GR_INPROC_TEST_SELECTION: include
       VLLM_GR_RUN_MODEL_SMOKE: "1"
       VLLM_ENABLE_V1_MULTIPROCESSING: "0"
     command: >-
-      python3 -m pytest -p tools.ci.inproc_test_selection
+      pytest -p tools.ci.inproc_test_selection
       --run-slow --durations=10 -sv -m 'l2 and gpu_test'
       tests/kernels
 
@@ -71,7 +73,7 @@ steps:
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       --durations=10 -sv -m 'l2 and gpu_test'
       tests/constraints
 
@@ -81,7 +83,7 @@ steps:
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       --durations=10 -sv -m 'l2 and gpu_test'
       tests/ops
 
@@ -91,7 +93,7 @@ steps:
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       --durations=10 -sv -m 'l2 and gpu_test'
       tests/v1/attention
 
@@ -101,7 +103,7 @@ steps:
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       --durations=10 -sv -m 'l2 and gpu_test'
       tests/v1/beam
 
@@ -111,7 +113,7 @@ steps:
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       --durations=10 -sv -m 'l2 and gpu_test'
       tests/sidecar
 
@@ -121,6 +123,6 @@ steps:
     timeout_in_minutes: 30
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
+      pytest
       --run-slow --durations=10 -sv -m 'l2 and gpu_test'
       tests/e2e
