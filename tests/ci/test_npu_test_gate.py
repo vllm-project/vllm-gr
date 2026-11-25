@@ -188,35 +188,54 @@ pytestmark = pytest.mark.cpu_test
     ("initial", "after_build", "built", "ok"),
     [
         ("ready", "fail", False, True),
+        ("absent", "ready", True, True),
         ("missing", "ready", True, True),
         ("missing-op", "ready", True, True),
+        ("noncallable", "ready", True, True),
         ("missing-topk", "ready", True, True),
+        ("broken", "ready", True, True),
+        ("missing", "noop", True, False),
+        ("missing", "missing-op", True, False),
+        ("missing", "noncallable", True, False),
         ("missing", "missing-topk", True, False),
+        ("missing", "broken", True, False),
         ("broken", "broken", True, False),
         ("missing", "fail", True, False),
         ("missing", "default", True, True),
     ],
 )
+@pytest.mark.parametrize("wrapper", ["absent", "ready", "broken"])  # type: ignore[misc]
 def test_install_checks_callable_ops_before_and_after_build(
-    tmp_path: Path, initial: str, after_build: str, built: bool, ok: bool
+    tmp_path: Path, initial: str, after_build: str, built: bool, ok: bool, wrapper: str
 ) -> None:
     # Simulate the vendor interpreter, its binding and a custom build offline.
     interpreter = tmp_path / "python3"
     interpreter.write_text('#!/bin/bash\nexec "$TEST_PYTHON" -S "$@"\n', newline="\n")
     interpreter.chmod(0o755)
     (tmp_path / "torch.py").write_text("ops = None\n")
-    for name in ("vllm_ascend", "vllm_ascend/ops"):
-        directory = tmp_path / name
-        directory.mkdir()
-        (directory / "__init__.py").touch()
-    (tmp_path / "vllm_ascend/ops/xllm_ops.py").touch()
-    (tmp_path / "libxllm_ops.so").touch()
+    # Neither a legacy wrapper nor a discoverable library proves the binding works.
+    if wrapper != "absent":
+        for name in ("vllm_ascend", "vllm_ascend/ops"):
+            directory = tmp_path / name
+            directory.mkdir()
+            (directory / "__init__.py").touch()
+        (tmp_path / "vllm_ascend/ops/xllm_ops.py").write_text(
+            "def x_attention(): pass\n"
+            if wrapper == "ready"
+            else "raise ImportError('legacy wrapper unavailable')\n"
+        )
+    if initial != "absent":
+        (tmp_path / "libxllm_ops.so").touch()
     attention_kv_ops = (
         "def x_attention(): pass\ndef select_unshared_kv(): pass\ndef cache_unshared_kv(): pass\n"
     )
     ready = attention_kv_ops + "def rec_constrained_topk(): pass\n"
     (tmp_path / "ready.py").write_text(ready)
     (tmp_path / "missing-topk.py").write_text(attention_kv_ops)
+    (tmp_path / "missing-op.py").write_text("x_attention = None\n")
+    noncallable = ready.replace("def x_attention(): pass", "x_attention = None")
+    (tmp_path / "noncallable.py").write_text(noncallable)
+    (tmp_path / "broken.py").write_text("raise ImportError('unresolved library')\n")
     binding = tmp_path / "custom_ops_lib.py"
     if initial == "ready":
         binding.write_text(ready)
@@ -224,6 +243,8 @@ def test_install_checks_callable_ops_before_and_after_build(
         binding.write_text(attention_kv_ops)
     elif initial == "missing-op":
         binding.write_text("x_attention = None\n")
+    elif initial == "noncallable":
+        binding.write_text(noncallable)
     elif initial == "broken":
         binding.write_text("raise ImportError('unresolved library')\n")
     build = tmp_path / "build.sh"
@@ -231,6 +252,10 @@ def test_install_checks_callable_ops_before_and_after_build(
         'touch built\ncase "$BUILD_RESULT" in\n'
         "  ready) cp ready.py custom_ops_lib.py ;;\n"
         "  missing-topk) cp missing-topk.py custom_ops_lib.py ;;\n"
+        "  missing-op) cp missing-op.py custom_ops_lib.py ;;\n"
+        "  noncallable) cp noncallable.py custom_ops_lib.py ;;\n"
+        "  broken) cp broken.py custom_ops_lib.py ;;\n"
+        "  noop) : ;;\n"
         "  fail) exit 7 ;;\nesac\n",
         newline="\n",
     )
@@ -242,6 +267,7 @@ def test_install_checks_callable_ops_before_and_after_build(
         PATH=str(tmp_path) + os.pathsep + env["PATH"],
         TEST_PYTHON=Path(sys.executable).as_posix(),
         PYTHONPATH=str(tmp_path),
+        PYTHONDONTWRITEBYTECODE="1",
         LD_LIBRARY_PATH=tmp_path.as_posix(),
         XLLM_OPS_SKIP_NPU_CHECK="1",
         XLLM_OPS_BUILD_SCRIPT=build.as_posix(),
@@ -291,3 +317,18 @@ def test_install_checks_callable_ops_before_and_after_build(
     assert (tmp_path / "built").exists() == built
     if after_build == "missing-topk":
         assert "missing callable operators: rec_constrained_topk" in result.stderr
+    if ok:
+        # A second invocation must recheck the binding and skip even a failing build.
+        (tmp_path / "built").unlink(missing_ok=True)
+        env.update(XLLM_OPS_BUILD_SCRIPT=build.as_posix(), BUILD_RESULT="fail")
+        repeated = subprocess.run(
+            ["bash", (ROOT / "tools/npu/install_xllm_ops.sh").as_posix()],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert repeated.returncode == 0, repeated.stderr
+        assert not (tmp_path / "built").exists()
