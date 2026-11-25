@@ -26,7 +26,7 @@ UPSTREAM_PROCESS_INPUT_SOCKETS = None
 
 
 def make_patched_engine_init(original):
-    """Publish the loaded table's immutable capacity before accepting requests."""
+    """Initialize the GR queue step and publish Trie capacity before admission."""
     if getattr(original, "_gr_trie_capacity_patch", False):
         return original
 
@@ -34,7 +34,10 @@ def make_patched_engine_init(original):
     def initialize(self, *args, **kwargs):
         original(self, *args, **kwargs)
         from vllm_gr.config import GRConfig
-        from vllm_gr.v1.engine.core import loaded_constraint_trie_count
+        from vllm_gr.v1.engine.core import (
+            install_inproc_gr_terminal_step,
+            loaded_constraint_trie_count,
+        )
         from vllm_gr.v1.engine.worker_readiness import verify_engine_backend_readiness
 
         verify_engine_backend_readiness(self)
@@ -46,6 +49,7 @@ def make_patched_engine_init(original):
         if not counts or any(type(n) is not int or n < 1 or n != counts[0] for n in counts):
             raise RuntimeError("Workers disagree on the loaded constraint table Trie count")
         self._gr_trie_count = self.scheduler._gr_trie_count = counts[0]
+        install_inproc_gr_terminal_step(self)
 
     setattr(initialize, "_gr_trie_capacity_patch", True)
     return initialize

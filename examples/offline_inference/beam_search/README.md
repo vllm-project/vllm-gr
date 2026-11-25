@@ -8,7 +8,7 @@ catalog. The commands below run from the repository root in Bash.
 ## Run the V1 example
 
 Install the [CUDA](../../../docs/getting_started/installation/gpu.md) or
-[Ascend](../../../docs/getting_started/installation/npu.md) runtime and set `ONEREC_MODEL`
+[NPU](../../../docs/getting_started/installation/npu.md) runtime and set `ONEREC_MODEL`
 to a local OneRec-1.7B snapshot with its tokenizer. See the
 [model preparation steps](../../README.md#run-onerec-offline) to set the path
 or download the snapshot. On CUDA, use the default backend.
@@ -17,8 +17,8 @@ or download the snapshot. On CUDA, use the default backend.
 python examples/offline_inference/beam_search/quickstart.py --model "$ONEREC_MODEL"
 ```
 
-On Ascend, add `--constraint-backend npu --execution eager`. The script uses
-ModelRunner V1 on Ascend and defaults to V2 on CUDA. See
+On NPU, add `--constraint-backend npu --execution eager`. The script uses
+ModelRunner V1 on NPU and defaults to V2 on CUDA. See
 [ModelRunner selection](../../README.md#choose-a-modelrunner) for the CUDA override.
 
 The default prompt is `Recommend the next video.` The script prints
@@ -56,7 +56,7 @@ python tools/constraints/build_constraint_triples.py \
 ```
 
 With `ONEREC_MODEL` set as above, run both commands with the same prompt.
-On Ascend, append `--constraint-backend npu --execution eager` to both commands.
+On NPU, append `--constraint-backend npu --execution eager` to both commands.
 
 ```bash
 python examples/offline_inference/beam_search/quickstart.py \
@@ -179,7 +179,7 @@ belong to `offline_beam_search.py`. Library defaults can differ.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `beam_graph_enabled` | `true` on CUDA | On Ascend, `--execution graph` enables Beam graphs and `--execution eager` disables them. CUDA ignores this flag. |
+| `beam_graph_enabled` | `true` on CUDA | On NPU, `--execution graph` enables Beam graphs and `--execution eager` disables them. CUDA ignores this flag. |
 | `worker_decision` | `true` | The script enables Beam selection on the Worker. |
 | `beam_width` | `[128, 128, 128]` | `--beam-width` sets both the engine capacity and the request width. |
 | `max_decode_steps` | `3` | `--generated-steps` sets the effective token count. The three-layer Constraint Table requires `3`. |
@@ -201,7 +201,7 @@ compiles a temporary artifact and fills in its path and digests.
 | Parameter | Example value | How to set it |
 | --- | --- | --- |
 | `gr.constraint_mode` | `table` | The script enables the table when you pass `--catalog`. It selects `none` for full-vocabulary Beam Search. |
-| `backend` | `cuda` | Use `--constraint-backend npu` on Ascend. |
+| `backend` | `cuda` | Use `--constraint-backend npu` on NPU. |
 | `max_top_k` | `128` | The script sets this capacity to the candidate width. In YAML, set it to at least that width. |
 | `candidate_width` | Omitted, resolves to `128` | Use `--candidate-width` to set the candidates per Beam row independently of `--beam-width`. The accepted range is 1 through 256. Set it explicitly when the Beam width exceeds 256. |
 | `path` | `/absolute/path/to/video_constraint_table.safetensors` | In YAML, use the absolute path to the compiled artifact. |
@@ -237,7 +237,12 @@ These values apply to the single-request CUDA command in
 | `max_num_batched_tokens` | `8192` | The script uses the larger of `max_model_len` and the batch's Prefill token budget. The full batch must fit when chunked Prefill is disabled. |
 | `max_num_seqs` | `128` | The script uses the larger of `--beam-width` and `--batch-size`. |
 | `max_logprobs` | `128` | The script uses `--candidate-width` when set and `--beam-width` otherwise. |
-| `enforce_eager` | `False` | The script sets it to `True` on Ascend with `--execution eager`. |
+| `enforce_eager` | `False` | The script sets it to `True` on NPU with `--execution eager`. |
+
+For Python callers consuming token IDs and scores in bulk, use
+`llm.beam_search(inputs, params, output_mode="flat")`. See the
+[offline output formats](../../../docs/user_guide/beam_search_npu.md#offline-output-formats)
+for the array shapes and compact conversion.
 
 ### Request parameters
 
@@ -436,7 +441,7 @@ The focused CPU tests cover flat EngineArgs B=1/2/4 preservation, Prefill-only
 example output, native NONE/PIECEWISE/FULL shape misses, and captured-context
 reuse across B=2 -> B=1 -> B=2. They do not load a model or execute NPU kernels.
 
-On a configured Ascend server, run the opt-in public-API regression:
+On a configured NPU server, run the opt-in public-API regression:
 
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \

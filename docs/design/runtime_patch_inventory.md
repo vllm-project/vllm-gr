@@ -105,7 +105,11 @@ Owner: `vllm_gr/v1/engine/core.py, core_socket.py, engine_core_patch.py, and hot
 
 Installer: `vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches`
 
-Risk: `critical`; process roles: `engine_core`
+Risk: `critical`; process roles: `main`, `engine_core`
+
+In-process Beam engines can consume a ready terminal batch before attempting
+another scheduling step. The EngineCore queues and publishes the result through
+the same accounting calls and returns to the native step for other work.
 
 ### GR-PATCH-010 — Scheduler Beam Override
 
@@ -177,7 +181,7 @@ Installer: `vllm_gr.platforms.ascend.spawn_patch.apply_npu_spawn_patch`
 
 Risk: `medium`; process roles: `main`, `engine_core`
 
-### GR-PATCH-018 — Ascend Penalties Warmup OOM Guard
+### GR-PATCH-018 — NPU Penalties Warmup OOM Guard
 
 Scope: `backend`; backend ID: `ascend`
 
@@ -187,7 +191,7 @@ Installer: `vllm_gr.v1.worker.npu.startup_patch.apply_penalties_warmup_oom_guard
 
 Risk: `medium`; process roles: `npu_worker`
 
-### GR-PATCH-019 — Ascend additional_config Sanitizer
+### GR-PATCH-019 — NPU additional_config Sanitizer
 
 Scope: `backend`; backend ID: `ascend`
 

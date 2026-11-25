@@ -86,11 +86,11 @@ def test_v1_flow_closes_after_execution_failure() -> None:
     assert frontend.events == ["prepare", "submit", "wait", "close"]
 
 
-@pytest.mark.parametrize("output_mode", [None, "full", "compact"])  # type: ignore[misc]
+@pytest.mark.parametrize("output_mode", [None, "full", "compact", "flat"])  # type: ignore[misc]
 @pytest.mark.parametrize("trie_ids", [None, [1]])  # type: ignore[misc]
 def test_grllm_v1_entry_uses_new_frontend(
     monkeypatch: pytest.MonkeyPatch,
-    output_mode: Literal["full", "compact"] | None,
+    output_mode: Literal["full", "compact", "flat"] | None,
     trie_ids: list[int] | None,
 ) -> None:
     from vllm_gr.entrypoints.gr import GRLLM

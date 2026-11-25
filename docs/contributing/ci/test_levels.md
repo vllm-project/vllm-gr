@@ -10,7 +10,7 @@ level) and **where it can run** (one or more platform markers).
 | Level | Use it for | GR example |
 | --- | --- | --- |
 | L1 | Fast checks of an isolated rule or public contract | Reject an invalid beam width. |
-| L2 | A small, representative execution through a component or device | Compare a CUDA or Ascend kernel with a reference on one small input. |
+| L2 | A small, representative execution through a component or device | Compare a CUDA or NPU kernel with a reference on one small input. |
 | L3 | Integration across components or a broader functional matrix | Exercise a model request through the frontend, scheduler, and worker. |
 | L4 | Expensive accuracy, performance, or large parameter sweeps | Measure Recall on a fixed dataset or check many attention shapes. |
 | L5 | Long-running stability and stress | Check memory growth across repeated model reloads over an extended run. |
@@ -32,13 +32,18 @@ apply to a module, class, function, or individual parameter.
 | --- | --- |
 | `cpu_test` | The case can run without an accelerator. Its Python dependencies and shared fixtures still apply. |
 | `gpu_test` | The case exercises CUDA. |
-| `npu_test` | The case needs the Ascend runtime or device. |
+| `npu_test` | The case needs the NPU runtime or device. |
 
 Use both accelerator markers for a case that can run on either platform.
+Base the marker on the runtime and device the test actually uses. Host-side
+tests of CUDA or NPU routing and mocked runtime checks use `cpu_test`.
+In mixed modules, mark native cases or parameters explicitly and check device
+availability in their fixtures or test bodies so other lanes can collect the module.
+
 The markers describe eligibility. Keep an availability check with a test
 that must skip when its device is unavailable. In `tests/kernels/` and
 `tests/st/`, cases with no platform marker default to `gpu_test`. Mark CPU
-and Ascend cases there explicitly. Add `model_test` when weights are
+and NPU cases there explicitly. Add `model_test` when weights are
 required. The `slow` and `slow_test` markers require `--run-slow`.
 
 ### Host test example
@@ -80,5 +85,5 @@ python -m pytest --collect-only --strict-test-levels tests/ci/test_level_policy.
 python -m pytest --strict-test-levels -m 'l1 and cpu_test' tests/ci/test_level_policy.py
 ```
 
-To run a level across the suite on CUDA or Ascend, use the
+To run a level across the suite on CUDA or NPU, use the
 [local runner guide](local_runner.md) and the [level runner](../../../tools/ci/run_test_level.sh).

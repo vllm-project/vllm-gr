@@ -19,6 +19,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
+    BeamSequenceColumns,
     validate_terminal_beam_batch_result,
 )
 
@@ -32,6 +33,41 @@ class SyncGRSessionHandle:
 class AsyncGRSessionHandle:
     request: BeamBatchRequest
     output_collector: Any
+
+
+def _has_owned_columns(result: BeamBatchResult) -> bool:
+    if (
+        type(result) is not BeamBatchResult
+        or type(result.protocol_version) is not int
+        or type(result.batch_id) is not str
+        or result.failure is not None
+        or type(result.output) is not BeamBatchOutput
+        or type(result.output.items) is not tuple
+    ):
+        return False
+    for item in result.output.items:
+        if type(item) is not BeamRequestOutput or type(item.item_index) is not int:
+            return False
+        columns = item.sequences
+        if (
+            type(item.request_id) is not str
+            or type(columns) is not BeamSequenceColumns
+            or type(columns.count) is not int
+            or columns.count < 1
+            or type(columns.steps) is not int
+            or columns.steps < 1
+            or type(columns.token_ids) is not bytes
+            or (
+                columns.cumulative_logprobs is not None
+                and type(columns.cumulative_logprobs) is not bytes
+            )
+            or (
+                columns.parent_beam_indices is not None
+                and type(columns.parent_beam_indices) is not bytes
+            )
+        ):
+            return False
+    return True
 
 
 def _normalize_inproc_result(result: BeamBatchResult) -> BeamBatchResult:
@@ -64,7 +100,9 @@ def _normalize_inproc_result(result: BeamBatchResult) -> BeamBatchResult:
         return msgspec.msgpack.decode(msgspec.msgpack.encode(result), type=BeamBatchResult)
 
 
-def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
+def _terminal_result(
+    request: BeamBatchRequest, output: Any, *, local_ascend: bool = False
+) -> BeamBatchResult:
     params = getattr(output, "kv_transfer_params", None) or {}
     result = params.get("gr_batch_result")
     # kv_transfer_params is an untyped IPC field, so array-like msgspec
@@ -72,7 +110,8 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
     # msgspec.convert trusts constructed Structs. Strip those wrappers before
     # typed conversion so inproc values receive the same nested validation.
     if isinstance(result, BeamBatchResult):
-        result = _normalize_inproc_result(result)
+        if not local_ascend or not _has_owned_columns(result):
+            result = _normalize_inproc_result(result)
     elif isinstance(result, (list, tuple)):
         result = msgspec.convert(result, type=BeamBatchResult)
     if isinstance(result, BeamBatchResult):
@@ -108,12 +147,19 @@ def wait_gr_session_sync(
 ) -> BeamBatchResult:
     if handle.request.batch_id != session_id:
         raise ValueError("GR session handle does not match session_id")
+    from vllm.v1.engine.core_client import InprocClient
+
     native_request = handle.request.items[0].request
     output_id = getattr(native_request, "external_req_id", None) or session_id
+    config = getattr(engine, "vllm_config", None)
+    device = getattr(getattr(config, "device_config", None), "device", None)
+    local_ascend = getattr(device, "type", None) == "npu" and isinstance(
+        getattr(engine, "engine_core", None), InprocClient
+    )
     while True:
         for output in engine.step():
             if output.request_id == output_id and output.finished:
-                return _terminal_result(handle.request, output)
+                return _terminal_result(handle.request, output, local_ascend=local_ascend)
 
 
 def abort_gr_session_sync(engine: Any, session_id: str) -> None:

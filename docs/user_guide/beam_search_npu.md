@@ -1,8 +1,8 @@
-# Unconstrained Beam search on Ascend
+# Unconstrained Beam search on NPU
 
 <a id="unconstrained-beam-search-v1-on-npu"></a>
 
-Use `GRLLM.beam_search()` on Ascend to rank candidates from the model's
+Use `GRLLM.beam_search()` on NPU to rank candidates from the model's
 full output vocabulary. The example uses the Beam API with no catalog artifact.
 
 !!! note "Catalog membership"
@@ -14,8 +14,8 @@ full output vocabulary. The example uses the Beam API with no catalog artifact.
 ## Configuration and Python entry point
 
 Prepare the vendor runtime and Beam attention dependencies in the
-[Ascend installation guide](../getting_started/installation/npu.md). Beam
-search on Ascend uses [ModelRunner V1](../configuration/README.md#modelrunner-selection).
+[NPU installation guide](../getting_started/installation/npu.md). Beam
+search on NPU uses [ModelRunner V1](../configuration/README.md#modelrunner-selection).
 The full-vocabulary selector uses PyTorch and reuses the Beam attention and
 KV operators from that setup.
 
@@ -96,9 +96,31 @@ Omit the artifact path and digests, vocabulary offset, and vocabulary slice.
 The engine rejects an enabled Constraint Table or a vocabulary slice with
 `constrained_generation=False`.
 
-`output_mode="full"` returns the usual Beam sequence objects, and is also the
-default to keep the upstream vLLM contract. Pass `output_mode="compact"` to
-request the compact output format. No new output type is introduced by default.
+### Offline output formats
+
+`output_mode="full"` is the default and returns the usual Beam sequence objects.
+Pass `output_mode="compact"` for eager generated-only candidates. For bulk
+consumption, pass `output_mode="flat"`. Fixed-length columnar results expose
+read-only NumPy arrays at `output.sequences.token_ids` with shape
+`(candidates, tokens)` and `output.sequences.cumulative_logprobs` with shape
+`(candidates,)`. Other results expose a tuple of compact candidates. This
+includes some fixed-length results, such as those with a small Beam width.
+Check the sequence type before accessing the arrays.
+
+```python
+from vllm_gr.outputs import FlatBeamSearchSequences
+
+sequences = output.sequences
+if isinstance(sequences, FlatBeamSearchSequences):
+    token_ids = sequences.token_ids
+    scores = sequences.cumulative_logprobs
+else:
+    token_ids = [candidate.token_ids for candidate in sequences]
+    scores = [candidate.cumulative_logprob for candidate in sequences]
+```
+
+Both representations support iteration, and `output.as_compact()` returns the
+compact form in either case.
 
 ## Catalog-free SA/SB/SC generation
 
@@ -189,26 +211,27 @@ model forward. Enabling the Prefill flag does not guarantee every input shape ca
 use a FULL graph; use the execution diagnostics/profile to verify the actual
 dispatch mode.
 
+In-process Beam Search can consume a ready terminal Decode receipt immediately
+when it is the only in-flight work and no abort or other request is pending.
+
 ## Candidate scores
 
-In the default full-vocabulary mode, each parent row is normalized in FP32 over its complete finite model vocabulary
-before TopK truncation. A temperature of zero retains the established Beam
-meaning of unscaled logits (effective temperature one); positive temperatures
-scale the logits before normalization. The same token's logprob must not change
-merely because the requested candidate count changes.
+Unconstrained NPU Beam Search without SID-stage vocabulary restriction defaults
+to full-vocabulary scoring. The selector normalizes each parent over its
+complete finite model vocabulary and breaks score ties by ascending token ID.
+A token's log probability is independent of the requested candidate width.
 
-The initial selector is a native PyTorch baseline that sorts the complete
-vocabulary. Its purpose is functional support; no performance improvement over
-constrained selection is implied. Large vocabularies and wide Beam batches can
-make this selection step substantial.
+Set `gr.npu_unconstrained_topk_fast_path: true` to use native TopK and
+normalize only the selected logits in FP32. This uses native TopK tie ordering.
+The smaller normalization domain can change cumulative scores, cross-parent
+ordering, and the final candidate set.
 
-NaN and infinite logits are excluded. When fewer than K finite tokens are
-available, remaining slots have `valid_mask=False` and a score of negative
-infinity. A completely invalid row produces no valid candidates. Exact score ties
-prefer the smaller token ID. These guards make the candidate contract explicit;
-they do not imply bitwise parity across different model kernels or devices.
+Temperature zero uses unscaled logits. Positive temperatures scale logits before
+normalization in either mode. NaN and infinite logits are excluded. When fewer
+than K finite tokens are available, the remaining slots are invalid with
+negative-infinity scores. A completely invalid row produces no valid candidates.
 
-Run the focused regressions in the complete Ascend environment:
+Run the focused regressions in the complete NPU environment:
 
 ```bash
 python -m pytest tests/v1/engine/test_npu_unconstrained_beam.py \
@@ -237,7 +260,7 @@ xllm-ops helper header `test/python_test/pytorch_npu_helper.hpp` and checks
 the runtime versions before compiling.
 
 Run these commands inside the prepared NPU environment, from the vLLM-GR
-repository root after completing [Ascend installation](../getting_started/installation/npu.md).
+repository root after completing [NPU installation](../getting_started/installation/npu.md).
 Set `XLLM_OPS_DIR` to the source checkout used to build the
 installed xllm-ops library. Keep the CANN and custom operator environment
 loaded in the current shell.

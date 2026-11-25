@@ -263,6 +263,7 @@ def test_catalog_free_prefill_uses_full_vocab_without_constraint_state(
     batch_size: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     stage = _prefill_runner(batch_size, constrained=False)
+    stage.worker._vllm_gr_config = GRConfig(constraint=ConstraintConfig())
     assert stage.logits is not None
     assert stage.pending_plan is not None
     execution = stage.pending_plan.execution

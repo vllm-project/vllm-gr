@@ -65,6 +65,23 @@ def test_replaced_tensor_binding_updates_every_layer(cache: CacheHarness, name: 
     cache.assert_full_update()
 
 
+@pytest.mark.l1
+def test_rebound_tensor_storage_updates_every_layer(cache: CacheHarness) -> None:
+    cache.assert_full_update()
+    query = cache.entry.layers[1].query
+    assert query is not None
+    old_binding = query.detach()
+
+    query.set_(torch.empty_like(query))
+
+    assert cache.entry.layers[1].query is query
+    assert query.data_ptr() != old_binding.data_ptr()
+    cache.assert_full_update()
+    assert cache.update() is True
+    assert cache.api.events == []
+    assert cache.api.calls == []
+
+
 @pytest.mark.parametrize("change", ["shape", "stride", "offset", "dtype"])
 def test_tensor_layout_change_updates_every_layer(cache: CacheHarness, change: str) -> None:
     backing = torch.zeros(17, dtype=torch.int32, device="cpu")

@@ -119,10 +119,10 @@ boundaries have to agree. See the [runner contract](model_runner_v2.md).
 
 Scope: `backend`; backend ID: `ascend`
 
-The Ascend worker adapts native rows and attention metadata for grouped Beam
+The NPU worker adapts native rows and attention metadata for grouped Beam
 execution. Cached prefixes, real row lengths and parent selection must stay
 aligned with native block tables. See
-[Ascend Beam Decode execution](../feature/npu_decode_execution.md).
+[NPU Beam Decode execution](../feature/npu_decode_execution.md).
 
 The [worker stage projection](../../../vllm_gr/v1/worker/npu/stage_projection.py)
 wraps the instance logits processor, runner reload and native worker weight-update
@@ -152,24 +152,24 @@ native weight reload.
 
 Scope: `backend`; backend ID: `ascend`
 
-Ascend subprocesses must use a compatible start method when the parent has
-initialized the device. The Ascend provider installs spawn protection before
+NPU subprocesses must use a compatible start method when the parent has
+initialized the device. The NPU provider installs spawn protection before
 the native worker initialization hook.
 
-## GR-PATCH-018 — Ascend Penalties Warmup OOM Guard
+## GR-PATCH-018 — NPU Penalties Warmup OOM Guard
 
 Scope: `backend`; backend ID: `ascend`
 
-Ascend warmup can allocate penalty tensors that exceed available memory. The
+NPU warmup can allocate penalty tensors that exceed available memory. The
 [NPU startup hook](../../../vllm_gr/v1/worker/npu/startup_patch.py) handles the
 warmup allocation failure while preserving other execution errors.
 The inventory lists no behavioural test for this guard.
 
-## GR-PATCH-019 — Ascend additional_config Sanitizer
+## GR-PATCH-019 — NPU additional_config Sanitizer
 
 Scope: `backend`; backend ID: `ascend`
 
-The [Ascend configuration patch](../../../vllm_gr/platforms/ascend/config_patch.py)
+The [NPU configuration patch](../../../vllm_gr/platforms/ascend/config_patch.py)
 retains GR settings while filtering keys passed to the native configuration
 reader. Fresh EngineCore processes install the common plan before native
 construction. Worker startup also refreshes the filter's native bindings.
@@ -179,7 +179,7 @@ construction. Worker startup also refreshes the filter's native bindings.
 Scope: `backend`; backend ID: `ascend`
 
 The [NPU cache layout patch](../../../vllm_gr/v1/worker/npu/kv_layout_patch.py)
-lets eligible Ascend xllm Beam layers request contiguous prefix K/V at native
+lets eligible NPU xllm Beam layers request contiguous prefix K/V at native
 allocation. Attention row selection is a separate reader (`select_beam_rows`)
 that checks layout, strides and format before using the paged block table.
 An unsuitable layout keeps the gather path.

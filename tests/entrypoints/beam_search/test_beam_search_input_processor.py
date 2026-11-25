@@ -14,7 +14,9 @@ import pytest
 import torch
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TextPrompt, TokensPrompt, embeds_input, tokens_input
+from vllm.platforms import current_platform
 from vllm.renderers.params import TokenizeParams
+from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 
@@ -333,6 +335,52 @@ def test_offline_inputs_preserve_caller_formed_batch_order(batch_size: int) -> N
     assert [item.request.prompt_token_ids.tolist() for item in request.items] == prompts
     assert request.batch_id == request.items[0].request.request_id
     assert len({item.request.request_id for item in request.items}) == batch_size
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.cpu_test  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("device_type", "in_proc", "calls"),
+    [("npu", True, 1), ("npu", False, 2), ("cuda", True, 1), ("cpu", True, 1)],
+)
+def test_offline_flat_input_reuse_uses_in_process_core(
+    monkeypatch: pytest.MonkeyPatch, device_type: str, in_proc: bool, calls: int
+) -> None:
+    monkeypatch.setattr(current_platform, "device_type", device_type)
+    engine = _make_engine()
+    engine.get_supported_tasks = lambda: ("generate",)
+    engine.engine_core = object.__new__(InprocClient) if in_proc else object()
+    native = engine.input_processor
+    native.process_inputs = Mock(wraps=native.process_inputs)
+    native._validate_prompt_len = Mock()
+    tokenizer = SimpleNamespace(eos_token_id=2, convert_tokens_to_ids=lambda _token: 7)
+    prompts = ([1, 2], [3, 4, 5])
+    engine_inputs = [
+        {"type": "token", "prompt_token_ids": prompt, "cache_salt": salt}
+        for prompt, salt in zip(prompts, ("first", "second"), strict=True)
+    ]
+    llm = SimpleNamespace(
+        get_tokenizer=lambda: tokenizer,
+        _preprocess_cmpl=lambda _prompts: engine_inputs,
+        _lora_request_to_seq=lambda _lora, size: [None] * size,
+    )
+    params = BeamSearchParams(beam_width=2, max_tokens=4, ignore_eos=True, begin_token="<begin>")
+    frontend = BeamSearchInputProcessor(engine)
+
+    batch = frontend.process_offline_inputs(
+        llm, OfflineBeamSearchRequest(prompts, params, output_mode="flat")
+    )
+
+    assert native.process_inputs.call_count == calls
+    assert native._validate_prompt_len.call_count == (1 if calls == 1 else 0)
+    first, second = (item.request for item in batch.items)
+    assert first.request_id == batch.batch_id
+    assert first.request_id != second.request_id
+    assert first.external_req_id != second.external_req_id
+    assert (first.cache_salt, second.cache_salt) == ("first", "second")
+    assert first.prompt_token_ids.tolist() == [1, 2, 7]
+    assert second.prompt_token_ids.tolist() == [3, 4, 5, 7]
+    assert frontend.original_prompt_token_ids == ((1, 2), (3, 4, 5))
 
 
 @pytest.mark.parametrize("text_input", [False, True])  # type: ignore[misc]

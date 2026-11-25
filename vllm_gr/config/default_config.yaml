@@ -96,7 +96,8 @@ gr:
   prefix_calibration_path: null            # Custom YAML cache path. Default: $XDG_CACHE_HOME/vllm_gr/prefix_calibration.yaml,
                                            # or ~/.cache/vllm_gr/prefix_calibration.yaml if XDG_CACHE_HOME is unset.
 
-  # NPU: Ascend graphs and execution backend
+  # NPU graph and execution settings
+  npu_unconstrained_topk_fast_path: false   # Opt in to normalization over selected candidates.
   sid_stage_vocab: false                   # Stage-specific SID vocabulary without tables; worker decision and at most 3 steps.
   decode_graph_batch_size: 1               # Exact Decode request count, 1..128, also bounded by platform capacity.
   decode_graph_widths: null                # Extra Decode widths to warm up; null: engine width only; at most 8 widths in total.

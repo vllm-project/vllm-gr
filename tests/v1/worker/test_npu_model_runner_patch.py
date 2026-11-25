@@ -1566,7 +1566,9 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
 
     worker._update_states = npu_patch.make_patched_update_states(update).__get__(worker)
 
-    def prepare(self: Any, scheduled: Any, counts: np.ndarray) -> tuple[Any, ...]:
+    def prepare(
+        self: Any, scheduled: Any, counts: np.ndarray[Any, np.dtype[np.int32]]
+    ) -> tuple[Any, ...]:
         assert counts.dtype == np.int32
         assert torch.from_numpy(counts).tolist() == [3, 3]
         assert scheduled.total_num_scheduled_tokens == 6

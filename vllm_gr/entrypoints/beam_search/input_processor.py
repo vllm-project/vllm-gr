@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import struct
 import time
 from typing import Any
 
@@ -317,6 +318,94 @@ def _create_batch_request(
     return request
 
 
+def _pack_decoder_token_ids(values: list[int] | tuple[int, ...]) -> np.ndarray:
+    """Pack exact Python sequences into the GR token wire format."""
+    tokens = np.empty(len(values), dtype=np.int64)
+    struct.pack_into(f"={len(values)}q", tokens, 0, *values)
+    return tokens
+
+
+def _try_prepare_flat_requests(
+    engine: Any,
+    engine_inputs: Any,
+    lora_requests: Any,
+    sampling_params: SamplingParams,
+    supported_tasks: Any,
+    arrival_time: float,
+    begin_token_id: int | None,
+) -> tuple[list[EngineCoreRequest], list[tuple[int, ...]]] | None:
+    """Prepare an eligible in-process batch from a native request template."""
+    from msgspec.structs import replace
+    from vllm.platforms import current_platform
+    from vllm.v1.engine.core_client import InprocClient
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    processor = engine.input_processor
+    if (
+        type(processor) is not InputProcessor
+        or not isinstance(getattr(engine, "engine_core", None), InprocClient)
+        or processor.model_config.is_encoder_decoder
+        or sampling_params.max_tokens is None
+        or sampling_params.routed_experts_prompt_start != 0
+        or sampling_params.trace_decode_token_ids
+        or len(lora_requests) != len(engine_inputs)
+        or any(lora is not None for lora in lora_requests)
+        or any(
+            item["type"] != "token" or type(item["prompt_token_ids"]) not in (list, tuple)
+            for item in engine_inputs
+        )
+    ):
+        return None
+
+    requests = []
+    original_prompts = []
+    template = processor.process_inputs(
+        _generate_request_id(),
+        engine_inputs[0],
+        sampling_params,
+        supported_tasks=supported_tasks,
+        arrival_time=arrival_time,
+    )
+    original_prompts.append(tuple(_prepare_prompt(template, begin_token_id)))
+    processor.assign_request_id(template)
+    requests.append(template)
+    assert template.sampling_params is not None
+    for engine_input in engine_inputs[1:]:
+        current_platform.validate_request(engine_input, sampling_params)
+        original = engine_input["prompt_token_ids"]
+        processor._validate_prompt_len(len(original), "decoder")
+        try:
+            packed = _pack_decoder_token_ids(original)
+        except struct.error:
+            # Use the regular validation and wire conversion for unusual IDs.
+            processor._validate_model_inputs(None, engine_input)
+            packed = to_int64_tokens(original)
+
+        if processor.tokenizer is not None:
+            min_id, max_id = int(packed.min()), int(packed.max())
+            limit = max(
+                processor.tokenizer.max_token_id, processor.model_config.get_vocab_size() - 1
+            )
+            if min_id < 0:
+                raise VLLMValidationError(f"Token id {min_id} is out of vocabulary")
+            if max_id > limit:
+                raise VLLMValidationError(f"Token id {max_id} is out of vocabulary")
+
+        request = replace(
+            template,
+            request_id=_generate_request_id(),
+            external_req_id=None,
+            prompt_token_ids=packed,
+            cache_salt=engine_input.get("cache_salt"),
+            sampling_params=template.sampling_params.clone(),
+        )
+        _prepare_prompt(request, begin_token_id)
+        original_prompts.append(tuple(original))
+        processor.assign_request_id(request)
+        requests.append(request)
+    return requests, original_prompts
+
+
 class BeamSearchInputProcessor:
     """Prepare requests using the engine's native InputProcessor and limits."""
 
@@ -337,24 +426,38 @@ class BeamSearchInputProcessor:
         )
         engine_inputs = llm._preprocess_cmpl(call.prompts)
         lora_requests = llm._lora_request_to_seq(call.lora_request, len(engine_inputs))
-        engine_requests = []
-        original_prompts = []
         arrival_time = time.time()
         supported_tasks = self.engine.get_supported_tasks()
-        for engine_input, lora_request in zip(engine_inputs, lora_requests, strict=True):
-            engine_request = self.engine.input_processor.process_inputs(
-                _generate_request_id(),
-                engine_input,
+        prepared = None
+        if len(engine_inputs) > 1 and call.output_mode == "flat":
+            prepared = _try_prepare_flat_requests(
+                self.engine,
+                engine_inputs,
+                lora_requests,
                 sampling_params,
-                supported_tasks=supported_tasks,
-                arrival_time=arrival_time,
-                lora_request=lora_request,
+                supported_tasks,
+                arrival_time,
+                begin_token_id,
             )
-            original = _prepare_prompt(engine_request, begin_token_id)
-            if call.output_mode == "compact":
-                original_prompts.append(tuple(original))
-            self.engine.input_processor.assign_request_id(engine_request)
-            engine_requests.append(engine_request)
+        if prepared is None:
+            engine_requests = []
+            original_prompts = []
+            for engine_input, lora_request in zip(engine_inputs, lora_requests, strict=True):
+                engine_request = self.engine.input_processor.process_inputs(
+                    _generate_request_id(),
+                    engine_input,
+                    sampling_params,
+                    supported_tasks=supported_tasks,
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                )
+                original = _prepare_prompt(engine_request, begin_token_id)
+                if call.output_mode != "full":
+                    original_prompts.append(tuple(original))
+                self.engine.input_processor.assign_request_id(engine_request)
+                engine_requests.append(engine_request)
+        else:
+            engine_requests, original_prompts = prepared
         session_id = engine_requests[0].request_id
         request = _create_batch_request(
             session_id=session_id,
@@ -365,7 +468,7 @@ class BeamSearchInputProcessor:
         )
         self.boundary_token_ids = (begin_token_id, end_token_id)
         self.original_prompt_token_ids = (
-            tuple(original_prompts) if call.output_mode == "compact" else None
+            tuple(original_prompts) if call.output_mode != "full" else None
         )
         return request
 

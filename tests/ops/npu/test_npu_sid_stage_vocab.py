@@ -277,7 +277,9 @@ def _runner(
         _gr_npu_stage_projection=projection,
     )
     runner.pending_plan = SimpleNamespace(
-        execution=SimpleNamespace(num_execution_rows=1, candidate_top_k=3, stage_index=1)
+        execution=SimpleNamespace(
+            kind="decode", num_execution_rows=1, candidate_top_k=3, stage_index=1
+        )
     )
     return runner
 
