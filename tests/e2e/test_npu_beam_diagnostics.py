@@ -7,6 +7,7 @@ import ast
 import json
 from collections.abc import Mapping
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,13 +15,12 @@ import pytest
 import torch
 
 from tests.e2e.npu_beam_diagnostics import NPUForwardTrace
-from tests.helpers.paths import TESTS_DIR
 
 
 @pytest.fixture
 def prefill_case_helpers() -> dict[str, Any]:
     # Exercise the pure case policy without importing NPU runtime dependencies.
-    source = TESTS_DIR / "st/test_onerec_v1_npu_e2e.py"
+    source = Path(__file__).with_name("test_onerec_v1_npu_e2e.py")
     tree = ast.parse(source.read_text(encoding="utf-8"))
     names = {
         "_padded_prefill_requested",
