@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+FROM vllm/vllm-openai:v0.30.0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Shell-based tests also invoke Python through the unversioned command.
+RUN if ! command -v python >/dev/null 2>&1; then \
+        ln -s "$(command -v python3)" /usr/local/bin/python; \
+    fi \
+    && python --version
+
+WORKDIR /opt/vllm-gr
+COPY LICENSE NOTICE README.md MANIFEST.in pyproject.toml setup.py ./
+COPY requirements/ requirements/
+COPY tools/packaging/git_version.py tools/packaging/git_version.py
+COPY benchmarks/open_one_rec/ benchmarks/open_one_rec/
+COPY vllm_gr/ vllm_gr/
+RUN VLLM_GR_TARGET_DEVICE=cuda python3 -m pip install --no-cache-dir '.[dev,grpc]'
+
+ENTRYPOINT []

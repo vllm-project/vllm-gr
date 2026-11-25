@@ -44,7 +44,7 @@ class TestBenchmarkBranchPolicy(unittest.TestCase):
     def test_workflow_branch_and_device_scope(self) -> None:
         root = REPO_ROOT
         policy = load_policy(root / ".github/benchmark-gate.yaml")
-        workflow = yaml.safe_load((root / ".github/workflows/pre-commit.yml").read_text())
+        workflow = yaml.safe_load((root / ".github/workflows/ci.yml").read_text())
         step = next(
             item
             for item in workflow["jobs"]["benchmark-policy"]["steps"]

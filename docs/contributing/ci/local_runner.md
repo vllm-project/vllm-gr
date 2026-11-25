@@ -75,7 +75,12 @@ masks with the available devices and skip devices whose telemetry is missing
 or invalid. CUDA locks verify the physical device UUID. Ascend locks use
 sleep processes as advisory markers.
 
-By default the test hook runs the full pytest suite with `--run-slow`. Set
+Buildkite selects L1 CPU tests. The GitHub Actions device job uses
+`pr-device` to select L2 and accelerator-marked L1 tests.
+The separate Pre-commit checks workflow runs static hooks on Ubuntu for
+non-draft PRs without waiting for the `ready` label.
+By default the local test hook runs the full pytest suite with `--run-slow`
+and `--strict-test-levels`. Set
 `VLLM_GR_TEST_LEVEL=pr` to select L1 and L2. For a CUDA level run, set
 `VLLM_GR_TARGET_DEVICE=cuda` to select CPU and CUDA tests within those levels.
 The Ascend runner sets its target automatically. See

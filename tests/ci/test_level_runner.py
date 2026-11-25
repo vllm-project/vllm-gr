@@ -108,18 +108,30 @@ class TestLevelRunner(unittest.TestCase):
             "@pytest.mark.l1\n@pytest.mark.npu_test\ndef test_npu(): pass\n"
             "@pytest.mark.l1\n@pytest.mark.gpu_test\n@pytest.mark.npu_test\ndef test_both(): pass\n"
             "@pytest.mark.l1\n@pytest.mark.cpu_test\n@pytest.mark.gpu_test\ndef test_cpu_gpu(): pass\n"
+            "@pytest.mark.l2\n@pytest.mark.cpu_test\ndef test_l2_cpu(): pass\n"
+            "@pytest.mark.l2\n@pytest.mark.gpu_test\ndef test_l2_gpu(): pass\n"
+            "@pytest.mark.l2\n@pytest.mark.npu_test\ndef test_l2_npu(): pass\n"
             "@pytest.mark.l3\n@pytest.mark.cpu_test\ndef test_l3(): pass\n",
             encoding="utf-8",
         )
         expected = {
-            "cpu": {"test_cpu"},
-            "cuda": {"test_cpu", "test_gpu", "test_both", "test_cpu_gpu"},
-            "npu": {"test_cpu", "test_npu", "test_both"},
+            ("l1", "cpu"): {"test_cpu"},
+            ("l1", "cuda"): {"test_cpu", "test_gpu", "test_both", "test_cpu_gpu"},
+            ("l1", "npu"): {"test_cpu", "test_npu", "test_both"},
+            ("pr-device", "cpu"): {"test_l2_cpu"},
+            ("pr-device", "cuda"): {
+                "test_gpu",
+                "test_both",
+                "test_cpu_gpu",
+                "test_l2_cpu",
+                "test_l2_gpu",
+            },
+            ("pr-device", "npu"): {"test_npu", "test_both", "test_l2_cpu", "test_l2_npu"},
         }
-        for device, names in expected.items():
-            with self.subTest(device=device):
+        for (level, device), names in expected.items():
+            with self.subTest(level=level, device=device):
                 (self.directory / "calls.log").unlink(missing_ok=True)
-                result, calls = self.run_level("l1", smoke=False, device=device)
+                result, calls = self.run_level(level, smoke=False, device=device)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = calls[0].splitlines()
                 marker_index = max(i for i, arg in enumerate(args) if arg == "arg=-m")

@@ -20,7 +20,7 @@ from tests.helpers.paths import REPO_ROOT
 ROOT = REPO_ROOT
 POLICY = Path(".github/benchmark-gate.yaml")
 RESOLVER = Path("tools/ci/resolve_benchmark_policy.py")
-WORKFLOW = ROOT / ".github/workflows/pre-commit.yml"
+WORKFLOW = ROOT / ".github/workflows/ci.yml"
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
 

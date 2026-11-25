@@ -4,13 +4,14 @@
 set -uo pipefail
 
 usage() {
-  echo "Usage: $0 {pr|l1|l2|l3|l4|l5} [pytest arguments...]" >&2
+  echo "Usage: $0 {pr|pr-device|l1|l2|l3|l4|l5} [pytest arguments...]" >&2
 }
 
 level=${1:-pr}
 if [[ $# -gt 0 ]]; then shift; fi
 case "$level" in
   pr) expression='l1 or l2' ;;
+  pr-device) expression='l2 or (l1 and (gpu_test or npu_test))' ;;
   l1|l2|l3|l4|l5) expression="$level" ;;
   *) usage; exit 2 ;;
 esac

@@ -364,7 +364,7 @@ class TestRuntimeResolution(unittest.TestCase):
 
 class TestRuntimeWorkflow(unittest.TestCase):
     def test_every_runtime_job_resolves_before_cache_and_verifies_before_execution(self) -> None:
-        workflow = yaml.safe_load((ROOT / ".github/workflows/pre-commit.yml").read_text())
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         for name in ("pre-commit", "decode-benchmark"):
             with self.subTest(job=name):
                 steps = workflow["jobs"][name]["steps"]

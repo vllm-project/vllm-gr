@@ -322,13 +322,14 @@ def test_shared_driver_imports_each_selected_runtime(
             # Simulate an inherited path pointing at the wrong side.
             "PYTHONPATH": str(roots[1 - roots.index(root)]),
         }
-        subprocess.run(
+        result = subprocess.run(
             ["bash", str(script.resolve())],
             env=env,
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
+        assert result.returncode == 0, result.stdout + result.stderr
         setup = json.loads((output / "setup.json").read_text())
         expected_tools = root / "tools" if root == roots[0] else root / "tools/constraints"
         assert Path(setup["artifact_digest"]) == expected_tools / "build_constraint_table.py"

@@ -2,7 +2,7 @@
 
 <a id="benchmark-acceptance"></a>
 
-During full validation, the [CI workflow](../../../.github/workflows/pre-commit.yml)
+During full validation, the [CI workflow](../../../.github/workflows/ci.yml)
 selects one OneRec benchmark for the decode job based on the device and target
 branch. See [pull request checks](pr_merge_loop.md#pull-request-ci) for the CI review workflow.
 

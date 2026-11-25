@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+steps:
+  - label: "Unit tests"
+    key: unit-tests
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    command: >-
+      python3 -m pytest
+      -n 4 --durations=10 -s
+      -m '(l1) and (cpu_test and not gpu_test and not npu_test)' tests
