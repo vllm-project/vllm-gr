@@ -917,6 +917,7 @@ make_patched_determine_batch_execution_and_padding = (
 )
 
 
+#  Read actual packed row order
 def _select_bsnd_spec(runner, scheduler_output, p_runner, num_reqs):
     """BSND eligibility: complete prompts without history, fitting each row.
 
