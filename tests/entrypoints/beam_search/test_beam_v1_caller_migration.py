@@ -240,7 +240,7 @@ def test_benchmark_keeps_artifact_until_engine_shutdown(monkeypatch: Any) -> Non
 def test_onerec_benchmark_closes_engine_before_deleting_artifact(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_stage: str | None
 ) -> None:
-    from benchmarks.open_one_rec.one_rec_v1_benchmark import run_v1_benchmark
+    from benchmarks.open_one_rec.one_rec_latency import run_latency_benchmark
     from vllm_gr.constraints import artifact_builder
     from vllm_gr.entrypoints import gr
 
@@ -309,12 +309,12 @@ def test_onerec_benchmark_closes_engine_before_deleting_artifact(
     tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [1, 2])
     requests = [SimpleNamespace(prompt="prompt", expected_output_len=5)]
     if failure_stage is None:
-        run_v1_benchmark(args, tokenizer, requests)
+        run_latency_benchmark(args, tokenizer, requests)
         assert len(json.loads(output.read_text())["samples"]) == 1
         assert events == ["enter", "inference", "text", "text", "shutdown"]
     else:
         with pytest.raises(RuntimeError) as caught:
-            run_v1_benchmark(args, tokenizer, requests)
+            run_latency_benchmark(args, tokenizer, requests)
         assert caught.value is failure
         assert not output.exists()
         expected = ["enter", "inference"]
@@ -328,7 +328,7 @@ def test_onerec_benchmark_closes_engine_before_deleting_artifact(
 def test_benchmark_resolves_beam_api_across_rename() -> None:
     import benchmarks.beam_search.measure_latency as performance
     import benchmarks.open_one_rec.offline_ab as offline
-    import benchmarks.open_one_rec.one_rec_v1_benchmark as onerec
+    import benchmarks.open_one_rec.one_rec_latency as onerec
 
     calls: list[str] = []
 
@@ -357,7 +357,7 @@ def test_benchmark_resolves_beam_api_across_rename() -> None:
 
 
 def test_benchmark_loads_the_artifact_builder_present_in_checkout() -> None:
-    import benchmarks.open_one_rec.one_rec_v1_benchmark as onerec
+    import benchmarks.open_one_rec.one_rec_latency as onerec
     from vllm_gr.constraints.artifact_builder import build_single_trie_artifact
 
     assert onerec._load_build_artifact() is build_single_trie_artifact
@@ -368,7 +368,7 @@ def test_benchmark_loads_the_artifact_builder_present_in_checkout() -> None:
 def test_benchmark_falls_back_to_the_legacy_builder(
     monkeypatch: pytest.MonkeyPatch, legacy_v1: bool
 ) -> None:
-    import benchmarks.open_one_rec.one_rec_v1_benchmark as onerec
+    import benchmarks.open_one_rec.one_rec_latency as onerec
 
     shared = "vllm_gr.constraints.artifact_builder"
     legacy = "examples.offline_inference.beam_search.offline_beam_search"
@@ -395,7 +395,7 @@ def test_benchmark_falls_back_to_the_legacy_builder(
 def test_benchmark_propagates_missing_builder_dependency(
     monkeypatch: pytest.MonkeyPatch, legacy: bool
 ) -> None:
-    import benchmarks.open_one_rec.one_rec_v1_benchmark as onerec
+    import benchmarks.open_one_rec.one_rec_latency as onerec
 
     shared = "vllm_gr.constraints.artifact_builder"
     failure = ModuleNotFoundError(name="vllm_gr.constraints.compiler")

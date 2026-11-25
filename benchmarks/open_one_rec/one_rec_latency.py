@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-"""Sequential text-to-text V1 latency benchmark for the OneRec CLI."""
+"""Sequential text-to-text latency benchmark for the OneRec CLI."""
 
 import hashlib
 import json
@@ -44,7 +44,7 @@ def _load_build_artifact():
     raise ImportError("no constraint artifact builder found in the checkout")
 
 
-def run_v1_benchmark(args, tokenizer, requests):
+def run_latency_benchmark(args, tokenizer, requests):
     import vllm_gr
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams

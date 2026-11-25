@@ -56,7 +56,7 @@ vllm serve --gr --help
 vllm serve --gr --help=all                        # All installed serving options
 vllm bench --gr --help
 vllm bench --gr --list
-vllm bench qwen-v1 --gr --help
+vllm bench qwen --gr --help
 vllm check-env --gr                               # Detect the runtime platform
 vllm check-env --gr --npu                         # Require Ascend NPU
 ```

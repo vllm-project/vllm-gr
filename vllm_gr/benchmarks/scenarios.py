@@ -45,10 +45,10 @@ SCENARIOS: dict[str, BenchScenario] = {
         "Beam V1 recall gate",
         module="benchmarks.beam_search.measure_onerec_recall",
     ),
-    "qwen-v1": BenchScenario(
-        "qwen-v1",
-        "Qwen Beam Search V1 offline benchmark",
-        module="benchmarks.qwen.benchmark_v1",
+    "qwen": BenchScenario(
+        "qwen",
+        "Qwen offline Beam search benchmark",
+        module="benchmarks.qwen.benchmark",
     ),
     "ab-offline": BenchScenario(
         "ab-offline",

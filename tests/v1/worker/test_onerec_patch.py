@@ -625,7 +625,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
     def test_offline_beam_search_always_delegates_to_v1(self) -> None:
         """The former default path uses the same V1 owner as the explicit flag."""
         import benchmarks.open_one_rec.one_rec_patch as patch_mod
-        from benchmarks.open_one_rec import one_rec_v1_benchmark, open_one_rec_dataset
+        from benchmarks.open_one_rec import one_rec_latency, open_one_rec_dataset
 
         request = types.SimpleNamespace(prompt="prompt", expected_output_len=5)
         dataset = mock.MagicMock()
@@ -644,7 +644,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
         with (
             mock.patch.object(open_one_rec_dataset, "OneRecDataset", return_value=dataset),
             mock.patch.object(transformers, "AutoTokenizer") as auto_tokenizer,
-            mock.patch.object(one_rec_v1_benchmark, "run_v1_benchmark") as run_v1,
+            mock.patch.object(one_rec_latency, "run_latency_benchmark") as run_latency,
         ):
             tokenizer = auto_tokenizer.from_pretrained.return_value
             patch_mod._run_offline_beam_search_benchmark(args)
@@ -653,7 +653,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
                 no_oversample=True,
                 tokenizer=tokenizer,
             )
-            run_v1.assert_called_once_with(args, tokenizer, [request])
+            run_latency.assert_called_once_with(args, tokenizer, [request])
 
     def _stream_result(self, timed_deltas, completion_tokens):
         import benchmarks.open_one_rec.one_rec_patch as patch_mod

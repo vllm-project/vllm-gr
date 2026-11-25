@@ -562,7 +562,7 @@ def _run_offline_beam_search_benchmark(args):
     """Run the supported OneRec Beam benchmark through persistent V1."""
     from transformers import AutoTokenizer
 
-    from benchmarks.open_one_rec.one_rec_v1_benchmark import run_v1_benchmark
+    from benchmarks.open_one_rec.one_rec_latency import run_latency_benchmark
     from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
     if not getattr(args, "constraint_triples", None) or not getattr(args, "output_json", None):
@@ -582,7 +582,7 @@ def _run_offline_beam_search_benchmark(args):
         no_oversample=True,
         tokenizer=tokenizer,
     )
-    run_v1_benchmark(args, tokenizer, requests)
+    run_latency_benchmark(args, tokenizer, requests)
 
 
 def patched_main(args):

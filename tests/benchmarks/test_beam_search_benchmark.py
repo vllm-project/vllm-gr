@@ -19,7 +19,7 @@ import pytest
 
 from benchmarks.beam_search.measure_latency import distribution
 from benchmarks.metrics import linear_percentile_sorted
-from benchmarks.qwen import benchmark_v1 as benchmark
+from benchmarks.qwen import benchmark
 from benchmarks.qwen import make_workload as workload
 from tests.helpers.paths import REPO_ROOT
 
@@ -546,7 +546,7 @@ def test_qwen_shell_skip_checks_checkout_and_preserves_workload_options(tmp_path
         (qwen_dir / name).write_text(
             source.read_text(encoding="utf-8"), encoding="utf-8", newline="\n"
         )
-    (qwen_dir / "benchmark_v1.py").write_text(
+    (qwen_dir / "benchmark.py").write_text(
         "import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8"
     )
     workload_file = checkout / "input.jsonl"

@@ -13,7 +13,7 @@ you installed vLLM-GR from a wheel.
 | `vllm bench serve --gr` (alias for `vllm bench open-one-rec serve --gr`) | Throughput and latency of a running HTTP server | Server backend | [OneRec serving](bench/open_one_rec.md#online-serving) |
 | `vllm bench beam-performance MODE --gr` | Prepare inputs, measure offline Beam latency, or replay requests online | CUDA | [Beam performance](bench/beam_performance.md) |
 | `vllm bench beam-recall --gr` | OneRec Recall on one or more tasks | CUDA | [Beam Recall](bench/beam_recall.md) |
-| `vllm bench qwen-v1 --gr` | Synthetic Beam workload on a Qwen model | CUDA | [Qwen Beam benchmark](bench/qwen_v1.md) |
+| `vllm bench qwen --gr` | Synthetic Beam workload on a Qwen model | CUDA | [Qwen Beam benchmark](bench/qwen.md) |
 | `vllm bench beam-performance-ab --gr` | Compare recorded Beam latency runs | Host | [Comparison tool](../../benchmarks/beam_search/compare_latency_ab.py) |
 | `vllm bench ab-offline --gr` | Measure paired cold/warm OneRec requests | CUDA | [Offline A/B guide](../../tools/AB_Tests/README.md) |
 
@@ -24,7 +24,7 @@ go to the workload in their original order.
 
 | Workload | Example |
 | --- | --- |
-| Qwen Beam benchmark | `vllm bench qwen-v1 --gr -- --help` prints the runner's options. |
+| Qwen Beam benchmark | `vllm bench qwen --gr -- --help` prints the runner's options. |
 | Beam performance | `vllm bench beam-performance offline --gr --help` puts the mode before the options. |
 
 OneRec also accepts the earlier `open-one-rec bench throughput` spelling.

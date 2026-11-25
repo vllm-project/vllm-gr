@@ -1,8 +1,6 @@
 # Qwen Beam benchmark
 
-<a id="qwen-v1"></a>
-
-`vllm bench qwen-v1 --gr` runs a synthetic Beam workload against a Qwen model. It
+`vllm bench qwen --gr` runs a synthetic Beam workload against a Qwen model. It
 requires CUDA.
 
 ## Arguments
@@ -17,7 +15,7 @@ requires CUDA.
 | `--warmup-runs`, `--repeat` | Untimed warmup and measured run counts. Defaults are 1 and 3. |
 | `--timeline-output` | Write a gzip trace from separate profiled runs. |
 
-Use `vllm bench qwen-v1 --gr --help` for engine, tokenizer and profiling options.
+Use `vllm bench qwen --gr --help` for engine, tokenizer and profiling options.
 
 ## Example
 
@@ -31,7 +29,7 @@ python benchmarks/qwen/make_workload.py \
   --model-dir /models/Qwen --token-id-start 1000 --token-id-end 30000 \
   --context-len 5000 --requests 1 --output-jsonl results/workload.jsonl
 
-vllm bench qwen-v1 --gr \
+vllm bench qwen --gr \
   --model /models/Qwen --workload-jsonl results/workload.jsonl \
   --output-json results/qwen.json --token-id-start 1000 --token-id-end 30000 \
   --context-len 5000 --requests 1 --beam-width 128 --beam-steps 3

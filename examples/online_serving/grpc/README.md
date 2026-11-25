@@ -7,17 +7,17 @@ dependencies from the repository root.
 VLLM_GR_TARGET_DEVICE=cuda python -m pip install -e ".[grpc]"
 ```
 
-## Check the gRPC installation
+## Try gRPC with a tiny local model
 
-Run the smoke test to exercise the local gRPC server and client on CUDA. It
+Run this example to exercise the local gRPC server and client on CUDA. It
 creates a tiny random Llama locally and uses ModelRunner V1. You can run it
 before downloading OneRec or preparing a catalog.
 
 ```bash
-python examples/online_serving/grpc/run_smoke.py --output results/grpc-smoke
+python examples/online_serving/grpc/run_tiny_model.py --output results/grpc-tiny-model
 ```
 
-On success it prints and saves `results/grpc-smoke/result.json` with
+On success it prints and saves `results/grpc-tiny-model/result.json` with
 `"calls": 2` and `"batch_size": 4`. The two replies have identical token
 IDs and scores for the same input. The test then stops its server.
 

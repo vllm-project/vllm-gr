@@ -70,8 +70,8 @@ instructions for keeping a server running.
 
 ## Run gRPC
 
-- [Check the CUDA gRPC installation](online_serving/grpc/README.md#check-the-grpc-installation)
-  with two RPCs against a locally generated tiny Llama.
+- [Try gRPC with a tiny local model](online_serving/grpc/README.md#try-grpc-with-a-tiny-local-model)
+  by sending two RPCs to a randomly initialized Llama.
 - [Serve a real OneRec model over gRPC](online_serving/grpc/README.md#serve-onerec-over-grpc)
   with the same catalog and server configuration as HTTP.
 

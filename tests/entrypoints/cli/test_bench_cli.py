@@ -35,7 +35,7 @@ def test_scenario_registry_covers_all_existing_benchmarks() -> None:
         "beam-performance",
         "beam-performance-ab",
         "beam-recall",
-        "qwen-v1",
+        "qwen",
         "ab-offline",
     }
     assert all(SCENARIOS[name].module or SCENARIOS[name].path for name in SCENARIOS)
@@ -48,9 +48,9 @@ def test_parser_forwards_scenario_arguments(
     calls = []
     monkeypatch.setattr(bench_cli, "run_scenario", lambda name, argv: calls.append((name, argv)))
     forwarded = ["--model_path", "qwen", "--option.value=1", "--help"]
-    args = bench_cli.parse_bench_args(_parser(), ["bench", "qwen-v1", *separator, *forwarded])
+    args = bench_cli.parse_bench_args(_parser(), ["bench", "qwen", *separator, *forwarded])
     bench_cli.GRBenchSubcommand.cmd(args)
-    assert calls == [("qwen-v1", forwarded)]
+    assert calls == [("qwen", forwarded)]
 
 
 def test_list_scenarios(capsys: pytest.CaptureFixture[str]) -> None:
@@ -61,7 +61,7 @@ def test_list_scenarios(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_bare_bench_lists_scenarios(capsys: pytest.CaptureFixture[str]) -> None:
     bench_cli.GRBenchSubcommand.cmd(_parser().parse_args(["bench"]))
-    assert "qwen-v1" in capsys.readouterr().out
+    assert "qwen:" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("argv", [["--gr", "serve", "model"], ["--gr"], ["--help", "--gr"]])  # type: ignore[misc]
@@ -82,9 +82,9 @@ def test_mode_switch_preserves_configuration_and_forwarding_boundary() -> None:
     ]
     selected, forwarded = cli._mode_arguments(argv)
     assert selected and forwarded == argv[:2] + argv[3:]
-    assert cli._mode_arguments(["bench", "qwen-v1", "--", "--gr"]) == (
+    assert cli._mode_arguments(["bench", "qwen", "--", "--gr"]) == (
         False,
-        ["bench", "qwen-v1", "--", "--gr"],
+        ["bench", "qwen", "--", "--gr"],
     )
 
 
@@ -153,6 +153,7 @@ def test_onerec_adapter_adds_exactly_one_native_bench(
         ("beam-performance-ab", "--base-sha"),
         ("beam-recall", "--catalog-path"),
         ("ab-offline", "--catalog"),
+        ("qwen", "--token-id-start"),
     ],
 )
 def test_module_runner_works_from_package_directory(

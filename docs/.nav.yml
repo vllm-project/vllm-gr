@@ -41,7 +41,7 @@ nav:
       - cli/bench/open_one_rec.md
       - cli/bench/beam_performance.md
       - cli/bench/beam_recall.md
-      - cli/bench/qwen_v1.md
+      - cli/bench/qwen.md
     - cli/check_env.md
   - Developer Guide:
     - Contributing:

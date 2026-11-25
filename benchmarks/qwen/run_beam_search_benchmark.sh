@@ -53,7 +53,7 @@ Common environment overrides:
   TIMELINE_WITH_MEMORY=0
   OUT_DIR=repo/results/beam_search
 
-Extra arguments are forwarded to benchmark_v1.py.
+Extra arguments are forwarded to benchmark.py.
 EOF
   exit 0
 fi
@@ -273,7 +273,7 @@ else
 fi
 
 echo "[3/3] Run offline GRLLM.beam_search benchmark: ${OUTPUT_JSON}"
-"${VENV_PYTHON}" benchmarks/qwen/benchmark_v1.py "${ARGS[@]}" "$@"
+"${VENV_PYTHON}" benchmarks/qwen/benchmark.py "${ARGS[@]}" "$@"
 
 echo "Done."
 echo "Result JSON: ${OUTPUT_JSON}"

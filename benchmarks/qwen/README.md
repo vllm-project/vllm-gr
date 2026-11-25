@@ -1,4 +1,4 @@
-# Qwen Offline Beam Search V1 Benchmark
+# Qwen offline Beam search benchmark
 
 This directory contains the Qwen benchmark runner, workload generator, shell
 entry point and usage guide. Model selection is configurable; Qwen3-0.6B
@@ -105,7 +105,7 @@ multiple benchmark invocations:
 Then pass that exact JSONL file to the benchmark:
 
 ```bash
-.venv/bin/python benchmarks/qwen/benchmark_v1.py \
+.venv/bin/python benchmarks/qwen/benchmark.py \
   --model /path/to/Qwen3-0.6B \
   --output-json results/beam_search/manual.json \
   --workload-jsonl results/beam_search/workload.jsonl \

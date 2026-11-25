@@ -19,7 +19,7 @@ installed vLLM-GR version.
 
     The two offline examples measure different workloads. For a cross-device
     comparison, hold the model, inputs, catalog mode, Beam width, batch size and
-    timing scope constant. The [cache-miss benchmark](../../benchmarks/open_one_rec/V1_BENCHMARK.md)
+    timing scope constant. The [cache-miss benchmark](../../benchmarks/open_one_rec/README.md)
     records the CUDA timing scope and historical results.
 
 After applying the [vLLM CLI dispatch patch](../cli/README.md#command-form-and-installation),

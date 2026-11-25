@@ -1,6 +1,6 @@
-# OneRec offline V1 cache-miss benchmark
+# OneRec offline cache-miss benchmark
 
-Run the V1 benchmark from the repository root with `--beam-search`.
+Run the cache-miss benchmark from the repository root with `--beam-search`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 USE_TF=0 \

@@ -218,7 +218,7 @@ cli/README.md:
     cli/bench/open_one_rec.md: [onerec-additions]
     cli/bench/beam_performance.md: [beam-performance, beam-performance-ab-report]
     cli/bench/beam_recall.md: [beam-recall]
-    cli/bench/qwen_v1.md: [qwen-v1]
+    cli/bench/qwen.md: [qwen-v1]
 configuration/README.md:
   sections:
     configuration/README.md#load-and-override-a-configuration: [related-guides]
