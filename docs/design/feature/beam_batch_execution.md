@@ -59,6 +59,28 @@ position in the first allocation, and its limits apply to that whole extent.
 The worker uses parent indices to carry each survivor's history into the next
 step.
 
+### Hybrid CUDA Decode
+
+Both CUDA ModelRunners use the decoder's native cache groups. The scheduler
+budgets private blocks for each request and cache group alongside the native
+Prefill and Decode allocations. It keeps the original prompt blocks and the
+private blocks leased until the Worker has drained and released the session.
+
+With aligned recurrent prefix caching, native Prefill can schedule checkpoint
+chunks before the batch emits its first Beam token. Each partial dispatch uses
+native scheduling and output bookkeeping. Once all prompts can finish, the
+scheduler dispatches their final chunks together and the Worker restores the
+logical request order before selecting candidates.
+
+Decode shares complete attention prompt pages. Each beam has private pages
+from the first writable position onward and one private state per recurrent
+cache group. The Worker copies states and writable page history using
+request-local parent indices, then invokes the native model with one token
+per row. It gathers all sources before writing destinations so repeated
+parents and parent swaps preserve the previous state. For eligible KDA/MLA
+batches, the model forward can replay a CUDA graph. Cache copies and Beam
+selection run outside that graph.
+
 ### Validation boundaries
 
 | Boundary | Checks |
@@ -67,7 +89,7 @@ step.
 | Request form | Rejects `prompt_embeds`, `mm_features`, empty prompts and LoRA. Requires `ignore_eos=true`, `sampling_params.max_tokens` equal to `beam_params.max_tokens`, and `n=1`. EngineCore also clears native stop tokens. |
 | Engine capacity | Dispatch accepts one to eight prompts within native request, Prefill token, context and KV limits. The request beam width must equal the engine's fixed startup beam width. |
 | Dynamic widths | `dynamic_beam_widths` and `per_parent_beam_widths` must be tuples of length `max_tokens`; `max_tokens` must be 1 to 3 when either is set. Entries must be positive and at most the beam width, the first per-parent width must equal the first retained width, and each stage must satisfy `input_width * per_parent >= output_width`. |
-| Device and catalog | Ascend budgets Decode rows at the largest input width across Decode stages. Table-constrained requests must match the table depth and fit its candidate capacity. |
+| Device and catalog | Ascend and Hybrid CUDA budget Decode rows at the largest input width across stages. Hybrid CUDA also reserves private native cache blocks per request. Table-constrained requests must match the table depth and fit its candidate capacity. |
 | Output options | Candidate width counts expansions per parent. Retained width counts survivors per prompt. The final retained width bounds `num_return_sequences`. |
 
 Requests and results use wire protocol version 2. Multiprocess clients send
@@ -108,7 +130,8 @@ Prefill graph if its token bucket was captured. PIECEWISE uses the token
 bucket alone and can serve different admitted request counts.
 
 Size `max-num-seqs` for logical requests and `max-num-batched-tokens` for the
-Prefill workload and, on Ascend, the peak Decode row count. See the
+Prefill workload. Ascend and Hybrid CUDA also use these budgets for the peak
+Decode row count. See the
 [batch and token budgets](../../configuration/README.md#batch-sizes-and-token-budgets)
 and [OneRec walkthrough](../../user_guide/onerec_quickstart.md).
 

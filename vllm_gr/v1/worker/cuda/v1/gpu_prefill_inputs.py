@@ -33,6 +33,7 @@ def try_prepare_gr_prefill_inputs(
         return None
     if (
         runner.device.type != "cuda"
+        or getattr(getattr(runner, "model_config", None), "is_hybrid", False)
         # vLLM 0.30 represents all multi-dimensional RoPE through uses_mrope.
         or runner.uses_mrope
         or runner.enable_prompt_embeds

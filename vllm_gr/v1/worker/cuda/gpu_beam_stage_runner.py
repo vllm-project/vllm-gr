@@ -908,9 +908,11 @@ class GPUBeamStageRunner:
                 self.hidden = None
                 self.logits = self.hooks.prefill_logits(original, scheduler_output, *args, **kwargs)
             else:
+                native_cache = getattr(self.beam.session.context, "use_native_cache", False)
                 # Pure CPU work can run before the native Prefill staging fence.
                 assert self.pending is not None
-                self.prepared = self.prepare_cpu(m, self.pending[1])
+                if not native_cache:
+                    self.prepared = self.prepare_cpu(m, self.pending[1])
                 if previous_kind is GRStageKind.PREFILL:
                     # Native Prefill may asynchronously read reused CPU input
                     # buffers that the native state update mutates.  The
@@ -919,9 +921,20 @@ class GPUBeamStageRunner:
                 # Decode does not upload these native input buffers again, so
                 # subsequent Decode dispatches need no Host input-prep wait.
                 self.hooks.consume_native_state(scheduler_output)
-                self._bind_attention(m)
-                self.prepare_decode(entry)
-                self.logits = self.hooks.decode_logits(self)
+                if native_cache:
+                    from vllm_gr.v1.worker.cuda.hybrid_beam_graph import (
+                        hybrid_decode_logits,
+                    )
+
+                    if self.dynamic is not None:
+                        self.dynamic.activate(
+                            BeamBatchExecutionView.from_stage_metadata(m).input_width
+                        )
+                    self.logits = hybrid_decode_logits(self, m)
+                else:
+                    self._bind_attention(m)
+                    self.prepare_decode(entry)
+                    self.logits = self.hooks.decode_logits(self)
         return None
 
     def sample(self, grammar_output: Any = None) -> AsyncGPUBeamOutput:
@@ -1236,6 +1249,39 @@ def execute_gr_retirement(worker: Any, scheduler_output: Any) -> AsyncGRRetireOu
     return result
 
 
+def _validate_split_cache(worker: Any) -> None:
+    if len(worker.kv_cache_config.kv_cache_groups) != 1:
+        raise ValueError("persistent GR requires one uniform KV group")
+    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+
+    layers = worker.compilation_config.static_forward_context
+    for group in worker.kv_cache_config.kv_cache_groups:
+        for name in group.layer_names:
+            impl = getattr(layers.get(name), "impl", None)
+            if not isinstance(impl, BeamAttentionImpl):
+                raise ValueError(  # noqa: TRY004
+                    "persistent GR requires Beam Attention on every KV layer"
+                )
+            # Packed beam queries do not preserve sliding-window positions
+            # across the prefix/suffix split. No window is stored as (-1, -1).
+            if impl.sliding_window != (-1, -1):
+                raise ValueError(
+                    "persistent GR split attention does not support sliding-window attention: "
+                    f"{name} (window={impl.sliding_window})"
+                )
+    head_size = worker.model_config.get_head_size()
+    if (
+        head_size <= 0
+        or head_size & (head_size - 1)
+        or getattr(worker.model_config, "quantization", None) is not None
+        or worker.cache_config.cache_dtype
+        not in ("auto", str(worker.model_config.dtype).removeprefix("torch."))
+    ):
+        raise ValueError(
+            "persistent GR requires unquantized FP16/BF16 KV and a power-of-two head size"
+        )
+
+
 def get_stage_runner(
     worker: Any,
     scheduler_output: Any,
@@ -1315,42 +1361,19 @@ def get_stage_runner(
         )
     if (
         worker.model_config.is_encoder_decoder
-        or worker.model_config.is_hybrid
         or worker.supports_mm_inputs
         or getattr(worker, "lora_config", None) is not None
         or getattr(worker.vllm_config, "kv_transfer_config", None) is not None
     ):
         raise ValueError("persistent GR requires a text decoder without LoRA or KV transfer")
-    if len(worker.kv_cache_config.kv_cache_groups) != 1:
-        raise ValueError("persistent GR requires one uniform KV group")
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+    if worker.model_config.is_hybrid:
+        from vllm_gr.config.execution import validate_gr_execution_runtime
+        from vllm_gr.v1.worker.cuda.hybrid_beam_cache import validate_hybrid_cache
 
-    layers = worker.compilation_config.static_forward_context
-    for group in worker.kv_cache_config.kv_cache_groups:
-        for name in group.layer_names:
-            impl = getattr(layers.get(name), "impl", None)
-            if not isinstance(impl, BeamAttentionImpl):
-                raise ValueError(  # noqa: TRY004
-                    "persistent GR requires Beam Attention on every KV layer"
-                )
-            # Packed beam queries do not preserve sliding-window positions
-            # across the prefix/suffix split. No window is stored as (-1, -1).
-            if impl.sliding_window != (-1, -1):
-                raise ValueError(
-                    "persistent GR split attention does not support sliding-window attention: "
-                    f"{name} (window={impl.sliding_window})"
-                )
-    head_size = worker.model_config.get_head_size()
-    if (
-        head_size <= 0
-        or head_size & (head_size - 1)
-        or getattr(worker.model_config, "quantization", None) is not None
-        or worker.cache_config.cache_dtype
-        not in ("auto", str(worker.model_config.dtype).removeprefix("torch."))
-    ):
-        raise ValueError(
-            "persistent GR requires unquantized FP16/BF16 KV and a power-of-two head size"
-        )
+        validate_gr_execution_runtime(worker.vllm_config)
+        validate_hybrid_cache(worker, m)
+    else:
+        _validate_split_cache(worker)
     if getattr(worker, "_beam_postprocess_workspaces", None) is None:
         raise ValueError("persistent GR requires prewarmed Beam postprocess workspace")
     if getattr(worker, "_beam_sessions", {}):

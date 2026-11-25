@@ -525,6 +525,10 @@ def make_patched_model_forward_gpu(_orig_model_forward):
 
     @wraps(_orig_model_forward)
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
+        if getattr(getattr(self, "model_config", None), "is_hybrid", False):
+            return _orig_model_forward(
+                self, input_ids=input_ids, positions=positions, *args, **kwargs
+            )
         scheduler_output = getattr(self, "_current_scheduler_output", None)
         gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
         batch_view = None
@@ -684,7 +688,9 @@ def capture_prefill_graphs(runner) -> None:
     only when the prefill graph env gate is enabled. Only explicitly
     recoverable capture failures fall back to eager prefill.
     """
-    if not is_prefill_graph_enabled(runner):
+    if getattr(
+        getattr(runner, "model_config", None), "is_hybrid", False
+    ) or not is_prefill_graph_enabled(runner):
         return
     if getattr(runner, "_prefill_graphs_captured", False):
         return

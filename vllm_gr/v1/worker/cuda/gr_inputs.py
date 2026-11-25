@@ -174,6 +174,16 @@ def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
         raise ValueError(
             "Asynchronous scheduling prepared inputs belong to a different execution owner"
         )
+    running, width = bind_beam_decode_state(m, owner)
+    assert m.decode_step is not None
+    lengths = torch.where(running, m.decode_step + 1, 1).repeat_interleave(width)
+    owner.metadata.suffix_seqlens_kv_device.copy_(lengths)
+    owner.metadata.suffix_cu_seqlens_k_device[0].zero_()
+    torch.cumsum(lengths, dim=0, out=owner.metadata.suffix_cu_seqlens_k_device[1:])
+
+
+def bind_beam_decode_state(m: GRStageMetadata, owner: Any) -> tuple[torch.Tensor, int]:
+    """Bind selected tokens, positions and constraint prefixes for either cache layout."""
     state = owner.beam.state
     rows = owner.state_rows
     step = m.decode_step
@@ -206,11 +216,4 @@ def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
             -1,
         )
     )
-    lengths = torch.where(running, step + 1, 1).repeat_interleave(width)
-    owner.metadata.suffix_seqlens_kv_device.copy_(lengths)
-    owner.metadata.suffix_cu_seqlens_k_device[0].zero_()
-    torch.cumsum(
-        lengths,
-        dim=0,
-        out=owner.metadata.suffix_cu_seqlens_k_device[1:],
-    )
+    return running, width

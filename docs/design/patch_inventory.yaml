@@ -109,6 +109,7 @@ patches:
       - tests/engine/test_backend_plan_engine_args.py
       - tests/v1/attention/test_attention_backend_custom.py
       - tests/engine/test_gr_config_v1.py
+      - tests/v1/worker/test_hybrid_beam_cache.py::test_hybrid_runtime_requires_native_cuda_cache_modes
     process_roles: [main, api_server]
     target: vllm.engine.arg_utils.EngineArgs
     risk: high
@@ -174,15 +175,17 @@ patches:
     scope: core
     backend_id: null
     owner: vllm_gr/v1/core/sched/scheduler_patch.py and beam_async_scheduler.py
-    shared_helpers: vllm_gr/v1/core/sched/beam_session.py, vllm_gr/v1/beam/dispatch.py
+    shared_helpers: vllm_gr/v1/core/sched/beam_session.py, vllm_gr/v1/core/sched/hybrid_prefill.py, vllm_gr/v1/beam/dispatch.py, vllm_gr/v1/beam/hybrid_cache.py
     installer: vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch
-    activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper
+    activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper; the active Hybrid Beam session scopes native Mamba checkpoint splitting to partial Prefill when the Scheduler requires cache alignment
     validator_or_test:
       - vllm_gr.v1.core.sched.scheduler_patch.validate_scheduler_patch
       - tests/v1/engine/test_gr_async_scheduler.py
+      - tests/v1/engine/test_gr_async_scheduler.py::test_hybrid_checkpoint_holds_native_blocks_until_cancel_drains
+      - tests/v1/beam/test_beam_dispatch_session.py::test_hybrid_block_groups_stay_bound_to_the_session
       - tests/patch/test_patch_initialization.py::test_scheduler_plan_repairs_partial_install
     process_roles: [engine_core]
-    target: Scheduler.schedule and Scheduler.update_from_output in vllm.v1.core.sched.scheduler
+    target: Scheduler.schedule and Scheduler.update_from_output in vllm.v1.core.sched.scheduler; the schedule wrapper temporarily scopes Scheduler._mamba_block_aligned_split on the active instance
     risk: critical
     contract: scheduler-contract
     removal_condition: explicit upstream scheduler metadata hooks carry grouped Beam state
@@ -208,9 +211,9 @@ patches:
     scope: backend
     backend_id: cuda
     owner: vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py and vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/cuda/gpu_postprocess_workspace.py, vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/cuda/v1/gpu_prefill_inputs.py, vllm_gr/v1/worker/cuda/v2/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/cuda/gpu_stage_hooks.py, vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py, vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/cuda/gpu_postprocess_workspace.py, vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/cuda/v1/gpu_prefill_inputs.py, vllm_gr/v1/worker/cuda/v2/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/cuda/gpu_stage_hooks.py, vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py, vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py, vllm_gr/v1/worker/cuda/hybrid_beam_cache.py, vllm_gr/v1/worker/cuda/hybrid_beam_graph.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
-    activation: the CUDA provider mounts Worker utilities at process startup; Worker.init_device installs and verifies the admitted V1 or V2 generation, which binds the planned runner after model load regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
+    activation: the CUDA provider mounts Worker utilities at process startup; Worker.init_device installs and verifies the admitted V1 or V2 generation, which binds the planned runner after model load regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes. The Hybrid Beam path uses native Prefill and per-group Decode metadata on both runners. Eligible KDA/MLA Decode shapes capture lazily.
     binding_validation: first bind and full reload retain the admitted plan across positive native max_model_len reductions within its limit; provider validation sees the live fitted config and other drift fails before service creation
     validator_or_test:
       - vllm_gr.v1.worker.model_runner_patch.validate_model_runner_patch
@@ -239,6 +242,8 @@ patches:
       - tests/v1/worker/test_gr_startup.py
       - tests/tools/test_cuda_stage_typing.py
       - tests/st/test_modelrunner_v2_stage_parity_st.py
+      - tests/v1/worker/test_hybrid_beam_cache.py
+      - tests/st/test_kimi_linear_hybrid_beam.py
     process_roles: [gpu_worker]
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner, vllm.v1.worker.gpu.model_runner.GPUModelRunner, vllm.v1.worker.gpu_worker.Worker.init_device, and vllm.v1.worker.gpu_worker.Worker.reload_trie
     risk: critical

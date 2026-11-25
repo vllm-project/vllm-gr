@@ -179,6 +179,10 @@ class GRStageMetadata:
     # the complete session. B=1 keeps the original representation.
     request_ids: tuple[str, ...] = ()
     num_prompt_tokens_by_request: tuple[int, ...] = ()
+    # Hybrid block IDs follow request order, then native KV group order.
+    # Both the private blocks and original Prefill blocks are leased until drain.
+    hybrid_beam_blocks: tuple[tuple[tuple[int, ...], ...], ...] | None = None
+    hybrid_prompt_blocks: tuple[tuple[tuple[int, ...], ...], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +225,8 @@ SESSION_FIELDS = (
     "num_prompt_tokens",
     "request_ids",
     "num_prompt_tokens_by_request",
+    "hybrid_beam_blocks",
+    "hybrid_prompt_blocks",
 )
 STAGE_FIELDS = (
     "dispatch_id",
@@ -296,6 +302,7 @@ def validate_dispatch_session(scheduler_output: Any) -> GRDispatchSession:
         )
     if not m.num_prompt_tokens:
         raise ValueError("GR requires a nonempty prompt and complete, output-producing Prefill")
+    _validate_hybrid_block_tables(m, view.batch_size)
     params = m.beam_params
     if (
         params.dynamic_beam_widths is not None
@@ -336,6 +343,37 @@ def validate_dispatch_session(scheduler_output: Any) -> GRDispatchSession:
         ):
             raise ValueError("GR session_init disagrees with dispatch metadata")
     return GRDispatchSession(session_id=key, fields=_session_fields(m), capacity=capacity)
+
+
+def _validate_hybrid_block_tables(metadata: GRStageMetadata, batch_size: int) -> None:
+    private, prompt = metadata.hybrid_beam_blocks, metadata.hybrid_prompt_blocks
+    if private is None and prompt is None:
+        return
+    for table in (private, prompt):
+        if (
+            not isinstance(table, tuple)
+            or len(table) != batch_size
+            or any(
+                not isinstance(member, tuple)
+                or not member
+                or any(not isinstance(group, tuple) or not group for group in member)
+                for member in table
+            )
+        ):
+            raise ValueError("Invalid hybrid Beam block groups")
+    assert private is not None and prompt is not None
+    if any(len(a) != len(b) for a, b in zip(private, prompt, strict=True)):
+        raise ValueError("Hybrid Beam prompt and private KV groups must agree")
+    prompt_ids = [block for member in prompt for group in member for block in group]
+    private_ids = [block for member in private for group in member for block in group]
+    if any(type(block) is not int or block < 0 for block in prompt_ids):
+        raise ValueError("Invalid hybrid Beam prompt block IDs")
+    if (
+        any(type(block) is not int or block <= 0 for block in private_ids)
+        or len(set(private_ids)) != len(private_ids)
+        or set(prompt_ids).intersection(private_ids)
+    ):
+        raise ValueError("Hybrid Beam requires distinct non-null private block IDs")
 
 
 def validate_dispatch_step(

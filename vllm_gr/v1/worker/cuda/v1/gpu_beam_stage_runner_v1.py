@@ -63,7 +63,24 @@ class CudaStageHooksV1(CudaStageHooks):
         out = original(worker, scheduler_output, *args, **kwargs)
         if out is not None or worker.execute_model_state is None:
             raise RuntimeError("native GR Prefill must return logits through execute_model_state")
-        return worker.execute_model_state.logits
+        logits = worker.execute_model_state.logits
+        if getattr(getattr(worker, "model_config", None), "is_hybrid", False):
+            from vllm.utils.torch_utils import async_tensor_h2d
+
+            from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
+
+            (stage,) = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR).values()
+            native_ids = tuple(worker.input_batch.req_ids)
+            if set(native_ids) != set(stage.request_ids) or logits.shape[0] != len(native_ids):
+                raise ValueError("Hybrid Beam Prefill must return one logit row per request")
+            if native_ids != stage.request_ids:
+                order = async_tensor_h2d(
+                    [native_ids.index(request_id) for request_id in stage.request_ids],
+                    device=worker.device,
+                    dtype=torch.long,
+                )
+                logits = logits.index_select(0, order)
+        return logits
 
     def finish_native_output(self) -> None:
         """Drop native results after GR has submitted its output work."""
@@ -104,6 +121,8 @@ class CudaStageHooksV1(CudaStageHooks):
         return beam_width
 
     def prepare_new_adapter(self, view: BeamBatchExecutionView) -> None:
+        if getattr(getattr(self.worker, "model_config", None), "is_hybrid", False):
+            return
         graph = getattr(self.worker, "_beam_decode_graph", None)
         if graph is not None:
             graph.discard_geometry(view.batch_size, view.beam_width)

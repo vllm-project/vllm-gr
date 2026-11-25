@@ -77,6 +77,9 @@ Installer: `vllm_gr.engine.arg_utils.patch_add_cli_args`
 
 Risk: `high`; process roles: `main`, `api_server`
 
+Hybrid Beam admission checks the CUDA configuration, native cache mode
+and expanded Decode row budget.
+
 ### GR-PATCH-007 — EngineCore Client and AsyncLLM Extensions
 
 Scope: `core`; backend ID: `null`
@@ -117,6 +120,11 @@ Installer: `vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch`
 
 Risk: `critical`; process roles: `engine_core`
 
+Hybrid Beam reserves native cache blocks per request and group, and leases
+the prompt and private blocks until the Worker release. In aligned mode
+the schedule wrapper scopes native Mamba checkpoint splitting to partial
+Prefill dispatches. The update wrapper consumes their native receipts.
+
 ### GR-PATCH-022 — Prefix-cache hash memoization
 
 Scope: `core`; backend ID: `null`
@@ -136,6 +144,10 @@ Owner: `vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gp
 Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
 Risk: `critical`; process roles: `gpu_worker`
+
+For Hybrid Beam, both runners build per-group native metadata and copy the
+selected parent state into the Scheduler's private blocks before Decode.
+Graph-eligible KDA/MLA Decode uses fixed inputs for native state and KV slots.
 
 ### GR-PATCH-012 — NPU ModelRunner Override
 

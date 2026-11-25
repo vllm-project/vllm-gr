@@ -28,17 +28,24 @@ from vllm_gr.v1.beam.batch_contracts import (
     GRAdmissionError,
 )
 from vllm_gr.v1.beam.dispatch import (
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_RETIRE_RESULT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
     GRDeviceStateRef,
+    GRRetireResult,
     GRStageKind,
     GRWorkerResult,
 )
 from vllm_gr.v1.core.sched.beam_async_scheduler import (
+    _drain_resources,
     _gr_session_ready_to_finalize,
     add_gr_session,
+    attach_gr_retirement,
     attach_gr_stage_metadata,
     can_issue_gr_stage,
+    consume_gr_retirement,
+    gr_admission,
     update_gr_from_output,
 )
 from vllm_gr.v1.core.sched.beam_session import GRResourceStatus, GRSessionStatus
@@ -1000,6 +1007,98 @@ def test_native_kv_dispatch_lease_survives_abort_until_receipt() -> None:
     assert block.ref_cnt == 0
     update_gr_from_output(scheduler, session, scheduled, SimpleNamespace())
     assert block.ref_cnt == 0
+
+
+@pytest.mark.l1
+def test_hybrid_private_blocks_reserve_capacity_and_wait_for_retirement() -> None:
+    scheduler = _scheduler()
+    scheduler.waiting = []
+    scheduler.skipped_waiting = []
+    scheduler.max_num_scheduled_tokens = 16
+    pool = BlockPool(num_gpu_blocks=9, enable_caching=False, hash_block_size=16)
+
+    def native_allocate(request: Any, num_new_tokens: int, **kwargs: Any) -> Any:
+        assert kwargs["reserved_blocks"] == 5
+        assert kwargs["num_lookahead_tokens"] == 2
+        assert pool.get_num_free_blocks() - kwargs["reserved_blocks"] >= 2
+        return pool.get_new_blocks(2)
+
+    scheduler.kv_cache_manager = SimpleNamespace(
+        block_pool=pool, max_model_len=100, allocate_slots=native_allocate
+    )
+    session = add_gr_session(scheduler, make_batch_request(3))
+    session.hybrid_beam_block_counts = ((3, 2),)
+    request = scheduler.requests[session.session_id]
+    request.num_computed_tokens = 0
+    free = pool.get_num_free_blocks()
+    with gr_admission(scheduler):
+        native = scheduler.kv_cache_manager.allocate_slots(request, request.num_prompt_tokens)
+    assert tuple(map(len, session._hybrid_beam_blocks[0])) == (3, 2)
+    assert pool.get_num_free_blocks() == free - 7
+
+    session.worker_resources_allocated = True
+    session.status = GRSessionStatus.ABORTED
+    _drain_resources(scheduler, session)
+    pool.free_blocks(native)
+    assert pool.get_num_free_blocks() == free - 5
+
+    scheduled = SimpleNamespace(total_num_scheduled_tokens=0, finished_req_ids=set())
+    attach_gr_retirement(scheduler, scheduled)
+    metadata = getattr(scheduled, GR_RETIRE_OUTPUT_ATTR)
+    output = SimpleNamespace()
+    setattr(
+        output,
+        GR_RETIRE_RESULT_ATTR,
+        GRRetireResult(metadata.session_id, metadata.owner_generation, metadata.retire_id, True),
+    )
+    assert consume_gr_retirement(scheduler, scheduled, output) is session
+    assert consume_gr_retirement(scheduler, scheduled, output) is None
+    assert pool.get_num_free_blocks() == free
+
+
+@pytest.mark.l1
+def test_hybrid_checkpoint_holds_native_blocks_until_cancel_drains() -> None:
+    from vllm_gr.v1.core.sched.hybrid_prefill import (
+        attach_hybrid_prefill_chunk,
+        complete_hybrid_prefill_chunk,
+        hybrid_prefill_scope,
+    )
+
+    scheduler = _scheduler()
+    scheduler.need_mamba_block_aligned_split = True
+    pool = BlockPool(num_gpu_blocks=10, enable_caching=False, hash_block_size=16)
+    (block,) = pool.get_new_blocks(1)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        block_pool=pool, max_model_len=4096, get_blocks=lambda _: KVCacheBlocks(((block,),))
+    )
+    session = add_gr_session(scheduler, make_batch_request(3))
+    session.hybrid_beam_block_counts = ((2,),)
+    request = scheduler.requests[session.session_id]
+    request.num_computed_tokens = 0
+    request.is_prefill_chunk = True
+    running = scheduler.running = [request]
+
+    def native_split(request, num_new_tokens, *_):
+        return min(num_new_tokens, 2)
+
+    scheduler._mamba_block_aligned_split = native_split
+    with hybrid_prefill_scope(scheduler, session) as member:
+        assert member == session.session_id
+        assert scheduler._mamba_block_aligned_split(request, 3) == 2
+    assert scheduler.running is running
+    assert scheduler._mamba_block_aligned_split is native_split
+
+    scheduled = _scheduler_output()
+    attach_hybrid_prefill_chunk(scheduler, scheduled, session.session_id)
+    assert block.ref_cnt == 2
+    pool.free_blocks((block,))
+    session.status = GRSessionStatus.ABORTED
+    _drain_resources(scheduler, session)
+    assert block.ref_cnt == 1
+    assert session.resource_status is GRResourceStatus.DRAINING
+    complete_hybrid_prefill_chunk(scheduler, session)
+    assert block.ref_cnt == 0
+    assert session.resource_status is GRResourceStatus.CLOSED
 
 
 @pytest.mark.parametrize("num_groups", [1, 2])

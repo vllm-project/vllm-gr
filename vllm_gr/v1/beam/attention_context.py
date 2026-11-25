@@ -106,6 +106,7 @@ class BeamAttentionContext:
         device: torch.device,
         dtype: torch.dtype,
         enable_short_suffix_attention: bool = False,
+        use_native_cache: bool = False,
     ):
         if enable_short_suffix_attention:
             if device.type != "cuda":
@@ -126,6 +127,9 @@ class BeamAttentionContext:
                     "head size (multiple of 8, at most 256) and FP16/BF16/FP32"
                 )
         self.enable_short_suffix_attention = enable_short_suffix_attention
+        self.use_native_cache = use_native_cache
+        if use_native_cache:
+            num_kv_heads = head_dim = num_layers = 0
         _validate_pool_dtype(dtype)
 
         self.max_batch = max_batch

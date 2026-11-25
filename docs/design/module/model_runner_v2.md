@@ -42,6 +42,11 @@ capture can fall back per shape after cleanup and a device-health check. Losing
 a graph recorded as successfully captured is an error. Profiled prefix-length
 buckets have a separate [capture policy](../feature/cuda_decode_attention.md#decode-graphs-and-fallback).
 
+Hybrid decoders use native per-group attention metadata in both runners.
+The KDA/MLA Decode graph binds live sequence lengths, cache slots and
+recurrent state IDs through fixed CUDA buffers. Native vLLM dispatch governs
+Hybrid Prefill. See [Hybrid CUDA Decode](../feature/beam_batch_execution.md#hybrid-cuda-decode).
+
 ## Resource lifetime
 
 V2 Decode replay checks the captured model, context and input storage; V1
@@ -71,8 +76,10 @@ The V2 runner also has these limits:
 Admission accepts one to `max_decode_steps` generation steps; the reference
 OneRec workload uses three. The V2 Prefill plan exists only for a single rank
 with no data-parallel ubatching, LoRA, speculative decoding, auxiliary hidden
-states, multimodal input or `enforce_eager`. Chunked Prefill is rejected, and
-GR enforces `ignore_eos=true` on admitted requests.
+states, multimodal input or `enforce_eager`. GR enforces `ignore_eos=true`
+on admitted requests. Aligned Hybrid caches use native checkpoint chunks
+before the grouped final Prefill. Other GR paths require chunked Prefill to
+be disabled.
 
 ## Validation
 

@@ -235,7 +235,11 @@ class DynamicBeamState:
             raise ValueError("Beam state batch exceeds the context capacity")
         if self.max_decode_steps > context.max_decode_steps:
             raise ValueError("Beam history exceeds the context Decode capacity")
-        self.device = context.pools[0].unshared_key.device
+        self.device = (
+            context.device
+            if getattr(context, "use_native_cache", False)
+            else context.pools[0].unshared_key.device
+        )
         self.current_width = 0
         self.num_generated_tokens = 0
         self.sequence: torch.Tensor | None = None
@@ -373,7 +377,7 @@ class DynamicBeamState:
         parent_history = self.parent_history.gather(1, history_index)
         parent_history[:, :, stage_index].copy_(parents.to(torch.int32))
 
-        if not is_last:
+        if not is_last and not getattr(self.context, "use_native_cache", False):
             reorder_stage_kv(
                 self.context, input_width, output_width, parents, history_steps=stage_index
             )

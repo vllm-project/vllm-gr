@@ -235,7 +235,9 @@ def make_patched_initialize_kv_cache_v2(original: Any) -> Any:
     @wraps(original)
     def initialize_kv_cache(self: Any, *args: Any, **kwargs: Any) -> Any:
         result = original(self, *args, **kwargs)
-        if _get_gr_config(self).beam_max_width is not None:
+        if _get_gr_config(self).beam_max_width is not None and not getattr(
+            getattr(self, "model_config", None), "is_hybrid", False
+        ):
             from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
                 install_prefill_graph_manager_v2,
             )
@@ -289,7 +291,9 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
         profile_only = kwargs.get("profile_only", False)
         # The Engine admits only beam_search for V2 Beam engines. The
         # execution layer checks whether Beam is enabled, not its protocol.
-        if _get_gr_config(self).beam_max_width is not None:
+        if _get_gr_config(self).beam_max_width is not None and not getattr(
+            getattr(self, "model_config", None), "is_hybrid", False
+        ):
             from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (
                 GRPrefillCudaGraphManager,
                 install_prefill_graph_manager_v2,

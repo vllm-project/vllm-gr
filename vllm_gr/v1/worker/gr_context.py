@@ -142,6 +142,7 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
 
     model_config = runner.model_config
     parallel_config = runner.parallel_config
+    use_native_cache = getattr(model_config, "is_hybrid", False)
 
     return BeamAttentionContext(
         max_batch=max_batch,
@@ -153,6 +154,9 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
         device=runner.device,
         dtype=model_config.dtype,
         enable_short_suffix_attention=(
-            runner.device.type == "cuda" and gr_cfg.enable_short_suffix_attention
+            runner.device.type == "cuda"
+            and not use_native_cache
+            and gr_cfg.enable_short_suffix_attention
         ),
+        use_native_cache=use_native_cache,
     )

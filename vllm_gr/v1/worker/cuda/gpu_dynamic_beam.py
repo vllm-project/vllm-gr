@@ -42,6 +42,7 @@ class GPUDynamicBeam:
         owner = self.owner
         if width not in self.buffers:
             worker, state = owner.worker, owner.beam.state
+            native_cache = getattr(owner.beam.session.context, "use_native_cache", False)
             batch = len(owner.bindings)
             rows = batch * width
             device = state.device
@@ -52,12 +53,16 @@ class GPUDynamicBeam:
                 "slots": torch.full((rows,), -1, dtype=torch.int64, device=device),
                 "execution_mask": torch.empty(rows, dtype=torch.bool, device=device),
                 "prefixes": torch.empty((rows, 3), dtype=torch.int32, device=device),
-                "inputs": GRInputBuffers(
-                    width,
-                    worker.model_config.max_model_len,
-                    worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
-                    device,
-                    max_batch=batch,
+                "inputs": (
+                    None
+                    if native_cache
+                    else GRInputBuffers(
+                        width,
+                        worker.model_config.max_model_len,
+                        worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
+                        device,
+                        max_batch=batch,
+                    )
                 ),
             }
         for name, value in self.buffers[width].items():
@@ -102,6 +107,10 @@ class GPUDynamicBeam:
         target.active_mask[:batch].zero_()
         target.active_mask[:batch, :width].copy_(valid)
         target.input_ids[:batch, :width].copy_(sequence[:, :, view.stage_index])
+        if getattr(self.state.context, "use_native_cache", False):
+            parents = self.state.parent_history
+            assert parents is not None
+            target.parent_ids[:batch, :width].copy_(parents[:, :, view.stage_index])
         target.sequence[:batch, :width, : sequence.shape[2]].copy_(sequence)
         target.beam_scores[:batch, :width].copy_(scores)
         target.num_active_beams[:batch].copy_(valid.sum(dim=1))

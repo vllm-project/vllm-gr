@@ -14,6 +14,7 @@ The matrix describes the documented runtime paths and their configuration limits
 | --- | --- | --- | --- |
 | vLLM ModelRunner | Library and general CLI default to V1. The direct offline Beam, HTTP and OneRec gRPC examples select V2 by default. | ModelRunner V1 required for Beam search | [ModelRunner selection](../configuration/README.md#modelrunner-selection), [example defaults](../../examples/README.md#choose-a-modelrunner) |
 | Catalog-constrained Beam (constraint table) | Supported | Supported | [Configure a constraint table](../configuration/README.md#constraint-table) |
+| Hybrid Beam with recurrent state and paged attention | ModelRunner V1 and V2, fixed or dynamic widths, native prefix caching in align mode, Decode graphs for GDN/KDA with `TRITON_MLA` | Unavailable | [Hybrid CUDA configuration](../../examples/offline_inference/beam_search/README.md#run-hybrid-beam-on-cuda) |
 | Full-vocabulary Beam without a catalog | Supported | Supported, with execution boundaries | [Beam Search on NPU](beam_search_npu.md) |
 | Dynamic Beam widths | Supported | Supported with or without a table. In full-vocabulary mode, candidate and retained widths must match at each step. | [Beam settings](../configuration/README.md#beam-settings), [Ascend execution limits](beam_search_npu.md#supported-execution-boundaries) |
 | Independent per-parent candidate widths | Supported | Supported with an NPU constraint table, within its `max_top_k`. | [Beam settings](../configuration/README.md#beam-settings) |

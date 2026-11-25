@@ -77,6 +77,15 @@ def validate_gr_request(
     if config is not None:
         gr_config = GRConfig.from_vllm_config(config)
         validate_gr_generation_budget(gr_config, request.beam_params.max_tokens)
+        if getattr(getattr(config, "model_config", None), "is_hybrid", False):
+            params = request.beam_params
+            widths = params.dynamic_beam_widths
+            input_width = max(widths[:-1], default=0) if widths else params.beam_width
+            scheduler = config.scheduler_config
+            if params.max_tokens > 1 and len(request.items) * input_width > min(
+                scheduler.max_num_seqs, scheduler.max_num_batched_tokens
+            ):
+                raise ValueError("Hybrid Beam Decode rows exceed native sequence or token capacity")
         _reject_candidate_width_below_dynamic_schedule(gr_config, request.beam_params)
         validate_decode_token_budget(request, config)
 

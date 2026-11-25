@@ -113,8 +113,6 @@ class BeamSearchRunner:
         )
 
         self.session = session
-        first = context.pools[0].unshared_key
-        layers, aux = len(context.pools), context.aux_key_buf
         self.state = state
         self.workspace = workspace
         self.state_index = state_index
@@ -148,6 +146,16 @@ class BeamSearchRunner:
         self._selected_scores = workspace.selected_scores[workspace_index]
         self._selected_flat = workspace.selected_flat_indices[workspace_index]
         self._next_sequence = workspace.next_sequence[workspace_index]
+        self._scratch_owner = scratch
+        self._session_reset: tuple[Any, ...] | None = None
+        self._kv_capacity = context.max_decode_steps
+        self._kv_grid: tuple[int] | None = None
+        if not getattr(context, "use_native_cache", False):
+            self._bind_split_cache(context, session.slot, width)
+
+    def _bind_split_cache(self, context: Any, slot: int, width: int) -> None:
+        first = context.pools[0].unshared_key
+        layers, aux = len(context.pools), context.aux_key_buf
         self._kv_capacity = first.shape[3]
         self._kv_grid = (layers * width * first.shape[2],)
         self._kv_args = (
@@ -155,27 +163,25 @@ class BeamSearchRunner:
             context.pool_value_ptrs,
             aux.data_ptr(),
             context.aux_value_buf.data_ptr(),
-            session.slot * first.stride(0) * first.element_size(),
+            slot * first.stride(0) * first.element_size(),
             width,
             self._state["num_decode_steps"],
         )
-        self._kv_kwargs = dict(
-            H=first.shape[2],
-            BLOCK_D=triton.next_power_of_2(first.shape[4]),
-            D=first.shape[4],
-            stride_pw=first.stride(1),
-            stride_ph=first.stride(2),
-            stride_ps=first.stride(3),
-            stride_al=aux.stride(0),
-            stride_aw=aux.stride(1),
-            stride_ah=aux.stride(2),
-            stride_as=aux.stride(3),
-            active_mask=self._state["active_mask"],
-            execute=self._scratch["reorder"],
-            DEVICE_STEPS=True,
-        )
-        self._session_reset: tuple[Any, ...] | None = None
-        self._scratch_owner = scratch
+        self._kv_kwargs = {
+            "H": first.shape[2],
+            "BLOCK_D": triton.next_power_of_2(first.shape[4]),
+            "D": first.shape[4],
+            "stride_pw": first.stride(1),
+            "stride_ph": first.stride(2),
+            "stride_ps": first.stride(3),
+            "stride_al": aux.stride(0),
+            "stride_aw": aux.stride(1),
+            "stride_ah": aux.stride(2),
+            "stride_as": aux.stride(3),
+            "active_mask": self._state["active_mask"],
+            "execute": self._scratch["reorder"],
+            "DEVICE_STEPS": True,
+        }
 
     def rebind_session(self, session: BeamSearchSession) -> None:
         """Bind an admitted session after release, retaining fixed tensor views.
@@ -187,7 +193,7 @@ class BeamSearchRunner:
             raise RuntimeError("Beam rebind requires a released runner on the same context")
         if not session.is_active or session.beam_width != self.state.beam_width:
             raise ValueError("Beam rebind requires an active matching session")
-        if session.slot != self.session.slot:
+        if self._kv_grid is not None and session.slot != self.session.slot:
             first = session.context.pools[0].unshared_key
             args = self._kv_args
             self._kv_args = (
@@ -355,6 +361,13 @@ class BeamSearchRunner:
             or workspace.max_decode_steps < context.decision.sequence.shape[2]
         ):
             raise ValueError("workspace geometry/device does not match Beam state")
+        if getattr(context, "use_native_cache", False):
+            if context.pools or not 0 <= kv_slot < context.max_batch:
+                raise ValueError("Native Beam cache has an invalid session slot or split KV pool")
+            return tuple(
+                (t.data_ptr(), t.shape, t.stride(), t.dtype, t.device)
+                for t in _bound_resource_tensors(context, workspace)
+            )
         if not context.pools:
             raise ValueError("session must provide at least one KV layer")
         first = context.pools[0].unshared_key
@@ -616,7 +629,7 @@ class BeamSearchRunner:
             BLOCK=triton.next_power_of_2(extent),
             PREFILL=prefill,
         )
-        if not prefill:
+        if not prefill and self._kv_grid is not None:
             _select_kv_gather_kernel[self._kv_grid](
                 *self._kv_args, s["parent_ids"], **self._kv_kwargs
             )

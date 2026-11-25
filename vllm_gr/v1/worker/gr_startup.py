@@ -140,6 +140,7 @@ def _capture_enabled(worker: Any) -> bool:
     # A one-token session completes in Prefill and never replays a Decode graph.
     return (
         not worker.model_config.enforce_eager
+        and not getattr(worker.model_config, "is_hybrid", False)
         and cfg.beam_graph_enabled
         and cfg.beam_max_decode_steps > 1
     )

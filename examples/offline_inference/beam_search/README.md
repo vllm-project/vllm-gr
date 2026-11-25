@@ -89,6 +89,116 @@ then regenerate `constraint_triples.json` from that catalog. Pass the new
 triples file to the constrained command.
 The same guide shows how to compile a persistent table for online serving.
 
+## Run Hybrid Beam on CUDA
+
+`GRLLM.beam_search()` supports native Hybrid decoders with recurrent state
+and paged attention on CUDA ModelRunner V1 and V2. This example uses
+[Kimi Linear 48B-A3B](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct),
+which combines Kimi Delta Attention (KDA) and Multi-Head Latent Attention (MLA).
+Use `TRITON_MLA` for KDA/MLA Beam Decode graphs. `mamba_cache_mode="align"`
+uses native prefix caching with chunked Prefill enabled. With prefix caching
+and chunked Prefill disabled, use `mamba_cache_mode="none"`.
+
+Set `max_num_seqs` and `max_num_batched_tokens` to cover the number of
+prompts times the largest Decode input width. The token budget must also
+cover the sum of the prompt lengths. For eager execution, set
+`enforce_eager=True`. Other native attention layouts can use eager Decode.
+
+For recommendation, use a checkpoint trained on your SID tokens. Set
+`KIMI_MODEL` to the trusted local checkpoint path, `SID_TRIPLES` to a triples
+JSON file, and `SID_PROMPT` to a UTF-8 prompt file. Each entry under `triples`
+uses `a`, `b`, and `c` keys with values from the checkpoint's tokenizer.
+
+Save the following as `hybrid_beam.py` and run it with
+`VLLM_USE_V2_MODEL_RUNNER=1 python hybrid_beam.py`.
+
+```python
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from vllm_gr.constraints.artifact_builder import build_single_trie_artifact
+from vllm_gr.entrypoints.gr import GRLLM
+from vllm_gr.sampling_params import BeamSearchParams
+
+
+def main():
+    model = Path(os.environ["KIMI_MODEL"]).resolve()
+    catalog = Path(os.environ["SID_TRIPLES"])
+    prompt = Path(os.environ["SID_PROMPT"]).read_text(encoding="utf-8")
+    width = 8
+    with TemporaryDirectory() as directory:
+        artifact = Path(directory) / "table.safetensors"
+        artifact_digest, tokenizer_digest = build_single_trie_artifact(model, catalog, artifact)
+        with GRLLM(
+            model=str(model),
+            trust_remote_code=True,
+            dtype="bfloat16",
+            attention_config={"backend": "TRITON_MLA"},
+            enforce_eager=False,
+            async_scheduling=True,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            mamba_cache_mode="align",
+            max_model_len=2048,
+            max_num_batched_tokens=4096,
+            max_num_seqs=2 * width,
+            gpu_memory_utilization=0.84,
+            offload_group_size=4,
+            offload_num_in_group=3,
+            offload_params={"w13_weight", "w2_weight"},
+            compilation_config={
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1, 2, 4, 8, 12, 16],
+            },
+            gr={
+                "beam_width": [width] * 3,
+                "candidate_width": [width] * 3,
+                "max_decode_steps": 3,
+                "constraint_mode": "table",
+                "constraint_table": {
+                    "format": "constraint_table_v1",
+                    "path": str(artifact),
+                    "backend": "cuda",
+                    "max_top_k": width,
+                    "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
+                },
+            },
+        ) as llm:
+            results = llm.beam_search(
+                [{"prompt": prompt}, {"prompt": prompt}],
+                BeamSearchParams(
+                    beam_width=width,
+                    dynamic_beam_widths=[4, 6, 3],
+                    per_parent_beam_widths=[4, 3, 2],
+                    result_width=2,
+                    max_tokens=3,
+                    ignore_eos=True,
+                ),
+                output_mode="compact",
+            )
+            for request, result in enumerate(results):
+                for beam in result.sequences:
+                    print(request, beam.token_ids, beam.cumulative_logprob)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+The offload options use the native vLLM prefetch offloader to fit the BF16
+weights on one 48 GB L20 with sufficient host RAM. If your accelerator can
+hold the weights, omit the three offload options. This example uses
+`FULL_DECODE_ONLY` to combine Decode graph replay with eager native Prefill.
+
+If your checkpoint uses SID boundary tokens, supply `begin_token` and
+`end_token` in `BeamSearchParams` and add their count to `max_tokens`.
+
+Use the same GR table and native cache settings with
+`vllm serve MODEL --gr` for [HTTP](../../../docs/serving/completions.md#request)
+or add `--grpc` for [gRPC](../../../docs/serving/grpc.md). Grouped HTTP
+completions set `n` to the engine beam width and send a list of prompts.
+
 ## Beam Search V1
 
 EngineCore schedules Beam Search V1 asynchronously. The profiling and A/B
@@ -128,7 +238,7 @@ Both modes require:
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
 - Set the request `beam_width` to the maximum value in `gr.beam_width`.
 - Token/text prompts rather than embedding prompts.
-- No speculative decoding, LoRA, quantization, hybrid model, encoder-decoder
+- No speculative decoding, LoRA, quantization, encoder-decoder
   model, or multimodal model.
 
 For catalog-constrained generation, pass `--catalog`, set
