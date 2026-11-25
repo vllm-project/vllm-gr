@@ -936,7 +936,7 @@ def _select_bsnd_spec(runner, scheduler_output, p_runner, num_reqs):
     if computed is None or prompt is None or req_id_to_index is None:
         return None
     # Packed model inputs follow input-batch row order,
-    # not scheduler dictionary insertion order (the failure log contains 0,2,1,3).
+    # not scheduler dictionary insertion order.
     row_counts = []
     for req_id, n_sched in num_scheduled.items():
         row = req_id_to_index.get(req_id)
