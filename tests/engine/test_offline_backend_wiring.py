@@ -29,6 +29,8 @@ from unittest import mock
 import msgspec
 import pytest
 
+from tests.helpers.gr_config import prepared_engine_args
+
 # ``arg_utils`` / ``gr`` are cached in sys.modules once a process imports
 # them (possibly against the real vLLM in CI).  Each test re-imports them
 # against its own fakes so patch state cannot leak across tests.
@@ -42,24 +44,15 @@ _VLLM_GR_REIMPORT = (
 def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide every vLLM module the offline GRLLM import chain needs."""
 
-    # ``arg_utils`` patches this class (add_cli_args / create_engine_config /
-    # from_cli_args / __init__), so it must carry the four originals first.
     class EngineArgs:
         def __init__(self, model: str = "", **kwargs: Any) -> None:
             self.model = model
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
-        def add_cli_args(self, parser: Any) -> Any:  # replaced by the patch
-            raise NotImplementedError
-
         def create_engine_config(  # replaced by the patch
             self, usage_context: Any = None, headless: bool = False
         ) -> Any:
-            raise NotImplementedError
-
-        @classmethod
-        def from_cli_args(cls, args: Any) -> Any:  # replaced by the patch
             raise NotImplementedError
 
     class AsyncEngineArgs(EngineArgs):
@@ -213,6 +206,7 @@ def _isolated_vllm_imports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     # These fakes exercise typed argument forwarding. Native CLI conversion is
     # covered in tests/config; do not rely on a parser cached by another test.
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--max-model-len", type=int)
     with ExitStack() as restore:
         # Preserve the original module and parent bindings. A later re-import
         # could otherwise capture live, already-patched EngineArgs methods.
@@ -237,43 +231,28 @@ def _fake_config() -> SimpleNamespace:
     )
 
 
-class TestEngineArgsGrInitPatch:
-    """The offline path reaches EngineCore only through this patch."""
-
-    def test_patch_mounts_and_stashes_gr_values(self) -> None:
-        from vllm_gr.engine.arg_utils import patch_add_cli_args
-
-        patch_add_cli_args()
-
-        from vllm.engine.arg_utils import EngineArgs
-
-        engine_args = EngineArgs(
-            model="Qwen/Qwen3-1.7B",
-            gr={"beam_width": 8},
-        )
-        assert engine_args.gr == {"beam_width": 8}
-        # Native LLM.from_engine_args forwards vars(engine_args) to its constructor.
-        assert EngineArgs(**vars(engine_args)).gr == engine_args.gr
+class TestEngineArgsConfiguration:
+    """GR frontends prepare defaults before native EngineArgs construction."""
 
     def test_patch_applies_engine_defaults_and_preserves_overrides(self) -> None:
-        from vllm_gr.engine.arg_utils import patch_add_cli_args
+        from vllm_gr.engine.arg_utils import patch_create_engine_config
 
-        patch_add_cli_args()
+        patch_create_engine_config()
 
         from vllm.engine.arg_utils import EngineArgs
 
         native = EngineArgs(model="Qwen/Qwen3-1.7B")
-        assert native._gr_selected is False
+        assert not hasattr(native, "gr")
         assert not hasattr(native, "max_model_len")
 
-        defaults = EngineArgs(model="Qwen/Qwen3-1.7B", gr={})
-        assert defaults._gr_selected is True
+        defaults = prepared_engine_args(model="Qwen/Qwen3-1.7B", gr={})
+        assert "vllm_gr" in defaults.additional_config
         assert defaults.max_model_len == 8192
         assert defaults.max_num_batched_tokens == 8192
         assert defaults.enable_chunked_prefill is False
         assert defaults.enable_prefix_caching is True
 
-        overridden = EngineArgs(
+        overridden = prepared_engine_args(
             model="Qwen/Qwen3-1.7B",
             gr={},
             max_model_len=4096,
@@ -286,7 +265,7 @@ class TestEngineArgsGrInitPatch:
         assert overridden.enable_chunked_prefill is True
         assert overridden.enable_prefix_caching is False
 
-        long_context = EngineArgs(
+        long_context = prepared_engine_args(
             model="Qwen/Qwen3-1.7B",
             gr={},
             max_model_len=32768,
@@ -294,7 +273,7 @@ class TestEngineArgsGrInitPatch:
         assert long_context.max_model_len == 32768
         assert long_context.max_num_batched_tokens == 32768
 
-        chunked_long_context = EngineArgs(
+        chunked_long_context = prepared_engine_args(
             model="Qwen/Qwen3-1.7B",
             gr={},
             max_model_len=32768,
@@ -302,7 +281,7 @@ class TestEngineArgsGrInitPatch:
         )
         assert chunked_long_context.max_num_batched_tokens == 8192
 
-        explicit_batched_limit = EngineArgs(
+        explicit_batched_limit = prepared_engine_args(
             model="Qwen/Qwen3-1.7B",
             gr={},
             max_model_len=32768,
@@ -314,9 +293,12 @@ class TestEngineArgsGrInitPatch:
     def test_unconstrained_default_needs_no_artifact(self) -> None:
         """The default Beam engine must bind a model-specific constraint table."""
         from vllm_gr.engine import arg_utils
-        from vllm_gr.engine.arg_utils import create_engine_config, patch_add_cli_args
+        from vllm_gr.engine.arg_utils import (
+            create_engine_config,
+            patch_create_engine_config,
+        )
 
-        patch_add_cli_args()
+        patch_create_engine_config()
 
         from vllm.engine.arg_utils import EngineArgs
 
@@ -359,11 +341,8 @@ class TestGrllmCanonicalConstruction:
         gr = self._import_gr(monkeypatch)
         native = {"max_model_len": 4096, "dtype": "float16"}
         llm = gr.GRLLM(model="model", **native)
-        assert {
-            key: value for key, value in llm._last_kwargs.items() if not key.startswith("_gr_")
-        } == native
-        assert llm._last_kwargs["_gr_mode"] is True
-        assert set(native) <= llm._last_kwargs["_gr_explicit_native_fields"]
+        assert native.items() <= llm._last_kwargs.items()
+        assert "vllm_gr" in llm._last_kwargs["additional_config"]
         assert not hasattr(llm, "constraint_strategy")
 
     @pytest.mark.parametrize(
@@ -392,12 +371,9 @@ class TestGrllmCanonicalConstruction:
         config = tmp_path / "scenario.yaml"
         config.write_text("max-model-len: 4096\ngr: {}\n")
         llm = gr.GRLLM(model="model", config=config, async_scheduling=True)
-        assert llm._last_kwargs["config"] == config
-        assert "max_model_len" not in llm._last_kwargs
+        assert llm._last_kwargs["max_model_len"] == 4096
         assert llm._last_kwargs["async_scheduling"] is True
-        assert llm._last_kwargs["_gr_startup_document"]["max-model-len"] == 4096
-        assert "async_scheduling" in llm._last_kwargs["_gr_explicit_native_fields"]
-        assert "max_model_len" not in llm._last_kwargs["_gr_explicit_native_fields"]
+        assert "vllm_gr" in llm._last_kwargs["additional_config"]
         assert not hasattr(llm, "constraint_coordinator")
 
 

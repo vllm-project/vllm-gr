@@ -139,9 +139,10 @@ def test_full_load_rebinds_the_same_plan_only_once_per_model(
     provider = Mock(
         backend_id="test",
         api_version=2,
-        plan_api_version=2,
+        plan_api_version=3,
         adapter_revision="1",
         vendor_distribution=None,
+        additional_config_key=None,
     )
     provider.resolve.side_effect = lambda request: BackendPlan(
         "test", 2, request, PlanData({"runner": "native"})
@@ -181,9 +182,10 @@ def autofit_runner(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, BackendPl
     provider = Mock(
         backend_id="test",
         api_version=2,
-        plan_api_version=2,
+        plan_api_version=3,
         adapter_revision="1",
         vendor_distribution=None,
+        additional_config_key=None,
     )
     provider.resolve.side_effect = lambda request: BackendPlan(
         "test",

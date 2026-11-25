@@ -12,6 +12,7 @@ import torch
 
 from tests.constraints.test_multi_trie import SIDS, make_tries
 from tests.helpers.beam_requests import make_multi_batch_request
+from tests.helpers.gr_config import update_worker_config
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
@@ -72,7 +73,7 @@ def test_mixed_roots_beam_selection_and_reuse(graph, widths, independent_k):
     backend._mark_ready()
     worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     worker.model_config.enforce_eager = not graph
-    worker._vllm_gr_config.beam_graph_enabled = graph
+    update_worker_config(worker, beam_graph_enabled=graph)
     base = torch.tensor([0.1, 0.7, -0.3, 0.2, 0.5, -0.9], device=worker.device, dtype=torch.float16)
     install_decode_model(worker, lambda ids, positions: base.expand(ids.numel(), -1).contiguous())
     owner_before = None
@@ -152,7 +153,7 @@ def test_multi_trie_startup_capture_and_request_reuse():
     backend._mark_ready()
     worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     worker.model_config.enforce_eager = False
-    worker._vllm_gr_config.beam_graph_enabled = True
+    update_worker_config(worker, beam_graph_enabled=True)
     base = torch.arange(6, device=worker.device, dtype=torch.float16)
     install_decode_model(worker, lambda ids, positions: base.expand(ids.numel(), -1).contiguous())
     assert (

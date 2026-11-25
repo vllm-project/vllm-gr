@@ -73,7 +73,7 @@ Scope: `core`; backend ID: `null`
 
 Owner: `vllm_gr/engine/arg_utils.py`
 
-Installer: `vllm_gr.engine.arg_utils.patch_add_cli_args`
+Installer: `vllm_gr.engine.arg_utils.patch_create_engine_config`
 
 Risk: `high`; process roles: `main`, `api_server`
 

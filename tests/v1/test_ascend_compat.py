@@ -481,7 +481,6 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
         read_backend_plan,
     )
     from vllm_gr.config.parser import parse_gr_config
-    from vllm_gr.platforms.planning import BACKEND_OPTIONS_KEY
 
     seen: list[Any] = []
 
@@ -500,7 +499,6 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
             "refresh": True,
             "vllm_gr": {"gr": {"beam_width": [width] * 3, "candidate_width": [width] * 3}},
             BACKEND_PLAN_KEY: plan.to_wire(),
-            BACKEND_OPTIONS_KEY: {"test_option": width},
         }
         config = SimpleNamespace(additional_config=additional)
         before = deepcopy(additional)

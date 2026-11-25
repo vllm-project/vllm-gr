@@ -26,7 +26,8 @@ def install_ascend_config_filter() -> None:
     """
     import vllm_ascend.ascend_config as ascend_config_mod
 
-    from vllm_gr.config.parser import BACKEND_TRANSPORT_KEYS, GR_CONFIG_KEY
+    from vllm_gr.config.backend_plan import BACKEND_PLAN_KEY
+    from vllm_gr.config.parser import GR_CONFIG_KEY
 
     current = ascend_config_mod.init_ascend_config
     if getattr(current, "_vllm_gr_sanitized", False) is True:
@@ -43,7 +44,7 @@ def install_ascend_config_filter() -> None:
             filtered = {
                 key: value
                 for key, value in additional.items()
-                if key != GR_CONFIG_KEY and key not in BACKEND_TRANSPORT_KEYS
+                if key not in (GR_CONFIG_KEY, BACKEND_PLAN_KEY)
             }
             if len(filtered) == len(additional):
                 return original(vllm_config)

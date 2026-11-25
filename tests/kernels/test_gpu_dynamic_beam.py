@@ -11,6 +11,7 @@ import msgspec
 import pytest
 import torch
 
+from tests.helpers.gr_config import update_worker_config
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
@@ -80,10 +81,10 @@ def test_dynamic_stage_execution_and_reuse(
     worker.constraint_backend = VersionedConstraintTable(backend, loader=lambda _: backend)
     if not constrained:
         worker.constraint_backend = None
-        worker._vllm_gr_config.constraint = ConstraintConfig()
+        update_worker_config(worker, constraint=ConstraintConfig())
     worker.model_config.enforce_eager = not graph
     worker.model_config.max_model_len = 64
-    worker._vllm_gr_config.beam_graph_enabled = graph
+    update_worker_config(worker, beam_graph_enabled=graph)
     worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec = SimpleNamespace(block_size=16)
     base = torch.tensor([0.1, 0.7, -0.3, 0.2, 0.5, -0.9], device="cuda", dtype=torch.float16)
     weights = torch.arange(6, device="cuda", dtype=torch.float16) * 0.031

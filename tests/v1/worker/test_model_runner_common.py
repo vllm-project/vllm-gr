@@ -13,6 +13,8 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.gr_config import worker_config
+from vllm_gr.config import GRConfig
 from vllm_gr.v1.beam import BEAM_DATA_VAR
 from vllm_gr.v1.worker import gr_gc as _gc_runtime
 from vllm_gr.v1.worker import model_runner_common as common
@@ -98,9 +100,11 @@ def _m2_runner(
         return sample_tokens_return
 
     runner = SimpleNamespace(
-        vllm_config=SimpleNamespace(additional_config={}),
-        _vllm_gr_config=SimpleNamespace(
-            beam_worker_decision=beam_worker_decision,
+        vllm_config=worker_config(
+            GRConfig(
+                beam_worker_decision=beam_worker_decision,
+            ),
+            SimpleNamespace(additional_config={}),
         ),
         use_async_scheduling=use_async_scheduling,
         parallel_config=SimpleNamespace(pipeline_parallel_size=pipeline_parallel_size),

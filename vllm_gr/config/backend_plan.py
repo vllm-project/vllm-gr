@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 PLAN_SCHEMA_VERSION = 1
-PLAN_API_VERSION = 2
+PLAN_API_VERSION = 3
 BACKEND_PLAN_KEY = "vllm_gr_backend_plan"
 
 

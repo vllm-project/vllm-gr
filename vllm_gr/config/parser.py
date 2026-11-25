@@ -15,6 +15,7 @@ from typing import Any, Final, TypeAlias
 
 import yaml
 
+from vllm_gr.config.backend_plan import BACKEND_PLAN_KEY
 from vllm_gr.config.models import (
     OPTION_KEYS,
     ConstraintConfig,
@@ -117,7 +118,6 @@ def _read_settings(path: Path, parents: tuple[Path, ...]) -> dict:
 
 
 GR_CONFIG_KEY: Final = "vllm_gr"
-BACKEND_TRANSPORT_KEYS: Final = frozenset({"vllm_gr_backend_plan", "vllm_gr_backend_options"})
 GRConfigInput: TypeAlias = str | Path
 CAPACITY_FIELDS = ("beam_max_width", "beam_candidate_width")
 CONFIG_ATTRIBUTES = {
@@ -266,12 +266,14 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     return result
 
 
-def _load_document(
+def resolve_startup_config(
     document: Mapping,
     overrides: Mapping | None = None,
     *,
     worker_decision_default: bool | None = None,
-) -> GRConfig:
+) -> tuple[GRConfig, str, int | None]:
+    if overrides is not None and not isinstance(overrides, Mapping):
+        raise ValueError("gr must be a mapping")
     document = _mapping(document, "Configuration")
     retired = {
         "schema_version",
@@ -286,54 +288,41 @@ def _load_document(
         )
     base = read_settings(COMMON_ENGINE_CONFIG)["gr"]
     effective = merge_gr_settings(merge_gr_settings(base, document.get("gr", {})), overrides or {})
+    host = effective.pop("admin_host")
+    port = effective.pop("admin_port")
+    if not isinstance(host, str) or not host:
+        raise ValueError("gr.admin_host requires a hostname or address")
+    if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+        raise ValueError("gr.admin_port must be in 1..65535")
     if effective.get("worker_decision") is None and worker_decision_default is not None:
         effective["worker_decision"] = worker_decision_default
     payload: dict[str, object] = {"gr": effective}
     attention = document.get("attention-config")
     if isinstance(attention, Mapping) and attention.get("backend") == "CUSTOM":
         payload["attention-config"] = attention
-    return gr_config_from_mapping(payload, base_dir=Path.cwd())
+    return gr_config_from_mapping(payload, base_dir=Path.cwd()), host, port
 
 
-def load_gr_config(path: str | Path, overrides: Mapping | None = None) -> GRConfig:
+def load_gr_config(
+    path: str | Path = COMMON_ENGINE_CONFIG, overrides: Mapping | None = None
+) -> GRConfig:
     if not isinstance(path, (str, Path)):
         raise TypeError("config must be a YAML file path")
-    return _load_document(read_settings(path), overrides)
+    return resolve_startup_config(read_settings(path), overrides)[0]
 
 
-def load_engine_gr_config(
-    path: GRConfigInput | None,
-    additional: object,
-    overrides: Mapping | None = None,
-    *,
-    startup_document: Mapping | None = None,
-    worker_decision_default: bool | None = None,
-) -> GRConfig:
-    if path is not None and not isinstance(path, (str, Path)):
-        raise TypeError("config must be a YAML file path")
-    if overrides is not None and not isinstance(overrides, Mapping):
-        raise ValueError("gr must be a mapping")
-    if isinstance(additional, Mapping):
-        _reject_flat_gr_keys(additional)
-        if GR_CONFIG_KEY in additional:
-            raise ValueError("Supply GR settings with gr=..., --gr-config, or --config")
-    if startup_document is not None:
-        return _load_document(
-            startup_document, overrides, worker_decision_default=worker_decision_default
-        )
-    if path is not None:
-        return _load_document(
-            read_settings(path), overrides, worker_decision_default=worker_decision_default
-        )
-    return _load_document({"gr": {}}, overrides, worker_decision_default=worker_decision_default)
-
-
-def _reject_flat_gr_keys(additional: Mapping) -> None:
+def validate_additional_keys(additional: Mapping) -> None:
     invalid = sorted(
         key
         for key in additional
-        if isinstance(key, str) and key.startswith("vllm_gr_") and key not in BACKEND_TRANSPORT_KEYS
+        if isinstance(key, str) and key.startswith("vllm_gr_") and key != BACKEND_PLAN_KEY
     )
+    if "vllm_gr_backend_options" in invalid:
+        raise ValueError(
+            "vllm_gr_backend_options was removed. Drop empty options or move planning "
+            "options to the provider's documented additional_config key. To enable GR, "
+            'also supply additional_config["vllm_gr"].'
+        )
     if invalid:
         raise ValueError(
             f"Removed vLLM-GR configuration keys: {invalid}. "
@@ -345,7 +334,7 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, Mapping):
         return GRConfig()
-    _reject_flat_gr_keys(additional)
+    validate_additional_keys(additional)
     if GR_CONFIG_KEY not in additional:
         return GRConfig()
     return _decode_gr_config(additional[GR_CONFIG_KEY], resolve_paths=False)
@@ -355,6 +344,6 @@ def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, MutableMapping):
         raise ValueError("vLLM-GR additional_config must be a mutable mapping")
-    _reject_flat_gr_keys(additional)
+    validate_additional_keys(additional)
     additional[GR_CONFIG_KEY] = gr_config_to_mapping(gr_config)
     object.__setattr__(vllm_config, "_vllm_gr_parsed_config", gr_config)

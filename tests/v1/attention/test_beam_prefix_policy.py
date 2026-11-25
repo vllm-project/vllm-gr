@@ -5,7 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.helpers.gr_config import engine_config
+from tests.helpers.gr_config import engine_config, worker_config
+from vllm_gr.config import GRConfig
 from vllm_gr.config.models import DeploymentOptions
 from vllm_gr.v1.attention.backends import beam_prefix_policy as policy
 from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeGraph
@@ -60,8 +61,8 @@ def test_fixed_width_v2_captures_a_new_length_bucket(monkeypatch):
 
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
-        _vllm_gr_config=SimpleNamespace(
-            beam_graph_enabled=True, deployment=DeploymentOptions(beam_batch_sizes=(1,))
+        vllm_config=worker_config(
+            GRConfig(beam_graph_enabled=True, deployment=DeploymentOptions(beam_batch_sizes=(1,)))
         ),
         model=SimpleNamespace(compute_logits=Mock(return_value="logits")),
     )
