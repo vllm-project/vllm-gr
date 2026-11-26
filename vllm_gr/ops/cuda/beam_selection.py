@@ -62,6 +62,7 @@ def _local_beam_topk_kernel(
     BLOCK: tl.constexpr,
     MASK_INVALID_INDICES: tl.constexpr = False,
     SELECT_BLOCK: tl.constexpr = 0,
+    TOPK: tl.constexpr = None,
 ):
     request = tl.program_id(0)
     tile = tl.program_id(1)
@@ -102,7 +103,7 @@ def _local_beam_topk_kernel(
             # cannot handle.  The smallest packed key preserves the same order.
             ranked = tl.min(packed, axis=0, keep_dims=True)
         else:
-            ranked = ~tl.topk(~packed, SELECT_BLOCK)
+            ranked = ~TOPK(~packed, SELECT_BLOCK)
         output_mask = retained < select_width
         output = request * scratch_stride + tile * select_width + retained
         tl.store(local_scores + output, unpack_score(ranked), mask=output_mask)
@@ -657,7 +658,8 @@ def _hierarchical_topk_out(
         # When a list is wider than the selection, keep only the winners
         # (bitonic Top-K) instead of sorting every lane.  0 keeps the plain
         # sort for the square W == K case.
-        SELECT_BLOCK=select_block if select_block < local_block else 0,
+        SELECT_BLOCK=select_block if select_block < local_block and hasattr(tl, "topk") else 0,
+        TOPK=getattr(tl, "topk", None),
         # A wider selection (a beam width above 256) makes one local list span
         # more than 256 lanes; add a tier so the per-thread register load of
         # the in-block sort does not explode.  Widths <= 256 are unchanged.
