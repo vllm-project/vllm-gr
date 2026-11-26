@@ -156,7 +156,11 @@ class EagerBeamAttention:
         metadata = attn_metadata
         if metadata.prefix_indices is None:
             offsets = metadata.std_cu_seqlens_q_cpu
+            if offsets is None:
+                offsets = metadata.std_cu_seqlens_q_device.tolist()
             lengths = metadata.std_seqlens_kv_cpu
+            if lengths is None:
+                lengths = metadata.std_seqlens_kv_device.tolist()
             for row, length in enumerate(lengths):
                 start, end = offsets[row : row + 2]
                 output[start:end].copy_(
