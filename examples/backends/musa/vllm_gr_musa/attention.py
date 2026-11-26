@@ -220,7 +220,7 @@ class EagerBeamAttention:
             raise ValueError("Unsupported eager MUSA Beam prefill configuration")
         offsets = attn_metadata.query_start_loc.tolist()
         lengths = attn_metadata.seq_lens.tolist()
-        blocks = attn_metadata.block_table_tensor
+        blocks = getattr(attn_metadata, "block_table_tensor", None)
         if blocks is None:
             blocks = attn_metadata.block_table
         for row, length in enumerate(lengths):
