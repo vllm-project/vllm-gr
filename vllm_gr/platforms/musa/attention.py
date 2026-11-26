@@ -122,7 +122,7 @@ def write_paged_kv(
     if key_cache.dtype != key.dtype or value_cache.dtype != value.dtype:
         raise ValueError("Eager MUSA Beam requires unquantized KV")
     if torch.musa.is_current_stream_capturing():
-        from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
+        from vllm._custom_ops import reshape_and_cache_flash
 
         reshape_and_cache_flash(
             key,
