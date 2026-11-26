@@ -31,9 +31,14 @@ def _add_gpu(
     node_dir = root / "topology" / str(node)
     node_dir.mkdir(parents=True)
     (node_dir / "gpu_id").write_text(f"{gpu_id}\n")
+    render = 127 + node
     (node_dir / "properties").write_text(
         f"cpu_cores_count 0\nsimd_count 192\nlocation_id {bus << 8}\ndomain 0\n"
+        f"drm_render_minor {render}\n"
     )
+    dri = root / "dri"
+    dri.mkdir(exist_ok=True)
+    (dri / f"renderD{render}").touch()
     pci = root / "pci" / f"0000:{bus:02x}:00.0"
     pci.mkdir(parents=True)
     (pci / "gpu_busy_percent").write_text(f"{busy}\n")
@@ -52,7 +57,7 @@ def sysfs(tmp_path: Path) -> Path:
     cpu = tmp_path / "topology" / "0"
     cpu.mkdir(parents=True)
     (cpu / "gpu_id").write_text("0\n")
-    (cpu / "properties").write_text("cpu_cores_count 32\nsimd_count 0\n")
+    (cpu / "properties").write_text("cpu_cores_count 32\nsimd_count 0\ndrm_render_minor 0\n")
     (tmp_path / "proc").mkdir()
     _add_gpu(tmp_path, 1, 111, 0x75)
     _add_gpu(tmp_path, 2, 222, 0x05)
@@ -66,7 +71,7 @@ def run_rocm(sysfs: Path, script: str, *args: str) -> subprocess.CompletedProces
         pytest.skip("Bash required")
     prelude = f"""
         export VLLM_GR_KFD_TOPOLOGY={sysfs}/topology VLLM_GR_KFD_PROC={sysfs}/proc
-        export VLLM_GR_PCI_DEVICES={sysfs}/pci
+        export VLLM_GR_PCI_DEVICES={sysfs}/pci VLLM_GR_DEV_DRI={sysfs}/dri
         unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
         rocm_state=true
         source tools/devices/resource.sh
@@ -94,6 +99,14 @@ def test_indices_follow_kfd_order_and_skip_busy_and_small_gpus(sysfs: Path) -> N
         """,
     )
     assert result.stdout.splitlines() == ["3", "0000:75:00.0", "0000:0e:00.0", "1", "none"]
+
+
+def test_only_gpus_with_a_render_node_are_numbered(sysfs: Path) -> None:
+    # A container that mounts one render node sees that GPU as HIP device 0.
+    (sysfs / "dri" / "renderD128").unlink()
+    (sysfs / "dri" / "renderD130").unlink()
+    result = run_rocm(sysfs, "rocm_gpu_count; rocm_gpu_pci_address 0; get_gpu 18 1")
+    assert result.stdout.splitlines() == ["1", "0000:05:00.0", "0"]
 
 
 def test_lock_sized_usage_makes_an_idle_gpu_busy(sysfs: Path) -> None:
@@ -143,7 +156,7 @@ def test_telemetry_must_be_complete_and_idle(
 
 def test_detection_defers_to_nvidia_tooling_and_explicit_state(sysfs: Path) -> None:
     script = f"""
-        export VLLM_GR_KFD_TOPOLOGY={sysfs}/topology
+        export VLLM_GR_KFD_TOPOLOGY={sysfs}/topology VLLM_GR_DEV_DRI={sysfs}/dri
         nvidia-smi() {{ echo 1; }}
         source tools/devices/resource.sh
         echo "$rocm_state"

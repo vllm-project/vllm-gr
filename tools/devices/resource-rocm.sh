@@ -6,9 +6,12 @@
 # This script is meant to be sourced by resource.sh.
 # It provides AMD ROCm telemetry for local GPU selection.
 #
-# Device indices follow the KFD topology order of GPU nodes, which is the HIP
-# enumeration order used by HIP_VISIBLE_DEVICES. amd-smi may list devices in
-# a different (PCI address) order, so it is not used for indexing.
+# Device indices follow the KFD topology order of the GPU nodes whose render
+# node is present in /dev/dri, which is the HIP enumeration order used by
+# HIP_VISIBLE_DEVICES. A container that mounts only some render nodes sees
+# only those GPUs, renumbered from zero, while sysfs still lists every GPU.
+# amd-smi may list devices in a different (PCI address) order, so it is not
+# used for indexing.
 #
 # Usage is read from sysfs, which is shared by every container on the host:
 # a GPU is idle when the VRAM held by all KFD processes is below the threshold
@@ -20,12 +23,13 @@
 : "${VLLM_GR_KFD_TOPOLOGY:=/sys/class/kfd/kfd/topology/nodes}"
 : "${VLLM_GR_KFD_PROC:=/sys/class/kfd/kfd/proc}"
 : "${VLLM_GR_PCI_DEVICES:=/sys/bus/pci/devices}"
+: "${VLLM_GR_DEV_DRI:=/dev/dri}"
 # GPUs with less VRAM, such as integrated GPUs, are never selected.
 : "${VLLM_GR_ROCM_MIN_VRAM_MIB:=4096}"
 
-# Prints "<gpu_id> <pci_address>" for each GPU node in HIP order.
+# Prints "<gpu_id> <pci_address>" for each accessible GPU node in HIP order.
 function _rocm_gpu_nodes() {
-    local node props simd location domain gpu_id
+    local node props simd location domain gpu_id render
     local -a nodes=()
     for node in "$VLLM_GR_KFD_TOPOLOGY"/*; do
         [[ -f $node/properties ]] && nodes+=("$(basename "$node")")
@@ -37,6 +41,9 @@ function _rocm_gpu_nodes() {
         props="$node/properties"
         simd=$(awk '$1 == "simd_count" {print $2}' "$props")
         [[ $simd =~ ^[0-9]+$ ]] && [ "$simd" -gt 0 ] || continue
+        # HIP enumerates only GPUs whose render node this process can open.
+        render=$(awk '$1 == "drm_render_minor" {print $2}' "$props")
+        [[ $render =~ ^[0-9]+$ ]] && [ -e "$VLLM_GR_DEV_DRI/renderD$render" ] || continue
         location=$(awk '$1 == "location_id" {print $2}' "$props")
         domain=$(awk '$1 == "domain" {print $2}' "$props")
         gpu_id=$(cat "$node/gpu_id" 2>/dev/null) || continue
