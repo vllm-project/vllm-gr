@@ -42,3 +42,41 @@ def eager_beam_decode(
     prefix_output = torch.einsum("bhgt,thd->bhgd", prefix_weight, prefix_value)
     suffix_output = torch.einsum("bhgt,bhtd->bhgd", suffix_weight, suffix_value.float())
     return (prefix_output + suffix_output).reshape_as(query).to(query.dtype)
+
+
+def write_suffix_kv(
+    unshared_key: torch.Tensor,
+    unshared_value: torch.Tensor,
+    curr_key: torch.Tensor,
+    curr_value: torch.Tensor,
+    slot: int,
+    decode_step: int,
+    beam_session: object = None,
+) -> None:
+    """Append the current token to the request-major decode pool."""
+    width = curr_key.shape[0]
+    unshared_key[slot, :width, :, decode_step].copy_(curr_key)
+    unshared_value[slot, :width, :, decode_step].copy_(curr_value)
+
+
+def write_paged_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    """Scatter valid slots into the logical NHD view, preserving its strides."""
+    if key_cache.dtype != key.dtype or value_cache.dtype != value.dtype:
+        raise ValueError("Eager MUSA Beam requires unquantized KV")
+    slots = slot_mapping.long()
+    valid = slots >= 0
+    slots = slots[valid]
+    block_size = key_cache.shape[1]
+    pages = slots // block_size
+    offsets = slots % block_size
+    key_cache[pages, offsets] = key[: slot_mapping.numel()][valid]
+    value_cache[pages, offsets] = value[: slot_mapping.numel()][valid]
