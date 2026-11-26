@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Moore Threads backend discovery and runtime initialization."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
-from vllm_gr.config.backend_plan import BackendPlan, BackendRequest
+from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
 from vllm_gr.platforms.compat import require_runtime_version
 from vllm_gr.platforms.cuda.provider import CUDABackendProvider
 from vllm_gr.platforms.identity import PlatformIdentity, current_platform_identity
@@ -70,9 +70,22 @@ class MUSABackendProvider(CUDABackendProvider):
             )
         ):
             raise ValueError("MUSA Beam requires single-device ModelRunner V1")
-        if request.has_constraint_table or gr["attention_backend"] != "CUSTOM":
-            raise ValueError("MUSA Beam requires unconstrained requests and CUSTOM attention")
-        return super().resolve(request)
+        if gr["attention_backend"] != "CUSTOM":
+            raise ValueError("MUSA Beam requires CUSTOM attention")
+        plan = super().resolve(request)
+        if not request.has_constraint_table:
+            return plan
+        implementation = plan.choices.to_dict()
+        implementation["constraint_implementation"] = "musa"
+        return replace(plan, choices=PlanData(implementation))
+
+    def create_constrained_topk_execution(self, *, device=None, plan=None):
+        from vllm_gr.constraints.execution import TorchConstrainedTopKExecution
+        from vllm_gr.platforms.services import require_provider_plan
+
+        if plan is not None:
+            require_provider_plan(self, plan)
+        return TorchConstrainedTopKExecution(device=device or "musa")
 
 
 MUSA_BACKEND = MUSABackendProvider()
