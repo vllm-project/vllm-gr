@@ -617,7 +617,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             for key, value in step["env"].items()
         }
         return run_workflow_command(
-            ["bash", "-eu", "-o", "pipefail", "-c", step["run"]],
+            [shutil.which("bash") or "bash", "-eu", "-o", "pipefail", "-c", step["run"]],
             env=env,
         )
 
@@ -841,6 +841,10 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             return bool(evaluate(condition, context()))
 
         for step in steps[1:]:
+            if step.get("name") == "Report tests moved to Buildkite":
+                self.assertTrue(evaluate(step["if"], context(event="workflow_dispatch")))
+                self.assertFalse(evaluate(step["if"], context(event="push")))
+                continue
             self.assertIn("steps.accelerator.outputs.run", step["if"])
             for level in ("l1", "l2", "l3", "l4", "l5"):
                 for hit in ("true", "false"):

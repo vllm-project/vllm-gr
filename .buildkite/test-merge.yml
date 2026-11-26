@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+steps:
+  - label: "Unit tests"
+    key: merge-unit-tests
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      -n 4 --durations=10 -sv
+      -m '(l1) and (cpu_test and not gpu_test and not npu_test)' tests
+
+  - label: "Kernels Test"
+    key: l3-gpu-kernels
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 35
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      --durations=10 -sv -m 'l3 and gpu_test'
+      tests/kernels
+
+  - group: "E2E Test"
+    key: l3-gpu-system
+    steps:
+      - label: "Engine Entrypoint Startup Test"
+        key: l3-gpu-engine-entrypoint-startup
+        depends_on: upload-merge-pipeline
+        timeout_in_minutes: 30
+        mirror_hardwares: l4_1
+        command: >-
+          pytest
+          --run-slow --durations=10 -sv -m 'l3 and gpu_test'
+          tests/e2e/test_engine_entrypoint_startup.py
+
+      - label: "OneRec V1 Scheduler Test"
+        key: l3-gpu-onerec-v1-scheduler
+        depends_on: upload-merge-pipeline
+        timeout_in_minutes: 30
+        mirror_hardwares: l4_1
+        command: >-
+          pytest
+          --run-slow --durations=10 -sv -m 'l3 and gpu_test'
+          tests/e2e/test_onerec_v1_scheduler_st.py
+
+  - label: "Entrypoints Test"
+    key: l3-gpu-entrypoints
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 35
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      --run-slow --durations=10 -sv -m 'l3 and gpu_test'
+      tests/entrypoints

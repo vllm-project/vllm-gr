@@ -162,7 +162,7 @@ def run(args: argparse.Namespace) -> None:
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
-    from tests.st.test_onerec_v1_scheduler_st import _engine_kwargs, _inputs, _params
+    from tests.e2e.test_onerec_v1_scheduler_st import _engine_kwargs, _inputs, _params
     from vllm_gr import GRLLM
 
     output = args.output.resolve()
@@ -179,7 +179,7 @@ def run(args: argparse.Namespace) -> None:
         max_num_batched_tokens=1024,
         enforce_eager=args.mode == "eager",
         compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 128, 256, 512, 1024]},
-        worker_extension_cls="tests.st.model_runner_policy_isolation.PolicyWorkerExtension",
+        worker_extension_cls="tests.e2e.model_runner_policy_isolation.PolicyWorkerExtension",
         shutdown_timeout=10,
     )
     expected_rows, expected_batches = startup_expectations(

@@ -424,10 +424,27 @@ jobs:
       - name: Kill stale process on device
         run: bash ./scripts/kill_vllm_on_device.sh --yes
 
+      - name: Report tests moved to Buildkite
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          cpu_message='Manual runs exclude CPU-only tests. Run L1 CPU Unit tests in Buildkite Ready or Merge.'
+          echo "::notice::$cpu_message"
+          echo "$cpu_message" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VLLM_GR_TARGET_DEVICE" == cuda ]]; then
+            cuda_message='Manual CUDA device tests are disabled here. Run L2 CUDA tests in Buildkite Ready and L3 CUDA tests in Buildkite Merge.'
+            echo "::notice::$cuda_message"
+            echo "$cuda_message" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Run device tests
+        if: github.event_name != 'workflow_dispatch' || env.VLLM_GR_TARGET_DEVICE != 'cuda'
+        env:
+          VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS: "1"
+          VLLM_GR_EXCLUDE_CPU_TESTS: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: bash tools/ci/run_test_level.sh "$VLLM_GR_TEST_LEVEL"
 
       - name: Run L2 resource probe if isolated
+        if: github.event_name != 'workflow_dispatch' || env.VLLM_GR_TARGET_DEVICE != 'cuda'
         run: bash tools/ci/run_resource_level.sh
 
       - name: Check clear device

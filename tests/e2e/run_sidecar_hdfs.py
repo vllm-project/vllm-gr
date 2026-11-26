@@ -63,9 +63,9 @@ def install_control_trace() -> None:
 
 
 def main() -> None:
-    from tests.st.run_checkpoint_reload import ROOT, outputs, prepare, request, server
-    from tests.st.run_trie_reload import A, B
-    from tests.st.run_trie_reload import prepare as prepare_trie
+    from tests.e2e.run_checkpoint_reload import ROOT, outputs, prepare, request, server
+    from tests.e2e.run_trie_reload import A, B
+    from tests.e2e.run_trie_reload import prepare as prepare_trie
     from vllm_gr.sidecar import HDFSDownloader
 
     parser = argparse.ArgumentParser(description=__doc__)

@@ -32,14 +32,14 @@ from vllm_gr.ops.npu import beam_ops
 
 assert beam_ops.is_available(), f"NPU Beam operators are required: {beam_ops.unavailable_reason()}"
 
-from tests.helpers.paths import REPO_ROOT  # noqa: E402
-from tests.st.test_onerec_v1_npu_e2e import (  # noqa: E402
+from tests.e2e.test_onerec_v1_npu_e2e import (  # noqa: E402
     _BEGIN_TOKEN,
     _END_TOKEN,
     _assert_batch_equal,
     _build_constraint_artifact,
     _prompt_tokens,
 )
+from tests.helpers.paths import REPO_ROOT  # noqa: E402
 
 pytestmark = pytest.mark.npu_test
 
@@ -366,7 +366,7 @@ def test_npu_dynamic_beam_full_model_eager_graph(tmp_path: Path) -> None:
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
-    command = [sys.executable, "-m", "tests.st.test_npu_dynamic_beam_st", str(tmp_path)]
+    command = [sys.executable, "-m", "tests.e2e.test_npu_dynamic_beam_st", str(tmp_path)]
     with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
         try:
             assert process.wait(timeout=900) == 0, "NPU dynamic Beam E2E subprocess failed"

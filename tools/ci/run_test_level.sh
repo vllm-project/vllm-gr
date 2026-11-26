@@ -28,6 +28,15 @@ case "${VLLM_GR_TARGET_DEVICE:-}" in
   *) echo "Unsupported VLLM_GR_TARGET_DEVICE: $VLLM_GR_TARGET_DEVICE" >&2; exit 2 ;;
 esac
 
+if [[ "${VLLM_GR_TARGET_DEVICE:-}" == cuda &&
+      "${VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS:-}" == 1 ]]; then
+  expression="($expression) and not ((l2 or l3) and gpu_test)"
+fi
+
+if [[ "${VLLM_GR_EXCLUDE_CPU_TESTS:-}" == 1 ]]; then
+  expression="($expression) and not ($cpu_expression)"
+fi
+
 pytest_args=(-x --run-slow --strict-test-levels --durations=10 -s -m "$expression")
 
 # The opt-in tiny-model tests inspect the in-process vLLM engine directly.

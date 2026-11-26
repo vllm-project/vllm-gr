@@ -442,7 +442,7 @@ def _engine_kwargs(model: str, config: dict[str, Any]) -> dict[str, Any]:
         compilation_config={
             "cudagraph_capture_sizes": [1, 2, 16, *range(128, 2049, 128)],
         },
-        worker_extension_cls="tests.st.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
+        worker_extension_cls="tests.e2e.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
     )
 
 
@@ -1224,7 +1224,7 @@ def test_onerec_v1_completion_batch_online(
         command = [
             sys.executable,
             "-m",
-            "tests.st.test_onerec_v1_scheduler_st",
+            "tests.e2e.test_onerec_v1_scheduler_st",
             str(tmp_path),
             mode,
         ]
@@ -1265,7 +1265,7 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool, runner: str) -
         ),
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
-    command = [sys.executable, "-m", "tests.st.test_onerec_v1_scheduler_st", str(tmp_path)]
+    command = [sys.executable, "-m", "tests.e2e.test_onerec_v1_scheduler_st", str(tmp_path)]
     if online:
         command.append("--online")
     process_started = time.monotonic()

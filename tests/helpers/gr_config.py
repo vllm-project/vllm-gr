@@ -135,7 +135,7 @@ def npu_dynamic_engine_args(
         max_num_seqs=64,
         max_logprobs=beam_width,
         gpu_memory_utilization=0.5,
-        worker_extension_cls="tests.st.test_npu_dynamic_beam_st.DynamicBeamTestWorkerExtension",
+        worker_extension_cls="tests.e2e.test_npu_dynamic_beam_st.DynamicBeamTestWorkerExtension",
     )
     config["beam_graph_enabled"] = graph
     if not explicit_widths:
