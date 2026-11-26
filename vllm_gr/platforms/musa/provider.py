@@ -75,4 +75,4 @@ class MUSABackendProvider(CUDABackendProvider):
         return super().resolve(request)
 
 
-BACKEND = MUSABackendProvider()
+MUSA_BACKEND = MUSABackendProvider()
