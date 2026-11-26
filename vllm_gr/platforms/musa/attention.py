@@ -300,7 +300,7 @@ class EagerBeamAttention:
         if blocks is None:
             blocks = attn_metadata.block_table
         if torch.musa.is_current_stream_capturing():
-            from flash_attn_3 import flash_attn_varlen_func
+            from flash_attn_interface import flash_attn_varlen_func
 
             flash_attn_varlen_func(
                 q=query,
