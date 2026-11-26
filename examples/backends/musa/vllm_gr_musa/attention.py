@@ -196,3 +196,22 @@ class EagerBeamAttention:
 
 
 EAGER_BEAM_ATTENTION = EagerBeamAttention()
+
+
+def reorder_suffix_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slot: int,
+    parent_ids: torch.Tensor,
+    decode_step: int,
+) -> None:
+    """Copy live parent histories into the next beam order.
+
+    Materialize the gathered rows before writing so swaps and repeated parents
+    read the old generation. Leave future positions and other slots intact.
+    """
+    width = parent_ids.numel()
+    parents = parent_ids.long()
+    for pool in (key, value):
+        live = pool[slot, :width, :, : decode_step + 1]
+        live.copy_(live.index_select(0, parents))
