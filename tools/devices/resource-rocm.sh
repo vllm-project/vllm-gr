@@ -39,7 +39,8 @@ function _rocm_gpu_nodes() {
     while read -r id; do
         node="$VLLM_GR_KFD_TOPOLOGY/$id"
         props="$node/properties"
-        simd=$(awk '$1 == "simd_count" {print $2}' "$props")
+        # KFD denies reading the properties of GPUs this container cannot access.
+        simd=$(awk '$1 == "simd_count" {print $2}' "$props" 2>/dev/null) || continue
         [[ $simd =~ ^[0-9]+$ ]] && [ "$simd" -gt 0 ] || continue
         # HIP enumerates only GPUs whose render node this process can open.
         render=$(awk '$1 == "drm_render_minor" {print $2}' "$props")
