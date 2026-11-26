@@ -239,6 +239,10 @@ class BeamSearchRunner:
             plan = (tensors, sizes, tuple(starts), tuple(fill for _, fill in rows))
             self._session_reset = plan
         tensors, sizes, starts, negative_infinity = plan
+        if self._reorder_kv is not None:
+            for tensor, fill_negative_infinity in zip(tensors, negative_infinity, strict=True):
+                tensor.fill_(float("-inf") if fill_negative_infinity else 0)
+            return
         ops._reset_session_state_kernel[(starts[-1],)](
             tensors, sizes, starts, negative_infinity, BLOCK=256, num_warps=4
         )
