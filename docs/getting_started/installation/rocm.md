@@ -87,9 +87,16 @@ Beam attention uses the upstream `flash_attn` package that vLLM loads on ROCm.
     cd flash-attention
     git checkout b038b49
     git submodule update --init third_party/aiter
-    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE pip install --no-build-isolation --no-deps .
-    export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE AITER_USE_SYSTEM_TRITON=1 AITER_TRITON_ONLY=1 \
+      pip install --no-build-isolation --no-deps .
+    export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE AITER_TRITON_ONLY=1
     ```
+
+    The install builds the bundled AITER package. Without
+    `AITER_USE_SYSTEM_TRITON=1`, AITER replaces the Triton build that PyTorch
+    was built with. `AITER_TRITON_ONLY=1` installs and imports only AITER's
+    Triton kernels; otherwise AITER compiles its C++ modules on first import.
+    Check that `pip list` still shows the Triton version of your PyTorch image.
 
     Do not use the Triton backend at the older `0e60e394` revision: its
     varlen path ignores `block_table` instead of rejecting it.
