@@ -248,8 +248,9 @@ def reorder_suffix_kv(
     value: torch.Tensor,
     slot: int,
     parent_ids: torch.Tensor,
-    decode_step: int,
+    decode_step: torch.Tensor,
     active_mask: torch.Tensor,
+    execute: torch.Tensor,
 ) -> None:
     """Copy live parent histories into the next beam order.
 
@@ -258,7 +259,9 @@ def reorder_suffix_kv(
     """
     width = parent_ids.numel()
     destinations = torch.arange(width, device=parent_ids.device)
-    parents = torch.where(active_mask, parent_ids, destinations).long()
+    parents = torch.where(active_mask & execute, parent_ids, destinations).long()
     for pool in (key, value):
-        live = pool[slot, :width, :, : decode_step + 1]
-        live.copy_(live.index_select(0, parents))
+        history = pool[slot, :width]
+        positions = torch.arange(history.shape[2], device=pool.device)
+        live = positions[None, None, :, None] <= decode_step
+        history.copy_(torch.where(live, history.index_select(0, parents), history))
