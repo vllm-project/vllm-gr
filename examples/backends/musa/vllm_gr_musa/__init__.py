@@ -55,10 +55,14 @@ class MUSABackendProvider(CUDABackendProvider):
     def resolve(self, request: BackendRequest) -> BackendPlan:
         native = request.native.to_dict()
         gr = request.config.to_dict()
-        if not native["enforce_eager"] or gr["beam_graph_enabled"] or gr["prefill_graph_enabled"]:
+        if (
+            not native["model_config"]["enforce_eager"]
+            or gr["beam_graph_enabled"]
+            or gr["deployment"]["prefill_graph_enabled"]
+        ):
             raise ValueError("MUSA Beam requires eager execution with both GR graph modes disabled")
         if native["use_v2_model_runner"] or any(
-            native[name] != 1
+            native["parallel_config"][name] != 1
             for name in (
                 "tensor_parallel_size",
                 "pipeline_parallel_size",
