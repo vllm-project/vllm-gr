@@ -28,8 +28,15 @@ class _LazyBeamField:
             return self
         materializer = obj.__dict__.get("_lazy_materializer")
         if materializer is not None:
+            if obj.__dict__.get("_lazy_materializing", False):
+                raise RuntimeError("recursive Beam output materialization")
+            obj.__dict__["_lazy_materializing"] = True
+            try:
+                materializer(obj)
+            finally:
+                obj.__dict__.pop("_lazy_materializing", None)
+            # A failed attempt must retain the callback for subsequent access.
             obj.__dict__["_lazy_materializer"] = None
-            materializer(obj)
         return obj.__dict__.get(self.name)
 
     def __set__(self, obj: Any, value: Any) -> None:

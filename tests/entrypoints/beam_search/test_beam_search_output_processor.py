@@ -147,6 +147,149 @@ def test_output_boundaries_and_lazy_materialization(
     assert request.items[0].request.prompt_token_ids.tolist() == prefix
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("first_field", ["tokens", "text", "logprobs"])  # type: ignore[misc]
+def test_lazy_decode_failure_preserves_beam_until_retry(
+    monkeypatch: pytest.MonkeyPatch, first_field: str
+) -> None:
+    import vllm_gr.entrypoints.beam_search.output_processor as output_processor
+
+    processor, call, request, result, tokenizer = _case()
+    beams = processor.process_outputs(call, request, result)[0].sequences
+    beam = beams[0]
+    materializer = vars(beam)["_lazy_materializer"]
+    suffix = vars(beam)["_v1_suffix"]
+    full = (1, 2, 10, 3, 4, 20)
+    failed = False
+    original_decode = tokenizer.decode
+
+    def decode(ids: Any) -> str:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise ValueError("transient decode failure")
+        return cast(str, original_decode(ids))
+
+    monkeypatch.setattr(tokenizer, "decode", decode)
+    monkeypatch.setattr(output_processor, "_can_share_prompt_decode", lambda *_: False)
+
+    with pytest.raises(ValueError, match="transient decode failure"):
+        getattr(beam, first_field)
+    assert type(beam) is _LazyMaterializedBeamSequence
+    assert vars(beam)["_lazy_materializer"] is materializer
+    assert vars(beam)["_v1_suffix"] is suffix
+    assert vars(beam)["tokens"] == [] and vars(beam)["text"] is None
+    assert "_lazy_materializing" not in vars(beam)
+    assert type(beams[1]) is _LazyMaterializedBeamSequence
+
+    getattr(beam, first_field)
+    assert type(beam) is BeamSearchSequence
+    assert beam.tokens == list(full)
+    assert beam.logprobs == []
+    assert beam.text == "|".join(map(str, full))
+    assert beam.cum_logprob == -1.25
+    assert "_v1_suffix" not in vars(beam)
+    assert vars(beam)["_lazy_materializer"] is None
+    assert "_lazy_materializing" not in vars(beam)
+    assert tokenizer.decode_calls == 1
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_recursive_lazy_field_access_does_not_publish_placeholders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor, call, request, result, tokenizer = _case()
+    beam = processor.process_outputs(call, request, result)[0].sequences[0]
+    materializer = vars(beam)["_lazy_materializer"]
+    suffix = vars(beam)["_v1_suffix"]
+    original_decode = tokenizer.decode
+
+    def reentrant_decode(ids: Any) -> str:
+        return cast(str, beam.text)
+
+    monkeypatch.setattr(tokenizer, "decode", reentrant_decode)
+    with pytest.raises(RuntimeError, match="recursive Beam output materialization"):
+        _ = beam.tokens
+    assert type(beam) is _LazyMaterializedBeamSequence
+    assert vars(beam)["_lazy_materializer"] is materializer
+    assert vars(beam)["_v1_suffix"] is suffix
+    assert vars(beam)["tokens"] == [] and vars(beam)["text"] is None
+    assert "_lazy_materializing" not in vars(beam)
+
+    monkeypatch.setattr(tokenizer, "decode", original_decode)
+    assert beam.tokens == [1, 2, 10, 3, 4, 20]
+    assert beam.text == "1|2|10|3|4|20"
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_shared_prompt_decode_retry_keeps_materialized_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_gr.entrypoints.beam_search.output_processor as output_processor
+
+    processor, call, request, result, tokenizer = _case()
+    first, second = processor.process_outputs(call, request, result)[0].sequences
+    materializer = vars(second)["_lazy_materializer"]
+    suffix = vars(second)["_v1_suffix"]
+    original_decode = tokenizer.decode
+    failed = False
+
+    def decode(ids: Any) -> str:
+        nonlocal failed
+        ids = tuple(ids)
+        if ids == (5, 20) and not failed:
+            failed = True
+            raise ValueError("transient decode failure")
+        return cast(str, original_decode(ids))
+
+    monkeypatch.setattr(tokenizer, "decode", decode)
+    monkeypatch.setattr(output_processor, "_can_share_prompt_decode", lambda *_: True)
+    assert first.text == "1|2|103|4|20"
+    completed_first = asdict(first)
+
+    with pytest.raises(ValueError, match="transient decode failure"):
+        _ = second.text
+    assert type(first) is BeamSearchSequence
+    assert asdict(first) == completed_first
+    assert type(second) is _LazyMaterializedBeamSequence
+    assert vars(second)["_lazy_materializer"] is materializer
+    assert vars(second)["_v1_suffix"] is suffix
+    assert "_lazy_materializing" not in vars(second)
+
+    assert second.text == "1|2|105|20"
+    assert second.tokens == [1, 2, 10, 5, 20]
+    assert second.logprobs == [] and second.cum_logprob == -2.5
+    assert second.finish_reason == "stop" and second.stop_reason == 20
+    assert asdict(first) == completed_first
+    assert tokenizer.decode_calls == 3
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_lazy_class_transition_failure_keeps_the_accepted_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.entrypoints.generate.beam_search.utils as beam_utils
+
+    class IncompatibleSequence:
+        __slots__ = ("different_layout",)
+
+    processor, call, request, result, _ = _case()
+    beam = processor.process_outputs(call, request, result)[0].sequences[0]
+    materializer = vars(beam)["_lazy_materializer"]
+    suffix = vars(beam)["_v1_suffix"]
+    with monkeypatch.context() as patch:
+        patch.setattr(beam_utils, "BeamSearchSequence", IncompatibleSequence)
+        with pytest.raises(TypeError, match="__class__ assignment"):
+            _ = beam.text
+    assert type(beam) is _LazyMaterializedBeamSequence
+    assert vars(beam)["_lazy_materializer"] is materializer
+    assert vars(beam)["_v1_suffix"] is suffix
+    assert vars(beam)["tokens"] == [] and vars(beam)["text"] is None
+    assert "_lazy_materializing" not in vars(beam)
+    assert beam.tokens == [1, 2, 10, 3, 4, 20]
+    assert type(beam) is BeamSearchSequence
+
+
 @pytest.mark.parametrize("operation", [copy.copy, replace, asdict])  # type: ignore[misc]
 def test_public_dataclass_contract(operation: Any) -> None:
     processor, call, request, result, _ = _case()
