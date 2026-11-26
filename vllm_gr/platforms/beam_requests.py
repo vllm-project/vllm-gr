@@ -79,8 +79,8 @@ def validate_frontend_constraint_mode(
 ) -> None:
     device = _device_type(config, default="cuda")
     if configured_constraint_mode(gr_config) is ConstraintMode.NONE:
-        if device not in ("cuda", "npu"):
-            raise ValueError("unconstrained beam_search requires CUDA or NPU")
+        if device not in ("cuda", "musa", "npu"):
+            raise ValueError("unconstrained beam_search requires CUDA, MUSA, or NPU")
         return
 
     table = runtime_constraint_table(gr_config)
