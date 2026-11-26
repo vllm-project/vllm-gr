@@ -26,7 +26,13 @@ def _device_type(config: Any, *, default: str | None = None) -> str | None:
 def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
     """Check execution support without importing a device runtime."""
     device = _device_type(config)
-    if device not in (None, "cuda", "npu"):
+    if device == "musa":
+        from vllm_gr.platforms.interface import BeamKVReorderProvider
+        from vllm_gr.platforms.registry import get_active_backend
+
+        if not isinstance(get_active_backend(), BeamKVReorderProvider):
+            raise ValueError("MUSA Beam requires an active GR Beam provider")
+    elif device not in (None, "cuda", "npu"):
         raise ValueError(
             "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
         )

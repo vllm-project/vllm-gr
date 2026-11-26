@@ -53,7 +53,22 @@ class MUSABackendProvider(CUDABackendProvider):
         return full_vocabulary_topk_out
 
     def resolve(self, request: BackendRequest) -> BackendPlan:
-        raise ValueError("The MUSA provider currently supports runtime initialization only")
+        native = request.native.to_dict()
+        gr = request.config.to_dict()
+        if not native["enforce_eager"] or gr["beam_graph_enabled"] or gr["prefill_graph_enabled"]:
+            raise ValueError("MUSA Beam requires eager execution with both GR graph modes disabled")
+        if native["use_v2_model_runner"] or any(
+            native[name] != 1
+            for name in (
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "data_parallel_size",
+            )
+        ):
+            raise ValueError("MUSA Beam requires single-device ModelRunner V1")
+        if request.has_constraint_table or gr["attention_backend"] != "CUSTOM":
+            raise ValueError("MUSA Beam requires unconstrained requests and CUSTOM attention")
+        return super().resolve(request)
 
 
 BACKEND = MUSABackendProvider()
