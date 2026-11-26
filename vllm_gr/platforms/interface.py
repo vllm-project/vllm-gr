@@ -30,6 +30,23 @@ class ConfigProvider(Protocol):
     def create_config_service(self) -> BackendConfigService: ...
 
 
+class BeamKVReorder(Protocol):
+    def __call__(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot: int,
+        parent_ids: torch.Tensor,
+        decode_step: int,
+        active_mask: torch.Tensor,
+    ) -> None: ...
+
+
+@runtime_checkable
+class BeamKVReorderProvider(Protocol):
+    def get_beam_kv_reorder(self) -> BeamKVReorder: ...
+
+
 class FullVocabularySelector(Protocol):
     """Write Beam candidates into the stage runner's preallocated buffers."""
 
