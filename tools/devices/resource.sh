@@ -19,9 +19,27 @@ if [ "$npu_state" = true ]; then
     source "$_vllm_gr_device_tools_dir/resource-npu.sh"
 fi
 
+# Detect an AMD ROCm environment: no NPU or NVIDIA tooling, and the amdgpu
+# KFD driver exposes at least one GPU node. Set rocm_state before sourcing to
+# override the detection.
+# shellcheck source=tools/devices/resource-rocm.sh
+source "$_vllm_gr_device_tools_dir/resource-rocm.sh"
+if [ -z "${rocm_state:-}" ]; then
+    if [ "$npu_state" = false ] && ! command -v nvidia-smi &> /dev/null \
+        && rocm_gpu_count &> /dev/null; then
+        rocm_state=true
+    else
+        rocm_state=false
+    fi
+fi
+
 function is_available() {
     if [ "$npu_state" = true ]; then
         is_available_npu "$@"
+        return $?
+    fi
+    if [ "$rocm_state" = true ]; then
+        is_available_rocm "$@"
         return $?
     fi
     local i=$1
@@ -36,15 +54,15 @@ function is_available() {
     [[ $stats =~ $idle_record ]] && [ "${BASH_REMATCH[1]}" -lt "$mem_gpu" ]
 }
 
-# _cuda_device_indices <gpu_count>
-# Prints the physical GPU indices to consider, one per line. Honors
-# CUDA_VISIBLE_DEVICES (a comma-separated list of physical indices, matching
-# nvidia-smi under CUDA_DEVICE_ORDER=PCI_BUS_ID) so selection stays inside the
-# devices the CUDA runtime can see. Falls back to all indices when unset, and
-# exposes none when the variable is set but empty, matching the CUDA runtime.
-function _cuda_device_indices() {
-    local gpu_count=$1
-    if ! [[ -v CUDA_VISIBLE_DEVICES ]]; then
+# _visible_device_indices <variable> <gpu_count>
+# Prints the physical GPU indices to consider, one per line. Honors the named
+# visibility variable (a comma-separated list of physical indices) so
+# selection stays inside the devices the runtime can see. Falls back to all
+# indices when unset, and exposes none when the variable is set but empty.
+function _visible_device_indices() {
+    local name=$1
+    local gpu_count=$2
+    if ! [[ -v $name ]]; then
         # Unset: consider every physical GPU.
         local i
         for (( i=0; i<gpu_count; i++ )); do
@@ -52,18 +70,19 @@ function _cuda_device_indices() {
         done
         return 0
     fi
-    if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
-        # Set but empty: CUDA exposes no devices.
-        echo "CUDA_VISIBLE_DEVICES is set but empty: no devices visible" >&2
+    local mask=${!name}
+    if [ -z "$mask" ]; then
+        # Set but empty: the runtime exposes no devices.
+        echo "$name is set but empty: no devices visible" >&2
         return 1
     fi
-    if [[ ! $CUDA_VISIBLE_DEVICES =~ ^[0-9]+(,[0-9]+)*$ ]]; then
-        echo "Invalid CUDA_VISIBLE_DEVICES: expected comma-separated non-negative integers" >&2
+    if [[ ! $mask =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "Invalid $name: expected comma-separated non-negative integers" >&2
         return 1
     fi
     local idx found=0
     local -a indices
-    IFS=',' read -ra indices <<< "$CUDA_VISIBLE_DEVICES"
+    IFS=',' read -ra indices <<< "$mask"
     for idx in "${indices[@]}"; do
         if [ "$idx" -lt "$gpu_count" ]; then
             echo "$((10#$idx))"
@@ -71,10 +90,34 @@ function _cuda_device_indices() {
         fi
     done
     if [ "$found" -eq 0 ]; then
-        echo "No CUDA_VISIBLE_DEVICES id is within [0, $gpu_count)" >&2
+        echo "No $name id is within [0, $gpu_count)" >&2
         return 1
     fi
     return 0
+}
+
+# _cuda_device_indices <gpu_count>
+# Honors CUDA_VISIBLE_DEVICES, matching nvidia-smi under
+# CUDA_DEVICE_ORDER=PCI_BUS_ID.
+function _cuda_device_indices() {
+    _visible_device_indices CUDA_VISIBLE_DEVICES "$1"
+}
+
+# _gpu_count and _gpu_indices <gpu_count> select the vendor tooling.
+function _gpu_count() {
+    if [ "$rocm_state" = true ]; then
+        rocm_gpu_count
+        return $?
+    fi
+    nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tail -n 1
+}
+
+function _gpu_indices() {
+    if [ "$rocm_state" = true ]; then
+        _rocm_device_indices "$1"
+        return $?
+    fi
+    _cuda_device_indices "$1"
 }
 
 function get_gpu() {
@@ -87,12 +130,12 @@ function get_gpu() {
     local timeout_secs=${2:-15} # seconds to wait; 0 waits indefinitely
 
     local gpu_count
-    gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tail -n 1) || return 1
+    gpu_count=$(_gpu_count) || return 1
     if [ -z "$gpu_count" ]; then echo "No GPUs available" >&2; return 1; fi
 
     local indices
-    indices=$(_cuda_device_indices "$gpu_count") || return 1
-    if [ -z "$indices" ]; then echo "No GPUs visible to CUDA" >&2; return 1; fi
+    indices=$(_gpu_indices "$gpu_count") || return 1
+    if [ -z "$indices" ]; then echo "No GPUs visible to the runtime" >&2; return 1; fi
 
     local start_time=$(date +%s)
 
@@ -127,11 +170,11 @@ function get_gpus() {
     local timeout_secs=${3:-15} # seconds to wait; 0 waits indefinitely
 
     local gpu_count
-    gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tail -n 1) || return 1
+    gpu_count=$(_gpu_count) || return 1
     if [ -z "$gpu_count" ]; then return 1; fi
 
     local indices
-    indices=$(_cuda_device_indices "$gpu_count") || return 1
+    indices=$(_gpu_indices "$gpu_count") || return 1
     if [ -z "$indices" ]; then return 1; fi
 
     local start_time=$(date +%s)
@@ -176,7 +219,7 @@ function get_gpus() {
 # This prevents other scripts using get_gpu from selecting it.
 # It starts a background process and prints its PID.
 # The caller is responsible for killing this PID to unlock the GPU.
-# Requires Python on CUDA.
+# Requires Python on CUDA and ROCm.
 function lock_gpu() {
     local gpu_id=$1
     local lock_pid=0
@@ -199,7 +242,17 @@ function lock_gpu() {
             echo "Cannot lock GPU: install python or python3" >&2
             return 1
         fi
-        "$interpreter" "$_vllm_gr_device_tools_dir/lock_gpu.py" "$gpu_id" > "$ready_file" 2>&1 &
+        local -a lock_args=("$gpu_id")
+        if [ "$rocm_state" = true ]; then
+            local address
+            if ! address=$(rocm_gpu_pci_address "$gpu_id"); then
+                rm -f -- "$ready_file"
+                echo "Unknown ROCm GPU index $gpu_id" >&2
+                return 1
+            fi
+            lock_args+=(--rocm-pci-address "$address")
+        fi
+        "$interpreter" "$_vllm_gr_device_tools_dir/lock_gpu.py" "${lock_args[@]}" > "$ready_file" 2>&1 &
         lock_pid=$!
     fi
     # Poll until we see 'READY' or the process dies (max ~10s).
