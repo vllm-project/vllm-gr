@@ -48,6 +48,7 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
         return _orig_prepare_inputs
 
+    # vLLM-MUSA execute_model passes use_cached_decode_logits_indices to _prepare_inputs.
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens, **native_options):
         # Publish the scheduler output so the _model_forward prefill-graph
