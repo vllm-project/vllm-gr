@@ -12,6 +12,7 @@ import torch
 
 from vllm_gr.v1.beam.attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.session import BeamSearchSession
+from vllm_gr.v1.beam.session_registry import BeamSessionRegistry
 
 
 def _make_context(
@@ -217,6 +218,37 @@ def test_slot_allocation_and_release_cycle() -> None:
     # Now we can allocate again
     slot3 = context.registry.allocate("session_3", beam_width=1, prefix_len=5)
     assert slot3 == 0  # recycled slot
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("max_batch", [1, 2])  # type: ignore[misc]
+def test_duplicate_slot_allocation_preserves_session_and_capacity(max_batch: int) -> None:
+    registry = BeamSessionRegistry(max_batch)
+    slot = registry.allocate("existing", beam_width=2, prefix_len=10)
+    state = registry.get_state("existing")
+    state.decode_step = 1
+
+    with pytest.raises(RuntimeError, match="Beam session 'existing' already allocated"):
+        registry.allocate("existing", beam_width=4, prefix_len=20)
+
+    assert registry.num_active_sessions == 1
+    assert registry.get_slot("existing") == slot
+    assert registry.get_state("existing") is state
+    assert state.beam_width == 2
+    assert state.prefix_len == 10
+    assert state.decode_step == 1
+
+    registry.release("existing")
+    assert registry.num_active_sessions == 0
+    assert registry.allocate("existing", beam_width=1, prefix_len=0) == slot
+    registry.release("existing")
+    assert [
+        registry.allocate(f"replacement_{index}", beam_width=1, prefix_len=0)
+        for index in range(max_batch)
+    ] == list(range(max_batch))
+    assert registry.num_active_sessions == max_batch
+    with pytest.raises(RuntimeError, match="No free beam session slots"):
+        registry.allocate("overflow", beam_width=1, prefix_len=0)
 
 
 def test_step_complete_advances_decode_step() -> None:
