@@ -106,6 +106,7 @@ include = ["vllm_gr*"]
 "vllm_gr.config" = ["default_config.yaml"]
 "vllm_gr.entrypoints.grpc" = ["proto/*.proto"]
 "vllm_gr.entrypoints.grpc.generated" = ["README.md"]
+"vllm_gr.platforms.musa" = ["README.md"]
 
 [tool.setuptools_scm]
 # setup.py owns version selection and device suffixes.
