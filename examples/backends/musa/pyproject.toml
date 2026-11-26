@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-gr-musa"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+dependencies = ["vllm-gr>=0.30.0,<0.31.0"]
+
+[project.entry-points."vllm_gr.platform_backends"]
+musa = "vllm_gr_musa:BACKEND"
