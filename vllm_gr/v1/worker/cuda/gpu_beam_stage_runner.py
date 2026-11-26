@@ -1286,7 +1286,7 @@ def get_stage_runner(
         raise ValueError("Scheduler and Worker Asynchronous scheduling execution capacities differ")
     parallel = worker.parallel_config
     if (
-        torch.device(worker.device).type != "cuda"
+        torch.device(worker.device).type not in ("cuda", "musa")
         or not worker.vllm_config.scheduler_config.async_scheduling
         or parallel.tensor_parallel_size != 1
         or parallel.pipeline_parallel_size != 1
@@ -1299,7 +1299,7 @@ def get_stage_runner(
         or cfg.beam_max_decode_steps < m.beam_params.max_tokens
     ):
         raise ValueError(
-            "persistent GR requires CUDA async, TP/PP/DP=1, FP16/BF16 and matching capacity"
+            "persistent GR requires GPU async, TP/PP/DP=1, FP16/BF16 and matching capacity"
         )
     backend = getattr(worker, "constraint_backend", None)
     unconstrained = configured_constraint_mode(cfg) is ConstraintMode.NONE
