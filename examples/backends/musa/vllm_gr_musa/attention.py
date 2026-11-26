@@ -190,9 +190,10 @@ class EagerBeamAttention:
             )
         )
 
-    @staticmethod
-    def prefill_attention(**kwargs) -> None:
-        raise ValueError("Eager MUSA Beam does not support prefill graphs")
+    def prefill_attention(self, *, dense_prefill="off", **kwargs) -> None:
+        if dense_prefill != "off":
+            raise ValueError("MUSA Beam requires paged prefill")
+        self.cascade_attention(**kwargs)
 
 
 EAGER_BEAM_ATTENTION = EagerBeamAttention()
