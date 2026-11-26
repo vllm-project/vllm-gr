@@ -142,11 +142,13 @@ def test_selector_installation_is_idempotent_and_force_uses_original(
         AttentionBackendEnum.FLASH_ATTN,
         "selector-config",
         num_heads=2,
+        _run_kv_cache_dtype="auto",
     )
     native_selector.assert_called_once_with(
         AttentionBackendEnum.FLASH_ATTN,
         "selector-config",
         num_heads=2,
+        _run_kv_cache_dtype="auto",
     )
 
 
