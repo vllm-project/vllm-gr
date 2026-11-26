@@ -60,6 +60,61 @@ def _lock_gpu_cuda(ordinal: int, expected_uuid: bytes, mem_to_alloc_mb: int) -> 
         return False
 
 
+# A HIP context holds no VRAM, so a ROCm lock must allocate more than the idle
+# thresholds that runners pass to get_gpu (resource-rocm.sh counts KFD VRAM).
+ROCM_MIN_LOCK_MB = 64
+
+
+def _load_hip() -> ctypes.CDLL:
+    candidates: list[str] = []
+    try:
+        import rocm_sdk  # Pip-installed ROCm SDKs keep the library in a package.
+
+        candidates += [str(path) for path in rocm_sdk.find_libraries("amdhip64")]
+    except Exception:
+        pass
+    candidates += ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
+    for root in (os.environ.get("ROCM_PATH"), "/opt/rocm"):
+        if root:
+            candidates.append(os.path.join(root, "lib", "libamdhip64.so"))
+    for candidate in candidates:
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError:
+            continue
+    raise OSError("Cannot load the HIP runtime library (libamdhip64.so)")
+
+
+def lock_gpu_rocm(pci_address: str, mem_to_alloc_mb: int) -> None:
+    """Lock the ROCm GPU at ``pci_address`` among the HIP-visible devices."""
+    try:
+        hip = _load_hip()
+        if hip.hipInit(0) != 0:
+            sys.exit("hipInit failed")
+        count = ctypes.c_int()
+        if hip.hipGetDeviceCount(ctypes.byref(count)) != 0:
+            sys.exit("hipGetDeviceCount failed")
+        target = pci_address.lower()
+        for ordinal in range(count.value):
+            bus_id = ctypes.create_string_buffer(32)
+            if hip.hipDeviceGetPCIBusId(bus_id, len(bus_id), ordinal) != 0:
+                continue
+            if bus_id.value.decode().lower() == target:
+                break
+        else:
+            sys.exit(f"No HIP-visible device has PCI address {pci_address}")
+        if hip.hipSetDevice(ordinal) != 0:
+            sys.exit(f"hipSetDevice({ordinal}) failed")
+        size_bytes = max(mem_to_alloc_mb, ROCM_MIN_LOCK_MB) * 1024 * 1024
+        pointer = ctypes.c_void_p()
+        if hip.hipMalloc(ctypes.byref(pointer), ctypes.c_size_t(size_bytes)) != 0:
+            sys.exit(f"hipMalloc failed on {pci_address}")
+    except OSError as exc:
+        sys.exit(f"Cannot lock ROCm GPU {pci_address}: {exc}")
+    print("READY", flush=True)
+    time.sleep(31536000)
+
+
 def lock_gpu(gpu_id: int, mem_to_alloc_mb: int):
     try:
         ordinal = _cuda_visible_ordinal(gpu_id)
@@ -233,5 +288,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Lock a GPU by allocating some VRAM.")
     parser.add_argument("gpu_id", type=int, help="ID of the GPU to lock.")
     parser.add_argument("--mem", type=int, default=4, help="Amount of memory in MB to allocate.")
+    parser.add_argument(
+        "--rocm-pci-address",
+        help="Lock the ROCm GPU at this PCI address (resource.sh resolves it from gpu_id).",
+    )
     args = parser.parse_args()
-    lock_gpu(args.gpu_id, args.mem)
+    if args.rocm_pci_address:
+        lock_gpu_rocm(args.rocm_pci_address, args.mem)
+    else:
+        lock_gpu(args.gpu_id, args.mem)

@@ -59,7 +59,8 @@ the vendor's `bin/set_env.bash` when present. The fallback requires a single
 
 On shared machines, pass the IDs allocated to your job. The runner uses
 `--device-id` to set `CUDA_VISIBLE_DEVICES` or `ASCEND_RT_VISIBLE_DEVICES`
-for the tests, replacing any inherited value. Without that option, the runner
+for the tests, replacing any inherited value. On AMD ROCm hosts it also sets
+`HIP_VISIBLE_DEVICES`. Without that option, the runner
 first runs resource probes, then waits for an idle device from the visible
 set. A probe on multi-GPU hosts can temporarily select GPU 1. Automatic
 selection gives no exclusive reservation for the suite.
@@ -74,6 +75,24 @@ exposes none. Malformed masks stop selection. The helpers intersect valid
 masks with the available devices and skip devices whose telemetry is missing
 or invalid. CUDA locks verify the physical device UUID. Ascend locks use
 sleep processes as advisory markers.
+
+On AMD ROCm hosts, the helpers read sysfs instead of `amd-smi`:
+
+- Device IDs follow the KFD topology order, which is the HIP order used by
+  `HIP_VISIBLE_DEVICES`. `amd-smi` lists devices by PCI address, which can
+  differ, so do not take IDs from it.
+- A GPU is idle when the VRAM held by all KFD processes on the host, in any
+  container, is below the threshold and its busy percentage reaches zero
+  within three samples. Total VRAM usage includes driver reservations, and a
+  GPU that drives a display reports short graphics bursts, so neither is used
+  directly.
+- GPUs with less than `VLLM_GR_ROCM_MIN_VRAM_MIB` (default 4096) of VRAM,
+  such as integrated GPUs, are never selected.
+- `HIP_VISIBLE_DEVICES` takes precedence over `CUDA_VISIBLE_DEVICES`.
+  `ROCR_VISIBLE_DEVICES` renumbers devices and is rejected.
+- Locks match the GPU by PCI address and allocate at least 64 MiB. A HIP
+  context holds no VRAM, so a smaller lock would stay below the idle
+  thresholds.
 
 Buildkite runs L1 CPU and L2 CUDA tests in the Ready pipeline and L3 CUDA
 tests in the Merge pipeline. The GitHub Actions device job uses `pr-device`
