@@ -728,7 +728,7 @@ def bootstrap_beam_outputs_out(
         COMPACT_INPUT=compact_input,
         WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
         BLOCK=triton.next_power_of_2(max(beam_width, candidate_width)),
-        REUSE_ORDERED_CANDIDATES=reuse_ordered_candidates,
+        REUSE_ORDERED_CANDIDATES=reuse_ordered_candidates and hasattr(tl, "gather"),
         num_warps=num_warps,
     )
 
