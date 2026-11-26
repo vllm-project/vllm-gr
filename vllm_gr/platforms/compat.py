@@ -19,6 +19,9 @@ logger = logging.getLogger("vllm_gr.platforms.compat")
 SUPPORTED_VLLM_VERSION = "0.30.0"
 SUPPORTED_VLLM_ASCEND_VERSION = "0.30.0rc2"
 SUPPORTED_TRITON_ASCEND_VERSION = "3.6.0"
+#: ROCm builds vLLM from source. v0.30.0rc2 differs from v0.30.0 only in
+#: CPU-image and CUDA DeepGEMM build scripts, so both releases are accepted.
+SUPPORTED_ROCM_VLLM_VERSION_RANGE = ">=0.30.0rc2,<=0.30.0"
 
 #: When set to a truthy value, an unsatisfied declared range is a hard failure.
 #: The default only warns: whether a declared range still holds is a vendor
@@ -86,6 +89,16 @@ def require_runtime_version(distribution: str, required: str) -> str:
 def check_vllm_runtime() -> dict[str, str]:
     """Check the vLLM runtime supported by the built-in providers."""
     return {"vllm": require_runtime_version("vllm", SUPPORTED_VLLM_VERSION)}
+
+
+def check_vllm_runtime_range(specifier: str) -> dict[str, str]:
+    """Check that the installed vLLM public version is inside ``specifier``."""
+    installed = installed_version("vllm")
+    if installed is None:
+        raise RuntimeError("vllm-gr requires vllm to be installed before runtime initialization")
+    if not _specifier_allows(specifier, installed.partition("+")[0]):
+        raise RuntimeError(f"Unsupported vllm version: found {installed}, required {specifier}.")
+    return {"vllm": installed}
 
 
 def _specifier_allows(specifier: str, version: str) -> bool:

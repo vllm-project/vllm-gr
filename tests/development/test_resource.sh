@@ -17,6 +17,9 @@ elif command -v npu-smi &> /dev/null; then
     # Use npu-smi to count the number of NPUs by counting the number of entries
     # Each NPU entry starts with a line containing a number and the card name
     GPU_COUNT=$(npu-smi info 2>/dev/null | grep "^| [0-9]" | awk '{print $2}' | sort -u | wc -l)
+elif [ -d "${VLLM_GR_KFD_TOPOLOGY:-/sys/class/kfd/kfd/topology/nodes}" ]; then
+    # AMD ROCm: resource.sh counts the KFD GPU nodes once it is sourced.
+    GPU_COUNT=rocm
 else
     echo "SKIP: No supported accelerator (GPU/NPU) found to test."
     exit 0
@@ -24,6 +27,12 @@ fi
 
 # Source the target library
 source "./tools/devices/resource.sh"
+if [ "$GPU_COUNT" = rocm ]; then
+    if [ "$rocm_state" != true ] || ! GPU_COUNT=$(rocm_gpu_count); then
+        echo "SKIP: No supported accelerator (GPU/NPU) found to test."
+        exit 0
+    fi
+fi
 
 lock_pid_state() {
     local pid=$1 stat rc

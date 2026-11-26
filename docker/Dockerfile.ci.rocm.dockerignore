@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+**
+!LICENSE
+!NOTICE
+!README.md
+!MANIFEST.in
+!pyproject.toml
+!setup.py
+!tools/packaging/git_version.py
+!requirements/
+!vllm_gr/
+!benchmarks/open_one_rec/
+!docs/cli/patches/vllm-0.30.0-gr-cli.patch
+!tools/ci/fetch_github_source.sh
+**/__pycache__/
+vllm_gr/_version.py

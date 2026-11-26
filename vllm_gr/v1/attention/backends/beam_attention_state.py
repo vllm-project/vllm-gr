@@ -22,6 +22,13 @@ class AttentionState(NamedTuple):
     lse: torch.Tensor
 
 
+def _fa2_swaps_single_query_gqa_lse() -> bool:
+    """vLLM's CUDA FA2 packs single-query GQA heads; ROCm FlashAttention does not."""
+    from vllm_gr.utils import accelerator
+
+    return not accelerator.is_rocm()
+
+
 def normalize_flash_attn_state(
     out: torch.Tensor,
     lse: torch.Tensor,
@@ -33,8 +40,9 @@ def normalize_flash_attn_state(
 ) -> AttentionState:
     """Adapt vLLM's FA2/3/4 varlen results without reading device data on CPU.
 
-    FA3/FA4 and FA2 paged KV already return canonical head-major LSE. FA2's
-    non-paged single-query GQA specialization needs a layout conversion.
+    FA3/FA4 and FA2 paged KV already return canonical head-major LSE. CUDA FA2's
+    non-paged single-query GQA specialization needs a layout conversion; ROCm
+    FlashAttention has no such specialization and is already canonical.
     Ordinary multi-query prefix calls reuse their tensors without GPU work.
     """
     if fa_version not in (2, 3, 4):
@@ -50,7 +58,13 @@ def normalize_flash_attn_state(
         raise ValueError("Attention output and LSE must be on the same device")
 
     group_size = heads // num_kv_heads
-    if fa_version == 2 and not paged_kv and max_query_len == 1 and group_size > 1:
+    if (
+        fa_version == 2
+        and not paged_kv
+        and max_query_len == 1
+        and group_size > 1
+        and _fa2_swaps_single_query_gqa_lse()
+    ):
         lse = (
             lse.reshape(num_kv_heads, group_size, tokens)
             .transpose(1, 2)

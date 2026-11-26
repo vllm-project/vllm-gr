@@ -30,6 +30,20 @@ def is_cuda_available() -> bool:
         return False
 
 
+def is_rocm() -> bool:
+    """Return whether vLLM selected AMD ROCm (tensors still use ``cuda`` placement).
+
+    ROCm-specific Beam attention behavior queries this single helper so tests
+    that simulate NVIDIA CUDA on any host can pin it.
+    """
+    try:
+        from vllm.platforms import current_platform
+    except ImportError:
+        return False
+    probe = getattr(current_platform, "is_rocm", None)
+    return bool(probe()) if callable(probe) else False
+
+
 def _cleanup_torch_backend(backend, *, collect_ipc: bool) -> bool:
     """Best-effort cleanup for a torch accelerator backend."""
     if backend is None:
