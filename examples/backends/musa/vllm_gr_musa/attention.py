@@ -80,3 +80,31 @@ def write_paged_kv(
     offsets = slots % block_size
     key_cache[pages, offsets] = key[: slot_mapping.numel()][valid]
     value_cache[pages, offsets] = value[: slot_mapping.numel()][valid]
+
+
+def eager_paged_prefill(
+    query: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    block_table: torch.Tensor,
+    sequence_length: int,
+    scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """Attend the final query positions to their logical paged KV sequence."""
+    query_length, query_heads, head_dim = query.shape
+    _, page_size, kv_heads, _ = key_pages.shape
+    if not query_length <= sequence_length <= block_table.numel() * page_size:
+        raise ValueError("Invalid paged prefill geometry")
+    pages = block_table[: (sequence_length + page_size - 1) // page_size].long()
+    key = key_pages.index_select(0, pages).flatten(0, 1)[:sequence_length].float()
+    value = value_pages.index_select(0, pages).flatten(0, 1)[:sequence_length].float()
+    grouped = query.float().reshape(query_length, kv_heads, -1, head_dim)
+    scores = torch.einsum("qhgd,khd->qhgk", grouped, key) * scale
+    if causal:
+        positions = torch.arange(sequence_length, device=query.device)
+        query_positions = positions[-query_length:]
+        future = positions[None, :] > query_positions[:, None]
+        scores = scores.masked_fill(future[:, None, None, :], -torch.inf)
+    result = torch.einsum("qhgk,khd->qhgd", scores.softmax(dim=-1), value)
+    return result.reshape_as(query).to(query.dtype)
