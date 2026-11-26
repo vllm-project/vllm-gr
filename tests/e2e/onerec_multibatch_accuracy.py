@@ -50,8 +50,8 @@ def run(args: argparse.Namespace) -> int:
         TASK_REGISTRY,
         DataLoaderWrapper,
     )
-    from tests.st.model_runner_policy_isolation import check_idle, startup_expectations
-    from tests.st.multibatch_accuracy_checks import compare_output, validate_output
+    from tests.e2e.model_runner_policy_isolation import check_idle, startup_expectations
+    from tests.e2e.multibatch_accuracy_checks import compare_output, validate_output
     from vllm_gr.constraints.artifact_builder import (
         build_single_trie_artifact,
         load_triples,
@@ -144,8 +144,8 @@ def run(args: argparse.Namespace) -> int:
         | set(Path("benchmarks/open_one_rec").rglob("*.py"))
         | {
             Path(__file__),
-            Path("tests/st/model_runner_policy_isolation.py"),
-            Path("tests/st/multibatch_accuracy_checks.py"),
+            Path("tests/e2e/model_runner_policy_isolation.py"),
+            Path("tests/e2e/multibatch_accuracy_checks.py"),
             Path(".github/benchmark-gate.yaml"),
         }
     )
@@ -213,7 +213,7 @@ def run(args: argparse.Namespace) -> int:
         "gpu_memory_utilization": 0.7,
         "enforce_eager": False,
         "compilation_config": {"cudagraph_capture_sizes": capture_sizes},
-        "worker_extension_cls": "tests.st.model_runner_policy_isolation.PolicyWorkerExtension",
+        "worker_extension_cls": "tests.e2e.model_runner_policy_isolation.PolicyWorkerExtension",
     }
     expected_rows, expected_batches = startup_expectations(
         runner=args.runner,

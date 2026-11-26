@@ -160,10 +160,14 @@ def _short_suffix_engine_config(
         cache_config=CacheConfig(enable_prefix_caching=False),
         scheduler_config=SimpleNamespace(async_scheduling=True, enable_chunked_prefill=False),
     )
+    from vllm_gr.config import load_gr_config
+
     args = (
         engine_args_from_file(tmp_path, {"gr": options})
         if source == "file"
-        else SimpleNamespace(gr=options)
+        else SimpleNamespace(
+            additional_config={"vllm_gr": gr_config_to_mapping(load_gr_config(overrides=options))}
+        )
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: config)
     monkeypatch.setattr(

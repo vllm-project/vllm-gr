@@ -65,7 +65,7 @@ fully before cropping and therefore do not gain projection FLOPs from slicing.
 Do not infer bitwise parity or business accuracy from a latency improvement.
 
 For targeted projection comparisons, use
-`tests/st/run_vocab_slice_v1_review.py` with `--mode eager|graph` and
+`tests/e2e/run_vocab_slice_v1_review.py` with `--mode eager|graph` and
 `--projection full|slice`. Its `--strict-bf16` option is an isolated numerical
 control, not a production default. Diagnostic GPU stage timing is separate from
 the public end-to-end timing defined above; mocked TP routing is not multi-GPU

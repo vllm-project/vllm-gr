@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -146,29 +147,10 @@ def test_engine_config_entrypoint_preserves_unrelated_config(tmp_path: Path) -> 
 
 
 def test_cli_parser_uses_vllm_gr_engine_defaults() -> None:
+    from vllm.engine.arg_utils import EngineArgs
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    from vllm_gr.engine.arg_utils_gr import add_cli_args
-
-    def add_upstream_engine_args(
-        parser: FlexibleArgumentParser,
-    ) -> FlexibleArgumentParser:
-        for name in ("max_model_len", "max_num_batched_tokens"):
-            parser.add_argument(f"--{name.replace('_', '-')}", type=int, default=None)
-        for name in (
-            "enable_chunked_prefill",
-            "enable_prefix_caching",
-        ):
-            parser.add_argument(f"--{name.replace('_', '-')}", action="store_true", default=None)
-        return parser
-
-    parser = FlexibleArgumentParser()
-    with mock.patch(
-        "vllm_gr.engine.arg_utils_gr.origin_add_cli_args",
-        side_effect=add_upstream_engine_args,
-    ):
-        add_cli_args(parser)
-
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     defaults = parser.parse_args([])
     # GR defaults are resolved at EngineArgs construction after mode selection.
     assert defaults.max_model_len is None
@@ -223,8 +205,9 @@ def test_engine_config_rejects_invalid_raw_gr_value_without_cli_override() -> No
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
             return_value=_vllm_config({ATTENTION_BACKEND_KEY: "INVALID"}),
         ),
-        pytest.raises(ValueError, match="Supply GR settings"),
+        pytest.raises(ValueError, match="Removed vLLM-GR configuration keys"),
     ):
+        engine_args.additional_config = {ATTENTION_BACKEND_KEY: "INVALID"}
         create_engine_config(engine_args)
 
 
@@ -394,14 +377,16 @@ pytestmark = pytest.mark.cpu_test
 def test_engine_config_merge_keeps_npu_execution_choice(
     tmp_path: Path, execution: str | None
 ) -> None:
-    from vllm_gr.config.parser import load_engine_gr_config
+    from vllm_gr.config.parser import load_gr_config
 
-    args = engine_args_from_file(
-        tmp_path,
-        gr_config_to_mapping(GRConfig(npu_decode_execution=execution, beam_graph_batch_size=4)),
+    path = tmp_path / "scenario.yaml"
+    path.write_text(
+        json.dumps(
+            gr_config_to_mapping(GRConfig(npu_decode_execution=execution, beam_graph_batch_size=4))
+        )
     )
-    result = load_engine_gr_config(
-        args.config, {}, {"beam_width": [32, 32, 32], "candidate_width": [32, 32, 32]}
+    result = load_gr_config(
+        path, overrides={"beam_width": [32, 32, 32], "candidate_width": [32, 32, 32]}
     )
     assert result.npu_decode_execution is execution
     assert result.beam_graph_batch_size == 4

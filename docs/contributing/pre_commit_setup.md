@@ -57,7 +57,7 @@ pre-commit run mixed-line-ending --files "${files[@]}"
 git diff --check
 ```
 
-[Documentation CI](../../.github/workflows/pre-commit.yml) also runs
+[Documentation CI](../../.github/workflows/ci.yml) also runs
 `pre-commit run check-filenames --all-files` on all tracked paths, including
 for deletion-only PRs. Verify changed links, anchors, and example commands as
 described in the [documentation guide](docs_guide.md#checks).

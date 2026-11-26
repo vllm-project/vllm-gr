@@ -222,7 +222,7 @@ Select an available GPU using the environment's existing device allocation rules
 ```bash
 USE_TF=0 \
 VLLM_GR_TEST_MODEL="$ONEREC_MODEL" \
-python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py
+python -m pytest --run-slow -v -s tests/e2e/test_onerec_v1_scheduler_st.py
 ```
 
 The same file also carries one completions-route check configured with
@@ -234,7 +234,7 @@ and routing tests retain default `[1,2,4]` and sparse `[1,3,7]` policy coverage.
 The test configuration does not change production defaults.
 
 ```bash
-python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py \
+python -m pytest --run-slow -v -s tests/e2e/test_onerec_v1_scheduler_st.py \
   -k completion_batch --durations=0
 ```
 

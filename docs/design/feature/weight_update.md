@@ -186,7 +186,7 @@ dot-directories or symbolic links.
 [Sidecar runtime](../../../tests/sidecar/test_runtime.py), [management](../../../tests/sidecar/test_management.py),
 [retention](../../../tests/sidecar/test_retention.py) and [worker update](../../../tests/sidecar/test_worker_update.py)
 tests cover rollout order, 409 handling and validity transitions, cache
-pruning and Trie switching. The [HDFS system entry point](../../../tests/st/run_sidecar_hdfs.py)
+pruning and Trie switching. The [HDFS system entry point](../../../tests/e2e/run_sidecar_hdfs.py)
 exercises the end-to-end rollout and failure recovery.
 
 ## Source map

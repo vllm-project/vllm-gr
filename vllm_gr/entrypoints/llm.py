@@ -88,7 +88,7 @@ class GRLLM(LLM):
             raise ValueError(f"Removed GR options {sorted(removed)}; use gr or config")
 
         # Ensure the vllm-gr runtime patches are installed (EngineArgs
-        # arg-threading, worker hooks, EngineCore entrypoint) before building
+        # config finalization, worker hooks, EngineCore entrypoint) before building
         # EngineArgs.  The vLLM general-plugin loader normally does this at
         # process start, but offline GRLLM construction can precede that;
         # calling it explicitly is idempotent and self-contained.
@@ -98,18 +98,28 @@ class GRLLM(LLM):
         self._shutdown_complete = False
         self._frontend_gc_registered = False
 
-        kwargs["_gr_mode"] = True
-        kwargs["_gr_explicit_native_fields"] = set(kwargs) | ({"model"} if model else set())
-        if gr is not None:
-            kwargs["gr"] = gr
-        if config is not None:
-            from vllm_gr.config.parser import read_settings
+        from vllm_gr.config.parser import read_settings
+        from vllm_gr.engine.startup import (
+            prepare_engine_settings,
+            resolve_native_settings,
+        )
 
-            document = read_settings(config)
-            model = model or document.get("model", "")
-            kwargs["config"] = config
-            kwargs["_gr_startup_document"] = document
-        super().__init__(model=model, **kwargs)
+        if model:
+            kwargs["model"] = model
+        additional = kwargs.get("additional_config")
+        if (
+            config is None
+            and gr is None
+            and additional is not None
+            and not isinstance(additional, Mapping)
+        ):
+            # Leave the native extension object for vLLM to validate and hash.
+            values = resolve_native_settings(None, kwargs)
+        else:
+            document = read_settings(config) if config is not None else None
+            values, _, _ = prepare_engine_settings(document, kwargs, gr)
+        values.setdefault("model", model)
+        super().__init__(**values)
 
         _install_renderer_eos_token_id_cache()
 

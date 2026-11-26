@@ -25,9 +25,9 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Apply patches so EngineArgs.create_engine_config is wrapped."""
-        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+        from vllm_gr.engine.arg_utils_gr import patch_create_engine_config
 
-        patch_add_cli_args()
+        patch_create_engine_config()
 
     def _make_fake_config(self, backend=None, marker=None):
         """Build a lightweight VllmConfig-like object for mocking."""
@@ -63,7 +63,7 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
         mock_origin_create.return_value = fake_config
 
         class FakeSelf:
-            _gr_selected = True
+            additional_config = {"vllm_gr": {"gr": {}}}
             attention_backend = "CUSTOM"
             attention_config = None
 
@@ -86,7 +86,7 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
         mock_origin_create.return_value = fake_config
 
         class FakeSelf:
-            _gr_selected = True
+            additional_config = {"vllm_gr": {"gr": {}}}
             attention_backend = None
             attention_config = AttentionConfig(backend=AttentionBackendEnum.CUSTOM)
 

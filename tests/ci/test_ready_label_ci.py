@@ -175,7 +175,7 @@ class TestReadyLabelCI(unittest.TestCase):
         self.workflows = {
             path.name: yaml.safe_load(path.read_text())
             for path in (ROOT / ".github/workflows").glob("*.yml")
-            if path.name in {"pre-commit.yml", "build_wheel.yml"}
+            if path.name in {"ci.yml", "build_wheel.yml"}
         }
 
     def scheduled(
@@ -304,7 +304,7 @@ class TestReadyLabelCI(unittest.TestCase):
                 self.assertNotEqual(render(group, second), render(group, github))
 
     def test_abtest_toggle_does_not_cancel_ready_validation(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         group = workflow["concurrency"]["group"]
         cancel = workflow["concurrency"]["cancel-in-progress"]
         full = context("synchronize", ready=True, abtest=True)
@@ -347,7 +347,7 @@ class TestReadyLabelCI(unittest.TestCase):
         )
 
     def test_failed_validation_does_not_skip_blocking_gate(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         if "benchmark-blocking" not in workflow["jobs"]:
             self.skipTest("This branch uses a single validation job")
         for failed in workflow["jobs"]["benchmark-blocking"]["needs"]:
@@ -355,7 +355,7 @@ class TestReadyLabelCI(unittest.TestCase):
                 self.assertIn("benchmark-blocking", self.scheduled(workflow, context(), failed))
 
     def test_blocking_gate_still_rejects_unsuccessful_checks(self) -> None:
-        job = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]
+        job = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]
         success = dict.fromkeys(job["needs"], "success")
         success["beam-performance-ab-only"] = "skipped"
         scenarios = [(success, 0)]
@@ -383,7 +383,7 @@ class TestReadyLabelCI(unittest.TestCase):
         # job that actually failed, and describe the others as blocked by it,
         # otherwise a single root cause looks like several failures and
         # sends reviewers after the wrong thing.
-        job = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]
+        job = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]
         success = dict.fromkeys(job["needs"], "success")
         success["beam-performance-ab-only"] = "skipped"
         broken = {
@@ -420,7 +420,7 @@ class TestReadyLabelCI(unittest.TestCase):
         # Nothing failed, but required checks did not run. That must still fail
         # the gate, and must say so plainly rather than blaming a nonexistent
         # failure.
-        job = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]
+        job = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]
         success = dict.fromkeys(job["needs"], "success")
         success["beam-performance-ab-only"] = "skipped"
         skipped = {**success, "benchmark-policy": "skipped", "pre-commit": "skipped"}
@@ -432,7 +432,7 @@ class TestReadyLabelCI(unittest.TestCase):
         self.assertNotIn("failed and blocked", " ".join(errors))
 
     def test_ab_only_has_separate_check_and_does_not_run_on_drafts(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         gate = workflow["jobs"]["benchmark-blocking"]
         for ready in (False, True):
             github = context("labeled", ready=ready, abtest=True, label="abtest")
@@ -452,7 +452,7 @@ class TestReadyLabelCI(unittest.TestCase):
         self.assertEqual(self.run_gate(results, draft).returncode, 1)
 
     def test_docs_only_skips_ab(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         for event in (
             context("synchronize", ready=True, abtest=True),
             context("labeled", ready=True, abtest=True, label="ready"),
@@ -476,7 +476,7 @@ class TestReadyLabelCI(unittest.TestCase):
                 )
 
     def test_docs_gate_requires_docs_checks_and_ignores_ab_results(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         gate = workflow["jobs"]["benchmark-blocking"]
         event = context("synchronize", ready=True, abtest=True)
         results = dict.fromkeys(gate["needs"], "skipped")
@@ -489,7 +489,7 @@ class TestReadyLabelCI(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
     def test_ab_only_code_update_and_ready_removal_do_not_pass_full_gate(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         gate = workflow["jobs"]["benchmark-blocking"]
         results = dict.fromkeys(gate["needs"], "skipped")
         for github, expected_name in (
@@ -513,7 +513,7 @@ class TestReadyLabelCI(unittest.TestCase):
         self.assertEqual(render(gate["name"], ready), "Benchmark blocking gate")
 
     def test_ready_reuses_fresh_ab_and_reruns_stale_ab(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         ready = context("labeled", ready=True, label="ready")
         for fresh in (False, True):
             with self.subTest(fresh=fresh):
@@ -535,7 +535,7 @@ class TestReadyLabelCI(unittest.TestCase):
     def test_ab_freshness_lookup_accepts_only_current_revision(self) -> None:
         if shutil.which("node") is None:
             self.skipTest("Node.js is required to exercise the github-script lookup")
-        step = self.workflows["pre-commit.yml"]["jobs"]["resolve-ab-freshness"]["steps"][0]
+        step = self.workflows["ci.yml"]["jobs"]["resolve-ab-freshness"]["steps"][0]
         harness = """
 const fixture = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const outputs = {};
@@ -598,7 +598,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         ab_passed: bool = False,
         docs_only: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        steps = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]["steps"]
+        steps = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]["steps"]
         step = next(
             item for item in steps if item.get("name") == "Require every blocking check to pass"
         )
@@ -617,12 +617,12 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             for key, value in step["env"].items()
         }
         return run_workflow_command(
-            ["bash", "-eu", "-o", "pipefail", "-c", step["run"]],
+            [shutil.which("bash") or "bash", "-eu", "-o", "pipefail", "-c", step["run"]],
             env=env,
         )
 
     def test_main_ab_routing(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         gate = workflow["jobs"]["benchmark-blocking"]
         group = workflow["concurrency"]["group"]
         cancel = workflow["concurrency"]["cancel-in-progress"]
@@ -677,7 +677,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             )
 
     def test_recall_and_decode_benchmark_cover_both_target_branches_and_devices(self) -> None:
-        steps = self.workflows["pre-commit.yml"]["jobs"]["decode-benchmark"]["steps"]
+        steps = self.workflows["ci.yml"]["jobs"]["decode-benchmark"]["steps"]
         by_name = {step.get("name"): step for step in steps}
         recall_steps = (
             "Cache OneRec Recall constraint tables",
@@ -697,7 +697,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                             github.ref_name = "481/merge"
                         github.base_ref = github.event.pull_request.base.ref
                         target = render(
-                            self.workflows["pre-commit.yml"]["env"]["POLICY_TARGET_BRANCH"], github
+                            self.workflows["ci.yml"]["env"]["POLICY_TARGET_BRANCH"], github
                         )
                         expect_recall = device == "gpu" and (
                             branch == "main"
@@ -720,7 +720,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                         self.assertEqual(bool(evaluate(benchmark, github)), not expect_recall)
 
     def test_unready_and_draft_events_fail_required_gate(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         gate = workflow["jobs"]["benchmark-blocking"]
         for github in (
             context("opened", ready=False),
@@ -741,7 +741,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
 
     @pytest.mark.l1  # type: ignore[misc]
     def test_benchmark_jobs_wait_for_successful_precommit_and_policy(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         job = workflow["jobs"]["decode-benchmark"]
         self.assertEqual(set(job["needs"]), {"benchmark-policy", "pre-commit"})
         for policy in ("success", "failure", "cancelled", "skipped"):
@@ -777,7 +777,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         self.assertEqual(workflow["concurrency"]["queue"], "max")
         self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
 
-        pr_workflow = self.workflows["pre-commit.yml"]
+        pr_workflow = self.workflows["ci.yml"]
         gpu_lock = pr_workflow["jobs"]["pre-commit"]["concurrency"]["group"]
         self.assertEqual(gpu_lock, "vllm-gr-accelerator-${{ github.repository }}")
         self.assertEqual(workflow["concurrency"]["group"], gpu_lock)
@@ -841,6 +841,10 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             return bool(evaluate(condition, context()))
 
         for step in steps[1:]:
+            if step.get("name") == "Report tests moved to Buildkite":
+                self.assertTrue(evaluate(step["if"], context(event="workflow_dispatch")))
+                self.assertFalse(evaluate(step["if"], context(event="push")))
+                continue
             self.assertIn("steps.accelerator.outputs.run", step["if"])
             for level in ("l1", "l2", "l3", "l4", "l5"):
                 for hit in ("true", "false"):
@@ -867,9 +871,9 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             self.assertFalse(enabled(by_name[name], "true", "l3", "false"))
 
     def test_level_ci_preserves_existing_benchmark_gates(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
+        workflow = self.workflows["ci.yml"]
         jobs = workflow["jobs"]
-        self.assertEqual(jobs["pre-commit"]["env"]["VLLM_GR_TEST_LEVEL"], "pr")
+        self.assertEqual(jobs["pre-commit"]["env"]["VLLM_GR_TEST_LEVEL"], "pr-device")
         self.assertIn(
             "vars.VLLM_GR_ISOLATED_RUNNER",
             jobs["pre-commit"]["env"]["VLLM_GR_ISOLATED_RUNNER"],
@@ -886,7 +890,10 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         self.assertIn("beam-performance-ab-only", jobs)
         local_runner = (ROOT / "tools/pre_commit/run_tests.sh").read_text()
         self.assertIn("VLLM_GR_TEST_LEVEL", local_runner)
-        self.assertIn("python3 -m pytest -x --run-slow --durations=10 -s tests", local_runner)
+        self.assertIn(
+            "python3 -m pytest -x --run-slow --strict-test-levels --durations=10 -s tests",
+            local_runner,
+        )
         level_runner = (ROOT / "tools/ci/run_test_level.sh").read_text()
         self.assertIn("--strict-test-levels", level_runner)
         self.assertIn("--run-slow", level_runner)
@@ -900,7 +907,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
 
     @pytest.mark.l1  # type: ignore[misc]
     def test_parallel_benchmark_jobs_provision_on_cache_miss(self) -> None:
-        jobs = self.workflows["pre-commit.yml"]["jobs"]
+        jobs = self.workflows["ci.yml"]["jobs"]
         steps = jobs["decode-benchmark"]["steps"]
         names = [step.get("name") for step in steps]
         create = steps[names.index("Create virtual environment")]

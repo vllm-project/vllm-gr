@@ -37,7 +37,7 @@ apply to a module, class, function, or individual parameter.
 Use both accelerator markers for a case that can run on either platform.
 The markers describe eligibility. Keep an availability check with a test
 that must skip when its device is unavailable. In `tests/kernels/` and
-`tests/st/`, cases with no platform marker default to `gpu_test`. Mark CPU
+`tests/e2e/`, cases with no platform marker default to `gpu_test`. Mark CPU
 and Ascend cases there explicitly. Add `model_test` when weights are
 required. The `slow` and `slow_test` markers require `--run-slow`.
 

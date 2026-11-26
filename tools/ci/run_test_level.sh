@@ -4,13 +4,14 @@
 set -uo pipefail
 
 usage() {
-  echo "Usage: $0 {pr|l1|l2|l3|l4|l5} [pytest arguments...]" >&2
+  echo "Usage: $0 {pr|pr-device|l1|l2|l3|l4|l5} [pytest arguments...]" >&2
 }
 
 level=${1:-pr}
 if [[ $# -gt 0 ]]; then shift; fi
 case "$level" in
   pr) expression='l1 or l2' ;;
+  pr-device) expression='l2 or (l1 and (gpu_test or npu_test))' ;;
   l1|l2|l3|l4|l5) expression="$level" ;;
   *) usage; exit 2 ;;
 esac
@@ -26,6 +27,15 @@ case "${VLLM_GR_TARGET_DEVICE:-}" in
   '') ;;  # Preserve unfiltered local runs when no platform was selected.
   *) echo "Unsupported VLLM_GR_TARGET_DEVICE: $VLLM_GR_TARGET_DEVICE" >&2; exit 2 ;;
 esac
+
+if [[ "${VLLM_GR_TARGET_DEVICE:-}" == cuda &&
+      "${VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS:-}" == 1 ]]; then
+  expression="($expression) and not ((l2 or l3) and gpu_test)"
+fi
+
+if [[ "${VLLM_GR_EXCLUDE_CPU_TESTS:-}" == 1 ]]; then
+  expression="($expression) and not ($cpu_expression)"
+fi
 
 pytest_args=(-x --run-slow --strict-test-levels --durations=10 -s -m "$expression")
 

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from tests.st.multibatch_accuracy_checks import (
+from tests.e2e.multibatch_accuracy_checks import (
     compare_output,
     validate_output,
 )

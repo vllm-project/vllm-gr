@@ -10,7 +10,7 @@ marking the PR ready for review. Include the commands, outcomes and any
 checks you could not run in the PR description.
 
 GitHub shows the checks that apply to the target branch and changed files.
-[PR validation](../../../.github/workflows/pre-commit.yml) selects either
+[PR validation](../../../.github/workflows/ci.yml) selects either
 documentation checks or full validation. The
 [wheel contents](../../../.github/workflows/wheel-contents.yml) and
 [wheel build](../../../.github/workflows/build_wheel.yml) workflows have

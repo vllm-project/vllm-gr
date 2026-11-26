@@ -90,7 +90,7 @@ patches:
       - vllm_gr.entrypoints.openai.beam_search_patch.validate_openai_beam_search_patch
       - vllm_gr.entrypoints.openai.beam_search_patch.validate_sampling_patch
       - tests/entrypoints/beam_search/test_beam_search_online_entry.py
-      - tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online
+      - tests/e2e/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online
       - tests/entrypoints/openai/test_beam_search_dispatch.py
     process_roles: [api_server]
     target: GenerateBaseServing.beam_search, ChatCompletionRequest/CompletionRequest.to_beam_search_params, and CompletionRequest.model_fields["vllm_xargs"]
@@ -102,15 +102,15 @@ patches:
     scope: core
     backend_id: null
     owner: vllm_gr/engine/arg_utils.py
-    installer: vllm_gr.engine.arg_utils.patch_add_cli_args
-    activation: the required frontend patch plan detects GR EngineArgs methods are not installed; GR defaults and Beam validation activate only for explicit GR engines
+    installer: vllm_gr.engine.arg_utils.patch_create_engine_config
+    activation: the frontend installs the creation hook; only engines carrying GR settings run GR finalization
     validator_or_test:
       - vllm_gr.engine.arg_utils.validate_engine_args_patch
       - tests/engine/test_backend_plan_engine_args.py
       - tests/v1/attention/test_attention_backend_custom.py
       - tests/engine/test_gr_config_v1.py
     process_roles: [main, api_server]
-    target: vllm.engine.arg_utils.EngineArgs
+    target: vllm.engine.arg_utils.EngineArgs.create_engine_config
     risk: high
     contract: engine-args-descriptors
     removal_condition: vLLM configuration hooks cover every active GR option
@@ -127,7 +127,7 @@ patches:
       - tests/v1/engine/test_gr_admission_queue.py
       - tests/entrypoints/beam_search/test_beam_search_online_entry.py
       - tests/v1/engine/test_beam_admission_rejection_reporting.py
-      - tests/st/test_engine_entrypoint_startup.py
+      - tests/e2e/test_engine_entrypoint_startup.py
     process_roles: [main, api_server]
     target: EngineCore clients and AsyncLLM
     risk: critical
@@ -238,8 +238,8 @@ patches:
       - tests/kernels/test_gpu_beam_stage_v2_state.py
       - tests/v1/worker/test_gr_startup.py
       - tests/tools/test_cuda_stage_typing.py
-      - tests/st/test_modelrunner_v2_stage_parity_st.py
-      - tests/st/test_cuda_sid_stage_token_ids.py
+      - tests/e2e/test_modelrunner_v2_stage_parity_st.py
+      - tests/e2e/test_cuda_sid_stage_token_ids.py
     process_roles: [gpu_worker]
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner, vllm.v1.worker.gpu.model_runner.GPUModelRunner, vllm.v1.worker.gpu_worker.Worker.init_device, and vllm.v1.worker.gpu_worker.Worker.reload_trie
     risk: critical

@@ -442,7 +442,7 @@ def _engine_kwargs(model: str, config: dict[str, Any]) -> dict[str, Any]:
         compilation_config={
             "cudagraph_capture_sizes": [1, 2, 16, *range(128, 2049, 128)],
         },
-        worker_extension_cls="tests.st.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
+        worker_extension_cls="tests.e2e.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
     )
 
 
@@ -594,8 +594,10 @@ async def _run_online(work_dir: Path) -> None:
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
     # The native 0.30 default is zero: it kills EngineCore before IPC cleanup.
     # Give the real shutdown path time to run and check its exit below.
+    from vllm_gr.config.parser import gr_config_to_mapping, load_gr_config
+
     args = AsyncEngineArgs(
-        gr=config,
+        additional_config={"vllm_gr": gr_config_to_mapping(load_gr_config(overrides=config))},
         attention_config={"backend": "CUSTOM"},
         shutdown_timeout=10,
         **_engine_kwargs(model, config),
@@ -896,8 +898,13 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
         kwargs,
         prompts,
     )
+    from vllm_gr.config.parser import gr_config_to_mapping, load_gr_config
+
     args = AsyncEngineArgs(
-        gr=config, attention_config={"backend": "CUSTOM"}, shutdown_timeout=10, **kwargs
+        additional_config={"vllm_gr": gr_config_to_mapping(load_gr_config(overrides=config))},
+        attention_config={"backend": "CUSTOM"},
+        shutdown_timeout=10,
+        **kwargs,
     )
     async with _measured_engine(build_async_engine_client_from_engine_args, args) as engine:
         processes = list(engine.engine_core.resources.engine_manager.processes)
@@ -1217,7 +1224,7 @@ def test_onerec_v1_completion_batch_online(
         command = [
             sys.executable,
             "-m",
-            "tests.st.test_onerec_v1_scheduler_st",
+            "tests.e2e.test_onerec_v1_scheduler_st",
             str(tmp_path),
             mode,
         ]
@@ -1258,7 +1265,7 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool, runner: str) -
         ),
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
-    command = [sys.executable, "-m", "tests.st.test_onerec_v1_scheduler_st", str(tmp_path)]
+    command = [sys.executable, "-m", "tests.e2e.test_onerec_v1_scheduler_st", str(tmp_path)]
     if online:
         command.append("--online")
     process_started = time.monotonic()

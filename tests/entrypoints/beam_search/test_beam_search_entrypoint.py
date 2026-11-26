@@ -410,18 +410,17 @@ def test_serving_engine_logprob_capacity_is_an_integer_for_width_schedules(
     from vllm.engine.arg_utils import AsyncEngineArgs
 
     from tests.helpers.gr_config import serving_beam_engine_args
-    from vllm_gr.engine.arg_utils_gr import _init_async_engine_args
+    from vllm_gr.config import GRConfig
 
     config = {"beam_width": widths, "candidate_width": candidates, "beam_graph_enabled": False}
     # EngineArgs resolves the model path; an existing local directory avoids
     # treating this unit-test placeholder as a Hugging Face repository.
     kwargs = serving_beam_engine_args(str(tmp_path), config, 0.7)
-    args = AsyncEngineArgs.__new__(AsyncEngineArgs)
-    _init_async_engine_args(args, **kwargs)
+    args = AsyncEngineArgs(**kwargs)
     assert args.model == str(tmp_path)
     assert TypeAdapter(int).validate_python(args.max_logprobs, strict=True) == 2 * max(candidates)
     assert args.max_num_seqs == 1 and args.enforce_eager
-    assert args.gr is config
+    assert GRConfig.from_vllm_config(args).deployment.beam_width == tuple(widths)
 
 
 pytestmark = pytest.mark.cpu_test

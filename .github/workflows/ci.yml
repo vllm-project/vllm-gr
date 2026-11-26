@@ -1,4 +1,4 @@
-name: Pre-commit and Benchmark
+name: CI
 
 # Keep this metadata protocol in sync with the default-branch retest router.
 run-name: >-
@@ -29,12 +29,6 @@ on:
       - labeled
       - unlabeled
   workflow_dispatch:
-    inputs:
-      rebuild_pre_commit_cache:
-        description: Delete and rebuild this runner's local pre-commit cache
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   # Keep A/B-only requests out of the full validation's single pending slot.
@@ -222,7 +216,7 @@ jobs:
               for (const event of ['pull_request', 'pull_request_review']) {
                 for (let page = 1; page <= 10 && !fresh; page++) {
                   const {data} = await github.rest.actions.listWorkflowRuns({
-                    owner, repo, workflow_id: 'pre-commit.yml', event,
+                    owner, repo, workflow_id: 'ci.yml', event,
                     head_sha: pr.head.sha, per_page: 100, page,
                   });
                   for (const run of data.workflow_runs) {
@@ -334,12 +328,12 @@ jobs:
           python -I tools/ci/resolve_benchmark_policy.py "${args[@]}"
 
   pre-commit:
-    name: Pre-commit
+    name: Device tests
     needs: benchmark-policy
     if: needs.benchmark-policy.result == 'success'
     runs-on: self-hosted
     env:
-      VLLM_GR_TEST_LEVEL: pr
+      VLLM_GR_TEST_LEVEL: pr-device
       VLLM_GR_ISOLATED_RUNNER: ${{ vars.VLLM_GR_ISOLATED_RUNNER || 'false' }}
       # Activate the opt-in tiny-model smoke tests (graph/eager parity and the
       # dynamic-beam CPU-oracle comparison) that L2 now collects per PR.
@@ -394,7 +388,6 @@ jobs:
           {
             echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
             echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
-            echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311"
           } >> "$GITHUB_ENV"
 
       - name: Install CUDA base environment
@@ -431,23 +424,27 @@ jobs:
       - name: Kill stale process on device
         run: bash ./scripts/kill_vllm_on_device.sh --yes
 
-      - name: Install pre-commit
-        run: uv pip install pre-commit==4.6.2
+      - name: Report tests moved to Buildkite
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          cpu_message='Manual runs exclude CPU-only tests. Run L1 CPU Unit tests in Buildkite Ready or Merge.'
+          echo "::notice::$cpu_message"
+          echo "$cpu_message" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VLLM_GR_TARGET_DEVICE" == cuda ]]; then
+            cuda_message='Manual CUDA device tests are disabled here. Run L2 CUDA tests in Buildkite Ready and L3 CUDA tests in Buildkite Merge.'
+            echo "::notice::$cuda_message"
+            echo "$cuda_message" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-      - name: Reset local pre-commit cache
-        if: >-
-          github.event_name == 'workflow_dispatch' &&
-          inputs.rebuild_pre_commit_cache
-        run: pre-commit clean
-
-      - name: Run pre-commit
-        run: >-
-          pre-commit run
-          --show-diff-on-failure
-          --color=always
-          --all-files
+      - name: Run device tests
+        if: github.event_name != 'workflow_dispatch' || env.VLLM_GR_TARGET_DEVICE != 'cuda'
+        env:
+          VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS: "1"
+          VLLM_GR_EXCLUDE_CPU_TESTS: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: bash tools/ci/run_test_level.sh "$VLLM_GR_TEST_LEVEL"
 
       - name: Run L2 resource probe if isolated
+        if: github.event_name != 'workflow_dispatch' || env.VLLM_GR_TARGET_DEVICE != 'cuda'
         run: bash tools/ci/run_resource_level.sh
 
       - name: Check clear device
