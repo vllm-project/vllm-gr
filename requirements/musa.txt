@@ -1,5 +1,5 @@
 -r common.txt
 
 # The prepared MUSA environment supplies vLLM, PyTorch, and vendor libraries.
-numpy==2.2.6
-opencv-python-headless>=4.13.0
+# Match vLLM-MUSA and retain the prepared image's NumPy-compatible OpenCV.
+numpy<2
