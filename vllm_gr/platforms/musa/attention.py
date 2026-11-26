@@ -121,6 +121,20 @@ def write_paged_kv(
     """Scatter valid slots into the logical NHD view, preserving its strides."""
     if key_cache.dtype != key.dtype or value_cache.dtype != value.dtype:
         raise ValueError("Eager MUSA Beam requires unquantized KV")
+    if torch.musa.is_current_stream_capturing():
+        from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
+
+        reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
     slots = slot_mapping.long()
     valid = slots >= 0
     slots = slots[valid]
