@@ -98,6 +98,8 @@ Buildkite runs L1 CPU and L2 CUDA tests in the Ready pipeline and L3 CUDA
 tests in the Merge pipeline. The GitHub Actions device job uses `pr-device`
 to select L2 and accelerator-marked L1 tests. On CUDA, the GitHub Actions
 test jobs exclude the L2 and L3 GPU cases assigned to Buildkite.
+An optional [AMD ROCm job](rocm_ci.md) runs OneRec on a self-hosted W7900
+agent.
 The separate Pre-commit checks workflow runs static hooks on Ubuntu for
 non-draft PRs without waiting for the `ready` label.
 By default the local test hook runs the full pytest suite with `--run-slow`

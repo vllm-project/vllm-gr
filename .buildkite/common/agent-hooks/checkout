@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+# Buildkite agent checkout hook for hosts that reach the GitHub REST API (or an
+# API proxy) but not git. It fetches the build commit as a source tarball and
+# turns it into a one-commit Git repository. Install it as
+# <agent hooks path>/checkout next to tools/ci/fetch_github_source.sh; see
+# docs/contributing/ci/rocm_ci.md. Set GITHUB_API and GITHUB_TOKEN_FILE in the
+# agent environment hook.
+
+set -euo pipefail
+
+repo=$(sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' <<< "$BUILDKITE_REPO")
+checkout="$BUILDKITE_BUILD_CHECKOUT_PATH"
+[ -n "$checkout" ] && [ "$checkout" != / ] || { echo "Invalid checkout path: $checkout" >&2; exit 1; }
+rm -rf -- "$checkout"
+"$(dirname -- "${BASH_SOURCE[0]}")/fetch_github_source.sh" \
+    "$repo" "$BUILDKITE_COMMIT" "$checkout" --git-init

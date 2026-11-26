@@ -47,3 +47,17 @@ mirror_hardwares:
                 emptyDir:
                   medium: Memory
                   sizeLimit: 24Gi
+  amd_w7900_1:
+    # Self-hosted AMD agents; see docs/contributing/ci/rocm_ci.md. The job
+    # builds the ROCm image and runs it with Docker on the agent host.
+    agents:
+      queue: amd-w7900
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 1
+        # No idle GPU or the model could not be fetched.
+        - exit_status: 75
+          limit: 2
+        - signal_reason: agent_stop
+          limit: 1

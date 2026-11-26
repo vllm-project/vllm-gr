@@ -238,3 +238,6 @@ vllm_gr/_version.py
 # AI coding assistants
 .claude/
 .codex/
+
+# ROCm CI logs (tools/ci/run_rocm_tests.sh via .buildkite/common/scripts/run-rocm-ci.sh)
+ci-output/

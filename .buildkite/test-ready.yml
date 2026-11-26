@@ -109,3 +109,15 @@ steps:
       pytest
       --run-slow --durations=10 -sv -m 'l2 and gpu_test'
       tests/e2e
+
+  # Enabled once an AMD agent serves the amd-w7900 queue: set
+  # VLLM_GR_ROCM_CI=1 in the pipeline environment.
+  - label: "ROCm Test (W7900)"
+    key: rocm-w7900
+    depends_on: upload-ready-pipeline
+    if: build.env("VLLM_GR_ROCM_CI") == "1"
+    soft_fail: true
+    timeout_in_minutes: 60
+    mirror_hardwares: amd_w7900_1
+    artifact_paths: "ci-output/rocm/**/*.log"
+    command: bash .buildkite/common/scripts/run-rocm-ci.sh

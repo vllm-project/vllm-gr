@@ -55,6 +55,7 @@ nav:
       - CI:
         - Test Levels and Platform Markers: contributing/ci/test_levels.md
         - contributing/ci/local_runner.md
+        - AMD ROCm CI: contributing/ci/rocm_ci.md
         - Benchmark Acceptance and Gates: contributing/ci/benchmark_acceptance.md
         - contributing/ci/pr_merge_loop.md
     - Design:

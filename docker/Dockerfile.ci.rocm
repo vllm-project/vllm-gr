@@ -1,0 +1,132 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+# ROCm CI image for Radeon GPUs, which use the FlashAttention Triton backend.
+# The rocm-runtime stage builds vLLM from source and changes only when the
+# ROCm base, vLLM revision or GPU architecture changes. The final stage adds
+# vLLM-GR. Build it from the repository root:
+#
+#   docker build -f docker/Dockerfile.ci.rocm --build-arg PYTORCH_ROCM_ARCH=gfx1100 \
+#     -t vllm-gr-ci-rocm .
+
+ARG BASE_IMAGE=rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.12.0
+
+FROM ${BASE_IMAGE} AS rocm-runtime
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# VLLM_REF must be a release tag; its version is passed to setuptools-scm.
+ARG VLLM_REF=v0.30.0
+ARG FLASH_ATTN_REF=b038b49
+ARG PYTORCH_ROCM_ARCH=gfx1100
+ARG MAX_JOBS
+# Sources are fetched through the GitHub REST API, so hosts that only reach an
+# API proxy can build the image. Pass a token with
+# --secret id=github_token,src=FILE to raise the API rate limit.
+ARG GITHUB_API=https://api.github.com
+# Optional Ubuntu mirror, for example https://mirrors.ustc.edu.cn/ubuntu.
+ARG APT_MIRROR=
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -i -E "s#https?://(archive|security)\.ubuntu\.com/ubuntu/?#${APT_MIRROR%/}/#g" \
+            /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git cmake curl patch \
+    && rm -rf /var/lib/apt/lists/*
+
+# Shell-based tests also invoke Python through the unversioned command.
+RUN if ! command -v python >/dev/null 2>&1; then \
+        ln -s "$(command -v python3)" /usr/local/bin/python; \
+    fi
+
+# Keep the ROCm PyTorch stack of the base image for every later install.
+RUN python3 -m pip list --format=freeze \
+        | grep -iE '^(torch|torchvision|torchaudio|triton|apex)==' > /opt/rocm-torch-constraints.txt \
+    && cat /opt/rocm-torch-constraints.txt
+
+# vLLM detects ROCm through amdsmi; pip-installed ROCm SDKs ship it unpackaged.
+RUN if command -v rocm-sdk >/dev/null 2>&1 && ! python3 -c 'import amdsmi' 2>/dev/null; then \
+        echo "$(rocm-sdk path --root)/share/amd_smi" \
+            > "$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/rocm_sdk_amdsmi.pth"; \
+    fi
+
+COPY tools/ci/fetch_github_source.sh /usr/local/bin/fetch_github_source.sh
+
+# Fetch all sources in one cached layer, so a mirror change or a failed build
+# step does not download them again. vLLM fetches triton_kernels from
+# ROCm/triton during its build; fetch the commit that vLLM pins through the
+# API as well and point CMake at it.
+RUN --mount=type=secret,id=github_token,required=false \
+    export GITHUB_API="${GITHUB_API}" GITHUB_TOKEN_FILE=/run/secrets/github_token \
+    && fetch_github_source.sh vllm-project/vllm "${VLLM_REF}" /opt/vllm-src \
+    && triton_ref=$(sed -n '/STREQUAL "rocm"/,/else()/s/.*TRITON_KERNELS_TAG "\([0-9a-f]*\)".*/\1/p' \
+        /opt/vllm-src/cmake/external_projects/triton_kernels.cmake) \
+    && test -n "$triton_ref" \
+    && fetch_github_source.sh ROCm/triton "$triton_ref" /opt/triton-src \
+    && fetch_github_source.sh Dao-AILab/flash-attention "${FLASH_ATTN_REF}" /opt/flash-attention \
+        --submodule third_party/aiter
+
+# Python package index for the remaining steps, for example a nearby mirror.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+RUN cd /opt/vllm-src \
+    && python3 -m pip install -r requirements/rocm.txt -c /opt/rocm-torch-constraints.txt \
+        "setuptools>=77.0.3,<80" setuptools_scm setuptools-rust wheel \
+    && if command -v rocm-sdk >/dev/null 2>&1; then \
+        export ROCM_PATH="$(rocm-sdk path --root)" CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake)"; \
+        export ROCM_HOME="$ROCM_PATH" HIP_PATH="$ROCM_PATH"; \
+    fi \
+    && SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_REF#v}" \
+        TRITON_KERNELS_SRC_DIR=/opt/triton-src/python/triton_kernels/triton_kernels \
+        VLLM_TARGET_DEVICE=rocm MAX_JOBS="${MAX_JOBS:-$(nproc)}" \
+        python3 setup.py bdist_wheel --dist-dir=/opt/wheels \
+    && python3 -m pip install --no-deps /opt/wheels/vllm-*.whl
+
+# The Triton AMD backend at this revision rejects paged varlen calls instead of
+# ignoring block_table; vLLM-GR gathers paged KV before calling it. Its setup
+# installs the bundled AITER, which would otherwise replace the base image's
+# Triton with its own build, so keep the Triton that PyTorch was built with and
+# install only AITER's Triton kernels. FLASH_ATTENTION_FORCE_BUILD skips the
+# prebuilt wheel download from GitHub releases, which fails hard when the
+# release host is unreachable.
+RUN cd /opt/flash-attention \
+    && FLASH_ATTENTION_FORCE_BUILD=TRUE AITER_USE_SYSTEM_TRITON=1 AITER_TRITON_ONLY=1 \
+        python3 -m pip install --no-build-isolation --no-deps . \
+    && python3 -m pip list --format=freeze | grep -iE '^triton==' \
+        | diff - <(grep -iE '^triton==' /opt/rocm-torch-constraints.txt)
+
+# Import only AITER's Triton ops; its C++/CK modules would otherwise JIT-build
+# on first import and need a toolchain that this image does not use.
+ENV AITER_TRITON_ONLY=1
+
+FROM rocm-runtime
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+WORKDIR /opt/vllm-gr
+COPY LICENSE NOTICE README.md MANIFEST.in pyproject.toml setup.py ./
+COPY requirements/ requirements/
+COPY tools/packaging/git_version.py tools/packaging/git_version.py
+COPY benchmarks/open_one_rec/ benchmarks/open_one_rec/
+COPY docs/cli/patches/vllm-0.30.0-gr-cli.patch docs/cli/patches/vllm-0.30.0-gr-cli.patch
+COPY vllm_gr/ vllm_gr/
+
+# requirements/cuda.txt would replace the ROCm vLLM build, so install the
+# shared requirements and the dev extra explicitly, then vLLM-GR alone.
+RUN python3 -m pip install -r requirements/common.txt -c /opt/rocm-torch-constraints.txt \
+    && python3 -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["project"]["optional-dependencies"]["dev"]))' \
+        > /tmp/dev-requirements.txt \
+    && python3 -m pip install -r /tmp/dev-requirements.txt -c /opt/rocm-torch-constraints.txt \
+    && VLLM_GR_TARGET_DEVICE=cuda python3 -m pip install --no-deps --no-build-isolation . \
+    && patch --forward -p1 \
+        -d "$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
+        < docs/cli/patches/vllm-0.30.0-gr-cli.patch \
+    && (cd /tmp && python3 -c 'import vllm, vllm_gr; print("vllm", vllm.__version__)')
+
+ENTRYPOINT []
