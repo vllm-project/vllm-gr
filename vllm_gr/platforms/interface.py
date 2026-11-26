@@ -30,6 +30,27 @@ class ConfigProvider(Protocol):
     def create_config_service(self) -> BackendConfigService: ...
 
 
+class FullVocabularySelector(Protocol):
+    """Write Beam candidates into the stage runner's preallocated buffers."""
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        token_ids: torch.Tensor,
+        logprobs: torch.Tensor,
+        valid_mask: torch.Tensor,
+        valid_counts: torch.Tensor,
+    ) -> None: ...
+
+
+@runtime_checkable
+class FullVocabularyProvider(Protocol):
+    """Optional replacement for the default GPU full-vocabulary selector."""
+
+    def get_full_vocabulary_selector(self) -> FullVocabularySelector: ...
+
+
 class ModelRunnerPatchHooks(Protocol):
     """Required hooks for the V1 ModelRunner patch dispatcher.
 

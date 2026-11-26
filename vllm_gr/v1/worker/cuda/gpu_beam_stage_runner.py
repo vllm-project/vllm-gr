@@ -20,6 +20,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gr.config import resolve_candidate_width
+from vllm_gr.config.backend_plan import read_backend_plan
 from vllm_gr.config.models import (
     ConstraintMode,
     configured_constraint_mode,
@@ -43,6 +44,8 @@ from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     unconstrained_topk_mcap_out as unconstrained_topk_out,
 )
+from vllm_gr.platforms.interface import FullVocabularyProvider
+from vllm_gr.platforms.registry import get_active_backend
 from vllm_gr.v1.attention.backends.beam_prefix_policy import configured_fa_version
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
@@ -563,11 +566,21 @@ class GPUBeamStageRunner:
         rows = batch_size * beam.state.beam_width
         host = getattr(worker, "vllm_config", None)
         self.gr_settings = deployment_for(host)
+        provider = get_active_backend() if read_backend_plan(host) is not None else None
+        self.full_vocabulary_selector = (
+            provider.get_full_vocabulary_selector()
+            if isinstance(provider, FullVocabularyProvider)
+            else None
+        )
         self._unit_temperature = True
         self.explicit_fa_version = configured_fa_version(host)
         settings = self.gr_settings
         slice_request = 0
-        if backend is None and self.hooks.supports_transposed_head:
+        if (
+            backend is None
+            and self.full_vocabulary_selector is None
+            and self.hooks.supports_transposed_head
+        ):
             slice_request = (
                 SLICE_AUTO if settings.head_slice == "auto" else cast(int, settings.head_slice)
             )
@@ -987,6 +1000,13 @@ class GPUBeamStageRunner:
                         out_valid_counts=self.counts[:rows],
                         device_step=self.constraint_steps,
                         specialize_steps=self.hooks.specialize_constraint_steps,
+                    )
+                elif self.full_vocabulary_selector is not None:
+                    self.full_vocabulary_selector(
+                        model_output[:rows],
+                        self.temperatures[:rows],
+                        *candidates,
+                        self.counts[:rows],
                     )
                 else:
                     sliced = self.hidden is not None

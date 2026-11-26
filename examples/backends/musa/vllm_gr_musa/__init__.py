@@ -9,6 +9,7 @@ from vllm_gr.config.backend_plan import BackendPlan, BackendRequest
 from vllm_gr.platforms.compat import require_runtime_version
 from vllm_gr.platforms.cuda.provider import CUDABackendProvider
 from vllm_gr.platforms.identity import PlatformIdentity, current_platform_identity
+from vllm_gr.platforms.interface import FullVocabularySelector
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,11 @@ class MUSABackendProvider(CUDABackendProvider):
         if not self.matches(identity):
             raise RuntimeError(f"MUSA provider requires vLLM-MUSA, got {identity.describe()}")
         return {"platform": "musa", "vllm": require_runtime_version("vllm", "0.32.0")}
+
+    def get_full_vocabulary_selector(self) -> FullVocabularySelector:
+        from .topk import full_vocabulary_topk_out
+
+        return full_vocabulary_topk_out
 
     def resolve(self, request: BackendRequest) -> BackendPlan:
         raise ValueError("The MUSA provider currently supports runtime initialization only")
