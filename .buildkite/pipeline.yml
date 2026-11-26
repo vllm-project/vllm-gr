@@ -19,3 +19,16 @@ steps:
     agents:
       queue: medium_cpu_queue_premerge
     command: python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/test-ready.yml
+
+  - label: "Upload merge pipeline"
+    key: upload-merge-pipeline
+    if: >-
+      (build.branch == "main" && build.pull_request.id == null) ||
+      (build.pull_request.id != null &&
+       build.pull_request.base_branch == "main" &&
+       build.pull_request.draft == false &&
+       build.pull_request.labels includes "merge-test")
+    depends_on: image-build
+    agents:
+      queue: medium_cpu_queue_premerge
+    command: python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/test-merge.yml

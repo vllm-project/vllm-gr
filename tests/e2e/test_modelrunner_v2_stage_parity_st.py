@@ -29,10 +29,10 @@ from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runti
 
 _SESSIONS = ((1024, 3), (900, 3), (900, 3), (1024, 3))
 _EXTENSIONS = {
-    "graph": "tests.st.test_modelrunner_v2_stage_parity_st.OneRecV2ParityWorkerExtension",
-    "eager": "tests.st.test_modelrunner_v2_stage_parity_st.OneRecV2ParityWorkerExtension",
-    "decode_fallback": "tests.st.v2_decode_failure_worker.FailedDecodeWorkerExtension",
-    "prefill_fallback": "tests.st.v2_prefill_failure_worker.FailedFullWorkerExtension",
+    "graph": "tests.e2e.test_modelrunner_v2_stage_parity_st.OneRecV2ParityWorkerExtension",
+    "eager": "tests.e2e.test_modelrunner_v2_stage_parity_st.OneRecV2ParityWorkerExtension",
+    "decode_fallback": "tests.e2e.v2_decode_failure_worker.FailedDecodeWorkerExtension",
+    "prefill_fallback": "tests.e2e.v2_prefill_failure_worker.FailedFullWorkerExtension",
 }
 
 
@@ -122,7 +122,7 @@ class OneRecV2ParityWorkerExtension:
             self._v2_parity_probe = None
 
     def onerec_v2_parity_snapshot(self) -> dict[str, Any]:
-        from tests.st.test_onerec_v1_scheduler_st import _worker_snapshot
+        from tests.e2e.test_onerec_v1_scheduler_st import _worker_snapshot
         from vllm_gr.v1.worker.gr_context import (
             get_beam_graph_runtime_stats,
         )
@@ -153,7 +153,7 @@ def _decode_path_probe(llm: Any) -> Iterator[None]:
 
 
 def _run_arm(work_dir: Path, arm: str) -> None:
-    from tests.st.test_onerec_v1_scheduler_st import (
+    from tests.e2e.test_onerec_v1_scheduler_st import (
         _completed_sequences,
         _engine_kwargs,
         _inputs,
@@ -288,7 +288,7 @@ def test_modelrunner_v2_stage_parity(tmp_path: Path) -> None:
         command = [
             sys.executable,
             "-m",
-            "tests.st.test_modelrunner_v2_stage_parity_st",
+            "tests.e2e.test_modelrunner_v2_stage_parity_st",
             str(work_dir),
             arm,
         ]

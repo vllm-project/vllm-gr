@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Exercise original weight reload over production gRPC and HTTP control APIs.
 
-Usage: python tests/st/run_checkpoint_reload.py --output /tmp/ckpt-reload
+Usage: python tests/e2e/run_checkpoint_reload.py --output /tmp/ckpt-reload
 Uses local tiny random Llama/Qwen3 checkpoints, optionally with GR head caches.
 No downloads.
 """

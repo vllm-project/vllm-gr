@@ -2,12 +2,128 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 steps:
+  - label: "Beam V1 performance A/B"
+    key: beam-v1-performance-ab
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 180
+    mirror_hardwares: l4_1
+    env:
+      V1_PERF_OUTPUT_DIR: v1_performance_results
+    command: |-
+      bash -euo pipefail <<'BASH'
+      V1_PERF_BASELINE_DIR="$(python3 .buildkite/common/scripts/find-beam-v1-baseline.py /tmp)"
+      export V1_PERF_BASELINE_DIR
+      pytest --run-slow -sv \
+        'tests/e2e/test_beam_v1_performance.py::test_beam_v1_performance[compare]'
+      BASH
+    artifact_paths: "v1_performance_results/**/*"
+
+  - label: "Decode benchmark"
+    key: decode-benchmark
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 360
+    mirror_hardwares: l4_1
+    env:
+      V1_RECALL_OUTPUT_DIR: v1_recall_results
+    command: >-
+      pytest --run-slow -sv
+      tests/e2e/test_beam_v1_recall.py
+    artifact_paths: "v1_recall_results/**/*"
+
   - label: "Unit tests"
     key: unit-tests
     depends_on: upload-ready-pipeline
     timeout_in_minutes: 25
     mirror_hardwares: l4_1
     command: >-
-      python3 -m pytest
-      -n 4 --durations=10 -s
+      pytest
+      -n 4 --durations=10 -sv
       -m '(l1) and (cpu_test and not gpu_test and not npu_test)' tests
+
+  - label: "Kernels Test"
+    key: l2-gpu-kernels
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 35
+    mirror_hardwares: l4_1
+    env:
+      PYTHONPATH: "."
+      VLLM_GR_INPROC_TEST_SELECTION: exclude
+    command: >-
+      pytest -p tools.ci.inproc_test_selection
+      --run-slow --durations=10 -sv -m 'l2 and gpu_test'
+      tests/kernels
+
+  - label: "Kernels Test (in-process)"
+    key: l2-gpu-inproc
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    env:
+      PYTHONPATH: "."
+      VLLM_GR_INPROC_TEST_SELECTION: include
+      VLLM_GR_RUN_MODEL_SMOKE: "1"
+      VLLM_ENABLE_V1_MULTIPROCESSING: "0"
+    command: >-
+      pytest -p tools.ci.inproc_test_selection
+      --run-slow --durations=10 -sv -m 'l2 and gpu_test'
+      tests/kernels
+
+  - label: "Constraints Test"
+    key: l2-gpu-constraints
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      --durations=10 -sv -m 'l2 and gpu_test'
+      tests/constraints
+
+  - label: "Ops Test"
+    key: l2-gpu-ops
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      --durations=10 -sv -m 'l2 and gpu_test'
+      tests/ops
+
+  - label: "V1 Attention Test"
+    key: l2-gpu-v1-attention
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      --durations=10 -sv -m 'l2 and gpu_test'
+      tests/v1/attention
+
+  - label: "V1 Beam Test"
+    key: l2-gpu-v1-beam
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      --durations=10 -sv -m 'l2 and gpu_test'
+      tests/v1/beam
+
+  - label: "Sidecar Test"
+    key: l2-gpu-sidecar
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 25
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      --durations=10 -sv -m 'l2 and gpu_test'
+      tests/sidecar
+
+  - label: "System Test"
+    key: l2-gpu-system
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 30
+    mirror_hardwares: l4_1
+    command: >-
+      pytest
+      --run-slow --durations=10 -sv -m 'l2 and gpu_test'
+      tests/e2e

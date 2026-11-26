@@ -46,7 +46,14 @@ class TestLevelRunner(unittest.TestCase):
         fake_python.chmod(0o755)
 
     def run_level(
-        self, level: str, *, smoke: bool, main: int = 0, inproc: int = 0, device: str | None = None
+        self,
+        level: str,
+        *,
+        smoke: bool,
+        main: int = 0,
+        inproc: int = 0,
+        device: str | None = None,
+        exclude_migrated_gpu: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         bash = os.environ.get("TEST_BASH") or shutil.which("bash")
         self.assertIsNotNone(bash)
@@ -61,6 +68,9 @@ class TestLevelRunner(unittest.TestCase):
         }
         env.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
         env.pop("VLLM_GR_TARGET_DEVICE", None)
+        env.pop("VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS", None)
+        if exclude_migrated_gpu:
+            env["VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS"] = "1"
         if device is not None:
             env["VLLM_GR_TARGET_DEVICE"] = device
         if smoke:
@@ -111,27 +121,37 @@ class TestLevelRunner(unittest.TestCase):
             "@pytest.mark.l2\n@pytest.mark.cpu_test\ndef test_l2_cpu(): pass\n"
             "@pytest.mark.l2\n@pytest.mark.gpu_test\ndef test_l2_gpu(): pass\n"
             "@pytest.mark.l2\n@pytest.mark.npu_test\ndef test_l2_npu(): pass\n"
-            "@pytest.mark.l3\n@pytest.mark.cpu_test\ndef test_l3(): pass\n",
+            "@pytest.mark.l3\n@pytest.mark.cpu_test\ndef test_l3(): pass\n"
+            "@pytest.mark.l3\n@pytest.mark.gpu_test\ndef test_l3_gpu(): pass\n"
+            "@pytest.mark.l3\n@pytest.mark.gpu_test\n@pytest.mark.npu_test\ndef test_l3_both(): pass\n"
+            "@pytest.mark.l4\n@pytest.mark.gpu_test\ndef test_l4_gpu(): pass\n",
             encoding="utf-8",
         )
         expected = {
-            ("l1", "cpu"): {"test_cpu"},
-            ("l1", "cuda"): {"test_cpu", "test_gpu", "test_both", "test_cpu_gpu"},
-            ("l1", "npu"): {"test_cpu", "test_npu", "test_both"},
-            ("pr-device", "cpu"): {"test_l2_cpu"},
-            ("pr-device", "cuda"): {
+            ("l1", "cpu", False): {"test_cpu"},
+            ("l1", "cuda", False): {"test_cpu", "test_gpu", "test_both", "test_cpu_gpu"},
+            ("l1", "npu", False): {"test_cpu", "test_npu", "test_both"},
+            ("pr-device", "cpu", False): {"test_l2_cpu"},
+            ("pr-device", "cuda", False): {
                 "test_gpu",
                 "test_both",
                 "test_cpu_gpu",
                 "test_l2_cpu",
                 "test_l2_gpu",
             },
-            ("pr-device", "npu"): {"test_npu", "test_both", "test_l2_cpu", "test_l2_npu"},
+            ("pr-device", "npu", False): {"test_npu", "test_both", "test_l2_cpu", "test_l2_npu"},
+            ("pr-device", "cuda", True): {"test_gpu", "test_both", "test_cpu_gpu", "test_l2_cpu"},
+            ("pr-device", "npu", True): {"test_npu", "test_both", "test_l2_cpu", "test_l2_npu"},
+            ("l3", "cuda", True): {"test_l3"},
+            ("l3", "npu", True): {"test_l3", "test_l3_both"},
+            ("l4", "cuda", True): {"test_l4_gpu"},
         }
-        for (level, device), names in expected.items():
-            with self.subTest(level=level, device=device):
+        for (level, device, exclude_gpu), names in expected.items():
+            with self.subTest(level=level, device=device, exclude_gpu=exclude_gpu):
                 (self.directory / "calls.log").unlink(missing_ok=True)
-                result, calls = self.run_level(level, smoke=False, device=device)
+                result, calls = self.run_level(
+                    level, smoke=False, device=device, exclude_migrated_gpu=exclude_gpu
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = calls[0].splitlines()
                 marker_index = max(i for i, arg in enumerate(args) if arg == "arg=-m")
