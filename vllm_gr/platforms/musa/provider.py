@@ -72,8 +72,6 @@ class MUSABackendProvider(CUDABackendProvider):
             raise ValueError("MUSA Beam requires single-device ModelRunner V1")
         if gr["attention_backend"] != "CUSTOM":
             raise ValueError("MUSA Beam requires CUSTOM attention")
-        if request.has_constraint_table:
-            raise ValueError("MUSA canonical catalog tables require a device-side loader")
         return super().resolve(request)
 
 
