@@ -194,10 +194,50 @@ class EagerBeamAttention:
             )
         )
 
-    def prefill_attention(self, *, dense_prefill="off", **kwargs) -> None:
-        if dense_prefill != "off":
-            raise ValueError("MUSA Beam requires paged prefill")
-        self.cascade_attention(**kwargs)
+    def prefill_attention(
+        self,
+        *,
+        output,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        sliding_window_size,
+        scale,
+        logits_soft_cap,
+        vllm_flash_attn_version,
+        s_aux=None,
+        alibi_slopes=None,
+        dense_prefill="off",
+    ) -> None:
+        if (
+            dense_prefill != "off"
+            or sliding_window_size not in (None, (-1, -1), [-1, -1])
+            or logits_soft_cap
+            or s_aux is not None
+            or alibi_slopes is not None
+        ):
+            raise ValueError("Unsupported eager MUSA Beam prefill configuration")
+        offsets = attn_metadata.query_start_loc.tolist()
+        lengths = attn_metadata.seq_lens.tolist()
+        blocks = attn_metadata.block_table_tensor
+        if blocks is None:
+            blocks = attn_metadata.block_table
+        for row, length in enumerate(lengths):
+            start, end = offsets[row : row + 2]
+            if start == end:
+                continue
+            output[start:end].copy_(
+                eager_paged_prefill(
+                    query[start:end],
+                    key_cache,
+                    value_cache,
+                    blocks[row],
+                    length,
+                    scale,
+                    attn_metadata.causal,
+                )
+            )
 
 
 EAGER_BEAM_ATTENTION = EagerBeamAttention()
