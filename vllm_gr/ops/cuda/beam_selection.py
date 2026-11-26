@@ -247,6 +247,7 @@ def _bootstrap_beam_outputs_kernel(
     WRITE_FLAT_INDICES: tl.constexpr,
     BLOCK: tl.constexpr,
     REUSE_ORDERED_CANDIDATES: tl.constexpr = False,
+    GATHER: tl.constexpr = None,
 ):
     """Expand the first live parent of every request from one beam to W."""
 
@@ -276,7 +277,7 @@ def _bootstrap_beam_outputs_kernel(
     if REUSE_ORDERED_CANDIDATES:
         # Compare the same packed keys as the fallback sort. Unordered
         # candidates or valid lanes following a stop/masked lane still sort.
-        previous = tl.gather(packed, tl.maximum(rank - 1, 0), axis=0)
+        previous = GATHER(packed, tl.maximum(rank - 1, 0), axis=0)
         if tl.sum(((rank > 0) & (packed < previous)).to(tl.int32), axis=0) != 0:
             selected = tl.sort(packed, descending=False)
         else:
@@ -713,6 +714,7 @@ def bootstrap_beam_outputs_out(
     num_warps: int = 4,
 ) -> None:
     """Expand the first parent of each request into caller-owned Beam outputs."""
+    gather = getattr(tl, "gather", None)
     _bootstrap_beam_outputs_kernel[(batch_size,)](
         cumulative_logprobs,
         top_tokens,
@@ -728,7 +730,8 @@ def bootstrap_beam_outputs_out(
         COMPACT_INPUT=compact_input,
         WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
         BLOCK=triton.next_power_of_2(max(beam_width, candidate_width)),
-        REUSE_ORDERED_CANDIDATES=reuse_ordered_candidates and hasattr(tl, "gather"),
+        REUSE_ORDERED_CANDIDATES=reuse_ordered_candidates and gather is not None,
+        GATHER=gather,
         num_warps=num_warps,
     )
 
