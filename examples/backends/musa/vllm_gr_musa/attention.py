@@ -108,3 +108,91 @@ def eager_paged_prefill(
         scores = scores.masked_fill(future[:, None, None, :], -torch.inf)
     result = torch.einsum("qhgk,khd->qhgd", scores.softmax(dim=-1), value)
     return result.reshape_as(query).to(query.dtype)
+
+
+class EagerBeamAttention:
+    """Consume the host sequence geometry already carried by Beam metadata."""
+
+    reshape_and_cache = staticmethod(write_paged_kv)
+    cache_unshared_kv = staticmethod(write_suffix_kv)
+
+    @staticmethod
+    def is_available() -> bool:
+        return True
+
+    @staticmethod
+    def get_flash_attn_version(*, requires_alibi=False, head_size=None) -> None:
+        if requires_alibi:
+            raise ValueError("Eager MUSA Beam does not support ALiBi")
+
+    @staticmethod
+    def supports_sinks() -> bool:
+        return False
+
+    @staticmethod
+    def cascade_attention(
+        *,
+        output,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        sliding_window_size,
+        scale,
+        logits_soft_cap,
+        vllm_flash_attn_version,
+        s_aux=None,
+        alibi_slopes=None,
+        beam_pool=None,
+        prefill_flash_attn_version=None,
+    ) -> None:
+        if (
+            sliding_window_size not in (None, (-1, -1), [-1, -1])
+            or logits_soft_cap
+            or s_aux is not None
+            or alibi_slopes is not None
+        ):
+            raise ValueError("Unsupported eager MUSA Beam attention configuration")
+        metadata = attn_metadata
+        if metadata.prefix_indices is None:
+            offsets = metadata.std_cu_seqlens_q_cpu
+            lengths = metadata.std_seqlens_kv_cpu
+            for row, length in enumerate(lengths):
+                start, end = offsets[row : row + 2]
+                output[start:end].copy_(
+                    eager_paged_prefill(
+                        query[start:end],
+                        key_cache,
+                        value_cache,
+                        metadata.std_block_table[row],
+                        length,
+                        scale,
+                        metadata.causal,
+                    )
+                )
+            return
+        if metadata.std_indices is not None or metadata.num_reqs != 1 or beam_pool is None:
+            raise ValueError("Eager MUSA Beam decode requires one dedicated Beam request")
+        session = metadata.beam_session
+        width = session.beam_width
+        length = metadata.incremental_suffix_kv_len
+        slot = session.slot
+        output[:width].copy_(
+            eager_beam_decode(
+                query[:width],
+                key_cache,
+                value_cache,
+                metadata.prefix_block_table[0],
+                metadata.prefix_seqlens_kv_cpu[0],
+                beam_pool.unshared_key[slot, :width, :, :length],
+                beam_pool.unshared_value[slot, :width, :, :length],
+                scale,
+            )
+        )
+
+    @staticmethod
+    def prefill_attention(**kwargs) -> None:
+        raise ValueError("Eager MUSA Beam does not support prefill graphs")
+
+
+EAGER_BEAM_ATTENTION = EagerBeamAttention()
