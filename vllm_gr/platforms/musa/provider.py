@@ -36,4 +36,4 @@ class MUSABackendProvider(CUDABackendProvider):
         raise ValueError("The MUSA provider currently supports runtime initialization only")
 
 
-BACKEND = MUSABackendProvider()
+MUSA_BACKEND = MUSABackendProvider()
