@@ -102,9 +102,7 @@ class BeamSearchRunner:
         width = state.beam_width
         provider = get_active_backend() if state.device.type != "cuda" else None
         self._reorder_kv = (
-            provider.get_beam_kv_reorder()
-            if isinstance(provider, BeamKVReorderProvider)
-            else None
+            provider.get_beam_kv_reorder() if isinstance(provider, BeamKVReorderProvider) else None
         )
         if state.device.type != "cuda" and self._reorder_kv is None:
             raise ValueError("BeamSearchRunner requires a GPU KV reorder implementation")
@@ -399,7 +397,9 @@ class BeamSearchRunner:
                 or tensor.device != first.device
             ):
                 raise ValueError("KV reorder requires compatible per-layer scratch")
-        for ptrs in (context.pool_key_ptrs, context.pool_value_ptrs):
+        for ptrs in (
+            () if pool_device.type != "cuda" else (context.pool_key_ptrs, context.pool_value_ptrs)
+        ):
             if (
                 ptrs is None
                 or ptrs.shape != (layers,)
@@ -419,7 +419,11 @@ class BeamSearchRunner:
             stride,
             dtype,
             pool_device,
-            tuple((t.data_ptr(), t.shape, t.stride(), t.dtype, t.device) for t in bound),
+            tuple(
+                (t.data_ptr(), t.shape, t.stride(), t.dtype, t.device)
+                for t in bound
+                if t is not None
+            ),
         )
 
     def end_session(self, consumer_done: torch.Event | None = None) -> None:
