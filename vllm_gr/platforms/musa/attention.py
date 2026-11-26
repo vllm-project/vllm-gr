@@ -96,6 +96,14 @@ def write_suffix_kv(
 ) -> None:
     """Append the current token to the request-major decode pool."""
     width = curr_key.shape[0]
+    if torch.musa.is_current_stream_capturing():
+        step = beam_session.context.decode_step_buf
+        for pool, current in ((unshared_key, curr_key), (unshared_value, curr_value)):
+            history = pool[slot, :width]
+            offsets = torch.arange(history.shape[2], device=pool.device)
+            write = offsets[None, None, :, None] == step
+            history.copy_(torch.where(write, current.unsqueeze(2), history))
+        return
     unshared_key[slot, :width, :, decode_step].copy_(curr_key)
     unshared_value[slot, :width, :, decode_step].copy_(curr_value)
 
@@ -222,6 +230,21 @@ class EagerBeamAttention:
         width = session.beam_width
         length = metadata.incremental_suffix_kv_len
         slot = session.slot
+        if torch.musa.is_current_stream_capturing():
+            output[:width].copy_(
+                masked_beam_decode(
+                    query[:width],
+                    key_cache,
+                    value_cache,
+                    metadata.prefix_block_table[0],
+                    metadata.prefix_seqlens_kv_device[0],
+                    beam_pool.unshared_key[slot, :width],
+                    beam_pool.unshared_value[slot, :width],
+                    session.context.decode_step_buf + 1,
+                    scale,
+                )
+            )
+            return
         output[:width].copy_(
             eager_beam_decode(
                 query[:width],
