@@ -687,26 +687,24 @@ def test_npu_capture_cascade_mode_returns_false(monkeypatch: pytest.MonkeyPatch)
     assert npu_patch.capture_beam_decode_graph(runner) is False
 
 
-def test_npu_capture_tp_gt1_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("tensor_parallel_size", "use_ubatching"),
+    [(2, False), (1, True)],
+    ids=["tp-gt1", "ubatching"],
+)
+@pytest.mark.l1  # type: ignore[misc]
+def test_npu_capture_returns_false_for_unsupported_parallel_layout(
+    monkeypatch: pytest.MonkeyPatch, tensor_parallel_size: int, use_ubatching: bool
+) -> None:
     _stub_gr_config(
         monkeypatch,
         SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
     )
     monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
     runner = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=2, use_ubatching=False),
-    )
-    assert npu_patch.capture_beam_decode_graph(runner) is False
-
-
-def test_npu_capture_ubatching_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_gr_config(
-        monkeypatch,
-        SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
-    )
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
-    runner = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=True),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tensor_parallel_size, use_ubatching=use_ubatching
+        ),
     )
     assert npu_patch.capture_beam_decode_graph(runner) is False
 

@@ -101,14 +101,10 @@ def _client_params(*, ignore_eos: bool) -> BeamSearchParams:
     return BeamSearchParams(beam_width=BEAM_WIDTH, max_tokens=MAX_TOKENS, ignore_eos=ignore_eos)
 
 
-def test_the_engine_receives_ignore_eos_true_when_the_client_asked_for_it() -> None:
-    call = _sent_to_engine(_client_params(ignore_eos=True))
-
-    assert call.params.ignore_eos is True
-
-
-def test_the_engine_receives_ignore_eos_true_when_the_client_asked_for_false() -> None:
-    call = _sent_to_engine(_client_params(ignore_eos=False))
+@pytest.mark.parametrize("asked", [True, False])  # type: ignore[misc]
+@pytest.mark.l1  # type: ignore[misc]
+def test_the_engine_always_receives_ignore_eos_true(asked: bool) -> None:
+    call = _sent_to_engine(_client_params(ignore_eos=asked))
 
     assert call.params.ignore_eos is True
 

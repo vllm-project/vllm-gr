@@ -141,37 +141,43 @@ def test_run_step1_decode_returns_expected_shape(tokenizer: MagicMock) -> None:
     assert tuple(result.top_tokens.shape) == (4, 2)
 
 
-def test_run_rejects_bad_prefill_shape(tokenizer: MagicMock) -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("logits_shape", "sequence_group_shape", "temperatures", "step", "top_k", "match"),
+    [
+        pytest.param((2, 20), (2, 2, 1), 0, 0, 2, "must be \\[B, 1, 1\\]", id="prefill-rows"),
+        pytest.param((2, 20), (2, 1, 5), 0, 0, 2, "must be \\[B, 1, 1\\]", id="prefill-depth"),
+        # batch=2, width=2 -> rows must be 4, not 3.
+        pytest.param((3, 20), (2, 2, 5), 0, 1, 2, "batch\\*width", id="decode-rows"),
+        pytest.param((2, 20), (2, 1, 1), 0, 3, 2, "expected 0, 1, or 2", id="unsupported-step"),
+        pytest.param((2, 5), (2, 1, 1), 0, 0, 2, "vocab_size", id="logits-vocab"),
+        pytest.param((2, 20), (2, 1, 1), 0, 0, 0, "in \\[1, 256\\]", id="top-k-zero"),
+        pytest.param((2, 20), (2, 1, 1), 0, 0, 300, "in \\[1, 256\\]", id="top-k-above-limit"),
+        # rows=2, temperatures must be [0], [1], or [2].
+        pytest.param((2, 20), (2, 1, 1), 3, 0, 2, "must have shape", id="temperature-shape"),
+        pytest.param((4, 20), (2, 2, 1), 0, 1, 2, "> current_step", id="decode-max-step"),
+    ],
+)
+@pytest.mark.l1  # type: ignore[misc]
+def test_run_rejects_invalid_arguments(
+    tokenizer: MagicMock,
+    logits_shape: tuple[int, int],
+    sequence_group_shape: tuple[int, int, int],
+    temperatures: int,
+    step: int,
+    top_k: int,
+    match: str,
+) -> None:
     resource = _build_resource(tokenizer)
     execution = TorchConstrainedTopKExecution(device="cpu")
     execution.load_tables(resource)
 
-    with pytest.raises(ValueError, match="must be \\[B, 1, 1\\]"):
+    with pytest.raises(ValueError, match=match):
         execution.run(
-            torch.randn(2, 20), torch.zeros(2, 2, 1, dtype=torch.int32), torch.zeros(0), 0, 2
-        )
-
-
-def test_run_rejects_bad_decode_rows(tokenizer: MagicMock) -> None:
-    resource = _build_resource(tokenizer)
-    execution = TorchConstrainedTopKExecution(device="cpu")
-    execution.load_tables(resource)
-
-    # batch=2, width=2 -> rows must be 4, not 3.
-    with pytest.raises(ValueError, match="batch\\*width"):
-        execution.run(
-            torch.randn(3, 20), torch.zeros(2, 2, 5, dtype=torch.int32), torch.zeros(0), 1, 2
-        )
-
-
-def test_run_rejects_unsupported_step(tokenizer: MagicMock) -> None:
-    resource = _build_resource(tokenizer)
-    execution = TorchConstrainedTopKExecution(device="cpu")
-    execution.load_tables(resource)
-
-    with pytest.raises(ValueError, match="expected 0, 1, or 2"):
-        execution.run(
-            torch.randn(2, 20), torch.zeros(2, 1, 1, dtype=torch.int32), torch.zeros(0), 3, 2
+            torch.randn(*logits_shape),
+            torch.zeros(*sequence_group_shape, dtype=torch.int32),
+            torch.zeros(temperatures),
+            step,
+            top_k,
         )
 
 
@@ -244,67 +250,6 @@ def test_npu_adapter_not_loaded_fails(tokenizer: MagicMock) -> None:
             torch.zeros(0),
             0,
             2,
-        )
-
-
-def test_run_rejects_logits_vocab_mismatch(tokenizer: MagicMock) -> None:
-    resource = _build_resource(tokenizer)  # vocab_size=20
-    execution = TorchConstrainedTopKExecution(device="cpu")
-    execution.load_tables(resource)
-
-    with pytest.raises(ValueError, match="vocab_size"):
-        execution.run(
-            torch.randn(2, 5), torch.zeros(2, 1, 1, dtype=torch.int32), torch.zeros(0), 0, 2
-        )
-
-
-def test_run_rejects_top_k_out_of_range(tokenizer: MagicMock) -> None:
-    resource = _build_resource(tokenizer)
-    execution = TorchConstrainedTopKExecution(device="cpu")
-    execution.load_tables(resource)
-
-    with pytest.raises(ValueError, match="in \\[1, 256\\]"):
-        execution.run(
-            torch.randn(2, 20), torch.zeros(2, 1, 1, dtype=torch.int32), torch.zeros(0), 0, 0
-        )
-    with pytest.raises(ValueError, match="in \\[1, 256\\]"):
-        execution.run(
-            torch.randn(2, 20), torch.zeros(2, 1, 1, dtype=torch.int32), torch.zeros(0), 0, 300
-        )
-
-
-def test_run_rejects_bad_temperature_shape(tokenizer: MagicMock) -> None:
-    resource = _build_resource(tokenizer)
-    execution = TorchConstrainedTopKExecution(device="cpu")
-    execution.load_tables(resource)
-
-    # rows=2, temperatures must be [0], [1], or [2].
-    with pytest.raises(ValueError, match="must have shape"):
-        execution.run(
-            torch.randn(2, 20), torch.zeros(2, 1, 1, dtype=torch.int32), torch.zeros(3), 0, 2
-        )
-
-
-def test_run_rejects_prefill_deeper_than_1(tokenizer: MagicMock) -> None:
-    """Prefill sequence_group must be exactly [B, 1, 1], not [B, 1, n]."""
-    resource = _build_resource(tokenizer)
-    execution = TorchConstrainedTopKExecution(device="cpu")
-    execution.load_tables(resource)
-
-    with pytest.raises(ValueError, match="must be \\[B, 1, 1\\]"):
-        execution.run(
-            torch.randn(2, 20), torch.zeros(2, 1, 5, dtype=torch.int32), torch.zeros(0), 0, 2
-        )
-
-
-def test_run_rejects_decode_max_step_le_current_step(tokenizer: MagicMock) -> None:
-    resource = _build_resource(tokenizer)
-    execution = TorchConstrainedTopKExecution(device="cpu")
-    execution.load_tables(resource)
-
-    with pytest.raises(ValueError, match="> current_step"):
-        execution.run(
-            torch.randn(4, 20), torch.zeros(2, 2, 1, dtype=torch.int32), torch.zeros(0), 1, 2
         )
 
 

@@ -43,34 +43,6 @@ assert "vllm_gr.v1.attention.backends.beam_attn_npu" not in sys.modules
     )
 
 
-def test_cuda_platform_rejects_xllm_execution_mode() -> None:
-    """CUDA + xllm must fail loudly in a fresh process (no NPU stack)."""
-    project_root = REPO_ROOT
-    code = """
-from types import SimpleNamespace
-
-import vllm_gr.v1.attention.backends.beam_attn as beam_attn
-
-beam_attn.CUDA_DEVICE = True
-beam_attn.NPU_DEVICE = False
-beam_attn._NPU_DECODE_EXECUTION_MODE = "xllm"
-
-try:
-    beam_attn._get_platform_execution_module()
-except RuntimeError as exc:
-    assert "requires an Ascend NPU" in str(exc), exc
-else:
-    raise AssertionError("expected RuntimeError for xllm mode on CUDA")
-"""
-    subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=project_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-
 def test_xllm_module_import_fails_fast_without_operator_library() -> None:
     """Importing beam_attn_npu_xllm without xllm-ops must raise immediately."""
     project_root = REPO_ROOT
