@@ -556,6 +556,8 @@ def main():
                 )
                 output.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n")
                 if diagnostic_samples is not None:
+                    from msgspec.structs import asdict
+
                     from vllm_gr.config import GRConfig, gr_config_to_mapping
 
                     resolved = GRConfig.from_vllm_config(llm.llm_engine.vllm_config)
@@ -572,8 +574,13 @@ def main():
                         "runtime_provenance": metrics["runtime_provenance"],
                         "engine_config": engine_config,
                         "gr_config": gr_config_to_mapping(resolved)["gr"],
+                        "beam_search_params": asdict(params),
                         "prefix_environment": prefix_environment(resolved.deployment),
                         "graph_runtime": graph_runtime,
+                        "batches": [
+                            [str(sid) for sid in item["sample_ids"][start:end]]
+                            for start, end in item["batches"]
+                        ],
                         "samples": diagnostic_samples,
                     }
                     (item["result_dir"] / "diagnostic_samples.json").write_text(
