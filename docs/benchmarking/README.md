@@ -27,6 +27,41 @@ run `vllm bench --gr --list` and see the
 [CLI benchmark reference](../cli/bench.md) for arguments and backend support.
 For pull request acceptance criteria, see the [CI benchmark gates](../contributing/ci/benchmark_acceptance.md#benchmark-gates).
 
+## Compare individual Beam Recall outputs
+
+Run the [Beam Recall benchmark](../contributing/ci/benchmark_acceptance.md#reproduce-the-cuda-gate)
+with `V1_RECALL_DIAGNOSTICS=1` for each run. Compare the
+`diagnostic_samples.json` files for the same task from the repository root.
+Only Python is needed for the comparison.
+
+```bash
+python -m benchmarks.beam_search.compare_recall_diagnostics \
+  reference/video/diagnostic_samples.json candidate/video/diagnostic_samples.json \
+  --top-k 10 --details > comparison.json
+```
+
+The comparison matches sample IDs and prompt token digests. It reports exact
+order, equal sets with changed order, changed sets, shared SIDs and Top-1
+agreement. Top-1 counts include samples with a candidate on both sides. Omit
+`--top-k` to use every returned SID. Use `--details` to include per-sample
+results and the token IDs added to or removed from each list.
+
+Batch fields compare the ordered members of each submitted batch and the order
+in which the batches were submitted. Older diagnostics without batch records
+still support ranking comparisons and report the batch context as
+`unrecorded`.
+
+The `beam_search_params_status` field compares the submitted search parameters,
+including temperature and beam width. If either file lacks these parameters,
+the status is `unrecorded`. Parameter differences also appear in
+`changed_metadata`.
+
+Absolute score differences cover shared SIDs with scores on both sides. The
+report lists changed runtime, model and catalog metadata. Interpret score
+differences with the [score normalization rules](../design/module/constraint_tables.md)
+for the compared runs. The command produces diagnostics for investigation and
+can be used alongside the Recall acceptance gates.
+
 <a id="open-one-rec-benchmark-dataset"></a>
 
 ## OneRec benchmark dataset
