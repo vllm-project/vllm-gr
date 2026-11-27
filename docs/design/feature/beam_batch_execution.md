@@ -97,6 +97,11 @@ finish reason `length` with no stop token; it does not validate
 - **Cancellation.** Queued work can be cancelled immediately. Active work
   drains before release, and the engine suppresses any late success.
 
+Offline `output_mode="full"` defers public Beam fields until first access.
+If detokenization or the final public-type transition fails, the lazy object
+keeps the accepted tail and materializer, so a later access retries. Recursive
+access during materialization raises instead of publishing placeholders.
+
 ## Configuration
 
 `gr.beam_batch_sizes` selects the prompt counts eligible for grouped HTTP
