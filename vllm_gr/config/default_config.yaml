@@ -77,6 +77,7 @@ gr:
 
   # GPU: CUDA graphs and vocabulary projection
   adapter_cache_enabled: false             # Cache execution adapters by B; V1 retains buffers for multiple captured B values.
+  enable_radix_topk: false                 # Opt into Radix Top-K for fixed-width CUDA Beam Decode selection.
   prefill_flash_attn_version: auto         # auto: upgrade eligible FA2 to FA3; 2 or 3: explicit version; null: follow Decode.
   unconstrained_head_layout: transposed    # Cache a transposed LM head using extra weight memory; null: original layout.
                                            # Unconstrained, unquantized FP16/BF16 Qwen3 only; TP=PP=1 and no LoRA.

@@ -296,6 +296,49 @@ def test_worker_uses_driver_paths_and_frozen_deployment(
     assert GRConfig.from_vllm_config(worker) == config
 
 
+@pytest.mark.parametrize("enabled", [False, True])  # type: ignore[misc]
+def test_radix_topk_round_trips_through_public_and_worker_config(
+    enabled: bool, tmp_path: Path
+) -> None:
+    config = gr_config_from_mapping(
+        {
+            "gr": {
+                "beam_width": [8, 8, 8],
+                "candidate_width": [8, 8, 8],
+                "enable_radix_topk": enabled,
+            }
+        }
+    )
+    assert config.enable_radix_topk is enabled
+    encoded = gr_config_to_mapping(config)
+    encoded_gr = encoded["gr"]
+    assert isinstance(encoded_gr, dict)
+    assert encoded_gr["enable_radix_topk"] is enabled
+    assert gr_config_from_mapping(encoded) == config
+
+    document = tmp_path / "radix.yaml"
+    document.write_text(
+        "gr:\n  enable_radix_topk: " + str(enabled).lower() + "\n", encoding="utf-8"
+    )
+    assert load_gr_config(document).enable_radix_topk is enabled
+
+    driver_config = SimpleNamespace(additional_config={})
+    assert GRConfig.from_vllm_config(driver_config).enable_radix_topk is False
+    config.write_to_vllm_config(driver_config)
+    snapshot = json.loads(json.dumps(driver_config.additional_config))
+    assert GRConfig.from_vllm_config(SimpleNamespace(additional_config=snapshot)) == config
+    GRConfig().write_to_vllm_config(driver_config)
+    assert GRConfig.from_vllm_config(driver_config).enable_radix_topk is False
+
+
+@pytest.mark.parametrize("invalid", [None, 1, "true"])  # type: ignore[misc]
+def test_radix_topk_rejects_non_boolean_config(invalid: object) -> None:
+    with pytest.raises(TypeError, match=r"gr\.enable_radix_topk must be a boolean"):
+        gr_config_from_mapping({"gr": {"enable_radix_topk": invalid}})
+    with pytest.raises(TypeError, match=r"gr\.enable_radix_topk must be a boolean"):
+        GRConfig(enable_radix_topk=invalid)
+
+
 @pytest.mark.parametrize("key", ["execution_mode", "dynamic_beam_widths", "per_parent_beam_widths"])  # type: ignore[misc]
 def test_retired_configuration_keys_are_rejected(key: str) -> None:
     with pytest.raises(ValueError, match="Unknown gr settings"):

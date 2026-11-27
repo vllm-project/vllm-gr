@@ -109,7 +109,7 @@ def _write_test_kv(
     tl.store(value + offset, -number, mask=live)
 
 
-def _write_kv(runner):
+def _write_kv(runner: BeamSearchRunner) -> None:
     s = runner._state
     for layer, pool in enumerate(runner.session.pools):
         _write_test_kv[(runner.state.beam_width,)](

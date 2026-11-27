@@ -147,6 +147,10 @@ def close_v2_runtime(runner: Any) -> None:
         graph.uninstall()
         graph.clear()
         runner._beam_decode_graph = None
+    pool = getattr(runner, "_beam_postprocess_workspaces", None)
+    if pool is not None:
+        for key in pool.keys:
+            pool.require(key).radix_graphs.clear()
     for name in (
         "_gr_v2_runtime",
         "_gr_gpu_stage_runner",
@@ -158,12 +162,14 @@ def close_v2_runtime(runner: Any) -> None:
             delattr(runner, name)
 
 
-def capture_multibatch_forward(worker: Any, *, allow_eager_fallback: bool = True) -> bool:
+def capture_multibatch_forward(
+    worker: Any, *, allow_eager_fallback: bool = True, profile_only: bool = False
+) -> bool:
     """Publish configured V2 Decode shapes, with shape-local fallback."""
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
     from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
     from vllm_gr.v1.worker.gr_context import _get_gr_config
-    from vllm_gr.v1.worker.gr_startup import _capture_batch, _capture_enabled
+    from vllm_gr.v1.worker.gr_startup import _capture_batches, _capture_enabled
 
     with torch.inference_mode():
         if not _capture_enabled(worker) or str(worker.device).split(":")[0] != "cuda":
@@ -192,21 +198,13 @@ def capture_multibatch_forward(worker: Any, *, allow_eager_fallback: bool = True
             raise RuntimeError(
                 "Asynchronous scheduling startup encountered an incomplete capture state"
             )
-        from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
-            ensure_prefix_calibration,
+        failures = _capture_batches(
+            worker,
+            batches,
+            hooks_type=CudaStageHooksV2,
+            allow_eager_fallback=allow_eager_fallback,
+            log_radix_summary=not profile_only,
         )
-
-        ensure_prefix_calibration(worker)
-        failures = {}
-        for batch in batches:
-            error = _capture_batch(
-                worker,
-                batch,
-                hooks_type=CudaStageHooksV2,
-                allow_eager_fallback=allow_eager_fallback,
-            )
-            if error is not None:
-                failures[batch] = error
         runtime.startup_failures = failures
         runtime.capture_failed = len(failures) == len(batches)
         runtime.capture_error = next(iter(failures.values()), None)

@@ -67,12 +67,6 @@ def capture_async_forward(
             )
 
             return capture_multibatch_forward(worker, allow_eager_fallback=allow_eager_fallback)
-        # Measure (or load) the device-local prefix cost model before any Beam graph
-        # is captured: the cache write is a YAML file and the probe needs the GPU to
-        # itself. Failures degrade to "no calibration", never to a failed start-up.
-        from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
-            ensure_prefix_calibration,
-        )
         from vllm_gr.v1.worker.gr_context import _get_gr_config
 
         cfg = _get_gr_config(worker)
@@ -104,21 +98,50 @@ def capture_async_forward(
             raise RuntimeError(
                 "Asynchronous scheduling startup encountered an incomplete capture state"
             )
-        ensure_prefix_calibration(worker)
-        failures = {}
-        for batch in batches:
-            error = _capture_batch(
-                worker,
-                batch,
-                hooks_type=hooks_type,
-                allow_eager_fallback=allow_eager_fallback,
-            )
-            if error is not None:
-                failures[batch] = error
+        failures = _capture_batches(
+            worker, batches, hooks_type=hooks_type, allow_eager_fallback=allow_eager_fallback
+        )
         worker._gr_decode_capture_failures = failures
         worker._gr_async_decode_graph_capture_failed = len(failures) == len(batches)
         worker._gr_async_decode_graph_capture_error = next(iter(failures.values()), None)
         return len(failures) < len(batches)
+
+
+def _capture_batches(
+    worker: Any,
+    batches: tuple[int, ...],
+    *,
+    hooks_type: CudaStageHooksType,
+    allow_eager_fallback: bool,
+    log_radix_summary: bool = True,
+) -> dict[int, str]:
+    from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
+        ensure_prefix_calibration,
+    )
+
+    # Measure or load the device-local prefix cost model before Beam capture.
+    # The probe needs the GPU to itself and degrades to no calibration on failure.
+    ensure_prefix_calibration(worker)
+    failures = {}
+    radix_capture_rows: dict[tuple[int, int], bool] | None = {} if log_radix_summary else None
+    for batch in batches:
+        error = _capture_batch(
+            worker,
+            batch,
+            hooks_type=hooks_type,
+            allow_eager_fallback=allow_eager_fallback,
+            radix_capture_rows=radix_capture_rows,
+        )
+        if error is not None:
+            failures[batch] = error
+    if radix_capture_rows:
+        captured = sum(radix_capture_rows.values())
+        logger.info(
+            "Radix selection startup capture: captured_rows=%d, eager_rows=%d",
+            captured,
+            len(radix_capture_rows) - captured,
+        )
+    return failures
 
 
 def _capture_enabled(worker: Any) -> bool:
@@ -151,6 +174,7 @@ def _capture_batch(
     *,
     hooks_type: CudaStageHooksType,
     allow_eager_fallback: bool,
+    radix_capture_rows: dict[tuple[int, int], bool] | None = None,
 ) -> str | None:
     """Capture the explicit batch selected by the V1 or V2 entry point."""
     from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
@@ -237,6 +261,16 @@ def _capture_batch(
                 # the dummy session; a device error here aborts startup.
                 torch.accelerator.synchronize(worker.device)
                 fallback_error = error
+            workspace = owner.beam.workspace
+            if workspace.radix_scratch is not None:
+                for runner in owner.beam.runners:
+                    if graph is not None and graph.ready:
+                        runner.capture_radix_selection()
+                    if radix_capture_rows is not None:
+                        row = runner.workspace_index
+                        # Batch sizes reuse workspace rows, and a larger batch
+                        # can successfully retry a previously refused capture.
+                        radix_capture_rows[id(workspace), row] = row in workspace.radix_graphs
         finally:
             done = torch.Event()
             done.record()

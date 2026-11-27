@@ -311,7 +311,7 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
 
             capturing_enabled = monitor.cudagraph_capturing_enabled
             try:
-                v2_resources.capture_multibatch_forward(self)
+                v2_resources.capture_multibatch_forward(self, profile_only=profile_only)
             finally:
                 # Beam's local capture closes its window. Profiling runs
                 # inside native startup, which still needs to capture later.

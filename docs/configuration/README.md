@@ -136,6 +136,7 @@ artifact layout and have their own version identifiers.
 | `gr.constraint_table.max_top_k` | In table mode, this capacity must cover the largest candidate width. CUDA and Ascend table operators support up to 256 candidates per parent. |
 | `gr.result_width` | Number of sequences to return, up to the final retained width. The default (`null`) uses the final retained width. |
 | `gr.worker_decision` | `true` enables worker-side Beam selection. `null` uses the platform default. |
+| `gr.enable_radix_topk` | `true` opts into Radix Top-K for fixed-width CUDA Beam Decode. Defaults to `false`. |
 | `gr.max_decode_steps` | Generation capacity, excluding begin and end markers. It must cover the width lists and defaults to 3. |
 
 Unconstrained generation accepts widths from 1 to 1024. On Ascend,

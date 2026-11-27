@@ -83,7 +83,8 @@ def capture_runtime(monkeypatch: pytest.MonkeyPatch) -> CaptureRuntime:
         positions=Mock(),
         execution_mask=Mock(),
         beam=SimpleNamespace(
-            session=SimpleNamespace(context=SimpleNamespace(decode_step_buf=Mock()))
+            session=SimpleNamespace(context=SimpleNamespace(decode_step_buf=Mock())),
+            workspace=SimpleNamespace(radix_scratch=None),
         ),
         capture_forward=Mock(return_value=graph),
     )
@@ -115,6 +116,117 @@ def _capture(worker: SimpleNamespace, *, allow: bool = True) -> bool:
     return bool(capture_multibatch_forward(worker, allow_eager_fallback=allow))
 
 
+@pytest.fixture  # type: ignore[misc]
+def radix_capture_runtime(
+    capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch
+) -> tuple[CaptureRuntime, Mock]:
+    from contextlib import nullcontext
+
+    from vllm_gr.ops.cuda import beam_radix_topk as radix
+    from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
+
+    _worker, owner, _graph, _stream, _health = capture_runtime
+    workspace = SimpleNamespace(
+        radix_scratch=object(),
+        radix_graphs={},
+        topk_scores=torch.empty(1, 4, 4),
+    )
+    runner = cast(Any, BeamSearchRunner.__new__(BeamSearchRunner))
+    runner.workspace = workspace
+    runner.workspace_index = 0
+    runner._scratch = {
+        "parent_scores": torch.empty(1, 4),
+        "selection_mask": torch.ones(1, 16, dtype=torch.bool),
+    }
+    owner.beam.workspace = workspace
+    owner.beam.runners = (runner,)
+    operations = Mock()
+    monkeypatch.setattr(radix, "beam_radix_topk_out", operations)
+    monkeypatch.setattr(torch.cuda, "Stream", Mock(return_value=Mock()))
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Mock(return_value=Mock()))
+    monkeypatch.setattr(torch.cuda, "stream", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kwargs: nullcontext())
+    return capture_runtime, operations
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_radix_capture_refusal_preserves_forward_graph(
+    radix_capture_runtime: tuple[CaptureRuntime, Mock],
+) -> None:
+    runtime, operations = radix_capture_runtime
+    worker, owner, graph, stream, health = runtime
+    operations.side_effect = [
+        None,
+        RuntimeError("operation not supported when stream is capturing"),
+    ]
+
+    assert _capture(worker)
+    assert owner.graph is graph
+    assert owner.beam.workspace.radix_graphs == {}
+    assert operations.call_count == 2
+    assert owner.closed
+    health.assert_called_once_with(torch.device("cpu"))
+    stream.synchronize.assert_called_once_with()
+    graph.clear.assert_not_called()
+    assert not get_v2_runtime(worker).capture_failed
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "phase,message",
+    [
+        ("warmup", "operation not supported when stream is capturing"),
+        ("capture", "illegal memory access"),
+        ("capture", "operation failed due to a previous error during capture"),
+        ("capture", "shape mismatch"),
+    ],
+)
+def test_radix_warmup_and_fatal_capture_failures_abort_startup(
+    radix_capture_runtime: tuple[CaptureRuntime, Mock], phase: str, message: str
+) -> None:
+    runtime, operations = radix_capture_runtime
+    worker, owner, graph, _stream, health = runtime
+    error = RuntimeError(message)
+    operations.side_effect = error if phase == "warmup" else [None, error]
+
+    with pytest.raises(RuntimeError) as caught:
+        _capture(worker)
+    assert caught.value is error
+    assert owner.graph is None
+    assert owner.beam.workspace.radix_graphs == {}
+    assert owner.closed
+    graph.clear.assert_called_once_with()
+    health.assert_not_called()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("failure", ["capturing", "synchronize"])  # type: ignore[misc]
+def test_radix_capture_refusal_requires_healthy_device(
+    radix_capture_runtime: tuple[CaptureRuntime, Mock],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    runtime, operations = radix_capture_runtime
+    worker, owner, graph, _stream, health = runtime
+    operations.side_effect = [
+        None,
+        RuntimeError("operation not supported when stream is capturing"),
+    ]
+    if failure == "capturing":
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        expected = "did not leave capture mode"
+    else:
+        health.side_effect = RuntimeError("illegal memory access")
+        expected = "illegal memory access"
+
+    with pytest.raises(RuntimeError, match=expected):
+        _capture(worker)
+    assert owner.graph is None
+    assert owner.beam.workspace.radix_graphs == {}
+    assert owner.closed
+    graph.clear.assert_called_once_with()
+
+
 @pytest.mark.l1  # type: ignore[misc]
 def test_cuda_startup_requires_explicit_hooks(capture_runtime: CaptureRuntime) -> None:
     with pytest.raises(ValueError, match="requires explicit stage hooks"):
@@ -129,6 +241,8 @@ def test_success_publishes_only_after_release_and_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worker, owner, graph, stream, health = capture_runtime
+    info = Mock()
+    monkeypatch.setattr(startup.logger, "info", info)
     assert startup.capture_async_forward(worker, hooks_type=hooks_type)
     assert cast(Mock, stages.get_stage_runner).call_args.kwargs == {
         "hooks_type": hooks_type,
@@ -147,6 +261,83 @@ def test_success_publishes_only_after_release_and_sync(
     stream.synchronize.assert_called_once()
     health.assert_not_called()
     graph.clear.assert_not_called()
+    info.assert_not_called()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "hooks_type,profile_only",
+    [(CudaStageHooksV1, False), (CudaStageHooksV2, False), (CudaStageHooksV2, True)],
+)
+def test_startup_summarizes_radix_capture_across_batches(
+    capture_runtime: CaptureRuntime,
+    hooks_type: type[CudaStageHooks],
+    profile_only: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.ops.cuda.beam_radix_topk import BeamRadixSelectionGraph
+    from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
+
+    worker, owner, graph, _stream, _health = capture_runtime
+    update_worker_config(
+        worker,
+        enable_radix_topk=True,
+        deployment=DeploymentOptions(beam_batch_sizes=(2, 4)),
+    )
+    worker.vllm_config.scheduler_config.max_num_seqs = 4
+    workspace = SimpleNamespace(
+        radix_scratch=object(),
+        radix_graphs={},
+        topk_scores=torch.empty(4, 4, 4),
+    )
+    owner.beam.workspace = workspace
+    runners = []
+    for row in range(4):
+        runner = cast(Any, BeamSearchRunner.__new__(BeamSearchRunner))
+        runner.workspace = workspace
+        runner.workspace_index = row
+        runner._scratch = {
+            "parent_scores": torch.empty(4),
+            "selection_mask": torch.empty(16, dtype=torch.bool),
+        }
+        runners.append(runner)
+
+    def prepare_stage(
+        _worker: SimpleNamespace, scheduled: SimpleNamespace, **_kwargs: Any
+    ) -> SimpleNamespace:
+        owner.graph = None
+        owner.closed = False
+        owner.beam.runners = runners[: len(scheduled.num_scheduled_tokens)]
+        return owner
+
+    monkeypatch.setattr(stages, "get_stage_runner", prepare_stage)
+
+    # Row 0 is reused. Row 1 succeeds on retry, and only row 2 uses eager Radix.
+    capture_results = iter((object(), None, object(), None, object()))
+
+    def capture_selection(*_args: Any) -> object | None:
+        assert owner.capture_forward.call_count == owner.release.call_count + 1
+        return next(capture_results)
+
+    capture = Mock(side_effect=capture_selection)
+    monkeypatch.setattr(BeamRadixSelectionGraph, "capture", capture)
+    info = Mock()
+    monkeypatch.setattr(startup.logger, "info", info)
+
+    if profile_only:
+        assert capture_multibatch_forward(worker, profile_only=True)
+    else:
+        assert startup.capture_async_forward(worker, hooks_type=hooks_type)
+    assert [call.args[1].data_ptr() for call in capture.call_args_list] == [
+        workspace.topk_scores[row].data_ptr() for row in (0, 1, 1, 2, 3)
+    ]
+    assert owner.graph is graph
+    if profile_only:
+        info.assert_not_called()
+    else:
+        info.assert_called_once_with(
+            "Radix selection startup capture: captured_rows=%d, eager_rows=%d", 3, 1
+        )
 
 
 @pytest.mark.parametrize("batch_size", range(1, 9))  # type: ignore[misc]

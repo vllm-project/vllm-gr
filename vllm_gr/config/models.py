@@ -483,6 +483,17 @@ class GRConfig:
     )
     """Resolved startup settings shared by the driver and workers."""
 
+    enable_radix_topk: bool = field(
+        default=False,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_enable_radix_topk",
+                canonical_path=("gr", "enable_radix_topk"),
+            )
+        },
+    )
+    """Opt into Radix Top-K for request-level CUDA Beam Decode selection."""
+
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import validate_config_fields
 

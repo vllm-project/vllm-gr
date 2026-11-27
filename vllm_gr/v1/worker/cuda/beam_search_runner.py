@@ -15,6 +15,10 @@ from vllm_gr.ops.cuda.beam_kv_reorder import (
     _select_kv_gather_kernel,
     _select_kv_scatter_kernel,
 )
+from vllm_gr.ops.cuda.beam_radix_topk import (
+    BeamRadixSelectionGraph,
+    beam_radix_topk_out,
+)
 from vllm_gr.ops.cuda.beam_selection import (
     _group_beam_outputs_kernel,
     _hierarchical_topk_out,
@@ -242,6 +246,21 @@ class BeamSearchRunner:
     ) -> None:
         """Initialize once from one GPU parent row; generated values stay on GPU."""
         self._advance(token_ids, logprobs, valid_mask, prefill=True)
+
+    def capture_radix_selection(self) -> None:
+        """Bind a decode selection graph to the startup workspace row."""
+        workspace = self.workspace
+        scratch = workspace.radix_scratch
+        row = self.workspace_index
+        if scratch is not None and row not in workspace.radix_graphs:
+            graph = BeamRadixSelectionGraph.capture(
+                self._scratch["parent_scores"],
+                workspace.topk_scores[row],
+                self._scratch["selection_mask"],
+                scratch,
+            )
+            if graph is not None:
+                workspace.radix_graphs[row] = graph
 
     def advance(
         self, token_ids: torch.Tensor, logprobs: torch.Tensor, valid_mask: torch.Tensor
@@ -534,17 +553,32 @@ class BeamSearchRunner:
                 reuse_ordered_candidates=True,
             )
         else:
-            selected_scores, selected_flat, stride = _hierarchical_topk_out(
-                w["parent_scores"],
-                logprobs,
-                w["selection_mask"],
-                1,
-                rows,
-                candidate_width,
-                width,
-                self.workspace.selection_scratch,
-                mask_invalid_indices=True,
-            )
+            select_inputs = (w["parent_scores"], logprobs, w["selection_mask"])
+            radix_scratch = self.workspace.radix_scratch
+            if not prefill and radix_scratch is not None:
+                graph = self.workspace.radix_graphs.get(self.workspace_index)
+                selected = graph.replay(*select_inputs) if graph is not None else None
+                if selected is None:
+                    selected = beam_radix_topk_out(
+                        *select_inputs,
+                        1,
+                        rows,
+                        candidate_width,
+                        width,
+                        radix_scratch,
+                        mask_invalid_indices=True,
+                    )
+            else:
+                selected = _hierarchical_topk_out(
+                    *select_inputs,
+                    1,
+                    rows,
+                    candidate_width,
+                    width,
+                    self.workspace.selection_scratch,
+                    mask_invalid_indices=True,
+                )
+            selected_scores, selected_flat, stride = selected
             _group_beam_outputs_kernel[(1,)](
                 selected_scores,
                 selected_flat,

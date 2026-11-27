@@ -97,8 +97,9 @@ def test_load_wrapper_propagates_failure_without_accounting(
     assert initialize.call_count == (failure == "workspace")
 
 
+@pytest.mark.parametrize("enable_radix_topk", [False, True])  # type: ignore[misc]
 def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storage(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, enable_radix_topk: bool
 ) -> None:
     from unittest.mock import Mock
 
@@ -115,6 +116,7 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
         max_batch=capacity,
         max_decode_steps=3,
         device_memory_bytes=0,
+        radix_scratch=object() if enable_radix_topk else None,
     )
     allocate = Mock(return_value=workspace)
     monkeypatch.setattr(BeamPostprocessWorkspace, "allocate", allocate)
@@ -126,6 +128,7 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
                 beam_worker_decision=True,
                 beam_max_width=4,
                 beam_max_decode_steps=3,
+                enable_radix_topk=enable_radix_topk,
             )
         ),
     )
@@ -141,6 +144,7 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
         logits_dtype=torch.float16,
         flash_logits_rows=0,
         flash_logits_vocab_size=0,
+        enable_radix_topk=enable_radix_topk,
     )
     runner._beam_context = SimpleNamespace(max_batch=capacity)
     assert workspace_support.initialize_beam_postprocess_workspaces(runner) is pool

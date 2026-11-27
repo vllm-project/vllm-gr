@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +14,10 @@ from vllm.logger import init_logger
 from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 
 if TYPE_CHECKING:
+    from vllm_gr.ops.cuda.beam_radix_topk import (
+        BeamRadixScratch,
+        BeamRadixSelectionGraph,
+    )
     from vllm_gr.ops.cuda.beam_state import BeamStateScratch
 
 logger = init_logger(__name__)
@@ -94,6 +98,11 @@ class BeamPostprocessWorkspace:
     # the device cannot run it, or no batch geometry qualifies.
     flash_logits: torch.Tensor | None = None
 
+    # Request-local selection runs serially on the owning stream. Each graph
+    # binds one input row while sharing the same output scratch.
+    radix_scratch: BeamRadixScratch | None = None
+    radix_graphs: dict[int, BeamRadixSelectionGraph] = field(default_factory=dict)
+
     @classmethod
     def allocate(
         cls,
@@ -106,6 +115,7 @@ class BeamPostprocessWorkspace:
         logits_dtype: torch.dtype,
         flash_logits_rows: int = 0,
         flash_logits_vocab_size: int = 0,
+        enable_radix_topk: bool = False,
     ) -> BeamPostprocessWorkspace:
         """Allocate every tensor once; callers retain the returned object."""
 
@@ -142,6 +152,13 @@ class BeamPostprocessWorkspace:
             beam_width,
             resolved_device,
         )
+        radix_scratch = None
+        if enable_radix_topk:
+            from vllm_gr.ops.cuda.beam_radix_topk import allocate_beam_radix_scratch
+
+            radix_scratch = allocate_beam_radix_scratch(
+                1, beam_width, top_k, beam_width, resolved_device
+            )
 
         return cls(
             key=key,
@@ -161,6 +178,7 @@ class BeamPostprocessWorkspace:
             next_sequence=device_empty(sequence_shape, torch.int32),
             selection_scratch=selection_scratch,
             flash_logits=flash_logits,
+            radix_scratch=radix_scratch,
         )
 
     def device_tensors(self) -> tuple[torch.Tensor, ...]:
@@ -186,6 +204,8 @@ class BeamPostprocessWorkspace:
             tensors += self.state_scratch.device_tensors()
         if self.flash_logits is not None:
             tensors += (self.flash_logits,)
+        if self.radix_scratch is not None:
+            tensors += self.radix_scratch.device_tensors()
         return tensors
 
     @property
@@ -256,6 +276,7 @@ def initialize_beam_postprocess_workspaces(
     if not bool(gr_cfg.beam_worker_decision) or width is None:
         return None
     candidate_width = resolve_candidate_width(gr_cfg)
+    enable_radix_topk = gr_cfg.enable_radix_topk
 
     context = getattr(runner, "_beam_context", None)
     # The Beam context is created later, on the first admitted batch, with
@@ -290,8 +311,10 @@ def initialize_beam_postprocess_workspaces(
     existing = getattr(runner, "_beam_postprocess_workspaces", None)
     if existing is not None:
         workspace = existing.require(key)
-        if workspace.max_batch != resolved_max_batch or workspace.max_decode_steps != int(
-            gr_cfg.beam_max_decode_steps
+        if (
+            workspace.max_batch != resolved_max_batch
+            or workspace.max_decode_steps != int(gr_cfg.beam_max_decode_steps)
+            or (workspace.radix_scratch is not None) != enable_radix_topk
         ):
             raise RuntimeError(
                 "prewarmed Beam postprocess workspace geometry changed after "
@@ -308,6 +331,7 @@ def initialize_beam_postprocess_workspaces(
         logits_dtype=dtype,
         flash_logits_rows=flash_rows,
         flash_logits_vocab_size=flash_vocab_size,
+        enable_radix_topk=enable_radix_topk,
     )
     pool = BeamPostprocessWorkspacePool()
     pool.add(workspace)

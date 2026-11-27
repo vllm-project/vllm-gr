@@ -212,7 +212,7 @@ def test_capture_order_and_failure_propagation(
     expected = [call.native(worker)]
     if beam_enabled:
         expected.insert(0, call.plan(worker))
-        expected.append(call.decode(worker))
+        expected.append(call.decode(worker, profile_only=False))
 
     def native(runner: Any) -> int:
         return cast(int, events.native(runner))
@@ -276,7 +276,11 @@ def test_repeated_capture_preserves_published_decode_failure(
         assert runtime.capture_error == reason
 
     capture.assert_called_once_with(
-        worker, 1, hooks_type=CudaStageHooksV2, allow_eager_fallback=True
+        worker,
+        1,
+        hooks_type=CudaStageHooksV2,
+        allow_eager_fallback=True,
+        radix_capture_rows={},
     )
 
 
@@ -318,7 +322,7 @@ def test_profile_capture_includes_decode_without_freezing(
     decode = Mock()
     freeze = Mock()
     monkeypatch.setattr(monitor, "cudagraph_capturing_enabled", capturing_enabled)
-    decode.side_effect = lambda worker: monitor.set_cudagraph_capturing_enabled(False)
+    decode.side_effect = lambda worker, **kwargs: monitor.set_cudagraph_capturing_enabled(False)
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", install)
     monkeypatch.setattr(resources, "capture_multibatch_forward", decode)
     monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", freeze)
@@ -327,7 +331,7 @@ def test_profile_capture_includes_decode_without_freezing(
     assert v2.make_patched_capture_model_v2(native)(worker, profile_only=profile_only) == 5120
     native.assert_called_once_with(worker, profile_only=profile_only)
     install.assert_called_once_with(worker)
-    decode.assert_called_once_with(worker)
+    decode.assert_called_once_with(worker, profile_only=profile_only)
     if profile_only:
         freeze.assert_not_called()
     else:
@@ -357,8 +361,9 @@ def test_profile_decode_failure_restores_native_capture_state(
     setattr(native, v2._WORKER_V2_GRAPH_PATCH_MARKER, False)
     install, freeze = Mock(), Mock()
 
-    def capture(runner: Any) -> bool:
+    def capture(runner: Any, *, profile_only: bool) -> bool:
         assert runner is worker
+        assert profile_only
         monitor.set_cudagraph_capturing_enabled(False)
         raise error
 
@@ -383,9 +388,16 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
 ) -> None:
     from contextlib import nullcontext
 
+    import torch
     from vllm.config import CUDAGraphMode as Mode
     from vllm.v1.worker.gpu import cudagraph_utils as native
 
+    from vllm_gr.ops.cuda.beam_radix_topk import BeamRadixSelectionGraph
+    from vllm_gr.v1.worker.cuda.beam_search_runner import BeamSearchRunner
+    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+        BeamPostprocessWorkspaceKey,
+        BeamPostprocessWorkspacePool,
+    )
     from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
 
     mib = 1 << 20
@@ -400,6 +412,28 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
     )
     graph = Mock()
     events: list[str] = []
+    scores = torch.empty(1, 128, 128)
+    scratch = object()
+    workspace = SimpleNamespace(
+        key=BeamPostprocessWorkspaceKey(128, 128, torch.float16),
+        radix_scratch=scratch,
+        radix_graphs={},
+        topk_scores=scores,
+        execution_owner=None,
+    )
+    pool_workspaces = BeamPostprocessWorkspacePool()
+    pool_workspaces.add(workspace)
+    worker._beam_postprocess_workspaces = pool_workspaces
+    selection = cast(Any, BeamSearchRunner.__new__(BeamSearchRunner))
+    selection.workspace = workspace
+    selection.workspace_index = 0
+    selection._scratch = {
+        "parent_scores": torch.empty(1, 128),
+        "selection_mask": torch.empty(1, 128 * 128, dtype=torch.bool),
+    }
+    profiling_graph, serving_graph = object(), object()
+    capture_selection = Mock(side_effect=[profiling_graph, serving_graph])
+    monkeypatch.setattr(BeamRadixSelectionGraph, "capture", capture_selection)
 
     def install(runner: Any) -> None:
         assert runner.cudagraph_manager is not manager
@@ -415,6 +449,8 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
         assert manager.pool == native.current_platform.get_global_graph_pool()
         manager._capture_mem_samples.extend([10 * mib, 2 * mib])
         worker._beam_decode_graph = graph
+        selection.capture_radix_selection()
+        assert workspace.radix_graphs[0] is profiling_graph
         from threading import Lock
 
         worker._gr_gpu_stage_runner = SimpleNamespace(
@@ -467,6 +503,13 @@ def test_native_profiler_uses_gr_plan_and_cleans_temporary_decode(
     )
     graph.uninstall.assert_called_once()
     graph.clear.assert_called_once()
+    assert workspace.radix_graphs == {}
+    assert workspace.topk_scores is scores and workspace.radix_scratch is scratch
+    assert worker._beam_postprocess_workspaces is pool_workspaces
+    capture_selection.assert_called_once()
+    selection.capture_radix_selection()
+    assert capture_selection.call_count == 2
+    assert workspace.radix_graphs[0] is serving_graph
 
 
 def test_profile_rejects_bound_runtime_and_preserves_non_beam(
