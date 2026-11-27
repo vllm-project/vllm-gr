@@ -57,6 +57,21 @@ this is documented intent rather than a tested invariant. The
 [CUDA backend](../../../vllm_gr/constraints/cuda_backend.py) implements
 selection.
 
+For fixed-width CUDA Decode, `gr.enable_streaming_constrained_head: true`
+can reduce projection workspace by consuming the existing vocabulary window
+in tiles. The path retains the full-window FP32 logsumexp and canonical legal
+candidate order. It uses an 8192-column tile for smaller windows or a
+32768-column tile for windows of at least 65536 tokens. The option defaults to
+`false`. Unconstrained and dynamic-width requests, unsupported LM-head
+variants, and windows without workspace savings use their existing paths.
+
+Streaming sampling runs outside native Forward CUDA Graphs. Each lookup uses
+the concrete current table; publishing a table with different degrees rebuilds
+the candidate workspace without recapturing native Forward. Catalog counts
+are not Triton specialization keys. For an eligible streaming head, each new
+compatible table prewarms the streaming kernels with a single row before
+publication. Different batch sizes reuse the same Triton variants.
+
 ### Ascend
 
 The loader creates a six-table view per Trie. A multi-Trie table is rebased;

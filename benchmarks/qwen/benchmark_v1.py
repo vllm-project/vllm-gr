@@ -28,6 +28,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from benchmarks.metrics import linear_percentile_sorted
+from benchmarks.streaming_head import (
+    add_streaming_head_argument,
+    read_inference_cuda_peak,
+    reset_inference_cuda_peak,
+    streaming_head_config,
+)
 
 MAX_BEAM_STEPS = 3
 
@@ -334,6 +340,7 @@ def canonical_gr_config(args: argparse.Namespace, artifact: ConstraintArtifact) 
             },
         },
         "candidate_width": [args.beam_width] * args.beam_steps,
+        **streaming_head_config(args),
     }
 
 
@@ -603,6 +610,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "dtype": args.dtype,
         "seed": args.seed,
     }
+    if getattr(args, "kv_cache_memory_bytes", None) is not None:
+        engine_kwargs["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
     if timeline_trace_dir is not None:
         engine_kwargs["profiler_config"] = _profiler_config(args, timeline_trace_dir)
 
@@ -618,6 +627,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     beam_steps=args.beam_steps,
                     record_outputs=False,
                 )
+            measure_memory = reset_inference_cuda_peak(llm)
             measured = [
                 _run_once(
                     llm,
@@ -629,6 +639,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 for _ in range(args.repeat)
             ]
+            memory = read_inference_cuda_peak(llm) if measure_memory else None
             if timeline_target is not None and timeline_trace_dir is not None:
                 timeline_run = _run_timeline(
                     llm,
@@ -687,7 +698,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "ignore_eos": args.ignore_eos,
             "length_penalty": args.length_penalty,
         },
+        "memory": memory,
         "engine_config": {
+            "enable_streaming_constrained_head": bool(streaming_head_config(args)),
             "worker_multiprocessing_method": multiprocessing_method,
             "async_scheduling": True,
             "constraint_backend": "canonical_cuda_constraint_table",
@@ -697,6 +710,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "max_num_seqs": 1,
             "enable_prefix_caching": args.enable_prefix_caching,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "kv_cache_memory_bytes": engine_kwargs.get("kv_cache_memory_bytes"),
             "attention_backend": args.attention_backend,
             "enforce_eager": args.enforce_eager,
             "dtype": args.dtype,
@@ -748,10 +762,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--max-num-batched-tokens", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--kv-cache-memory-bytes", type=int, help="Pin the native KV cache budget")
     parser.add_argument("--attention-backend", default="CUSTOM")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--disable-beam-graph", action="store_true")
+    add_streaming_head_argument(parser)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument(

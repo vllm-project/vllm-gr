@@ -120,9 +120,11 @@ sequenceDiagram
 ```
 
 1. **Load and validate.** Each worker loads the candidate table and checks its
-   Trie count and vocabulary projection.
-2. **Publish locally.** A worker that passes validation switches its own
-   default table. A worker that fails keeps its previous default; workers
+   Trie count and vocabulary projection. For an eligible streaming constrained
+   LM head, the worker also prewarms the new table's Triton kernels before
+   publication, so any new candidate geometry compiles during the reload.
+2. **Publish locally.** A worker that passes validation and preparation switches
+   its own default table. A worker that fails keeps its previous default; workers
    publish independently, so one failure cannot undo another worker's switch.
 3. **Record.** EngineCore records the instance version after the worker calls
    return.

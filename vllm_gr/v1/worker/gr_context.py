@@ -25,8 +25,14 @@ def _beam_graph_enabled_for_run(runner: Any) -> bool:
     return bool(_get_gr_config(runner).beam_graph_enabled)
 
 
-def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
-    """Return capture/dispatch state through ``collective_rpc``.
+def get_beam_graph_runtime_stats(
+    worker: Any, *, cuda_allocator: str | None = None
+) -> dict[str, Any]:
+    """Return capture/dispatch state and optional Worker-local allocator peaks.
+
+    A benchmark can request ``reset`` after warmup and ``read`` after the
+    measured calls. Using this named RPC avoids serializing Python callables
+    when the inference worker lives in a separate EngineCore.
 
     vLLM utility RPC callables receive the Worker, while Beam graph state is
     owned by its ModelRunner.  Keeping this probe in an importable module makes
@@ -95,7 +101,27 @@ def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
                 "fallback_reasons": dict(getattr(runner, "_beam_graph_fallback_reasons", {})),
             }
         )
+    if cuda_allocator is not None:
+        stats["cuda_allocator"] = _cuda_allocator_stats(worker, runner, cuda_allocator)
     return stats
+
+
+def _cuda_allocator_stats(worker: Any, runner: Any, operation: str) -> dict[str, int]:
+    import torch
+
+    device = torch.device(getattr(worker, "device", None) or runner.device)
+    if device.type != "cuda" or operation not in ("reset", "read"):
+        raise ValueError("CUDA allocator diagnostics require a CUDA worker and reset or read")
+    torch.accelerator.synchronize(device)
+    if operation == "reset":
+        torch.accelerator.reset_peak_memory_stats(device)
+    stage = getattr(runner, "_gr_gpu_stage_runner", None)
+    head = getattr(stage, "_stream_head", None)
+    return {
+        "peak_allocated_bytes": torch.accelerator.max_memory_allocated(device),
+        "peak_reserved_bytes": torch.accelerator.max_memory_reserved(device),
+        "streaming_workspace_bytes": head.workspace_bytes if head is not None else 0,
+    }
 
 
 def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:

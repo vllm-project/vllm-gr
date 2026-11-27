@@ -16,8 +16,13 @@ requires CUDA.
 | `--requests`, `--beam-width`, `--beam-steps` | Request count, width and generated stages per request. Defaults are 1, 256 and 3. |
 | `--warmup-runs`, `--repeat` | Untimed warmup and measured run counts. Defaults are 1 and 3. |
 | `--timeline-output` | Write a gzip trace from separate profiled runs. |
+| `--streaming-constrained-head`, `--no-streaming-constrained-head` | Toggle the optional constrained projection for a controlled comparison; off by default. |
+| `--kv-cache-memory-bytes` | Pin the native KV cache budget so allocator peaks are comparable across processes. |
 
 Use `vllm bench qwen-v1 --gr --help` for engine, tokenizer and profiling options.
+The result reports inference-worker CUDA allocator peaks after warmup and before
+profiling, including when EngineCore runs in a separate process. Allocated and
+reserved bytes are different metrics.
 
 ## Example
 

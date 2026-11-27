@@ -64,6 +64,7 @@ class DeploymentOptions:
     head_slice: int | str = "auto"
     head_slice_min_rows: int = 1024
     head_slice_max_mb: float = 128
+    enable_streaming_constrained_head: bool = False
     unconstrained_head_layout: str | None = "transposed"
     topk_keep: int = 8
     topk_select: str = "i64"
@@ -121,7 +122,12 @@ class DeploymentOptions:
             raise ValueError(
                 "gr.topk_keep must be in 1..256 and topk_select must be i32, i64 or flash"
             )
-        for key in ("prefill_graph_enabled", "npu_stage_lm_head", "prefix_calibration"):
+        for key in (
+            "prefill_graph_enabled",
+            "npu_stage_lm_head",
+            "prefix_calibration",
+            "enable_streaming_constrained_head",
+        ):
             if type(getattr(self, key)) is not bool:
                 raise ValueError(f"gr.{key} requires a boolean")
         if self.head_slice != "auto" and (type(self.head_slice) is not int or self.head_slice < 0):

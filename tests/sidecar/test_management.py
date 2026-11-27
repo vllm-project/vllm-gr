@@ -349,6 +349,35 @@ def test_trie_rejects_unsupported_execution_before_worker_rpc(unsupported: str) 
 
 
 @pytest.mark.l1
+@pytest.mark.parametrize("compatible", [False, True])
+def test_failed_prepublication_keeps_previous_trie(compatible: bool) -> None:
+    old, candidate = _backend(), _backend()
+    if not compatible:
+        candidate.vocab_slice = (0, 8)
+
+    def fail_preparation(table_to_publish: Any) -> None:
+        assert table_to_publish is candidate
+        assert table.current == INITIAL_CONSTRAINT_VERSION
+        assert table.get() is old
+        raise RuntimeError("warmup failed")
+
+    before_publish = Mock(side_effect=fail_preparation)
+    table = VersionedConstraintTable(old, loader=lambda _: candidate, before_publish=before_publish)
+    if compatible:
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            table.reload("candidate", "v2")
+        before_publish.assert_called_once_with(candidate)
+    else:
+        with pytest.raises(ValueError, match="cannot change the model vocabulary projection"):
+            table.reload("candidate", "v2")
+        before_publish.assert_not_called()
+    assert table.current == INITIAL_CONSTRAINT_VERSION
+    assert table.tables == {INITIAL_CONSTRAINT_VERSION: old}
+    candidate.close.assert_called_once()
+    old.close.assert_not_called()
+
+
+@pytest.mark.l1
 def test_versioned_table_lazy_expiry_and_default_access(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_gr.constraints import versioned_table
 

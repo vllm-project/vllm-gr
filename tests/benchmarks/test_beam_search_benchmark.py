@@ -419,8 +419,17 @@ def test_report_input_lengths_come_from_consumed_jsonl_rows(
     )
     benchmark.finalize_args(args)
     inputs: list[int] = []
+    memory_calls: list[str] = []
 
     class Engine:
+        def __init__(self) -> None:
+            self.llm_engine = SimpleNamespace(collective_rpc=self.collective_rpc)
+
+        def collective_rpc(self, method: str, *, kwargs: dict[str, str]) -> list[Any]:
+            assert method == "get_gr_beam_graph_runtime_stats"
+            memory_calls.append(kwargs["cuda_allocator"])
+            return [{"cuda_allocator": {"peak_allocated_bytes": 1024, "peak_reserved_bytes": 2048}}]
+
         def __enter__(self) -> Any:
             return self
 
@@ -459,6 +468,8 @@ def test_report_input_lengths_come_from_consumed_jsonl_rows(
     assert report["declared_context_len"] == 5000
     assert report["input_token_lengths"] == inputs == [128, second_length]
     assert len(report["runs"][0]["request_latencies_ms"]) == len(inputs)
+    assert memory_calls == ["reset", "read"]
+    assert report["memory"]["peak_allocated_bytes"] == 1024
 
 
 @pytest.mark.l1  # type: ignore[misc]

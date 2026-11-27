@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Condition, Lock
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.cuda.streams import Event as CUDAEvent
@@ -27,6 +27,7 @@ from vllm_gr.config.models import (
 )
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
+from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     LOCAL_TILE_SIZE,
 )
@@ -440,6 +441,12 @@ class _HeadLogits:
         self.slice = None
 
 
+if TYPE_CHECKING:
+    from vllm_gr.v1.worker.cuda.streaming_constrained_head import (
+        StreamingConstrainedHead,
+    )
+
+
 def _stage_hidden(owner: GPUBeamStageRunner, hidden: torch.Tensor) -> torch.Tensor:
     """Copy Decode hidden states out of the graph's shared replay buffer.
 
@@ -468,6 +475,9 @@ def _stage_hidden(owner: GPUBeamStageRunner, hidden: torch.Tensor) -> torch.Tens
 def _hidden_logits(owner: GPUBeamStageRunner, hidden: torch.Tensor) -> torch.Tensor | None:
     """Turn Decode hidden states into logits, or publish them for slicing."""
 
+    if getattr(owner, "_streaming_head_enabled", False) and owner._streaming_head_for(hidden):
+        owner.hidden = _stage_hidden(owner, hidden)
+        return None
     if owner._head_slice_request:
         # The row count decides whether slicing pays for this stage.
         cols = owner.head_slice_cols(hidden.shape[0])
@@ -494,7 +504,7 @@ class GPUBeamStageRunner:
         worker: Any,
         beam: BeamBatchSearchRunner,
         bindings: tuple[BeamRequestBinding, ...],
-        backend: CUDAConstraintBackend | None,
+        backend: CUDAConstraintBackend | VersionedConstraintTable | None,
         hooks: CudaStageHooks,
         trie_ids: tuple[int, ...] | None = None,
     ):
@@ -566,6 +576,9 @@ class GPUBeamStageRunner:
         self._unit_temperature = True
         self.explicit_fa_version = configured_fa_version(host)
         settings = self.gr_settings
+        self._streaming_head_enabled = settings.enable_streaming_constrained_head
+        self._stream_table: CUDAConstraintBackend | None = None
+        self._stream_head: StreamingConstrainedHead | None = None
         slice_request = 0
         if backend is None and self.hooks.supports_transposed_head:
             slice_request = (
@@ -606,6 +619,29 @@ class GPUBeamStageRunner:
         self.configure_trie_ids(trie_ids)
         context._gr_execution_owner = self
         beam.workspace.execution_owner = self
+
+    def _streaming_head_for(self, hidden: torch.Tensor) -> StreamingConstrainedHead | None:
+        if self.backend is None or self.dynamic is not None or not hidden.is_contiguous():
+            return None
+        table = (
+            self.backend.get()
+            if isinstance(self.backend, VersionedConstraintTable)
+            else self.backend
+        )
+        if self._stream_table is not table:
+            from vllm_gr.v1.worker.cuda.streaming_constrained_head import (
+                StreamingConstrainedHead,
+            )
+
+            # A reload keeps the manager but can change the concrete table and
+            # its maximum legal degree. Sampling is outside native Forward
+            # graphs; replacing this workspace does not invalidate a capture.
+            self._stream_head = StreamingConstrainedHead.for_worker(
+                self.worker, table, hidden.shape[0], self.beam.workspace.key.top_k
+            )
+            self._stream_table = table
+        head = self._stream_head
+        return head if head is not None and head.supports(hidden) else None
 
     def configure_trie_ids(self, trie_ids: tuple[int, ...] | None) -> None:
         """Keep per-width request-major selectors stable across adapter reuse."""
@@ -972,22 +1008,40 @@ class GPUBeamStageRunner:
                             f"{tuple(tensor.shape)} {tensor.dtype} {tensor.device}"
                         )
                 if self.backend is not None:
-                    self.backend.select_out_unchecked(
-                        self.logits,
-                        ConstraintMetadata(
+                    hidden = self.hidden
+                    # Recheck at the lookup boundary so a publication between
+                    # Forward and sampling cannot reuse an old table workspace.
+                    head = self._streaming_head_for(hidden) if hidden is not None else None
+                    trie_ids = self.trie_ids_by_width.get(layout.input_width)
+                    if head is not None:
+                        assert hidden is not None
+                        head.select(
+                            hidden,
                             self.prefixes[:rows],
                             self.temperatures[:rows],
-                            0,
-                            layout.candidate_top_k,
-                            trie_ids=self.trie_ids_by_width.get(layout.input_width),
-                        ),
-                        out_token_ids=candidates[0],
-                        out_logprobs=candidates[1],
-                        out_valid_mask=candidates[2],
-                        out_valid_counts=self.counts[:rows],
-                        device_step=self.constraint_steps,
-                        specialize_steps=self.hooks.specialize_constraint_steps,
-                    )
+                            candidates,
+                            self.counts[:rows],
+                            self.constraint_steps,
+                            trie_ids=trie_ids,
+                        )
+                    else:
+                        logits = self._decode_logits(hidden) if hidden is not None else self.logits
+                        self.backend.select_out_unchecked(
+                            logits,
+                            ConstraintMetadata(
+                                self.prefixes[:rows],
+                                self.temperatures[:rows],
+                                0,
+                                layout.candidate_top_k,
+                                trie_ids=trie_ids,
+                            ),
+                            out_token_ids=candidates[0],
+                            out_logprobs=candidates[1],
+                            out_valid_mask=candidates[2],
+                            out_valid_counts=self.counts[:rows],
+                            device_step=self.constraint_steps,
+                            specialize_steps=self.hooks.specialize_constraint_steps,
+                        )
                 else:
                     sliced = self.hidden is not None
                     logits = None if sliced else model_output[:rows]

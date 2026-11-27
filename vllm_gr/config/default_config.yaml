@@ -84,6 +84,7 @@ gr:
                                            # Explicit slice sizes must align to the kernel granularity.
   head_slice_min_rows: 1024                # Minimum logits rows for automatic slicing; nonnegative.
   head_slice_max_mb: 128                   # Temporary logits budget per slice in MiB; 0: disable budget-based shrinking.
+  enable_streaming_constrained_head: false # Reduce workspace for eligible fixed-width CUDA table-constrained Decode.
   topk_keep: 8                             # Local candidates per vocabulary block in CUDA unconstrained Top-K; 1..256.
                                            # Smaller values reduce merging; exact repair preserves the requested result count.
   topk_select: i64                         # i64: full 64-bit sort keys; i32: short-key preselection with exact boundary repair.

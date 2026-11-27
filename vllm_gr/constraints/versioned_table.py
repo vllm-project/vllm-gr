@@ -15,8 +15,9 @@ INITIAL_CONSTRAINT_VERSION = "__initial__"
 class VersionedConstraintTable:
     """Default accesses use the latest table. API calls release expired old tables.
 
-    Retention starts when reload replaces a version. There is no timer thread,
-    session tracking, preparation phase, or separate publication operation.
+    Retention starts when reload replaces a version. An optional preparation
+    hook runs synchronously before a new version is published. There is no
+    timer thread, session tracking, or separate publication operation.
     """
 
     def __init__(
@@ -26,6 +27,7 @@ class VersionedConstraintTable:
         loader: Callable[[str], Any],
         retention_seconds: float = 60,
         before_release: Callable[[], None] | None = None,
+        before_publish: Callable[[Any], None] | None = None,
     ) -> None:
         if not math.isfinite(retention_seconds) or retention_seconds < 0:
             raise ValueError("Trie retention_seconds must be finite and non-negative")
@@ -35,6 +37,7 @@ class VersionedConstraintTable:
         self.retention_seconds = retention_seconds
         self._loader = loader
         self._before_release = before_release
+        self._before_publish = before_publish
         self._retired_at: dict[str, float] = {}
 
     def __getattr__(self, name: str) -> Any:
@@ -65,6 +68,8 @@ class VersionedConstraintTable:
                     != candidate.info.table_metadata.artifact_digest
                 ):
                     raise ValueError("A Trie version cannot be reused for different contents")
+            elif self._before_publish is not None:
+                self._before_publish(candidate)
         except Exception:
             candidate.close()
             raise

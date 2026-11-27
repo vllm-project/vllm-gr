@@ -43,7 +43,16 @@ same model tokenizer into a canonical CUDA artifact.
 
 The JSON records implementation commit, actual input lengths, workload and
 constraint/tokenizer digests, raw latencies, candidate IDs and scores.
+It also reports peak allocated and reserved CUDA bytes from the inference
+worker, even when EngineCore runs in a separate process. Peaks cover the
+measured requests; warmup resets the counters after startup allocations.
 Compare these digests and outputs in addition to latency.
+
+Use `--streaming-constrained-head` and `--no-streaming-constrained-head`
+for an opt-in comparison of fixed-width CUDA constrained Decode. Keep the
+native KV budget fixed with `--kv-cache-memory-bytes` when comparing allocator
+peaks. `--gpu-memory-utilization` sets the engine's memory budget when the
+native KV budget is not pinned.
 
 For A/B, use the **same benchmark code** against separate implementation
 worktrees, sharing model files, dataset and constraints. Run A-B-B-A sequentially,

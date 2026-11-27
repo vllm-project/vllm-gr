@@ -492,7 +492,10 @@ def patched_add_parser(parser):
 
 def patched_add_cli_args(parser):
     """Patch add_cli_args to include onerec arguments."""
+    from benchmarks.streaming_head import add_streaming_head_argument
+
     original_add_cli_args(parser)
+    add_streaming_head_argument(parser)
     parser.add_argument(
         "--beam-search",
         action="store_true",

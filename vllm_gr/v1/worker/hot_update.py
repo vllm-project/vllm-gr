@@ -64,11 +64,28 @@ def versioned_constraint_table(
         return candidate
 
     settings = deployment_for(getattr(runner, "vllm_config", None))
+    before_publish: Callable[[Any], None] | None = None
+    if settings.enable_streaming_constrained_head and torch.device(runner.device).type == "cuda":
+        from vllm_gr.config import GRConfig, resolve_candidate_width
+        from vllm_gr.v1.worker.cuda.streaming_constrained_head import (
+            prewarm_streaming_constrained_head,
+        )
+
+        def prepare_streaming(candidate: Any) -> None:
+            config = GRConfig.from_vllm_config(runner.vllm_config)
+            if config.beam_max_width is not None:
+                prewarm_streaming_constrained_head(
+                    runner, candidate, resolve_candidate_width(config)
+                )
+
+        before_publish = prepare_streaming
+
     return VersionedConstraintTable(
         backend,
         loader=load,
         retention_seconds=settings.trie_retention_seconds,
         before_release=lambda: _sync(runner),
+        before_publish=before_publish,
     )
 
 

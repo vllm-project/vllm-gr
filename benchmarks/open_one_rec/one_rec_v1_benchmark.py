@@ -12,6 +12,11 @@ from importlib import import_module
 from pathlib import Path
 
 from benchmarks.metrics import distribution_ms
+from benchmarks.streaming_head import (
+    read_inference_cuda_peak,
+    reset_inference_cuda_peak,
+    streaming_head_config,
+)
 
 
 def _resolve_beam_search(llm):
@@ -86,10 +91,12 @@ def run_v1_benchmark(args, tokenizer, requests):
         max_num_batched_tokens=args.max_num_batched_tokens or model_len,
         max_num_seqs=args.n,
         max_logprobs=args.n,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=getattr(args, "gpu_memory_utilization", 0.9),
         enforce_eager=False,
         seed=0,
     )
+    if getattr(args, "kv_cache_memory_bytes", None) is not None:
+        engine_config["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
     samples = []
     with tempfile.TemporaryDirectory(prefix="onerec-v1-") as directory:
         artifact = Path(directory) / "constraints.safetensors"
@@ -109,6 +116,7 @@ def run_v1_benchmark(args, tokenizer, requests):
                 "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
             },
             "candidate_width": [args.n] * steps,
+            **streaming_head_config(args),
         }
         with GRLLM(
             model=args.model,
@@ -118,6 +126,8 @@ def run_v1_benchmark(args, tokenizer, requests):
             **engine_config,
         ) as llm:
             for index in range(args.warmup_requests + args.num_prompts):
+                if index == args.warmup_requests:
+                    measure_memory = reset_inference_cuda_peak(llm)
                 measured = index >= args.warmup_requests
                 row = index - args.warmup_requests if measured else index
                 if not llm.reset_prefix_cache():
@@ -149,6 +159,7 @@ def run_v1_benchmark(args, tokenizer, requests):
                             ],
                         }
                     )
+            memory = read_inference_cuda_peak(llm) if measure_memory else None
     latencies = [sample["e2e_ms"] for sample in samples]
     repo = Path(vllm_gr.__file__).resolve().parents[1]
     result = {
@@ -163,6 +174,8 @@ def run_v1_benchmark(args, tokenizer, requests):
         "beam_width": args.n,
         "generated_steps": steps,
         "engine_config": engine_config,
+        "enable_streaming_constrained_head": bool(streaming_head_config(args)),
+        "memory": memory,
         "input_lengths_including_sid_begin": lengths[: args.num_prompts],
         "workload_sha256": hashlib.sha256(
             json.dumps(prompts, ensure_ascii=False).encode()

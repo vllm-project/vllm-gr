@@ -49,24 +49,8 @@ def validate_cuda_sort_capacity(
             )
 
 
-@triton.jit(
-    do_not_specialize=[
-        "logits_vocab_size",
-        "table_vocab_size",
-        "vocab_offset",
-        "pair_count",
-        "first_count",
-        "prefix1_value_count",
-        "prefix2_value_count",
-        "logits_row_stride",
-        "logits_vocab_stride",
-        "prefix_stride",
-        "temperature_count",
-        "top_k",
-    ]
-)
-def _fused_topk_kernel(
-    logits,
+@triton.jit
+def _lookup_constraint_tokens(
     prefixes,
     trie_ids,
     first_offsets,
@@ -76,39 +60,15 @@ def _fused_topk_kernel(
     pair_keys,
     prefix2_offsets,
     prefix2_values,
-    temperatures,
-    output_ids,
-    output_logprobs,
-    output_wire_logprobs,
-    output_valid_mask,
-    valid_counts,
-    prefill_status,
-    prefill_payload,
-    logits_vocab_size,
+    row,
+    prefix_stride,
     table_vocab_size,
-    vocab_offset,
     pair_count,
     first_count,
-    prefix1_value_count,
-    prefix2_value_count,
-    logits_row_stride,
-    logits_vocab_stride,
-    prefix_stride,
-    temperature_count,
-    top_k,
-    WRITE_WIRE_LOGPROBS: tl.constexpr,
-    PACK_PREFILL_RESULT: tl.constexpr,
+    step,
     TRIE_COUNT: tl.constexpr,
-    step: tl.constexpr,
-    device_step,
-    DEVICE_STEP: tl.constexpr,
     BLOCK: tl.constexpr,
-    OUTPUT_BLOCK: tl.constexpr,
-    WINDOW_BLOCK: tl.constexpr,
 ):
-    if DEVICE_STEP:
-        step = tl.minimum(tl.maximum(tl.load(device_step), 0), 2)
-    row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
     begin = tl.full((), 0, tl.int64)
     degree = tl.cast(first_count, tl.int64)
@@ -168,15 +128,204 @@ def _fused_topk_kernel(
         token = tl.load(prefix1_values + begin + offsets, mask=candidate_mask, other=0)
     else:
         token = tl.load(prefix2_values + begin + offsets, mask=candidate_mask, other=0)
+    return offsets, begin, degree, token, candidate_mask
+
+
+@triton.jit(
+    do_not_specialize=[
+        "start",
+        "cols",
+        "vocab_size",
+        "vocab_offset",
+        "pair_count",
+        "first_count",
+        "temperature_count",
+    ]
+)
+def _stream_constraint_logits_kernel(
+    logits,
+    candidate_logits,
+    denominator_stats,
+    prefixes,
+    trie_ids,
+    first_offsets,
+    first_ids,
+    prefix1_offsets,
+    prefix1_values,
+    pair_keys,
+    prefix2_offsets,
+    prefix2_values,
+    temperatures,
+    device_step,
+    start,
+    cols,
+    vocab_size,
+    vocab_offset,
+    prefix_stride: tl.constexpr,
+    candidate_stride: tl.constexpr,
+    table_vocab_size: tl.constexpr,
+    pair_count,
+    first_count,
+    temperature_count,
+    TRIE_COUNT: tl.constexpr,
+    step: tl.constexpr,
+    DEVICE_STEP: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WINDOW_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if DEVICE_STEP:
+        step = tl.minimum(tl.maximum(tl.load(device_step), 0), 2)
+    offsets, begin, degree, token, candidate_mask = _lookup_constraint_tokens(
+        prefixes,
+        trie_ids,
+        first_offsets,
+        first_ids,
+        prefix1_offsets,
+        prefix1_values,
+        pair_keys,
+        prefix2_offsets,
+        prefix2_values,
+        row,
+        prefix_stride,
+        table_vocab_size,
+        pair_count,
+        first_count,
+        step,
+        TRIE_COUNT,
+        BLOCK,
+    )
+    local = token.to(tl.int64) - vocab_offset
+    candidate_mask &= (local >= 0) & (local < vocab_size)
+    in_block = candidate_mask & (local >= start) & (local < start + cols)
+    values = tl.load(logits + row * cols + local - start, mask=in_block, other=0)
+    tl.store(candidate_logits + row * candidate_stride + offsets, values, mask=in_block)
+    temperature_index = tl.where(temperature_count == 1, 0, row)
+    temperature = tl.load(temperatures + temperature_index, mask=temperature_count > 0, other=1.0)
+    temperature = tl.where(temperature == 0.0, 1.0, temperature)
+    maximum = tl.load(denominator_stats + row * 2, mask=start > 0, other=-float("inf"))
+    total = tl.load(denominator_stats + row * 2 + 1, mask=start > 0, other=0.0)
+    if tl.sum(candidate_mask.to(tl.int32), axis=0) > 0:
+        window_offsets = tl.arange(0, WINDOW_BLOCK)
+        for chunk in tl.range(0, tl.cdiv(cols, WINDOW_BLOCK)):
+            index = chunk * WINDOW_BLOCK + window_offsets
+            valid = index < cols
+            value = tl.load(logits + row * cols + index, mask=valid, other=-float("inf")).to(
+                tl.float32
+            )
+            value = value / temperature
+            chunk_max = tl.max(value, axis=0)
+            updated = tl.maximum(maximum, chunk_max)
+            total = total * tl.where(
+                maximum == -float("inf"), 0.0, tl.exp(maximum - updated)
+            ) + tl.sum(
+                tl.where(valid & (updated != -float("inf")), tl.exp(value - updated), 0.0),
+                axis=0,
+            )
+            maximum = updated
+    tl.store(denominator_stats + row * 2, maximum)
+    tl.store(denominator_stats + row * 2 + 1, total)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "logits_vocab_size",
+        "table_vocab_size",
+        "vocab_offset",
+        "pair_count",
+        "first_count",
+        "prefix1_value_count",
+        "prefix2_value_count",
+        "logits_row_stride",
+        "logits_vocab_stride",
+        "prefix_stride",
+        "temperature_count",
+        "top_k",
+    ]
+)
+def _fused_topk_kernel(
+    logits,
+    candidate_logits,
+    denominator_stats,
+    prefixes,
+    trie_ids,
+    first_offsets,
+    first_ids,
+    prefix1_offsets,
+    prefix1_values,
+    pair_keys,
+    prefix2_offsets,
+    prefix2_values,
+    temperatures,
+    output_ids,
+    output_logprobs,
+    output_wire_logprobs,
+    output_valid_mask,
+    valid_counts,
+    prefill_status,
+    prefill_payload,
+    logits_vocab_size,
+    table_vocab_size,
+    vocab_offset,
+    pair_count,
+    first_count,
+    prefix1_value_count,
+    prefix2_value_count,
+    logits_row_stride,
+    logits_vocab_stride,
+    candidate_row_stride,
+    prefix_stride,
+    temperature_count,
+    top_k,
+    WRITE_WIRE_LOGPROBS: tl.constexpr,
+    PACK_PREFILL_RESULT: tl.constexpr,
+    TRIE_COUNT: tl.constexpr,
+    step: tl.constexpr,
+    device_step,
+    DEVICE_STEP: tl.constexpr,
+    PRECOMPUTED: tl.constexpr,
+    BLOCK: tl.constexpr,
+    OUTPUT_BLOCK: tl.constexpr,
+    WINDOW_BLOCK: tl.constexpr,
+):
+    if DEVICE_STEP:
+        step = tl.minimum(tl.maximum(tl.load(device_step), 0), 2)
+    row = tl.program_id(0)
+    offsets, begin, degree, token, candidate_mask = _lookup_constraint_tokens(
+        prefixes,
+        trie_ids,
+        first_offsets,
+        first_ids,
+        prefix1_offsets,
+        prefix1_values,
+        pair_keys,
+        prefix2_offsets,
+        prefix2_values,
+        row,
+        prefix_stride,
+        table_vocab_size,
+        pair_count,
+        first_count,
+        step,
+        TRIE_COUNT,
+        BLOCK,
+    )
     local_token = token.to(tl.int64) - vocab_offset
     token_in_window = (local_token >= 0) & (local_token < logits_vocab_size)
     candidate_mask = candidate_mask & token_in_window
     valid_degree = tl.sum(candidate_mask, axis=0)
-    score = tl.load(
-        logits + row * logits_row_stride + local_token * logits_vocab_stride,
-        mask=candidate_mask,
-        other=-float("inf"),
-    ).to(tl.float32)
+    if PRECOMPUTED:
+        score = tl.load(
+            candidate_logits + row * candidate_row_stride + offsets,
+            mask=candidate_mask,
+            other=-float("inf"),
+        ).to(tl.float32)
+    else:
+        score = tl.load(
+            logits + row * logits_row_stride + local_token * logits_vocab_stride,
+            mask=candidate_mask,
+            other=-float("inf"),
+        ).to(tl.float32)
     temperature_index = tl.where(temperature_count == 1, 0, row)
     temperature = tl.load(
         temperatures + temperature_index,
@@ -195,7 +344,15 @@ def _fused_topk_kernel(
     # reduction: a running max rescales the running exp-sum, so every window
     # element is loaded and divided exactly once instead of once per pass.
     full_denominator = 0.0
-    if valid_degree > 0:
+    if PRECOMPUTED:
+        window_max = tl.load(denominator_stats + row * 2)
+        window_sum = tl.load(denominator_stats + row * 2 + 1)
+        full_denominator = tl.where(
+            window_max != -float("inf"),
+            window_max + tl.log(window_sum),
+            0.0,
+        )
+    elif valid_degree > 0:
         window_offsets = tl.arange(0, WINDOW_BLOCK)
         n_chunks = tl.cdiv(logits_vocab_size, WINDOW_BLOCK)
         window_max = tl.full((), -float("inf"), tl.float32)
@@ -587,6 +744,7 @@ def _stage_topk_kernel(
             prefix2_value_count,
             logits_row_stride,
             logits_vocab_stride,
+            0,  # Unused streamed candidate row stride.
             prefix_stride,
             temperature_count,
             top_k,
@@ -596,6 +754,7 @@ def _stage_topk_kernel(
             step=0,
             device_step=None,
             DEVICE_STEP=False,
+            PRECOMPUTED=False,
             BLOCK=BLOCKS[0],
             OUTPUT_BLOCK=OUTPUT_BLOCK,
             WINDOW_BLOCK=WINDOW_BLOCK,
@@ -612,6 +771,7 @@ def _stage_topk_kernel(
             prefix2_value_count,
             logits_row_stride,
             logits_vocab_stride,
+            0,  # Unused streamed candidate row stride.
             prefix_stride,
             temperature_count,
             top_k,
@@ -621,6 +781,7 @@ def _stage_topk_kernel(
             step=1,
             device_step=None,
             DEVICE_STEP=False,
+            PRECOMPUTED=False,
             BLOCK=BLOCKS[1],
             OUTPUT_BLOCK=OUTPUT_BLOCK,
             WINDOW_BLOCK=WINDOW_BLOCK,
@@ -637,6 +798,7 @@ def _stage_topk_kernel(
             prefix2_value_count,
             logits_row_stride,
             logits_vocab_stride,
+            0,  # Unused streamed candidate row stride.
             prefix_stride,
             temperature_count,
             top_k,
@@ -646,6 +808,7 @@ def _stage_topk_kernel(
             step=2,
             device_step=None,
             DEVICE_STEP=False,
+            PRECOMPUTED=False,
             BLOCK=BLOCKS[2],
             OUTPUT_BLOCK=OUTPUT_BLOCK,
             WINDOW_BLOCK=WINDOW_BLOCK,
@@ -680,11 +843,20 @@ def _launch_rec_constrained_topk_cuda_out(
     table_vocab_size: int,
     trie_ids: torch.Tensor | None = None,
     first_token_offsets: torch.Tensor | None = None,
+    candidate_logits: torch.Tensor | None = None,
+    denominator_stats: torch.Tensor | None = None,
+    logits_vocab_size_override: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (candidate_logits is None) != (denominator_stats is None):
+        raise ValueError("streamed candidates and denominator stats must be supplied together")
     if stage_blocks is not None:
+        if candidate_logits is not None:
+            raise ValueError("streamed candidates cannot use stage-specialized full logits")
         _stage_topk_kernel[(rows,)](
             (
                 logits,
+                logits,  # Unused candidate logits in this specialization.
+                logits,  # Unused denominator stats.
                 flat_prefixes,
                 trie_ids if trie_ids is not None else flat_prefixes,
                 first_token_offsets if first_token_offsets is not None else prefix1_offsets,
@@ -727,6 +899,8 @@ def _launch_rec_constrained_topk_cuda_out(
         return out_token_ids, out_logprobs, out_valid_mask, out_valid_counts
     _fused_topk_kernel[(rows,)](
         logits,
+        candidate_logits if candidate_logits is not None else logits,
+        denominator_stats if denominator_stats is not None else logits,
         flat_prefixes,
         trie_ids if trie_ids is not None else flat_prefixes,
         first_token_offsets if first_token_offsets is not None else prefix1_offsets,
@@ -744,7 +918,9 @@ def _launch_rec_constrained_topk_cuda_out(
         out_valid_counts,
         out_prefill_status if out_prefill_status is not None else out_valid_counts,
         out_prefill_payload if out_prefill_payload is not None else out_token_ids,
-        logits_vocab_size=logits.shape[1],
+        logits_vocab_size=(
+            logits.shape[1] if logits_vocab_size_override is None else logits_vocab_size_override
+        ),
         table_vocab_size=table_vocab_size,
         vocab_offset=vocab_offset,
         pair_count=prefix1_pair_keys.numel(),
@@ -753,6 +929,7 @@ def _launch_rec_constrained_topk_cuda_out(
         prefix2_value_count=prefix2_values.numel(),
         logits_row_stride=logits.stride(0),
         logits_vocab_stride=logits.stride(1),
+        candidate_row_stride=0 if candidate_logits is None else candidate_logits.stride(0),
         prefix_stride=flat_prefixes.shape[1],
         temperature_count=temperatures.numel(),
         top_k=top_k,
@@ -762,6 +939,7 @@ def _launch_rec_constrained_topk_cuda_out(
         step=current_step,
         device_step=device_step,
         DEVICE_STEP=device_step is not None,
+        PRECOMPUTED=candidate_logits is not None and denominator_stats is not None,
         BLOCK=block,
         OUTPUT_BLOCK=triton.next_power_of_2(top_k),
         WINDOW_BLOCK=2048,
