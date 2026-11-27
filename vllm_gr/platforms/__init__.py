@@ -23,7 +23,9 @@ from .errors import (
 )
 from .identity import PlatformIdentity, current_platform_identity, platform_identity
 from .interface import (
+    CONSTRAINT_BACKEND_API_VERSION,
     PROVIDER_API_VERSION,
+    CanonicalConstraintProvider,
     ConfigProvider,
     GRBackendProvider,
     GRPlanningProvider,
@@ -39,6 +41,8 @@ from .registry import (
 )
 
 __all__ = [
+    "CONSTRAINT_BACKEND_API_VERSION",
+    "CanonicalConstraintProvider",
     "PROVIDER_API_VERSION",
     "PLAN_API_VERSION",
     "BackendPlan",

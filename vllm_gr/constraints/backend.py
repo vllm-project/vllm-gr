@@ -36,7 +36,7 @@ class ConstraintMetadata:
     ``temperatures`` is a caller-validated tensor of finite, non-negative
     values.  Zero has the established constrained-operator meaning of one:
     logits are left unscaled, rather than divided by zero. Positive values
-    scale logits before normalization. The CPU and CUDA Backends normalize
+    scale logits before normalization. The CPU, CUDA and MLU Backends normalize
     over the complete shared logits window so candidate scores are
     comparable across parent rows.
 

@@ -11,7 +11,9 @@ if TYPE_CHECKING:
     import torch
 
     from vllm_gr.config.backend_plan import BackendPlan, BackendRequest
+    from vllm_gr.constraints.backend import ConstraintBackend
     from vllm_gr.constraints.execution import ConstrainedTopKExecution
+    from vllm_gr.constraints.table import ConstraintTable
 
     from .config import BackendConfigService
     from .identity import PlatformIdentity
@@ -178,6 +180,25 @@ class GRBackendProvider(Protocol):
         *,
         device: str | torch.device | None = None,
     ) -> ConstrainedTopKExecution | None: ...
+
+
+CONSTRAINT_BACKEND_API_VERSION = 1
+
+
+class CanonicalConstraintProvider(Protocol):
+    """Optional factory for canonical tables, independent of the legacy Top-K API."""
+
+    constraint_backend_api_version: int
+
+    def create_constraint_backend(
+        self,
+        *,
+        artifact: ConstraintTable,
+        device: torch.device,
+        dtype: torch.dtype,
+        max_rows: int,
+        max_top_k: int,
+    ) -> ConstraintBackend: ...
 
 
 class GRPlanningProvider(GRBackendProvider, Protocol):

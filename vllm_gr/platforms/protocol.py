@@ -3,9 +3,11 @@
 """Compatibility imports for providers using the original protocol module."""
 
 from .interface import (
+    CONSTRAINT_BACKEND_API_VERSION,
     LEGACY_PROVIDER_API_VERSION,
     PROVIDER_API_VERSION,
     BeamAttentionExecution,
+    CanonicalConstraintProvider,
     ConfigProvider,
     GRBackendProvider,
     GRPlanningProvider,
@@ -13,9 +15,11 @@ from .interface import (
 )
 
 __all__ = [
+    "CONSTRAINT_BACKEND_API_VERSION",
     "LEGACY_PROVIDER_API_VERSION",
     "PROVIDER_API_VERSION",
     "BeamAttentionExecution",
+    "CanonicalConstraintProvider",
     "ConfigProvider",
     "GRBackendProvider",
     "GRPlanningProvider",

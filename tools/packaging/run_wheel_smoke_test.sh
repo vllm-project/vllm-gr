@@ -133,16 +133,18 @@ if not overridden and sdist_metadata.is_file():
 elif not overridden:
     local = Version(version).local
     suffix = local.split(".")[-1] if local else None
-    if target in {"cpu", "npu"} and suffix != target:
+    if target in {"cpu", "mlu", "npu"} and suffix != target:
         raise SystemExit(f"{target} wheel has wrong version suffix: {version}")
-    if target == "cuda" and suffix in {"cpu", "npu"}:
+    if target == "cuda" and suffix in {"cpu", "mlu", "npu"}:
         raise SystemExit(f"CUDA wheel has wrong version suffix: {version}")
 if "regex" not in requirements:
     raise SystemExit("wheel is missing its direct regex dependency")
 if target == "cuda" and requirements.get("vllm") != "==0.30.0":
     raise SystemExit(f"CUDA wheel has wrong vLLM requirement: {requirements.get('vllm')}")
-if target in {"cpu", "npu"} and "vllm" in requirements:
+if target in {"cpu", "mlu", "npu"} and "vllm" in requirements:
     raise SystemExit(f"{target} wheel unexpectedly depends on vLLM")
+if target == "mlu" and requirements.keys() & {"torch", "torch-mlu", "vllm-mlu"}:
+    raise SystemExit("MLU wheel must not depend on the base image's runtime packages")
 print(f"vllm-gr {version} from {origin}")
 PY
 )

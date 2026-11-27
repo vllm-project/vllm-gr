@@ -206,6 +206,7 @@ class ConstraintBackendKind(str, Enum):
     CPU = "cpu"
     CUDA = "cuda"
     NPU = "npu"
+    MLU = "mlu"
 
 
 @dataclass(frozen=True, slots=True)

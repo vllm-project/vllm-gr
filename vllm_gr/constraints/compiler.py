@@ -37,6 +37,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
+from vllm_gr.config.models import MAX_CONSTRAINT_CANDIDATE_WIDTH
 from vllm_gr.constraints.json_compiler import (
     FORMAT_VERSION,
     FORMAT_VERSION_KEY,
@@ -49,10 +50,9 @@ from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     MAX_CONSTRAINT_TABLE_BYTES,
 )
-from vllm_gr.ops.npu.rec_constrained_topk import MAX_TOP_K as MAX_TOP_K
 
-# ``MAX_TOP_K`` remains importable from this legacy module, but the NPU
-# operator boundary is its single source of truth.
+# Compatibility export for legacy callers, without importing an operator backend.
+MAX_TOP_K = MAX_CONSTRAINT_CANDIDATE_WIDTH
 
 # Upper bound on the total device-table bytes a constraint resource may occupy.
 MAX_RESOURCE_BYTES = MAX_CONSTRAINT_TABLE_BYTES

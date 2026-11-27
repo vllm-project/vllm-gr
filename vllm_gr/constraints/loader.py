@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
-"""Construct independent CPU/CUDA/NPU Backends from a canonical Artifact."""
+"""Construct independent Backends from a canonical Artifact."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -26,26 +26,21 @@ from vllm_gr.constraints.backend import (
     ConstraintBackend,
     ConstraintBackendInfo,
     ConstraintMetadata,
-)
-from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
-from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
-from vllm_gr.constraints.npu_backend import NPUConstraintBackend
-from vllm_gr.constraints.npu_tables import (
-    NPUStageVocab,
-    build_npu_stage_vocab,
-    npu_trie_arrays,
+    ConstraintOutput,
+    build_constraint_output,
 )
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
     token_id_window,
 )
-from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
-from vllm_gr.ops.npu.rec_constrained_topk import (
-    MAX_TOP_K,
-    NPUConstraintOp,
-    resolve_rec_constrained_topk_npu,
-)
+from vllm_gr.platforms.constraint_backend import canonical_constraint_provider
+
+if TYPE_CHECKING:
+    from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
+    from vllm_gr.constraints.npu_backend import NPUConstraintBackend
+    from vllm_gr.constraints.npu_tables import NPUStageVocab
+    from vllm_gr.ops.npu.rec_constrained_topk import NPUConstraintOp
 
 _LOGIT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _READINESS_BACKGROUND_LOGIT = -0.25
@@ -212,6 +207,9 @@ def _upload_npu_backend(
     enable_npu_stage_vocab: bool = False,
     stage_lm_head: bool = DEFAULT_DEPLOYMENT.npu_stage_lm_head,
 ) -> tuple[NPUConstraintBackend, tuple[_ReadyCase, ...]]:
+    from vllm_gr.constraints.npu_backend import NPUConstraintBackend
+    from vllm_gr.constraints.npu_tables import build_npu_stage_vocab, npu_trie_arrays
+
     cases = tuple(
         case
         for trie_id in range(table.metadata.trie_count)
@@ -274,6 +272,9 @@ def _upload_cuda_backend(
     max_top_k: int,
     max_rows: int,
 ) -> tuple[CUDAConstraintBackend, tuple[_ReadyCase, ...]]:
+    from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
+    from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
+
     validate_cuda_sort_capacity(
         table.max_first_degree,
         table.metadata.max_prefix1_degree,
@@ -422,19 +423,20 @@ def _expected_ready_logprobs(
 
 
 def _run_device_readiness(
-    backend: CUDAConstraintBackend | NPUConstraintBackend,
+    info: ConstraintBackendInfo,
     *,
+    select: Callable[[torch.Tensor, ConstraintMetadata], ConstraintOutput],
     cases: tuple[_ReadyCase, ...],
     device: torch.device,
     dtype: torch.dtype,
     max_rows: int,
-    synchronize: Callable[[torch.device], None],
     normalize_over_candidates: bool,
+    synchronize: Callable[[torch.device], None] | None = None,
     stage_vocab: NPUStageVocab | None = None,
 ) -> None:
     rows = min(max_rows, 2)
-    vocab_size = backend.info.table_metadata.vocab_size
-    top_k = backend.info.max_top_k
+    vocab_size = info.table_metadata.vocab_size
+    top_k = info.max_top_k
     for case in cases:
         background_logit = float(
             torch.tensor(_READINESS_BACKGROUND_LOGIT, dtype=dtype).float().item()
@@ -491,7 +493,7 @@ def _run_device_readiness(
             dtype=torch.float32,
             device=device,
         )
-        output = backend._select_for_readiness(  # noqa: SLF001
+        output = select(
             logits,
             ConstraintMetadata(
                 prefix_token_ids=prefixes,
@@ -500,12 +502,16 @@ def _run_device_readiness(
                 top_k=top_k,
                 trie_ids=(
                     torch.full((rows,), case.trie_id, dtype=torch.int32, device=device)
-                    if backend.info.table_metadata.trie_count > 1
+                    if info.table_metadata.trie_count > 1
                     else None
                 ),
             ),
         )
-        synchronize(device)
+        if synchronize is not None:
+            synchronize(device)
+        build_constraint_output(
+            output.token_ids, output.logprobs, output.valid_mask, logits=logits, top_k=top_k
+        )
         _validate_ready_output(
             output,
             expected_logprobs=expected,
@@ -529,7 +535,8 @@ def _run_cuda_readiness(
     # scores must be comparable across parent rows).  Readiness must verify
     # against the same domain, not the legacy candidate-set normalization.
     _run_device_readiness(
-        backend,
+        backend.info,
+        select=backend._select_for_readiness,  # noqa: SLF001
         cases=cases,
         device=device,
         dtype=dtype,
@@ -551,7 +558,8 @@ def _run_npu_readiness(
     # the shared full-window scoring contract is adopted by the CPU and CUDA
     # Backends only; the fused NPU operator path is intentionally unchanged.
     _run_device_readiness(
-        backend,
+        backend.info,
+        select=backend._select_for_readiness,  # noqa: SLF001
         cases=cases,
         device=device,
         dtype=dtype,
@@ -561,7 +569,8 @@ def _run_npu_readiness(
     )
     if backend.stage_vocab is not None:
         _run_device_readiness(
-            backend,
+            backend.info,
+            select=backend._select_for_readiness,  # noqa: SLF001
             cases=cases,
             device=device,
             dtype=dtype,
@@ -602,6 +611,18 @@ def load_constraint_backend(
 
     max_top_k = config.max_top_k
     assert max_top_k is not None
+    provider = None
+    if backend_kind not in (
+        ConstraintBackendKind.CPU,
+        ConstraintBackendKind.CUDA,
+        ConstraintBackendKind.NPU,
+    ):
+        if backend_kind.value != device.type:
+            raise RuntimeError(
+                f"{backend_kind.value.upper()} constraint backend requires a "
+                f"{backend_kind.value.upper()} device, got {device}"
+            )
+        provider = canonical_constraint_provider(device.type)
     op: NPUConstraintOp | None = None
     if backend_kind is ConstraintBackendKind.CUDA:
         if max_top_k > MAX_CONSTRAINT_CANDIDATE_WIDTH:
@@ -614,6 +635,11 @@ def load_constraint_backend(
         if device.type != "cuda":
             raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
     if backend_kind is ConstraintBackendKind.NPU:
+        from vllm_gr.ops.npu.rec_constrained_topk import (
+            MAX_TOP_K,
+            resolve_rec_constrained_topk_npu,
+        )
+
         if max_top_k > MAX_TOP_K:
             raise ValueError(f"NPU constraint max_top_k must be <= {MAX_TOP_K}, got {max_top_k}")
         if device.type != "npu":
@@ -627,7 +653,43 @@ def load_constraint_backend(
         expected_vocab_size=vocab_size,
         expected_format=config.format,
     )
+    if provider is not None:
+        backend = provider.create_constraint_backend(
+            artifact=table, device=device, dtype=dtype, max_rows=max_rows, max_top_k=max_top_k
+        )
+        try:
+            info = backend.info
+            if (info.backend, info.table_metadata, info.max_rows, info.max_top_k) != (
+                backend_kind,
+                table.metadata,
+                max_rows,
+                max_top_k,
+            ):
+                raise RuntimeError("Canonical constraint backend returned mismatched resource info")
+            cases = tuple(
+                case
+                for trie_id in range(table.metadata.trie_count)
+                for case in _readiness_cases(table, max_top_k, trie_id)
+            )
+            del table
+            # Validate the small startup output on Host; the steady-state
+            # selection path does not copy logits, prefixes, or candidates.
+            _run_device_readiness(
+                info,
+                select=backend.select,
+                cases=cases,
+                device=device,
+                dtype=dtype,
+                max_rows=max_rows,
+                normalize_over_candidates=False,
+            )
+            return backend
+        except BaseException:
+            backend.close()
+            raise
     if backend_kind is ConstraintBackendKind.CPU:
+        from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
+
         info = _backend_info(
             table,
             backend=ConstraintBackendKind.CPU,

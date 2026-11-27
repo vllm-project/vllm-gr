@@ -268,7 +268,7 @@ def check_versions(expected: dict[str, str], installed: dict[str, str]) -> list[
                 # The source identity includes the commit. The wheel may
                 # append its build target to that same local version.
                 return observed == wanted or any(
-                    observed == Version(f"{wanted}.{device}") for device in ("cpu", "npu")
+                    observed == Version(f"{wanted}.{device}") for device in ("cpu", "mlu", "npu")
                 )
             except InvalidVersion:
                 return False

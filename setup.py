@@ -5,7 +5,8 @@ Setup script for vllm-gr with hardware-dependent installation.
 
 This setup.py implements platform-aware dependency routing so users can run
 `pip install vllm-gr` and automatically receive the correct platform-specific
-dependencies (CUDA/NPU/CPU) without requiring extras like `[gpu]`.
+dependencies without requiring extras like `[gpu]`. MLU builds select their
+vendor-managed runtime explicitly.
 """
 
 import logging
@@ -22,7 +23,7 @@ from setuptools_scm import get_version
 
 logger = logging.getLogger("vllm_gr.setup")
 
-_VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
+_VALID_DEVICES = frozenset(("cuda", "npu", "mlu", "cpu"))
 VLLM_GR_BASE_VERSION = "0.30.0"
 ROOT_DIR = Path(__file__).resolve().parent
 _SCM_OVERRIDE = "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_GR"
@@ -67,15 +68,16 @@ def detect_target_device() -> str:
         return _cached_device
 
     target_device = os.environ.get("VLLM_GR_TARGET_DEVICE")
-    if target_device:
-        if target_device.lower() in _VALID_DEVICES:
-            logger.info("Using target device from VLLM_GR_TARGET_DEVICE: %s", target_device.lower())
-            _cached_device = target_device.lower()
-            return _cached_device
-        logger.warning(
-            "Invalid VLLM_GR_TARGET_DEVICE '%s', falling back to auto-detection",
-            target_device,
-        )
+    if target_device is not None:
+        device = target_device.lower()
+        if device not in _VALID_DEVICES:
+            raise ValueError(
+                f"Invalid VLLM_GR_TARGET_DEVICE={target_device!r}; "
+                f"expected one of {', '.join(sorted(_VALID_DEVICES))}"
+            )
+        logger.info("Using target device from VLLM_GR_TARGET_DEVICE: %s", device)
+        _cached_device = device
+        return device
 
     if os.environ.get("READTHEDOCS"):
         logger.info("Detected READTHEDOCS=1; using cpu requirements for docs build")
@@ -116,6 +118,7 @@ def get_vllm_gr_version() -> str:
     Version format examples:
         - 0.30.0 (cuda, no suffix)
         - 0.30.0+npu
+        - 0.30.0+mlu
         - 0.30.0+cpu
 
     Environment variables:
@@ -145,7 +148,7 @@ def get_vllm_gr_version() -> str:
 
         if device == "cuda":
             pass
-        elif device in ("npu", "cpu"):
+        elif device in ("npu", "mlu", "cpu"):
             sep = "+" if "+" not in version else "."
             version += f"{sep}{device}"
         else:

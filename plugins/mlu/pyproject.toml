@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77.0.3,<81.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-gr-mlu"
+version = "0.1.0.dev0"
+description = "Experimental Cambricon MLU constraint backend for vLLM-GR"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+# The core must be built with VLLM_GR_TARGET_DEVICE=mlu and installed explicitly.
+# An ordinary vllm-gr dependency would let pip pull the CUDA distribution.
+
+[project.entry-points."vllm_gr.platform_backends"]
+mlu = "vllm_gr_mlu.provider:MLU_BACKEND"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -17,7 +17,7 @@ import torch
 
 from tests.constraints.test_table import make_table
 from vllm_gr.config import ConstraintBackendKind, ConstraintTableSpec
-from vllm_gr.constraints import loader
+from vllm_gr.constraints import loader, npu_tables
 from vllm_gr.constraints.artifact import save_constraint_table_artifact
 from vllm_gr.constraints.backend import INVALID_LOGIT, ConstraintBackendInfo
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
@@ -214,7 +214,7 @@ def test_npu_stage_vocab_allocation_requires_explicit_eligible_worker(
     def build_stage_vocab(table: ConstraintTable, *args: object) -> None:
         allocations.append(table)
 
-    monkeypatch.setattr(loader, "build_npu_stage_vocab", build_stage_vocab)
+    monkeypatch.setattr(npu_tables, "build_npu_stage_vocab", build_stage_vocab)
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
     backend, _ = loader._upload_npu_backend(  # noqa: SLF001
         table,
@@ -236,7 +236,7 @@ def test_direct_npu_upload_does_not_allocate_stage_vocab_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        loader,
+        npu_tables,
         "build_npu_stage_vocab",
         lambda *args, **kwargs: pytest.fail("Direct backend upload has no eligible runner"),
     )

@@ -42,7 +42,7 @@ gr:
   # To enable, set constraint_mode: table and replace constraint_table: null with this mapping.
   # constraint_table:                       # Deployment-specific artifact metadata.
   #   path: /absolute/path/to/video_constraint_table.safetensors  # The actual --output path.
-  #   backend: auto                         # auto, cpu, cuda, or npu.
+  #   backend: auto                         # auto, cpu, cuda, npu, or mlu (external provider).
   #   format: constraint_table_v1           # constraint_table_v1: single table; constraint_table_v2: multiple tries.
   #   max_top_k: 128                        # Per-parent candidate capacity; current CUDA/NPU table operators cap this at 256.
   #   digests:                              # sha256: followed by 64 lowercase hexadecimal characters.

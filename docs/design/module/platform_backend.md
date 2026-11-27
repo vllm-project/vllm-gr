@@ -60,6 +60,20 @@ operations. `platforms/protocol.py` keeps the original imports available.
 | `create_constrained_topk_execution` | Construct the selection implementation for the target device. |
 | `create_config_service` | Optionally supply host defaults and admission through `BackendConfigService`. |
 
+## External canonical constraint factories
+
+An external constraint placement can opt in by declaring
+`constraint_backend_api_version = 1` and implementing `create_constraint_backend`.
+This is separate from the provider API and does not change registration or
+require an engine plan API bump. The constraint loader resolves the active
+provider for the requested tensor placement and passes it a validated artifact.
+The returned backend must own its own tables and satisfy the loader's readiness
+checks. The optional factory does not opt a provider into Beam execution or
+replace the legacy `create_constrained_topk_execution`.
+
+See the [experimental MLU provider](../../../plugins/mlu/README.md) for the
+current scope and the remaining native runtime requirements.
+
 ## Engine plans
 
 Providers that declare plan API version 3 and an adapter revision can build an

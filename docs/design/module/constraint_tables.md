@@ -27,7 +27,7 @@ Pair keys are `int64` and the other tensors are `int32`. Offsets address the
 concatenated arrays. The Trie ID distinguishes identical token prefixes in
 different catalogs. For a single-Trie file, the loader derives the root interval
 `[0, len(first_token_ids)]`. The tensor payload is limited to 512 MiB, and the
-device operators reject `max_top_k > 256`. See the
+built-in device operators reject `max_top_k > 256`. See the
 [table validation](../../../vllm_gr/constraints/table.py) and
 [safetensors reader and writer](../../../vllm_gr/constraints/artifact.py).
 

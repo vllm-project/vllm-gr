@@ -89,6 +89,12 @@ def _load_setup_module() -> _SetupModule:
             {"msgspec", "regex", "safetensors", "pyyaml"},
             {"vllm"},
         ),
+        (
+            "mlu",
+            {"msgspec", "regex", "safetensors>=0.6.2", "PyYAML>=6.0"},
+            {"msgspec", "regex", "safetensors", "pyyaml"},
+            {"vllm", "torch", "torch-mlu", "vllm-mlu"},
+        ),
     ],
 )
 def test_get_install_requires_by_device(
@@ -183,7 +189,7 @@ def _assert_version(module: _SetupModule, expected: str) -> None:
     assert dict(os.environ) == before
 
 
-@pytest.mark.parametrize("device", ["cuda", "npu", "cpu"])  # type: ignore[misc]
+@pytest.mark.parametrize("device", ["cuda", "npu", "mlu", "cpu"])  # type: ignore[misc]
 def test_release_version_by_device(version_source: _SetupModule, device: str) -> None:
     version_source._cached_device = device
     suffix = "" if device == "cuda" else f"+{device}"
@@ -316,7 +322,14 @@ def package_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("source_device", "device"),
-    [("cuda", "cuda"), ("npu", "npu"), ("cpu", "cpu"), ("cpu", "cuda"), ("cuda", "npu")],
+    [
+        ("cuda", "cuda"),
+        ("npu", "npu"),
+        ("mlu", "mlu"),
+        ("cpu", "cpu"),
+        ("cpu", "cuda"),
+        ("cuda", "npu"),
+    ],
 )
 def test_sdist_wheel_metadata(
     tmp_path: Path,
@@ -389,6 +402,25 @@ def test_sdist_wheel_metadata(
     runtime = [str(req) for req in requirements if req.name == "vllm" and req.marker is None]
     assert runtime == ([_requirement_line("cuda", "vllm")] if device == "cuda" else [])
     assert not any(req.name == "black" for req in requirements)
+    if device == "mlu":
+        expected_deps = {
+            Requirement(line.split("#", 1)[0].strip())
+            for line in COMMON_FILE.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        assert {req for req in requirements if req.marker is None} == expected_deps
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.cpu_test  # type: ignore[misc]
+@pytest.mark.parametrize("device", ["", "mllu"])  # type: ignore[misc]
+def test_invalid_explicit_target_fails_before_detection(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    monkeypatch.setenv("VLLM_GR_TARGET_DEVICE", device)
+    monkeypatch.setenv("READTHEDOCS", "1")
+    with pytest.raises(ValueError, match="Invalid VLLM_GR_TARGET_DEVICE.*mlu"):
+        _load_setup_module().get_install_requires()
 
 
 def test_tagged_editable_install_runtime_verify(

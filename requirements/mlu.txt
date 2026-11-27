@@ -1,0 +1,4 @@
+-r common.txt
+
+# The selected MLU base image supplies vLLM, torch and torch_mlu together.
+# Do not install upstream CUDA runtimes into that environment.

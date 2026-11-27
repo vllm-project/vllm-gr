@@ -42,7 +42,7 @@ python -m pytest --confcutdir=tests/packaging -q tests/packaging/test_install_me
 ### Wheel smoke test
 
 Check the built wheel's dependency metadata and import it outside the
-checkout using the target you changed (`cpu`, `cuda` or `npu`).
+checkout using the target you changed (`cpu`, `cuda`, `mlu` or `npu`).
 
 !!! warning "Build artifacts"
 
