@@ -26,6 +26,7 @@ class OfflineBeamSearchRequest:
     concurrency_limit: int | None = None
     output_mode: Literal["full", "compact"] = "compact"
     trie_ids: list[int] | tuple[int, ...] | None = None
+    iid_sampling: tuple[int, int, float, int] | None = None
 
     def __post_init__(self) -> None:
         if self.output_mode not in ("full", "compact"):

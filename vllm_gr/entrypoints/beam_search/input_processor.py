@@ -335,6 +335,8 @@ class BeamSearchInputProcessor:
         sampling_params, begin_token_id, end_token_id = _create_request_params(
             params, tokenizer, vllm_config=self.engine.vllm_config
         )
+        if call.iid_sampling is not None:
+            sampling_params.extra_args = {"gr_iid_sampling": call.iid_sampling}
         engine_inputs = llm._preprocess_cmpl(call.prompts)
         lora_requests = llm._lora_request_to_seq(call.lora_request, len(engine_inputs))
         engine_requests = []

@@ -4,7 +4,7 @@
 """Offline vLLM entry point with persistent GR Beam Search V1 execution."""
 
 import gc
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Union, cast, overload
 
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine.llm_engine import LLMEngine
 
     from vllm_gr.entrypoints.beam_search.protocol import BeamSearchFrontend
+    from vllm_gr.entrypoints.iid_sampling import IIDSampleResult
     from vllm_gr.outputs import CompactBeamSearchOutput
 
 logger = init_logger("vllm_gr.entrypoints.gr")
@@ -201,6 +202,62 @@ class GRLLM(LLM):
         return cast(
             list["BeamSearchOutput"] | list["CompactBeamSearchOutput"],
             run_beam_search(self._create_beam_search_client(), call),
+        )
+
+    def sample_sids(
+        self,
+        prompt_token_ids: Sequence[int],
+        num_samples: int,
+        *,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        seed: int | None = None,
+        trie_id: int = 0,
+    ) -> "IIDSampleResult":
+        """Draw an unordered, catalog-constrained bag of three-token OneRec SIDs.
+
+        Supply the prompt before the next SID begin marker. A prefix occurring
+        m times shares one model row and gets m independent draws.
+        """
+        return self.sample_sids_batch(
+            [prompt_token_ids],
+            num_samples,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+            trie_ids=[trie_id],
+        )[0]
+
+    def sample_sids_batch(
+        self,
+        prompts: Sequence[Sequence[int]],
+        num_samples: int,
+        *,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        seed: int | None = None,
+        trie_ids: Sequence[int] | None = None,
+    ) -> list["IIDSampleResult"]:
+        """Sample one bag per prompt in input order, using one CUDA V1 eager session.
+
+        Prompts exclude the next SID begin marker. Each prompt receives
+        num_samples draws with replacement under its own catalog trie. The
+        optional seed initializes the random stream for this ordered batch.
+        """
+        from vllm_gr.entrypoints.iid_sampling import run_iid_sampling
+
+        return run_iid_sampling(
+            self,
+            prompts,
+            num_samples,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+            trie_ids=trie_ids,
         )
 
     def _create_beam_search_client(self) -> "BeamSearchFrontend":

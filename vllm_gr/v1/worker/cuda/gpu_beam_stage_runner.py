@@ -552,6 +552,7 @@ class GPUBeamStageRunner:
         self.terminal_cleanup_pending = False
         self.execution_error: Exception | None = None
         self.dynamic: Any = None
+        self.iid: Any = None
         self.unconstrained_topk_scratch: UnconstrainedTopKScratch | None = None
         self.inputs: GRInputBuffers | None = None
         self.prepared: PreparedGRInputs | None = None
@@ -673,6 +674,8 @@ class GPUBeamStageRunner:
                 )
         entries, offset = [], 0
         for m in stages:
+            if self.iid is not None:
+                m = self.iid.local_metadata(m)
             view = BeamBatchExecutionView.from_stage_metadata(m)
             count = view.num_execution_rows if m.kind is GRStageKind.DECODE else view.batch_size
             entries.append(BeamDispatchEntry(self.binding, m, offset, count))
@@ -921,7 +924,10 @@ class GPUBeamStageRunner:
                 self.hooks.consume_native_state(scheduler_output)
                 self._bind_attention(m)
                 self.prepare_decode(entry)
-                self.logits = self.hooks.decode_logits(self)
+                if self.iid is not None:
+                    self.logits = self.worker.model.compute_logits(self._forward_hidden(False))
+                else:
+                    self.logits = self.hooks.decode_logits(self)
         return None
 
     def sample(self, grammar_output: Any = None) -> AsyncGPUBeamOutput:
@@ -935,7 +941,10 @@ class GPUBeamStageRunner:
         terminal_payload = False
         for entry in execution.entries:
             m = entry.metadata
-            if m.produces_output and not self.cancelled:
+            if m.produces_output and not self.cancelled and self.iid is not None:
+                assert self.logits is not None
+                self.iid.sample(self.logits, m.stage_index, m.beam_params.temperature)
+            elif m.produces_output and not self.cancelled:
                 model_output = self.hidden if self.hidden is not None else self.logits
                 if model_output is None:
                     raise RuntimeError("GR output stage has no native model logits")
@@ -1411,8 +1420,29 @@ def get_stage_runner(
         discard_dynamic_graphs,
         uses_dynamic_beam,
     )
+    from vllm_gr.v1.worker.cuda.gpu_iid_sampling import GPUIIDSampling
 
-    dynamic_requested = uses_dynamic_beam(m.beam_params)
+    iid_options = None
+    if m.session_init is not None:
+        sampling = getattr(m.session_init.items[0].request, "sampling_params", None)
+        iid_options = (getattr(sampling, "extra_args", None) or {}).get("gr_iid_sampling")
+    if iid_options is not None:
+        n, k, p, seed = iid_options
+        if (
+            m.beam_params.max_tokens != 3
+            or backend is None
+            or type(n) is not int
+            or not 1 <= n <= view.beam_width
+            or n != m.output_options.num_return_sequences
+            or type(k) is not int
+            or k < -1
+            or not 0 < p <= 1
+            or type(seed) is not int
+            or not 0 <= seed < 2**63
+            or not 0 < m.beam_params.temperature <= 2
+        ):
+            raise ValueError("invalid CUDA IID sampling request or catalog configuration")
+    dynamic_requested = iid_options is not None or uses_dynamic_beam(m.beam_params)
     # Captures refer to an adapter's input/attention buffers. Keep one drained
     # adapter per B instead of replacing those addresses on every B transition.
     # A new schedule or resource binding invalidates the whole bounded cache.
@@ -1435,6 +1465,7 @@ def get_stage_runner(
         m.beam_params.beam_width,
         view.dynamic_beam_widths,
         dynamic_requested,
+        iid_options is not None,
     )
     cache_matches = cache_enabled and (
         getattr(worker, "_gr_gpu_stage_runner_cache_key", None) == cache_key
@@ -1450,6 +1481,7 @@ def get_stage_runner(
         and existing.closed
         and resources_match
         and (existing_dynamic is not None) == dynamic_requested
+        and isinstance(existing_dynamic, GPUIIDSampling) == (iid_options is not None)
         and existing.beam.layout.dynamic_beam_widths == view.dynamic_beam_widths
         and existing.beam.state.beam_width == m.beam_params.beam_width
         and existing.beam.session.context is context
@@ -1481,6 +1513,8 @@ def get_stage_runner(
         and existing.beam.state.ignore_stop_tokens_config == m.beam_params.ignore_stop_tokens
         and existing.beam.state.candidate_width == candidate_width
     )
+    if reuse_adapter and isinstance(existing_dynamic, GPUIIDSampling):
+        existing_dynamic.trim_idle_buffers()
     if reuse_beam:
         assert existing is not None
         existing.beam.reset_for_session()
@@ -1561,7 +1595,14 @@ def get_stage_runner(
         adapter = GPUBeamStageRunner(
             worker, beam, binding_tuple, backend, hooks=hooks, trie_ids=trie_ids
         )
-    if dynamic_requested:
+    if iid_options is not None:
+        if not isinstance(adapter.dynamic, GPUIIDSampling):
+            adapter.dynamic = GPUIIDSampling(adapter)
+        else:
+            adapter.dynamic.reset()
+        adapter.iid = adapter.dynamic
+        adapter.iid.start(iid_options, tuple(item.trie_id for item in m.session_init.items))
+    elif dynamic_requested:
         if adapter.dynamic is None:
             adapter.dynamic = GPUDynamicBeam(adapter)
         else:
