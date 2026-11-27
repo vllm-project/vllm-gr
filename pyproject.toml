@@ -76,10 +76,10 @@ gpu = [
 npu = []
 
 [project.urls]
-Homepage = "https://github.com/JiusiServe/vllm-gr"
-Documentation = "https://github.com/JiusiServe/vllm-gr#readme"
-Repository = "https://github.com/JiusiServe/vllm-gr.git"
-Issues = "https://github.com/JiusiServe/vllm-gr/issues"
+Homepage = "https://github.com/vllm-project/vllm-gr"
+Documentation = "https://github.com/vllm-project/vllm-gr#readme"
+Repository = "https://github.com/vllm-project/vllm-gr.git"
+Issues = "https://github.com/vllm-project/vllm-gr/issues"
 
 [project.entry-points."vllm.general_plugins"]
 vllm_gr = "vllm_gr.plugin:register"

@@ -7,7 +7,7 @@ body:
 - type: markdown
   attributes:
     value: >
-      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/JiusiServe/vllm-gr/issues?q=is%3Aissue+sort%3Acreated-desc+).
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/vllm-project/vllm-gr/issues?q=is%3Aissue+sort%3Acreated-desc+).
 - type: textarea
   attributes:
     label: Proposal to improve performance
@@ -20,7 +20,7 @@ body:
     label: Report of performance regression
     description: >
       Describe the performance comparison used to confirm the regression.
-      For reproducible workloads, see https://github.com/JiusiServe/vllm-gr/blob/main/docs/benchmarking/README.md
+      For reproducible workloads, see https://github.com/vllm-project/vllm-gr/blob/main/docs/benchmarking/README.md
   validations:
     required: false
 - type: textarea
@@ -35,7 +35,7 @@ body:
     label: Your current environment (if you think it is necessary)
     description: |
       Run `python collect_env.py` in the affected Python environment and paste the output below.
-      If you installed from a wheel, [download collect_env.py](https://github.com/JiusiServe/vllm-gr/raw/refs/heads/main/collect_env.py) first.
+      If you installed from a wheel, [download collect_env.py](https://github.com/vllm-project/vllm-gr/raw/refs/heads/main/collect_env.py) first.
       Review the script before running it and the output before sharing it.
     value: |
       ```text

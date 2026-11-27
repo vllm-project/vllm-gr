@@ -1,7 +1,7 @@
 site_name: vLLM-GR
 site_description: Inference and serving for generative recommendation models
 repo_name: vllm-gr
-repo_url: !ENV [DOCS_REPO_URL, 'https://github.com/JiusiServe/vllm-gr']
+repo_url: !ENV [DOCS_REPO_URL, 'https://github.com/vllm-project/vllm-gr']
 edit_uri: edit/main/docs/
 strict: true
 
