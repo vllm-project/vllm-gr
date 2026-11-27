@@ -54,6 +54,7 @@ git clone https://github.com/xLLM-AI/xllm-ops.git
 
 # Prepare the xllm-ops build
 cd xllm-ops
+git checkout 3271763
 git submodule init
 git submodule update
 
