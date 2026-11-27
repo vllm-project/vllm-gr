@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.beam_candidates import describe_beam_candidate_mismatch
 from tests.helpers.paths import REPO_ROOT, TESTS_DIR
 
 pytestmark = pytest.mark.gpu_test
@@ -1017,7 +1018,8 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                     ]
                     for output in direct
                 ]
-                (work_dir / f"completion-pair-{count}.json").write_text(
+                pair_path = work_dir / f"completion-pair-{count}.json"
+                pair_path.write_text(
                     json.dumps(
                         dict(
                             count=count,
@@ -1030,7 +1032,11 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                         indent=2,
                     )
                 )
-                assert reference["candidates"] == direct_candidates
+                assert reference["candidates"] == direct_candidates, (
+                    describe_beam_candidate_mismatch(
+                        reference["candidates"], direct_candidates, pair_path
+                    )
+                )
                 assert [c["token_ids"] for c in data["choices"]] == [
                     list(c.token_ids) for output in direct for c in output.outputs
                 ]
