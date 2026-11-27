@@ -1,8 +1,6 @@
 name: Test levels
 
 on:
-  push:
-    branches: [main]
   schedule:
     # 02:00 Asia/Shanghai, daily; 03:00 Monday, weekly (UTC cron).
     - cron: '0 18 * * *'
@@ -36,19 +34,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Buildkite runs the CUDA and CPU coverage for main-branch L3.
-        device: ${{ fromJSON((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.level == 'l2' || inputs.level == 'l3'))) && '["npu"]' || '["gpu", "npu"]') }}
-    runs-on: self-hosted
+        device: ${{ fromJSON((github.event_name == 'workflow_dispatch' && (inputs.level == 'l2' || inputs.level == 'l3')) && '["migrated"]' || (github.event_name == 'workflow_dispatch' && inputs.level == 'l1') && '["gpu"]' || '["gpu", "npu"]') }}
+    runs-on: ${{ matrix.device == 'migrated' && 'ubuntu-latest' || 'self-hosted' }}
     timeout-minutes: 360
     env:
       LANE_DEVICE: ${{ matrix.device }}
-      TEST_LEVEL: ${{ github.event_name == 'push' && 'l3' || github.event_name == 'schedule' && (github.event.schedule == '0 19 * * 0' && 'l5' || 'l4') || inputs.level || 'l3' }}
+      TEST_LEVEL: ${{ github.event_name == 'schedule' && (github.event.schedule == '0 19 * * 0' && 'l5' || 'l4') || inputs.level || 'l3' }}
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       VLLM_GR_RUN_MODEL_SMOKE: '1'
       VLLM_GR_ISOLATED_RUNNER: ${{ vars.VLLM_GR_ISOLATED_RUNNER || 'false' }}
     steps:
       - name: Detect runner accelerator
         id: accelerator
+        if: matrix.device != 'migrated'
         shell: bash
         run: |
           set -euo pipefail
@@ -76,10 +74,12 @@ jobs:
           cpu_message='Manual runs exclude CPU-only tests. Run L1 CPU Unit tests in Buildkite Ready or Merge.'
           echo "::notice::$cpu_message"
           echo "$cpu_message" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$TEST_LEVEL" == l2 ]]; then
-            message='L2 CUDA tests have moved to the Buildkite Ready pipeline.'
+          if [[ "$TEST_LEVEL" == l1 ]]; then
+            message='Former L1 NPU tests now run as L2 in Buildkite Ready.'
+          elif [[ "$TEST_LEVEL" == l2 ]]; then
+            message='L2 CUDA and NPU tests have moved to the Buildkite Ready pipeline.'
           elif [[ "$TEST_LEVEL" == l3 ]]; then
-            message='L3 CUDA tests have moved to the Buildkite Merge pipeline.'
+            message='L3 CUDA and NPU tests have moved to the Buildkite Merge pipeline.'
           else
             exit 0
           fi
@@ -166,7 +166,7 @@ jobs:
       - name: Run selected level
         if: steps.accelerator.outputs.run == 'true'
         env:
-          VLLM_GR_EXCLUDE_CPU_TESTS: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && '1' || '0' }}
+          VLLM_GR_EXCLUDE_CPU_TESTS: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: bash tools/ci/run_test_level.sh "$TEST_LEVEL"
 
       - name: Run L2 resource probe if isolated

@@ -41,9 +41,12 @@ steps:
         timeout_in_minutes: 30
         mirror_hardwares: l4_1
         command: >-
+          mkdir -p results &&
           pytest
           --run-slow --durations=10 -sv -m 'l3 and gpu_test'
+          --basetemp=results/onerec-v1-scheduler
           tests/e2e/test_onerec_v1_scheduler_st.py
+        artifact_paths: "results/onerec-v1-scheduler/**/*.json"
 
   - label: "Entrypoints Test"
     key: l3-gpu-entrypoints

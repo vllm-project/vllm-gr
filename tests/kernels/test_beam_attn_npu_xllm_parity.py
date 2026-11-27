@@ -66,7 +66,7 @@ MAX_DECODE_STEPS = 8
 NUM_LAYERS = 1
 
 
-@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.l2  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("case", "expected"),
     [

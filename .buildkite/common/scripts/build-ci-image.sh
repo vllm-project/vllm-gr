@@ -11,6 +11,16 @@ repository="${VLLM_GR_CI_IMAGE_REPOSITORY:-public.ecr.aws/q9t5s3a7/vllm-ci-test-
 image="${repository}:vllm-gr-${BUILDKITE_COMMIT}"
 dockerfile="docker/Dockerfile.ci"
 builder="vllm-gr-builder"
+platform_args=()
+case "${1:-cuda}" in
+  cuda) ;;
+  npu)
+    image="${repository}:vllm-gr-npu-${BUILDKITE_COMMIT}-a2"
+    dockerfile="docker/Dockerfile.npu.ci"
+    platform_args=(--platform linux/arm64)
+    ;;
+  *) echo "Usage: $0 [cuda|npu]" >&2; exit 2 ;;
+esac
 
 if [[ "$repository" == public.ecr.aws/* ]]; then
   aws ecr-public get-login-password --region us-east-1 \
@@ -25,6 +35,7 @@ echo "Building ${image} with cache ${cache_ref}"
 docker buildx inspect "$builder" >/dev/null 2>&1 \
   || docker buildx create --name "$builder" --driver docker-container
 docker buildx build --builder "$builder" --push --progress=plain \
+  "${platform_args[@]}" \
   --cache-from "type=registry,ref=${cache_ref}" \
   --cache-to "type=registry,ref=${cache_ref},mode=max,compression=zstd" \
   --file "$dockerfile" \

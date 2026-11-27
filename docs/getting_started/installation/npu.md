@@ -48,12 +48,16 @@ npu-smi info
 
 ### Install xllm-ops
 
+Use the pinned revision below to avoid the optional operator metadata dependency
+regression introduced by [xllm-ops #113](https://github.com/xLLM-AI/xllm-ops/pull/113).
+
 ```bash
 gr_checkout=$PWD
 git clone https://github.com/xLLM-AI/xllm-ops.git
 
 # Prepare the xllm-ops build
 cd xllm-ops
+git checkout --detach d5694d2248e24902b5a6331aa909b283a38f5bd6
 git submodule init
 git submodule update
 

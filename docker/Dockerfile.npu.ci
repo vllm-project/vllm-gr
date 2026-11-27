@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+FROM quay.io/ascend/vllm-ascend:v0.30.0rc2
+
+ENV VLLM_GR_TARGET_DEVICE=npu
+
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git cmake g++ make ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/vllm-gr
+# Keep GR source changes from invalidating the expensive operator build.
+# Pin before the optional ops-info dependency regression in xllm-ops #113.
+RUN git clone https://github.com/xLLM-AI/xllm-ops.git /tmp/xllm-ops \
+    && cd /tmp/xllm-ops \
+    && git checkout --detach d5694d2248e24902b5a6331aa909b283a38f5bd6 \
+    && git submodule init \
+    && git submodule update \
+    && source "${ASCEND_TOOLKIT_HOME}/set_env.sh" \
+    && bash build.sh \
+       -n 'beam_search_group;cache_unshared_kv;select_unshared_kv;x_attention;onerec_final_beam_select;rec_constrained_top_k' \
+       --no-build-transformer --no-build-flash \
+    && source "${ASCEND_HOME_PATH}/opp/vendors/custom_xllm_math/bin/set_env.bash" \
+    && cd /tmp/xllm-ops/test/python_test \
+    && bash build_and_run.sh \
+    && cd /opt/vllm-gr \
+    && ln -s "${ASCEND_HOME_PATH:-${ASCEND_TOOLKIT_HOME}}/opp/vendors/custom_xllm_math" /opt/xllm-opp \
+    && test -d /opt/xllm-opp/op_api/lib \
+    && printf '%s\n' /opt/xllm-opp/op_api/lib > /etc/ld.so.conf.d/xllm-ops.conf \
+    && ldconfig \
+    && rm -rf /tmp/xllm-ops
+
+# Keep the custom OPP visible to pytest launched by the Buildkite command shell.
+ENV ASCEND_CUSTOM_OPP_PATH="/opt/xllm-opp${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
+
+COPY LICENSE NOTICE README.md MANIFEST.in pyproject.toml setup.py ./
+COPY requirements/ requirements/
+COPY tools/packaging/git_version.py tools/packaging/git_version.py
+COPY benchmarks/open_one_rec/ benchmarks/open_one_rec/
+COPY vllm_gr/ vllm_gr/
+RUN source "${ASCEND_TOOLKIT_HOME}/set_env.sh" \
+    && python3 -m pip install --no-cache-dir --no-build-isolation -e '.[dev,grpc]'
+# Loading torch_npu requires the host driver supplied to runtime containers.
+RUN python3 -c "from importlib.util import find_spec; \
+    assert all(find_spec(name) is not None for name in \
+    ('torch', 'torch_npu', 'custom_ops_lib'))"
+
+ENTRYPOINT []

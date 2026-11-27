@@ -33,6 +33,11 @@ if [[ "${VLLM_GR_TARGET_DEVICE:-}" == cuda &&
   expression="($expression) and not ((l2 or l3) and gpu_test)"
 fi
 
+if [[ "${VLLM_GR_TARGET_DEVICE:-}" == npu &&
+      "${VLLM_GR_EXCLUDE_MIGRATED_NPU_TESTS:-}" == 1 ]]; then
+  expression="($expression) and not ((l1 or l2 or l3) and npu_test)"
+fi
+
 if [[ "${VLLM_GR_EXCLUDE_CPU_TESTS:-}" == 1 ]]; then
   expression="($expression) and not ($cpu_expression)"
 fi

@@ -333,11 +333,7 @@ jobs:
     if: needs.benchmark-policy.result == 'success'
     runs-on: self-hosted
     env:
-      VLLM_GR_TEST_LEVEL: pr-device
       VLLM_GR_ISOLATED_RUNNER: ${{ vars.VLLM_GR_ISOLATED_RUNNER || 'false' }}
-      # Activate the opt-in tiny-model smoke tests (graph/eager parity and the
-      # dynamic-beam CPU-oracle comparison) that L2 now collects per PR.
-      VLLM_GR_RUN_MODEL_SMOKE: '1'
     concurrency:
       group: vllm-gr-accelerator-${{ github.repository }}
       queue: max
@@ -425,26 +421,21 @@ jobs:
         run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Report tests moved to Buildkite
-        if: github.event_name == 'workflow_dispatch'
         run: |
-          cpu_message='Manual runs exclude CPU-only tests. Run L1 CPU Unit tests in Buildkite Ready or Merge.'
+          cpu_message='CPU-only pytest tests are disabled here. Run L1 CPU Unit tests in Buildkite Ready or Merge.'
           echo "::notice::$cpu_message"
           echo "$cpu_message" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$VLLM_GR_TARGET_DEVICE" == cuda ]]; then
-            cuda_message='Manual CUDA device tests are disabled here. Run L2 CUDA tests in Buildkite Ready and L3 CUDA tests in Buildkite Merge.'
+            cuda_message='Run L2 CUDA tests in Buildkite Ready and L3 CUDA tests in Buildkite Merge.'
             echo "::notice::$cuda_message"
             echo "$cuda_message" >> "$GITHUB_STEP_SUMMARY"
           fi
-
-      - name: Run device tests
-        if: github.event_name != 'workflow_dispatch' || env.VLLM_GR_TARGET_DEVICE != 'cuda'
-        env:
-          VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS: "1"
-          VLLM_GR_EXCLUDE_CPU_TESTS: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
-        run: bash tools/ci/run_test_level.sh "$VLLM_GR_TEST_LEVEL"
+          npu_message='Former L1 NPU tests now run as L2 in Buildkite Ready. Run L3 NPU tests in Buildkite Merge.'
+          echo "::notice::$npu_message"
+          echo "$npu_message" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run L2 resource probe if isolated
-        if: github.event_name != 'workflow_dispatch' || env.VLLM_GR_TARGET_DEVICE != 'cuda'
+        if: github.event_name != 'workflow_dispatch'
         run: bash tools/ci/run_resource_level.sh
 
       - name: Check clear device

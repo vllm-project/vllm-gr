@@ -2,6 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 mirror_hardwares:
+  a2b3_npu_1:
+    agents:
+      queue: ascend-a2b3
+      resource_class: npu-1
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: "${VLLM_GR_CI_IMAGE_REPOSITORY:-public.ecr.aws/q9t5s3a7/vllm-ci-test-repo}:vllm-gr-npu-${BUILDKITE_COMMIT?}-a2"
+
   l4_1:
     agents:
       queue: l4-k8s

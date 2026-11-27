@@ -764,7 +764,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
     def test_level_workflow_schedule_and_resource_safety(self) -> None:
         workflow = yaml.safe_load((ROOT / ".github/workflows/test-levels.yml").read_text())
         triggers = workflow.get("on", workflow.get(True))
-        self.assertEqual(triggers["push"]["branches"], ["main"])
+        self.assertNotIn("push", triggers)  # Buildkite Merge covers L3 on main.
         self.assertNotIn("pull_request", triggers)  # PR levels run in the existing gate.
         self.assertEqual(
             [item["cron"] for item in triggers["schedule"]],
@@ -788,11 +788,20 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         )
 
         job = workflow["jobs"]["level"]
-        self.assertEqual(job["runs-on"], "self-hosted")
+        self.assertEqual(
+            evaluate(
+                job["runs-on"].replace("matrix.device", "'migrated'"),
+                context(event="workflow_dispatch"),
+            ),
+            "ubuntu-latest",
+        )
+        self.assertEqual(
+            evaluate(job["runs-on"].replace("matrix.device", "'npu'"), context()),
+            "self-hosted",
+        )
         expression = job["env"]["TEST_LEVEL"].strip().removeprefix("${{").removesuffix("}}")
         expression = expression.replace("&&", " and ").replace("||", " or ")
         for event, schedule, chosen, expected in (
-            ("push", "", "", "l3"),
             ("schedule", "0 18 * * *", "", "l4"),
             ("schedule", "0 19 * * 0", "", "l5"),
             ("workflow_dispatch", "", "l2", "l2"),
@@ -830,6 +839,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         detect = steps[0]
         self.assertEqual(detect["id"], "accelerator")
         self.assertEqual(detect["name"], "Detect runner accelerator")
+        self.assertFalse(evaluate(detect["if"].replace("matrix.device", "'migrated'"), context()))
 
         def enabled(step: dict[str, Any], runner: str, level: str, hit: str) -> bool:
             condition = step["if"]
@@ -873,7 +883,12 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
     def test_level_ci_preserves_existing_benchmark_gates(self) -> None:
         workflow = self.workflows["ci.yml"]
         jobs = workflow["jobs"]
-        self.assertEqual(jobs["pre-commit"]["env"]["VLLM_GR_TEST_LEVEL"], "pr-device")
+        self.assertFalse(
+            any(
+                "tools/ci/run_test_level.sh" in step.get("run", "")
+                for step in jobs["pre-commit"]["steps"]
+            )
+        )
         self.assertIn(
             "vars.VLLM_GR_ISOLATED_RUNNER",
             jobs["pre-commit"]["env"]["VLLM_GR_ISOLATED_RUNNER"],
