@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -228,8 +229,9 @@ def build_synthetic_constraint_document(
     layout: str,
     token_id_start: int,
     token_id_end: int,
+    alternate_beam_widths: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Build a three-step table with exactly ``beam_width`` valid paths."""
+    """Build a three-step table that can fill both requested width schedules."""
     from vllm_gr.constraints.json_compiler import compile_relations_json
 
     tokens = _synthetic_constraint_tokens(
@@ -240,13 +242,19 @@ def build_synthetic_constraint_document(
         token_id_start=token_id_start,
         token_id_end=token_id_end,
     )
+    fanout = [1, 1]
+    # A narrowed stage needs enough children per retained prefix to widen again.
+    for stage, (parents, children) in enumerate(pairwise(alternate_beam_widths or [])):
+        fanout[stage] = (children + parents - 1) // parents
     triples = [
         [
-            tokens[index],
-            tokens[beam_width + index],
-            tokens[2 * beam_width + index],
+            tokens[root],
+            tokens[beam_width + (root + child) % beam_width],
+            tokens[2 * beam_width + (root + leaf) % beam_width],
         ]
-        for index in range(beam_width)
+        for root in range(beam_width)
+        for child in range(fanout[0])
+        for leaf in range(fanout[1])
     ]
     return compile_relations_json(triples)
 
@@ -269,6 +277,7 @@ def ensure_constraint_document(
         layout=args.synthetic_token_layout,
         token_id_start=args.token_id_start,
         token_id_end=args.token_id_end,
+        alternate_beam_widths=args.alternate_beam_widths,
     )
     _write_json(path, document)
     return path
@@ -436,6 +445,79 @@ def _run_once(
     }
 
 
+def _run_width_switch(
+    llm: Any, workload: list[dict[str, Any]], params: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    prompts = [{"prompt_token_ids": row["input_ids"]} for row in workload]
+    batch_size = len(prompts)
+
+    def run_batch(schedule: str) -> Any:
+        return llm.beam_search(
+            prompts,
+            params[schedule],
+            use_tqdm=False,
+            concurrency_limit=batch_size,
+            output_mode="full",
+        )
+
+    def snapshot() -> dict[str, int]:
+        (stats,) = llm.llm_engine.collective_rpc(
+            "get_gr_beam_graph_runtime_stats", kwargs={"include_cuda_snapshot": True}
+        )
+        return stats["cuda_snapshot"]
+
+    reference_outputs: dict[str, list[dict[str, Any]]] = {}
+    phases = {}
+    # Both schedules have measured steady-state runs before the first switch.
+    for phase, schedules in (
+        ("steady_a", ["a"] * args.repeat),
+        ("steady_b", ["b"] * args.repeat),
+        ("switching", ["a", "b"] * args.repeat + ["a"]),
+    ):
+        if phase != "switching":
+            for _ in range(args.warmup_runs):
+                run_batch(schedules[0])
+        before = snapshot()
+        batches = []
+        for schedule in schedules:
+            started = time.perf_counter()
+            outputs = run_batch(schedule)
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            normalized = [
+                _normalize_output([output], row, expected_beam_width=args.beam_width)
+                for output, row in zip(outputs, workload, strict=True)
+            ]
+            expected = reference_outputs.setdefault(schedule, normalized)
+            batches.append(
+                {
+                    "schedule": schedule,
+                    "batch_latency_ms": latency_ms,
+                    "exact_outputs": sum(
+                        actual == reference
+                        for actual, reference in zip(normalized, expected, strict=True)
+                    ),
+                }
+            )
+        after = snapshot()
+        latencies = [batch["batch_latency_ms"] for batch in batches]
+        phases[phase] = {
+            "batch_latency_ms_p50": _percentile(latencies, 0.50),
+            "batch_latency_ms_p95": _percentile(latencies, 0.95),
+            "cuda_graph_captures": after["captures"] - before["captures"],
+            "worker_before": before,
+            "worker_after": after,
+            "exact_outputs": sum(batch["exact_outputs"] for batch in batches),
+            "outputs_compared": len(batches) * batch_size,
+            "batches": batches,
+        }
+    return {
+        "batch_size": batch_size,
+        "schedules": {label: setting.dynamic_beam_widths for label, setting in params.items()},
+        "reference_outputs": reference_outputs,
+        "phases": phases,
+    }
+
+
 def _timeline_target(args: argparse.Namespace) -> Path | None:
     if not args.timeline_output:
         return None
@@ -561,18 +643,24 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         vocab_size=vocab_size,
     )
     gr_config = canonical_gr_config(args, constraint_artifact)
-    params = BeamSearchParams(
+    param_kwargs = dict(
         beam_width=args.beam_width,
         max_tokens=args.beam_steps,
         temperature=args.temperature,
         ignore_eos=args.ignore_eos,
         length_penalty=args.length_penalty,
     )
+    switching = args.alternate_beam_widths is not None
+    batch_size = len(workload) if switching else 1
+    if switching:
+        gr_config.update(beam_batch_sizes=[batch_size], prefill_graph_enabled=False)
     input_token_lengths = [len(row["input_ids"]) for row in workload]
     max_prompt_len = max(input_token_lengths)
     max_model_len = args.max_model_len or max_prompt_len + args.beam_steps
     max_num_batched_tokens = args.max_num_batched_tokens or max(
-        max_prompt_len, args.beam_width, max_model_len
+        sum(input_token_lengths) if switching else max_prompt_len,
+        batch_size * args.beam_width,
+        max_model_len,
     )
     timeline_target = _timeline_target(args)
     timeline_temp = (
@@ -595,7 +683,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "max_logprobs": args.beam_width,
         "async_scheduling": True,
         "enable_prefix_caching": args.enable_prefix_caching,
-        "max_num_seqs": 1,
+        "max_num_seqs": batch_size,
         "max_num_batched_tokens": max_num_batched_tokens,
         "max_model_len": max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -609,35 +697,48 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     timeline_run = None
     try:
         with GRLLM(gr=gr_config, **engine_kwargs) as llm:
-            for _ in range(args.warmup_runs):
-                _run_once(
-                    llm,
-                    workload,
-                    params,
-                    beam_width=args.beam_width,
-                    beam_steps=args.beam_steps,
-                    record_outputs=False,
-                )
-            measured = [
-                _run_once(
-                    llm,
-                    workload,
-                    params,
-                    beam_width=args.beam_width,
-                    beam_steps=args.beam_steps,
-                    record_outputs=True,
-                )
-                for _ in range(args.repeat)
-            ]
-            if timeline_target is not None and timeline_trace_dir is not None:
-                timeline_run = _run_timeline(
-                    llm,
-                    workload,
-                    params,
-                    args,
-                    trace_dir=timeline_trace_dir,
-                    target=timeline_target,
-                )
+            if switching:
+                schedules = {
+                    "a": BeamSearchParams(
+                        **param_kwargs, dynamic_beam_widths=[args.beam_width] * args.beam_steps
+                    ),
+                    "b": BeamSearchParams(
+                        **param_kwargs, dynamic_beam_widths=args.alternate_beam_widths
+                    ),
+                }
+                measurements = {"width_switch": _run_width_switch(llm, workload, schedules, args)}
+            else:
+                params = BeamSearchParams(**param_kwargs)
+                for _ in range(args.warmup_runs):
+                    _run_once(
+                        llm,
+                        workload,
+                        params,
+                        beam_width=args.beam_width,
+                        beam_steps=args.beam_steps,
+                        record_outputs=False,
+                    )
+                measured = [
+                    _run_once(
+                        llm,
+                        workload,
+                        params,
+                        beam_width=args.beam_width,
+                        beam_steps=args.beam_steps,
+                        record_outputs=True,
+                    )
+                    for _ in range(args.repeat)
+                ]
+                if timeline_target is not None and timeline_trace_dir is not None:
+                    timeline_run = _run_timeline(
+                        llm,
+                        workload,
+                        params,
+                        args,
+                        trace_dir=timeline_trace_dir,
+                        target=timeline_target,
+                    )
+                measurements = {**_metric_summaries(measured), "runs": measured}
     finally:
         if timeline_temp is not None:
             timeline_temp.cleanup()
@@ -646,7 +747,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "framework": "vllm-gr",
         "api": "GRLLM.beam_search",
-        "execution_mode": "offline_sequential_single_prompt",
+        "execution_mode": "offline_width_switch"
+        if switching
+        else "offline_sequential_single_prompt",
         "model": args.model,
         "vllm_gr_repo": str(repo_root),
         "vllm_gr_commit": _git_commit(repo_root),
@@ -680,13 +783,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         }
         if timeline_target is not None and timeline_run is not None
         else None,
-        "sampling_params": {
-            "beam_width": args.beam_width,
-            "max_tokens": args.beam_steps,
-            "temperature": args.temperature,
-            "ignore_eos": args.ignore_eos,
-            "length_penalty": args.length_penalty,
-        },
+        "sampling_params": param_kwargs,
         "engine_config": {
             "worker_multiprocessing_method": multiprocessing_method,
             "async_scheduling": True,
@@ -694,15 +791,22 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "beam_graph_enabled": not args.disable_beam_graph,
             "max_model_len": max_model_len,
             "max_num_batched_tokens": max_num_batched_tokens,
-            "max_num_seqs": 1,
+            "max_num_seqs": batch_size,
             "enable_prefix_caching": args.enable_prefix_caching,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "attention_backend": args.attention_backend,
             "enforce_eager": args.enforce_eager,
             "dtype": args.dtype,
+            **(
+                {
+                    "beam_batch_sizes": gr_config["beam_batch_sizes"],
+                    "prefill_graph_enabled": gr_config["prefill_graph_enabled"],
+                }
+                if switching
+                else {}
+            ),
         },
-        **_metric_summaries(measured),
-        "runs": measured,
+        **measurements,
         "environment": _environment(torch),
     }
 
@@ -737,6 +841,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Total generated Beam stages: one Prefill plus beam_steps-1 Decode stages.",
     )
     parser.add_argument("--beam-width", type=int, default=256)
+    parser.add_argument(
+        "--alternate-beam-widths",
+        type=int,
+        nargs="+",
+        metavar="WIDTH",
+        help="Alternate this retained-width schedule with full-width Beam in one engine.",
+    )
     parser.add_argument("--requests", type=int, default=1)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
@@ -805,6 +916,24 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("context-len, requests, and repeat must be positive")
     if args.warmup_runs < 0:
         raise ValueError("--warmup-runs must be non-negative")
+    widths = args.alternate_beam_widths
+    if widths is not None:
+        from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
+
+        if (
+            len(widths) != args.beam_steps
+            or any(not 1 <= width <= args.beam_width for width in widths)
+            or widths[-1] != args.beam_width
+            or all(width == args.beam_width for width in widths)
+        ):
+            raise ValueError(
+                "--alternate-beam-widths must have one width in [1, beam-width] per step, "
+                "end at beam-width, and change an earlier width"
+            )
+        if args.requests not in SUPPORTED_BEAM_BATCH_SIZES:
+            raise ValueError("width switching requires a supported Beam batch size in --requests")
+        if args.timeline_output:
+            raise ValueError("--timeline-output cannot be combined with --alternate-beam-widths")
     if not 0.0 < args.gpu_memory_utilization <= 1.0:
         raise ValueError("--gpu-memory-utilization must be in (0, 1]")
     if not 1 <= args.timeline_requests <= args.requests:
@@ -821,6 +950,9 @@ def main() -> None:
     configure_multiprocessing()
     summary = run_benchmark(args)
     _write_json(args.output_json, summary)
+    if args.alternate_beam_widths is not None:
+        print(f"Width-switch results: {args.output_json}")
+        return
     print(
         json.dumps(
             {

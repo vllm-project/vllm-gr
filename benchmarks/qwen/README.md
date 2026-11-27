@@ -145,6 +145,37 @@ Constraint triples and the canonical artifact default beside the result JSON.
 Run the shell entry point with `--help`, or the Python entry point with
 `--help`, for all supported settings.
 
+## Beam width switching
+
+Use `--alternate-beam-widths` to compare two retained-width schedules in one
+CUDA V1 engine. The reference uses `--beam-width` at every stage. The alternate
+must change an earlier stage and end at the same width. Every call uses the same
+batch of `--requests` prompts. The generated table branches when necessary to
+fill both schedules.
+
+```bash
+MODEL=/path/to/Qwen3-0.6B
+OUT=results/beam_search/width-switch
+python benchmarks/qwen/make_workload.py \
+  --model-dir "$MODEL" --context-len 64 --requests 4 --seed 42 \
+  --token-id-start 1000 --token-id-end 2000 --output-jsonl "$OUT/workload.jsonl"
+
+CUDA_VISIBLE_DEVICES=0 VLLM_USE_V2_MODEL_RUNNER=0 python -m benchmarks.qwen.benchmark_v1 \
+  --model "$MODEL" --no-trust-remote-code --dtype bfloat16 \
+  --gpu-memory-utilization 0.30 --max-model-len 128 --max-num-batched-tokens 256 \
+  --token-id-start 1000 --token-id-end 2000 --workload-jsonl "$OUT/workload.jsonl" \
+  --context-len 64 --requests 4 --beam-width 8 --alternate-beam-widths 4 8 8 \
+  --warmup-runs 3 --repeat 20 --output-json "$OUT/graph.json"
+```
+
+The report contains separate warmup-excluded phases for A, B, and
+`A, B, A, ... , A`. It records batch-call latency, the worker's vLLM CUDA Graph
+capture counter delta, and PyTorch allocated and reserved bytes at each phase
+boundary. Each output is compared with the first measured output for the same
+schedule, including ordered token IDs and scores. GR Prefill Graph is disabled.
+Pass `--disable-beam-graph` for an eager Beam Decode control. Timeline profiling
+is available in the regular mode.
+
 ## Reading the result JSON
 
 `input_token_lengths` lists the lengths of the token ID arrays actually sent,

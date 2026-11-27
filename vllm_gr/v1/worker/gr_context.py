@@ -25,7 +25,9 @@ def _beam_graph_enabled_for_run(runner: Any) -> bool:
     return bool(_get_gr_config(runner).beam_graph_enabled)
 
 
-def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
+def get_beam_graph_runtime_stats(
+    worker: Any, *, include_cuda_snapshot: bool = False
+) -> dict[str, Any]:
     """Return capture/dispatch state through ``collective_rpc``.
 
     vLLM utility RPC callables receive the Worker, while Beam graph state is
@@ -83,6 +85,17 @@ def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
         stats["prefill_graph_piecewise_dispatches"] = counts["PIECEWISE"]
         stats["prefill_graph_none_dispatches"] = counts["NONE"]
     device_type = str(getattr(runner, "device", "")).split(":", 1)[0].lower()
+    if include_cuda_snapshot:
+        if device_type != "cuda":
+            raise RuntimeError("CUDA graph snapshots require a CUDA ModelRunner")
+        import torch
+        from vllm.compilation.counter import compilation_counter
+
+        stats["cuda_snapshot"] = {
+            "captures": compilation_counter.num_cudagraph_captured,
+            "allocated_bytes": torch.accelerator.memory_allocated(runner.device),
+            "reserved_bytes": torch.accelerator.memory_reserved(runner.device),
+        }
     if device_type == "npu" or hasattr(runner, "_gr_npu_beam_graph_shapes"):
         stats.update(
             {
