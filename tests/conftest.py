@@ -9,6 +9,9 @@ pytest_plugins = ("tests.level_plugin",)
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--loops", action="store", default=1, type=int, help="number to test loops")
     parser.addoption("--run-slow", action="store_true", default=False, help="run slow tests")
+    parser.addoption(
+        "--strict-gate", action="store_true", help="Require every selected gate to pass"
+    )
 
 
 # Marker registration lives in pyproject.toml so IDE test runners and
@@ -51,3 +54,14 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 @pytest.fixture  # type: ignore
 def loops(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("--loops"))
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    if session.config.getoption("strict_gate") and session.exitstatus == pytest.ExitCode.OK:
+        reporter = session.config.pluginmanager.getplugin("terminalreporter")
+        if (
+            reporter is None
+            or any(reporter.stats.get(key) for key in ("skipped", "xfailed", "xpassed"))
+            or not reporter.stats.get("passed")
+        ):
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
