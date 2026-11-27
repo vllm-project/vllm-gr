@@ -89,6 +89,16 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _kv_pool_override(args: argparse.Namespace) -> dict[str, bool]:
+    """Emit explicit overrides only in the selected runtime's supported schema."""
+    enabled = getattr(args, "kv_pool_ping_pong", None)
+    if enabled is None or args.ab_legacy_config:
+        return {}
+    key = "enable_kv_pool_ping_pong"
+    parser = import_module("vllm_gr.config.parser")
+    return {key: enabled} if key in getattr(parser, "CONFIG_ATTRIBUTES", {}) else {}
+
+
 def prepare(args: argparse.Namespace) -> None:
     import yaml
 
@@ -125,6 +135,7 @@ def prepare(args: argparse.Namespace) -> None:
             "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
         },
         "candidate_width": [args.beam_width] * args.generated_steps,
+        **_kv_pool_override(args),
     }
     if args.ab_prefill_grid:
         config.update(
@@ -231,6 +242,7 @@ def _measure_offline_batch(
     prompt_token_ids: list[list[int]],
     count: int,
     beam_width: int,
+    output_snapshots: list[Any] | None = None,
 ) -> float:
     """Consume and validate one batch, releasing its outputs before the next call."""
     import torch
@@ -284,6 +296,18 @@ def _measure_offline_batch(
             if not math.isfinite(score) or not isinstance(text, str):
                 raise RuntimeError(f"{context}: invalid score/text")
             validate_sid_tokens(tokenizer, tokens, context)
+    if output_snapshots is not None:
+        # Store only ordinary Python values after timing and validation. Keep
+        # the output-release contract and the measured consumption work intact.
+        output_snapshots.append(
+            [
+                [
+                    {"token_ids": [int(token) for token in tokens], "score": score}
+                    for tokens, score, _ in row
+                ]
+                for row in consumed
+            ]
+        )
     return elapsed
 
 
@@ -347,6 +371,7 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
         engine_args["vllm_gr_config"] = _legacy_ab_config(gr)
     else:
         engine_args.update(gr=gr, attention_config={"backend": "CUSTOM"})
+    result["gr_config"] = engine_args["vllm_gr_config"] if args.ab_legacy_config else gr
     if args.revision:
         engine_args["revision"] = args.revision
     params = BeamSearchParams(
@@ -381,9 +406,21 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
         for count in args.batch_sizes:
             prompts = [{"prompt_token_ids": tokens} for tokens in prompt_token_ids[:count]]
             group_samples = []
+            snapshots: list[Any] | None = [] if getattr(args, "record_outputs", False) else None
             for iteration in range(args.warmup_runs + args.measured_runs):
                 elapsed = _measure_offline_batch(
-                    llm, prompts, params, tokenizer, prompt_token_ids, count, args.beam_width
+                    llm,
+                    prompts,
+                    params,
+                    tokenizer,
+                    prompt_token_ids,
+                    count,
+                    args.beam_width,
+                    **(
+                        {"output_snapshots": snapshots}
+                        if snapshots is not None and iteration >= args.warmup_runs
+                        else {}
+                    ),
                 )
                 if iteration >= args.warmup_runs:
                     group_samples.append(elapsed)
@@ -395,9 +432,16 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
                 args,
             )
             case["prompt_tokens_including_sid_begin"] = [args.input_len] * count
+            if snapshots is not None:
+                case["outputs"] = snapshots
             result["cases"].append(case)
             write_json(args.output_dir / "offline.json", result)
-            print(json.dumps(case, sort_keys=True), flush=True)
+            print(
+                json.dumps(
+                    {key: value for key, value in case.items() if key != "outputs"}, sort_keys=True
+                ),
+                flush=True,
+            )
 
 
 async def run_online(args: argparse.Namespace, result: dict[str, Any]) -> None:
@@ -497,6 +541,17 @@ def parse_args() -> argparse.Namespace:
         "--ab-legacy-config",
         action="store_true",
         help="Use schema-v1 startup for an offline A/B pass",
+    )
+    parser.add_argument(
+        "--kv-pool-ping-pong",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the KV bank setting if supported by the selected runtime (default: off).",
+    )
+    parser.add_argument(
+        "--record-outputs",
+        action="store_true",
+        help="Save measured beam token IDs and scores after the timed section.",
     )
     args = parser.parse_args()
     if args.ab_legacy_config and (not args.ab_prefill_grid or args.mode == "online"):

@@ -462,6 +462,17 @@ class GRConfig:
     )
     """Opt into CUDA stage-adapter and Decode graph reuse across batch sizes."""
 
+    enable_kv_pool_ping_pong: bool = field(
+        default=False,
+        metadata={
+            "gr": ConfigFieldSpec(
+                "validate_enable_kv_pool_ping_pong",
+                canonical_path=("gr", "enable_kv_pool_ping_pong"),
+            )
+        },
+    )
+    """Opt into a second CUDA KV bank for fixed-width deployments."""
+
     constraint: ConstraintConfig | None = field(
         default=None,
         metadata={"gr": ConfigFieldSpec("validate_constraint_config")},

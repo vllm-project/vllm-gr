@@ -40,6 +40,7 @@ Common environment overrides:
   MAX_NUM_BATCHED_TOKENS=auto
   ATTENTION_BACKEND=CUSTOM
   DISABLE_BEAM_GRAPH=0
+  KV_POOL_PING_PONG=0        1 enables next-bank KV gather for A/B comparison
   ENFORCE_EAGER=0
   ENABLE_PREFIX_CACHING=0
   CONSTRAINT_TRIPLES=        existing real triples; empty generates synthetic
@@ -98,6 +99,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 DISABLE_BEAM_GRAPH="${DISABLE_BEAM_GRAPH:-0}"
+KV_POOL_PING_PONG="${KV_POOL_PING_PONG:-0}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-0}"
 CONSTRAINT_TRIPLES="${CONSTRAINT_TRIPLES:-}"
@@ -235,6 +237,11 @@ fi
 if [[ "${DISABLE_BEAM_GRAPH}" == "1" ]]; then
   ARGS+=(--disable-beam-graph)
 fi
+case "${KV_POOL_PING_PONG}" in
+  1) ARGS+=(--kv-pool-ping-pong) ;;
+  0) ARGS+=(--no-kv-pool-ping-pong) ;;
+  *) echo "KV_POOL_PING_PONG must be 0 or 1." >&2; exit 2 ;;
+esac
 if [[ "${ENFORCE_EAGER}" == "1" ]]; then
   ARGS+=(--enforce-eager)
 fi

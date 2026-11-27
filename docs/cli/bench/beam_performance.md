@@ -31,6 +31,8 @@ prompts and baseline results that the online run replays.
 | `--max-model-len` | 8192 | Context length limit in tokens. |
 | `--gpu-memory-utilization` | 0.7 | Fraction of GPU memory available to the engine. |
 | `--port`, `--request-timeout` | 7001, 180 | HTTP port and request timeout in seconds. |
+| `--kv-pool-ping-pong`, `--no-kv-pool-ping-pong` | Off | Set the KV bank policy at `prepare` on runtimes that support it. Omitted on older runtimes. |
+| `--record-outputs` | Off | Save measured candidate token IDs and scores after offline timing and validation. |
 | `--ab-prefill-grid` | Off | Capture prefill for the A/B workload's batch sizes 1, 2 and 4. |
 | `--ab-legacy-config` | Off | Use the legacy startup schema for offline A/B. Requires `--ab-prefill-grid`. |
 

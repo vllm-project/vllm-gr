@@ -109,6 +109,8 @@ class BeamSearchSession:
                 pool_key_ptrs=pool_key_ptrs,
                 pool_value_ptrs=pool_value_ptrs,
                 layout_prevalidated=layout_prevalidated,
+                standby_key_ptrs=getattr(self.context, "standby_key_ptrs", None),
+                standby_value_ptrs=getattr(self.context, "standby_value_ptrs", None),
             )
         state.decode_step += 1
 

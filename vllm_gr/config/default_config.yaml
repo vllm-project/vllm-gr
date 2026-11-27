@@ -71,6 +71,7 @@ gr:
   prefill_kv_bound: null                   # Positive lower bound for captured Attention KV length; null: infer from buckets.
                                            # An explicit bound also adds short buckets 1 and 16, up to the largest bucket.
   enable_short_suffix_attention: true      # Allow short-suffix Attention optimization for Beam.
+  enable_kv_pool_ping_pong: false           # Opt in to a second KV bank for fixed-width CUDA Beam.
   trie_retention_seconds: 60               # Retain old tries for this many seconds after hot update; nonnegative.
   admin_host: 127.0.0.1                    # Bind address for the gRPC management service.
   admin_port: null                         # null: disable the management service; otherwise a port in 1..65535.

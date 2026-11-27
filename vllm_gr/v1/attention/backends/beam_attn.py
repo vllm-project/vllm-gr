@@ -483,6 +483,11 @@ class BeamAttentionImpl(AttentionImpl):
                     beam_session.slot,
                     decode_step_buf,
                     active_mask=getattr(attn_metadata, "beam_active_mask", None),
+                    **(
+                        {"standby_key": pool.standby_key, "standby_value": pool.standby_value}
+                        if getattr(pool, "standby_key", None) is not None
+                        else {}
+                    ),
                 )
             else:
                 # Non-CUDA (NPU xllm/cascade, CPU unit tests) dispatches through

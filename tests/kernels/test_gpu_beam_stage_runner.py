@@ -63,14 +63,19 @@ def test_batch_finishes_only_when_all_members_finish_or_any_member_errors():
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_admission_accepts_full_attention(dtype):
-    worker = admission_worker(dtype=dtype)
+@pytest.mark.parametrize("ping_pong", [False, True])
+def test_admission_accepts_full_attention(dtype, ping_pong):
+    worker = admission_worker(dtype=dtype, enable_kv_pool_ping_pong=ping_pong)
     owner = get_stage_runner(worker, dispatch(metadata()), hooks_type=CudaStageHooksV1)
     assert owner.beam.session.is_active
     assert worker._beam_context.registry.num_active_sessions == 1
     assert worker._beam_context._gr_execution_owner is owner
     assert owner.beam.workspace.execution_owner is owner
-    assert worker._beam_context.max_batch == owner.beam.workspace.max_batch
+    context = worker._beam_context
+    assert context.max_batch == owner.beam.workspace.max_batch
+    assert context.enable_kv_pool_ping_pong is ping_pong
+    assert (context.standby_key_buf is not None) is ping_pong
+    assert (context.standby_value_buf is not None) is ping_pong
     assert owner.beam.workspace.max_batch == max(SUPPORTED_BEAM_BATCH_SIZES)
     done = torch.Event()
     done.record()

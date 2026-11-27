@@ -140,6 +140,8 @@ def reorder_unshared_kv(
     pool_value_ptrs: torch.Tensor | None = None,
     *,
     layout_prevalidated: bool = False,
+    standby_key_ptrs: torch.Tensor | None = None,
+    standby_value_ptrs: torch.Tensor | None = None,
 ) -> None:
     """Reorder every layer's unshared pool KV in place after selection.
 
@@ -161,6 +163,28 @@ def reorder_unshared_kv(
             back to the per-layer cascade kernel.
     """
     pools = list(pools)
+    if standby_key_ptrs is not None or standby_value_ptrs is not None:
+        if standby_key_ptrs is None or standby_value_ptrs is None:
+            raise ValueError("KV ping-pong requires both standby pointer tables")
+        if pool_key_ptrs is None or pool_value_ptrs is None:
+            raise ValueError("KV ping-pong requires both source pointer tables")
+        from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_ping_pong
+
+        select_unshared_kv_ping_pong(
+            parent,
+            slot,
+            [p.unshared_key for p in pools],
+            [p.unshared_value for p in pools],
+            [p.standby_key for p in pools],
+            [p.standby_value for p in pools],
+            decode_step,
+            pool_key_ptrs,
+            pool_value_ptrs,
+            standby_key_ptrs,
+            standby_value_ptrs,
+            validate_layout=not layout_prevalidated,
+        )
+        return
     if _resolve_mode() == "xllm":
         pool_beam_width = pools[0].unshared_key.shape[1]
         if _fused_reorder_applies(parent, pool_beam_width):

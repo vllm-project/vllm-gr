@@ -56,12 +56,14 @@ def recall_gr_config(
     artifact: Path,
     artifact_digest: str,
     tokenizer_digest: str,
+    enable_kv_pool_ping_pong: bool = False,
 ) -> dict[str, object]:
     return {
         "beam_width": [beam_width] * 3,
         "candidate_width": [beam_width] * 3,
         "max_decode_steps": 3,
         "beam_graph_enabled": True,
+        "enable_kv_pool_ping_pong": enable_kv_pool_ping_pong,
         "worker_decision": True,
         "beam_batch_sizes": [batch_size],
         "prefill_token_buckets": buckets,
@@ -254,6 +256,12 @@ def parse_args():
     parser.add_argument(
         "--validate-only", action="store_true", help="Load/tokenize data without an engine"
     )
+    parser.add_argument(
+        "--kv-pool-ping-pong",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Opt into gathering directly into the next KV bank.",
+    )
     args = parser.parse_args()
     if args.task_types is not None and len(set(args.task_types)) != len(args.task_types):
         parser.error("--task-types must not contain duplicates")
@@ -445,6 +453,7 @@ def main():
             artifact=artifact,
             artifact_digest=artifact_digest,
             tokenizer_digest=tokenizer_digest,
+            enable_kv_pool_ping_pong=args.kv_pool_ping_pong,
         )
         engine_config["gpu_memory_utilization"] = resolve_memory_utilization(
             args.gpu_memory_utilization
@@ -521,6 +530,7 @@ def main():
                     model_revision=args.model_revision,
                     task=task,
                     beam_width=args.n,
+                    enable_kv_pool_ping_pong=args.kv_pool_ping_pong,
                     temperature=args.temperature,
                     batch_size=args.batch_size,
                     sample_ids=item["source_ids"],

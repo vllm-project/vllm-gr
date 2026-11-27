@@ -59,7 +59,13 @@ else:
 class GPUBeamAttentionBatch:
     """Zero-copy request-major attention view over contiguous Beam slots."""
 
-    def __init__(self, sessions: tuple[Any, ...], *, width: int | None = None) -> None:
+    def __init__(
+        self,
+        sessions: tuple[Any, ...],
+        *,
+        width: int | None = None,
+        kv_pool_ping_pong: bool = True,
+    ) -> None:
         if not sessions:
             raise ValueError("GPU Beam attention batch must not be empty")
         first = sessions[0]
@@ -94,6 +100,17 @@ class GPUBeamAttentionBatch:
             pool.unshared_value = source.unshared_value[: self.batch_size].reshape(
                 1, storage_rows, *source.unshared_value.shape[2:]
             )
+            pool.standby_key = pool.standby_value = None
+            standby_key = getattr(source, "standby_key", None)
+            if kv_pool_ping_pong and standby_key is not None:
+                standby_value = source.standby_value
+                assert standby_value is not None
+                pool.standby_key = standby_key[: self.batch_size].reshape(
+                    1, storage_rows, *standby_key.shape[2:]
+                )
+                pool.standby_value = standby_value[: self.batch_size].reshape(
+                    1, storage_rows, *standby_value.shape[2:]
+                )
             self.pools.append(pool)
 
     @property
@@ -703,6 +720,13 @@ def cascade_attention(
         D = pool.head_dim
         W = beam_session.beam_width
         max_steps = pool.max_decode_steps
+        standby_key = getattr(pool, "standby_key", None)
+        standby_value = getattr(pool, "standby_value", None)
+        banks = (
+            {"standby_key": standby_key, "standby_value": standby_value}
+            if standby_key is not None
+            else {}
+        )
         # Pure incremental short decode: consume the pool directly and
         # merge into the final output, avoiding packed KV and suffix FA2.
         decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
@@ -724,6 +748,7 @@ def cascade_attention(
                 decode_step_buf,
                 scale,
                 getattr(attn_metadata, "beam_active_mask", None),
+                **banks,
             )
             return
 
@@ -750,12 +775,17 @@ def cascade_attention(
                 decode_step_buf,
                 beam_width=W,
                 active_mask=getattr(attn_metadata, "beam_active_mask", None),
+                **banks,
             )
         else:
             # Eager fallback: host-int slice copy (packed layout)
             step = beam_session.decode_step  # host int
-            pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
-            pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
+            key_pool, value_pool = pool.unshared_key, pool.unshared_value
+            if step & 1 and standby_key is not None:
+                assert standby_value is not None
+                key_pool, value_pool = standby_key, standby_value
+            pool_k = key_pool[slot, :W, :, : step + 1, :]
+            pool_v = value_pool[slot, :W, :, : step + 1, :]
 
             # Copy to suffix_buf in packed layout: [W*(step+1), H, D]
             # Beam 0's KV rows first, then beam 1's, etc.

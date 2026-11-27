@@ -211,6 +211,7 @@ def test_finalize_args_generates_self_contained_paths(tmp_path: Path) -> None:
 def test_canonical_config_enables_cuda_artifact(tmp_path: Path) -> None:
     args = Namespace(
         disable_beam_graph=False,
+        kv_pool_ping_pong=True,
         beam_width=128,
         beam_steps=3,
         attention_backend="CUSTOM",
@@ -229,6 +230,45 @@ def test_canonical_config_enables_cuda_artifact(tmp_path: Path) -> None:
     assert config["max_decode_steps"] == 3
     assert config["constraint_table"]["backend"] == "cuda"
     assert config["constraint_table"]["path"] == str(artifact.path)
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("enabled", [False, True])  # type: ignore[misc]
+def test_kv_pool_ping_pong_benchmark_and_config_roundtrip(tmp_path: Path, enabled: bool) -> None:
+    from vllm_gr.config.parser import (
+        gr_config_from_mapping,
+        gr_config_to_mapping,
+        parse_gr_config,
+        write_canonical_gr_config,
+    )
+
+    args = benchmark.build_parser().parse_args(
+        [
+            "--model",
+            "Qwen3-0.6B",
+            "--output-json",
+            str(tmp_path / "result.json"),
+            "--workload-jsonl",
+            str(tmp_path / "workload.jsonl"),
+            "--token-id-start",
+            "1000",
+            "--token-id-end",
+            "2000",
+            "--kv-pool-ping-pong" if enabled else "--no-kv-pool-ping-pong",
+        ]
+    )
+    artifact = benchmark.ConstraintArtifact(
+        path=tmp_path / "table.safetensors",
+        artifact_digest="sha256:" + "a" * 64,
+        tokenizer_digest="sha256:" + "b" * 64,
+        vocab_size=151936,
+    )
+    config = gr_config_from_mapping({"gr": benchmark.canonical_gr_config(args, artifact)})
+    assert config.enable_kv_pool_ping_pong is enabled
+    assert gr_config_from_mapping(gr_config_to_mapping(config)).enable_kv_pool_ping_pong is enabled
+    engine = SimpleNamespace(additional_config={})
+    write_canonical_gr_config(engine, config)
+    assert parse_gr_config(engine).enable_kv_pool_ping_pong is enabled
 
 
 def test_timeline_profiles_repeat_runs_and_moves_gzip_trace(tmp_path: Path) -> None:

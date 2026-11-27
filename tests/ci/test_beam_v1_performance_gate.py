@@ -24,8 +24,9 @@ SID_TEXT = "".join(SID_PIECES)
 
 
 @pytest.mark.parametrize("compact", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("record", [False, True])  # type: ignore[misc]
 def test_offline_releases_consumed_outputs_before_next_call(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compact: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compact: bool, record: bool
 ) -> None:
     import torch
 
@@ -152,6 +153,7 @@ def test_offline_releases_consumed_outputs_before_next_call(
         warmup_runs=2,
         measured_runs=3,
         ab_legacy_config=False,
+        record_outputs=record,
     )
     result: dict[str, Any] = {"cases": []}
     gc_policy = gc.isenabled(), gc.get_threshold()
@@ -159,6 +161,15 @@ def test_offline_releases_consumed_outputs_before_next_call(
 
     assert (gc.isenabled(), gc.get_threshold()) == gc_policy
     assert [case["group_samples_ms"] for case in result["cases"]] == [[1.0] * 3] * 2
+    for count, case in zip(args.batch_sizes, result["cases"], strict=True):
+        if record:
+            assert (
+                case["outputs"]
+                == [[[{"token_ids": SID_IDS, "score": -1.0}] * args.beam_width] * count]
+                * args.measured_runs
+            )
+        else:
+            assert "outputs" not in case
     assert events == [
         event
         for count in args.batch_sizes
@@ -359,11 +370,23 @@ def test_prepare_propagates_missing_builder_dependency(monkeypatch: pytest.Monke
 
 
 @pytest.mark.l1  # type: ignore[misc]
-@pytest.mark.parametrize("legacy_config", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("legacy_config", "supports_ping_pong"),
+    [
+        pytest.param(True, False, id="legacy-base"),
+        pytest.param(False, False, id="native-base"),
+        pytest.param(False, True, id="candidate"),
+    ],
+)
+@pytest.mark.parametrize("ping_pong", [None, False, True])  # type: ignore[misc]
 def test_ab_driver_prepares_equivalent_startup_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_config: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_config: bool,
+    supports_ping_pong: bool,
+    ping_pong: bool | None,
 ) -> None:
-    from vllm_gr.config.parser import load_gr_config
+    from vllm_gr.config.parser import CONFIG_ATTRIBUTES, gr_config_from_mapping
     from vllm_gr.entrypoints import gr
 
     class EngineReached(Exception):
@@ -406,12 +429,24 @@ def test_ab_driver_prepares_equivalent_startup_settings(
         request_timeout=60,
         ab_prefill_grid=True,
         ab_legacy_config=legacy_config,
+        kv_pool_ping_pong=ping_pong,
     )
-    gate.prepare(args)
-    setup = json.loads((tmp_path / "setup.json").read_text())
+    key = "enable_kv_pool_ping_pong"
+    with monkeypatch.context() as runtime:
+        if not supports_ping_pong:
+            runtime.delitem(CONFIG_ATTRIBUTES, key)
+        gate.prepare(args)
+        setup = json.loads((tmp_path / "setup.json").read_text())
+        settings = setup["gr"]
+        # The native base parser rejects extra keys. Dropping the field from
+        # its schema exercises that validation, not just the emitted dict.
+        worker = gr_config_from_mapping({"gr": settings})
     assert setup["beam_width"] == 128
-    settings = setup["gr"]
-    worker = load_gr_config(overrides=settings)
+    if supports_ping_pong and ping_pong is not None:
+        assert settings[key] is ping_pong
+    else:
+        assert key not in settings
+    assert worker.enable_kv_pool_ping_pong is (supports_ping_pong and ping_pong is True)
     assert worker.beam_max_width == 128
     assert worker.beam_max_decode_steps == 3
     assert worker.deployment.beam_batch_sizes == (1, 2, 4)

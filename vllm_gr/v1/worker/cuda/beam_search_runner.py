@@ -13,6 +13,7 @@ import triton
 from vllm_gr.ops.cuda import beam_state as ops
 from vllm_gr.ops.cuda.beam_kv_reorder import (
     _select_kv_gather_kernel,
+    _select_kv_ping_pong_kernel,
     _select_kv_scatter_kernel,
 )
 from vllm_gr.ops.cuda.beam_selection import (
@@ -45,12 +46,31 @@ def _bound_resource_tensors(context: Any, workspace: BeamPostprocessWorkspace) -
         workspace.selected_scores,
         workspace.selected_flat_indices,
         workspace.next_sequence,
+        *(
+            (
+                context.standby_key_buf,
+                context.standby_value_buf,
+                context.standby_key_ptrs,
+                context.standby_value_ptrs,
+            )
+            if getattr(context, "enable_kv_pool_ping_pong", False)
+            else ()
+        ),
     )
 
 
 def _live_resource_tensors(context: Any, workspace: BeamPostprocessWorkspace) -> tuple[Any, ...]:
     return (
         *(tensor for pool in context.pools for tensor in (pool.unshared_key, pool.unshared_value)),
+        *(
+            tuple(
+                tensor
+                for pool in context.pools
+                for tensor in (pool.standby_key, pool.standby_value)
+            )
+            if getattr(context, "enable_kv_pool_ping_pong", False)
+            else ()
+        ),
         *_bound_resource_tensors(context, workspace),
         workspace.topk_token_ids,
     )
@@ -149,12 +169,13 @@ class BeamSearchRunner:
         self._selected_flat = workspace.selected_flat_indices[workspace_index]
         self._next_sequence = workspace.next_sequence[workspace_index]
         self._kv_capacity = first.shape[3]
+        self._kv_ping_pong = getattr(context, "enable_kv_pool_ping_pong", False)
         self._kv_grid = (layers * width * first.shape[2],)
         self._kv_args = (
             context.pool_key_ptrs,
             context.pool_value_ptrs,
-            aux.data_ptr(),
-            context.aux_value_buf.data_ptr(),
+            context.standby_key_ptrs if self._kv_ping_pong else aux.data_ptr(),
+            context.standby_value_ptrs if self._kv_ping_pong else context.aux_value_buf.data_ptr(),
             session.slot * first.stride(0) * first.element_size(),
             width,
             self._state["num_decode_steps"],
@@ -166,14 +187,17 @@ class BeamSearchRunner:
             stride_pw=first.stride(1),
             stride_ph=first.stride(2),
             stride_ps=first.stride(3),
-            stride_al=aux.stride(0),
-            stride_aw=aux.stride(1),
-            stride_ah=aux.stride(2),
-            stride_as=aux.stride(3),
             active_mask=self._state["active_mask"],
             execute=self._scratch["reorder"],
             DEVICE_STEPS=True,
         )
+        if not self._kv_ping_pong:
+            self._kv_kwargs.update(
+                stride_al=aux.stride(0),
+                stride_aw=aux.stride(1),
+                stride_ah=aux.stride(2),
+                stride_as=aux.stride(3),
+            )
         self._session_reset: tuple[Any, ...] | None = None
         self._scratch_owner = scratch
 
@@ -401,6 +425,39 @@ class BeamSearchRunner:
             ):
                 raise ValueError("KV reorder requires persistent layer pointer tables")
 
+        if getattr(context, "enable_kv_pool_ping_pong", False):
+            ranges = []
+            for pool in context.pools:
+                for original, standby in (
+                    (pool.unshared_key, pool.standby_key),
+                    (pool.unshared_value, pool.standby_value),
+                ):
+                    if (
+                        standby is None
+                        or standby.shape != shape
+                        or standby.stride() != stride
+                        or standby.dtype != dtype
+                        or standby.device != pool_device
+                        or standby.data_ptr() == original.data_ptr()
+                    ):
+                        raise ValueError("KV ping-pong requires disjoint identical-layout banks")
+                    addresses.append(standby.data_ptr())
+                    for tensor in (original, standby):
+                        start = tensor.data_ptr()
+                        ranges.append((start, start + tensor.numel() * tensor.element_size()))
+            ranges.sort()
+            if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+                raise ValueError("KV ping-pong banks must not overlap")
+            for ptrs in (context.standby_key_ptrs, context.standby_value_ptrs):
+                if (
+                    ptrs is None
+                    or ptrs.shape != (layers,)
+                    or ptrs.dtype != torch.int64
+                    or ptrs.device != device
+                    or not ptrs.is_contiguous()
+                ):
+                    raise ValueError("KV ping-pong requires persistent standby pointer tables")
+
         # These tensors back cached views/launch arguments. Include layout and
         # address so a valid replacement rebuilds views instead of using stale
         # ones; malformed replacements above are rejected before state reset.
@@ -617,10 +674,15 @@ class BeamSearchRunner:
             PREFILL=prefill,
         )
         if not prefill:
-            _select_kv_gather_kernel[self._kv_grid](
-                *self._kv_args, s["parent_ids"], **self._kv_kwargs
-            )
-            _select_kv_scatter_kernel[self._kv_grid](*self._kv_args, **self._kv_kwargs)
+            if self._kv_ping_pong:
+                _select_kv_ping_pong_kernel[self._kv_grid](
+                    *self._kv_args, s["parent_ids"], **self._kv_kwargs
+                )
+            else:
+                _select_kv_gather_kernel[self._kv_grid](
+                    *self._kv_args, s["parent_ids"], **self._kv_kwargs
+                )
+                _select_kv_scatter_kernel[self._kv_grid](*self._kv_args, **self._kv_kwargs)
         ops._commit_step_kernel[(1,)](
             s["active_mask"],
             s["num_generated_tokens"],

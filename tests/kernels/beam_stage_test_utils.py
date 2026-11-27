@@ -15,7 +15,7 @@ from tests.constraints.test_table import make_table
 from tests.helpers.beam_requests import make_batch_request
 from tests.helpers.gr_config import engine_config, table_constraint, worker_config
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, GRConfig
-from vllm_gr.config.models import DEFAULT_DEPLOYMENT
+from vllm_gr.config.models import DEFAULT_DEPLOYMENT, DeploymentOptions
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
@@ -163,6 +163,7 @@ def admission_worker(
     dtype: torch.dtype = torch.float16,
     *,
     max_rows: int = 4,
+    enable_kv_pool_ping_pong: bool = False,
 ) -> SimpleNamespace:
     device = torch.device("cuda", torch.accelerator.current_device_index())
     backend, _ = _upload_cuda_backend(make_table(), device=device, max_top_k=4, max_rows=max_rows)
@@ -212,10 +213,15 @@ def admission_worker(
         cache_config=SimpleNamespace(cache_dtype="auto", sliding_window=None),
         vllm_config=worker_config(
             GRConfig(
-                deployment=DEFAULT_DEPLOYMENT,
+                deployment=(
+                    DeploymentOptions(beam_width=(4, 4, 4), candidate_width=(4, 4, 4))
+                    if enable_kv_pool_ping_pong
+                    else DEFAULT_DEPLOYMENT
+                ),
                 beam_max_width=4,
                 beam_max_decode_steps=3,
                 enable_short_suffix_attention=False,
+                enable_kv_pool_ping_pong=enable_kv_pool_ping_pong,
                 beam_candidate_width=None,
                 constraint=table_constraint(),
             ),

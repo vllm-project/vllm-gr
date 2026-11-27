@@ -774,6 +774,52 @@ def test_create_beam_context_uses_grconfig_params(device: str, enabled: bool | N
         )
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("device", "setting", "widths", "candidates", "steps", "expected"),
+    [
+        ("cuda", None, (4, 4, 4), (4, 4, 4), 3, False),
+        ("cuda", True, (4, 4, 4), (4, 4, 4), 3, True),
+        ("cuda", True, (4, 2, 4), (4, 4, 4), 3, False),
+        ("cuda", True, (4, 4, 4), (4, 2, 4), 3, False),
+        ("cuda", True, (4, 4), (4, 4), 2, False),
+        ("cuda", True, None, None, 3, False),
+        ("privateuseone", True, (4, 4, 4), (4, 4, 4), 3, False),
+    ],
+)
+def test_create_beam_context_reserves_standby_only_for_opted_in_fixed_cuda(
+    device: str,
+    setting: bool | None,
+    widths: tuple[int, ...] | None,
+    candidates: tuple[int, ...] | None,
+    steps: int,
+    expected: bool,
+) -> None:
+    from unittest.mock import patch
+
+    from vllm_gr.config.models import DeploymentOptions
+
+    cfg = GRConfig(
+        beam_max_width=4,
+        beam_max_decode_steps=steps,
+        deployment=DeploymentOptions(beam_width=widths, candidate_width=candidates),
+        **({"enable_kv_pool_ping_pong": setting} if setting is not None else {}),
+    )
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_kv_heads=lambda pc: 1,
+            get_head_size=lambda: 32,
+            get_num_layers=lambda pc: 2,
+            dtype=torch.float16,
+        ),
+        parallel_config=SimpleNamespace(),
+        device=torch.device(device),
+    )
+    with patch("vllm_gr.v1.beam.attention_context.BeamAttentionContext") as context:
+        gpu_patch._create_beam_context(runner, cfg, max_batch=4)
+    assert context.call_args.kwargs["enable_kv_pool_ping_pong"] is expected
+
+
 def test_create_beam_context_dtype_from_model_config() -> None:
     """dtype must come from model_config.dtype, not hardcoded."""
     from unittest.mock import MagicMock, patch

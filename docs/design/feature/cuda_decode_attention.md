@@ -59,6 +59,27 @@ a multiple of 8, an available FA2/FA3/FA4 backend, a CUDA device, and a model
 dtype of FP16, BF16 or FP32. The attention must be unwindowed and without
 ALiBi, softcap or sinks. Invalid static configurations fail at initialization.
 
+### Optional KV bank rotation
+
+For fixed-width CUDA Beam with at least three configured stages,
+`gr.enable_kv_pool_ping_pong: true` reserves a second suffix KV bank. The
+Decode step selects the active bank. Selection gathers surviving parent
+histories directly into the next bank instead of scattering back to the
+source. Both addresses stay fixed across Decode graph replays. The fused and
+packed suffix paths read the same bank.
+
+The option is off by default. A deployment must configure constant
+`gr.beam_width` and `gr.candidate_width` schedules. Dynamic deployments and
+NPU do not reserve a standby bank. Dynamic request overrides in an opted-in
+fixed deployment use their own width-specific pools, not the standby bank.
+
+The standby bank replaces the existing one-slot reorder scratch. For an
+allocated pool of B request slots, it costs about `(B - 1) * S` extra bytes,
+where S is the key and value storage for one slot across all layers. S grows
+with beam width and maximum Decode length. B is allocated slot capacity, not
+the size of a particular call. Measure memory and supported concurrency before
+opting in; less KV reorder GPU time does not imply the same end-to-end gain.
+
 ### Decode graphs and fallback
 
 For eligible segmented shapes, the async metadata builder derives a prefix
@@ -82,6 +103,7 @@ buffers during replay.
 | `prefix_calibration` | `false` disables segmentation outright, not only measurement. |
 | `prefix_calibration_path`, `prefix_min_chain_us` | Select the calibration profile and the minimum predicted unsplit chain time for segmentation. |
 | `enable_short_suffix_attention` | Defaults to `true` on eligible CUDA CUSTOM engines. Set to `false` under `gr` at startup to use the packed path. |
+| `enable_kv_pool_ping_pong` | Defaults to `false`. Opt into an extra KV bank for fixed-width CUDA Beam at startup. |
 
 `attention_config.flash_attn_version` affects segmentation; the
 `gr.prefill_flash_attn_version` option is resolved for Prefill only. An
