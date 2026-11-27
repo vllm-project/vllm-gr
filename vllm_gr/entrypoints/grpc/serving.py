@@ -147,8 +147,10 @@ class BeamVllmEngineServicer(VllmEngineServicer):
             if source.HasField("truncate_prompt_tokens"):
                 length = source.truncate_prompt_tokens
                 if length == -1:
-                    length = self.engine.model_config.max_model_len
-                if length <= 0:
+                    length = self.engine.model_config.max_model_len - source.max_tokens
+                    if length <= 0:
+                        raise ValueError("prompt plus generation exceeds model length")
+                elif length <= 0:
                     raise ValueError("truncate_prompt_tokens must be positive or -1")
                 if tokenizer is not None and tokenizer.truncation_side == "left":
                     tokens = tokens[-length:]
