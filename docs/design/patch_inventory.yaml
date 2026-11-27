@@ -83,17 +83,18 @@ patches:
   - id: GR-PATCH-004
     scope: core
     backend_id: null
-    owner: vllm_gr/entrypoints/openai/serving_engine.py and protocol.py
+    owner: vllm_gr/entrypoints/openai/serving_engine.py, protocol.py, and beam_search_patch.py
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_beam_search and patch_sampling
-    activation: the required frontend patch plan detects a missing serving or sampling binding, or a mismatched Completion vllm_xargs schema
+    activation: the required frontend patch plan detects a missing serving, stream-context, or sampling binding, or a mismatched Completion vllm_xargs schema
     validator_or_test:
       - vllm_gr.entrypoints.openai.beam_search_patch.validate_openai_beam_search_patch
       - vllm_gr.entrypoints.openai.beam_search_patch.validate_sampling_patch
       - tests/entrypoints/beam_search/test_beam_search_online_entry.py
       - tests/e2e/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online
       - tests/entrypoints/openai/test_beam_search_dispatch.py
+      - tests/v1/engine/test_beam_admission_rejection_reporting.py
     process_roles: [api_server]
-    target: GenerateBaseServing.beam_search, ChatCompletionRequest/CompletionRequest.to_beam_search_params, and CompletionRequest.model_fields["vllm_xargs"]
+    target: GenerateBaseServing.beam_search, GenerateBaseServing._raise_if_error, BaseServing._base_request_id, OutputProcessor.add_request, OpenAIServingCompletion.completion_stream_generator, OpenAIServingChat.chat_completion_stream_generator, ChatCompletionRequest/CompletionRequest.to_beam_search_params, and CompletionRequest.model_fields["vllm_xargs"]
     risk: high
     contract: beam_search adapts upstream callers exclusively to the GR implementation
     removal_condition: upstream exposes grouped-Beam serving and sampling extension points

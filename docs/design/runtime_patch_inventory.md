@@ -61,9 +61,11 @@ Risk: `medium`; process roles: `offline_frontend`, `api_server`
 
 Scope: `core`; backend ID: `null`
 
-Owner: `vllm_gr/entrypoints/openai/serving_engine.py and protocol.py`
+Owner: `vllm_gr/entrypoints/openai/serving_engine.py, protocol.py, and beam_search_patch.py`
 
 Installer: `vllm_gr.entrypoints.openai.beam_search_patch.patch_beam_search and patch_sampling`
+
+Targets: `GenerateBaseServing.beam_search`, `GenerateBaseServing._raise_if_error`, `BaseServing._base_request_id`, `OutputProcessor.add_request`, `OpenAIServingCompletion.completion_stream_generator`, `OpenAIServingChat.chat_completion_stream_generator`, `ChatCompletionRequest`/`CompletionRequest.to_beam_search_params`, and `CompletionRequest.model_fields["vllm_xargs"]`
 
 Risk: `high`; process roles: `api_server`
 

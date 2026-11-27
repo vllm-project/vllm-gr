@@ -88,7 +88,7 @@ def patch_admission_rejection_reporting():
     from vllm.exceptions import VLLMValidationError
 
     from vllm_gr.v1.engine.output_processor import (
-        _CLIENT_REQUEST_ID,
+        _ENGINE_REQUEST_IDS,
         take_admission_rejection,
     )
 
@@ -104,7 +104,7 @@ def patch_admission_rejection_reporting():
             message = take_admission_rejection(
                 getattr(self, "engine_client", None),
                 request_id,
-                _CLIENT_REQUEST_ID.get(),
+                _ENGINE_REQUEST_IDS.get(),
             )
             if message is not None:
                 raise VLLMValidationError(message)
@@ -128,18 +128,62 @@ def patch_client_request_id():
     a caller's name through ``BaseServing._base_request_id`` and nowhere
     else, and every request -- completing, beam session, or batch item --
     reaches the frontend's request table through ``OutputProcessor.add_request``.
-    The first publishes the resolved name for the request being handled in that
-    task, the second records the engine request it became.
+    The first starts the list of engine requests for the request being handled
+    in that task, the second appends each one it became: a prompt list or
+    ``n > 1`` submits several.
+
+    A streamed response is iterated outside the task that resolved its id
+    (``with_cancellation`` runs the handler in a task of its own), so the
+    stream generators carry the list along with them.
     """
     from functools import wraps
 
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
     from vllm.entrypoints.serve.engine.serving import BaseServing
     from vllm.v1.engine.output_processor import OutputProcessor
 
     from vllm_gr.v1.engine.output_processor import (
-        _CLIENT_REQUEST_ID,
-        remember_client_request_id,
+        _ENGINE_REQUEST_IDS,
+        start_client_request_ids,
+        track_engine_request_id,
     )
+
+    for owner, name in (
+        (OpenAIServingCompletion, "completion_stream_generator"),
+        (OpenAIServingChat, "chat_completion_stream_generator"),
+    ):
+        original_stream = getattr(owner, name)
+        if getattr(original_stream, _CLIENT_REQUEST_ID_PATCH_MARKER, False):
+            continue
+
+        def patched_stream(*args, _original=original_stream, **kwargs):
+            engine_request_ids = _ENGINE_REQUEST_IDS.get()
+            stream = _original(*args, **kwargs)
+
+            async def carried():
+                try:
+                    while True:
+                        token = _ENGINE_REQUEST_IDS.set(engine_request_ids)
+                        try:
+                            chunk = await anext(stream)
+                        except StopAsyncIteration:
+                            break
+                        finally:
+                            _ENGINE_REQUEST_IDS.reset(token)
+                        yield chunk
+                finally:
+                    token = _ENGINE_REQUEST_IDS.set(engine_request_ids)
+                    try:
+                        await stream.aclose()
+                    finally:
+                        _ENGINE_REQUEST_IDS.reset(token)
+
+            return carried()
+
+        wrapped_stream = wraps(original_stream)(patched_stream)
+        setattr(wrapped_stream, _CLIENT_REQUEST_ID_PATCH_MARKER, True)
+        setattr(owner, name, wrapped_stream)
 
     original_base_request_id = BaseServing._base_request_id
     if not getattr(original_base_request_id, _CLIENT_REQUEST_ID_PATCH_MARKER, False):
@@ -147,7 +191,7 @@ def patch_client_request_id():
         @wraps(original_base_request_id)
         def patched_base_request_id(raw_request, default=None):
             request_id = original_base_request_id(raw_request, default)
-            _CLIENT_REQUEST_ID.set(request_id)
+            _ENGINE_REQUEST_IDS.set(start_client_request_ids())
             return request_id
 
         setattr(patched_base_request_id, _CLIENT_REQUEST_ID_PATCH_MARKER, True)
@@ -159,9 +203,7 @@ def patch_client_request_id():
 
     @wraps(original_add_request)
     def patched_add_request(self, request, prompt, parent_req=None, request_index=0, queue=None):
-        client_request_id = _CLIENT_REQUEST_ID.get()
-        if client_request_id is not None:
-            remember_client_request_id(self, client_request_id, request.request_id)
+        track_engine_request_id(self, request.request_id, _ENGINE_REQUEST_IDS.get())
         return original_add_request(self, request, prompt, parent_req, request_index, queue)
 
     setattr(patched_add_request, _SUBMIT_REQUEST_ID_PATCH_MARKER, True)
@@ -240,9 +282,17 @@ def _validate_admission_rejection_patch() -> str | None:
 
 
 def _validate_client_request_id_patch() -> str | None:
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
     from vllm.entrypoints.serve.engine.serving import BaseServing
     from vllm.v1.engine.output_processor import OutputProcessor
 
+    for owner, name in (
+        (OpenAIServingCompletion, "completion_stream_generator"),
+        (OpenAIServingChat, "chat_completion_stream_generator"),
+    ):
+        if not getattr(getattr(owner, name, None), _CLIENT_REQUEST_ID_PATCH_MARKER, False):
+            return f"{owner.__name__}.{name} does not reference the GR client-request-id wrapper"
     if not getattr(
         getattr(BaseServing, "_base_request_id", None), _CLIENT_REQUEST_ID_PATCH_MARKER, False
     ):
