@@ -122,6 +122,10 @@ else
 fi
 
 echo "running on device $idle_gpu"
+if [ "${rocm_state:-false}" == "true" ]; then
+    # HIP indices follow the KFD order that resource.sh selected from.
+    export HIP_VISIBLE_DEVICES=$idle_gpu
+fi
 if [ "${npu_state:-false}" == "true" ]; then
     # Beam-related NPU tests depend on xllm-ops. Ensure the custom operator
     # library is available before entering the pre-commit/test gate. The
