@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable
 from functools import wraps
+from importlib import import_module
+from threading import RLock
 from time import perf_counter
 from typing import Any
 
@@ -22,6 +24,7 @@ from vllm_gr.config.models import (
     configured_constraint_mode,
     deployment_for,
 )
+from vllm_gr.platforms.compat import installed_version
 from vllm_gr.v1.worker.gr_context import (
     _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
@@ -45,6 +48,16 @@ from vllm_gr.v1.worker.prefill_graph_runner import (
 )
 
 logger = init_logger(__name__)
+
+_ASCEND_WORKER = "vllm_ascend.worker.worker"
+_ASCEND_RC1_RUNNER = "vllm_ascend.worker.v1.model_runner"
+_FACTORY_PATCH_MARKER = "_vllm_gr_ascend_v1_factory_patch"
+_INSTALL_LOCK = RLock()
+
+
+def _uses_rc1_runner_factory() -> bool:
+    version = installed_version("vllm-ascend") or ""
+    return version.partition("+")[0] == "0.31.0rc1"
 
 
 def make_patched_load_model(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -887,10 +900,9 @@ def capture_beam_decode_graph(runner: Any) -> bool:
 
 
 def discover_worker_runners() -> tuple[tuple[str, type], ...]:
-    """Discover NPUModelRunner through vLLM-Ascend's supported entry point."""
+    """Discover the native class or the Worker that constructs it."""
     try:
-        # worker initializes vllm_ascend.ops before importing model_runner_v1.
-        from vllm_ascend.worker.worker import NPUModelRunner
+        worker = import_module(_ASCEND_WORKER)
     except ImportError as exc:
         logger.warning(
             "Failed to import NPUModelRunner through "
@@ -902,7 +914,13 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
         )
         logger.debug("NPUModelRunner import traceback", exc_info=True)
         return ()
-    return (("NPUModelRunner", NPUModelRunner),)
+    if _uses_rc1_runner_factory():
+        return (("Ascend Worker V1 runner factory", worker.NPUWorker),)
+    runner_class = getattr(worker, "NPUModelRunner", None)
+    if not isinstance(runner_class, type):
+        logger.warning("Ascend worker does not export a supported NPUModelRunner class")
+        return ()
+    return (("NPUModelRunner", runner_class),)
 
 
 make_patched_prepare_inputs = make_patched_prepare_inputs_npu
@@ -1134,16 +1152,60 @@ make_patched_model_forward = make_patched_model_forward_npu
 def is_patched(runner_class: type) -> bool:
     from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle
 
+    worker = sys.modules.get(_ASCEND_WORKER)
+    if worker is not None and runner_class is getattr(worker, "NPUWorker", None):
+        return bool(getattr(getattr(worker, "NPUModelRunner", None), _FACTORY_PATCH_MARKER, False))
     return is_worker_runner_patched(runner_class) and has_runner_lifecycle(runner_class, __name__)
 
 
-def install() -> None:
-    """Install the Ascend runner after its native worker initializes device ops."""
+def _install_v1_hooks(runners: tuple[tuple[str, type], ...] | None = None) -> None:
     from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
     from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
 
     install_v1_worker_hooks(
         sys.modules[__name__],
+        runners=runners,
         constraint_max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
         implementation_id=__name__,
     )
+
+
+def install() -> None:
+    """Install the Ascend runner hooks at the native construction boundary."""
+    if not _uses_rc1_runner_factory():
+        _install_v1_hooks()
+        return
+
+    with _INSTALL_LOCK:
+        worker = import_module(_ASCEND_WORKER)
+        factory = worker.NPUModelRunner
+        if getattr(factory, _FACTORY_PATCH_MARKER, False):
+            return
+        factory_type = type(factory)
+        if (
+            factory_type.__name__ != "_V1ModelRunnerFactory"
+            or factory_type.__module__ != _ASCEND_WORKER
+            or not callable(factory)
+        ):
+            raise RuntimeError("Unsupported vLLM-Ascend 0.31.0rc1 V1 runner factory")
+
+        @wraps(factory)
+        def construct_v1_runner(*args: Any, **kwargs: Any) -> Any:
+            # Ascend selects the device and registers FLA ops before calling the factory.
+            from vllm_gr.v1.worker.npu.kv_layout_patch import (
+                apply_npu_contiguous_kv_cache_patch,
+            )
+
+            with _INSTALL_LOCK:
+                runner_module = import_module(_ASCEND_RC1_RUNNER)
+                runner_class = runner_module.NPUModelRunner
+                if not isinstance(runner_class, type):
+                    raise RuntimeError("vLLM-Ascend 0.31.0rc1 V1 runner class is unavailable")
+                _install_v1_hooks((("NPUModelRunner", runner_class),))
+                if not is_patched(runner_class):
+                    raise RuntimeError("Failed to install Ascend V1 runner Beam hooks")
+                apply_npu_contiguous_kv_cache_patch(runner_module=runner_module)
+            return factory(*args, **kwargs)
+
+        setattr(construct_v1_runner, _FACTORY_PATCH_MARKER, True)
+        setattr(worker, "NPUModelRunner", construct_v1_runner)

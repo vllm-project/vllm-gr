@@ -1,0 +1,16 @@
+{
+  "vllm": {
+    "tag": "v0.31.0",
+    "commit": "db9527a46873454610df6dbedf79a36d6bf1a7f6"
+  },
+  "cuda": {
+    "variant": "cu130",
+    "arch": "x86_64",
+    "wheel_url": "https://wheels.vllm.ai/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm-0.31.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+    "wheel_sha256": "39132b433967f0962d03d8a5f633b9bee6b32708f566c7d5637b79f8d0ef3433"
+  },
+  "ascend": {
+    "tag": "v0.31.0rc1",
+    "image_digest": null
+  }
+}

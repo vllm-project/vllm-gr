@@ -139,7 +139,7 @@ elif not overridden:
         raise SystemExit(f"CUDA wheel has wrong version suffix: {version}")
 if "regex" not in requirements:
     raise SystemExit("wheel is missing its direct regex dependency")
-if target == "cuda" and requirements.get("vllm") != "==0.30.0":
+if target == "cuda" and requirements.get("vllm") != "==0.31.0":
     raise SystemExit(f"CUDA wheel has wrong vLLM requirement: {requirements.get('vllm')}")
 if target in {"cpu", "npu"} and "vllm" in requirements:
     raise SystemExit(f"{target} wheel unexpectedly depends on vLLM")

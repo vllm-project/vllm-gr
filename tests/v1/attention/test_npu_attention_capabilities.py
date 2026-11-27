@@ -20,6 +20,7 @@ def attention_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     config = SimpleNamespace(
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
         additional_config={
             "vllm_gr": {

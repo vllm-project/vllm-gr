@@ -3,10 +3,9 @@
 
 """NPU operator namespace.
 
-Ascend fused operators are supplied by the vendor runtime (xllm-ops built
-for the CANN 9.2.0 base image). Their registration contract is validated
-against the vLLM-Ascend 0.30.0rc2 stack by the xllm parity and NPU
-acceptance gates.
+Ascend fused operators are supplied by xllm-ops built for the CANN version
+in the vendor image. The xllm parity and NPU acceptance gates validate their
+registration contract.
 """
 
 from vllm_gr.ops.npu.beam_ops import (

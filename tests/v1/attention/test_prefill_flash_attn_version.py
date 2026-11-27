@@ -235,6 +235,7 @@ def test_initialization_preserves_global_decode_config(
     config = SimpleNamespace(
         attention_config=SimpleNamespace(flash_attn_version=decode_version),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
         additional_config={
             "vllm_gr": {
@@ -281,7 +282,8 @@ def test_npu_prefill_default_and_inherit_are_noops(
     import vllm.config
 
     config = SimpleNamespace(
-        additional_config={"vllm_gr": {"gr": {"prefill_flash_attn_version": policy}}}
+        additional_config={"vllm_gr": {"gr": {"prefill_flash_attn_version": policy}}},
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", False)

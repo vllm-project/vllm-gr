@@ -190,7 +190,7 @@ def test_failed_range_check_keeps_backend_inactive(monkeypatch: pytest.MonkeyPat
     with pytest.raises(BackendNotActiveError):
         get_active_backend()
 
-    monkeypatch.setattr(compat, "installed_version", lambda dist: "0.30.0")
+    monkeypatch.setattr(compat, "installed_version", lambda dist: compat.SUPPORTED_VLLM_VERSION)
     assert loader.activate_current_backend().backend_id == "cuda"
 
 

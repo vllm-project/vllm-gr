@@ -9,10 +9,10 @@ pre_upgrade_baseline:
 
 current_runtime:
   cuda:
-    vllm: "0.30.0"
+    vllm: "0.31.0"
   npu:
-    vllm: "0.30.0"
-    vllm_ascend: "0.30.0rc2"
+    vllm: "0.31.0"
+    vllm_ascend: "0.31.0rc1"
 
 patches:
   - id: GR-PATCH-000
@@ -38,6 +38,8 @@ patches:
     installer: vllm_gr.v1.attention.selector_patch.apply_custom_attention_backend_patch
     activation: the vLLM attention selector is importable and the wrapper is not installed
     validator_or_test:
+      - tests/contract/test_upstream_patch_contracts.py::test_attention_selector_contracts
+      - tests/v1/test_ascend_compat.py::test_selector_routes_custom_marker_and_native_backends
       - tests/v1/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
       - tests/v1/test_ascend_compat.py::test_selector_reinstalls_over_replaced_upstream_target
       - tests/v1/test_ascend_compat.py::test_selector_cache_reset_preserves_installed_callable
@@ -176,10 +178,12 @@ patches:
     owner: vllm_gr/v1/core/sched/scheduler_patch.py and beam_async_scheduler.py
     shared_helpers: vllm_gr/v1/core/sched/beam_session.py, vllm_gr/v1/beam/dispatch.py
     installer: vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch
-    activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper
+    activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper. On vLLM 0.31.0, the admission gate scopes waiting and kv_holding_waiting while native scheduling owns deferred_waiting
     validator_or_test:
       - vllm_gr.v1.core.sched.scheduler_patch.validate_scheduler_patch
       - tests/v1/engine/test_gr_async_scheduler.py
+      - tests/v1/engine/test_async_scheduling_scheduler.py::test_native_finish_returns_original_requests_and_cleans_queues
+      - tests/v1/engine/test_gr_admission_queue.py::test_native_finish_returns_entire_gr_batch_and_drains_before_release
       - tests/patch/test_patch_initialization.py::test_scheduler_plan_repairs_partial_install
     process_roles: [engine_core]
     target: Scheduler.schedule and Scheduler.update_from_output in vllm.v1.core.sched.scheduler
@@ -225,6 +229,7 @@ patches:
       - tests/v1/worker/test_gpu_model_runner_v2_patch.py
       - tests/v1/worker/test_v2_runtime_resources.py
       - tests/kernels/test_gpu_beam_stage_lifecycle.py
+      - tests/kernels/test_gpu_beam_stage_v2_state.py
       - tests/kernels/test_gr_prefill_v2.py
       - tests/kernels/test_v2_multibatch_graphs.py
       - tests/kernels/test_beam_pool_recapture.py
@@ -251,7 +256,12 @@ patches:
     owner: vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/stage_projection.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/npu/npu_model_runner_inputs.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/ops/npu/stage_projection.py, vllm_gr/v1/worker/npu/startup_patch.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
-    activation: the Ascend provider discovers NPUModelRunner and binds its planned lifecycle after model load; the delayed NPUWorker.init_device wrapper mounts common Worker utilities before native initialization, independently of the management listener; online Trie reload remains rejected by Core on NPU
+    activation: >-
+      The Ascend provider uses the native runner class on 0.30.0rc2 and wraps the V1 runner factory on 0.31.0rc1.
+      The factory installs and verifies the runner wrappers after native device selection and FLA registration.
+      The runner binds its planned lifecycle after model load. The NPUWorker.init_device wrapper mounts common
+      Worker utilities before native initialization, independently of the management listener. Core rejects online
+      Trie reload on NPU.
     binding_validation: uses the same admitted-plan and native max_model_len autofit checks as GR-PATCH-011
     validator_or_test:
       - vllm_gr.v1.worker.model_runner_patch.validate_model_runner_patch
@@ -260,6 +270,7 @@ patches:
       - tests/platforms/test_runner_lifecycle.py::test_autofit_does_not_hide_worker_plan_drift
       - tests/v1/worker/test_npu_model_runner_patch.py
       - tests/v1/worker/test_model_runner_patch.py
+      - tests/v1/worker/test_model_runner_patch.py::test_ascend_rc1_installs_hooks_only_at_native_v1_factory
       - tests/v1/worker/test_npu_prefill_bsnd.py
       - tests/v1/worker/test_prefill_graph_runner.py
       - tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
@@ -267,8 +278,9 @@ patches:
       - tests/sidecar/test_worker_update.py
       - tests/ops/test_npu_stage_logits.py
       - tests/v1/worker/test_npu_stage_projection_lifecycle.py
-    process_roles: [npu_worker]
+    process_roles: [main, engine_core, npu_worker]
     target: >-
+      vllm_ascend.worker.worker.NPUModelRunner factory on 0.31.0rc1,
       NPUModelRunner execute_model, _prepare_inputs, sample_tokens and graph/lifecycle hooks,
       and NPUWorker.reload_trie (native _sample and _bookkeeping_sync unchanged).
       Stage projection wraps the instance LogitsProcessor._get_logits, NPUModelRunner.reload_weights,
@@ -373,12 +385,13 @@ patches:
     backend_id: ascend
     owner: vllm_gr/v1/worker/npu/kv_layout_patch.py
     installer: vllm_gr.v1.worker.npu.kv_layout_patch.apply_npu_contiguous_kv_cache_patch
-    activation: NPUWorker init_device before native runner construction; known Ascend 0.30.0rc2 bindings
+    activation: NPUWorker init_device before native runner construction on 0.30.0rc2; from the V1 runner factory after native device selection and FLA registration on 0.31.0rc1
     validator_or_test:
       - tests/v1/test_npu_kv_layout.py
+      - tests/v1/test_npu_kv_layout.py::test_rc1_updates_only_already_imported_factory_runner
       - tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
     process_roles: [npu_worker]
-    target: vllm_ascend.attention.utils.requires_contiguous_pa_kv_cache and its model_runner_v1 import binding
+    target: vllm_ascend.attention.utils.requires_contiguous_pa_kv_cache and its import binding in worker.model_runner_v1 (0.30.0rc2) or worker.v1.model_runner (0.31.0rc1)
     risk: high
     contract: npu-contiguous-prefix-kv-allocation
     removal_condition: Ascend exposes a backend contiguous-KV capability covering GR xllm without a native policy bridge

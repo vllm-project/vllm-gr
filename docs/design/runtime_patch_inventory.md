@@ -37,6 +37,9 @@ Installer: `vllm_gr.v1.attention.selector_patch.apply_custom_attention_backend_p
 
 Risk: `critical`; process roles: `engine_core`, `worker`
 
+The vLLM 0.31 selector wrapper forwards the runtime KV-cache dtype to native
+selection and preserves the cache key for each dtype.
+
 ### GR-PATCH-002 — NPUWorker Initialization Hook
 
 Scope: `backend`; backend ID: `ascend`
@@ -117,6 +120,9 @@ Installer: `vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch`
 
 Risk: `critical`; process roles: `engine_core`
 
+The vLLM 0.31 admission gate scopes the ordinary waiting queue and the
+KV-holding waiting queue. Native scheduling owns the deferred set.
+
 ### GR-PATCH-022 — Prefix-cache hash memoization
 
 Scope: `core`; backend ID: `null`
@@ -137,6 +143,9 @@ Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
 Risk: `critical`; process roles: `gpu_worker`
 
+The vLLM 0.31 V2 input wrapper forwards the active LoRA count to native
+preparation. Fused GR prefill uses the native input batch metadata layout.
+
 ### GR-PATCH-012 — NPU ModelRunner Override
 
 Scope: `backend`; backend ID: `ascend`
@@ -145,7 +154,11 @@ Owner: `vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/s
 
 Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
-Risk: `critical`; process roles: `npu_worker`
+Risk: `critical`; process roles: `main, engine_core, npu_worker`
+
+On Ascend 0.31.0rc1, startup verifies the V1 factory wrapper. The native
+factory call installs and verifies the runner methods after device selection
+and FLA registration.
 
 ### GR-PATCH-013 — CUSTOM Attention Backend Registration
 
@@ -206,6 +219,9 @@ Owner: `vllm_gr/v1/worker/npu/kv_layout_patch.py`
 Installer: `vllm_gr.v1.worker.npu.kv_layout_patch.apply_npu_contiguous_kv_cache_patch`
 
 Risk: `high`; process roles: `npu_worker`
+
+The 0.31.0rc1 factory patches the allocation helper and its binding in
+`worker.v1.model_runner` before constructing the runner.
 
 ## Retired patches
 

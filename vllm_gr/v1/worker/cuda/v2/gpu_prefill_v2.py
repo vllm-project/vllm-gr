@@ -364,6 +364,7 @@ def try_prepare_gr_prefill_inputs_v2(
         num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
         is_prefilling_np=batch_req_state.is_prefilling_np,
         has_prefill=batch_req_state.has_prefill,
+        decode_graph_eligible=batch_req_state.decode_graph_eligible,
         input_ids=buffers.input_ids[:padded],
         positions=buffers.positions[:padded],
         is_padding=buffers.is_padding[:padded],
@@ -372,7 +373,9 @@ def try_prepare_gr_prefill_inputs_v2(
         cu_num_logits_np=np.array([0, 1], dtype=np.int32),
         has_structured_output_reqs=False,
         prompt_lens=None,
+        max_seq_len_np=batch_req_state.max_seq_len_np,
         max_query_len=batch_desc.max_query_len,
+        prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
     )
 
 
@@ -435,7 +438,7 @@ def _try_prepare_gr_prefill_batch_inputs_v2(
     seq_lens_cpu = np.zeros(padded_reqs, dtype=np.int32)
     seq_lens_cpu[:num_reqs] = ends
     # Fresh sampling indices survive asynchronous consumption of this batch.
-    idx_mapping = torch.empty(num_reqs, dtype=torch.int64, device=runner.device)
+    idx_mapping = torch.empty(num_reqs, dtype=torch.int32, device=runner.device)
     batch_indices = torch.empty(2 * num_reqs + 1, dtype=torch.int32, device=runner.device)
     logits_indices = torch.empty(num_reqs, dtype=torch.int64, device=runner.device)
     buffers = runner.input_buffers
@@ -485,6 +488,7 @@ def _try_prepare_gr_prefill_batch_inputs_v2(
         num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
         is_prefilling_np=batch_req_state.is_prefilling_np,
         has_prefill=batch_req_state.has_prefill,
+        decode_graph_eligible=batch_req_state.decode_graph_eligible,
         input_ids=buffers.input_ids[:padded_tokens],
         positions=buffers.positions[:padded_tokens],
         is_padding=buffers.is_padding[:padded_tokens],
@@ -493,5 +497,7 @@ def _try_prepare_gr_prefill_batch_inputs_v2(
         cu_num_logits_np=np.arange(num_reqs + 1, dtype=np.int32),
         has_structured_output_reqs=False,
         prompt_lens=None,
+        max_seq_len_np=batch_req_state.max_seq_len_np,
         max_query_len=batch_desc.max_query_len,
+        prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
     )

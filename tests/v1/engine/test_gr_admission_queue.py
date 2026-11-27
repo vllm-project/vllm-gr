@@ -390,7 +390,8 @@ def test_native_finish_returns_entire_gr_batch_and_drains_before_release(core, s
     assert not scheduler.requests
     assert not scheduler.running
     assert not scheduler.waiting
-    assert not scheduler.skipped_waiting
+    assert not scheduler.kv_holding_waiting
+    assert not scheduler.deferred_waiting
     assert session.status is GRSessionStatus.ABORTED
     assert scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED) == []
 

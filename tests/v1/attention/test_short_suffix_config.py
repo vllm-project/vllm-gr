@@ -158,6 +158,7 @@ def _short_suffix_engine_config(
             backend="CUSTOM" if custom else None, flash_attn_version=fa_version
         ),
         cache_config=CacheConfig(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         scheduler_config=SimpleNamespace(async_scheduling=True, enable_chunked_prefill=False),
     )
     from vllm_gr.config import load_gr_config
@@ -735,6 +736,7 @@ def test_layer_constructor_validates_before_execution(
     config = SimpleNamespace(
         additional_config={},
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
     )
     GRConfig(

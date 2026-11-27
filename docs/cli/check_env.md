@@ -14,16 +14,16 @@ vllm check-env --gr --npu    # Require the Ascend NPU platform
 
 Without `--npu`, the command validates the vLLM version and reports the
 platform that vLLM auto-detection selected. This GR release supports vLLM
-0.30.0.
+0.31.0.
 
 With `--npu`, or when auto-detection selects `npu`, the command additionally
 validates the Ascend runtime:
 
 | Item | Required |
 | --- | --- |
-| `vllm` | 0.30.0 |
-| `vllm-ascend` | 0.30.0rc2 |
-| `triton-ascend` | 3.6.0 |
+| `vllm` | 0.31.0 |
+| `vllm-ascend` | 0.31.0rc1 |
+| `triton-ascend` | 3.2.2 |
 | `triton` module | Provides `triton._C.libtriton.ascend` |
 
 The Triton check imports the module that Python actually resolves. Installing
@@ -37,7 +37,7 @@ validated item:
 
 ```text
 vLLM-GR environment check passed
-  vllm: 0.30.0
+  vllm: 0.31.0
   platform: cuda
 ```
 

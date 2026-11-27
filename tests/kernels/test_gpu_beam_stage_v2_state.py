@@ -44,7 +44,6 @@ def test_full_prefill_advances_native_state_without_counting_padding(
 
         worker.model_state = DefaultModelState.__new__(DefaultModelState)
         worker.model_state.rope_state = None
-        worker.use_pp = False
         worker.dp_size = 1
         worker.supports_mm_inputs = False
         worker.is_encoder_decoder = False
@@ -77,7 +76,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(
             assert batch.num_computed_prefill_tokens_np.tolist() == [cached]
             assert batch.input_ids.data_ptr() == runner.input_buffers.input_ids.data_ptr()
         else:
-            batch = runner.prepare_inputs(scheduled, batch_state, desc)
+            batch = runner.prepare_inputs(scheduled, batch_state, desc, num_active_loras=0)
         assert batch.is_padding.tolist() == [False] * count + [True] * (8 - count)
         ids = batch.input_ids[:count].clone()
         positions = batch.positions[:count].clone()
@@ -162,7 +161,7 @@ def test_ordinary_prefill_chunks_keep_native_state_and_token_progress():
         runner.update_requests(scheduled)
         desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, scheduled.total_num_scheduled_tokens, 1)
         batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
-        batch = runner.prepare_inputs(scheduled, batch_state, desc)
+        batch = runner.prepare_inputs(scheduled, batch_state, desc, num_active_loras=0)
         count = scheduled.total_num_scheduled_tokens
         observed.append((batch.input_ids[:count].clone(), batch.positions[:count].clone()))
         runner.execute_model_state = SimpleNamespace(input_batch=batch)
@@ -226,7 +225,10 @@ def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
     def native_prefill(runner, scheduled):
         batch_state, _ = runner.gather_batch_req_state(scheduled, dummy_run=False)
         batch = runner.prepare_inputs(
-            scheduled, batch_state, BatchExecutionDescriptor(CUDAGraphMode.FULL, 24, 4)
+            scheduled,
+            batch_state,
+            BatchExecutionDescriptor(CUDAGraphMode.FULL, 24, 4),
+            num_active_loras=0,
         )
         assert batch.req_ids == ["b", "d", "c", "a"]
         runner.execute_model_state = SimpleNamespace(

@@ -16,6 +16,7 @@ import torch
 import zmq
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
+from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
@@ -52,6 +53,7 @@ ENGINE_CORE_REQUEST_FIELDS = (
     "reasoning_parser_kwargs",
     "abort_immediately",
     "session_id",
+    "kv_hints",
 )
 
 
@@ -71,6 +73,7 @@ def _native_request() -> EngineCoreRequest:
         cache_salt=None,
         data_parallel_rank=None,
         session_id="native-session",
+        kv_hints=KvHintsEnvelope(protocol_version="1.0", message_id="native-hint", actions=[]),
     )
 
 
@@ -92,6 +95,7 @@ def test_native_request_payload_schema() -> None:
     assert isinstance(decoded[0], EngineCoreRequest)
     assert decoded[0].request_id == "request-0"
     assert decoded[0].session_id == "native-session"
+    assert decoded[0].kv_hints == request.kv_hints
 
 
 def _transport_engine(optional_features: bool):
@@ -106,6 +110,7 @@ def _transport_engine(optional_features: bool):
             num_gpu_blocks=11,
             block_size=32,
             mamba_block_size=64 if optional_features else None,
+            effective_attention_block_size=32 if optional_features else None,
             kv_cache_size_tokens=352,
             kv_cache_max_concurrency=0.34375,
         ),
@@ -274,6 +279,8 @@ def test_process_input_sockets_adapter_preserves_upstream_handshake(
                         kv_cache_max_concurrency=None,
                     ),
                 ),
+                _effective_attention_block_sizes=set(),
+                _kv_event_sources={},
                 stats_update_address=None,
             )
             MPClient._apply_ready_response(client, payload)
@@ -282,9 +289,15 @@ def test_process_input_sockets_adapter_preserves_upstream_handshake(
             assert cache.num_gpu_blocks == 16
             assert cache.block_size == 32
             assert cache.mamba_block_size == expected.mamba_block_size
+            assert cache.effective_attention_block_size == expected.effective_attention_block_size
             assert cache.kv_cache_size_tokens == 352
             assert cache.kv_cache_max_concurrency == 0.34375
             assert client.stats_update_address == expected.dp_stats_address
+            assert client._kv_event_sources == (
+                {expected.data_parallel_rank: expected.kv_events_config}
+                if optional_features
+                else {}
+            )
 
 
 @pytest.mark.parametrize("implementation", ["native", "gr"])
@@ -348,6 +361,7 @@ def test_gr_socket_queues_whole_batch_with_tensor_frames(monkeypatch, batch_size
 
     source = make_batch_request()
     embeds = torch.arange(256, dtype=torch.float32).reshape(2, 128)
+    kv_hints = _native_request().kv_hints
     items = tuple(
         BeamBatchItem(
             i,
@@ -356,6 +370,7 @@ def test_gr_socket_queues_whole_batch_with_tensor_frames(monkeypatch, batch_size
                 request_id=f"member-{i}",
                 session_id=f"native-session-{i}",
                 prompt_embeds=embeds + i,
+                kv_hints=kv_hints,
             ),
         )
         for i in range(batch_size)
@@ -375,6 +390,7 @@ def test_gr_socket_queues_whole_batch_with_tensor_frames(monkeypatch, batch_size
             assert isinstance(item.request, EngineCoreRequest)
             assert item.request.request_id == f"member-{i}"
             assert item.request.session_id == f"native-session-{i}"
+            assert item.request.kv_hints == kv_hints
             torch.testing.assert_close(item.request.prompt_embeds, embeds + i)
         transport.engine.preprocess_add_request.assert_not_called()
         assert transport.engine.input_queue.empty()

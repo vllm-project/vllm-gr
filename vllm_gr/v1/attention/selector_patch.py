@@ -54,13 +54,20 @@ def apply_custom_attention_backend_patch(force: bool = False) -> int:
         backend: Any,
         attn_selector_config: Any,
         num_heads: int | None = None,
+        *,
+        _run_kv_cache_dtype: str | None = None,
     ) -> Any:
         # Preserve the original CUSTOM import error rather than hiding it.
         if backend == AttentionBackendEnum.CUSTOM:
             return _get_custom_beam_backend()
         if backend is None and _get_current_gr_attention_backend() is GRAttentionBackend.CUSTOM:
             return _get_custom_beam_backend()
-        return original(backend, attn_selector_config, num_heads=num_heads)
+        return original(
+            backend,
+            attn_selector_config,
+            num_heads=num_heads,
+            _run_kv_cache_dtype=_run_kv_cache_dtype,
+        )
 
     setattr(_patched_cached_get_attn_backend, _ORIGINAL_ATTR, original)
     selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend

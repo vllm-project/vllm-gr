@@ -109,17 +109,19 @@ def test_selector_routes_custom_marker_and_native_backends(
             AttentionBackendEnum.FLASH_ATTN,
             "selector-config",
             num_heads=4,
+            _run_kv_cache_dtype="fp8",
         )
         is native_backend
     )
 
     assert get_beam_backend.call_count == 2
     assert native_selector.call_args_list == [
-        mock.call(None, "selector-config", num_heads=8),
+        mock.call(None, "selector-config", num_heads=8, _run_kv_cache_dtype=None),
         mock.call(
             AttentionBackendEnum.FLASH_ATTN,
             "selector-config",
             num_heads=4,
+            _run_kv_cache_dtype="fp8",
         ),
     ]
 
@@ -147,6 +149,7 @@ def test_selector_installation_is_idempotent_and_force_uses_original(
         AttentionBackendEnum.FLASH_ATTN,
         "selector-config",
         num_heads=2,
+        _run_kv_cache_dtype=None,
     )
 
 
@@ -165,7 +168,9 @@ def test_selector_reinstalls_over_replaced_upstream_target(
     assert (
         selector._cached_get_attn_backend(AttentionBackendEnum.FLASH_ATTN, "config") == "new-native"
     )
-    replacement.assert_called_once_with(AttentionBackendEnum.FLASH_ATTN, "config", num_heads=None)
+    replacement.assert_called_once_with(
+        AttentionBackendEnum.FLASH_ATTN, "config", num_heads=None, _run_kv_cache_dtype=None
+    )
     first_native.assert_not_called()
 
 
@@ -180,7 +185,13 @@ def test_selector_cache_reset_preserves_installed_callable(
     calls: list[object] = []
 
     @lru_cache
-    def native_selector(backend: Any, config: Any, num_heads: int | None = None) -> object:
+    def native_selector(
+        backend: Any,
+        config: Any,
+        num_heads: int | None = None,
+        *,
+        _run_kv_cache_dtype: str | None = None,
+    ) -> object:
         result = object()
         calls.append(result)
         return result
@@ -193,11 +204,17 @@ def test_selector_cache_reset_preserves_installed_callable(
     first = installed(*args)
     assert installed(*args) is first
     assert len(calls) == 1
+    if install_wrapper:
+        assert installed(*args, _run_kv_cache_dtype=None) is first
+        fp8 = installed(*args, _run_kv_cache_dtype="fp8")
+        assert fp8 is not first
+        assert installed(*args, _run_kv_cache_dtype="fp8") is fp8
+        assert len(calls) == 2
 
     selector_patch.clear_attention_backend_cache()
     assert selector._cached_get_attn_backend is installed
     assert installed(*args) is not first
-    assert len(calls) == 2
+    assert len(calls) == (3 if install_wrapper else 2)
 
 
 def test_custom_backend_import_failure_is_not_swallowed(

@@ -225,19 +225,19 @@ python -m pytest tests/v1/engine/test_npu_unconstrained_beam.py \
 
 ## Version and validation scope
 
-The current runtime uses vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2. Treat earlier
-functional and performance results as evidence for their recorded environment
-(vLLM 0.22.1 and vLLM-Ascend 0.22.1rc1).
+See [Ascend installation](../getting_started/installation/npu.md) for the
+current runtime. Earlier functional and performance results used vLLM 0.22.1
+and vLLM-Ascend 0.22.1rc1.
 
 ## Optional XAttention output binding
 
 The [caller-owned output path](../design/feature/npu_decode_execution.md#caller-owned-xattention-output)
 uses a separate extension around the installed kernel. The build needs the
 xllm-ops helper header `test/python_test/pytorch_npu_helper.hpp` and checks
-the runtime versions before compiling.
+the runtime versions before compiling. It requires vLLM 0.30.0,
+vLLM-Ascend 0.30.0rc2, and torch-npu 2.10.0.post7.
 
-Run these commands inside the prepared NPU environment, from the vLLM-GR
-repository root after completing [Ascend installation](../getting_started/installation/npu.md).
+Run these commands from the vLLM-GR repository root in that 0.30 environment.
 Set `XLLM_OPS_DIR` to the source checkout used to build the
 installed xllm-ops library. Keep the CANN and custom operator environment
 loaded in the current shell.

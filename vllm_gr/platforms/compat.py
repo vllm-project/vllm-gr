@@ -16,9 +16,9 @@ logger = logging.getLogger("vllm_gr.platforms.compat")
 
 # Exact versions supported by the built-in providers. The CI resolver reads
 # these literals without importing the target checkout.
-SUPPORTED_VLLM_VERSION = "0.30.0"
-SUPPORTED_VLLM_ASCEND_VERSION = "0.30.0rc2"
-SUPPORTED_TRITON_ASCEND_VERSION = "3.6.0"
+SUPPORTED_VLLM_VERSION = "0.31.0"
+SUPPORTED_VLLM_ASCEND_VERSION = "0.31.0rc1"
+SUPPORTED_TRITON_ASCEND_VERSION = "3.2.2"
 
 #: When set to a truthy value, an unsatisfied declared range is a hard failure.
 #: The default only warns: whether a declared range still holds is a vendor

@@ -52,6 +52,7 @@ def make_native_v2_worker(prompt: list[int], computed: int = 0, capacity: int = 
     worker: Any = GPUModelRunner.__new__(GPUModelRunner)
     worker.device = torch.device("cuda", torch.accelerator.current_device_index())
     worker.max_num_reqs = capacity
+    worker.use_pp = False
     worker.use_dcp = False
     worker.input_buffers = InputBuffers(capacity, 64, worker.device)
     worker.req_states = RequestState(capacity, 16, 64, 0, 512, worker.device)

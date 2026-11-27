@@ -23,7 +23,7 @@ from setuptools_scm import get_version
 logger = logging.getLogger("vllm_gr.setup")
 
 _VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
-VLLM_GR_BASE_VERSION = "0.30.0"
+VLLM_GR_BASE_VERSION = "0.31.0"
 ROOT_DIR = Path(__file__).resolve().parent
 _SCM_OVERRIDE = "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_GR"
 

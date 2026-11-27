@@ -154,6 +154,7 @@ def test_shutdown_releases_the_failure_frames_but_keeps_the_cause() -> None:
     apply_engine_client_patches()
     client = object.__new__(InprocClient)
     client.engine_core = _LeakyCore(None)
+    client._finalizer = weakref.finalize(client, client.engine_core.shutdown)
     try:
         client.get_output()
     except EngineDeadError:

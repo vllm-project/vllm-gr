@@ -22,6 +22,7 @@ from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CompilationConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode as Mode
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.sequence import IntermediateTensors
 from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 from vllm.v1.worker.gpu import cudagraph_utils as native
 
@@ -117,7 +118,14 @@ def test_native_capture_replay_fixed_output_and_piecewise_recovery(
         def compute(self, x: torch.Tensor) -> torch.Tensor:
             return (x[:, None] + self.offset).expand(-1, 4).contiguous()
 
-        def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            *,
+            intermediate_tensors: IntermediateTensors | None = None,
+        ) -> torch.Tensor:
+            assert intermediate_tensors is None
             if (
                 self.failure
                 and input_ids.numel() == 128

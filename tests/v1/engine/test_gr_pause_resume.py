@@ -78,6 +78,7 @@ def core(admission_core):
     core.log_stats = False
     core._process_aborts_queue = lambda: None
     core.is_ec_consumer = True
+    core.is_mm_encoder_only = False
     core.is_pooling_model = False
     return core
 

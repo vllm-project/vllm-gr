@@ -161,6 +161,7 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
     )
     platform_hooks: list[str] = []
     if device_type == "npu":
+        monkeypatch.setattr(npu_model_runner_patch, "installed_version", lambda _: "0.30.0rc2")
 
         def install_platform_load(original: Any) -> Any:
             platform_hooks.append("load")
@@ -328,6 +329,8 @@ def test_numpy_token_staging_installs_for_cuda_runners_only(
 
     runner_hooks = gpu_model_runner_patch if device_type == "cuda" else npu_model_runner_patch
     calls: list[str] = []
+    if device_type == "npu":
+        monkeypatch.setattr(npu_model_runner_patch, "installed_version", lambda _: "0.30.0rc2")
     monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: runner_hooks)
     monkeypatch.setattr(runner_hooks, "discover_worker_runners", lambda: ())
     monkeypatch.setattr(cuda, "install_worker_utilities", lambda: None)
@@ -351,6 +354,94 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
 
     model_runner_patch.apply_worker_patches()
     assert called == ["staging", "v2"]
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_ascend_rc1_installs_hooks_only_at_native_v1_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker.npu import kv_layout_patch, npu_model_runner_patch
+
+    worker = ModuleType("vllm_ascend.worker.worker")
+    runner_module = ModuleType("vllm_ascend.worker.v1.model_runner")
+    events: list[str] = []
+
+    class Worker:
+        pass
+
+    class Runner:
+        def execute_model(self, *args: Any) -> None:
+            pass
+
+        def _prepare_inputs(self, *args: Any) -> None:
+            pass
+
+        def _update_states(self, *args: Any) -> None:
+            pass
+
+        def _bookkeeping_sync(self, *args: Any) -> None:
+            pass
+
+    class _V1ModelRunnerFactory:
+        def __call__(self, config: object, *, device: object) -> Runner:
+            assert config is expected_config and device is expected_device
+            assert npu_model_runner_patch.is_patched(Runner)
+            events.append("construct")
+            return Runner()
+
+    expected_config, expected_device = object(), object()
+    _V1ModelRunnerFactory.__module__ = worker.__name__
+    setattr(worker, "NPUWorker", Worker)
+    setattr(runner_module, "NPUModelRunner", Runner)
+    original = _V1ModelRunnerFactory()
+    setattr(worker, "NPUModelRunner", original)
+    monkeypatch.setitem(sys.modules, worker.__name__, worker)
+
+    def load(name: str) -> ModuleType:
+        if name == worker.__name__:
+            return worker
+        assert name == runner_module.__name__ and "native FLA registered" in events
+        events.append("resolve runner")
+        return runner_module
+
+    def install_layout(*, runner_module: ModuleType) -> int:
+        assert getattr(runner_module, "NPUModelRunner") is Runner
+        events.append("bind KV aliases")
+        return 1
+
+    monkeypatch.setattr(npu_model_runner_patch, "import_module", load)
+    monkeypatch.setattr(npu_model_runner_patch, "installed_version", lambda _: "0.31.0rc1+local")
+    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: npu_model_runner_patch)
+    monkeypatch.setattr(kv_layout_patch, "apply_npu_contiguous_kv_cache_patch", install_layout)
+
+    assert model_runner_patch.validate_model_runner_patch() is not None
+    model_runner_patch.apply_worker_patches()
+    factory = getattr(worker, "NPUModelRunner")
+    model_runner_patch.apply_worker_patches()
+    assert factory is getattr(worker, "NPUModelRunner") and factory is not original
+    assert model_runner_patch.validate_model_runner_patch() is None
+    assert events == []
+
+    events.append("native FLA registered")
+    assert isinstance(factory(expected_config, device=expected_device), Runner)
+    execute_model = Runner.execute_model
+    assert isinstance(factory(expected_config, device=expected_device), Runner)
+    assert Runner.execute_model is execute_model
+    assert events == [
+        "native FLA registered",
+        "resolve runner",
+        "bind KV aliases",
+        "construct",
+        "resolve runner",
+        "bind KV aliases",
+        "construct",
+    ]
+
+    setattr(worker, "NPUModelRunner", original)
+    assert model_runner_patch.validate_model_runner_patch() is not None
+    monkeypatch.setattr(npu_model_runner_patch, "installed_version", lambda _: "0.31.0rc2")
+    assert npu_model_runner_patch.discover_worker_runners() == ()
+    assert getattr(worker, "NPUModelRunner") is original
 
 
 @pytest.mark.parametrize("mode", [None, 4])  # type: ignore[misc]
@@ -384,6 +475,7 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
 
     from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
+    monkeypatch.setattr(npu_model_runner_patch, "installed_version", lambda _: "0.30.0rc2")
     monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: npu_model_runner_patch)
     monkeypatch.setattr(npu_model_runner_patch, "capture_prefill_graphs", lambda _: None)
     monkeypatch.setattr(

@@ -231,8 +231,8 @@ def _observe_v2_prefill(runner: Any, events: list[dict[str, Any]], wrap: Any) ->
     original_prepare = runner.prepare_inputs
     manager = runner.cudagraph_manager
 
-    def prepare(scheduled: Any, request_state: Any, desc: Any) -> Any:
-        batch = original_prepare(scheduled, request_state, desc)
+    def prepare(scheduled: Any, request_state: Any, desc: Any, num_active_loras: int) -> Any:
+        batch = original_prepare(scheduled, request_state, desc, num_active_loras)
         stages = getattr(scheduled, "gr_stage_metadata", {})
         if stages and all(m.stage_index == 0 for m in stages.values()):
             events.append(

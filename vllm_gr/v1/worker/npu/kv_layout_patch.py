@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Narrow Ascend 0.30 allocation-policy bridge for dense Beam prefix KV."""
+"""Narrow Ascend allocation-policy bridge for dense Beam prefix KV."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from functools import wraps
 from importlib import import_module
 from importlib.metadata import version
+from types import ModuleType
 from typing import Any, cast
 
 logger = logging.getLogger("vllm_gr.v1.npu_kv_layout")
@@ -19,6 +20,7 @@ _ORIGINAL = "_vllm_gr_contiguous_prefix_kv_original"
 _HELPER = "requires_contiguous_pa_kv_cache"
 _UTILS = "vllm_ascend.attention.utils"
 _RUNNER = "vllm_ascend.worker.model_runner_v1"
+_RC1_RUNNER = "vllm_ascend.worker.v1.model_runner"
 _MISSING = object()
 _ASCEND_COMPILATION_DEFAULTS = {
     "enable_npugraph_ex": False,
@@ -194,17 +196,25 @@ def _wrap_policy(original: NativePolicy) -> NativePolicy:
     return policy
 
 
-def apply_npu_contiguous_kv_cache_patch() -> int:
-    """Patch both known 0.30 aliases before native KV allocation, or do nothing."""
+def apply_npu_contiguous_kv_cache_patch(*, runner_module: ModuleType | None = None) -> int:
+    """Patch both known aliases before native KV allocation."""
     try:
         if import_module("vllm.platforms").current_platform.device_type != "npu":
             return 0
-        if version("vllm-ascend") != "0.30.0rc2":
+        runtime_version = version("vllm-ascend")
+        if runner_module is None:
+            if runtime_version != "0.30.0rc2":
+                return 0
+        elif (
+            runtime_version.partition("+")[0] != "0.31.0rc1"
+            or runner_module.__name__ != _RC1_RUNNER
+        ):
             return 0
         utils = import_module(_UTILS)
-        runner = import_module(_RUNNER)
+        if runner_module is None:
+            runner_module = import_module(_RUNNER)
         utility_policy = getattr(utils, _HELPER, None)
-        runner_policy = getattr(runner, _HELPER, None)
+        runner_policy = getattr(runner_module, _HELPER, None)
         wrapped = [
             function
             for function in (utility_policy, runner_policy)
@@ -228,7 +238,7 @@ def apply_npu_contiguous_kv_cache_patch() -> int:
             wrapper = _wrap_policy(cast(NativePolicy, utility_policy))
         changed = utility_policy is not wrapper or runner_policy is not wrapper
         setattr(utils, _HELPER, wrapper)
-        setattr(runner, _HELPER, wrapper)
+        setattr(runner_module, _HELPER, wrapper)
         return int(changed)
     except Exception:
         # This is an optional, version-specific policy extension. Never

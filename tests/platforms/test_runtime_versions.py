@@ -64,7 +64,7 @@ def test_environment_checks_ascend_runtime_on_npu(backend_registry: None) -> Non
     from vllm_gr.platforms.registry import get_active_backend
 
     platform = _FakeAscendPlatform()
-    expected = {"vllm": "0.30.0", "vllm-ascend": "0.30.0rc2", "platform": "npu"}
+    expected = {"vllm": "0.31.0", "vllm-ascend": "0.31.0rc1", "platform": "npu"}
     with (
         mock.patch("vllm.platforms.current_platform", platform),
         mock.patch("vllm_gr.platforms.compat.check_vllm_runtime") as check_versions,
@@ -100,11 +100,11 @@ def test_environment_rejects_unknown_platform_without_cuda_fallback(backend_regi
     ("versions", "check", "expected"),
     [
         (
-            {"vllm": "0.30.0", "vllm-ascend": "0.30.0rc2+npu"},
-            lambda: require_runtime_version("vllm-ascend", "0.30.0rc2"),
-            "0.30.0rc2+npu",
+            {"vllm": "0.31.0", "vllm-ascend": "0.31.0rc1+npu"},
+            lambda: require_runtime_version("vllm-ascend", "0.31.0rc1"),
+            "0.31.0rc1+npu",
         ),
-        ({"vllm": "0.30.0+cu130"}, check_vllm_runtime, {"vllm": "0.30.0+cu130"}),
+        ({"vllm": "0.31.0+cu130"}, check_vllm_runtime, {"vllm": "0.31.0+cu130"}),
     ],
     ids=["vendor-local-suffix", "core-local-suffix"],
 )
@@ -120,12 +120,12 @@ def test_supported_runtime_version_keeps_the_local_suffix(
 
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "installed", ["0.29.0", "0.30.0rc2", "0.30+vendor"], ids=["older", "rc", "shortened"]
+    "installed", ["0.30.0", "0.31.0rc1", "0.31+vendor"], ids=["older", "rc", "shortened"]
 )
 def test_rejects_unsupported_vllm_versions(installed: str) -> None:
     with (
         mock.patch("vllm_gr.platforms.compat.metadata.version", return_value=installed),
-        pytest.raises(RuntimeError, match="required 0.30.0"),
+        pytest.raises(RuntimeError, match="required 0.31.0"),
     ):
         check_vllm_runtime()
 
@@ -134,29 +134,29 @@ def test_rejects_wrong_ascend_version() -> None:
     with (
         mock.patch(
             "vllm_gr.platforms.compat.metadata.version",
-            side_effect=lambda name: {"vllm": "0.30.0", "vllm-ascend": "0.30.0"}[name],
+            side_effect=lambda name: {"vllm": "0.31.0", "vllm-ascend": "0.30.0rc2"}[name],
         ),
-        pytest.raises(RuntimeError, match="required 0.30.0rc2"),
+        pytest.raises(RuntimeError, match="required 0.31.0rc1"),
     ):
-        require_runtime_version("vllm-ascend", "0.30.0rc2")
+        require_runtime_version("vllm-ascend", "0.31.0rc1")
 
 
 def test_requires_ascend_distribution_on_npu() -> None:
     def version(name: str) -> str:
         if name == "vllm":
-            return "0.30.0"
+            return "0.31.0"
         raise PackageNotFoundError(name)
 
     with mock.patch("vllm_gr.platforms.compat.metadata.version", side_effect=version):
         with pytest.raises(RuntimeError, match="vllm-ascend"):
-            require_runtime_version("vllm-ascend", "0.30.0rc2")
+            require_runtime_version("vllm-ascend", "0.31.0rc1")
 
 
 def _ascend_distribution_version(name: str) -> str:
     return {
-        "vllm": "0.30.0",
-        "vllm-ascend": "0.30.0rc2+npu",
-        "triton-ascend": "3.6.0+dev20261027",
+        "vllm": "0.31.0",
+        "vllm-ascend": "0.31.0rc1+npu",
+        "triton-ascend": "3.2.2+vendor",
     }[name]
 
 
@@ -184,7 +184,7 @@ def test_ascend_environment_checks_active_triton_backend() -> None:
     ):
         report = check_ascend_environment()
 
-    assert report["triton-ascend"] == "3.6.0+dev20261027"
+    assert report["triton-ascend"] == "3.2.2+vendor"
     assert report["triton-ascend-backend"] == "available"
     assert report["triton"] == "not installed"
 
@@ -210,12 +210,12 @@ def test_ascend_environment_rejects_overwritten_triton_namespace() -> None:
             check_ascend_environment()
 
 
-@pytest.mark.parametrize("version", ["3.2.1", "3.6.0rc1", "3.7.0"])  # type: ignore[misc]
+@pytest.mark.parametrize("version", ["3.2.1", "3.2.2rc1", "3.6.0"])  # type: ignore[misc]
 def test_ascend_environment_rejects_wrong_triton_ascend_version(version: str) -> None:
     def distribution_version(name: str) -> str:
         versions = {
-            "vllm": "0.30.0",
-            "vllm-ascend": "0.30.0rc2",
+            "vllm": "0.31.0",
+            "vllm-ascend": "0.31.0rc1",
             "triton-ascend": version,
         }
         return versions[name]
@@ -225,7 +225,7 @@ def test_ascend_environment_rejects_wrong_triton_ascend_version(version: str) ->
             "vllm_gr.platforms.compat.metadata.version",
             side_effect=distribution_version,
         ),
-        pytest.raises(RuntimeError, match="required 3.6.0"),
+        pytest.raises(RuntimeError, match="required 3.2.2"),
     ):
         check_ascend_environment()
 
@@ -237,9 +237,9 @@ def test_check_env_cli_uses_shared_runtime_checks(
 ) -> None:
     from vllm_gr.entrypoints.cli.check_env import CheckEnvSubcommand
 
-    versions = {"vllm": "0.30.0+local"}
+    versions = {"vllm": "0.31.0+local"}
     if device == "npu":
-        versions.update({"vllm-ascend": "0.30.0rc2+npu", "triton-ascend": "3.6.0"})
+        versions.update({"vllm-ascend": "0.31.0rc1+npu", "triton-ascend": "3.2.2"})
     platform = SimpleNamespace(device_type=device)
 
     def version(name: str) -> str:

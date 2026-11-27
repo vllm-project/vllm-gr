@@ -26,18 +26,18 @@ ROOT = REPO_ROOT
 
 class TestRuntimeResolution(unittest.TestCase):
     def test_shipped_runtime_declarations_match_both_platforms(self) -> None:
-        gr_version = runtime.package_version(ROOT, "0.30.0")
+        gr_version = runtime.package_version(ROOT, "0.31.0")
         self.assertEqual(
             runtime.declarations(ROOT, "cuda"),
-            {"vllm": "0.30.0", "vllm-gr": gr_version},
+            {"vllm": "0.31.0", "vllm-gr": gr_version},
         )
         self.assertEqual(
             runtime.declarations(ROOT, "npu"),
             {
-                "vllm": "0.30.0",
+                "vllm": "0.31.0",
                 "vllm-gr": gr_version,
-                "vllm-ascend": "0.30.0rc2",
-                "triton-ascend": "3.6.0",
+                "vllm-ascend": "0.31.0rc1",
+                "triton-ascend": "3.2.2",
             },
         )
 
@@ -89,7 +89,7 @@ class TestRuntimeResolution(unittest.TestCase):
         setup = self.repo / "setup.py"
         setup.write_text(
             setup.read_text().replace(
-                'VLLM_GR_BASE_VERSION = "0.30.0"', 'VLLM_GR_BASE_VERSION = "0.29.0"'
+                'VLLM_GR_BASE_VERSION = "0.31.0"', 'VLLM_GR_BASE_VERSION = "0.29.0"'
             )
         )
         (self.repo / "pyproject.toml").write_text("[tool.setuptools_scm]\n")

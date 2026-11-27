@@ -34,7 +34,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unav
 
 def _registration_worker(capacity=8):
     worker = make_native_v2_worker([1], capacity=capacity)
-    worker.use_pp = False
     worker.dp_size = 1
     worker.parallel_config = SimpleNamespace(
         tensor_parallel_size=1, prefill_context_parallel_size=1
@@ -311,7 +310,9 @@ def _assert_inputs_match_native(monkeypatch, lengths, computed, query_lens, desc
     fast, scheduled, batch_state = _input_case(
         lengths, computed, query_lens, desc.num_tokens, cpu_ahead
     )
-    expected = GPUModelRunner.prepare_inputs(native, native_scheduled, native_state, desc)
+    expected = GPUModelRunner.prepare_inputs(
+        native, native_scheduled, native_state, desc, num_active_loras=0
+    )
 
     def forbidden(*args, **kwargs):
         raise AssertionError("Input preparation must not read device state on the host")

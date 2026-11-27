@@ -27,7 +27,7 @@ python -m pip --version
 
 ### Install vLLM-GR
 
-The CUDA package contract pins `vllm==0.30.0`. The platform-specific
+The CUDA package contract pins `vllm==0.31.0`. The platform-specific
 requirements are selected automatically; do not install a different vLLM
 version into the same environment.
 
@@ -53,9 +53,9 @@ python -m pip check
 ```
 
 Shared dependencies come from `requirements/common.txt`, while CUDA adds the
-vLLM runtime from `requirements/cuda.txt`. There is no CUDA extra. The Ascend
-path is validated on the vLLM-Ascend 0.30.0rc2 vendor image; see the
-[Ascend installation guide](npu.md) before attempting an NPU environment.
+vLLM runtime from `requirements/cuda.txt`. There is no CUDA extra. See the
+[Ascend installation guide](npu.md) for the separate vendor-runtime
+requirements.
 
 If you have `uv` installed, you can use it with the same target and dependency
 contract.
@@ -70,7 +70,7 @@ Torch for backend detection.
 ### Enable the GR CLI and verify the runtime
 
 Follow the [CLI dispatch patch instructions](../../cli/README.md#command-form-and-installation)
-for the active vLLM 0.30.0 installation. For a wheel, apply the patch in the
+for the active vLLM installation. For a wheel, apply the patch in the
 interpreter's site-packages. For editable vLLM, apply it at the vLLM source
 root. Then run the environment check in the same shell.
 

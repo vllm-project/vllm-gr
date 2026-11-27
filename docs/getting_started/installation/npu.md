@@ -4,39 +4,30 @@ Prepare the Ascend runtime and operators, then verify the vLLM-GR installation o
 
 ## Prerequisites
 
-- An Ascend NPU host (verified on 910B/950) with the matching driver
+- An Ascend NPU host with the matching driver
 - A container runtime (Docker or Podman)
 - 32GB+ RAM (recommended)
-- A vendor image matching the host hardware and operating system; see the
-  image variants below
+- A vendor image matching the host hardware and the runtime versions below
 
 For the shared checkout, target-flag, and interpreter steps, see
 [Installation](README.md).
 
 ### Vendor images
 
-Select a tag for your Ascend generation and host operating system.
-
-| Image tag | Hardware | Operating system |
-| --- | --- | --- |
-| `quay.io/ascend/vllm-ascend:v0.30.0rc2` | A2 (910B) | Ubuntu |
-| `quay.io/ascend/vllm-ascend:v0.30.0rc2-openeuler` | A2 (910B) | openEuler |
-| `quay.io/ascend/vllm-ascend:v0.30.0rc2-a5` | A5 (950DT) | Ubuntu |
-| `quay.io/ascend/vllm-ascend:v0.30.0rc2-a5-openeuler` | A5 (950DT) | openEuler |
-
-The validated stack includes Python 3.12, CANN 9.2.0, PyTorch / torch-npu
-2.10.0, vLLM 0.30.0, vLLM-Ascend 0.30.0rc2 and Triton-Ascend 3.6.0.
-Keep the NumPy and OpenCV builds supplied by the image.
+Prepare a vendor image with vLLM 0.31.0, vLLM-Ascend 0.31.0rc1, and
+Triton-Ascend 3.2.2. The 910B trial uses Python 3.12, CANN 9.1.0, and
+`torch-npu 2.10.0.post4`. Keep the NumPy and OpenCV builds supplied by the
+prepared image and verify the installed versions before installing vLLM-GR.
 
 ## Setup
 
 ### Start the container
 
 Follow the vendor's release-specific container instructions for
-[A2](https://github.com/vllm-project/vllm-ascend/blob/v0.30.0rc2/docs/source/getting_started/quick_start/ascend_image/atlas-a2.inc.md)
-or [950DT / A5](https://github.com/vllm-project/vllm-ascend/blob/v0.30.0rc2/docs/source/getting_started/quick_start/ascend_image/atlas-950dt.inc.md).
-Use the image tag for your host from the table above and pass the assigned
-NPU through to the container. Mount your GR checkout, or clone it inside the
+[A2](https://github.com/vllm-project/vllm-ascend/blob/v0.31.0rc1/docs/source/getting_started/quick_start/ascend_image/atlas-a2.inc.md)
+or [950DT / A5](https://github.com/vllm-project/vllm-ascend/blob/v0.31.0rc1/docs/source/getting_started/quick_start/ascend_image/atlas-950dt.inc.md).
+Pass the assigned NPU through to the prepared container. Mount your GR
+checkout, or clone it inside the
 container using the [shared checkout steps](README.md#shared-steps).
 
 Inside the container, confirm that your assigned device appears, then change
@@ -138,8 +129,8 @@ by `python -m pip show vllm` as the patch target.
 
 ## Optional XAttention output binding
 
-For direct writes to the caller's attention buffer, follow the
-[optional extension build and verification steps](../../user_guide/beam_search_npu.md#optional-xattention-output-binding).
+The optional extension for direct writes to the caller's attention buffer
+is pinned to the [previous 0.30 runtime](../../user_guide/beam_search_npu.md#optional-xattention-output-binding).
 
 ## Dependency checking on Ascend
 
@@ -149,24 +140,9 @@ For the environment check's output and exit status, see [check-env](../../cli/ch
 
 ### Vendor package metadata
 
-!!! note "Dependency metadata in vendor images"
-
-    Keep the output of `python -m pip check` as a diagnostic. The validated
-    image has the metadata conflicts listed below. Use the runtime checks
-    above to confirm imports and operator availability.
-
-- Declaration conflict: the image's opencv-python-headless 5.x wheel declares
-  `numpy>=2` while triton-ascend 3.6.0 declares `numpy==1.26.4`. The
-  successful runtime validation used the vendor-supplied cv2 build. Confirm
-  its actual import with NumPy 1.26.4; a version declaration or vLLM's lazy
-  import fallback is not evidence of binary compatibility.
-- Metadata drift: the image's vllm-ascend metadata declares slightly older
-  companions (triton-ascend 3.2.2, torch-npu 2.10.0.post4) than the image
-  actually ships (3.6.0, post7).
-
-Treat these recorded vendor-image discrepancies separately from new missing
-or incompatible dependencies. Validate runtime versions, direct numpy/cv2
-imports, custom operator loading, and inference inside the selected image.
-Do not ignore unrelated `pip check` errors or replace vendor packages merely
-to silence the known reports. Package availability on PyPI and consistency
-of installed package metadata are separate questions.
+The published vLLM-Ascend 0.31.0rc1 wheel and vLLM 0.31.0 declare
+incompatible FastAPI and Transformers versions. Triton-Ascend 3.2.2 requires
+NumPy 1.26.4, so the image also needs an OpenCV build compatible with that
+NumPy version. For release validation, use a vendor build with compatible
+dependencies and record `python -m pip check`, the direct NumPy and OpenCV
+imports, and the NPU inference results.

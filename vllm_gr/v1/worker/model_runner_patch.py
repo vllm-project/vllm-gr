@@ -325,6 +325,7 @@ def apply_worker_patches() -> None:
 def install_v1_worker_hooks(
     platform_module: Any,
     *,
+    runners: tuple[tuple[str, type], ...] | None = None,
     cuda_hooks_type: CudaStageHooksType | None = None,
     workspace_load_patcher: Callable[..., Any] | None = None,
     constraint_max_batch: int = 1,
@@ -340,7 +341,10 @@ def install_v1_worker_hooks(
     from vllm_gr.v1.worker.runner_binding import bind_after_model_load
     from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
-    for runner_name, runner_class in platform_module.discover_worker_runners():
+    if runners is None:
+        runners = platform_module.discover_worker_runners()
+    runner_class: Any
+    for runner_name, runner_class in runners:
         if is_worker_runner_patched(runner_class):
             if implementation_id is not None:
                 install_runner_lifecycle(runner_class, implementation_id, prepare="_prepare_inputs")

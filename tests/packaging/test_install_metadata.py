@@ -187,7 +187,7 @@ def _assert_version(module: _SetupModule, expected: str) -> None:
 def test_release_version_by_device(version_source: _SetupModule, device: str) -> None:
     version_source._cached_device = device
     suffix = "" if device == "cuda" else f"+{device}"
-    _assert_version(version_source, f"0.30.0{suffix}")
+    _assert_version(version_source, f"0.31.0{suffix}")
 
 
 @pytest.mark.parametrize("release_tag", [None, "0.30.1", "0.30.1rc1"])  # type: ignore[misc]
@@ -199,7 +199,7 @@ def test_git_version_source(version_source: _SetupModule, release_tag: str | Non
         _git(root, "tag", f"v{release_tag}")
         _assert_version(version_source, f"{release_tag}+npu")
 
-    next_release = {None: "0.30.0", "0.30.1": "0.30.2", "0.30.1rc1": "0.30.1rc2"}[release_tag]
+    next_release = {None: "0.31.0", "0.30.1": "0.30.2", "0.30.1rc1": "0.30.1rc2"}[release_tag]
     versions = []
     for step in (1, 2):
         _git(root, "commit", "--allow-empty", "-qm", f"Development commit {step}")
@@ -214,7 +214,7 @@ def test_git_version_source(version_source: _SetupModule, release_tag: str | Non
 
 
 def test_repeated_version_generation_does_not_leak_override(version_source: _SetupModule) -> None:
-    for device, expected in [("cpu", "0.30.0+cpu"), ("npu", "0.30.0+npu"), ("cuda", "0.30.0")]:
+    for device, expected in [("cpu", "0.31.0+cpu"), ("npu", "0.31.0+npu"), ("cuda", "0.31.0")]:
         version_source._cached_device = device
         _assert_version(version_source, expected)
 

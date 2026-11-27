@@ -197,14 +197,21 @@ def make_patched_prepare_inputs_v2(
 
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(
-        self: Any, scheduler_output: Any, batch_req_state: Any, batch_desc: Any
+        self: Any,
+        scheduler_output: Any,
+        batch_req_state: Any,
+        batch_desc: Any,
+        num_active_loras: int,
     ) -> Any:
-        batch = try_prepare_gr_prefill_inputs_v2(
-            self, scheduler_output, batch_req_state, batch_desc
+        if num_active_loras == 0:
+            batch = try_prepare_gr_prefill_inputs_v2(
+                self, scheduler_output, batch_req_state, batch_desc
+            )
+            if batch is not None:
+                return batch
+        return _orig_prepare_inputs(
+            self, scheduler_output, batch_req_state, batch_desc, num_active_loras
         )
-        if batch is not None:
-            return batch
-        return _orig_prepare_inputs(self, scheduler_output, batch_req_state, batch_desc)
 
     setattr(patched_prepare_inputs, _WORKER_V2_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs

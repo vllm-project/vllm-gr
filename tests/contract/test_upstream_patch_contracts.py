@@ -191,7 +191,11 @@ def test_attention_selector_contracts() -> None:
         "backend",
         "attn_selector_config",
         "num_heads",
+        "_run_kv_cache_dtype",
     ]
+    dtype_param = inspect.signature(_cached_get_attn_backend).parameters["_run_kv_cache_dtype"]
+    assert dtype_param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert dtype_param.default is None
     assert AttentionBackendEnum.CUSTOM is not None
     assert callable(register_backend)
 

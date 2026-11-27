@@ -236,7 +236,8 @@ def test_native_finish_returns_original_requests_and_cleans_queues(scheduler, ru
     assert not scheduler.requests
     assert not scheduler.running
     assert not scheduler.waiting
-    assert not scheduler.skipped_waiting
+    assert not scheduler.kv_holding_waiting
+    assert not scheduler.deferred_waiting
     assert not getattr(scheduler, "_gr_v1_sessions", {})
     assert scheduler.finish_requests(request.request_id, status) == []
 
@@ -390,6 +391,7 @@ def test_native_batch_queue_submits_successor_before_consuming_receipt(scheduler
         batch_queue=deque(),
         batch_queue_size=2,
         is_ec_consumer=True,
+        is_mm_encoder_only=False,
         is_pooling_model=False,
         model_executor=Executor(),
         _should_throttle_prefills=lambda: False,

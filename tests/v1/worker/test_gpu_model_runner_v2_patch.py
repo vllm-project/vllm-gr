@@ -56,7 +56,11 @@ def test_apply_v2_runner_patches_stamps_markers(
             return None
 
         def prepare_inputs(
-            self, scheduler_output: Any, batch_req_state: Any, batch_desc: Any
+            self,
+            scheduler_output: Any,
+            batch_req_state: Any,
+            batch_desc: Any,
+            num_active_loras: int,
         ) -> Any:
             return None
 
@@ -487,7 +491,10 @@ def test_profile_rejects_bound_runtime_and_preserves_non_beam(
     original.assert_called_once_with(worker)
 
 
-def test_prepare_inputs_preserves_native_batch_state_for_ordinary_requests() -> None:
+@pytest.mark.parametrize("num_active_loras", [0, 2])  # type: ignore[misc]
+def test_prepare_inputs_preserves_native_batch_state_for_ordinary_requests(
+    num_active_loras: int,
+) -> None:
     from vllm.config import CUDAGraphMode
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
@@ -495,9 +502,11 @@ def test_prepare_inputs_preserves_native_batch_state_for_ordinary_requests() -> 
     scheduled = SimpleNamespace(num_scheduled_tokens={"ordinary": 2})
     desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, 2, 1)
     native = Mock(return_value=result)
-    prepared = v2.make_patched_prepare_inputs_v2(native)(worker, scheduled, state, desc)
+    prepared = v2.make_patched_prepare_inputs_v2(native)(
+        worker, scheduled, state, desc, num_active_loras
+    )
     assert prepared is result
-    native.assert_called_once_with(worker, scheduled, state, desc)
+    native.assert_called_once_with(worker, scheduled, state, desc, num_active_loras)
 
 
 pytestmark = pytest.mark.cpu_test

@@ -139,7 +139,7 @@ def gr_admission(scheduler: Any):
     if owner is None:
         yield
         return
-    waiting, skipped = scheduler.waiting, scheduler.skipped_waiting
+    waiting, kv_holding = scheduler.waiting, scheduler.kv_holding_waiting
     budget = scheduler.max_num_scheduled_tokens
     manager = scheduler.kv_cache_manager
     allocate = manager.allocate_slots
@@ -161,14 +161,14 @@ def gr_admission(scheduler: Any):
         return result
 
     scheduler.waiting = _AdmissionQueue(waiting, owner_ids)
-    scheduler.skipped_waiting = _AdmissionQueue(skipped, owner_ids)
+    scheduler.kv_holding_waiting = _AdmissionQueue(kv_holding, owner_ids)
     manager.allocate_slots = reserve
     if not can_issue_gr_stage(scheduler, owner):
         scheduler.max_num_scheduled_tokens = 0
     try:
         yield
     finally:
-        scheduler.waiting, scheduler.skipped_waiting = waiting, skipped
+        scheduler.waiting, scheduler.kv_holding_waiting = waiting, kv_holding
         scheduler.max_num_scheduled_tokens = budget
         manager.allocate_slots = allocate
 

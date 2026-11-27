@@ -47,7 +47,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
         "GR-PATCH-021",
     )
     api_version: ClassVar[int] = PROVIDER_API_VERSION
-    gr_version_range: ClassVar[str | None] = ">=0.30.0,<0.31.0"
+    gr_version_range: ClassVar[str | None] = ">=0.31.0,<0.32.0"
     vllm_version_range: ClassVar[str | None] = f"=={SUPPORTED_VLLM_VERSION}"
     vendor_version_range: ClassVar[str | None] = f"=={SUPPORTED_VLLM_ASCEND_VERSION}"
     vendor_distribution: ClassVar[str | None] = "vllm-ascend"

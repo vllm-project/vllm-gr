@@ -146,6 +146,26 @@ def test_both_aliases_enable_exact_dense_beam(policy: Any) -> None:
     assert policy.calls == [case]
 
 
+@pytest.mark.l1  # type: ignore[misc]
+def test_rc1_updates_only_already_imported_factory_runner(
+    policy: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(policy.module, "version", lambda _: "0.31.0rc1+local")
+    patch = policy.module.apply_npu_contiguous_kv_cache_patch
+    assert patch() == 0
+    assert policy.imports == ["vllm.platforms"]
+
+    runner = ModuleType("vllm_ascend.worker.v1.model_runner")
+    setattr(runner, "requires_contiguous_pa_kv_cache", policy.native)
+    assert patch(runner_module=runner) == 1
+    assert patch(runner_module=runner) == 0
+    bound_policy = getattr(runner, "requires_contiguous_pa_kv_cache")
+    assert bound_policy is (
+        policy.modules["vllm_ascend.attention.utils"].requires_contiguous_pa_kv_cache
+    )
+    assert bound_policy(*_case()) is True
+
+
 def _observed_compiler_defaults() -> dict[str, bool]:
     return {
         "enable_npugraph_ex": False,
