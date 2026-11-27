@@ -266,7 +266,7 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         with mock.patch.object(
             beam_attn_metadata,
             "get_scheduler_metadata",
-            return_value={},
+            return_value=torch.empty(0, dtype=torch.int32),
         ) as scheduler:
             beam_metadata_tensors.get_schedule(
                 builder._tensor_context(),

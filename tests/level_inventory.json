@@ -1736,6 +1736,7 @@
     "tests/v1/attention/test_beam_attention_metadata.py::test_cached_seqlens_views_reuse_same_objects": "l1",
     "tests/v1/attention/test_beam_attention_metadata.py::test_create_beam_tensors_explicit_contiguous_flag_skips_scan": "l1",
     "tests/v1/attention/test_beam_attention_metadata.py::test_create_beam_tensors_geom_key_arrange_contiguity": "l1",
+    "tests/v1/attention/test_beam_attention_metadata.py::test_create_beam_tensors_requires_scheduler_keyword": "l1",
     "tests/v1/attention/test_beam_attention_metadata.py::test_geom_cache_key_stable_without_decode_step": "l1",
     "tests/v1/attention/test_beam_attention_metadata.py::test_geometry_cache_evicts_finished_session_entries": "l1",
     "tests/v1/attention/test_beam_attention_metadata.py::test_identity_row_proof_is_not_reused_for_same_shape_changed_prefix": "l1",

@@ -41,7 +41,7 @@ from vllm_gr.v1.beam import BEAM_DATA_VAR
 logger = init_logger(__name__)
 
 
-def get_scheduler_metadata(*args, **kwargs):
+def get_scheduler_metadata(*args, **kwargs) -> torch.Tensor | None:
     from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 
     if not is_flash_attn_varlen_func_available():
@@ -107,8 +107,8 @@ class BeamAttentionMetadata:
     num_std_indices: int = 0
     num_prefix_indices: int = 0
 
-    scheduler_metadata: dict | None = None
-    prefix_scheduler_metadata: dict | None = None
+    scheduler_metadata: torch.Tensor | None = None
+    prefix_scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
     block_size: int = 16
     num_heads: int = 0
@@ -677,20 +677,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             device,
         )
 
-        (
-            prefix_indices_tensor,
-            prefix_seqlens_kv_device,
-            prefix_max_seq_len,
-            prefix_cu_seqlens_q_device,
-            prefix_max_q_len,
-            prefix_block_table,
-            suffix_seqlens_kv_device,
-            suffix_max_seq_len,
-            suffix_cu_seqlens_q_device,
-            suffix_cu_seqlens_k_device,
-            suffix_max_q_len,
-            prefix_scheduler_metadata,
-        ) = create_beam_tensors(
+        beam_tensors = create_beam_tensors(
             tensor_context,
             common_attn_metadata,
             prefix_indices,
@@ -759,21 +746,21 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_req_idxs_cpu=std_req_idxs,
             prefix_req_idxs_cpu=prefix_req_idxs_cpu,
             max_prefix_blocks_count=max_prefix_blocks_count,
-            prefix_indices=prefix_indices_tensor,
-            prefix_cu_seqlens_q_device=prefix_cu_seqlens_q_device,
-            prefix_seqlens_kv_device=prefix_seqlens_kv_device,
-            prefix_max_q_len=prefix_max_q_len,
-            prefix_max_seq_len=prefix_max_seq_len,
-            prefix_block_table=prefix_block_table,
+            prefix_indices=beam_tensors.prefix_indices,
+            prefix_cu_seqlens_q_device=beam_tensors.prefix_cu_seqlens_q,
+            prefix_seqlens_kv_device=beam_tensors.prefix_seqlens_kv,
+            prefix_max_q_len=beam_tensors.prefix_max_q_len,
+            prefix_max_seq_len=beam_tensors.prefix_max_seq_len,
+            prefix_block_table=beam_tensors.prefix_block_table,
             prefix_seqlens_q_cpu=prefix_seqlens_q_cpu,
             prefix_cu_seqlens_q_cpu=prefix_cu_seqlens_q_cpu,
             prefix_seqlens_kv_cpu=prefix_seqlens_kv_cpu,
-            prefix_scheduler_metadata=prefix_scheduler_metadata,
-            suffix_cu_seqlens_q_device=suffix_cu_seqlens_q_device,
-            suffix_cu_seqlens_k_device=suffix_cu_seqlens_k_device,
-            suffix_seqlens_kv_device=suffix_seqlens_kv_device,
-            suffix_max_q_len=suffix_max_q_len,
-            suffix_max_seq_len=suffix_max_seq_len,
+            prefix_scheduler_metadata=beam_tensors.prefix_scheduler_metadata,
+            suffix_cu_seqlens_q_device=beam_tensors.suffix_cu_seqlens_q,
+            suffix_cu_seqlens_k_device=beam_tensors.suffix_cu_seqlens_k,
+            suffix_seqlens_kv_device=beam_tensors.suffix_seqlens_kv,
+            suffix_max_q_len=beam_tensors.suffix_max_q_len,
+            suffix_max_seq_len=beam_tensors.suffix_max_seq_len,
             suffix_seqlens_q_cpu=suffix_seqlens_q_cpu,
             suffix_cu_seqlens_q_cpu=suffix_cu_seqlens_q_cpu,
             suffix_seqlens_kv_cpu=suffix_seqlens_kv_cpu,

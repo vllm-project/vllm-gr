@@ -824,7 +824,8 @@ def test_prefix_block_table_view_requires_npu_incremental_identity_rows(
             max_num_splits=0,
             geom_key=key,
             decode_step=step if incremental else None,
-        )[5]
+            scheduler=lambda **_kwargs: None,
+        ).prefix_block_table
 
     key = ("request-a", tuple(request_rows)) if incremental else None
     blocks = build(key, 0)
@@ -1078,20 +1079,22 @@ def test_incremental_seqlens_through_create_beam_tensors() -> None:
             max_num_splits=0,
             geom_key=geom_key,
             decode_step=step,
+            scheduler=lambda **_kwargs: None,
         )
 
     m0 = run(0)
-    assert m0[1].tolist() == [8]  # prefix_seqlens_kv_device
-    assert m0[2] == 16  # prefix_max_seq_len (4 blocks * block_size 2)
-    assert m0[6].tolist() == [1, 1, 1, 1]  # suffix_seqlens_kv_device
-    assert m0[8].tolist() == [0, 1, 2, 3, 4]  # suffix_cu_seqlens_q_device
+    assert isinstance(m0, tensors.BeamTensorResult)
+    assert m0.prefix_seqlens_kv.tolist() == [8]
+    assert m0.prefix_max_seq_len == 16  # 8 buffer columns * block_size 2
+    assert m0.suffix_seqlens_kv.tolist() == [1, 1, 1, 1]
+    assert m0.suffix_cu_seqlens_q.tolist() == [0, 1, 2, 3, 4]
 
     # Step 3: suffix KV length = 4, cu_seqlens_k = [0,4,8,12,16].
     m3 = run(3)
-    assert m3[6].tolist() == [4, 4, 4, 4]
-    assert m3[9].tolist() == [0, 4, 8, 12, 16]
+    assert m3.suffix_seqlens_kv.tolist() == [4, 4, 4, 4]
+    assert m3.suffix_cu_seqlens_k.tolist() == [0, 4, 8, 12, 16]
     # Fixed prefix untouched across the cached step.
-    assert m3[1].tolist() == [8]
+    assert m3.prefix_seqlens_kv.tolist() == [8]
 
 
 def test_create_beam_tensors_geom_key_arrange_contiguity() -> None:
@@ -1125,14 +1128,15 @@ def test_create_beam_tensors_geom_key_arrange_contiguity() -> None:
             max_num_splits=0,
             geom_key=geom_key,
             decode_step=0,
+            scheduler=lambda **_kwargs: None,
         )
 
     # Contiguous range under a geom_key: emitted with a strided arange.
     m = run([0, 1, 2, 3])
-    assert m[0].tolist() == [0, 1, 2, 3]
+    assert m.prefix_indices.tolist() == [0, 1, 2, 3]
     # Non-contiguous layout under a geom_key must NOT be wrongly ranged.
     m = run([3, 7, 11])
-    assert m[0].tolist() == [3, 7, 11]
+    assert m.prefix_indices.tolist() == [3, 7, 11]
 
 
 def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
@@ -1162,18 +1166,35 @@ def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
             max_num_splits=0,
             geom_key=geom_key,
             decode_step=0,
+            scheduler=lambda **_kwargs: None,
             **kw,
         )
 
     # Explicit True: arange fast path without the scan.
     m = run([5, 6, 7, 8], prefix_indices_contiguous=True)
-    assert m[0].tolist() == [5, 6, 7, 8]
-    # Precomputed scalars are consumed (prefix_max_q_len visible in the tuple).
-    m = run([5, 6, 7, 8], prefix_indices_contiguous=True, prefix_max_q_len=4, suffix_max_q_len=1)
-    assert m[0].tolist() == [5, 6, 7, 8]
+    assert m.prefix_indices.tolist() == [5, 6, 7, 8]
+    # Precomputed scalars are consumed instead of the fallback maxima.
+    m = run(
+        [5, 6, 7, 8],
+        prefix_indices_contiguous=True,
+        prefix_max_q_len=9,
+        suffix_max_q_len=7,
+    )
+    assert m.prefix_indices.tolist() == [5, 6, 7, 8]
+    assert m.prefix_max_q_len == 9
+    assert m.suffix_max_q_len == 7
     # Explicit False: host copy even for a visually contiguous list.
     m = run([0, 1, 2, 3], prefix_indices_contiguous=False)
-    assert m[0].tolist() == [0, 1, 2, 3]
+    assert m.prefix_indices.tolist() == [0, 1, 2, 3]
+
+
+def test_create_beam_tensors_requires_scheduler_keyword() -> None:
+    """Direct callers must supply the scheduler used on AOT cache misses."""
+    import inspect
+
+    parameter = inspect.signature(tensors.create_beam_tensors).parameters["scheduler"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
 
 
 def test_build_beam_mappings_incremental_returns_analytic_scalars() -> None:
