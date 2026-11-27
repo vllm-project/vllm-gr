@@ -226,3 +226,76 @@ client/server difference includes transport/runtime scheduling, not just wire
 protocol work. HTTP returns text while gRPC returns token arrays, so frontend
 savings include decoding and response formatting. All samples are retained;
 isolated gRPC wall-time spikes affect means, so median/P95 are also reported.
+
+## Online overload baseline
+
+Run three fixed-rate phases against one HTTP Beam server: normal load,
+overload, and recovery. Requests in flight carry over between phases.
+Sweep the offered rate to choose a normal rate below saturation and an
+overload rate above it. `--recovery-seconds` sets the recovery duration
+independently of `--phase-seconds`.
+
+| Metric | Timing boundary |
+| --- | --- |
+| Started and completed requests/s | Counted in the wall-clock phase in which the event occurs. Completions count successful responses. |
+| Successful-request P99 | Measured from client start to response completion and grouped by scheduled phase. |
+| Recovery windows | Five-second groups by scheduled start, with offered and successful counts and successful-request P99. |
+| Client start delay | Time from the scheduled start to the client starting the request. |
+
+A successful response contains the requested number of non-empty choices.
+The JSON report counts timeouts, transport errors, invalid responses, and
+HTTP status codes separately.
+
+### Reproduce the L4 recovery workload
+
+Set `ONEREC_MODEL` to the local [OneRec-1.7B snapshot](https://huggingface.co/OpenOneRec/OneRec-1.7B/tree/cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b).
+The L4 run used vLLM 0.30.0+cu129 with [GR CLI dispatch](../cli/README.md#enable-gr-dispatch).
+From the repository root, generate the 512-item catalog and 160-item history,
+then start the server.
+
+```bash
+export ONEREC_WORKDIR="$PWD/results/onerec-overload"
+mkdir -p "$ONEREC_WORKDIR"
+python - "$ONEREC_WORKDIR" <<'PY'
+import itertools
+import json
+import sys
+from pathlib import Path
+
+workdir = Path(sys.argv[1])
+catalog = [
+    ["<|sid_begin|>", f"<s_a_{a}>", f"<s_b_{b}>", f"<s_c_{c}>", "<|sid_end|>"]
+    for a, b, c in itertools.product(range(1, 9), repeat=3)
+]
+(workdir / "catalog.json").write_text(json.dumps(catalog), encoding="utf-8")
+history = "".join("".join(sid) for sid in catalog[::3][:160])
+(workdir / "prompt.txt").write_text(
+    f"The user watched these videos: {history}\nRecommend the next video.",
+    encoding="utf-8",
+)
+PY
+python -m examples.online_serving.catalog.prepare_serving_config \
+  --model "$ONEREC_MODEL" --workdir "$ONEREC_WORKDIR" \
+  --constraint-backend cuda --raw-catalog "$ONEREC_WORKDIR/catalog.json"
+VLLM_USE_V2_MODEL_RUNNER=1 VLLM_USE_FLASHINFER_SAMPLER=0 \
+  vllm serve "$ONEREC_MODEL" --gr --host 127.0.0.1 --port 8000 \
+  --served-model-name onerec --config "$ONEREC_WORKDIR/vllm_gr_config.yaml" \
+  --trust-remote-code --max-logprobs 128 --max-num-seqs 128 \
+  --max-model-len 2048 --max-num-batched-tokens 2048 \
+  --async-scheduling --no-enable-chunked-prefill --no-enable-prefix-caching
+```
+
+From a second terminal, verify the Beam response and run the benchmark.
+
+```bash
+export ONEREC_WORKDIR="$PWD/results/onerec-overload"
+ONEREC_BASE_URL=http://127.0.0.1:8000 ONEREC_SERVED_MODEL_NAME=onerec \
+  bash examples/online_serving/beam_search/client.sh -p "$ONEREC_WORKDIR/prompt.txt" \
+  > "$ONEREC_WORKDIR/response.json"
+python examples/online_serving/catalog/verify_catalog.py \
+  "$ONEREC_WORKDIR/response.json" "$ONEREC_WORKDIR/catalog.json" --expected-count 128
+python -m benchmarks.open_one_rec.online_overload \
+  --model onerec --prompt "$ONEREC_WORKDIR/prompt.txt" --width 128 \
+  --normal-rps 5 --overload-rps 21 --phase-seconds 15 --recovery-seconds 45 \
+  --timeout 12 > "$ONEREC_WORKDIR/recovery.json"
+```
