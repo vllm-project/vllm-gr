@@ -2,6 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 steps:
+  - label: "Upload optional gate suites"
+    key: upload-gate-suites
+    if: >-
+      build.pull_request.id != null &&
+      build.pull_request.draft == false &&
+      build.pull_request.labels includes "gate-tests"
+    depends_on: image-build
+    agents:
+      queue: medium_cpu_queue_premerge
+    command: |
+      set -euo pipefail
+      python3 -m tools.ci.gate_matrix | buildkite-agent pipeline upload
+
   - label: "Build CI image"
     key: image-build
     agents:

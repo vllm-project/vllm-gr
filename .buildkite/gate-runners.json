@@ -1,0 +1,11 @@
+{
+  "cuda:L20": [],
+  "cuda:A100": [],
+  "cuda:H800": [],
+  "cuda:H100": [],
+  "cuda:L4": [{"cards": 1, "preset": "l4_1", "suites": ["unit"]}],
+  "cuda:B200": [],
+  "npu:A2": [],
+  "npu:A3": [],
+  "npu:A5": []
+}
