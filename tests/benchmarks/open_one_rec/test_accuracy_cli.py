@@ -5,6 +5,8 @@
 
 import json
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +19,86 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
 _SID_A = "<|sid_begin|><s_a_1><s_b_2><s_c_3><|sid_end|>"
 _SID_B = "<|sid_begin|><s_a_4><s_b_5><s_c_6><|sid_end|>"
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("beam_widths", "result_width", "returned_count", "expected_error"),
+    [
+        pytest.param([128, 128, 128], 32, 32, None, id="explicit-result-width"),
+        pytest.param([128, 64, 32], None, 32, None, id="final-retained-width"),
+        pytest.param([128, 128, 128], 32, 31, "31 of 32", id="too-few-candidates"),
+        pytest.param([128, 128, 128], None, 128, None, id="default-full-width"),
+    ],
+)
+def test_offline_accuracy_checks_resolved_result_width(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    beam_widths: list[int],
+    result_width: int | None,
+    returned_count: int,
+    expected_error: str | None,
+) -> None:
+    from transformers import AutoTokenizer
+
+    import benchmarks.open_one_rec.one_rec_acc_test as accuracy
+
+    def beam_search(
+        prompts: list[dict[str, str]], params: Any, *, output_mode: str
+    ) -> list[SimpleNamespace]:
+        assert prompts == [{"prompt": "question"}]
+        assert params.beam_width == 128
+        assert output_mode == "compact"
+        sequence = SimpleNamespace(token_ids=(1, 2, 3), cumulative_logprob=0.0)
+        return [SimpleNamespace(sequences=[sequence] * returned_count)]
+
+    @contextmanager
+    def engine(*, gr: dict[str, Any], **kwargs: Any) -> Iterator[SimpleNamespace]:
+        vllm_config = SimpleNamespace(additional_config={"vllm_gr": {"gr": gr}})
+        yield SimpleNamespace(
+            llm_engine=SimpleNamespace(vllm_config=vllm_config),
+            beam_search=beam_search,
+            get_tokenizer=lambda: SimpleNamespace(decode=lambda *a, **kw: _SID_A),
+        )
+
+    samples = {"video-42": {"prompt": "question", "ground_truth": _SID_A}}
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        accuracy, "DataLoaderWrapper", lambda **kw: SimpleNamespace(load_data=lambda **kw: samples)
+    )
+    monkeypatch.setattr(accuracy, "GRLLM", engine)
+    monkeypatch.setitem(
+        accuracy.TASK_REGISTRY["video"].config["evaluation_config"], "evaluation_mode", "sid"
+    )
+    settings = {
+        "beam_width": beam_widths,
+        "candidate_width": beam_widths,
+        "result_width": result_width,
+    }
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "accuracy",
+            "--task-type",
+            "video",
+            "--n",
+            "128",
+            "--gr",
+            json.dumps(settings),
+            "--result-dir",
+            str(tmp_path),
+        ],
+    )
+
+    status = accuracy.main()
+    report = json.loads(next(tmp_path.glob("*.json")).read_text())
+    if expected_error is not None:
+        assert status == 1
+        assert expected_error in report["sample_errors"]["video-42"]
+    else:
+        assert status == 0, report
+        assert report["total_samples"] == 1
+        assert report["recall@32"] == 1.0
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]

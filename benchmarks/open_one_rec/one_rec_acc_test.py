@@ -63,6 +63,7 @@ def run_offline_v1_inference(
     batch_size: int,
     *,
     sample_ids: list[str] | None = None,
+    expected_result_count: int | None = None,
 ) -> list[MockRequestOutput]:
     """Preserve sample order and decode only the generated SID token suffix."""
     if batch_size not in (1, 2, 4):
@@ -83,11 +84,12 @@ def run_offline_v1_inference(
         if len(raw_outputs) != size:
             reason = f"V1 returned an unexpected number of items: {len(raw_outputs)} of {size}"
             raise InferenceError(dict.fromkeys(batch_ids, reason))
+        expected = params.beam_width if expected_result_count is None else expected_result_count
         for sample_id, prompt, output in zip(batch_ids, batch, raw_outputs, strict=True):
-            if len(output.sequences) != params.beam_width:
+            if len(output.sequences) != expected:
                 reason = (
                     f"V1 returned an unexpected number of beams: "
-                    f"{len(output.sequences)} of {params.beam_width}"
+                    f"{len(output.sequences)} of {expected}"
                 )
                 raise InferenceError({sample_id: reason})
             # Compact output excludes the original prompt. Keep the public SID
@@ -482,17 +484,31 @@ def main() -> int:
             include_stop_str_in_output=True,
         )
         from vllm_gr.config import GRConfig
+        from vllm_gr.config.beam_widths import final_retained_width
+        from vllm_gr.entrypoints.beam_search.request_params import apply_beam_request_defaults
 
         try:
             with GRLLM(**engine_kwargs) as llm:
-                config = GRConfig.from_vllm_config(llm.llm_engine.vllm_config)
+                vllm_config = llm.llm_engine.vllm_config
+                config = GRConfig.from_vllm_config(vllm_config)
                 if config.beam_max_width is None or width != config.beam_max_width:
                     parser.error(
                         "Offline accuracy testing requires V1 and the configured beam width"
                     )
+                effective_params = apply_beam_request_defaults(vllm_config, params)
+                expected_result_count = effective_params.result_width
+                if expected_result_count is None:
+                    expected_result_count = final_retained_width(
+                        effective_params.beam_width, effective_params.dynamic_beam_widths
+                    )
                 gen_start = time.perf_counter()
                 outputs = run_offline_v1_inference(
-                    llm, prompts, params, args.batch_size, sample_ids=sample_ids
+                    llm,
+                    prompts,
+                    params,
+                    args.batch_size,
+                    sample_ids=sample_ids,
+                    expected_result_count=expected_result_count,
                 )
                 gen_end = time.perf_counter()
         except InferenceError as exc:
