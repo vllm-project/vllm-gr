@@ -1,0 +1,29 @@
+{
+  "onerec1b7": {
+    "repo_id": "OpenOneRec/OneRec-1.7B",
+    "revision": "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b",
+    "repo_type": "model",
+    "required_files": [
+      "config.json", "generation_config.json", "tokenizer_config.json",
+      "tokenizer.json", "vocab.json", "merges.txt", "added_tokens.json",
+      "special_tokens_map.json", "model.safetensors.index.json",
+      "model-00000-of-00001.safetensors"
+    ]
+  },
+  "onerec_benchmark": {
+    "repo_id": "OpenOneRec/OpenOneRec-RecIF",
+    "revision": "8f7cf2ee0b949e955a87a708d02024687be232c8",
+    "repo_type": "dataset",
+    "required_files": [
+      "benchmark_data/ad/ad_test.parquet",
+      "benchmark_data/interactive/interactive_test.parquet",
+      "benchmark_data/item_understand/item_understand_test.parquet",
+      "benchmark_data/label_cond/label_cond_test.parquet",
+      "benchmark_data/label_pred/label_pred_test.parquet",
+      "benchmark_data/product/product_test.parquet",
+      "benchmark_data/rec_reason/rec_reason_test.parquet",
+      "benchmark_data/video/video_test.parquet",
+      "benchmark_data/sid2pid.json", "benchmark_data/sid2iid.json"
+    ]
+  }
+}

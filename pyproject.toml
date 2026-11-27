@@ -56,6 +56,10 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-timeout",
     "pytest-cov>=4.0.0",
+    # Test inputs are prepared lazily on the executing runner.
+    "filelock>=3.12",
+    # Transformers/tokenizers in prepared CI runtimes require Hub below 2.x.
+    "huggingface-hub>=0.27,<2.0",
     "types-protobuf",
     "tblib",
     "ruff",
