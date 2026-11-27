@@ -17,7 +17,7 @@
     "tests/benchmarks/test_beam_search_benchmark.py::test_run_once_calls_beam_search_and_reports_metrics": "l1",
     "tests/benchmarks/test_beam_search_benchmark.py::test_single_token_interval_and_vocab_upper_bound": "l1",
     "tests/benchmarks/test_beam_search_benchmark.py::test_spread_synthetic_tokens_cover_the_vocab": "l1",
-    "tests/benchmarks/test_beam_search_benchmark.py::test_synthetic_constraint_document_has_one_path_per_beam": "l1",
+    "tests/benchmarks/test_beam_search_benchmark.py::test_synthetic_constraint_document_supports_requested_widths": "l1",
     "tests/benchmarks/test_beam_search_benchmark.py::test_synthetic_interval_excludes_special_tokens": "l1",
     "tests/benchmarks/test_beam_search_benchmark.py::test_synthetic_interval_rejects_insufficient_or_invalid_bounds": "l1",
     "tests/benchmarks/test_beam_search_benchmark.py::test_timeline_profiles_repeat_runs_and_moves_gzip_trace": "l1",

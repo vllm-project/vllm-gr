@@ -110,8 +110,13 @@ def test_invalid_workload_parameters(tmp_path: Path, overrides: dict[str, int]) 
         workload.build_workload(workload_args(tmp_path, **overrides))
 
 
-def test_synthetic_constraint_document_has_one_path_per_beam(
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("widths", "paths_per_root"), [(None, 1), ([1, 2, 4], 4)]
+)
+def test_synthetic_constraint_document_supports_requested_widths(
     monkeypatch: pytest.MonkeyPatch,
+    widths: list[int] | None,
+    paths_per_root: int,
 ) -> None:
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -126,12 +131,107 @@ def test_synthetic_constraint_document_has_one_path_per_beam(
         layout="spread",
         token_id_start=100,
         token_id_end=500,
+        alternate_beam_widths=widths,
     )
 
-    assert len(document["triples"]) == 4
-    assert all(len(triple) == 3 for triple in document["triples"])
-    flattened = [token for triple in document["triples"] for token in triple]
-    assert len(set(flattened)) == 12
+    triples = {tuple(triple) for triple in document["triples"]}
+    assert len(triples) == len(document["triples"]) == 4 * paths_per_root
+    for root in {triple[0] for triple in triples}:
+        branches = {(child, leaf) for first, child, leaf in triples if first == root}
+        assert len(branches) == paths_per_root
+        assert len({child for child, _ in branches}) == (1 if widths is None else 2)
+    assert len({token for triple in triples for token in triple}) == 12
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_width_switch_keeps_batch_and_counts_same_schedule_outputs() -> None:
+    calls: list[str] = []
+    captures = 0
+
+    class Engine:
+        class llm_engine:
+            @staticmethod
+            def collective_rpc(method: str, *, kwargs: dict[str, bool]) -> list[dict[str, Any]]:
+                assert method == "get_gr_beam_graph_runtime_stats"
+                assert kwargs == {"include_cuda_snapshot": True}
+                return [
+                    {
+                        "cuda_snapshot": {
+                            "captures": captures,
+                            "allocated_bytes": 20,
+                            "reserved_bytes": 32,
+                        }
+                    }
+                ]
+
+        def beam_search(
+            self, prompts: list[dict[str, list[int]]], params: Any, **kwargs: Any
+        ) -> list[SimpleNamespace]:
+            nonlocal captures
+            assert prompts == [{"prompt_token_ids": [1]}, {"prompt_token_ids": [2]}]
+            assert kwargs["concurrency_limit"] == 2
+            if not calls or params.label != calls[-1]:
+                captures += 1
+            calls.append(params.label)
+            # The steady schedules produce different ranks. Change a single
+            # score on the final return to A to check parity is discriminating.
+            output = []
+            for row, prompt in enumerate(prompts):
+                offset = 0 if params.label == "a" else 10
+                output.append(
+                    SimpleNamespace(
+                        sequences=[
+                            SimpleNamespace(
+                                tokens=[*prompt["prompt_token_ids"], 20 + offset + rank],
+                                cum_logprob=-float(rank + (len(calls) == 11 and row == 0)),
+                            )
+                            for rank in range(2)
+                        ]
+                    )
+                )
+            return output
+
+    workload = [{"request_id": str(i), "input_ids": [i]} for i in (1, 2)]
+    params = {
+        "a": SimpleNamespace(label="a", dynamic_beam_widths=[2, 2, 2]),
+        "b": SimpleNamespace(label="b", dynamic_beam_widths=[1, 2, 2]),
+    }
+    result = benchmark._run_width_switch(
+        Engine(), workload, params, Namespace(beam_width=2, warmup_runs=1, repeat=2)
+    )
+
+    assert calls == list("aaabbbababa")
+    assert result["batch_size"] == 2
+    assert result["phases"]["steady_a"]["cuda_graph_captures"] == 0
+    assert result["phases"]["steady_b"]["cuda_graph_captures"] == 0
+    switched = result["phases"]["switching"]
+    assert switched["cuda_graph_captures"] == 5
+    assert switched["outputs_compared"] == 10
+    assert switched["exact_outputs"] == 9
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("widths", [[4, 8], [9, 8, 8], [4, 8, 4], [8, 8, 8]])  # type: ignore[misc]
+def test_width_switch_rejects_incompatible_schedules(widths: list[int]) -> None:
+    args = benchmark.build_parser().parse_args(
+        [
+            "--model",
+            "model",
+            "--output-json",
+            "result.json",
+            "--workload-jsonl",
+            "workload.jsonl",
+            "--token-id-start",
+            "1000",
+            "--token-id-end",
+            "2000",
+            "--beam-width",
+            "8",
+        ]
+    )
+    args.alternate_beam_widths = widths
+    with pytest.raises(ValueError, match="--alternate-beam-widths"):
+        benchmark.validate_args(args)
 
 
 def test_run_once_calls_beam_search_and_reports_metrics() -> None:
