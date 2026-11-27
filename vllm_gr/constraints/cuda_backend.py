@@ -116,6 +116,42 @@ class CUDAConstraintBackend:
             raise RuntimeError("CUDA constraint backend is closed")
         return cast(_ConstraintTables, tables)
 
+    def iid_candidates(
+        self, logits: torch.Tensor, prefixes: torch.Tensor, step: int, trie_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather all legal child logits for the distinct live prefixes of each request."""
+        root, offsets, second, pairs, ends, third = self._tables()
+        meta = self.info.table_metadata
+        rows = prefixes.shape[0]
+        if step == 0 and self._first_token_offsets is None:
+            ids = root.long().expand(rows, -1)
+            valid = torch.ones_like(ids, dtype=torch.bool)
+        else:
+            if step == 0:
+                values, bounds = root, self._first_token_offsets
+                assert bounds is not None
+                keys = trie_ids
+                degree = self._max_first_degree
+            else:
+                keys = prefixes[:, 0].long()
+                if self._first_token_offsets is not None:
+                    keys = trie_ids * meta.vocab_size + keys
+                if step == 1:
+                    values, bounds, degree = second, offsets, meta.max_prefix1_degree
+                else:
+                    keys = torch.searchsorted(pairs, keys * meta.vocab_size + prefixes[:, 1])
+                    values, bounds, degree = third, ends, meta.max_prefix2_degree
+            indices = bounds[keys, None] + torch.arange(degree, device=logits.device)
+            valid = indices < bounds[keys + 1, None]
+            ids = values[indices.clamp_max(values.numel() - 1)].long()
+        offset = 0
+        if logits.shape[1] != meta.vocab_size:
+            if self.vocab_slice is None or logits.shape[1] != self.vocab_slice[1]:
+                raise ValueError("IID logits width differs from the catalog vocabulary window")
+            offset = self.vocab_slice[0]
+        scores = logits.gather(1, ids - offset).float().masked_fill(~valid, -torch.inf)
+        return ids, scores
+
     def _invoke(
         self,
         logits: torch.Tensor,

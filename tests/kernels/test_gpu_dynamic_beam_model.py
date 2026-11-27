@@ -44,8 +44,10 @@ def build_tiny_engine(tmp_path, *, capacity=4, dense_catalog=False, graph=True):
             max_position_embeddings=128,
         )
     ).save_pretrained(model_path)
+    vocab = {f"tok{i}": i for i in range(127)}
+    vocab["<|sid_begin|>"] = 127
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=Tokenizer(WordLevel({f"tok{i}": i for i in range(128)}, unk_token="tok0")),
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="tok0")),
         unk_token="tok0",
         bos_token="tok1",
         eos_token="tok2",
@@ -104,6 +106,7 @@ def build_tiny_engine(tmp_path, *, capacity=4, dense_catalog=False, graph=True):
         model=str(model_path),
         dtype="float16",
         gr=config,
+        enforce_eager=not graph,
         attention_config={"backend": "CUSTOM"},
         async_scheduling=True,
         enable_chunked_prefill=False,
@@ -168,3 +171,69 @@ def test_tiny_model_dynamic_decode(tmp_path):
                     assert 1 <= len(sequences) <= params.result_width
                     assert len(set(sequences)) == len(sequences)
                     assert set(sequences) <= legal
+
+
+@pytest.mark.l3
+@pytest.mark.gpu_test
+def test_tiny_model_iid_sampling(tmp_path):
+    from vllm.inputs import tokens_input
+    from transformers import LlamaForCausalLM
+
+    from vllm_gr.sampling_params import BeamSearchParams
+
+    legal = {(1, 2, 0), (1, 2, 1), (1, 4, 3), (3, 5, 1), (3, 5, 4)}
+    prompt = [1, 4, 2]
+    capacity = 24
+    llm, model_path = build_tiny_engine(tmp_path, capacity=capacity, graph=False)
+    with llm:
+        # Compute an independent reference by running the entire prompt plus
+        # each selected prefix through the original model, with no shared KV.
+        reference = LlamaForCausalLM.from_pretrained(model_path).eval()
+        prefix: tuple[int, ...] = ()
+        with torch.no_grad():
+            for step in range(3):
+                allowed = sorted({s[step] for s in legal if s[:step] == prefix})
+                logits = reference(torch.tensor([[*prompt, 127, *prefix]])).logits[0, -1]
+                prefix += (allowed[logits[allowed].argmax().item()],)
+        greedy = llm.sample_sids(prompt, capacity, top_k=1, seed=10)
+        assert greedy.counts == {prefix: capacity}
+        assert greedy.rows_per_stage == (1, 1, 1)
+        result = llm.sample_sids(prompt, capacity, seed=41)
+        assert sum(result.counts.values()) == capacity
+        assert set(result.counts) <= legal
+        assert result.rows_per_stage == (1, 2, 3)
+        runner = (
+            llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
+        )
+        prompts = [prompt, [1, 3, 5]]
+        bags = llm.sample_sids_batch(prompts, capacity, seed=41)
+        assert len(bags) == 2
+        state = runner._gr_gpu_stage_runner.iid
+        # A full model forward per prefix independently checks branching and the
+        # request-local suffix KV parent map for both users in the same batch.
+        for member, history in enumerate(prompts):
+            bag = bags[member]
+            assert sum(bag.counts.values()) == capacity and set(bag.counts) <= legal
+            expected: dict[tuple[int, ...], float] = {(): 0.0}
+            with torch.no_grad():
+                for step in range(3):
+                    next_scores = {}
+                    for parent, score in expected.items():
+                        allowed = sorted({s[step] for s in legal if s[:step] == parent})
+                        logits = reference(torch.tensor([[*history, 127, *parent]])).logits[0, -1]
+                        for child, lp in zip(allowed, logits[allowed].log_softmax(0), strict=True):
+                            next_scores[(*parent, child)] = score + lp.item()
+                    expected = next_scores
+            mask = state.members == member
+            for sid, score in zip(
+                state.sequence[mask].tolist(), state.scores[mask].tolist(), strict=True
+            ):
+                assert score == pytest.approx(expected[tuple(sid)], abs=0.005)
+        assert bags == llm.sample_sids_batch(prompts, capacity, seed=41)
+        # Switching between search policies must retire and replace their state.
+        params = BeamSearchParams(
+            beam_width=capacity, result_width=1, max_tokens=3, ignore_eos=True
+        )
+        output = llm.beam_search([tokens_input(prompt + [127])], params, output_mode="compact")
+        assert output[0].sequences[0].token_ids in legal
+        assert llm.sample_sids(prompt, capacity, seed=41) == result
