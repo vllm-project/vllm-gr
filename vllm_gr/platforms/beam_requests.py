@@ -33,6 +33,23 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
     gr_config = GRConfig.from_vllm_config(config)
     if gr_config.beam_sid_stage_vocab and device != "npu":
         raise ValueError("beam.sid_stage_vocab requires NPU ModelRunner V1")
+    stage_ids = gr_config.beam_sid_stage_token_ids
+    if stage_ids is not None:
+        if device != "cuda" or getattr(config, "use_v2_model_runner", False):
+            raise ValueError("gr.sid_stage_token_ids requires CUDA ModelRunner V1")
+        if request is not None and request.beam_params.max_tokens > len(stage_ids):
+            raise ValueError("Beam generation steps exceed the configured gr.sid_stage_token_ids")
+        model = getattr(config, "model_config", None)
+        get_vocab_size = getattr(model, "get_vocab_size", None)
+        vocab_size = (
+            get_vocab_size() if callable(get_vocab_size) else getattr(model, "vocab_size", None)
+        )
+        max_token_id = gr_config.beam_sid_max_token_id
+        if type(vocab_size) is int and max_token_id is not None and max_token_id >= vocab_size:
+            raise ValueError(
+                f"gr.sid_stage_token_ids includes token ID {max_token_id} outside the "
+                f"model vocabulary of size {vocab_size}"
+            )
     if device == "npu":
         from vllm_gr.platforms.ascend.admission import validate_npu_device_config
 

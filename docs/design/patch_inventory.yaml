@@ -239,6 +239,7 @@ patches:
       - tests/v1/worker/test_gr_startup.py
       - tests/tools/test_cuda_stage_typing.py
       - tests/e2e/test_modelrunner_v2_stage_parity_st.py
+      - tests/e2e/test_cuda_sid_stage_token_ids.py
     process_roles: [gpu_worker]
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner, vllm.v1.worker.gpu.model_runner.GPUModelRunner, vllm.v1.worker.gpu_worker.Worker.init_device, and vllm.v1.worker.gpu_worker.Worker.reload_trie
     risk: critical

@@ -228,7 +228,7 @@ def _primitive(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, tuple):
-        return list(value)
+        return [_primitive(item) for item in value]
     return value
 
 

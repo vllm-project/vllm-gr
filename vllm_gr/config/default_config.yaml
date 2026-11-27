@@ -31,6 +31,7 @@ gr:
   result_width: null                       # Returned sequences; 1..last beam_width; null: use the last beam_width.
   constraint_mode: none                    # none: unconstrained; table: use a table built for the inference model.
   constraint_table: null                   # Required in table mode. Paths resolve relative to the declaring YAML.
+  sid_stage_token_ids: null                # CUDA ModelRunner V1: explicit token ID lists for up to three Beam stages.
 
   # Build a table from the repository root; replace --model with the inference model directory.
   # Generate the OneRec video SID triples using tools/AB_Tests/README.md.

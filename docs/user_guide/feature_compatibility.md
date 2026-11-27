@@ -26,6 +26,7 @@ The matrix describes the documented runtime paths and their configuration limits
 | Online catalog replacement | Supported on the asynchronous Beam path | Compile and load the new table at startup | [Model and catalog updates](weight_update.md) |
 | NPU decode execution modes (`xllm`, `cascade`) | Not applicable | Supported | [Decode execution](../design/feature/npu_decode_execution.md) |
 | SID stage projection for catalog-free generation | Not applicable | Supported | [Beam Search on NPU](beam_search_npu.md) |
+| Explicit SID stage token IDs | ModelRunner V1 | Not applicable | [CUDA stage token IDs](../configuration/README.md#explicit-cuda-sid-stage-token-ids) |
 | Caller-owned XAttention output binding | Not applicable | Optional, separate build | [XAttention output](../design/feature/npu_decode_execution.md#caller-owned-xattention-output) |
 
 ## How to read this matrix
