@@ -57,8 +57,11 @@ class BeamSessionRegistry:
     def allocate(self, session_id: str, beam_width: int, prefix_len: int) -> int:
         """Allocate a slot for a new session.
 
-        Returns the slot index. Raises RuntimeError if no free slots.
+        Returns the slot index. Raises RuntimeError for an existing session ID
+        or if no free slots are available. Rejected allocations preserve state.
         """
+        if session_id in self._slot_map:
+            raise RuntimeError(f"Beam session {session_id!r} already allocated")
         if not self._free_slots:
             raise RuntimeError(
                 f"No free beam session slots (max_batch={self.max_batch}). "
