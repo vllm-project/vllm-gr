@@ -740,8 +740,14 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
 
 @pytest.mark.parametrize("device", ["cuda", "cpu", "privateuseone"])  # type: ignore[misc]
 @pytest.mark.parametrize("enabled", [None, False, True])  # type: ignore[misc]
-def test_create_beam_context_uses_grconfig_params(device: str, enabled: bool | None) -> None:
+def test_create_beam_context_uses_grconfig_params(
+    device: str, enabled: bool | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """_create_beam_context must pass gr_cfg.max_width/max_decode_steps."""
+    from vllm_gr.utils import accelerator
+
+    # Model NVIDIA CUDA, where the fused short-suffix kernel is available.
+    monkeypatch.setattr(accelerator, "is_rocm", lambda: False)
     from unittest.mock import MagicMock, patch
 
     gr_cfg = GRConfig(beam_max_width=64, beam_max_decode_steps=10)

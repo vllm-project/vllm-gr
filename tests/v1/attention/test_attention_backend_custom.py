@@ -19,6 +19,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _simulate_nvidia_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These host tests model NVIDIA CUDA; keep a ROCm host from leaking in."""
+    from vllm_gr.utils import accelerator
+
+    monkeypatch.setattr(accelerator, "is_rocm", lambda: False)
+
+
 class TestCustomAttentionBackendMarker(unittest.TestCase):
     """Verify CUSTOM backend marker persistence across CLI/API paths."""
 

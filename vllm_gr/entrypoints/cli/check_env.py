@@ -9,6 +9,13 @@ from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
+def _is_rocm_platform(platform: object) -> bool:
+    from vllm_gr.platforms.identity import platform_identity
+    from vllm_gr.platforms.rocm import ROCM_BACKEND
+
+    return ROCM_BACKEND.matches(platform_identity(platform))
+
+
 class CheckEnvSubcommand(CLISubcommand):
     """Validate the runtime packages and accelerator backend."""
 
@@ -26,6 +33,10 @@ class CheckEnvSubcommand(CLISubcommand):
             from vllm_gr.platforms.ascend.environment import check_ascend_environment
 
             report = check_ascend_environment(require_npu_platform=True)
+        elif _is_rocm_platform(current_platform):
+            from vllm_gr.platforms.rocm import ROCM_BACKEND
+
+            report = ROCM_BACKEND.check_environment()
         else:
             report = check_vllm_runtime()
             report["platform"] = detected_device
