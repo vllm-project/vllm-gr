@@ -49,11 +49,11 @@ def test_allocation_contract(dtype: torch.dtype) -> None:
     assert pool.unshared_key.data_ptr() != pool.unshared_value.data_ptr()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.int8])  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", [torch.float64, torch.int8])  # type: ignore[misc]
 def test_pool_rejects_non_activation_dtype(dtype: torch.dtype) -> None:
     with pytest.raises(
         ValueError,
-        match="dtype must be torch.float16 or torch.bfloat16",
+        match="dtype must be float16, bfloat16 or float32",
     ):
         _make_pool(dtype=dtype)
 

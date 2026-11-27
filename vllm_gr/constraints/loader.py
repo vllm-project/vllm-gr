@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -28,7 +28,6 @@ from vllm_gr.constraints.backend import (
     ConstraintMetadata,
 )
 from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
-from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
 from vllm_gr.constraints.npu_tables import (
     NPUStageVocab,
@@ -40,12 +39,15 @@ from vllm_gr.constraints.table import (
     ConstraintTable,
     token_id_window,
 )
-from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
 from vllm_gr.ops.npu.rec_constrained_topk import (
     MAX_TOP_K,
     NPUConstraintOp,
     resolve_rec_constrained_topk_npu,
 )
+
+if TYPE_CHECKING:
+    # CUDA modules import Triton; keep them lazy so CPU-only installs load.
+    from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 
 _LOGIT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _READINESS_BACKGROUND_LOGIT = -0.25
@@ -274,6 +276,8 @@ def _upload_cuda_backend(
     max_top_k: int,
     max_rows: int,
 ) -> tuple[CUDAConstraintBackend, tuple[_ReadyCase, ...]]:
+    from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
+
     validate_cuda_sort_capacity(
         table.max_first_degree,
         table.metadata.max_prefix1_degree,
@@ -300,6 +304,8 @@ def _upload_cuda_backend(
             host_memory_bytes=0,
             device_memory_bytes=_unique_storage_bytes(device_tables),
         )
+        from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
+
         backend = CUDAConstraintBackend(
             first_token_ids=device_tables["first_token_ids"],
             prefix1_offsets=device_tables["prefix1_offsets"],

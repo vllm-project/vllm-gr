@@ -48,7 +48,10 @@ def validate_gr_execution_runtime(config: Any) -> None:
     ):
         raise ValueError("Asynchronous scheduling requires a uniform text decoder model")
     dtype = getattr(model, "dtype", None)
-    if dtype is not None and str(dtype) not in ("torch.float16", "torch.bfloat16"):
+    dtypes = ("torch.float16", "torch.bfloat16")
+    if str(getattr(getattr(config, "device_config", None), "device_type", "")) == "cpu":
+        dtypes += ("torch.float32",)  # CPU reference attention
+    if dtype is not None and str(dtype) not in dtypes:
         raise ValueError("Asynchronous scheduling requires FP16 or BF16")
     if getattr(model, "quantization", None) is not None:
         raise ValueError("Asynchronous scheduling does not support quantization")

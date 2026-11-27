@@ -96,9 +96,9 @@ def test_constructor_allocates_frozen_storage_contract(dtype: torch.dtype) -> No
 def test_context_rejects_unsupported_activation_dtype() -> None:
     with pytest.raises(
         ValueError,
-        match="dtype must be torch.float16 or torch.bfloat16",
+        match="dtype must be float16, bfloat16 or float32",
     ):
-        _make_context(dtype=torch.float32)
+        _make_context(dtype=torch.float64)
 
 
 def test_session_references_shared_context() -> None:

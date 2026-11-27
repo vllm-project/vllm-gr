@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import torch
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+# FP32 pools serve the CPU reference attention.
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def _validate_pool_dtype(dtype: torch.dtype) -> None:
@@ -23,7 +24,7 @@ def _validate_pool_dtype(dtype: torch.dtype) -> None:
         raise TypeError(f"dtype must be a torch.dtype, got {type(dtype).__name__}")
     if dtype not in _SUPPORTED_DTYPES:
         raise ValueError(
-            f"BeamAttentionPool dtype must be torch.float16 or torch.bfloat16, got {dtype}"
+            f"BeamAttentionPool dtype must be float16, bfloat16 or float32, got {dtype}"
         )
 
 

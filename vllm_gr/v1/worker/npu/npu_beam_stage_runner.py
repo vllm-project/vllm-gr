@@ -420,7 +420,10 @@ class NPUEagerBeamStageRunner:
             self.worker._current_beam_info["req_ids"] = list(execution.request_ids)
         out = original(self.worker, prepared_output, prepared_counts)
         logits_indices, spec_metadata, total = out
-        if execution.kind == "decode" and total != plan.model_token_count:
+        # vLLM-Ascend returns the token count; the native (CPU) GPUModelRunner
+        # contract returns max_num_sampled_tokens and reads the count itself.
+        native_contract = str(self.worker.device).startswith("cpu")
+        if execution.kind == "decode" and not native_contract and total != plan.model_token_count:
             raise RuntimeError(
                 "NPU Decode input preparation did not preserve the physical "
                 f"B*W token count: {total} != {plan.model_token_count}"
@@ -449,7 +452,8 @@ class NPUEagerBeamStageRunner:
                 device=positions.device,
                 req_ids_key=execution.request_ids,
             )
-            total = plan.model_token_count
+            if not native_contract:
+                total = plan.model_token_count
         logits_indices = _materialize_logits_indices(self.worker, list(plan.logits_indices))
         return logits_indices, spec_metadata, total
 

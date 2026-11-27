@@ -703,7 +703,10 @@ class BeamAttentionImpl(AttentionImpl):
 @register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
     accept_output_buffer = True
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    # The CPU reference attention computes in FP32 and also accepts FP32 models.
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16] + (
+        [] if CUDA_DEVICE or NPU_DEVICE else [torch.float32]
+    )
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:

@@ -112,7 +112,8 @@ def execute_gr_stage(
             local,
             hooks_type=hooks_type,
         )
-    elif device_type == "npu":
+    elif device_type in ("npu", "cpu"):
+        # The eager NPU stage runner is plain PyTorch and also drives CPU.
         from vllm_gr.v1.worker.npu.npu_beam_stage_runner import get_npu_stage_runner
 
         stage_runner = get_npu_stage_runner(worker, local)
@@ -134,7 +135,7 @@ def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
         from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
             execute_gr_retirement as retire,
         )
-    elif device_type == "npu":
+    elif device_type in ("npu", "cpu"):
         from vllm_gr.v1.worker.npu.npu_beam_stage_runner import (
             execute_npu_gr_retirement,
         )

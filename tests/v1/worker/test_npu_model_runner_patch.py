@@ -1343,7 +1343,7 @@ def test_npu_capability_gate_allows_graph_mode_and_remains_npu_only() -> None:
     validate_npu_eager_capabilities(worker)
 
     worker.device = "cuda"
-    with pytest.raises(ValueError, match="NPU worker"):
+    with pytest.raises(ValueError, match="NPU or CPU worker"):
         validate_npu_eager_capabilities(worker)
 
 

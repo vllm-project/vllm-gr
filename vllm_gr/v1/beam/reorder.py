@@ -198,21 +198,23 @@ def reorder_unshared_kv(
     key_caches = [p.unshared_key for p in pools]
     value_caches = [p.unshared_value for p in pools]
     if aux_key is not None and aux_value is not None:
-        from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_fused
+        # The fused kernel is Triton; other devices use the reference below.
+        if parent.is_cuda:
+            from vllm_gr.ops.cuda.beam_kv_reorder import select_unshared_kv_fused
 
-        if select_unshared_kv_fused(
-            parent,
-            slot,
-            key_caches,
-            value_caches,
-            decode_step,
-            aux_key=aux_key,
-            aux_value=aux_value,
-            pool_key_ptrs=pool_key_ptrs,
-            pool_value_ptrs=pool_value_ptrs,
-            validate_layout=not layout_prevalidated,
-        ):
-            return
+            if select_unshared_kv_fused(
+                parent,
+                slot,
+                key_caches,
+                value_caches,
+                decode_step,
+                aux_key=aux_key,
+                aux_value=aux_value,
+                pool_key_ptrs=pool_key_ptrs,
+                pool_value_ptrs=pool_value_ptrs,
+                validate_layout=not layout_prevalidated,
+            ):
+                return
 
         # Build per-layer aux slices from the [num_layers, ...] buffer so the
         # reference path reuses the same allocation instead of .clone().
