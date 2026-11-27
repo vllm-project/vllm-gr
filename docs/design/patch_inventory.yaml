@@ -13,6 +13,8 @@ current_runtime:
   npu:
     vllm: "0.30.0"
     vllm_ascend: "0.30.0rc2"
+  xpu:
+    vllm: "0.30.0"
 
 patches:
   - id: GR-PATCH-000
@@ -43,6 +45,7 @@ patches:
       - tests/v1/test_ascend_compat.py::test_selector_cache_reset_preserves_installed_callable
       - tests/engine/test_gr_config.py::test_attention_selector_config_reader_propagates_validation_errors
       - tests/integration/test_ascend_attention_backend.py
+      - tests/platforms/test_xpu_backend.py::test_xpu_selector_uses_provider_and_preserves_native_selection
     process_roles: [engine_core, worker]
     target: vllm.v1.attention.selector._cached_get_attn_backend
     risk: critical
@@ -382,6 +385,22 @@ patches:
     risk: high
     contract: npu-contiguous-prefix-kv-allocation
     removal_condition: Ascend exposes a backend contiguous-KV capability covering GR xllm without a native policy bridge
+
+  - id: GR-PATCH-023
+    scope: backend
+    backend_id: xpu
+    owner: vllm_gr/v1/worker/xpu/runner.py
+    installer: vllm_gr.v1.worker.xpu.runner.install
+    activation: the native XPU provider installs its V2 runner adapter before model load
+    validator_or_test:
+      - vllm_gr.v1.worker.xpu.runner.is_patched
+      - tests/platforms/test_xpu_backend.py
+      - examples/offline_inference/beam_search/xpu_beam_search.py
+    process_roles: [main, engine_core, worker]
+    target: XPUModelRunnerV2.execute_model, sample_tokens, load_model, shutdown, and prepare_inputs
+    risk: high
+    contract: xpu-native-v2-eager-v1
+    removal_condition: upstream exposes persistent Beam execution and lifecycle extension points on XPU
 
 # IDs are retained here when the installer and its legacy surface have been removed.
 retired_patches:

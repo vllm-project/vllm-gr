@@ -1,0 +1,8 @@
+-r common.txt
+
+# Prepare the Intel XPU Torch/vLLM base runtime before installing GR.
+# XPU runtime validation is owned by platforms/xpu/provider.py.
+numpy>=2.0
+opencv-python-headless>=4.13.0
+# datasets 5.2 requires PyArrow >=24; keep GR's shared PyArrow 23 baseline.
+datasets<5.2

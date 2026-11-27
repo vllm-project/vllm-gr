@@ -17,6 +17,16 @@ def _get_current_gr_attention_backend() -> GRAttentionBackend | None:
 
 
 def _get_custom_beam_backend() -> type:
+    from vllm_gr.platforms.errors import BackendNotActiveError
+    from vllm_gr.platforms.registry import get_active_backend
+
+    try:
+        provider = get_active_backend()
+    except BackendNotActiveError:
+        provider = None
+    factory = getattr(provider, "get_attention_backend", None)
+    if callable(factory):
+        return cast(type[Any], factory())
     from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
 
     return cast(type[Any], BeamAttentionBackend)

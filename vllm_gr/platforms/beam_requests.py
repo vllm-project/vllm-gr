@@ -26,7 +26,7 @@ def _device_type(config: Any, *, default: str | None = None) -> str | None:
 def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
     """Check execution support without importing a device runtime."""
     device = _device_type(config)
-    if device not in (None, "cuda", "npu"):
+    if device not in (None, "cuda", "npu", "xpu"):
         raise ValueError(
             "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
         )
@@ -37,6 +37,12 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
         from vllm_gr.platforms.ascend.admission import validate_npu_device_config
 
         validate_npu_device_config(config, gr_config, request)
+    if device == "xpu":
+        from vllm_gr.platforms.xpu.provider import XPUConfigService
+
+        XPUConfigService().validate_engine(config, gr_config)
+        if request is not None:
+            XPUConfigService.validate_request(request)
 
 
 def validate_decode_token_budget(request: BeamBatchRequest, config: Any) -> None:
@@ -64,7 +70,7 @@ def uses_retained_candidate_widths(config: GRConfig, device: object) -> bool:
 
 
 def validate_dynamic_width_support(config: Any) -> None:
-    if _device_type(config, default="cuda") not in ("cuda", "npu"):
+    if _device_type(config, default="cuda") not in ("cuda", "npu", "xpu"):
         raise ValueError("dynamic_beam_widths and result_width require CUDA or NPU beam_search")
 
 
@@ -73,7 +79,7 @@ def validate_frontend_constraint_mode(
 ) -> None:
     device = _device_type(config, default="cuda")
     if configured_constraint_mode(gr_config) is ConstraintMode.NONE:
-        if device not in ("cuda", "npu"):
+        if device not in ("cuda", "npu", "xpu"):
             raise ValueError("unconstrained beam_search requires CUDA or NPU")
         return
 

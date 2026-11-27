@@ -207,6 +207,16 @@ Installer: `vllm_gr.v1.worker.npu.kv_layout_patch.apply_npu_contiguous_kv_cache_
 
 Risk: `high`; process roles: `npu_worker`
 
+### GR-PATCH-023 — XPU ModelRunner V2 Adapter
+
+Scope: `backend`; backend ID: `xpu`
+
+Owner: `vllm_gr/v1/worker/xpu/runner.py`
+
+Installer: `vllm_gr.v1.worker.xpu.runner.install`
+
+Risk: `high`; process roles: `main`, `engine_core`, `worker`
+
 ## Retired patches
 
 Retired IDs stay in the YAML inventory for traceability. They have no active

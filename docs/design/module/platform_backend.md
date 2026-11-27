@@ -3,8 +3,10 @@
 A provider binds GR operations to the active vLLM platform. Registry state is
 process-local module state: each frontend, EngineCore and worker process
 resolves its own provider, and an in-process EngineCore shares the frontend's
-registry. The built-in backend IDs are `cuda` and `ascend`, with device types
-`cuda` and `npu` respectively.
+registry. The built-in backend IDs are `cuda`, `ascend` and `xpu`, with device
+types `cuda`, `npu` and `xpu` respectively. The experimental XPU provider has
+an independent eager V2 Beam adapter on vLLM 0.30; see the
+[XPU guide](../../getting_started/installation/xpu.md) for its narrower contract.
 
 ## Registration and activation
 
@@ -57,6 +59,7 @@ operations. `platforms/protocol.py` keeps the original imports available.
 | `apply_runtime_patches` | Install early backend-specific compatibility. On Ascend this includes spawn protection and worker initialization. |
 | `get_model_runner_hooks` | Return the backend's ModelRunner installer (`install`, `is_patched`) or, for legacy patch-hook providers, its patch hooks. |
 | `get_attention_execution` | Expose its Beam attention primitives. |
+| `get_attention_backend` | Optionally provide the native CUSTOM backend class; providers without this factory keep the shared facade. |
 | `create_constrained_topk_execution` | Construct the selection implementation for the target device. |
 | `create_config_service` | Optionally supply host defaults and admission through `BackendConfigService`. |
 

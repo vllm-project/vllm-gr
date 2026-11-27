@@ -73,7 +73,7 @@ def test_common_and_selected_provider_patch_ownership_is_unique(
     patches = inventory["patches"]
     assert all(
         (p["scope"] == "core" and p["backend_id"] is None)
-        or (p["scope"] == "backend" and p["backend_id"] in {"cuda", "ascend"})
+        or (p["scope"] == "backend" and p["backend_id"] in {"cuda", "ascend", "xpu"})
         for p in patches
     )
     platforms = {
