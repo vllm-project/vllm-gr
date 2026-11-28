@@ -60,6 +60,8 @@ def validate_dispatch_request(request: BeamBatchRequest, *, trie_count: int | No
             raise ValueError("beam_search does not support multimodal inputs or LoRA")
         if params is None or params.ignore_eos is not True:
             raise ValueError("beam_search requires ignore_eos=True")
+        if params.structured_outputs is not None:
+            raise ValueError("beam_search does not support native structured_outputs")
         if params.max_tokens != request.beam_params.max_tokens or params.n != 1:
             raise ValueError("native and Beam generation budgets must match and n must be 1")
     _validate_gr_generation_params(request.beam_params)

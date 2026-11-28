@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import msgspec
 import numpy as np
 import pytest
+from vllm.sampling_params import StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher
@@ -156,6 +157,23 @@ def test_negative_tokens_rejected_before_preprocessing(core, monkeypatch, via_so
     core._handle_submit_gr_session(batch("valid-after-negative"))
     core._process_input_queue()
     complete(core, "valid-after-negative")
+
+
+@pytest.mark.l1
+def test_native_structured_outputs_rejected_before_preprocessing(core, monkeypatch):
+    bad = make_multi_batch_request()
+    bad.items[1].request.sampling_params.structured_outputs = StructuredOutputsParams(
+        choice=["yes"]
+    )
+    preprocess = Mock(wraps=core.preprocess_add_request)
+    monkeypatch.setattr(core, "preprocess_add_request", preprocess)
+
+    core._handle_submit_gr_session(bad)
+
+    preprocess.assert_not_called()
+    assert core.input_queue.empty()
+    assert_one_error(core, bad.batch_id, client=bad.items[0].request.client_index)
+    assert not core.scheduler.requests
 
 
 @pytest.mark.parametrize("counts", [[1], [2, 2], [1, 2], [], [0]])
