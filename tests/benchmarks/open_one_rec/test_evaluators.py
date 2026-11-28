@@ -142,8 +142,13 @@ def test_reason_judge_averages_integer_sample_scores() -> None:
     ],
 )
 def test_reason_judge_factory_uses_configured_http_endpoint(
-    tmp_path: Path, use_async: bool, response_kind: str, expected_error: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_async: bool,
+    response_kind: str,
+    expected_error: str | None,
 ) -> None:
+    monkeypatch.setenv("no_proxy", "*")
     requests: list[dict[str, Any]] = []
 
     class JudgeServer(BaseHTTPRequestHandler):
