@@ -27,7 +27,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from tests.helpers.beam_requests import make_batch_request
+from tests.helpers.beam_requests import make_batch_request, make_multi_batch_request
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchOutput,
     BeamBatchResult,
@@ -452,6 +452,51 @@ def test_prefix_cache_hit_reuses_only_full_prompt_blocks(scheduler):
     m = getattr(output, GR_STAGE_OUTPUT_ATTR)["B"]
     assert m.produces_output and m.stage_index == 0
     assert len(scheduler.kv_cache_manager.get_blocks("B").blocks[0]) == 3
+
+
+@pytest.mark.l1
+@pytest.mark.parametrize("scheduler", [True], indirect=True)
+@pytest.mark.parametrize(
+    ("prompt_length", "token_budget", "physical_blocks"),
+    [
+        pytest.param(33, 64, 4, id="prefill-budget"),
+        pytest.param(49, 128, 5, id="kv-capacity"),
+    ],
+)
+def test_warm_prefix_batch_fits_one_prefill(
+    scheduler, prompt_length, token_budget, physical_blocks
+):
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+
+    add(scheduler, "warmup", prompt=prompt_length, n=1)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, receipt(output))
+    assert not scheduler.has_requests()
+
+    scheduler.max_num_scheduled_tokens = token_budget
+    scheduler.scheduler_config.max_num_batched_tokens = token_budget
+    block_hasher = get_request_block_hasher(16, sha256)
+    batch = make_multi_batch_request()
+    requests = []
+    for index, item in enumerate(batch.items):
+        item.request.prompt_token_ids = np.full(prompt_length, 1, dtype=np.int64)
+        item.request.prompt_token_ids[-1] = index + 2
+        request = Request.from_engine_core_request(item.request, block_hasher=block_hasher)
+        request.gr_batch_request = batch
+        requests.append(request)
+    for request in requests:
+        scheduler.add_request(request)
+
+    request_ids = [request.request_id for request in requests]
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == dict.fromkeys(request_ids, 1)
+    block_ids = {
+        block_id
+        for request_id in request_ids
+        for block_id in scheduler.kv_cache_manager.get_block_ids(request_id)[0]
+    }
+    assert len(block_ids) == physical_blocks
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])

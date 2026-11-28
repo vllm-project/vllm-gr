@@ -186,7 +186,7 @@ def apply_scheduler_patch():
                 )
                 if duplicate_id is not None:
                     raise GRAdmissionError(f"GR request already exists: {duplicate_id}")
-                session = _prepare_gr_session(self, batch_request)
+                session = _prepare_gr_session(self, batch_request, first_native_request=request)
                 result = original_add_request(self, request)
                 _register_gr_session(self, session)
                 return result
@@ -549,6 +549,9 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         # drained, together with a genuinely finished native output.
         for session in updated_sessions:
             _finalize_ready_gr_session(self, result, session)
+        owner = sessions.get(getattr(self, "_gr_owner", None))
+        if owner is not None and not owner.issued_stages and owner.terminal_result_pending:
+            _finalize_ready_gr_session(self, result, owner)
 
         return result
 
