@@ -212,7 +212,10 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     if len(request.items) > getattr(scheduler_config, "max_num_seqs", len(request.items)):
         raise BeamSearchRequestError("Beam batch size exceeds max_num_seqs")
     total_prompt_tokens = sum(prompt_lengths)
-    if total_prompt_tokens > scheduler_config.max_num_batched_tokens:
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if total_prompt_tokens > scheduler_config.max_num_batched_tokens and not getattr(
+        cache_config, "enable_prefix_caching", False
+    ):
         raise BeamSearchRequestError(
             f"Prefill length {total_prompt_tokens} exceeds max_num_batched_tokens "
             f"{scheduler_config.max_num_batched_tokens}"

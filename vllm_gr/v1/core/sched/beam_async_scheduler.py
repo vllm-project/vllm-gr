@@ -8,12 +8,16 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any
 
+from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+
 from vllm_gr.config.execution import validate_gr_execution_config
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchRequest,
     BeamBatchResult,
     GRAdmissionError,
+    admission_rejected,
 )
 from vllm_gr.v1.beam.dispatch import (
     GR_BATCH_RESULT_ATTR,
@@ -146,6 +150,24 @@ def gr_admission(scheduler: Any):
 
     owner_ids = owner.request_ids
     owner_id_set = frozenset(owner_ids)
+    pinned_blocks = ()
+    if (
+        not owner.issued_stages
+        and can_issue_gr_stage(scheduler, owner)
+        and manager.enable_caching
+        and scheduler.pause_state == PauseState.UNPAUSED
+    ):
+        requests = tuple(scheduler.requests[request_id] for request_id in owner_ids)
+        error, _ = _prefill_capacity(scheduler, requests, owner.max_decode_steps)
+        if error is not None:
+            error, pinned_blocks = _prefill_capacity(
+                scheduler, requests, owner.max_decode_steps, use_prefix_cache=True
+            )
+            if error is not None:
+                _begin_terminal_drain(owner, admission_rejected(owner.session_id, error))
+            else:
+                # A miss on an earlier member must not evict a later member's hit.
+                manager.block_pool.touch(pinned_blocks)
 
     def reserve(request, num_new_tokens, *args, **kwargs):
         if request.request_id not in owner_id_set:
@@ -171,6 +193,8 @@ def gr_admission(scheduler: Any):
         scheduler.waiting, scheduler.skipped_waiting = waiting, skipped
         scheduler.max_num_scheduled_tokens = budget
         manager.allocate_slots = allocate
+        if pinned_blocks:
+            manager.block_pool.free_blocks(pinned_blocks)
 
 
 def _drain_resources(scheduler: Any, session: GRSessionState) -> None:
@@ -266,7 +290,58 @@ def _install_gr_prompt_cache_guard(scheduler: Any) -> None:
     manager._gr_prompt_cache_guard = True
 
 
-def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionState:
+def _prefill_capacity(
+    scheduler: Any,
+    requests: tuple[Any, ...],
+    max_decode_steps: int,
+    *,
+    use_prefix_cache: bool = False,
+    sequence_limit_exceeded: bool = False,
+) -> tuple[str | None, tuple[Any, ...]]:
+    """Return the rejection reason or the distinct cache hits for an admissible batch."""
+    manager = getattr(scheduler, "kv_cache_manager", None)
+    prefill_tokens = 0
+    new_blocks = 0
+    cached_blocks: dict[int, Any] = {}
+    for request in requests:
+        prompt_length = len(request.prompt_token_ids)
+        prefill_tokens += prompt_length
+        if manager is not None:
+            block_size = scheduler.cache_config.block_size
+            new_blocks += (prompt_length + max_decode_steps + block_size - 1) // block_size
+        if use_prefix_cache and manager.prefix_cache_lookup_enabled(request):
+            # Use the lookup alone: native scheduling owns cache events and counters.
+            (blocks,), hit_tokens, _ = manager.coordinator.find_longest_cache_hit(
+                request.block_hashes, request.num_tokens - 1
+            )
+            prefill_tokens -= hit_tokens
+            new_blocks -= len(blocks)
+            cached_blocks.update((block.block_id, block) for block in blocks)
+    if use_prefix_cache and len(requests) > 1:
+        new_blocks += manager.watermark_blocks
+    if (
+        manager is not None
+        and new_blocks + len(cached_blocks) > manager.block_pool.num_gpu_blocks - 1
+    ):
+        return "Asynchronous scheduling batch exceeds the total native KV capacity", ()
+    if sequence_limit_exceeded:
+        return "Beam batch size exceeds the native Scheduler max_num_seqs", ()
+    token_budget = getattr(scheduler.scheduler_config, "max_num_batched_tokens", prefill_tokens)
+    scheduled_limit = getattr(scheduler, "max_num_scheduled_tokens", None)
+    if scheduled_limit is not None:
+        token_budget = min(token_budget, scheduled_limit)
+    if prefill_tokens > token_budget:
+        error = (
+            "Beam batch Prefill exceeds the effective native scheduling token "
+            "budget; chunked Prefill is not supported by this scheduling layer"
+        )
+        return error, ()
+    return None, tuple(cached_blocks.values())
+
+
+def _prepare_gr_session(
+    scheduler: Any, request: BeamBatchRequest, *, first_native_request: Any = None
+) -> GRSessionState:
     """Validate admission without mutating session, owner or capacity state."""
     if not scheduler.scheduler_config.async_scheduling:
         raise RuntimeError("beam_search requires vLLM async_scheduling")
@@ -307,45 +382,51 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     except ValueError as error:
         raise GRAdmissionError(str(error)) from error
     manager = getattr(scheduler, "kv_cache_manager", None)
+    max_decode_steps = request.beam_params.max_tokens - 1
     if manager is not None:
-        pool = manager.block_pool
-        block_size = scheduler.cache_config.block_size
-        required_blocks = 0
         for engine_request in engine_requests:
-            extent = len(engine_request.prompt_token_ids) + request.beam_params.max_tokens - 1
-            required_blocks += (extent + block_size - 1) // block_size
-            if extent >= manager.max_model_len:
+            if len(engine_request.prompt_token_ids) + max_decode_steps >= manager.max_model_len:
                 raise GRAdmissionError(
                     "Asynchronous scheduling request exceeds the total native KV capacity"
                 )
-        if required_blocks > pool.num_gpu_blocks - 1:
-            raise GRAdmissionError(
-                "Asynchronous scheduling batch exceeds the total native KV capacity"
-            )
     scheduler_config = scheduler.scheduler_config
     max_num_seqs = getattr(scheduler_config, "max_num_seqs", len(engine_requests))
-    if len(engine_requests) > max_num_seqs:
-        raise GRAdmissionError("Beam batch size exceeds the native Scheduler max_num_seqs")
-    total_prompt_tokens = sum(
-        len(engine_request.prompt_token_ids) for engine_request in engine_requests
+    sequence_limit_exceeded = len(engine_requests) > max_num_seqs
+    error, _ = _prefill_capacity(
+        scheduler,
+        engine_requests,
+        max_decode_steps,
+        sequence_limit_exceeded=sequence_limit_exceeded,
     )
-    scheduling_token_budget = getattr(scheduler, "max_num_scheduled_tokens", None)
-    if scheduling_token_budget is None:
-        scheduling_token_budget = getattr(
-            scheduler_config, "max_num_batched_tokens", total_prompt_tokens
+    if error is not None:
+        block_hasher = getattr(first_native_request, "_block_hasher", None)
+        if (
+            sequence_limit_exceeded
+            or block_hasher is None
+            or not getattr(manager, "enable_caching", False)
+        ):
+            raise GRAdmissionError(error)
+        groups = manager.kv_cache_config.kv_cache_groups
+        if len(groups) != 1 or not isinstance(groups[0].kv_cache_spec, FullAttentionSpec):
+            raise GRAdmissionError(error)
+        native_type = type(first_native_request)
+        native_requests = tuple(
+            first_native_request
+            if item.request_id == first_native_request.request_id
+            else native_type.from_engine_core_request(item, block_hasher=block_hasher)
+            for item in engine_requests
         )
-    assert scheduling_token_budget is not None
-    if total_prompt_tokens > scheduling_token_budget:
-        raise GRAdmissionError(
-            "Beam batch Prefill exceeds the effective native scheduling token "
-            "budget; chunked Prefill is not supported by this scheduling layer"
+        error, _ = _prefill_capacity(
+            scheduler, native_requests, max_decode_steps, use_prefix_cache=True
         )
+        if error is not None:
+            raise GRAdmissionError(error)
     return GRSessionState(
         session_id=session_id,
         request=request,
         # The final Prefill invocation produces output token 0; the remaining
         # max_tokens - 1 invocations are Decode stages.
-        max_decode_steps=max(0, request.beam_params.max_tokens - 1),
+        max_decode_steps=max_decode_steps,
     )
 
 
