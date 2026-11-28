@@ -456,20 +456,7 @@ jobs:
       queue: max
       cancel-in-progress: false
     env:
-      BENCHMARK_POLICY_NAME: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_POLICY_NAME }}
       BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
-      ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ACCURACY_FAILURE_MODE }}
-      P99_TTFT_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TTFT_FAILURE_MODE }}
-      P99_TPOT_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_FAILURE_MODE }}
-      ONLINE_ELAPSED_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ONLINE_ELAPSED_FAILURE_MODE }}
-      OFFLINE_ELAPSED_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).OFFLINE_ELAPSED_FAILURE_MODE }}
-      PASS_AT_1_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PASS_AT_1_THRESHOLD }}
-      PASS_AT_32_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PASS_AT_32_THRESHOLD }}
-      RECALL_AT_32_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).RECALL_AT_32_THRESHOLD }}
-      ELAPSED_TIME_ONLINE_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ELAPSED_TIME_ONLINE_THRESHOLD }}
-      ELAPSED_TIME_OFFLINE_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ELAPSED_TIME_OFFLINE_THRESHOLD }}
-      P99_TTFT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TTFT_THRESHOLD }}
-      P99_TPOT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_THRESHOLD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -547,6 +534,10 @@ jobs:
         run: bash ./scripts/kill_vllm_on_device.sh --yes
 
       - name: Cache OpenOneRec dataset
+        if: >-
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
+          env.BENCHMARK_DEVICE == 'gpu'
         uses: corca-ai/local-cache@v2
         id: cache-dataset
         with:
@@ -555,7 +546,11 @@ jobs:
           key: dataset-openonerec-${{ runner.os }}
 
       - name: Download OpenOneRec dataset
-        if: steps.cache-dataset.outputs.cache-hit != 'true'
+        if: >-
+          (env.POLICY_TARGET_BRANCH == 'main' ||
+           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph')) &&
+          env.BENCHMARK_DEVICE == 'gpu' &&
+          steps.cache-dataset.outputs.cache-hit != 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -569,19 +564,6 @@ jobs:
             --token "$HF_TOKEN" \
             --local-dir ./OpenOneRec \
             --repo-type=dataset
-
-      - name: Build catalog
-        run: |
-          mkdir -p generated_data
-          python ./benchmarks/open_one_rec/tools/create_task_catalog.py \
-            -t video \
-            -d ./OpenOneRec/benchmark_data \
-            -o generated_data/video_catalog.json
-          python ./tools/constraints/build_constraint_triples.py \
-            --catalog generated_data/video_catalog.json \
-            --output generated_data/video_constraint_triples.json \
-            --begin "<|sid_begin|>" \
-            --end "<|sid_end|>"
 
       - name: Cache OneRec Recall constraint tables
         if: >-
@@ -641,17 +623,6 @@ jobs:
           path: v1_recall_results
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Execute decode benchmark gates
-        if: >-
-          env.BENCHMARK_DEVICE != 'gpu' ||
-          !(env.POLICY_TARGET_BRANCH == 'main' ||
-           (github.event_name == 'workflow_dispatch' && env.POLICY_TARGET_BRANCH == 'decode_graph'))
-        env:
-          DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
-          CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
-          TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
-        run: ./tests/system/run_benchmark_and_verify.sh
 
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'

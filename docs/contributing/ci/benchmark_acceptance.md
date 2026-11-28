@@ -2,14 +2,13 @@
 
 <a id="benchmark-acceptance"></a>
 
-During full validation, the [CI workflow](../../../.github/workflows/ci.yml)
-selects one OneRec benchmark for the decode job based on the device and target
-branch. See [pull request checks](pr_merge_loop.md#pull-request-ci) for the CI review workflow.
+See [pull request checks](pr_merge_loop.md#pull-request-ci) for the CI review
+workflow.
 
 | Workload | When it runs | What it checks |
 | --- | --- | --- |
 | [OneRec five-task Recall](#gpu-five-task-recall) | GPU PR validation targeting `main` and eligible manual GPU runs | Per-task SID Recall@32, input identity and graph replay |
-| [OneRec Video-100](#npu-video-100) | NPU and other manual GPU runs | Offline and HTTP accuracy and performance under the resolved policy |
+| [OneRec Video-100](#npu-video-100) | Buildkite [CUDA nightly](../../../.buildkite/test-cuda-nightly.yml) and [NPU nightly](../../../.buildkite/test-npu-nightly.yml) | Offline and HTTP accuracy and performance under the resolved policy |
 
 The OneRec decode job must succeed for full validation to pass.
 
@@ -22,11 +21,10 @@ commit. For a manual run, it supplies the selected revision. The policy job
 validates the YAML and passes one set of resolved values to the benchmark jobs.
 Its summary records the tested commit, policy SHA-256 and effective thresholds.
 
-### Policy selection
-
-The workflow selects the shared or default GPU policy based on the target
-branch. NPU runs use shared accuracy floors and retain board-specific
-performance settings. The policy summary records the effective thresholds.
+Video-100 reads the model name of the visible accelerator and selects its entry
+in the [JSON baseline](../../../tests/baseline/onerec_video_benchmark.json).
+The test fails if the detected model has no entry. The test log records the
+detected model and selected entry.
 
 ### GPU five-task Recall
 
@@ -52,18 +50,30 @@ V1_RECALL_BASELINE_FILE="$PWD/benchmarks/beam_search/recall_baseline_batch4.json
   bash tests/system/run_beam_v1_recall.sh
 ```
 
-### NPU Video-100
+### OneRec Video-100
 
-The [Video-100 runner](../../../tests/system/run_benchmark_and_verify.sh) evaluates
+<a id="npu-video-100"></a>
+
+The [Video-100 test](../../../tests/e2e/test_onerec_video_benchmark.py) evaluates
 100 video prompts offline and over HTTP at beam width 128. Both measurements
 must meet the pass@1, pass@32, and recall@32 floors in the
-[benchmark policy](../../../.github/benchmark-gate.yaml). Equality passes.
-An accuracy failure exits with code 86.
+[Video-100 baseline](../../../tests/baseline/onerec_video_benchmark.json). Equality passes.
+An accuracy result below a blocking threshold fails the pytest case.
 
 The shared floors were calibrated using L20 and A100 measurements after the
 parent-score correction in `0f5018516f82`. Applying the same floors on Ascend
-is an acceptance policy decision. Check the policy job summary for the
-runner's effective thresholds.
+is an acceptance policy decision. The test log records the thresholds used
+for each measured metric.
+
+The test downloads `benchmark_data` from the gated
+`OpenOneRec/OpenOneRec-RecIF` dataset and uses the Hugging Face cache.
+On a prepared Ascend runner with the model available, authenticate to
+Hugging Face with a token that has access to the dataset and run:
+
+```bash
+python -m pytest -sv --run-slow --strict-test-levels \
+  -m 'l4 and npu_test' tests/e2e/test_onerec_video_benchmark.py
+```
 
 ## Changing a policy
 

@@ -96,7 +96,7 @@
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_manual_dispatch_remains_enabled_without_push": "l1",
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_pr_lifecycle": "l1",
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_ready_reuses_fresh_ab_and_reruns_stale_ab": "l1",
-    "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_recall_and_decode_benchmark_cover_both_target_branches_and_devices": "l1",
+    "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_recall_benchmark_scope_by_target_branch_and_device": "l1",
     "tests/ci/test_ready_label_ci.py::TestReadyLabelCI::test_unready_and_draft_events_fail_required_gate": "l1",
     "tests/ci/test_v1_gate_validation.py::test_catalog_rejects_invalid_or_empty_input_without_overwriting_output": "l1",
     "tests/ci/test_v1_gate_validation.py::test_online_requires_complete_sid_and_consistent_usage": "l1",

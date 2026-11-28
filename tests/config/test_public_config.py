@@ -38,10 +38,9 @@ def test_decode_gate_configuration_reaches_public_loader(
     backend: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    script = Path(__file__).parents[1] / "system" / "run_benchmark_and_verify.sh"
-    producer = script.read_text().split("<<'PY_CONFIG'\n", 1)[1].split("\nPY_CONFIG", 1)[0]
+    from tests.e2e.test_onerec_video_benchmark import build_gr_overrides
+
     digests = ("sha256:" + "a" * 64, "sha256:" + "b" * 64)
     monkeypatch.setitem(
         sys.modules,
@@ -49,13 +48,8 @@ def test_decode_gate_configuration_reaches_public_loader(
         SimpleNamespace(build_single_trie_artifact=lambda *args: digests),
     )
     artifact = tmp_path / "table.safetensors"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["gate", str(tmp_path / "model"), str(tmp_path / "triples"), str(artifact), backend, "128"],
-    )
-    exec(compile(producer, str(script), "exec"), {"__name__": "__main__"})
-    config = load_gr_config(overrides=json.loads(capsys.readouterr().out))
+    overrides = build_gr_overrides(tmp_path / "model", tmp_path / "triples", artifact, backend)
+    config = load_gr_config(overrides=overrides)
     assert config.constraint is not None and config.constraint.table is not None
     assert config.constraint.table.backend.value == backend
     assert config.constraint.table.artifact_digest == digests[0]

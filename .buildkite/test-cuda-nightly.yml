@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+steps:
+  - label: "System tests (OneRec Video-100 benchmark)"
+    key: l4-cuda-system-tests
+    depends_on: upload-cuda-nightly-pipeline
+    timeout_in_minutes: 90
+    mirror_hardwares: l4_1
+    artifact_paths:
+      - generated_data/benchmark_v1/onerec-results.*/**/*.json
+    command: >-
+      python -m pytest -sv --run-slow --strict-test-levels
+      -m 'l4 and gpu_test' tests/e2e/test_onerec_video_benchmark.py

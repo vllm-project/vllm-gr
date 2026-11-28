@@ -6,8 +6,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +21,7 @@ from tests.helpers.gr_config import (
     fixed_beam_mapping,
     prepared_engine_args,
 )
-from tests.helpers.paths import REPO_ROOT, TESTS_DIR
+from tests.helpers.paths import REPO_ROOT
 from vllm_gr.config import (
     ConstraintMode,
     GRConfig,
@@ -427,36 +425,13 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
         "candidate_width": [128] * 3,
     }
 
-    # Execute the actual server command with an argument recorder instead of
-    # launching a model. This catches legacy flags left behind in the script.
-    script = (TESTS_DIR / "system/run_benchmark_and_verify.sh").read_text()
-    command = script.split('echo "Starting OneRec online server"\n', 1)[1]
-    command = command.split("\nSERVER_PID=$!", 1)[0]
-    captured = subprocess.run(
-        [
-            "bash",
-            "-eu",
-            "-c",
-            r"""python() { printf '%s\0' "$@"; }
-"""
-            + command
-            + "\nwait",
-        ],
-        env={
-            **os.environ,
-            "gr_overrides": json.dumps(overrides),
-            "run_port": "7000",
-            "MODEL_PATH": str(tmp_path),
-            "SCRIPT_DIR": str(TESTS_DIR / "system"),
-        },
-        capture_output=True,
-        check=True,
-    )
+    from tests.e2e.test_onerec_video_benchmark import server_command
+
+    argv = server_command(str(tmp_path), 7000, overrides)[1:]
     parser = GRArgumentParser()
     serve = GRServeSubcommand()
     child = serve.subparser_init(parser.add_subparsers(dest="subparser"))
     _add_mode_option(child)
-    argv = captured.stdout.decode().split("\0")[:-1]
     assert argv[:2] == ["-m", "vllm_gr.entrypoints.cli.main"]
     selected, serve_argv = _mode_arguments(argv[2:])
     assert selected
