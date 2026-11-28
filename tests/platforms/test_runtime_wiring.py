@@ -2,54 +2,34 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Production plugin routing with synthetic platform identities and native hooks."""
 
-from collections.abc import Iterator
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+import vllm_gr.platforms as table
+from tests.helpers.ascend_platform import AscendGRPlatform
+from tests.helpers.native_platform import native_platform
 from vllm_gr import patch, plugin
 from vllm_gr.engine import startup
-from vllm_gr.platforms import compat, loader
-from vllm_gr.platforms.ascend import environment, spawn_patch
-from vllm_gr.platforms.registry import (
-    _reset_backend_registry_for_tests,
-    get_active_backend,
-)
-from vllm_gr.v1.worker.npu import startup_patch
+from vllm_gr.platforms import compat
+from vllm_gr.platforms.ascend import config_patch, environment, spawn_patch
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
 
-@pytest.fixture(autouse=True)  # type: ignore[misc]
-def isolated_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    _reset_backend_registry_for_tests()
-    monkeypatch.setattr(loader, "entry_points", lambda **kwargs: ())
-    yield
-    _reset_backend_registry_for_tests()
-
-
-class _SyntheticAscendPlatform:
-    """Ascend identity built from the vendor class lineage, without the vendor."""
-
-    _enum = "OOT"
-    device_type = "npu"
-    device_name = "npu"
-
-
-_SyntheticAscendPlatform.__module__ = "vllm_ascend.platform"
-_SyntheticAscendPlatform.__qualname__ = "NPUPlatform"
+class _SyntheticAscendPlatform(AscendGRPlatform.native_platform_type):  # type: ignore[misc]
+    pass
 
 
 def _synthetic_platform(device_type: str) -> object:
     """Return a synthetic native platform for each supported backend."""
     if device_type == "npu":
         return _SyntheticAscendPlatform()
-    return SimpleNamespace(_enum="CUDA", device_type="cuda", device_name="cuda")
+    return native_platform("CUDA", "cuda")
 
 
 @pytest.mark.parametrize("device_type", ["cuda", "npu"])  # type: ignore[misc]
-def test_plugin_routes_validation_and_patches_through_selected_provider(
+def test_plugin_routes_validation_and_patches_through_selected_integration(
     monkeypatch: pytest.MonkeyPatch, device_type: str
 ) -> None:
     import vllm.platforms
@@ -69,35 +49,33 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
     npu_check = hook("npu_environment", {})
     monkeypatch.setattr(compat, "check_vllm_runtime", cuda_check)
     monkeypatch.setattr(environment, "check_ascend_environment", npu_check)
-    attention = hook("attention", 1)
-    monkeypatch.setattr(patch.selector_patch, "apply_custom_attention_backend_patch", attention)
     spawn = hook("spawn", True)
-    worker = hook("worker", 1)
+    worker = hook("sanitize", None)
     monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", spawn)
-    monkeypatch.setattr(startup_patch, "patch_npu_worker_init_device", worker)
+    monkeypatch.setattr(config_patch, "apply_engine_core_config_sanitizer", worker)
     beam = hook("beam", 1)
     monkeypatch.setattr(patch, "_apply_gr_beam_patches", beam)
     monkeypatch.setattr(patch, "get_last_beam_patch_report", lambda: None)
 
-    activate = Mock(wraps=loader.activate_current_backend)
-    monkeypatch.setattr(loader, "activate_current_backend", activate)
-    for _ in range(2):
+    activate = Mock(wraps=table.get_current_gr_platform)
+    monkeypatch.setattr(table, "get_current_gr_platform", activate)
+    for first_install in (True, False):
         events.clear()
         activate.reset_mock()
         state = plugin.initialize_runtime()
         activate.assert_called_once_with()
-        expected_backend_id = "ascend" if device_type == "npu" else "cuda"
-        assert get_active_backend().backend_id == expected_backend_id
-        backend_events = ["spawn", "worker"] if device_type == "npu" else []
+        backend_events = ["spawn", "sanitize"] if device_type == "npu" else []
         assert events == [
             "defaults",
             f"{device_type}_environment",
-            "attention",
             *backend_events,
             "beam",
         ]
-        assert state == {"patch_count": 4 if device_type == "npu" else 2, "patches": {}}
-        attention.assert_called_with(force=True)
+        assert state == {
+            "patch_count": 2 if device_type == "npu" else 1,
+            "patches": {},
+            "attention_selector": True,
+        }
         beam.assert_called_with()
 
     if device_type == "npu":
@@ -108,6 +86,30 @@ def test_plugin_routes_validation_and_patches_through_selected_provider(
         npu_check.assert_not_called()
         spawn.assert_not_called()
         worker.assert_not_called()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "platform_name,placement", [("ROCM", "cuda"), ("CPU", "cpu"), ("UNSPECIFIED", "")]
+)
+def test_ordinary_vllm_startup_on_platform_without_gr(
+    monkeypatch: pytest.MonkeyPatch, platform_name: str, placement: str
+) -> None:
+    import vllm.platforms
+
+    from vllm_gr.platforms.errors import UnsupportedBackendError
+
+    monkeypatch.setattr(
+        vllm.platforms,
+        "current_platform",
+        native_platform(platform_name, placement),
+    )
+    defaults = Mock()
+    monkeypatch.setattr(startup, "configure_model_runner_default", defaults)
+    plugin.register()
+    with pytest.raises(UnsupportedBackendError):
+        plugin.initialize_runtime()
+    defaults.assert_not_called()
 
 
 def test_environment_failure_prevents_runtime_patch_installation(
@@ -125,26 +127,25 @@ def test_environment_failure_prevents_runtime_patch_installation(
     install.assert_not_called()
 
 
-def test_partial_provider_failure_stops_common_plan_and_retains_cause(
+def test_partial_platform_failure_stops_common_plan_and_retains_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm.platforms
 
     # Exercise the direct entry used by a fresh worker, before any env dispatch.
     monkeypatch.setattr(vllm.platforms, "current_platform", _synthetic_platform("npu"))
-    monkeypatch.setattr(
-        patch.selector_patch, "apply_custom_attention_backend_patch", lambda **kw: 0
-    )
     spawn = Mock(return_value=True)
     monkeypatch.setattr(spawn_patch, "apply_npu_spawn_patch", spawn)
     failure = RuntimeError("native worker hook failed")
-    monkeypatch.setattr(startup_patch, "patch_npu_worker_init_device", Mock(side_effect=failure))
+    monkeypatch.setattr(
+        config_patch, "apply_engine_core_config_sanitizer", Mock(side_effect=failure)
+    )
     beam = Mock()
     monkeypatch.setattr(patch, "_apply_gr_beam_patches", beam)
 
     with pytest.raises(RuntimeError, match="backend 'ascend'.*partial.*restart") as raised:
         patch.re_apply_patches()
     assert raised.value.__cause__ is failure
-    assert get_active_backend().backend_id == "ascend"
+    assert table.get_current_gr_platform().backend_id == "ascend"
     spawn.assert_called_once_with()
     beam.assert_not_called()

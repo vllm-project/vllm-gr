@@ -177,6 +177,37 @@ def test_npu_budget_reaches_native_offline_and_online_frontends(
     engine.submit_gr_session.assert_not_called()
 
 
+@pytest.mark.parametrize("size,steps,widths,budget,accepted", CASES)
+def test_grpc_uses_admitted_decode_budget(size, steps, widths, budget, accepted):
+    from dataclasses import asdict
+
+    from tests.entrypoints.grpc.test_grpc_entry import engine, message
+    from tests.helpers.ascend_platform import AscendGRPlatform
+    from vllm_gr.entrypoints.grpc.serving import BeamVllmEngineServicer
+
+    backend = engine()
+    config = _config(budget=budget, constrained=steps == 3).vllm_config
+    integration = AscendGRPlatform()
+    config.additional_config["vllm_gr_limits"] = asdict(integration.get_beam_limits(config))
+    # A frontend can run on a different device and must keep the admitted budget.
+    config.device_config = SimpleNamespace(device="cpu")
+    config.scheduler_config.max_num_batched_tokens = 65536
+    backend.vllm_config = config
+    servicer = BeamVllmEngineServicer(backend, 0.0)
+    messages = [message(i) for i in range(size)]
+    for item in messages:
+        item.sampling_params.n = item.beam_search.beam_width = 128
+        item.sampling_params.max_tokens = steps
+        if widths is not None:
+            item.beam_search.dynamic_beam_widths.extend(widths)
+    if accepted:
+        request, _ = servicer.build_batch(messages)
+        assert len(request.items) == size
+    else:
+        with pytest.raises(ValueError, match="max_num_batched_tokens"):
+            servicer.build_batch(messages)
+
+
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
 def test_npu_physical_budget_does_not_change_other_devices(device):
     config = _config(device="cuda").vllm_config

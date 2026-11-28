@@ -203,6 +203,7 @@ class ConstraintBackendKind(str, Enum):
     """Resolved constraint-table placement, including automatic selection."""
 
     AUTO = "auto"
+    PLATFORM = "platform"
     CPU = "cpu"
     CUDA = "cuda"
     NPU = "npu"

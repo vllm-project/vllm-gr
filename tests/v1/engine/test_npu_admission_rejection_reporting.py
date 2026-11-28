@@ -392,3 +392,14 @@ def test_representable_temperatures_preserve_supported_admission(
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def select_test_npu_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These host tests construct NPU configs without running platform discovery.
+    import vllm_gr.platforms
+    from tests.helpers.ascend_platform import AscendGRPlatform
+
+    monkeypatch.setattr(
+        vllm_gr.platforms, "get_current_gr_platform", lambda **kw: AscendGRPlatform()
+    )

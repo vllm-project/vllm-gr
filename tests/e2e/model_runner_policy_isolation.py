@@ -99,6 +99,7 @@ class PolicyWorkerExtension:
         return {
             "source": str(Path(model_runner_patch.__file__).resolve()),
             "runner_class": f"{type(runner).__module__}.{type(runner).__name__}",
+            "runner_mro": [f"{cls.__module__}.{cls.__name__}" for cls in type(runner).__mro__],
             "decode_batches": sorted(s.batch_size for s in graph._bindings) if graph else [],
             "decode_failures": (runtime.startup_failures or {}) if runtime is not None else {},
             "addresses": {
@@ -212,7 +213,9 @@ def run(args: argparse.Namespace) -> None:
         check_idle(value)
         if args.expected_source:
             assert Path(value["source"]).parents[3] == args.expected_source.resolve()
-        assert (".gpu.model_runner." in value["runner_class"]) == (args.runner == "v2")
+        assert any(".gpu.model_runner." in cls for cls in value["runner_mro"]) == (
+            args.runner == "v2"
+        )
         assert value["backend_rows"] == expected_rows
         if args.runner == "v1":
             assert not value["addresses"]

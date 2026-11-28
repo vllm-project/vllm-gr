@@ -6,9 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm.logger import init_logger
-from vllm.platforms import current_platform
-
+from vllm_gr.platforms import get_current_gr_platform
 from vllm_gr.v1.worker.prefill_graph_common import (
     DEFAULT_PREFILL_BUCKETS,
     NPU_DEFAULT_PREFILL_BUCKETS,
@@ -19,8 +17,6 @@ from vllm_gr.v1.worker.prefill_graph_common import (
     is_prefill_graph_enabled,
     is_prefill_phase_batch,
 )
-
-logger = init_logger(__name__)
 
 __all__ = [
     "DEFAULT_PREFILL_BUCKETS",
@@ -38,17 +34,8 @@ __all__ = [
 
 
 def get_active_prefill_graph_runner_class() -> type[BasePrefillGraphRunner]:
-    """Returns the platform-specific prefill graph runner class."""
-    if f"{current_platform.device_type}".lower() == "npu":
-        from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
-
-        return NPUPrefillGraphRunner
-    else:
-        from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import (
-            GPUPrefillGraphRunner,
-        )
-
-        return GPUPrefillGraphRunner
+    """Return the V1 prefill graph implementation of the selected GR platform."""
+    return get_current_gr_platform().get_prefill_graph_runner_class()
 
 
 def BeamPrefillGraphRunner(

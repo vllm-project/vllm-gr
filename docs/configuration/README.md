@@ -245,5 +245,5 @@ For NPU SID-stage vocabulary execution through this native API, set
 `gr.worker_decision: true` explicitly in the YAML passed to `load_gr_config()`,
 along with `gr.sid_stage_vocab: true`, `gr.constraint_mode: none` and
 `gr.max_decode_steps` of at most 3. The loader validates the GR settings before
-`AsyncEngineArgs` is constructed. GR serve and `GRLLM` supply the NPU
-provider's worker-decision default before that validation.
+`AsyncEngineArgs` is constructed. GR serve and `GRLLM` supply the Ascend
+integration's worker-decision default before that validation.

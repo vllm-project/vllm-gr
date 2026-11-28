@@ -147,7 +147,9 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
         # device_type keeps the check on the version-only path.
         "vllm.platforms": _module(
             "vllm.platforms",
-            current_platform=SimpleNamespace(device_type="cpu"),
+            current_platform=SimpleNamespace(
+                device_type="cpu", is_cuda=lambda: False, _enum=SimpleNamespace(name="CPU")
+            ),
         ),
         # The entrypoint imports tokenizer types at runtime; the
         # real ``vllm.tokenizers`` package pulls in ``vllm.utils.import_utils``,

@@ -11,6 +11,9 @@ import pytest
 import regex as re
 import yaml
 
+from tests.helpers.ascend_platform import AscendGRPlatform
+from tests.helpers.native_platform import native_platform
+
 
 def _parameter_names(callable_obj: object) -> list[str]:
     return list(inspect.signature(callable_obj).parameters)
@@ -44,30 +47,19 @@ def test_patch_inventories_are_aligned_and_complete() -> None:
         assert f"Scope: `{patch['scope']}`; backend ID: `{backend_id}`" in section
 
 
-class _SyntheticAscendPlatform:
-    """Synthetic Ascend identity: vendor class lineage without the vendor import."""
-
-    _enum = "OOT"
-    device_type = "npu"
-    device_name = "npu"
-
-
-_SyntheticAscendPlatform.__module__ = "vllm_ascend.platform"
-_SyntheticAscendPlatform.__qualname__ = "NPUPlatform"
+class _SyntheticAscendPlatform(AscendGRPlatform.native_platform_type):
+    pass
 
 
 @pytest.mark.l1
 @pytest.mark.parametrize("backend_id", ["cuda", "ascend"])
-def test_common_and_selected_provider_patch_ownership_is_unique(
+def test_common_and_selected_platform_patch_ownership_is_unique(
     monkeypatch: pytest.MonkeyPatch, backend_id: str
 ) -> None:
-    from types import SimpleNamespace
-
     import vllm.platforms
 
     from vllm_gr.patch import CORE_PATCH_IDS
-    from vllm_gr.platforms import loader
-    from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
+    from vllm_gr.platforms import get_current_gr_platform
 
     inventory = yaml.safe_load(Path("docs/design/patch_inventory.yaml").read_text(encoding="utf-8"))
     patches = inventory["patches"]
@@ -77,23 +69,21 @@ def test_common_and_selected_provider_patch_ownership_is_unique(
         for p in patches
     )
     platforms = {
-        "cuda": SimpleNamespace(_enum="CUDA", device_type="cuda", device_name="cuda"),
+        "cuda": native_platform("CUDA", "cuda"),
         "ascend": _SyntheticAscendPlatform(),
     }
     monkeypatch.setattr(vllm.platforms, "current_platform", platforms[backend_id])
-    monkeypatch.setattr(loader, "entry_points", lambda **kwargs: ())
-    _reset_backend_registry_for_tests()
-    try:
-        provider = loader.activate_current_backend()
-        core_ids = {p["id"] for p in patches if p["scope"] == "core"}
-        backend_ids = {p["id"] for p in patches if p["backend_id"] == backend_id}
-        assert set(CORE_PATCH_IDS) == core_ids
-        assert set(provider.patch_ids) == backend_ids
-        claimed = (*CORE_PATCH_IDS, *provider.patch_ids)
-        assert len(claimed) == len(set(claimed))
-        assert set(claimed) == core_ids | backend_ids
-    finally:
-        _reset_backend_registry_for_tests()
+    assert get_current_gr_platform().backend_id == backend_id
+    core_ids = {p["id"] for p in patches if p["scope"] == "core"}
+    backend_ids = {p["id"] for p in patches if p["backend_id"] == backend_id}
+    assert set(CORE_PATCH_IDS) == core_ids
+    # Ownership is documented where the retained compatibility hook is installed.
+    # Platform selection no longer carries a second list of patch identifiers.
+    assert core_ids.isdisjoint(backend_ids)
+    for item in patches:
+        for path in item["owner"].split(", "):
+            if " and " not in path and path.startswith("vllm_gr/") and path.endswith(".py"):
+                assert Path(path).is_file(), path
 
 
 def test_engine_core_method_contracts() -> None:
@@ -140,11 +130,11 @@ def test_core_hot_update_utility_contracts(monkeypatch: pytest.MonkeyPatch) -> N
     native_resume_call = Mock()
     monkeypatch.setattr(core, "pause_scheduler", native_pause_call)
     monkeypatch.setattr(core, "resume_scheduler", native_resume_call)
-    assert getattr(core, "pause")() is pending
+    assert core.pause() is pending
     native_pause_call.assert_called_once_with(mode="wait", clear_cache=True)
     assert not pending.done()
     pending.set_result(None)
-    assert getattr(core, "resume")() == {"ok": True}
+    assert core.resume() == {"ok": True}
     native_resume_call.assert_called_once_with()
 
 

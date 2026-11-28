@@ -131,9 +131,6 @@ def test_reorder_cascade_mode_matches_beam_kernels(
     parent: torch.Tensor,
 ) -> None:
     """The dispatcher in cascade mode must equal the original kernel."""
-    from vllm_gr.v1.beam import reorder as reorder_mod
-
-    monkeypatch.setattr(reorder_mod, "_resolve_mode", lambda: "cascade")
 
     seed = 10 + int(parent.sum())
     pools = _make_pools(_POOL_SHAPE, _LAYERS, torch.device("cpu"), seed)
@@ -177,9 +174,6 @@ def test_reorder_xllm_mode_fused_matches_references_on_npu(
     parent: torch.Tensor,
 ) -> None:
     """Full-width sorted parents: fused op == cascade reference == torch golden."""
-    from vllm_gr.v1.beam import reorder as reorder_mod
-
-    monkeypatch.setattr(reorder_mod, "_resolve_mode", lambda: "xllm")
 
     device = torch.device("npu")
     seed = 100 + int(parent.sum())
@@ -188,7 +182,7 @@ def test_reorder_xllm_mode_fused_matches_references_on_npu(
 
     decode_step = 2
     _reference_reorder(parent, expected, slot=0, decode_step=decode_step)
-    reorder_unshared_kv(parent.to(device), 0, pools, decode_step)
+    reorder_unshared_kv(parent.to(device), 0, pools, decode_step, decode_mode="xllm")
     torch.npu.synchronize()
 
     for pool, ref in zip(pools, expected):
@@ -212,7 +206,6 @@ def test_reorder_xllm_mode_falls_back_for_unsorted_or_shrunk(
     """Unsorted / shrunk parents must stay correct via the cascade kernel."""
     from vllm_gr.v1.beam import reorder as reorder_mod
 
-    monkeypatch.setattr(reorder_mod, "_resolve_mode", lambda: "xllm")
     monkeypatch.setattr(reorder_mod, "_FALLBACK_LOGGED", False)
 
     device = torch.device("npu")
@@ -222,7 +215,7 @@ def test_reorder_xllm_mode_falls_back_for_unsorted_or_shrunk(
 
     decode_step = 2
     _reference_reorder(parent, expected, slot=0, decode_step=decode_step)
-    reorder_unshared_kv(parent.to(device), 0, pools, decode_step)
+    reorder_unshared_kv(parent.to(device), 0, pools, decode_step, decode_mode="xllm")
     torch.npu.synchronize()
 
     for pool, ref in zip(pools, expected):
@@ -237,9 +230,6 @@ def test_reorder_xllm_fused_agrees_with_onerec_golden_on_npu(
 ) -> None:
     """The fused-op call built by the dispatcher matches _select_unshared_kv_torch."""
     from vllm_gr.ops.onerec_decode import _select_unshared_kv_torch
-    from vllm_gr.v1.beam import reorder as reorder_mod
-
-    monkeypatch.setattr(reorder_mod, "_resolve_mode", lambda: "xllm")
 
     device = torch.device("npu")
     parent = torch.tensor([0, 0, 1, 2], dtype=torch.int32)
@@ -248,7 +238,7 @@ def test_reorder_xllm_fused_agrees_with_onerec_golden_on_npu(
     golden = _make_pools(_POOL_SHAPE, _LAYERS, torch.device("cpu"), seed)
 
     decode_step = 2
-    reorder_unshared_kv(parent.to(device), 0, pools, decode_step)
+    reorder_unshared_kv(parent.to(device), 0, pools, decode_step, decode_mode="xllm")
     torch.npu.synchronize()
 
     group_token_num = _group_token_num_from_parents(parent)

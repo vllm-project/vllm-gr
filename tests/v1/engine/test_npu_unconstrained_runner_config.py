@@ -11,7 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tests.helpers.gr_config import engine_args_from_file
+from tests.helpers.gr_config import engine_args_from_file, test_platform
 from vllm_gr.config import (
     ConstraintBackendKind,
     ConstraintConfig,
@@ -20,10 +20,9 @@ from vllm_gr.config import (
     GRConfig,
     gr_config_to_mapping,
 )
-from vllm_gr.platforms.legacy import legacy_config_service
 from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
-_V1_REQUIRED = "NPU unconstrained.*ModelRunner V1.*VLLM_USE_V2_MODEL_RUNNER=0"
+_V1_REQUIRED = "NPU.*ModelRunner V1.*VLLM_USE_V2_MODEL_RUNNER=0"
 
 
 def _gr_config(mode: str) -> GRConfig:
@@ -57,7 +56,9 @@ def _host(device: str, use_v2: bool) -> SimpleNamespace:
     return SimpleNamespace(
         additional_config={},
         device_config=SimpleNamespace(device=device),
-        scheduler_config=SimpleNamespace(async_scheduling=True),
+        scheduler_config=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=8192),
+        cache_config=SimpleNamespace(block_size=16, user_specified_block_size=False),
+        model_config=SimpleNamespace(is_hybrid=False),
         use_v2_model_runner=use_v2,
     )
 
@@ -103,22 +104,17 @@ def test_npu_v2_rejected_during_engine_config_before_runtime_hooks(
             additional_config={"vllm_gr": gr_config_to_mapping(load_gr_config(overrides=options))}
         )
     )
-    original_additional = config.additional_config.copy()
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
-    monkeypatch.setattr(arg_utils_gr, "engine_config_service", lambda: legacy_config_service("npu"))
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform("npu"))
     runtime_validation = Mock(side_effect=AssertionError("runtime initialization reached"))
-    canonical_write = Mock(side_effect=AssertionError("worker configuration published"))
     monkeypatch.setattr(execution, "validate_gr_execution_config", runtime_validation)
-    monkeypatch.setattr(arg_utils_gr, "write_canonical_gr_config", canonical_write)
 
     with pytest.raises(ValueError, match=_V1_REQUIRED):
         arg_utils_gr.create_engine_config(args)
 
     # EngineArgs only constructs configuration. The failure precedes returning
     # it to native engine/model allocation and publishing it to spawned workers.
-    assert config.additional_config == original_additional
     runtime_validation.assert_not_called()
-    canonical_write.assert_not_called()
 
 
 def _request(
@@ -223,7 +219,7 @@ def test_native_npu_admission_rejects_candidate_width_before_preprocessing(
         ("npu", False, "sid"),
         ("cuda", False, "generic"),
         ("cuda", True, "generic"),
-        ("npu", True, "catalog"),
+        ("npu", False, "catalog"),
         ("npu", True, "ordinary"),
     ],
 )
@@ -242,7 +238,7 @@ def test_device_admission_preserves_supported_and_existing_paths(
         ("npu", False, "sid"),
         ("cuda", False, "generic"),
         ("cuda", True, "generic"),
-        ("npu", True, "catalog"),
+        ("npu", False, "catalog"),
         ("npu", True, "ordinary"),
         ("npu", True, "ordinary_unconstrained"),
     ],
@@ -257,9 +253,7 @@ def test_engine_config_preserves_supported_and_existing_paths(
     gr_config = _gr_config(mode)
     args = engine_args_from_file(tmp_path, gr_config_to_mapping(gr_config))
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
-    monkeypatch.setattr(
-        arg_utils_gr, "engine_config_service", lambda: legacy_config_service(device)
-    )
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform(device))
     monkeypatch.setattr(config_patch, "apply_engine_core_config_sanitizer", Mock())
 
     assert arg_utils_gr.create_engine_config(args) is config
@@ -273,8 +267,10 @@ pytestmark = pytest.mark.cpu_test
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
-def _isolate_backend_plan_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise configuration policy independently of a native backend install."""
-    from vllm_gr.platforms import planning
+def select_test_npu_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm_gr.platforms
+    from tests.helpers.ascend_platform import AscendGRPlatform
 
-    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)
+    monkeypatch.setattr(
+        vllm_gr.platforms, "get_current_gr_platform", lambda **kw: AscendGRPlatform()
+    )

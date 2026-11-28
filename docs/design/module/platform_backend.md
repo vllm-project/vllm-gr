@@ -1,102 +1,147 @@
-# vLLM-GR platform backend contract
+# GR platform integration
 
-A provider binds GR operations to the active vLLM platform. Registry state is
-process-local module state: each frontend, EngineCore and worker process
-resolves its own provider, and an in-process EngineCore shares the frontend's
-registry. The built-in backend IDs are `cuda` and `ascend`, with device types
-`cuda` and `npu` respectively.
+vLLM owns the native hardware platform. GR discovers a separate
+`current_gr_platform`, following vLLM-Omni's combination of platform inheritance
+and independent discovery. GR does not replace `vllm.platforms.current_platform`.
+The selected platform supplies configuration and implementation choices; concrete
+Worker and ModelRunner subclasses own the engine's runtime resources.
 
-## Registration and activation
+## Discovery
 
-The [loader](../../../vllm_gr/platforms/loader.py) registers built-ins and
-discovers external provider objects in the `vllm_gr.platform_backends`
-entry-point group. With provider API v2, the entry-point name must match the
-provider's `backend_id`, and a non-legacy provider must declare
-`api_version == 2`. The deprecated provider API v1 adapter accepts the original
-device-type names from the `vllm_gr.legacy_placements` entry-point group; only
-the fixed `cuda` and `npu` identities are adapted.
+Discovery and the built-in probe table live in
+[platforms/__init__.py](../../../vllm_gr/platforms/__init__.py). Installed
+`vllm_gr.platform_plugins` entry points and built-ins expose zero-argument probes
+returning a qualified platform class name or `None`. A probe can inspect the
+native vLLM platform without importing its GR kernels or Worker.
 
-- `VLLM_GR_DISABLE_BUILTIN_BACKENDS` lists built-in IDs to skip before loading,
-  so an external provider can claim one; duplicate checks still apply.
-- Providers declare `gr_version_range`, `vllm_version_range`,
-  `vendor_version_range` and `vendor_distribution`. The loader validates them
-  at registration and enforces them at activation: mismatches warn by default
-  and fail when `VLLM_GR_STRICT_PROVIDER_RANGES=1`.
-- The loader validates a discovery batch before registration and rejects
-  duplicate backend IDs. Activation matches the native platform identity
-  through the provider's required `matches(identity)` callable. If multiple
-  providers match, select one explicitly with `VLLM_GR_BACKEND`.
-- Activation happens once per process. Activating a different backend later
-  raises `BackendAlreadyActiveError`.
+| External matches | Built-in matches | Result |
+| --- | --- | --- |
+| One | Any | Select the external implementation, including on CUDA and Ascend. |
+| More than one | Any | Fail with the matching plugin origins. |
+| None | One | Select the built-in implementation. |
+| None | More than one | Fail with an ambiguity. |
+| None | None | Use `UnspecifiedGRPlatform` for imports; explicit GR initialization fails. |
 
-### Plugin startup
+Failures loading or executing a probe are logged. A malformed result,
+incompatible selected class or constructor failure is an error, not a fallback.
+The winning instance is cached under a lock. Spawned processes discover their
+own platform; forked children clear the inherited cache and lock. Discovery is
+outside token execution.
 
-Provider modules defer hardware imports until a method is called, so discovery
-can run without loading either accelerator runtime. The `vllm.general_plugins`
-entry point (`vllm_gr.plugin:register`) then:
+## Platform classes
 
-1. Calls `configure_model_runner_default()`, which defaults
-   `VLLM_USE_V2_MODEL_RUNNER` to 0.
-2. Validates the environment.
-3. Installs the shared compatibility hooks: the tied-embedding patch and the
-   CUSTOM attention selector patch.
-4. Applies backend patches and installs the common Beam frontend and
-   sliced-logits hooks.
+[GRPlatform](../../../vllm_gr/platforms/interface.py) extends vLLM's `Platform`.
+[CudaGRPlatform](../../../vllm_gr/platforms/cuda/platform.py) also inherits the
+concrete native `CudaPlatform`; [AscendGRPlatform](../../../vllm_gr/platforms/ascend/platform.py)
+also inherits `vllm_ascend.platform.NPUPlatform`. This reuses native hardware
+methods while keeping GR-specific methods on the independent GR object.
 
-A partial installation failure stops startup.
-
-## Provider contract
-
-The [interface](../../../vllm_gr/platforms/interface.py) defines the provider
-operations. `platforms/protocol.py` keeps the original imports available.
-
-| Operation | Responsibility |
+| Platform method | Responsibility |
 | --- | --- |
-| `matches` | Decide whether this provider serves the current native platform identity. |
-| `check_environment` | Validate the selected runtime and its dependencies. |
-| `apply_runtime_patches` | Install early backend-specific compatibility. On Ascend this includes spawn protection and worker initialization. |
-| `get_model_runner_hooks` | Return the backend's ModelRunner installer (`install`, `is_patched`) or, for legacy patch-hook providers, its patch hooks. |
-| `get_attention_execution` | Expose its Beam attention primitives. |
-| `create_constrained_topk_execution` | Construct the selection implementation for the target device. |
-| `create_config_service` | Optionally supply host defaults and admission through `BackendConfigService`. |
+| `get_gr_worker_cls()` | Return the Worker class path used for a GR engine. Explicit user Worker classes remain authoritative. |
+| `check_environment()` | Validate the supported runtime before engine creation. |
+| `prepare_gr_engine()` | Install necessary process compatibility hooks, such as Ascend spawn protection. |
+| `check_and_update_gr_config(config)` | Validate and finalize GR device settings after native configuration. |
+| `get_gr_attention_backend_cls(...)` | Select the backend class for this engine's GR CUSTOM attention. |
+| `get_attention_execution()` | Supply Beam primitives for the current engine, including Ascend cascade/xllm selection. |
+| `get_beam_limits(config)` / `validate_gr_request(config, request)` | Advertise portable admission limits and enforce the platform's authoritative request policy. |
+| `create_constraint_backend(...)` | Construct a worker-owned canonical operator when `constraint_table.backend=platform`. |
+| `get_prefill_graph_runner_class()` | Supply the graph runner when the implementation supports GR Prefill capture. |
 
-## Engine plans
+CUDA and Ascend reuse the canonical constraint loader and select its existing
+`cuda` or `npu` implementation. A vendor may reuse these algorithms or implement
+the `platform` operator. Algorithm selection follows platform selection.
 
-Providers that declare plan API version 3 and an adapter revision can build an
-engine plan with backend services and runner hooks. The plan is admitted and
-attached to the engine config before worker startup. Each worker then
-re-resolves the plan, creates the declared services after model load, and
-attests them through the collective readiness check. Built-in patch IDs declare
-ownership in the [patch inventory](../patch_inventory.yaml). The
-[loader tests](../../../tests/platforms/test_plugin_loader.py) exercise
-entry-point registration, version and duplicate rejection, the disable switch,
-legacy adaptation and conflicting providers.
+## Configuration and ownership
 
-The provider interface version and the plan API version are independent.
-To migrate a planning provider from plan API v1, read the optional
-`constraint` block from `request.config.to_dict()`. Its `mode` is `none` or
-`table`; in table mode, `constraint["table"]` contains the artifact and its
-placement. An omitted constraint is represented by `None`. Replace reads of
-the old top-level `constraint_backend` and `constraint_table` fields before
-declaring `plan_api_version = 3`. Providers migrating from plan API v2 must
-also remove reads of `deployment.admin_host` and `deployment.admin_port`.
-GR serve owns those listener settings. Registration rejects v1 and v2 planning
-providers before calling their resolvers.
+```mermaid
+flowchart TD
+    N[vLLM native current_platform] --> P[Installed probes and built-in probes]
+    P --> G[Cached current_gr_platform]
+    G --> C[GR configuration hooks]
+    C --> V[VllmConfig: GR settings, worker_cls, Beam limits]
+    V --> E[Shared EngineCore and Beam scheduler]
+    E --> W[Selected Worker subclass]
+    W --> R[Concrete GR ModelRunner subclass]
+    R --> A[Attention primitives and canonical constraints]
+    R --> S[Shared Beam stage and graph algorithms]
+    R --> Q[Actual readiness report]
+    Q --> E
+```
 
-## Validation
+`GRConfig` remains the single GR settings representation in
+`VllmConfig.additional_config`. The native `parallel_config.worker_cls` selects
+the Worker. The compact `vllm_gr_limits` record lets a remote frontend enforce
+portable budgets and capabilities without loading the device plugin. SID stage
+vocabulary support is an explicit capability; a device name does not grant it.
+EngineCore validates the
+selected platform's device-specific request rules before allocating work.
+There is no backend plan, plan fingerprint, service requirement document,
+runner adapter registry or generic stage-binding object.
 
-| Test | Coverage |
-| --- | --- |
-| [Loader tests](../../../tests/platforms/test_plugin_loader.py) | Entry-point registration, name and version checks, duplicate and conflicting providers, built-in disabling, legacy adaptation. |
-| [Runtime wiring tests](../../../tests/platforms/test_runtime_wiring.py) | Provider activation and patch wiring. |
-| [Import isolation tests](../../../tests/platforms/test_import_isolation.py) | Provider discovery without loading the other accelerator runtime. |
+CUDA's Worker selects `CudaGRModelRunnerV1` or `CudaGRModelRunnerV2` using the
+resolved native `use_v2_model_runner` value. Both inherit their native Runner
+and reuse existing Beam execution helpers. Ascend selects
+`AscendGRModelRunner`, preserving native NPU initialization before Runner
+construction. Ascend GR requires V1. Shared scheduling, protocol, EngineCore,
+constraint formats and CUDA Beam algorithms remain shared.
 
-## Source map
+vLLM 0.30's CUDA `Worker.init_device()` hard-codes its Runner constructors, so
+`CudaGRWorker.init_device()` adapts that pinned method with native distributed,
+allocation and workspace helpers. This version-specific override must be
+reviewed on vLLM upgrades. Ascend exposes `_init_device()`, which the GR Worker
+reuses directly. Neither path mutates a native Worker or ModelRunner class to
+install GR execution methods.
 
-| File | Responsibility |
-| --- | --- |
-| [Loader](../../../vllm_gr/platforms/loader.py) | Registers built-ins, discovers external providers and activates one. |
-| [Registry](../../../vllm_gr/platforms/registry.py) | Stores providers, enforces identity matching and single activation. |
-| [Compatibility ranges](../../../vllm_gr/platforms/compat.py) | Validates declared version ranges. |
-| [Provider interface](../../../vllm_gr/platforms/interface.py) | Defines the provider operations and plan types. |
-| [Plugin entry point](../../../vllm_gr/plugin.py) | Installs shared hooks and starts provider activation in each process. |
+Loading a model initializes its canonical constraints and binds the selected
+attention primitives to that model's layers. Failed loads unwind acquired
+resources. Reload waits for the previous execute/sample dispatch to finish and
+releases old resources before replacement. Separate runners own separate
+state; the cached platform does not own an engine's models, tables or graphs.
+
+Before serving, EngineCore gathers actual Worker reports. It checks the selected
+platform, configured Worker class, runtime/plugin versions, GR settings,
+constraint artifact, requested attention/decode selection, graph outcomes and
+agreement across ranks. Positive native `max_model_len` reductions within the
+configured limit remain valid. Failed readiness shuts down the executor.
+
+## Attention selection
+
+The narrow [selector bridge](../../../vllm_gr/v1/attention/selector_patch.py)
+uses the current engine's GR marker. It handles native `None`/`CUSTOM` only when
+that engine requests GR CUSTOM, then calls the selected GR platform's backend
+method. Explicit other native backends pass through unchanged. The bridge
+never writes the shared CUSTOM registry slot or replaces the native platform.
+GR selections bypass the native selector cache, whose key omits GR settings.
+
+This preserves Ascend's behavior when its configuration resets native attention
+to auto, and selects Beam attention before its Runner constructor chooses ACL
+graph replay behavior. Plain vLLM engines keep native selection.
+
+## External platforms
+
+A vendor package registers a probe:
+
+```toml
+[project.entry-points."vllm_gr.platform_plugins"]
+my_accelerator = "my_gr_backend:probe"
+```
+
+```python
+def probe():
+    from vllm.platforms import current_platform
+    if current_platform.device_type == "my_accelerator":
+        return "my_gr_backend.platform.MyGRPlatform"
+    return None
+```
+
+The class extends `GRPlatform` and may also inherit its vendor's native
+`Platform`, as the built-ins do. Declare `native_platform_type` to validate
+compatibility. A vendor reusing CUDA can subclass `CudaGRPlatform` and override
+only the relevant methods. Platform API 3 is the direct-method interface;
+plugins implementing the retired plan/binding API must migrate.
+
+Install the vendor's native vLLM platform and GR platform package in each engine
+and worker environment. GR's packaging continues to support its existing CUDA
+and NPU targets; this design does not add an `external` packaging target.
+See [runtime patches](runtime_patches.md) for the remaining compatibility hooks.

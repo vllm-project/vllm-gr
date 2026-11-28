@@ -140,11 +140,13 @@ def _eligible_beam_layer(layer: Any, vllm_config: Any, spec: Any) -> bool:
 
     # Resolve only after NPU CUSTOM Beam has been selected. Importing this
     # module or checking ordinary/CUDA configs never imports Beam's backends.
+    from vllm_gr.platforms.ascend.decode import engine_mode
+
     beam = import_module("vllm_gr.v1.attention.backends.beam_attn")
     if (
         not beam.NPU_DEVICE
         or beam.CUDA_DEVICE
-        or beam._get_npu_decode_execution() != "xllm"
+        or engine_mode(vllm_config) != "xllm"
         or not _plain_beam_impl(layer, beam)
     ):
         return False

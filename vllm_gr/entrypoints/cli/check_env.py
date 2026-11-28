@@ -16,19 +16,12 @@ class CheckEnvSubcommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
-        from vllm.platforms import current_platform
+        from vllm_gr.platforms import ascend_platform_plugin, get_current_gr_platform
 
-        from vllm_gr.platforms.compat import check_vllm_runtime
-
-        detected_device = str(current_platform.device_type)
-        require_npu = bool(args.npu or detected_device == "npu")
-        if require_npu:
-            from vllm_gr.platforms.ascend.environment import check_ascend_environment
-
-            report = check_ascend_environment(require_npu_platform=True)
-        else:
-            report = check_vllm_runtime()
-            report["platform"] = detected_device
+        integration = get_current_gr_platform()
+        if args.npu and ascend_platform_plugin() is None:
+            raise RuntimeError("--npu requires the native Ascend platform")
+        report = integration.check_environment()
 
         print("vLLM-GR environment check passed")
         for name, value in report.items():

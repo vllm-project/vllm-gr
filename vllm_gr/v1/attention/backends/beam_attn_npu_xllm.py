@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """xLLM fused-operator execution primitives for the Beam Attention backend.
 
-NPU-only execution module selected by the Ascend provider when
+NPU-only execution module selected by the Ascend integration when
 ``vllm_gr_npu_decode_execution == "xllm"``.  It replaces the cascade
 per-operator path only for the incremental beam decode branch; every other
 branch (std requests, prefill) forwards to
@@ -34,6 +34,8 @@ from vllm_gr.v1.attention.backends.npu_cache_layout import (
     interleaved_pool_base,
     restore_npu_cache_pool_layout,
 )
+
+DECODE_MODE = "xllm"
 
 logger = init_logger(__name__)
 

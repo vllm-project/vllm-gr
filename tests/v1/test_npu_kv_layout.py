@@ -53,6 +53,9 @@ def policy(monkeypatch: pytest.MonkeyPatch) -> Any:
         AttentionType=SimpleNamespace(DECODER="decoder"),
         _get_npu_decode_execution=lambda: "xllm",
     )
+    from vllm_gr.platforms.ascend import decode
+
+    monkeypatch.setattr(decode, "engine_mode", lambda config: beam._get_npu_decode_execution())
     modules = {
         "vllm.platforms": SimpleNamespace(current_platform=SimpleNamespace(device_type="npu")),
         "vllm_ascend.attention.utils": SimpleNamespace(requires_contiguous_pa_kv_cache=native),

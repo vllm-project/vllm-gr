@@ -215,7 +215,7 @@ def test_v2_native_capture_sizes_do_not_change_v1_grid(
 ) -> None:
     from vllm_gr.config import GRConfig
     from vllm_gr.config.models import DeploymentOptions
-    from vllm_gr.v1.worker.prefill_graph_runner import get_prefill_graph_runner
+    from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
     monkeypatch.setattr(
         GRConfig,
@@ -229,7 +229,7 @@ def test_v2_native_capture_sizes_do_not_change_v1_grid(
     runner.model_config.max_model_len = 1000
     runner.scheduler_config.max_num_batched_tokens = 4096
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = sizes
-    v1 = get_prefill_graph_runner(runner)
+    v1 = GPUPrefillGraphRunner(runner)
     v2 = pg2.PrefillCapturePlan.for_runner(runner)
     assert v1.buckets == [128, 256, 384, 512, 640, 768, 896, 1000]
     assert v1.match_bucket(900) == 1000

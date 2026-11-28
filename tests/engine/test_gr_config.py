@@ -22,6 +22,7 @@ from tests.helpers.gr_config import (
     engine_args_from_file,
     fixed_beam_mapping,
     prepared_engine_args,
+    test_platform,
 )
 from tests.helpers.paths import REPO_ROOT, TESTS_DIR
 from vllm_gr.config import (
@@ -31,19 +32,10 @@ from vllm_gr.config import (
     gr_config_to_mapping,
 )
 from vllm_gr.config.parser import GR_CONFIG_KEY, parse_gr_config
-from vllm_gr.platforms.legacy import legacy_config_service
 
 ATTENTION_BACKEND_KEY = "vllm_gr_attention_backend"
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
-
-
-@pytest.fixture(autouse=True)  # type: ignore[misc]
-def _isolate_backend_plan_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise configuration policy independently of a native backend install."""
-    from vllm_gr.platforms import planning
-
-    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)
 
 
 def test_engine_config_entrypoint_preserves_unrelated_config(tmp_path: Path) -> None:
@@ -153,8 +145,8 @@ def test_npu_beam_without_catalog_stays_unconstrained(tmp_path: Path) -> None:
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr.engine_config_service",
-            return_value=legacy_config_service("npu"),
+            "vllm_gr.engine.arg_utils_gr.get_current_gr_platform",
+            return_value=test_platform("npu"),
         ),
     ):
         result = create_engine_config(
@@ -180,8 +172,8 @@ def test_cuda_beam_enables_worker_decision_by_default(tmp_path: Path) -> None:
             return_value=config_host(),
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr.engine_config_service",
-            return_value=legacy_config_service("cuda"),
+            "vllm_gr.engine.arg_utils_gr.get_current_gr_platform",
+            return_value=test_platform("cuda"),
         ),
     ):
         result = create_engine_config(engine_args)
@@ -210,8 +202,8 @@ def test_engine_config_preserves_explicit_decision_controls(
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config", return_value=vllm_config
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr.engine_config_service",
-            return_value=legacy_config_service(platform),
+            "vllm_gr.engine.arg_utils_gr.get_current_gr_platform",
+            return_value=test_platform(platform),
         ),
     ):
         result = GRConfig.from_vllm_config(create_engine_config(engine_args))
@@ -232,7 +224,7 @@ def test_default_capture_sizes_preserve_smaller_engine_capacity(
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs, async_scheduling=True),
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: host)
-    monkeypatch.setattr(arg_utils_gr, "engine_config_service", lambda: legacy_config_service(None))
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform(None))
     assert arg_utils_gr.create_engine_config(SimpleNamespace()) is host
     assert host.scheduler_config.max_num_seqs == max_num_seqs
     assert GRConfig.from_vllm_config(host).deployment.beam_batch_sizes == (1, 2, 4)
@@ -250,7 +242,7 @@ def test_engine_creation_preserves_beam_batch_sizes(
     )
     args = engine_args_from_file(tmp_path, {"gr": {"beam_batch_sizes": [1, 3, 7]}})
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: host)
-    monkeypatch.setattr(arg_utils_gr, "engine_config_service", lambda: legacy_config_service(None))
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform(None))
     assert arg_utils_gr.create_engine_config(args) is host
     assert GRConfig.from_vllm_config(host).deployment.beam_batch_sizes == (1, 3, 7)
     GRConfig().write_to_vllm_config(host)
@@ -267,7 +259,7 @@ def test_engine_creation_preserves_flat_graph_batch_size(
     config = config_host()
     args = engine_args_from_file(tmp_path, {"gr": {"decode_graph_batch_size": batch_size}})
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: config)
-    monkeypatch.setattr(arg_utils_gr, "engine_config_service", lambda: legacy_config_service(None))
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform(None))
 
     assert arg_utils_gr.create_engine_config(args) is config
     assert GRConfig.from_vllm_config(config).beam_graph_batch_size == batch_size
@@ -290,9 +282,7 @@ def test_canonical_inputs_produce_identical_worker_configuration(
         }
     }
     original = json.dumps(raw, sort_keys=True)
-    monkeypatch.setattr(
-        arg_utils_gr, "engine_config_service", lambda: legacy_config_service("cuda")
-    )
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform("cuda"))
     outputs = []
     for from_file in (False, True):
         host = SimpleNamespace(
@@ -336,8 +326,8 @@ def test_engine_creation_writes_enabled_canonical_config(
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr.engine_config_service",
-            return_value=legacy_config_service(None),
+            "vllm_gr.engine.arg_utils_gr.get_current_gr_platform",
+            return_value=test_platform(None),
         ),
     ):
         assert create_engine_config(engine_args) is vllm_config
@@ -373,7 +363,7 @@ def test_canonical_input_paths_share_serialization_and_compile_hash(
     offline = VllmConfig(additional_config={"other_plugin": unrelated})
     online = VllmConfig(additional_config={"other_plugin": unrelated})
     # Isolate configuration normalization from accelerator startup policy.
-    monkeypatch.setattr(arg_utils_gr, "engine_config_service", lambda: legacy_config_service(None))
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform(None))
     for host, engine_args in (
         (offline, engine_args_from_file(tmp_path, raw)),
         (online, engine_args_from_file(tmp_path, gr_config_to_mapping(expected))),
@@ -477,12 +467,14 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
         scheduler_config=SimpleNamespace(
             async_scheduling=args.async_scheduling,
             enable_chunked_prefill=args.enable_chunked_prefill,
+            max_num_batched_tokens=8192,
         ),
+        cache_config=SimpleNamespace(block_size=16, user_specified_block_size=False),
+        model_config=SimpleNamespace(is_hybrid=False),
+        use_v2_model_runner=False,
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
-    monkeypatch.setattr(
-        arg_utils_gr, "engine_config_service", lambda: legacy_config_service(device)
-    )
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform(device))
 
     result = arg_utils_gr.create_engine_config(engine_args)
 
@@ -506,8 +498,8 @@ def test_engine_creation_serializes_cuda_decision_defaults(tmp_path: Path) -> No
             return_value=vllm_config,
         ),
         mock.patch(
-            "vllm_gr.engine.arg_utils_gr.engine_config_service",
-            return_value=legacy_config_service("cuda"),
+            "vllm_gr.engine.arg_utils_gr.get_current_gr_platform",
+            return_value=test_platform("cuda"),
         ),
     ):
         assert create_engine_config(engine_args) is vllm_config
@@ -631,9 +623,7 @@ def test_native_engine_does_not_inherit_gr_defaults_or_parallelism_limits(
 
     from vllm_gr.engine import arg_utils_gr
 
-    monkeypatch.setattr(
-        arg_utils_gr, "engine_config_service", lambda: legacy_config_service("cuda")
-    )
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform("cuda"))
 
     def native_config(args: Any, *unused: Any) -> Any:
         return SimpleNamespace(
@@ -704,7 +694,7 @@ def test_npu_sid_stage_vocab_resolves_auto_before_validation(
     from vllm_gr.engine import arg_utils_gr
 
     defaults = arg_utils_gr._beam_worker_decision_default(
-        legacy_config_service("npu"), beam_width_configured=True, worker_decision=None
+        test_platform("npu"), beam_width_configured=True, worker_decision=None
     )
     settings = {"sid_stage_vocab": True}
     if worker_decision is not None:

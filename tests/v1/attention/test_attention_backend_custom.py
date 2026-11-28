@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import unittest
 from types import SimpleNamespace
@@ -28,6 +29,17 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
         from vllm_gr.engine.arg_utils_gr import patch_create_engine_config
 
         patch_create_engine_config()
+        # These tests verify marker reconciliation mechanics, not a platform
+        # runner-generation policy. Force ModelRunner V1 so the Ascend
+        # platform's own "NPU GR requires ModelRunner V1" admission rule (a
+        # real product rule, tested in the platform suites) cannot reject the
+        # marker-only configs these fixtures build.
+        cls._v2_env = mock.patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "0"})
+        cls._v2_env.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._v2_env.stop()
 
     def _make_fake_config(self, backend=None, marker=None):
         """Build a lightweight VllmConfig-like object for mocking."""
@@ -53,12 +65,15 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
 
     @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
     def test_attention_backend_cli_custom_persists_marker(self, mock_origin_create):
-        """--attention-backend CUSTOM sets marker and restores backend."""
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        """--attention-backend CUSTOM persists the marker; the field stays native.
 
+        The Beam intent travels in the GR configuration marker; the platform
+        seam resolves it from there. attention_config keeps whatever the
+        vendor runtime left (vllm-ascend clears the explicit backend during
+        VllmConfig creation), so nothing is restored at engine construction.
+        """
         from vllm_gr.engine.arg_utils_gr import create_engine_config
 
-        # Ascend clears the native backend during VllmConfig creation.
         fake_config = self._make_fake_config()
         mock_origin_create.return_value = fake_config
 
@@ -72,11 +87,15 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
         from vllm_gr.config import GRAttentionBackend, GRConfig
 
         assert GRConfig.from_vllm_config(result).attention_backend is GRAttentionBackend.CUSTOM
-        assert result.attention_config.backend == AttentionBackendEnum.CUSTOM
+        assert result.attention_config.backend is None
 
     @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
     def test_attention_config_backend_custom_persists_marker(self, mock_origin_create):
-        """Restore the explicit CUSTOM backend after Ascend clears it."""
+        """A config-provided CUSTOM backend persists the marker only.
+
+        The engine-args reconciliation keeps the GR marker in sync with the
+        requested backend; the native field is never written back.
+        """
         from vllm.config import AttentionConfig
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -95,7 +114,7 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
         from vllm_gr.config import GRAttentionBackend, GRConfig
 
         assert GRConfig.from_vllm_config(result).attention_backend is GRAttentionBackend.CUSTOM
-        assert result.attention_config.backend == AttentionBackendEnum.CUSTOM
+        assert result.attention_config.backend is None
 
     @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
     def test_non_custom_backend_does_not_set_marker(self, mock_origin_create):
@@ -155,34 +174,34 @@ class TestNpuDefaultBlockSize(unittest.TestCase):
         )
 
     def test_npu_uses_128_when_block_size_was_not_explicit(self):
-        from vllm_gr.platforms.ascend.config import AscendConfigService
+        from tests.helpers.ascend_platform import AscendGRPlatform
 
         config = self._config()
-        AscendConfigService().apply_native_defaults(config)
+        AscendGRPlatform().check_and_update_gr_config(config)
 
         assert config.cache_config.block_size == 128
 
     def test_npu_preserves_explicit_block_size(self):
-        from vllm_gr.platforms.ascend.config import AscendConfigService
+        from tests.helpers.ascend_platform import AscendGRPlatform
 
         config = self._config(user_specified=True)
-        AscendConfigService().apply_native_defaults(config)
+        AscendGRPlatform().check_and_update_gr_config(config)
 
         assert config.cache_config.block_size == 16
 
     def test_npu_preserves_hybrid_model_block_size(self):
-        from vllm_gr.platforms.ascend.config import AscendConfigService
+        from tests.helpers.ascend_platform import AscendGRPlatform
 
         config = self._config(is_hybrid=True)
-        AscendConfigService().apply_native_defaults(config)
+        AscendGRPlatform().check_and_update_gr_config(config)
 
         assert config.cache_config.block_size == 16
 
     def test_gpu_keeps_vllm_default(self):
-        from vllm_gr.platforms.cuda.config import CudaConfigService
+        from tests.helpers.cuda_platform import CudaGRPlatform
 
         config = self._config()
-        CudaConfigService().apply_native_defaults(config)
+        CudaGRPlatform().check_and_update_gr_config(config)
 
         assert config.cache_config.block_size == 16
 
@@ -216,6 +235,22 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
                 attn_type="decoder",
             )
         assert reasons == []
+
+    @pytest.mark.l1
+    @pytest.mark.gpu_test
+    def test_cuda_platform_routes_gr_engines_to_beam_class(self):
+        """The GR platform seam resolves the Beam class without the registry.
+
+        The slot-era path (register CUSTOM, resolve through CudaPlatform's
+        native validation) is gone: for a GR engine the seam returns the
+        Beam backend path that vLLM's selector imports, and the native
+        field never has to survive.
+        """
+        from vllm_gr.platforms.cuda.platform import CudaGRPlatform
+
+        assert CudaGRPlatform.get_gr_attention_backend_cls(None, object()) == (
+            "vllm_gr.v1.attention.backends.beam_attn.BeamAttentionBackend"
+        )
 
     def test_backend_pins_ascend_kv_cache_shape(self):
         """vLLM 0.30 dropped the base-class method; the NPU runner calls it."""
@@ -300,11 +335,3 @@ if __name__ == "__main__":
 
 
 pytestmark = pytest.mark.cpu_test
-
-
-@pytest.fixture(autouse=True)
-def _isolate_backend_plan_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise configuration policy independently of a native backend install."""
-    from vllm_gr.platforms import planning
-
-    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)

@@ -18,6 +18,7 @@ from vllm_gr.platforms.errors import GRDeviceRequestError
 
 if TYPE_CHECKING:
     from vllm_gr.config import GRConfig
+    from vllm_gr.platforms.admission import BeamLimits
     from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
 
 
@@ -27,16 +28,13 @@ NPU_UNCONSTRAINED_MAX_GENERATED_TOKENS = 6
 _NPU_KV_REORDER_BUFFER_BYTES = 95 * 1024
 
 
-def _validate_extended_unconstrained_kv_capacity(config: Any, capacity: int) -> None:
+def _validate_extended_unconstrained_kv_capacity(limits: BeamLimits, capacity: int) -> None:
     """Keep newly admitted suffixes within the native KV reorder buffer."""
-    try:
-        model = config.model_config
-        heads = model.get_num_kv_heads(getattr(config, "parallel_config", None))
-        head_size = model.get_head_size()
-    except (AttributeError, TypeError, ValueError) as exc:
+    heads, head_size = limits.local_kv_heads, limits.head_size
+    if heads is None or head_size is None:
         raise ValueError(
             "NPU unconstrained beam_search above three tokens requires model KV-head geometry"
-        ) from exc
+        )
     if type(heads) is not int or heads < 1 or type(head_size) is not int or head_size < 1:
         raise ValueError("NPU unconstrained beam_search requires positive integer KV-head geometry")
     # SelectUnsharedKV divides its 95 KiB region by head size when tiling,
@@ -55,14 +53,18 @@ def _validate_extended_unconstrained_kv_capacity(config: Any, capacity: int) -> 
 
 def validate_npu_unconstrained_runner(config: Any) -> None:
     """Check the catalog-free NPU adapter before model or request allocation."""
-    if getattr(config, "use_v2_model_runner", False):
+    _validate_runner_generation("v2" if getattr(config, "use_v2_model_runner", False) else "v1")
+
+
+def _validate_runner_generation(generation: str) -> None:
+    if generation != "v1":
         raise ValueError(
             "NPU unconstrained beam_search requires ModelRunner V1; set VLLM_USE_V2_MODEL_RUNNER=0"
         )
 
 
 def validate_npu_device_config(
-    config: Any, gr_config: GRConfig, request: BeamBatchRequest | None = None
+    limits: BeamLimits, gr_config: GRConfig, request: BeamBatchRequest | None = None
 ) -> None:
     """Validate NPU deployment and request capabilities before allocation."""
     parent_widths = gr_config.deployment.candidate_width
@@ -74,7 +76,7 @@ def validate_npu_device_config(
     ):
         raise ValueError("independent per-step candidate_width schedules require CUDA")
     if unconstrained:
-        validate_npu_unconstrained_runner(config)
+        _validate_runner_generation(limits.runner_generation)
         # Keep admission bounded to the validated decision/KV/graph horizon;
         # this does not admit CUDA's arbitrary generation horizons.
         if gr_config.beam_max_decode_steps > NPU_UNCONSTRAINED_MAX_GENERATED_TOKENS or (
@@ -86,7 +88,7 @@ def validate_npu_device_config(
                 f"1..{NPU_UNCONSTRAINED_MAX_GENERATED_TOKENS} generated tokens"
             )
         if gr_config.beam_max_decode_steps > 3:
-            _validate_extended_unconstrained_kv_capacity(config, gr_config.beam_max_decode_steps)
+            _validate_extended_unconstrained_kv_capacity(limits, gr_config.beam_max_decode_steps)
         # Public matching schedules describe K == W at each stage. Their
         # maximum is workspace capacity, not a fixed K for dynamic requests.
         # Keep the fixed-width check for internal scalar configurations and
@@ -140,29 +142,3 @@ def validate_npu_device_config(
                 raise GRDeviceRequestError(
                     f"NPU per_parent_beam_widths exceeds constraint_table.max_top_k={max_top_k}"
                 )
-
-
-def validate_decode_token_budget(request: BeamBatchRequest, config: Any) -> None:
-    """Fit physical Decode rows in the native ModelRunner's token buffers."""
-    device = getattr(getattr(config, "device_config", None), "device", None)
-    if str(device).split(":")[0] != "npu" or request.beam_params.max_tokens == 1:
-        return
-    budget = getattr(getattr(config, "scheduler_config", None), "max_num_batched_tokens", None)
-    if budget is None:
-        return
-    params = request.beam_params
-    # Prefill produces the first winners. Each remaining invocation consumes
-    # the preceding stage's winners; the final output is never a model input.
-    input_width = (
-        params.beam_width
-        if params.dynamic_beam_widths is None
-        else max(params.dynamic_beam_widths[:-1])
-    )
-    physical_tokens = len(request.items) * input_width
-    if physical_tokens > budget:
-        raise ValueError(
-            f"NPU Beam Decode requires {physical_tokens} physical tokens "
-            f"(batch_size={len(request.items)} * peak_input_width={input_width}), "
-            f"exceeding max_num_batched_tokens={budget}; increase the token budget "
-            "or reduce the batch size or Decode input widths"
-        )

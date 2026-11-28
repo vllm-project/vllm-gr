@@ -125,6 +125,7 @@ class BeamAttentionContext:
                     "Short suffix attention requires a FlashAttention-compatible "
                     "head size (multiple of 8, at most 256) and FP16/BF16/FP32"
                 )
+        self.decode_mode = "cascade"
         self.enable_short_suffix_attention = enable_short_suffix_attention
         _validate_pool_dtype(dtype)
 

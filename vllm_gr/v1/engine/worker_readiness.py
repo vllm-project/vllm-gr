@@ -1,59 +1,148 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Worker readiness RPC and cross-worker startup agreement."""
+"""Check actual GR worker initialization before accepting requests."""
 
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-from vllm_gr.config.backend_plan import (
-    BackendPlan,
-    PlanData,
-    read_backend_plan,
-)
-from vllm_gr.platforms.services import validate_required_services
+from vllm_gr.config import GRAttentionBackend, GRConfig
+from vllm_gr.config.models import runtime_constraint_table
+from vllm_gr.config.parser import gr_config_to_mapping
+from vllm_gr.platforms.identity import qualified_class_name
 
 logger = logging.getLogger(__name__)
 
 
+def _attention_by_kind(runner: Any) -> dict[str, list[str]]:
+    groups = getattr(runner, "attn_groups", ())
+    if not groups:
+        return {}
+    from vllm.v1.kv_cache_interface import get_kv_cache_spec_kind
+
+    selected: dict[str, set[str]] = {}
+    for group in groups:
+        for attention in group:
+            kind = get_kv_cache_spec_kind(attention.kv_cache_spec).value
+            selected.setdefault(kind, set()).add(attention.backend.get_name())
+    return {kind: sorted(names) for kind, names in selected.items()}
+
+
+def _runtime_versions() -> dict[str, str | None]:
+    from vllm_gr.platforms import current_gr_platform
+    from vllm_gr.platforms.compat import installed_version
+
+    distributions = {"vllm", "vllm-gr"}
+    distributions.update(
+        name
+        for name in (
+            current_gr_platform.vendor_distribution,
+            current_gr_platform.plugin_distribution,
+        )
+        if name is not None
+    )
+    return {name: installed_version(name) for name in sorted(distributions)}
+
+
 def worker_backend_readiness(worker: Any) -> dict[str, Any]:
-    """Callable RPC: native executors pass their Worker as the first argument."""
-    from vllm_gr.v1.worker.runner_binding import bind_backend_services
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
 
-    runner = getattr(worker, "model_runner", None)
-    if runner is None:
-        raise RuntimeError("Worker has no model runner for backend plan validation")
-    binding = bind_backend_services(runner)
-    if binding is None:
-        raise RuntimeError("Worker did not receive the engine backend plan")
-    return binding.report()
+    from vllm_gr.platforms import current_gr_platform
+
+    # Callable executor RPCs receive the native wrapper, not its loaded Worker.
+    if isinstance(worker, WorkerWrapperBase):
+        worker = worker.worker
+    runner = worker.model_runner
+    if not getattr(runner, "_gr_ready", False):
+        raise RuntimeError("GR Worker must initialize its GR ModelRunner before serving")
+    config = runner.vllm_config
+    gr = GRConfig.from_vllm_config(config)
+    if getattr(runner, "_gr_loaded_config", gr) != gr:
+        raise RuntimeError("GR configuration changed after model initialization")
+    backend = getattr(runner, "constraint_backend", None)
+    metadata = getattr(getattr(backend, "info", None), "table_metadata", None)
+    execution = getattr(runner, "_gr_attention_execution", None)
+    return {
+        "ready": True,
+        "platform": qualified_class_name(type(current_gr_platform)),
+        "runner": qualified_class_name(type(runner)),
+        "versions": _runtime_versions(),
+        "worker_classes": [qualified_class_name(cls) for cls in type(worker).__mro__],
+        "gr_config": gr_config_to_mapping(GRConfig.from_vllm_config(config)),
+        "max_model_len": config.model_config.max_model_len,
+        "constraint_digest": getattr(metadata, "artifact_digest", None),
+        "attention_by_kind": _attention_by_kind(runner),
+        "attention_execution": getattr(
+            execution, "__name__", qualified_class_name(type(execution))
+        ),
+        "decode_mode": getattr(execution, "DECODE_MODE", None),
+        "graph": runner.gr_graph_status(),
+    }
 
 
-def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_workers: int) -> None:
-    if type(expected_workers) is not int or expected_workers < 1:
-        raise ValueError("Backend readiness requires a positive integer worker count")
+def validate_worker_readiness(config: Any, reports: Any, *, expected_workers: int) -> None:
+    from vllm_gr.platforms import current_gr_platform
+
     if not isinstance(reports, (list, tuple)) or len(reports) != expected_workers or not reports:
-        raise RuntimeError(f"Backend readiness requires {expected_workers} worker reports")
-    required = plan.required_services
-    services = None
+        raise RuntimeError(f"GR startup requires {expected_workers} worker reports")
+    gr = GRConfig.from_vllm_config(config)
+    expected_config = gr_config_to_mapping(gr)
+    table = runtime_constraint_table(gr)
+    expected_versions = _runtime_versions()
+    expected_worker = config.parallel_config.worker_cls
+    if isinstance(expected_worker, type):
+        expected_worker = qualified_class_name(expected_worker)
+    first = None
     for index, report in enumerate(reports):
-        if not isinstance(report, dict):
-            raise RuntimeError(f"Backend worker {index} is not ready")
-        if report.get("ready") is not True:
+        if not isinstance(report, dict) or report.get("ready") is not True:
+            raise RuntimeError(f"GR worker {index} is not ready: {report}")
+        if report.get("platform") != qualified_class_name(type(current_gr_platform)):
+            raise RuntimeError(f"GR worker {index} selected a different platform")
+        if report.get("versions") != expected_versions:
+            raise RuntimeError(f"GR worker {index} has different runtime or plugin versions")
+        if expected_worker not in report.get("worker_classes", ()):
+            raise RuntimeError(f"GR worker {index} did not use the configured Worker class")
+        if not isinstance(report.get("runner"), str) or not report["runner"]:
+            raise RuntimeError(f"GR worker {index} did not report an initialized ModelRunner")
+        if report.get("gr_config") != expected_config:
+            raise RuntimeError(f"GR worker {index} received a different GR configuration")
+        length = report.get("max_model_len")
+        if type(length) is not int or not 0 < length <= config.model_config.max_model_len:
+            raise RuntimeError(f"GR worker {index} has an invalid max_model_len")
+        if (
+            table is not None
+            and table.enabled
+            and report.get("constraint_digest") != table.artifact_digest
+        ):
+            raise RuntimeError(f"GR worker {index} loaded a different constraint artifact")
+        if gr.attention_backend is GRAttentionBackend.CUSTOM:
+            if (
+                not report.get("attention_execution")
+                or report["attention_execution"] == "builtins.NoneType"
+            ):
+                raise RuntimeError(f"GR worker {index} has no Beam attention implementation")
+            mode = report.get("decode_mode")
+            if gr.npu_decode_execution not in (None, "auto") and mode != gr.npu_decode_execution:
+                raise RuntimeError(f"GR worker {index} did not select the requested decode mode")
+        overrides = getattr(config.attention_config, "backend_per_kind", None) or {}
+        for kind, names in report.get("attention_by_kind", {}).items():
+            expected = overrides.get(kind)
+            if expected is not None and names != [getattr(expected, "name", expected)]:
+                raise RuntimeError(
+                    f"GR worker {index} ignored the explicit {kind} attention backend"
+                )
+        graph = report.get("graph")
+        if not isinstance(graph, dict) or not {"captured", "fallback"} <= graph.keys():
+            raise RuntimeError(f"GR worker {index} did not report graph execution status")
+        if not gr.beam_graph_enabled and graph["captured"]:
+            raise RuntimeError(f"GR worker {index} captured graphs for an eager configuration")
+        # These are actual initialized outcomes, not a second configuration plan.
+        if first is not None and report != first:
             raise RuntimeError(
-                f"Backend worker {index} is not ready: {report.get('error', 'unknown error')}"
+                "GR workers disagree on implementations, versions, constraints or graph execution"
             )
-        if report.get("fingerprint") != plan.fingerprint:
-            raise RuntimeError(f"Backend worker {index} plan fingerprint mismatch")
-        reported = report.get("services")
-        if not isinstance(reported, dict):
-            raise RuntimeError(f"Backend worker {index} has no bound services")
-        validate_required_services(plan, required, reported, f"Backend worker {index}")
-        current = PlanData(reported)
-        if services is not None and current != services:
-            raise RuntimeError("Workers disagree on bound backend service implementations")
-        services = current
+        first = report
 
 
 def _external_launcher_reports(executor: Any, expected_workers: int) -> list[Any]:
@@ -83,25 +172,24 @@ def _external_launcher_reports(executor: Any, expected_workers: int) -> list[Any
 
 
 def verify_engine_backend_readiness(engine: Any) -> None:
-    plan = read_backend_plan(engine.vllm_config)
-    if plan is None:
+    config = engine.vllm_config
+    gr = GRConfig.from_vllm_config(config)
+    if gr.beam_max_width is None and gr.attention_backend is not GRAttentionBackend.CUSTOM:
         return
-    parallel = getattr(engine.vllm_config, "parallel_config", None)
-    # For native multiprocessing each DP EngineCore owns a TP/PP/PCP executor.
-    expected = getattr(parallel, "world_size", 1)
+    parallel = config.parallel_config
+    expected = parallel.world_size
     try:
-        if (
-            expected > 1
-            and getattr(parallel, "distributed_executor_backend", None) == "external_launcher"
-        ):
+        if expected > 1 and parallel.distributed_executor_backend == "external_launcher":
             reports = _external_launcher_reports(engine.model_executor, expected)
         else:
             reports = engine.model_executor.collective_rpc(worker_backend_readiness)
-        validate_worker_readiness(plan, reports, expected_workers=expected)
+        validate_worker_readiness(config, reports, expected_workers=expected)
+        from vllm_gr.platforms.beam_requests import engine_request_validator
+
+        engine._gr_validate_platform_request = engine_request_validator(config)
     except BaseException:
         try:
             engine.model_executor.shutdown()
         except Exception:
-            logger.exception("Failed to shut down executor after backend readiness failure")
+            logger.exception("Failed to shut down executor after GR initialization failure")
         raise
-    engine._gr_backend_fingerprint = plan.fingerprint

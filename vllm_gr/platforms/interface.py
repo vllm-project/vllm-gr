@@ -1,72 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Hardware-neutral contracts for vllm-gr backend providers."""
+"""GR extension points on vLLM's native platform interface."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol
+
+from vllm.platforms.interface import Platform
 
 if TYPE_CHECKING:
-    import torch
+    from vllm.config import VllmConfig
 
-    from vllm_gr.config.backend_plan import BackendPlan, BackendRequest
-    from vllm_gr.constraints.execution import ConstrainedTopKExecution
-
-    from .config import BackendConfigService
-    from .identity import PlatformIdentity
-
-#: Provider API implemented by built-in and external providers in this release.
-PROVIDER_API_VERSION = 2
-
-#: API version assumed for entry points that do not declare one.
-LEGACY_PROVIDER_API_VERSION = 1
-
-
-@runtime_checkable
-class ConfigProvider(Protocol):
-    """Optional host policy for native defaults and engine admission."""
-
-    def create_config_service(self) -> BackendConfigService: ...
-
-
-class ModelRunnerPatchHooks(Protocol):
-    """Required hooks for the V1 ModelRunner patch dispatcher.
-
-    Additional stage sampling and model-forward factories are optional
-    capabilities discovered by the dispatcher. Both platforms retain native
-    sampling and bookkeeping for ordinary inference.
-    """
-
-    def discover_worker_runners(self) -> tuple[tuple[str, type[Any]], ...]: ...
-
-    def make_patched_prepare_inputs(
-        self,
-        original: Callable[..., Any],
-    ) -> Callable[..., Any]: ...
-
-
-@runtime_checkable
-class ModelRunnerInstaller(Protocol):
-    """Install and verify the selected native runner's own method surface."""
-
-    def discover_worker_runners(self) -> tuple[tuple[str, type[Any]], ...]: ...
-
-    def install(self) -> None: ...
-
-    def is_patched(self, runner_class: type[Any]) -> bool: ...
-
-
-class ModelRunnerAdapter(Protocol):
-    """Per-runner callbacks with the selected native signatures and return values."""
-
-    def prepare_inputs(self, *args: Any, **kwargs: Any) -> Any: ...
-
-    def execute_model(self, *args: Any, **kwargs: Any) -> Any: ...
-
-    # Some native runners complete sampling entirely inside execute_model.
-    @property
-    def sample_tokens(self) -> Callable[..., Any] | None: ...
+    from vllm_gr.platforms.admission import BeamLimits
+    from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
 
 
 class BeamAttentionExecution(Protocol):
@@ -138,66 +84,75 @@ class BeamAttentionExecution(Protocol):
     ) -> None: ...
 
 
-class GRBackendProvider(Protocol):
-    """Process-local provider for one stable GR backend identity."""
+class GRPlatform(Platform):
+    """Select concrete GR implementations; engine state belongs to the runner."""
 
-    @property
-    def backend_id(self) -> str: ...
+    api_version = 3
+    native_platform_type: type[Platform] | None = None
+    backend_id = "unspecified"
+    plugin_distribution: str | None = None
+    vendor_distribution: str | None = None
+    beam_attention_layout: str | None = None
+    canonical_constraint_backend = "platform"
+    default_use_v2_model_runner: bool | None = None
+    default_worker_decision = False
+    supports_sid_stage_vocab = False
+    supports_unconstrained = False
+    supports_dynamic_width = False
 
-    @property
-    def device_type(self) -> str:
-        """Tensor placement of the supported platform; not the identity."""
+    def get_gr_worker_cls(self) -> str:
+        raise NotImplementedError(f"{self.backend_id} has no GR Worker")
 
-    @property
-    def api_version(self) -> int: ...
+    def check_environment(self) -> dict[str, str]:
+        from .compat import check_vllm_runtime
 
-    @property
-    def gr_version_range(self) -> str | None: ...
+        return check_vllm_runtime()
 
-    @property
-    def vllm_version_range(self) -> str | None: ...
+    def prepare_gr_engine(self) -> int:
+        return 0
 
-    @property
-    def vendor_version_range(self) -> str | None: ...
+    def check_and_update_gr_config(self, config: VllmConfig) -> None:
+        """Validate platform-specific settings after native configuration."""
 
-    @property
-    def vendor_distribution(self) -> str | None: ...
+    def get_beam_limits(self, config: VllmConfig) -> BeamLimits:
+        from .admission import BeamLimits
+        from .identity import qualified_class_name
 
-    def matches(self, identity: PlatformIdentity) -> bool: ...
+        return BeamLimits(
+            device_type=self.device_type,
+            platform_class=qualified_class_name(type(self)),
+            max_decode_rows=None,
+            retain_candidate_widths=False,
+            constraint_backend=self.canonical_constraint_backend,
+            runner_generation="v2" if getattr(config, "use_v2_model_runner", False) else "v1",
+            local_kv_heads=None,
+            head_size=None,
+            supports_unconstrained=self.supports_unconstrained,
+            supports_dynamic_width=self.supports_dynamic_width,
+            supports_sid_stage_vocab=self.supports_sid_stage_vocab,
+        )
 
-    def check_environment(self) -> dict[str, str]: ...
+    def validate_gr_request(self, config: VllmConfig, request: BeamBatchRequest | None) -> None:
+        """Additional device checks, run by the authoritative EngineCore."""
 
-    def apply_runtime_patches(self, *, force: bool = False) -> int: ...
+    @classmethod
+    def get_gr_attention_backend_cls(
+        cls, selected_backend, attn_selector_config, num_heads: int | None = None
+    ) -> str:
+        return "vllm_gr.v1.attention.backends.beam_attn.BeamAttentionBackend"
 
-    def get_model_runner_hooks(self) -> ModelRunnerInstaller | ModelRunnerPatchHooks: ...
+    def get_attention_execution(self) -> BeamAttentionExecution:
+        raise NotImplementedError(f"{self.backend_id} has no Beam attention implementation")
 
-    def get_attention_execution(self) -> BeamAttentionExecution: ...
+    def create_constraint_backend(self, table, *, device, dtype, max_rows, max_top_k):
+        """Build a worker-owned canonical constraint operator from a validated table."""
+        raise NotImplementedError(f"{self.backend_id} has no canonical constraint backend")
 
-    def create_constrained_topk_execution(
-        self,
-        *,
-        device: str | torch.device | None = None,
-    ) -> ConstrainedTopKExecution | None: ...
+    def get_prefill_graph_runner_class(self) -> type:
+        raise NotImplementedError(f"{self.backend_id} has no GR prefill graph runner")
 
 
-class GRPlanningProvider(GRBackendProvider, Protocol):
-    """Planning extension for provider API version 2.
+class UnspecifiedGRPlatform(GRPlatform):
+    """Import and CLI support without an available GR execution platform."""
 
-    Providers without plan_api_version keep the narrow API-v2 delegation path.
-    New factories receive an immutable engine plan, never provider.current_plan.
-    """
-
-    plan_api_version: int
-    adapter_revision: str
-
-    def resolve(self, request: BackendRequest) -> BackendPlan: ...
-
-    def validate_worker(self, *, plan: BackendPlan, native_runner: Any) -> None: ...
-
-    def create_model_runner_adapter(self, *, plan: BackendPlan, native_runner: Any) -> Any: ...
-
-    def create_attention_executor(self, *, plan: BackendPlan, device: Any) -> Any: ...
-
-    def create_constrained_topk_execution(
-        self, *, plan: BackendPlan | None = None, device: str | torch.device | None = None
-    ) -> ConstrainedTopKExecution | None: ...
+    device_type = "cpu"

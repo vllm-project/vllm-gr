@@ -131,7 +131,7 @@ if [ "${npu_state:-false}" == "true" ]; then
     bash tools/npu/install_xllm_ops.sh
 
     source tools/npu/xllm_env.sh
-    load_xllm_env
+    load_xllm_env "$@"
 
     PYTORCH_NPU_ALLOW_FORK=true \
     VLLM_WORKER_MULTIPROC_METHOD="spawn" \

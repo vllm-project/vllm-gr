@@ -14,15 +14,12 @@ from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 
 
 @pytest.fixture(autouse=True)  # type: ignore
-def _force_non_npu(monkeypatch: pytest.MonkeyPatch) -> None:
-    import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
+def _select_cuda_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.helpers.cuda_platform import CudaGRPlatform
 
-    monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: False)
-
-    class MockCUDAProvider:
-        device_type = "cuda"
-
-    monkeypatch.setattr(prefill_graph_runner_mod, "current_platform", MockCUDAProvider())
+    monkeypatch.setattr(
+        "vllm_gr.v1.worker.prefill_graph_runner.get_current_gr_platform", CudaGRPlatform
+    )
 
 
 class MockModelRunner:
@@ -274,33 +271,35 @@ def test_multi_req_graph_buffers() -> None:
 
 
 def test_platform_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
-    import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
+    from tests.helpers.ascend_platform import AscendGRPlatform
+    from tests.helpers.cuda_platform import CudaGRPlatform
+    from vllm_gr.platforms.interface import GRPlatform
+    from vllm_gr.v1.worker import prefill_graph_runner as dispatcher
     from vllm_gr.v1.worker.cuda.v1.gpu_prefill_graph_runner import GPUPrefillGraphRunner
     from vllm_gr.v1.worker.npu.npu_prefill_graph_runner import NPUPrefillGraphRunner
-    from vllm_gr.v1.worker.prefill_graph_runner import (
-        BeamPrefillGraphRunner,
-        get_active_prefill_graph_runner_class,
-    )
 
     runner = MockModelRunner()
+    for platform_cls, runner_cls in (
+        (AscendGRPlatform, NPUPrefillGraphRunner),
+        (CudaGRPlatform, GPUPrefillGraphRunner),
+    ):
+        monkeypatch.setattr(dispatcher, "get_current_gr_platform", platform_cls)
+        assert dispatcher.get_active_prefill_graph_runner_class() is runner_cls
+        assert isinstance(BeamPrefillGraphRunner(runner, buckets=[512]), runner_cls)
 
-    # 1. Test NPU platform selection
-    class MockNPUPlatform:
-        device_type = "npu"
+    vendor = GRPlatform()
+    monkeypatch.setattr(dispatcher, "get_current_gr_platform", lambda: vendor)
+    with pytest.raises(NotImplementedError, match="unspecified has no GR prefill graph runner"):
+        BeamPrefillGraphRunner(runner)
 
-    monkeypatch.setattr(prefill_graph_runner_mod, "current_platform", MockNPUPlatform)
-    assert get_active_prefill_graph_runner_class() is NPUPrefillGraphRunner
-    npu_runner = BeamPrefillGraphRunner(runner, buckets=[512])
-    assert isinstance(npu_runner, NPUPrefillGraphRunner)
+    class VendorRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            self.model_runner = kwargs["model_runner"]
 
-    # 2. Test CUDA platform selection
-    class MockCUDAProvider:
-        device_type = "cuda"
-
-    monkeypatch.setattr(prefill_graph_runner_mod, "current_platform", MockCUDAProvider)
-    assert get_active_prefill_graph_runner_class() is GPUPrefillGraphRunner
-    gpu_runner = BeamPrefillGraphRunner(runner, buckets=[512])
-    assert isinstance(gpu_runner, GPUPrefillGraphRunner)
+    monkeypatch.setattr(vendor, "get_prefill_graph_runner_class", lambda: VendorRunner)
+    custom = BeamPrefillGraphRunner(runner)
+    assert isinstance(custom, VendorRunner)
+    assert custom.model_runner is runner
 
 
 class MockNPUAttnBuilder:
@@ -1131,9 +1130,7 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import gr_startup, model_runner_patch
     from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
-    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     stream = SimpleNamespace(wait_stream=lambda _other: None)
     monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda runner=None: True)
@@ -1157,41 +1154,22 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
 
     events: list[str] = []
 
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
     from vllm_gr.config import GRConfig
+    from vllm_gr.v1.worker.cuda.v1 import model_runner as concrete
 
-    class Runner:
-        vllm_config = worker_config(GRConfig(beam_max_width=128))
-
-        def execute_model(self) -> None:
-            pass
-
-        def _prepare_inputs(self) -> None:
-            pass
-
-        def _bookkeeping_sync(self) -> None:
-            pass
-
-        def capture_model(self) -> None:
-            events.append("native")
-
-    platform = SimpleNamespace(
-        discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
-        make_patched_prepare_inputs=lambda original: original,
-        capture_prefill_graphs=patch.capture_prefill_graphs,
-    )
-    capture_async = Mock(return_value=None)
-    monkeypatch.setattr(gr_startup, "capture_async_forward", capture_async)
+    monkeypatch.setattr(GPUModelRunner, "capture_model", lambda self: events.append("native"))
     monkeypatch.setattr(
-        model_runner_patch,
-        "freeze_gc_after_graph_capture",
-        lambda _runner: events.append("freeze"),
+        concrete, "freeze_gc_after_graph_capture", lambda self: events.append("freeze")
     )
-
-    model_runner_patch.install_v1_worker_hooks(platform, cuda_hooks_type=CudaStageHooksV1)
-    worker = Runner()
+    worker = object.__new__(concrete.CudaGRModelRunnerV1)
+    worker.vllm_config = worker_config(GRConfig(beam_max_width=128))
+    capture_async = Mock(return_value=None)
+    worker.capture_gr_startup = capture_async
     with pytest.raises(RuntimeError) as raised:
         worker.capture_model()
-    capture_async.assert_called_once_with(worker, hooks_type=CudaStageHooksV1)
+    capture_async.assert_called_once_with(False)
     assert raised.value is error
     assert events == ["native"]
 

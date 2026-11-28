@@ -241,10 +241,17 @@ def test_retirement_releases_selectors_and_next_owner_uses_its_new_trie_order() 
 
 
 @pytest.mark.parametrize("count", [1, 2, 5])
-def test_npu_startup_publishes_the_loaded_backend_count_not_a_config_guess(count: int) -> None:
+def test_npu_startup_publishes_the_loaded_backend_count_not_a_config_guess(
+    count: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from vllm_gr.v1.engine.core import loaded_constraint_trie_count
     from vllm_gr.v1.engine.engine_core_patch import make_patched_engine_init
 
+    # Readiness is covered through native RPCs in test_worker_readiness.
+    readiness_gate = Mock()
+    monkeypatch.setattr(
+        "vllm_gr.v1.engine.worker_readiness.verify_engine_backend_readiness", readiness_gate
+    )
     worker = SimpleNamespace(model_runner=_runner(count).worker)
     engine = SimpleNamespace()
 
@@ -261,6 +268,7 @@ def test_npu_startup_publishes_the_loaded_backend_count_not_a_config_guess(count
         )
 
     make_patched_engine_init(initialize)(engine)
+    readiness_gate.assert_called_once_with(engine)
     assert engine._gr_trie_count == engine.scheduler._gr_trie_count == count
     engine.model_executor.collective_rpc.assert_called_once_with(loaded_constraint_trie_count)
 

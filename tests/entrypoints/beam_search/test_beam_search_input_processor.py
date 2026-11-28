@@ -744,7 +744,9 @@ def test_per_parent_beam_widths_reaches_worker_contract(device: str, online: boo
 def test_cpu_per_parent_beam_widths_is_rejected_before_submission(online: bool) -> None:
     engine = _make_engine()
     engine.vllm_config.device_config = SimpleNamespace(device="cpu")
-    with pytest.raises(BeamSearchRequestError, match="requires a CUDA ModelRunner or NPU"):
+    with pytest.raises(
+        BeamSearchRequestError, match="does not support a canonical constraint table"
+    ):
         _prepare_request(
             engine,
             [1, 2],
@@ -1297,3 +1299,14 @@ def test_native_params_reach_offline_preparation() -> None:
         engine, [1, 2], BeamSearchParams(beam_width=8, max_tokens=3, ignore_eos=True), online=False
     )
     assert request.beam_params.dynamic_beam_widths == (8, 4, 2)
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def select_test_npu_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These host tests construct NPU configs without running platform discovery.
+    import vllm_gr.platforms
+    from tests.helpers.ascend_platform import AscendGRPlatform
+
+    monkeypatch.setattr(
+        vllm_gr.platforms, "get_current_gr_platform", lambda **kw: AscendGRPlatform()
+    )

@@ -84,10 +84,15 @@ worker preserves candidate ancestry across reordering. The
 ## Platform execution
 
 Both backends use the same Beam batch and result contracts. At startup, each
-process activates the provider for the current vLLM device type. The provider
-checks the runtime and applies platform-specific patches. The worker and
-attention dispatchers then select the runner and attention implementation for
-the device.
+process reads vLLM's `current_platform`. One matching installed GR plugin takes
+precedence on every device. With no matching plugin, GR requires a unique
+built-in match. GR caches an independent `current_gr_platform` and leaves the
+native vLLM platform unchanged. Platform methods finalize configuration and
+select a Worker through native `worker_cls`. Concrete Worker/Runner subclasses
+reuse native services and shared Beam algorithms. Model loading initializes
+runner-owned attention and constraints. EngineCore checks actual initialized
+Worker reports before accepting requests; no separate backend plan or adapter
+binding is required.
 
 - **CUDA** workers manage device Beam state and can replay captured Prefill
   and Decode work. The [CUDA Prefill design](feature/cuda_prefill_graph.md)
@@ -98,6 +103,6 @@ the device.
   The [Ascend Decode design](feature/npu_decode_execution.md) describes the
   fused and cascade paths and their fallback conditions.
 
-See the [platform backend contract](module/platform_backend.md) for provider
-ownership and [feature compatibility](../user_guide/feature_compatibility.md)
+See the [platform backend contract](module/platform_backend.md) for platform
+selection and binding and [feature compatibility](../user_guide/feature_compatibility.md)
 for the supported combinations.

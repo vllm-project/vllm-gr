@@ -109,6 +109,7 @@ class BeamSearchSession:
                 pool_key_ptrs=pool_key_ptrs,
                 pool_value_ptrs=pool_value_ptrs,
                 layout_prevalidated=layout_prevalidated,
+                decode_mode=self.context.decode_mode,
             )
         state.decode_step += 1
 

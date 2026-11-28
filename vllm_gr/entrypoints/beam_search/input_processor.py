@@ -25,8 +25,8 @@ from vllm_gr.entrypoints.beam_search.protocol import (
 from vllm_gr.entrypoints.beam_search.request_params import (
     apply_beam_request_defaults,
 )
+from vllm_gr.platforms.admission import beam_limits
 from vllm_gr.platforms.beam_requests import (
-    uses_retained_candidate_widths,
     validate_dynamic_width_support,
     validate_frontend_constraint_mode,
 )
@@ -81,8 +81,7 @@ def _configured_candidate_width(vllm_config: Any) -> int | None:
     """Return the explicitly configured K, or ``None`` when K follows W."""
 
     config = GRConfig.from_vllm_config(vllm_config)
-    device = getattr(getattr(vllm_config, "device_config", None), "device", None)
-    if uses_retained_candidate_widths(config, device):
+    if beam_limits(vllm_config).uses_retained_widths(config):
         return None
     return config.beam_candidate_width
 

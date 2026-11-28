@@ -20,12 +20,38 @@ from vllm_gr.config import (
     GRConfig,
 )
 from vllm_gr.config.models import DeploymentOptions
+from vllm_gr.platforms.interface import GRPlatform
+
+
+def test_platform(device: str | None) -> GRPlatform:
+    """Supply native defaults for the platform simulated by an EngineArgs test."""
+    from tests.helpers.ascend_platform import AscendGRPlatform
+    from tests.helpers.cuda_platform import CudaGRPlatform
+
+    if device == "cuda":
+        return CudaGRPlatform()
+    if device == "npu":
+        return AscendGRPlatform()
+
+    class GenericPlatform(GRPlatform):  # type: ignore[misc]
+        device_type = "cpu"
+
+        def get_gr_worker_cls(self) -> Any:
+            return "tests.fixtures.GenericWorker"
+
+    return GenericPlatform()
+
+
+setattr(test_platform, "__test__", False)
 
 
 def config_host(additional_config: object | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         additional_config={} if additional_config is None else additional_config,
-        scheduler_config=SimpleNamespace(async_scheduling=True),
+        scheduler_config=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=8192),
+        cache_config=SimpleNamespace(block_size=16, user_specified_block_size=False),
+        model_config=SimpleNamespace(is_hybrid=False),
+        use_v2_model_runner=False,
     )
 
 

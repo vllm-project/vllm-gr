@@ -30,13 +30,6 @@ import torch
 _FALLBACK_LOGGED = False
 
 
-def _resolve_mode() -> str:
-    """Read the process-global decode execution mode (cascade | xllm)."""
-    from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
-
-    return _get_npu_decode_execution()
-
-
 def _group_token_num_from_parents(parent: torch.Tensor) -> torch.Tensor:
     """Request-local prefix sums of surviving-child counts per source beam.
 
@@ -140,6 +133,7 @@ def reorder_unshared_kv(
     pool_value_ptrs: torch.Tensor | None = None,
     *,
     layout_prevalidated: bool = False,
+    decode_mode: str = "cascade",
 ) -> None:
     """Reorder every layer's unshared pool KV in place after selection.
 
@@ -161,7 +155,7 @@ def reorder_unshared_kv(
             back to the per-layer cascade kernel.
     """
     pools = list(pools)
-    if _resolve_mode() == "xllm":
+    if decode_mode == "xllm":
         pool_beam_width = pools[0].unshared_key.shape[1]
         if _fused_reorder_applies(parent, pool_beam_width):
             from vllm_gr.ops.npu import beam_ops

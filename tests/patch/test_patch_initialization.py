@@ -36,7 +36,6 @@ def test_patch_plans_preserve_process_responsibilities() -> None:
         "engine_core_requests",
         "kv_hash_memo",
         "scheduler",
-        "model_runner",
     ]
     assert set(frontend_patches).isdisjoint(engine_core_patches)
 
@@ -75,23 +74,19 @@ def test_runtime_patch_order_preserves_ascend_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
-    from vllm_gr.platforms import loader
-    from vllm_gr.platforms.ascend import NPU_BACKEND, spawn_patch
-    from vllm_gr.v1.worker.npu import startup_patch
+    import vllm_gr.platforms as table
+    from tests.helpers.ascend_platform import AscendGRPlatform
+    from vllm_gr.platforms.ascend import config_patch, spawn_patch
 
-    monkeypatch.setattr(loader, "activate_current_backend", lambda: NPU_BACKEND)
+    monkeypatch.setattr(table, "get_current_gr_platform", AscendGRPlatform)
     call_order: list[str] = []
 
     def apply_npu_spawn() -> int:
         call_order.append("npu_spawn")
         return 1
 
-    def apply_attention(force: bool = False) -> int:
-        call_order.append("attention")
-        return 1
-
-    def patch_npu_worker() -> int:
-        call_order.append("npu_worker")
+    def sanitize(cls: object) -> int:
+        call_order.append("sanitize")
         return 1
 
     def apply_beam() -> int:
@@ -104,14 +99,9 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_npu_spawn,
     )
     monkeypatch.setattr(
-        runtime_patch.selector_patch,
-        "apply_custom_attention_backend_patch",
-        apply_attention,
-    )
-    monkeypatch.setattr(
-        startup_patch,
-        "patch_npu_worker_init_device",
-        patch_npu_worker,
+        config_patch,
+        "apply_engine_core_config_sanitizer",
+        sanitize,
     )
     monkeypatch.setattr(
         runtime_patch,
@@ -119,8 +109,8 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_beam,
     )
 
-    assert runtime_patch._apply_patches(force=True) == 4
-    assert call_order == ["attention", "npu_spawn", "npu_worker", "beam"]
+    assert runtime_patch._apply_patches(force=True) == 2
+    assert call_order == ["npu_spawn", "sanitize", "beam"]
 
 
 def test_optional_patch_count_tracks_actual_installation(
@@ -235,55 +225,18 @@ def test_engine_core_child_uses_minimal_authoritative_initialization_path(
     assert calls == ["initialize", "run"]
 
 
-def test_model_runner_verifier_checks_shared_discovery_set(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm_gr.v1.worker import model_runner_patch
-
-    class PatchedRunner:
-        pass
-
-    class MissingRunner:
-        pass
-
-    monkeypatch.setattr(
-        model_runner_patch,
-        "discover_active_worker_runners",
-        lambda: (
-            ("PatchedRunner", PatchedRunner),
-            ("MissingRunner", MissingRunner),
-        ),
-    )
-    monkeypatch.setattr(
-        model_runner_patch,
-        "is_active_worker_runner_patched",
-        lambda runner: runner is PatchedRunner,
-    )
-
-    assert (
-        model_runner_patch.validate_model_runner_patch()
-        == "MissingRunner beam execution hooks are not installed"
-    )
-
-    monkeypatch.setattr(model_runner_patch, "discover_active_worker_runners", lambda: ())
-    assert (
-        model_runner_patch.validate_model_runner_patch()
-        == "No supported active-platform ModelRunner is available"
-    )
-
-
 def test_plugin_exposes_simple_per_patch_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     startup = import_module("vllm_gr.engine.startup")
-    loader = import_module("vllm_gr.platforms.loader")
+    table = import_module("vllm_gr.platforms")
     plugin = import_module("vllm_gr.plugin")
     runtime_patch = import_module("vllm_gr.patch")
 
     report = BeamPatchReport((BeamPatchResult("flat_logprobs", BeamPatchStatus.APPLIED),))
-    provider = mock.Mock()
+    integration = mock.Mock()
     monkeypatch.setattr(startup, "configure_model_runner_default", mock.Mock())
-    monkeypatch.setattr(loader, "activate_current_backend", mock.Mock(return_value=provider))
+    monkeypatch.setattr(table, "get_current_gr_platform", mock.Mock(return_value=integration))
     reapply = mock.Mock(return_value=1)
     monkeypatch.setattr(runtime_patch, "re_apply_patches", reapply)
     monkeypatch.setattr(
@@ -294,10 +247,11 @@ def test_plugin_exposes_simple_per_patch_status(
 
     state = plugin.initialize_runtime()
 
-    provider.check_environment.assert_called_once_with()
-    reapply.assert_called_once_with(provider=provider)
+    integration.check_environment.assert_called_once_with()
+    reapply.assert_called_once_with(integration=integration)
     assert state == {
         "patch_count": 1,
+        "attention_selector": True,
         "patches": {"flat_logprobs": "applied"},
     }
 
@@ -767,8 +721,8 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
 def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vllm.utils.system_utils as system_utils
-    import vllm.v1.executor.multiproc_executor as multiproc_executor
+    from vllm.utils import system_utils
+    from vllm.v1.executor import multiproc_executor
 
     from vllm_gr.platforms.ascend import spawn_patch
 

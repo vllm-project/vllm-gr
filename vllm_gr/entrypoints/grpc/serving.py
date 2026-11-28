@@ -17,6 +17,10 @@ from vllm.sampling_params import RequestOutputKind
 from vllm_gr.config import GRConfig
 from vllm_gr.entrypoints.beam_search.client import AsyncBeamSearchClient
 from vllm_gr.entrypoints.beam_search.request_params import apply_beam_request_defaults
+from vllm_gr.platforms.admission import beam_limits
+from vllm_gr.platforms.beam_requests import (
+    validate_gr_device_config,
+)
 from vllm_gr.sampling_params import BeamSearchParams
 from vllm_gr.v1.beam.batch_contracts import (
     ADMISSION_REJECTED_CODE,
@@ -73,6 +77,9 @@ class BeamVllmEngineServicer(VllmEngineServicer):
             raise ValueError("requests must not be empty")
         config = getattr(self.engine, "vllm_config", None)
         gr_config = GRConfig.from_vllm_config(config) if config is not None else None
+        candidate_width = None
+        if gr_config is not None and not beam_limits(config).uses_retained_widths(gr_config):
+            candidate_width = gr_config.beam_candidate_width
         params_key = None
         members, identities = [], []
         batch_id = uuid.uuid4().hex
@@ -128,7 +135,7 @@ class BeamVllmEngineServicer(VllmEngineServicer):
                 per_parent_beam_widths=tuple(params.per_parent_beam_widths)
                 if params.per_parent_beam_widths is not None
                 else None,
-                candidate_width=gr_config.beam_candidate_width if gr_config is not None else None,
+                candidate_width=candidate_width,
             )
             output = BeamOutputOptions(
                 num_return_sequences=final_width
@@ -208,6 +215,8 @@ class BeamVllmEngineServicer(VllmEngineServicer):
             output_options=params_key[1],
         )
         validate_gr_request(request, config=config)
+        if config is not None:
+            validate_gr_device_config(config, request)
         return request, identities
 
     def build_response(

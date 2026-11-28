@@ -12,12 +12,10 @@ vllm check-env --gr --npu    # Require the Ascend NPU platform
 
 ## What it checks
 
-Without `--npu`, the command validates the vLLM version and reports the
-platform that vLLM auto-detection selected. This GR release supports vLLM
-0.30.0.
-
-With `--npu`, or when auto-detection selects `npu`, the command additionally
-validates the Ascend runtime:
+The command runs the environment check supplied by the selected GR platform.
+`--npu` additionally requires an Ascend native platform, including when an
+installed GR plugin handles it. The built-in CUDA and Ascend implementations
+support vLLM 0.30.0. The built-in Ascend class checks the following runtime.
 
 | Item | Required |
 | --- | --- |

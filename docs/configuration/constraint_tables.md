@@ -74,8 +74,10 @@ gr:
 
 For the two-Trie example below, use `./regions.safetensors` as the path,
 `constraint_table_v2` as the format and the digests from the manifest build.
-`backend: auto` selects the active accelerator. GR Beam inference supports
-CUDA and Ascend. The CPU table backend is a reference implementation.
+`backend: auto` uses the canonical table implementation chosen by the GR
+platform. CUDA and Ascend ship with device implementations. A vendor plugin
+can supply its own table backend. The CPU implementation serves as a
+reference. [Platform contract](../design/module/platform_backend.md#engine-plans)
 
 ## Requests
 

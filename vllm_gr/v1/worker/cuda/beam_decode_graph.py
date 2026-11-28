@@ -76,6 +76,14 @@ class BeamDecodeGraph:
         # entry (V1) or is installed only for the capture window (V2).
         self.installed = False
 
+    def captured_shapes(self) -> list[list[int]]:
+        """Report live captured shapes without selecting or modifying a registry."""
+        return sorted(
+            [key.batch_size, key.beam_width, key.prefix_bucket]
+            for key, entries in self._registries.items()
+            if any(entry.cudagraph is not None for entry in entries.values())
+        )
+
     @property
     def ready(self) -> bool:
         entry = self.wrapper.concrete_cudagraph_entries.get(self.descriptor)

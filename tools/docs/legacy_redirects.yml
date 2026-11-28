@@ -53,16 +53,21 @@ design/main-arch.md:
     design/index.md#feature-design: [feature-map]
     design/module/platform_backend.md: [platform-backend-contract, scope]
     design/module/platform_backend.md#engine-plans: [lifecycle-and-process-model, engine-plans-and-service-binding]
-    design/module/platform_backend.md#registration-and-activation: [platform-identity-and-deterministic-selection, external-provider-entry-points, current-built-in-mappings]
+    design/module/platform_backend.md#platform-selection: [platform-identity-and-deterministic-selection, external-provider-entry-points, current-built-in-mappings]
     design/module/platform_backend.md#plugin-startup: [lazy-import-boundary]
-    design/module/platform_backend.md#provider-contract: [provider-contract, provider-api-versions, regression-after-removing-the-built-in-npu-provider]
+    design/module/platform_backend.md#migrating-from-the-provider-api: [provider-contract, provider-api-versions, regression-after-removing-the-built-in-npu-provider]
     design/module/runtime_patches.md: [modelrunner-patch-hooks]
     design/index.md#decode-attention: [beam-attention-execution]
+design/module/platform_backend.md:
+  sections:
+    design/module/platform_backend.md#platform-selection: [registration-and-activation]
+    design/module/platform_backend.md#migrating-from-the-provider-api: [provider-contract, compatibility-provider-contract]
+    design/module/platform_backend.md#adding-an-in-tree-platform: [validation, source-map]
 features/README.md:
   page: user_guide/feature_compatibility.md
   sections:
     user_guide/feature_compatibility.md#support-matrix: [generation-and-constraints, execution-and-memory, serving-and-operations]
-    design/module/platform_backend.md#registration-and-activation: [backend-selection]
+    design/module/platform_backend.md#platform-selection: [backend-selection]
 features/attention.md:
   page: user_guide/feature_compatibility.md
   sections:

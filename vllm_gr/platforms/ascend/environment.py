@@ -51,12 +51,12 @@ def check_ascend_environment(*, require_npu_platform: bool = False) -> dict[str,
     if require_npu_platform:
         from vllm.platforms import current_platform
 
-        device_type = str(current_platform.device_type)
-        report["platform"] = device_type
-        if device_type != "npu":
+        from .. import ascend_platform_plugin
+
+        if ascend_platform_plugin() is None:
             raise RuntimeError(
-                "Ascend environment check requires the vLLM NPU platform, "
-                f"but the detected platform device_type is {device_type!r}."
+                f"Ascend environment check requires the vLLM NPU platform, got {current_platform}"
             )
+        report["platform"] = current_platform.device_type
 
     return report

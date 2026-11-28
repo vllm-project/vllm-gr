@@ -31,7 +31,7 @@ forward_pending_signal() {
 }
 
 # Invoked by the INT and TERM traps.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 handle_signal() {
     if (( signal_status == 0 )); then
         signal_status=$2
@@ -42,7 +42,7 @@ handle_signal() {
 }
 
 # Invoked by the EXIT trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     local status=$? cleanup_status=0
     if [[ -n "$secret_file" ]]; then

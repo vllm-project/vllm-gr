@@ -9,7 +9,7 @@ so expanding storage capacity does not implicitly enable concurrent scratch use.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
 from threading import Condition, Lock
 from typing import Any, cast
@@ -1586,3 +1586,39 @@ def get_stage_runner(
     adapter._dispatch_session = dispatch_session
     adapter._validated_dispatch = (scheduler_output, stages, dispatch_session)
     return cast(GPUBeamStageRunner, adapter)
+
+
+def cancel_finished_stage(worker: Any, finished: Collection[str]) -> None:
+    owner = getattr(worker, "_gr_gpu_stage_runner", None)
+    if owner is not None and not owner.closed and owner.binding.native_request_id in finished:
+        owner.cancel(owner.binding)
+
+
+def execute_cuda_stage(
+    worker: Any,
+    scheduled: Any,
+    original: Callable[..., Any],
+    *args: Any,
+    hooks_type: CudaStageHooksType,
+    **kwargs: Any,
+) -> Any:
+    owner = get_stage_runner(worker, scheduled, hooks_type=hooks_type)
+    try:
+        return owner.execute(scheduled, original, *args, **kwargs)
+    except Exception as error:
+        owner.execution_error = error
+        raise
+
+
+def _stage_graph_status(worker: Any) -> dict[str, Any]:
+    graph = getattr(worker, "_beam_decode_graph", None)
+    runtime = getattr(worker, "_gr_v2_runtime", None)
+    failures = (
+        getattr(runtime, "startup_failures", None)
+        if runtime is not None
+        else getattr(worker, "_gr_decode_capture_failures", None)
+    )
+    return {
+        "captured": graph.captured_shapes() if graph is not None else [],
+        "fallback": {str(batch): "capture_unsupported" for batch in (failures or {})},
+    }

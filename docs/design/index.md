@@ -38,7 +38,7 @@ settings and supported combinations, see
 | [Persistent GPU Beam state](module/beam_state.md) | Candidate history, completion records and buffer lifetime |
 | [Constraint tables](module/constraint_tables.md) | Catalog layout and per-prompt Trie routing |
 | [CUDA ModelRunner V2](module/model_runner_v2.md) | Native request integration, graph ownership and cleanup |
-| [Platform backend](module/platform_backend.md) | Provider discovery, activation and dispatch boundaries |
+| [Platform backend](module/platform_backend.md) | Native platform selection, runner binding and platform-specific operations |
 | [Runtime patches](module/runtime_patches.md) | Upstream assumptions and the reason for each hook in the [patch inventory](patch_inventory.yaml) |
 
 The [runtime patch inventory](runtime_patch_inventory.md) is the checked index

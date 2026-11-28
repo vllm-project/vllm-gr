@@ -41,7 +41,6 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
     from vllm_ascend.utils import register_ascend_customop
 
     from vllm_gr.platforms.ascend.environment import check_ascend_environment
-    from vllm_gr.platforms.config import engine_config_service
     from vllm_gr.v1.attention import selector_patch
     from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
 
@@ -49,7 +48,7 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
 
     config = VllmConfig(attention_config=AttentionConfig())
     config.attention_config.backend = None
-    engine_config_service().apply_native_defaults(config)
+    config.cache_config.block_size = 128
 
     # AscendWorker.init_device() registers Ascend ops before model/backend use.
     # This test has no real model_config, so use the registration entry point's
@@ -70,13 +69,18 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
 
     saved_registry = dict(op_registry_oot)
     saved_flag = ascend_utils._ASCEND_CUSTOMOP_IS_REIGISTERED
+    import vllm.platforms as vllm_platforms
+
+    from vllm_gr.v1.attention.selector_patch import install_gr_attention_selector
+
+    saved_platform = vllm_platforms.current_platform
     try:
         with mock.patch(
             "vllm.utils.import_utils.has_triton_kernels",
             return_value=False,
         ):
             register_ascend_customop()
-        selector_patch.apply_custom_attention_backend_patch(force=True)
+        install_gr_attention_selector()
         selector_patch.clear_attention_backend_cache()
 
         selector_config = AttentionSelectorConfig(
@@ -101,6 +105,8 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
         op_registry_oot.clear()
         op_registry_oot.update(saved_registry)
         ascend_utils._ASCEND_CUSTOMOP_IS_REIGISTERED = saved_flag
+        vllm_platforms.current_platform = saved_platform
+        selector_patch.clear_attention_backend_cache()
 
     assert backend is not BeamAttentionBackend
     assert backend.__module__.startswith("vllm_ascend.")

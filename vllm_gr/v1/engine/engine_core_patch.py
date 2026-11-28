@@ -215,12 +215,10 @@ def apply_engine_core_child_patches() -> None:
     interpreter. Each capability has its own idempotent applicator so a
     partially initialized process can be checked and repaired explicitly.
     """
-    from vllm_gr.v1.worker.model_runner_patch import apply_worker_patches
 
     apply_engine_core_request_patches()
     apply_kv_hash_memo_patch()
     apply_scheduler_patch()
-    apply_worker_patches()
 
 
 # Re-entry guard to detect recursive calls

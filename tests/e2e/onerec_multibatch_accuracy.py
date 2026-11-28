@@ -283,7 +283,9 @@ def run(args: argparse.Namespace) -> int:
         llm.collective_rpc("policy_observe")
         result["initial"] = snapshot()
         actual_class = result["initial"]["runner_class"]
-        assert (".gpu.model_runner." in actual_class) == (args.runner == "v2"), actual_class
+        assert any(".gpu.model_runner." in cls for cls in result["initial"]["runner_mro"]) == (
+            args.runner == "v2"
+        ), actual_class
         assert result["initial"]["decode_batches"] == expected_batches
         for b in args.batches:
             assert llm.reset_prefix_cache()

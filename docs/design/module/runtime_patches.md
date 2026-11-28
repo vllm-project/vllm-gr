@@ -8,35 +8,19 @@ Three files describe the same patch set:
 | [Runtime patch inventory](../runtime_patch_inventory.md) | Checked index: active IDs in contract-test order, scope, backend ownership, owner, installer and risk. |
 | This page | Rationale: the behavior each hook protects and the upstream assumption it depends on. |
 
-Backend ownership identifies which provider declares the patch. Installation
+Backend ownership identifies the shipped platform class responsible for an inventoried patch. Installation
 can still happen later in a worker or during native configuration.
 
 ## GR-PATCH-000 — Runtime Plugin Activation
 
 Scope: `core`; backend ID: `null`
 
-The general plugin sets ModelRunner defaults, activates the current provider,
-and validates its environment before passing that provider into patch
-installation. The frontend and EngineCore use their own ordered plans. Each
+The general plugin reads vLLM's native platform identity and resolves a GR platform class from installed probes and the built-in table. It sets ModelRunner defaults and checks runtime
+compatibility before installing platform and shared patches. The frontend and EngineCore use their own ordered plans. Each
 patch module verifies its bindings so repeated initialization can reuse an
-existing wrapper.
-
-## GR-PATCH-001 — CUSTOM Attention Selector Compatibility
-
-Scope: `core`; backend ID: `null`
-
-An explicit CUSTOM choice, including one restored from serialized GR
-configuration, must reach the registered Beam backend. Changes to the private
-attention selector or its cache can silently select a different backend.
-
-## GR-PATCH-002 — NPUWorker Initialization Hook
-
-Scope: `backend`; backend ID: `ascend`
-
-The [NPU startup hooks](../../../vllm_gr/v1/worker/npu/startup_patch.py) install
-worker utilities before native device initialization constructs the runner.
-An early import can precede worker availability, so later initialization
-retries the installation. The platform configuration filter can run separately.
+existing wrapper. The plugin keeps GR Beam decisions out of vLLM's shared
+selector cache so engines with identical geometry retain their own backend.
+The platform method still selects the backend class.
 
 ## GR-PATCH-003 — FlatLogprobs Fast Append Override
 
@@ -65,7 +49,7 @@ Scope: `core`; backend ID: `null`
 
 GR serve and GRLLM pass a validated snapshot through native
 `EngineArgs.additional_config`. The GR hook on `create_engine_config` resolves
-device-dependent settings and admits the backend plan before worker startup.
+device-dependent settings, selects the native worker_cls field and publishes compact Beam admission limits before worker startup.
 
 ## GR-PATCH-007 — EngineCore Client and AsyncLLM Extensions
 
@@ -107,37 +91,35 @@ Bounded per-process memoization avoids hashing identical prefix blocks and
 prompts repeatedly. Reinstallation checks the wrappers and the EngineCore
 binding that constructs the hasher.
 
-## GR-PATCH-011 — GPU ModelRunner V1/V2 Overrides
+## GR-PATCH-011 - CUDA array staging
 
 Scope: `backend`; backend ID: `cuda`
 
-CUDA ModelRunner V1 and V2 adapt native input preparation, stage execution and
-output completion. Request ordering, graph-visible storage and native lifecycle
-boundaries have to agree. See the [runner contract](model_runner_v2.md).
+Owner: `vllm_gr/v1/worker/cuda/numpy_staging.py`
 
-## GR-PATCH-012 — NPU ModelRunner Override
+Installer: `vllm_gr.v1.worker.cuda.numpy_staging.install_numpy_staging`
+
+`CudaGRWorker` retains native V2 buffer objects and installs bulk NumPy staging.
+The native Worker and Runner execution classes are unchanged; GR execution is
+implemented by subclasses. The staging hook preserves asynchronous transfer
+lifetime and handles received read-only arrays.
+
+Risk: `high`; process roles: `gpu_worker`
+
+## GR-PATCH-012 - Ascend stage projection updates
 
 Scope: `backend`; backend ID: `ascend`
 
-The Ascend worker adapts native rows and attention metadata for grouped Beam
-execution. Cached prefixes, real row lengths and parent selection must stay
-aligned with native block tables. See
-[Ascend Beam Decode execution](../feature/npu_decode_execution.md).
+Owner: `vllm_gr/v1/worker/npu/stage_projection.py`
 
-The [worker stage projection](../../../vllm_gr/v1/worker/npu/stage_projection.py)
-wraps the instance logits processor, runner reload and native worker weight-update
-methods. It invalidates the projection before native writes and refreshes it after
-finalization and device synchronization. The
-[operator helper](../../../vllm_gr/ops/npu/stage_projection.py) owns the fixed-address
-weights, biases and proxies.
+Installer: `vllm_gr.v1.worker.npu.stage_projection.install_npu_stage_weight_update_hooks`
 
-## GR-PATCH-013 — CUSTOM Attention Backend Registration
+Weight-update wrappers are installed on `AscendGRWorker`. Model loading attaches
+the fixed-address projection to each logits processor instance. Invalidation
+precedes native weight writes; refresh follows finalization and synchronization.
+Native NPU Worker and Runner execution classes are unchanged.
 
-Scope: `core`; backend ID: `null`
-
-GR registers Beam attention in the upstream CUSTOM slot. Registration and the
-selector have separate responsibilities. Another extension claiming that slot
-can invalidate the selection.
+Risk: `high`; process roles: `npu_worker`
 
 ## GR-PATCH-015 — Sliced Vocabulary Projection
 
@@ -153,7 +135,7 @@ native weight reload.
 Scope: `backend`; backend ID: `ascend`
 
 Ascend subprocesses must use a compatible start method when the parent has
-initialized the device. The Ascend provider installs spawn protection before
+initialized the device. The Ascend integration installs spawn protection before
 the native worker initialization hook.
 
 ## GR-PATCH-018 — Ascend Penalties Warmup OOM Guard

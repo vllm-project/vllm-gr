@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.helpers.gr_config import table_constraint
+from tests.helpers.gr_config import table_constraint, test_platform
 from vllm_gr.config import (
     ConstraintConfig,
     GRConfig,
@@ -27,8 +27,6 @@ from vllm_gr.config.parser import (
     OPTION_KEYS,
     read_settings,
 )
-from vllm_gr.platforms import planning
-from vllm_gr.platforms.config import BackendConfigService
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
@@ -415,8 +413,7 @@ def test_startup_logs_the_complete_public_snapshot(monkeypatch: pytest.MonkeyPat
         scheduler_config=SimpleNamespace(max_num_seqs=8, async_scheduling=True),
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: host)
-    monkeypatch.setattr(arg_utils_gr, "engine_config_service", BackendConfigService)
-    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform("cuda"))
     with patch.object(arg_utils_gr.logger, "info") as info:
         assert (
             arg_utils_gr.create_engine_config(
@@ -442,8 +439,7 @@ def test_native_attention_backend_reaches_worker_snapshot(monkeypatch: pytest.Mo
         attention_config=SimpleNamespace(backend=AttentionBackendEnum.CUSTOM),
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: host)
-    monkeypatch.setattr(arg_utils_gr, "engine_config_service", BackendConfigService)
-    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform("cuda"))
     arg_utils_gr.create_engine_config(SimpleNamespace(additional_config={"vllm_gr": {"gr": {}}}))
     assert GRConfig.from_vllm_config(host).attention_backend is GRAttentionBackend.CUSTOM
 

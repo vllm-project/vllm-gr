@@ -14,22 +14,20 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from vllm_gr.v1.attention import selector_patch
 from vllm_gr.v1.worker import sliced_logits_patch
 
 if TYPE_CHECKING:
-    from vllm_gr.platforms.interface import GRBackendProvider
+    from vllm_gr.platforms.interface import GRPlatform
 
 logger = logging.getLogger("vllm_gr.patch")
 
 # Semantic ownership, independent of which process orchestrates an installer.
-# Built-in providers declare their hardware-owned IDs in ``patch_ids``.
+# Backend ownership is recorded only in the authoritative inventory.
 # These independent architectural assertions are checked against the authoritative
 # docs/design/patch_inventory.yaml; they do not drive installation. See the ownership
 # rationale in docs/design/runtime_patch_inventory.md.
 CORE_PATCH_IDS = (
     "GR-PATCH-000",
-    "GR-PATCH-001",
     "GR-PATCH-003",
     "GR-PATCH-004",
     "GR-PATCH-005",
@@ -37,7 +35,6 @@ CORE_PATCH_IDS = (
     "GR-PATCH-008",
     "GR-PATCH-009",
     "GR-PATCH-010",
-    "GR-PATCH-013",
     "GR-PATCH-015",
     "GR-PATCH-022",
 )
@@ -128,7 +125,6 @@ def _validate_engine_session_hooks() -> str | None:
         validate_engine_core_request_patch,
     )
     from vllm_gr.v1.engine.wire import validate_request_types_patch
-    from vllm_gr.v1.worker.model_runner_patch import validate_model_runner_patch
 
     failures = tuple(
         detail
@@ -139,7 +135,6 @@ def _validate_engine_session_hooks() -> str | None:
             validate_engine_core_entrypoint_patch(),
             validate_engine_core_request_patch(),
             validate_scheduler_patch(),
-            validate_model_runner_patch(),
         )
         if detail is not None
     )
@@ -203,12 +198,6 @@ def _engine_core_beam_patches() -> tuple[BeamPatch, ...]:
             "vllm_gr.v1.core.sched.scheduler_patch",
             "apply_scheduler_patch",
             "validate_scheduler_patch",
-        ),
-        _module_patch(
-            "model_runner",
-            "vllm_gr.v1.worker.model_runner_patch",
-            "apply_worker_patches",
-            "validate_model_runner_patch",
         ),
     )
 
@@ -286,29 +275,28 @@ def _apply_gr_beam_patches() -> int:
     return patch_count
 
 
-def _apply_patches(force: bool = False, *, provider: "GRBackendProvider | None" = None) -> int:
+def _apply_patches(force: bool = False, *, integration: "GRPlatform | None" = None) -> int:
     """Apply all runtime patches needed by vllm-gr."""
-    if provider is None:
-        from vllm_gr.platforms.loader import activate_current_backend
+    if integration is None:
+        from vllm_gr.platforms import get_current_gr_platform
 
-        # Fresh workers can call this before provider activation.
-        provider = activate_current_backend()
-    # CUSTOM selection is shared by CUDA and Ascend. Install it before a
-    # provider imports its native worker; it must not become an NPU-only hook.
-    attention_count = selector_patch.apply_custom_attention_backend_patch(force=force)
+        integration = get_current_gr_platform()
     try:
-        # The selected provider installs its early hooks before the Beam
+        # The selected integration installs its early hooks before the Beam
         # plan can discover ModelRunner classes or create worker processes.
-        backend_count: int = provider.apply_runtime_patches(force=force)
+        backend_count: int = integration.prepare_gr_engine()
     except Exception as exc:
         raise RuntimeError(
-            f"Runtime patches for backend {provider.backend_id!r} failed; "
+            f"Runtime patches for backend {integration.backend_id!r} failed; "
             "initialization may be partial, restart the process"
         ) from exc
+    from vllm_gr.v1.worker.gr_async_output import install_async_output_guard
+
+    install_async_output_guard()
     beam_count = _apply_gr_beam_patches()
-    return attention_count + backend_count + beam_count
+    return backend_count + beam_count
 
 
-def re_apply_patches(*, provider: "GRBackendProvider | None" = None) -> int:
+def re_apply_patches(*, integration: "GRPlatform | None" = None) -> int:
     """Recheck live runtime targets and apply the required patches."""
-    return _apply_patches(force=True, provider=provider)
+    return _apply_patches(force=True, integration=integration)

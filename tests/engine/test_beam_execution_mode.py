@@ -7,12 +7,12 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.helpers.gr_config import test_platform
 from vllm_gr.config import (
     ConstraintConfig,
     GRConfig,
 )
 from vllm_gr.config.execution import validate_gr_execution_config
-from vllm_gr.platforms.legacy import legacy_config_service
 
 
 def test_native_async_does_not_select_v1() -> None:
@@ -42,7 +42,6 @@ def test_v1_requires_native_async() -> None:
 def test_v1_npu_startup_routes_to_acl_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr.v1.worker import gr_startup
     from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
     capture = Mock(return_value=True)
@@ -64,7 +63,9 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
         vllm_config=worker_vllm_config,
     )
 
-    assert gr_startup.capture_async_forward(worker)
+    from vllm_gr.v1.worker.npu.npu_beam_stage_runner import capture_ascend_forward
+
+    assert capture_ascend_forward(worker, False)
     capture.assert_called_once_with(worker)
 
 
@@ -118,14 +119,14 @@ def test_v1_reduction_policy_scope_overrides_and_cache_identity(
     original_hash = compilation.compute_hash()
     config = SimpleNamespace(
         additional_config={},
-        scheduler_config=SimpleNamespace(async_scheduling=True),
+        scheduler_config=SimpleNamespace(async_scheduling=True, max_num_batched_tokens=8192),
+        cache_config=SimpleNamespace(block_size=16, user_specified_block_size=False),
+        model_config=SimpleNamespace(is_hybrid=False),
         use_v2_model_runner=use_v2,
         compilation_config=compilation,
     )
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
-    monkeypatch.setattr(
-        arg_utils_gr, "engine_config_service", lambda: legacy_config_service(device_type)
-    )
+    monkeypatch.setattr(arg_utils_gr, "get_current_gr_platform", lambda: test_platform(device_type))
     args = SimpleNamespace(
         additional_config={
             "vllm_gr": {
@@ -158,11 +159,3 @@ def test_v1_reduction_policy_scope_overrides_and_cache_identity(
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
-
-
-@pytest.fixture(autouse=True)  # type: ignore[misc]
-def _isolate_backend_plan_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise configuration policy independently of a native backend install."""
-    from vllm_gr.platforms import planning
-
-    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)

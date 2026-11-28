@@ -21,10 +21,10 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
+from vllm_gr.platforms import get_current_gr_platform
+from vllm_gr.platforms.errors import UnsupportedBackendError
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
@@ -42,81 +42,18 @@ __all__ = [
 ]
 
 logger = init_logger(__name__)
-NPU_DEVICE = is_npu_available()
-CUDA_DEVICE = is_cuda_available()
-
-# Worker calls outside a vLLM context reuse the most recently bound engine mode.
-_NPU_DECODE_EXECUTION_MODE: str | None = None
-
-
-def _get_npu_decode_execution() -> str:
-    """Lazily resolve ``vllm_gr_npu_decode_execution`` (cascade | xllm).
-
-    An unset config (None) resolves per platform: ``xllm`` on NPU when the
-    xllm-ops operator library is installed, ``cascade`` everywhere else (CUDA,
-    NPU without the library, or config not yet installed in this process).
-    Explicit ``cascade`` / ``xllm`` values always win.
-    """
-    global _NPU_DECODE_EXECUTION_MODE
-    from vllm.config import get_current_vllm_config_or_none
-
-    from vllm_gr.config import GRConfig
-
-    vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is None:
-        return _NPU_DECODE_EXECUTION_MODE or "cascade"
-    bound = getattr(vllm_config, "_gr_npu_decode_execution", None)
-    if bound is not None:
-        _NPU_DECODE_EXECUTION_MODE = bound
-        return bound
-    configured = GRConfig.from_vllm_config(vllm_config).npu_decode_execution
-    if configured is not None:
-        mode = configured.value
-    elif NPU_DEVICE and not CUDA_DEVICE:
-        from vllm_gr.ops.npu import beam_ops
-
-        mode = "xllm" if beam_ops.is_available() else "cascade"
-        if mode == "cascade":
-            logger.info(
-                "vllm_gr_npu_decode_execution is unset and the xllm-ops library "
-                "is unavailable (%s); defaulting to the cascade decode path. "
-                "Install xllm-ops (tools/npu/install_xllm_ops.sh) to enable the "
-                "fused xllm decode path by default.",
-                beam_ops.unavailable_reason(),
-            )
-    else:
-        mode = "cascade"
-    object.__setattr__(vllm_config, "_gr_npu_decode_execution", mode)
-    _NPU_DECODE_EXECUTION_MODE = mode
-    return mode
+try:
+    _layout = get_current_gr_platform().beam_attention_layout
+except UnsupportedBackendError:
+    _layout = None
+CUDA_DEVICE = _layout == "cuda"
+NPU_DEVICE = _layout == "ascend"
 
 
 def _get_platform_execution_module() -> Any:
-    from vllm_gr.platforms.errors import BackendNotActiveError
-    from vllm_gr.platforms.registry import get_active_backend
+    from vllm_gr.platforms import get_current_gr_platform
 
-    if CUDA_DEVICE and not NPU_DEVICE and _get_npu_decode_execution() == "xllm":
-        raise RuntimeError("xllm decode requires an Ascend NPU")
-    try:
-        provider = get_active_backend()
-    except BackendNotActiveError:
-        # Standalone backend probes can precede general-plugin initialization.
-        pass
-    else:
-        return provider.get_attention_execution()
-
-    if NPU_DEVICE and not CUDA_DEVICE:
-        from vllm_gr.platforms.ascend import NPU_BACKEND
-
-        return NPU_BACKEND.get_attention_execution()
-    if CUDA_DEVICE and not NPU_DEVICE:
-        from vllm_gr.platforms.cuda import CUDA_BACKEND
-
-        return CUDA_BACKEND.get_attention_execution()
-    raise RuntimeError(
-        "BeamAttention requires exactly one active CUDA or NPU device "
-        f"(CUDA_DEVICE={CUDA_DEVICE}, NPU_DEVICE={NPU_DEVICE})."
-    )
+    return get_current_gr_platform().get_attention_execution()
 
 
 def _resolve_dense_prefill_mode() -> str | None:
@@ -132,21 +69,9 @@ def _resolve_dense_prefill_mode() -> str | None:
         # The paged path pins num_splits=1; cuDNN-vs-FA2 selection by request
         # count would make results depend on batch composition.
         return None
-    from vllm.config import get_current_vllm_config_or_none
+    from vllm_gr.platforms.cuda.config import dense_prefill_mode
 
-    from vllm_gr.config.models import deployment_for
-
-    config = get_current_vllm_config_or_none()
-    if (
-        config is None
-        or config.cache_config.enable_prefix_caching
-        or config.scheduler_config.enable_chunked_prefill
-        # A KV connector can load earlier prompt tokens into the paged cache.
-        or getattr(config, "kv_transfer_config", None) is not None
-    ):
-        return None
-    mode = deployment_for(config).dense_prefill
-    return mode if mode != "off" else None
+    return dense_prefill_mode()
 
 
 def _dense_prefill_kwargs(
@@ -177,6 +102,13 @@ class BeamAttentionImpl(AttentionImpl):
     def execution(self) -> Any:
         """Bootstrap implementation until this layer's runner publishes its binding."""
         return _get_platform_execution_module()
+
+    def bind_gr_attention_execution(self, execution: Any) -> None:
+        self.execution = execution
+
+    def release_gr_attention_execution(self, execution: Any) -> None:
+        if vars(self).get("execution") is execution:
+            del self.execution
 
     def validate_execution(self, execution: Any) -> None:
         """Verify the loaded layer can use this executor before publishing it."""
@@ -700,7 +632,6 @@ class BeamAttentionImpl(AttentionImpl):
         return output
 
 
-@register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
     accept_output_buffer = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
@@ -712,7 +643,7 @@ class BeamAttentionBackend(AttentionBackend):
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
         # Preserve the Ascend-compatible block size that
-        # the Ascend provider applies to the running config (128).
+        # the Ascend config service applies to the running config (128).
         # vLLM 0.30's platform hook otherwise resolves an unspecified size back
         # to a 16-multiple geometry that the Ascend kernels and prefix-caching
         # block tables cannot represent.
@@ -782,7 +713,7 @@ class BeamAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 256
+        return 0 < head_size <= 256 and head_size % 8 == 0
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:

@@ -31,6 +31,8 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
 from vllm_gr.v1.beam.attention_pool import write_eager_step
 from vllm_gr.v1.forward_context import in_fresh_prefill_capture
 
+DECODE_MODE = "cuda.cascade"
+
 logger = init_logger(__name__)
 
 cache_unshared_kv = write_eager_step

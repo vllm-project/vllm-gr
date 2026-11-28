@@ -159,9 +159,14 @@ def test_negative_tokens_rejected_before_preprocessing(core, monkeypatch, via_so
 
 
 @pytest.mark.parametrize("counts", [[1], [2, 2], [1, 2], [], [0]])
-def test_engine_startup_publishes_live_trie_count(counts):
+def test_engine_startup_publishes_live_trie_count(counts, monkeypatch):
     from vllm_gr.v1.engine.core import loaded_constraint_trie_count
 
+    # This test isolates table-capacity publication after the startup gate.
+    readiness_gate = Mock()
+    monkeypatch.setattr(
+        "vllm_gr.v1.engine.worker_readiness.verify_engine_backend_readiness", readiness_gate
+    )
     engine = SimpleNamespace()
 
     def original(self):
@@ -183,6 +188,7 @@ def test_engine_startup_publishes_live_trie_count(counts):
         initialize(engine)
         assert engine._gr_trie_count == engine.scheduler._gr_trie_count == counts[0]
         engine.model_executor.collective_rpc.assert_called_once_with(loaded_constraint_trie_count)
+    readiness_gate.assert_called_once_with(engine)
 
 
 def test_worker_reports_loaded_table_not_configuration():

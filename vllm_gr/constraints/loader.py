@@ -491,7 +491,7 @@ def _run_device_readiness(
             dtype=torch.float32,
             device=device,
         )
-        output = backend._select_for_readiness(  # noqa: SLF001
+        output = backend._select_for_readiness(
             logits,
             ConstraintMetadata(
                 prefix_token_ids=prefixes,
@@ -586,11 +586,11 @@ def load_constraint_backend(
 
     if not config.enabled:
         return None
-    backend_kind = (
-        ConstraintBackendKind.CUDA
-        if config.backend is ConstraintBackendKind.AUTO
-        else config.backend
-    )
+    backend_kind = config.backend
+    if backend_kind is ConstraintBackendKind.AUTO:
+        from vllm_gr.platforms import get_current_gr_platform
+
+        backend_kind = ConstraintBackendKind(get_current_gr_platform().canonical_constraint_backend)
     _validate_loader_inputs(
         device=device,
         vocab_size=vocab_size,
@@ -627,6 +627,30 @@ def load_constraint_backend(
         expected_vocab_size=vocab_size,
         expected_format=config.format,
     )
+    if backend_kind is ConstraintBackendKind.PLATFORM:
+        from vllm_gr.platforms import get_current_gr_platform
+
+        platform = get_current_gr_platform()
+        platform_backend = platform.create_constraint_backend(
+            table, device=device, dtype=dtype, max_rows=max_rows, max_top_k=max_top_k
+        )
+        # A ready backend owns its tables until close(). Check metadata before
+        # publishing it to the runner or replacing the active version on reload.
+        try:
+            info = platform_backend.info
+            if (
+                info.backend is not ConstraintBackendKind.PLATFORM
+                or info.table_metadata != table.metadata
+                or info.max_rows < max_rows
+                or info.max_top_k < max_top_k
+            ):
+                raise ValueError(
+                    f"GR platform {platform.backend_id!r} returned incompatible constraint metadata"
+                )
+        except BaseException:
+            platform_backend.close()
+            raise
+        return platform_backend
     if backend_kind is ConstraintBackendKind.CPU:
         info = _backend_info(
             table,
@@ -653,7 +677,7 @@ def load_constraint_backend(
                 dtype=dtype,
                 max_rows=max_rows,
             )
-            backend._mark_ready()  # noqa: SLF001
+            backend._mark_ready()
             return backend
         except BaseException:
             backend.close()
@@ -682,7 +706,7 @@ def load_constraint_backend(
             dtype=dtype,
             max_rows=max_rows,
         )
-        npu_backend._mark_ready()  # noqa: SLF001
+        npu_backend._mark_ready()
         return npu_backend
     except BaseException:
         npu_backend.close()

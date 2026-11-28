@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import sys
 from functools import wraps
 
 import torch
@@ -15,7 +14,6 @@ from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
 )
-from vllm_gr.v1.worker.cuda.runner_installer import V1_RUNNER
 from vllm_gr.v1.worker.cuda.v1.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 from vllm_gr.v1.worker.gr_context import (
     _beam_full_graph_ready,
@@ -30,7 +28,6 @@ from vllm_gr.v1.worker.model_runner_contracts import (
     _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
-    is_worker_runner_patched,
 )
 from vllm_gr.v1.worker.prefill_graph_common import scheduled_requests_are_fresh
 from vllm_gr.v1.worker.prefill_graph_runner import (
@@ -496,22 +493,6 @@ def capture_beam_decode_graph(runner) -> bool:
     return captured
 
 
-def discover_worker_runners() -> tuple[tuple[str, type], ...]:
-    """Discover the upstream GPU ModelRunner without importing NPU runtime."""
-    try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except ImportError as exc:
-        logger.warning(
-            "Failed to import vllm.v1.worker.gpu_model_runner.GPUModelRunner; "
-            "skipping vllm-gr GPU beam-search runner patches for this attempt. "
-            "ImportError: %s",
-            exc,
-        )
-        logger.debug("GPUModelRunner import traceback", exc_info=True)
-        return ()
-    return (("GPUModelRunner", GPUModelRunner),)
-
-
 make_patched_prepare_inputs = make_patched_prepare_inputs_gpu
 make_patched_sample_tokens = make_patched_sample_tokens_gpu
 make_patched_determine_batch_execution_and_padding = (
@@ -714,27 +695,3 @@ def capture_prefill_graphs(runner) -> None:
 
 
 make_patched_model_forward = make_patched_model_forward_gpu
-
-
-def is_patched(runner_class: type) -> bool:
-    from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle
-
-    return is_worker_runner_patched(runner_class) and has_runner_lifecycle(runner_class, V1_RUNNER)
-
-
-def install() -> None:
-    """Install CUDA Worker utilities and the V1 native runner wrappers."""
-    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
-        make_load_model_with_beam_postprocess_workspace,
-    )
-    from vllm_gr.v1.worker.cuda.runner_installer import install_worker_hooks
-    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
-    from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
-
-    install_worker_hooks()
-    install_v1_worker_hooks(
-        sys.modules[__name__],
-        cuda_hooks_type=CudaStageHooksV1,
-        workspace_load_patcher=make_load_model_with_beam_postprocess_workspace,
-        implementation_id=V1_RUNNER,
-    )

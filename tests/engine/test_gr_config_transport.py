@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -27,6 +28,7 @@ from vllm_gr.config import (
     write_canonical_gr_config,
 )
 from vllm_gr.config.parser import COMMON_ENGINE_CONFIG, GR_CONFIG_KEY, parse_gr_config
+from vllm_gr.platforms.admission import beam_limits
 
 CATALOG_PATH_KEY = "vllm_gr_catalog_path"
 
@@ -69,7 +71,14 @@ def test_rejects_unknown_prefixed_key_but_preserves_unrelated_keys() -> None:
 
 
 @pytest.mark.parametrize(
-    "key", ["vllm_gr_unknown_option", "vllm_gr_beam_max_width", CATALOG_PATH_KEY]
+    "key",
+    [
+        "vllm_gr_unknown_option",
+        "vllm_gr_beam_max_width",
+        CATALOG_PATH_KEY,
+        "vllm_gr_backend_options",
+        "vllm_gr_backend_choices",
+    ],
 )  # type: ignore[misc]
 def test_write_rejects_unknown_prefixed_key(key: str) -> None:
     host = config_host({"unrelated": 1})
@@ -131,14 +140,15 @@ def test_canonical_writer_uses_primitive_mapping(tmp_path: Path) -> None:
     stale = GRConfig.from_vllm_config(vllm_config)
     assert stale.beam_max_width is None
 
-    vllm_config.additional_config["vllm_gr_backend_options"] = {"provider": "example"}
+    limits = asdict(beam_limits(config_host()))
+    vllm_config.additional_config["vllm_gr_limits"] = limits
     write_canonical_gr_config(vllm_config, config)
 
     payload = vllm_config.additional_config[GR_CONFIG_KEY]
     assert json.loads(json.dumps(payload)) == payload
     assert GRConfig.from_vllm_config(vllm_config) == config
     assert vllm_config.additional_config["unrelated"] == 1
-    assert vllm_config.additional_config["vllm_gr_backend_options"] == {"provider": "example"}
+    assert vllm_config.additional_config["vllm_gr_limits"] == limits
 
 
 def test_canonical_and_legacy_additional_config_are_mutually_exclusive(

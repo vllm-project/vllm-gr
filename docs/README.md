@@ -54,7 +54,7 @@ extension of vLLM.
 - [Roll out model weights and update catalogs](user_guide/weight_update.md)
   independently. Replacing a catalog on a running instance requires the CUDA
   asynchronous Beam path.
-- Extend device support through [backend providers](design/module/platform_backend.md)
+- Add a [built-in or independently distributed platform](design/module/platform_backend.md)
   that validate the environment, apply runtime patches and implement
   catalog-constrained top-k selection.
 

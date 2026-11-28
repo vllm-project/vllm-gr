@@ -12,9 +12,8 @@ from typing import Any, Literal
 import pytest
 import torch
 
-from tests.helpers.gr_config import engine_args_from_file
+from tests.helpers.gr_config import engine_args_from_file, test_platform
 from vllm_gr.config import GRConfig, gr_config_from_mapping, gr_config_to_mapping
-from vllm_gr.platforms.legacy import legacy_config_service
 from vllm_gr.v1.attention.backends.beam_attn_gpu import (
     GPUBeamAttentionBatch,
     validate_short_suffix_attention,
@@ -158,7 +157,11 @@ def _short_suffix_engine_config(
             backend="CUSTOM" if custom else None, flash_attn_version=fa_version
         ),
         cache_config=CacheConfig(enable_prefix_caching=False),
-        scheduler_config=SimpleNamespace(async_scheduling=True, enable_chunked_prefill=False),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=True, enable_chunked_prefill=False, max_num_batched_tokens=8192
+        ),
+        model_config=SimpleNamespace(is_hybrid=False),
+        use_v2_model_runner=False,
     )
     from vllm_gr.config import load_gr_config
 
@@ -172,8 +175,8 @@ def _short_suffix_engine_config(
     monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: config)
     monkeypatch.setattr(
         arg_utils_gr,
-        "engine_config_service",
-        lambda: legacy_config_service("cuda" if cuda else "npu"),
+        "get_current_gr_platform",
+        lambda: test_platform("cuda" if cuda else "npu"),
     )
     return config, args
 
@@ -836,11 +839,3 @@ def test_fused_suffix_uses_the_fa2_emulating_kernel_for_every_prefix_backend(
 
 
 pytestmark = pytest.mark.cpu_test
-
-
-@pytest.fixture(autouse=True)
-def _isolate_backend_plan_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise configuration policy independently of a native backend install."""
-    from vllm_gr.platforms import planning
-
-    monkeypatch.setattr(planning, "admit_backend_plan", lambda config: None)

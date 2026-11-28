@@ -31,18 +31,12 @@ from __future__ import annotations
 import gc
 from collections.abc import Callable
 from functools import wraps
-from typing import Any, cast
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.v1.worker import gr_execution, gr_gc
-from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
-    _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
-    make_load_model_with_beam_postprocess_workspace,
-)
-from vllm_gr.v1.worker.cuda.runner_installer import V2_RUNNER
 from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_resources as v2_resources
 from vllm_gr.v1.worker.cuda.v2.gpu_prefill_v2 import (
     try_add_gr_prefill_requests,
@@ -52,17 +46,10 @@ from vllm_gr.v1.worker.gr_context import (
     _get_gr_config,
 )
 from vllm_gr.v1.worker.model_runner_contracts import (
-    _CONSTRAINT_LOAD_PATCH_MARKER,
-    _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
     _WORKER_EXECUTE_PATCH_MARKER,
     _WORKER_V2_ADD_REQUESTS_PATCH_MARKER,
     _WORKER_V2_PREPARE_PATCH_MARKER,
     _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
-    is_worker_runner_v2_patched,
-)
-from vllm_gr.v1.worker.model_runner_patch import (
-    make_load_model_with_constraint_backend,
-    make_shutdown_with_constraint_backend,
 )
 
 logger = init_logger(__name__)
@@ -80,22 +67,6 @@ def _warmup_constraint_backend(runner: Any, backend: Any) -> None:
         head_dtype = getattr(runner.model_config, "head_dtype", None)
         if head_dtype is not None and head_dtype != runner.model_config.dtype:
             backend.warmup_stage_topk(head_dtype)
-
-
-def discover_worker_runners() -> tuple[tuple[str, type[Any]], ...]:
-    """Discover the upstream V2 GPU ModelRunner without importing NPU runtime."""
-    try:
-        from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
-    except ImportError as exc:
-        logger.warning(
-            "Failed to import vllm.v1.worker.gpu.model_runner.GPUModelRunner; "
-            "skipping vllm-gr V2 beam-search runner patches for this attempt. "
-            "ImportError: %s",
-            exc,
-        )
-        logger.debug("GPUModelRunnerV2 import traceback", exc_info=True)
-        return ()
-    return (("GPUModelRunnerV2", GPUModelRunnerV2),)
 
 
 def make_patched_execute_model_v2(
@@ -119,8 +90,6 @@ def make_patched_execute_model_v2(
     if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
         return _orig_execute_model
 
-    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-
     @wraps(_orig_execute_model)
     def _patched_execute_model_step_v2(
         self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
@@ -134,7 +103,6 @@ def make_patched_execute_model_v2(
             scheduler_output,
             _orig_execute_model,
             *args,
-            hooks_type=CudaStageHooksV2,
             **kwargs,
         )
         if stage is not gr_execution._NOT_A_STAGE_FRAME:
@@ -146,6 +114,10 @@ def make_patched_execute_model_v2(
                 "configure gr.beam_width or unset VLLM_USE_V2_MODEL_RUNNER"
             )
 
+        finished = getattr(scheduler_output, "finished_req_ids", ())
+        if finished:
+            if getattr(self, "_gr_ready", False):
+                self.cancel_finished_gr(finished)
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)
 
     @wraps(_orig_execute_model)
@@ -311,7 +283,7 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
 
             capturing_enabled = monitor.cudagraph_capturing_enabled
             try:
-                v2_resources.capture_multibatch_forward(self)
+                self.capture_gr_startup(True)
             finally:
                 # Beam's local capture closes its window. Profiling runs
                 # inside native startup, which still needs to capture later.
@@ -344,102 +316,3 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
 
     setattr(patched_capture_model, _WORKER_V2_GRAPH_PATCH_MARKER, True)
     return patched_capture_model
-
-
-def _apply_v2_runner_patches() -> None:
-    """Install grouped-Beam hooks on the V2 GPU ModelRunner class.
-
-    Idempotent: every wrapper is marker-guarded and the whole runner is skipped
-    once ``is_worker_runner_v2_patched`` reports success.  The postprocess
-    workspace load wrapper is applied first and the canonical Constraint
-    Backend load wrapper last, so the final ``load_model`` carries the
-    constraint marker that the V2 validation gate checks.
-    """
-    from vllm_gr.v1.worker.runner_binding import bind_after_model_load
-    from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
-
-    for runner_name, runner_type in discover_worker_runners():
-        runner_class = cast(Any, runner_type)
-        if is_worker_runner_v2_patched(runner_class):
-            install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
-            continue
-        load_model = getattr(runner_class, "load_model", None)
-        if callable(load_model) and not getattr(
-            load_model, _BEAM_POSTPROCESS_LOAD_PATCH_MARKER, False
-        ):
-            runner_class.load_model = make_load_model_with_beam_postprocess_workspace(load_model)
-
-        load_model = getattr(runner_class, "load_model", None)
-        if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
-            runner_class.load_model = make_load_model_with_constraint_backend(
-                load_model,
-                max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
-                prepare_backend=_warmup_constraint_backend,
-            )
-
-        shutdown = getattr(runner_class, "shutdown", None)
-        if not getattr(shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
-            runner_class.shutdown = make_shutdown_with_constraint_backend(
-                shutdown if callable(shutdown) else None,
-                close_runtime=v2_resources.close_v2_runtime,
-            )
-
-        runner_class.execute_model = make_patched_execute_model_v2(runner_class.execute_model)
-        runner_class.sample_tokens = make_patched_sample_tokens_v2(runner_class.sample_tokens)
-        runner_class.prepare_inputs = make_patched_prepare_inputs_v2(runner_class.prepare_inputs)
-        runner_class.add_requests = make_patched_add_requests_v2(runner_class.add_requests)
-
-        # Native Prefill plan capture + async-forward decode graph capture.
-        # These optional graph hooks are NOT part of
-        # is_worker_runner_v2_patched's required set.
-        capture_model = getattr(runner_class, "capture_model", None)
-        if callable(capture_model):
-            runner_class.capture_model = make_patched_capture_model_v2(capture_model)
-
-        initialize_kv_cache = getattr(runner_class, "initialize_kv_cache", None)
-        if callable(initialize_kv_cache):
-            runner_class.initialize_kv_cache = make_patched_initialize_kv_cache_v2(
-                initialize_kv_cache
-            )
-        profile_cudagraph_memory = getattr(runner_class, "profile_cudagraph_memory", None)
-        if callable(profile_cudagraph_memory):
-            runner_class.profile_cudagraph_memory = make_patched_profile_cudagraph_memory_v2(
-                profile_cudagraph_memory
-            )
-
-        runner_class.load_model = bind_after_model_load(
-            runner_class.load_model, close_runtime=v2_resources.close_v2_runtime
-        )
-        install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
-        logger.info("%s V2 hooks patched successfully.", runner_name)
-
-
-def install() -> None:
-    """Install shared CUDA Worker utilities before patching the V2 runner."""
-    from vllm_gr.v1.worker.cuda.runner_installer import install_worker_hooks
-
-    install_worker_hooks()
-    _apply_v2_runner_patches()
-
-
-def is_patched(runner_class: type) -> bool:
-    from vllm_gr.v1.worker.runner_lifecycle import has_runner_lifecycle
-
-    return is_worker_runner_v2_patched(runner_class) and has_runner_lifecycle(
-        runner_class, V2_RUNNER
-    )
-
-
-__all__ = [
-    "_apply_v2_runner_patches",
-    "install",
-    "is_patched",
-    "discover_worker_runners",
-    "make_patched_execute_model_v2",
-    "make_patched_add_requests_v2",
-    "make_patched_capture_model_v2",
-    "make_patched_initialize_kv_cache_v2",
-    "make_patched_profile_cudagraph_memory_v2",
-    "make_patched_prepare_inputs_v2",
-    "make_patched_sample_tokens_v2",
-]

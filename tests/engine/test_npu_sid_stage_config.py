@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Any, Protocol, TypeVar, cast
 
@@ -22,6 +23,7 @@ from vllm_gr.config.parser import (
     GR_CONFIG_KEY,
     parse_gr_config,
 )
+from vllm_gr.platforms.admission import BeamLimits
 from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
 BEAM_SID_STAGE_VOCAB_KEY = "vllm_gr_beam_sid_stage_vocab"
@@ -152,7 +154,7 @@ def test_sid_stage_vocab_admits_npu_without_importing_device_runtime(device: str
 
 @_parametrize("device", ["cuda", "cuda:0", None])
 def test_sid_stage_vocab_rejects_other_or_unknown_device(device: str | None) -> None:
-    with pytest.raises(ValueError, match=r"sid_stage_vocab requires NPU"):
+    with pytest.raises(ValueError, match=r"does not support beam.sid_stage_vocab"):
         validate_gr_device_config(_device_config(device))
 
 
@@ -162,3 +164,29 @@ def test_full_vocabulary_default_keeps_device_admission(device: str | None) -> N
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@_parametrize("device", ["cuda", "npu", "vendor"])
+@_parametrize("supported", [False, True])
+def test_remote_sid_stage_admission_uses_platform_capability(device: str, supported: bool) -> None:
+    config = _device_config(device)
+    config.additional_config["vllm_gr_limits"] = asdict(
+        BeamLimits(
+            device_type=device,
+            max_decode_rows=None,
+            retain_candidate_widths=False,
+            constraint_backend="platform",
+            runner_generation="v1",
+            local_kv_heads=None,
+            head_size=None,
+            platform_class="vendor.Platform",
+            supports_unconstrained=True,
+            supports_sid_stage_vocab=supported,
+        )
+    )
+    if supported:
+        validate_gr_device_config(config)
+    else:
+        with pytest.raises(ValueError, match="does not support beam.sid_stage_vocab"):
+            validate_gr_device_config(config)

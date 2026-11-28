@@ -168,8 +168,6 @@ def test_execute_failure_is_propagated_to_sampling(
 ) -> None:
     from vllm.v1.core.sched.output import SchedulerOutput
 
-    from vllm_gr.v1.worker.gr_execution import execute_gr_stage
-
     owner = sample_owner
     owner.worker.device = "cuda"
     error = RuntimeError("native execution failed")
@@ -178,7 +176,7 @@ def test_execute_failure_is_propagated_to_sampling(
     pending = owner.pending
     native_state = owner.worker.execute_model_state
     with pytest.raises(RuntimeError) as execute_failure:
-        execute_gr_stage(
+        stages.execute_cuda_stage(
             owner.worker, SchedulerOutput.make_empty(), Mock(), hooks_type=type(owner.hooks)
         )
     assert execute_failure.value is error

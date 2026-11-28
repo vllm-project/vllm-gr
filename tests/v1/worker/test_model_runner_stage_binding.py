@@ -21,6 +21,20 @@ def _unexpected_native(*args: object, **kwargs: object) -> None:
     raise AssertionError("GR control frame dispatched to native execution")
 
 
+def _bind_cuda_stage(worker: SimpleNamespace, use_v2: bool) -> None:
+    from functools import partial
+
+    worker._gr_ready = True
+    worker._gr_pending_stage_sample = False
+    worker.execute_gr_stage = partial(
+        stages.execute_cuda_stage,
+        worker,
+        hooks_type=CudaStageHooksV2 if use_v2 else CudaStageHooksV1,
+    )
+    worker.retire_gr_stage = partial(stages.execute_gr_retirement, worker)
+    worker.cancel_finished_gr = partial(stages.cancel_finished_stage, worker)
+
+
 def _scheduled_frame(**metadata: object) -> SimpleNamespace:
     return SimpleNamespace(
         num_scheduled_tokens={"session": 1},
@@ -73,7 +87,8 @@ def test_execute_entry_binds_hooks_independently_of_environment(
         if use_v2
         else model_runner_common.make_patched_execute_model
     )
-    patched = factory(native) if use_v2 else factory(native, hooks_type=CudaStageHooksV1)
+    _bind_cuda_stage(worker, use_v2)
+    patched = factory(native)
     assert patched(worker, output) == "stage"
     local = get_owner.call_args.args[1]
     assert local is not output
@@ -91,56 +106,14 @@ def test_execute_entry_binds_hooks_independently_of_environment(
 
 
 @pytest.mark.l1  # type: ignore[misc]
-def test_cuda_dispatch_requires_explicit_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cuda_dispatch_requires_bound_stage(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_gr.v1.worker.gr_execution import execute_gr_stage
 
     get_owner = Mock(side_effect=AssertionError("unbound dispatch allocated an owner"))
     monkeypatch.setattr(stages, "get_stage_runner", get_owner)
-    with pytest.raises(ValueError, match="requires explicit stage hooks"):
+    with pytest.raises(RuntimeError, match="before model initialization"):
         execute_gr_stage(SimpleNamespace(device="cuda"), _scheduled_frame(), _unexpected_native)
     get_owner.assert_not_called()
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_v1_installer_binds_execution_and_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.worker import gr_startup, model_runner_patch
-    from vllm_gr.v1.worker.cuda import runner_installer as cuda
-    from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
-
-    class Runner:
-        device = "cuda"
-        vllm_config = SimpleNamespace(
-            additional_config={
-                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
-            }
-        )
-        execute_model = _unexpected_native
-        _prepare_inputs = _unexpected_native
-        _bookkeeping_sync = _unexpected_native
-
-        def capture_model(self) -> str:
-            return "native capture"
-
-    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: gpu_model_runner_patch)
-    monkeypatch.setattr(gpu_model_runner_patch, "capture_prefill_graphs", lambda _: None)
-    monkeypatch.setattr(cuda, "install_worker_hooks", lambda: None)
-    monkeypatch.setattr(
-        gpu_model_runner_patch, "discover_worker_runners", lambda: (("GPU", Runner),)
-    )
-    monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
-    capture = Mock()
-    get_owner = Mock(return_value=SimpleNamespace(execute=Mock(return_value="stage")))
-    monkeypatch.setattr(gr_startup, "capture_async_forward", capture)
-    monkeypatch.setattr(stages, "get_stage_runner", get_owner)
-    model_runner_patch.apply_worker_patches()
-    # A later environment change cannot change either installed entrypoint.
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    worker = Runner()
-    assert worker.capture_model() == "native capture"
-    capture.assert_called_once_with(worker, hooks_type=CudaStageHooksV1)
-    output = _scheduled_frame(**{GR_STAGE_OUTPUT_ATTR: {"session": object()}})
-    assert worker.execute_model(output) == "stage"
-    assert get_owner.call_args.kwargs["hooks_type"] is CudaStageHooksV1
 
 
 def test_v2_retirement_does_not_read_startup_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -148,6 +121,7 @@ def test_v2_retirement_does_not_read_startup_config(monkeypatch: pytest.MonkeyPa
     output = _scheduled_frame(**{GR_RETIRE_OUTPUT_ATTR: object()})
     retire = Mock(return_value="retired")
     monkeypatch.setattr(stages, "execute_gr_retirement", retire)
+    _bind_cuda_stage(worker, True)
     native = _unexpected_native
     assert _v2_integration.make_patched_execute_model_v2(native)(worker, output) == "retired"
     local = retire.call_args.args[1]
@@ -242,10 +216,7 @@ def test_stage_none_result_never_falls_through_to_native(
         if use_v2
         else model_runner_common.make_patched_execute_model
     )
-    wrapper = (
-        factory(_unexpected_native)
-        if use_v2
-        else factory(_unexpected_native, hooks_type=CudaStageHooksV1)
-    )
+    _bind_cuda_stage(worker, use_v2)
+    wrapper = factory(_unexpected_native)
     assert wrapper(worker, scheduled) is None
     assert owner.execute.call_count == 1

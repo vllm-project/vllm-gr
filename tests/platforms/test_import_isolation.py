@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -69,40 +70,28 @@ assert "vllm_gr.config.parser" not in sys.modules
 assert "vllm_gr.config.models" not in sys.modules
 
 for module_name in (
-    "torch",
     "torch_npu",
-    "vllm",
     "vllm_ascend",
     "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
     "vllm_gr.v1.worker.npu.npu_model_runner_patch",
     "vllm_gr.v1.attention.backends.beam_attn_gpu",
     "vllm_gr.v1.attention.backends.beam_attn_npu",
-    "vllm_gr.v1.ascend_compat",
     "vllm_gr.platforms.ascend.config_patch",
     "vllm_gr.v1.worker.npu.startup_patch",
     "vllm_gr.v1.worker.npu.kv_layout_patch",
 ):
     assert module_name not in sys.modules, module_name
 
-from vllm_gr.platforms.loader import load_backend_plugins
+from vllm_gr.platforms import BUILTIN_PROBES
+assert set(BUILTIN_PROBES) == {"cuda", "ascend"}
+assert "torch_npu" not in sys.modules
 
-load_backend_plugins()
-
-for module_name in (
-    "torch",
-    "torch_npu",
-    "vllm",
-    "vllm_ascend",
-    "vllm_gr.v1.worker.cuda.v1.gpu_model_runner_patch",
-    "vllm_gr.v1.worker.npu.npu_model_runner_patch",
-    "vllm_gr.v1.attention.backends.beam_attn_gpu",
-    "vllm_gr.v1.attention.backends.beam_attn_npu",
-    "vllm_gr.v1.ascend_compat",
-    "vllm_gr.platforms.ascend.config_patch",
-    "vllm_gr.v1.worker.npu.startup_patch",
-    "vllm_gr.v1.worker.npu.kv_layout_patch",
-):
-    assert module_name not in sys.modules, module_name
+from tests.helpers.native_platform import native_platform
+import vllm.platforms
+vllm.platforms.current_platform = native_platform("CUDA", "cuda")
+from vllm_gr.platforms import get_current_gr_platform
+assert get_current_gr_platform().backend_id == "cuda"
+assert "vllm_gr.platforms.ascend.platform" not in sys.modules
 """
 
     subprocess.run(
@@ -112,6 +101,47 @@ for module_name in (
         capture_output=True,
         text=True,
     )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_obsolete_installed_entry_point_cannot_replace_native_cuda(tmp_path: Path) -> None:
+    # Reproduce an environment that still contains a distribution from the
+    # retired plugin system. Its broken import must be irrelevant to selection.
+    dist = tmp_path / "stale_gr_plugin-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text("Name: stale-gr-plugin\nVersion: 1.0\n")
+    (dist / "entry_points.txt").write_text(
+        "[vllm_gr.platform_backends]\ncuda = missing_plugin:replacement\n"
+    )
+    code = """
+import os
+import sys
+from importlib import metadata
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, sys.argv[1])
+assert any(entry.value == "missing_plugin:replacement" for entry in
+           metadata.entry_points(group="vllm_gr.platform_backends"))
+from tests.helpers.native_platform import native_platform
+import vllm.platforms as native
+native.current_platform = native_platform("CUDA","cuda")
+os.environ["VLLM_GR_BACKEND"] = "old-replacement"
+os.environ["VLLM_GR_DISABLE_BUILTIN_BACKENDS"] = "cuda"
+
+installed_entry_points = metadata.entry_points
+def current_group_only(*, group):
+    assert group == "vllm_gr.platform_plugins", group
+    return installed_entry_points(group=group)
+with patch.object(metadata, "entry_points", side_effect=current_group_only):
+    from vllm_gr.platforms import get_current_gr_platform
+
+    assert type(get_current_gr_platform()).__module__ == "vllm_gr.platforms.cuda.platform"
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.l1  # type: ignore[misc]
@@ -126,9 +156,8 @@ import sys
 # imports are properties of the machine image, not of vllm-gr's backend
 # selection, so they cannot be forbidden here. The enforceable isolation
 # contract is that vllm-gr's own Ascend integration stays unloaded while the
-# CUDA provider initializes.
+# CUDA integration initializes.
 blocked = (
-    "vllm_gr.v1.ascend_compat",
     "vllm_gr.platforms.ascend.config_patch",
     "vllm_gr.platforms.ascend.spawn_patch",
     "vllm_gr.v1.worker.npu.startup_patch",
@@ -143,18 +172,29 @@ def reject_ascend(event, args):
 
 sys.addaudithook(reject_ascend)
 import vllm.platforms
-from vllm.platforms.interface import Platform
+from tests.helpers.cuda_platform import CudaGRPlatform
+from vllm.platforms.cuda import CudaPlatform
 
-# Synthetic device identity: exercise host initialization, not CUDA execution.
-# The identity carries the upstream enum and class lineage, so provider
-# selection never has to infer CUDA from tensor placement alone.
-platform = Platform()
-platform._enum = "CUDA"
-platform.device_type = "cuda"
-platform.device_name = "cuda"
+# The real CUDA class provides concrete methods needed during vLLM startup.
+platform = CudaPlatform()
+assert isinstance(platform, CudaGRPlatform.native_platform_type)
+if not __import__("torch").cuda.is_available():
+    # No device is visible on host-only builds. Stub the capability on the
+    # class: initialize_runtime installs the GR platform instance as
+    # current_platform, and that instance inherits the stub through the MRO.
+    CudaPlatform.get_device_capability = classmethod(
+        lambda *args, **kwargs: None
+    )
+
+# vllm's fused-MoE import chain resolves CUTLASS support at module import
+# through current_platform. Import it while the native platform is still
+# selected: CUDA hosts provide the compiled op for the probe, and every
+# other host short-circuits on is_cuda() == False. After the CUDA platform
+# switch below, the cached modules need no re-execution, so a host whose
+# vllm build lacks CUDA ops (an Ascend image) cannot crash in the probe.
+import vllm.v1.core.sched.scheduler  # noqa: F401
+
 vllm.platforms.current_platform = platform
-from vllm_gr.platforms import loader
-loader.entry_points = lambda **kwargs: ()
 
 from vllm_gr.plugin import initialize_runtime
 first = initialize_runtime()
@@ -207,41 +247,7 @@ class RejectInactiveIntegration(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, RejectInactiveIntegration())
 module_name = sys.argv[1]
-if module_name == "vllm_gr.v1.worker.model_runner_patch":
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-    import vllm.platforms
-    from vllm.platforms.interface import Platform
-
-    platform = Platform()
-    platform._enum = "CUDA"
-    platform.device_type = "cuda"
-    platform.device_name = "cuda"
-    vllm.platforms.current_platform = platform
-
-    from vllm_gr.platforms import loader
-    from vllm_gr.v1.worker.cuda import runner_installer as runner
-    from vllm_gr.v1.worker import model_runner_patch
-    class Worker:
-        vllm_config = None
-        use_v2_model_runner = True
-        def init_device(self):
-            pass
-
-    runner.discover_worker_runners = lambda: (("CUDA Worker.init_device", Worker),)
-    from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
-    native_class = type("V2", (), {})
-    v2.discover_worker_runners = lambda: (("V2", native_class),)
-    v2.is_patched = lambda cls: bool(getattr(cls, "_installed", False))
-    install_v2 = Mock(side_effect=lambda: setattr(native_class, "_installed", True))
-    v2._apply_v2_runner_patches = install_v2
-    loader.entry_points = lambda **kwargs: ()
-    runner.install_worker_hooks = Mock()
-    model_runner_patch.apply_worker_patches()
-    install_v2.assert_not_called()
-    Worker().init_device()
-    install_v2.assert_called_once_with()
-else:
-    importlib.import_module(module_name)
+importlib.import_module(module_name)
 assert not any(forbidden(name) for name in sys.modules)
 """
     subprocess.run(
@@ -261,7 +267,7 @@ pytestmark = pytest.mark.cpu_test
 def test_runner_contracts_import_stays_hardware_free() -> None:
     code = """
 import sys
-from vllm_gr.v1.worker import cuda, model_runner_contracts, npu
+from vllm_gr.v1.worker import cuda, model_runner_contracts, npu, runner
 from vllm_gr.v1.worker.cuda import v1, v2
 
 for package in (cuda, v1, v2, npu):
@@ -271,6 +277,7 @@ for package in (cuda, v1, v2, npu):
         for name in sys.modules
     )
 assert callable(model_runner_contracts.is_worker_runner_patched)
+assert callable(runner.require_gr_runner)
 for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
              "vllm_gr.v1.worker.model_runner_common",
              "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch"):
@@ -284,3 +291,51 @@ for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
         check=True,
         timeout=120,
     )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_shared_execution_imports_no_platform_implementation() -> None:
+    code = """
+import importlib
+import os
+import sys
+
+# Exercise GR imports independently of third-party plugin autoload on the host.
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+os.environ["VLLM_PLUGINS"] = ""
+
+# Ascend images install torch_npu, and this transformers release eagerly
+# imports it from its NPU flash-attention integration whenever its package
+# probe finds it. The shared modules legitimately reach vllm.config ->
+# transformers, so hide the package from that upstream probe: the
+# integration stays inert and the contract under test - the shared worker
+# modules load no device backend - stays observable on every host.
+import importlib.util
+
+_orig_find_spec = importlib.util.find_spec
+
+def _hide_torch_npu(name, *args, **kwargs):
+    if name == "torch_npu":
+        return None
+    return _orig_find_spec(name, *args, **kwargs)
+
+importlib.util.find_spec = _hide_torch_npu
+
+for suffix in (
+    "worker.gr_execution",
+    "worker.model_runner_common",
+    "worker.model_runner_patch",
+    "worker.gr_startup",
+    "worker.runner",
+    "engine.worker_readiness",
+):
+    importlib.import_module("vllm_gr.v1." + suffix)
+
+unexpected = [
+    name for name in sys.modules
+    if name.startswith(("vllm_gr.v1.worker.cuda.", "vllm_gr.v1.worker.npu."))
+    or name == "torch_npu" or name.startswith("torch_npu.")
+]
+assert not unexpected, unexpected
+"""
+    subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, check=True, timeout=120)

@@ -2,46 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 from argparse import Namespace
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
+from tests.helpers.ascend_platform import AscendGRPlatform
+from tests.helpers.native_platform import native_platform
+from vllm_gr.platforms import get_current_gr_platform
 from vllm_gr.platforms.ascend.environment import check_ascend_environment
 from vllm_gr.platforms.compat import check_vllm_runtime, require_runtime_version
-from vllm_gr.platforms.loader import activate_current_backend
 
 
-class _FakeAscendPlatform:
-    """Synthetic Ascend identity: the vendor class lineage, no vendor import."""
-
-    _enum = "OOT"
-    device_type = "npu"
-    device_name = "npu"
+class _FakeAscendPlatform(AscendGRPlatform.native_platform_type):  # type: ignore[misc]
+    pass
 
 
-_FakeAscendPlatform.__module__ = "vllm_ascend.platform"
-_FakeAscendPlatform.__qualname__ = "NPUPlatform"
+def test_environment_checks_only_vllm_on_non_npu() -> None:
+    from tests.helpers.cuda_platform import CudaGRPlatform
 
-
-@pytest.fixture  # type: ignore[misc]
-def backend_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    from vllm_gr.platforms import loader
-    from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
-
-    _reset_backend_registry_for_tests()
-    monkeypatch.setattr(loader, "entry_points", lambda **kwargs: ())
-    yield
-    _reset_backend_registry_for_tests()
-
-
-def test_environment_checks_only_vllm_on_non_npu(backend_registry: None) -> None:
-    from vllm_gr.platforms.cuda import CUDA_BACKEND
-    from vllm_gr.platforms.registry import get_active_backend
-
-    platform = SimpleNamespace(_enum="CUDA", device_type="cuda", device_name="cuda")
+    platform = native_platform("CUDA", "cuda")
     with (
         mock.patch("vllm.platforms.current_platform", platform),
         mock.patch(
@@ -49,19 +30,18 @@ def test_environment_checks_only_vllm_on_non_npu(backend_registry: None) -> None
         ) as check_versions,
         mock.patch("vllm_gr.platforms.ascend.environment.check_ascend_environment") as check_ascend,
     ):
-        assert activate_current_backend().check_environment() == {
+        assert get_current_gr_platform().check_environment() == {
             "vllm": "0.30.0",
             "platform": "cuda",
         }
-        assert get_active_backend() is CUDA_BACKEND
+        assert isinstance(get_current_gr_platform(), CudaGRPlatform)
 
     check_versions.assert_called_once_with()
     check_ascend.assert_not_called()
 
 
-def test_environment_checks_ascend_runtime_on_npu(backend_registry: None) -> None:
-    from vllm_gr.platforms.ascend import NPU_BACKEND
-    from vllm_gr.platforms.registry import get_active_backend
+def test_environment_checks_ascend_runtime_on_npu() -> None:
+    from tests.helpers.ascend_platform import AscendGRPlatform
 
     platform = _FakeAscendPlatform()
     expected = {"vllm": "0.30.0", "vllm-ascend": "0.30.0rc2", "platform": "npu"}
@@ -72,26 +52,26 @@ def test_environment_checks_ascend_runtime_on_npu(backend_registry: None) -> Non
             "vllm_gr.platforms.ascend.environment.check_ascend_environment", return_value=expected
         ) as check_ascend,
     ):
-        assert activate_current_backend().check_environment() is expected
-        assert get_active_backend() is NPU_BACKEND
+        assert get_current_gr_platform().check_environment() is expected
+        assert isinstance(get_current_gr_platform(), AscendGRPlatform)
 
     check_ascend.assert_called_once_with(require_npu_platform=True)
     check_versions.assert_not_called()
 
 
 @pytest.mark.l1  # type: ignore[misc]
-def test_environment_rejects_unknown_platform_without_cuda_fallback(backend_registry: None) -> None:
+def test_environment_rejects_unknown_platform_without_cuda_fallback() -> None:
     from vllm_gr.platforms.errors import UnsupportedBackendError
 
     with (
         mock.patch(
             "vllm.platforms.current_platform",
-            SimpleNamespace(_enum="UNSPECIFIED", device_type="unknown"),
+            native_platform("UNSPECIFIED", "unknown"),
         ),
         mock.patch("vllm_gr.platforms.compat.check_vllm_runtime") as check_versions,
         pytest.raises(UnsupportedBackendError, match="unknown"),
     ):
-        activate_current_backend().check_environment()
+        get_current_gr_platform().check_environment()
     check_versions.assert_not_called()
 
 
@@ -231,6 +211,20 @@ def test_ascend_environment_rejects_wrong_triton_ascend_version(version: str) ->
 
 
 @pytest.mark.l1  # type: ignore[misc]
+def test_require_npu_accepts_external_platform_on_native_ascend() -> None:
+    from vllm_gr.entrypoints.cli.check_env import CheckEnvSubcommand
+
+    external = mock.Mock(backend_id="vendor-ascend")
+    external.check_environment.return_value = {"platform": "vendor-ascend"}
+    with (
+        mock.patch("vllm.platforms.current_platform", _FakeAscendPlatform()),
+        mock.patch("vllm_gr.platforms.get_current_gr_platform", return_value=external),
+    ):
+        CheckEnvSubcommand.cmd(Namespace(npu=True))
+    external.check_environment.assert_called_once_with()
+
+
+@pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
 def test_check_env_cli_uses_shared_runtime_checks(
     device: str, capsys: pytest.CaptureFixture[str]
@@ -240,7 +234,7 @@ def test_check_env_cli_uses_shared_runtime_checks(
     versions = {"vllm": "0.30.0+local"}
     if device == "npu":
         versions.update({"vllm-ascend": "0.30.0rc2+npu", "triton-ascend": "3.6.0"})
-    platform = SimpleNamespace(device_type=device)
+    platform = _FakeAscendPlatform() if device == "npu" else native_platform("CUDA", "cuda")
 
     def version(name: str) -> str:
         if name not in versions:
@@ -263,6 +257,33 @@ def test_check_env_cli_uses_shared_runtime_checks(
         import_vendor.assert_any_call("triton._C.libtriton.ascend")
     else:
         import_vendor.assert_not_called()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("platform_enum", "placement", "require_npu", "message"),
+    [
+        ("ROCM", "cuda", False, "ROCM"),
+        ("OOT", "npu", False, "OOT"),
+        ("CUDA", "cuda", True, "--npu requires the native Ascend platform"),
+    ],
+)
+def test_check_env_cli_rejects_unsupported_native_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    platform_enum: str,
+    placement: str,
+    require_npu: bool,
+    message: str,
+) -> None:
+    import vllm.platforms
+
+    from vllm_gr.entrypoints.cli.check_env import CheckEnvSubcommand
+
+    native = native_platform(platform_enum, "foreign" if platform_enum == "OOT" else placement)
+    native.device_type = placement
+    monkeypatch.setattr(vllm.platforms, "current_platform", native)
+    with pytest.raises(RuntimeError, match=message):
+        CheckEnvSubcommand.cmd(Namespace(npu=require_npu))
 
 
 pytestmark = pytest.mark.cpu_test

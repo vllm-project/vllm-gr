@@ -11,20 +11,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from vllm_gr.v1.beam import BEAM_DATA_VAR
 from vllm_gr.v1.worker import gr_execution, gr_gc
 from vllm_gr.v1.worker import model_runner_contracts as contracts
 
-if TYPE_CHECKING:
-    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
-
 
 def make_patched_execute_model(
     _orig_execute_model: Callable[..., Any],
-    *,
-    hooks_type: CudaStageHooksType | None = None,
 ) -> Callable[..., Any]:
     """Wrap execute_model to publish beam-request context for the run.
 
@@ -51,7 +46,7 @@ def make_patched_execute_model(
             return retirement
 
         stage = gr_execution._dispatch_stage_frame(
-            self, scheduler_output, _orig_execute_model, *args, hooks_type=hooks_type, **kwargs
+            self, scheduler_output, _orig_execute_model, *args, **kwargs
         )
         if stage is not gr_execution._NOT_A_STAGE_FRAME:
             return stage
@@ -59,12 +54,10 @@ def make_patched_execute_model(
             raise ValueError(
                 "Legacy Beam frames have been removed; use the persistent Beam entrypoint."
             )
-        gr_stage = getattr(self, "_gr_gpu_stage_runner", None)
-        if gr_stage is not None and not gr_stage.closed:
-            if gr_stage.binding.native_request_id in getattr(
-                scheduler_output, "finished_req_ids", ()
-            ):
-                gr_stage.cancel(gr_stage.binding)
+        finished = getattr(scheduler_output, "finished_req_ids", ())
+        if finished:
+            if getattr(self, "_gr_ready", False):
+                self.cancel_finished_gr(finished)
         # Ordinary execution must not inherit a completed stage's context.
         self._current_beam_data = {}
         self._current_beam_info = {"beam_data": {}, "req_ids": []}

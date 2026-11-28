@@ -16,6 +16,7 @@ from tests.kernels.beam_stage_test_utils import (
     install_decode_model,
 )
 from vllm_gr.config.models import DeploymentOptions
+from vllm_gr.v1.worker.cuda.stage_capture import capture_cuda_v1_forward
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import (
     should_replay_decode_graph_v2,
@@ -24,7 +25,6 @@ from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import (
     capture_multibatch_forward,
     get_v2_runtime,
 )
-from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -132,8 +132,8 @@ def test_v1_startup_graphs_replay_with_their_own_batch_buffers() -> None:
     )
     worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=2)
     install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
-    assert capture_async_forward(worker, hooks_type=CudaStageHooksV1)
-    assert capture_async_forward(worker, hooks_type=CudaStageHooksV1)
+    assert capture_cuda_v1_forward(worker, hooks_type=CudaStageHooksV1)
+    assert capture_cuda_v1_forward(worker, hooks_type=CudaStageHooksV1)
     for batch, token in ((1, 5), (2, 9), (1, 17)):
         owner = worker._gr_gpu_stage_runner_cache[batch]
         owner.input_ids.fill_(token)

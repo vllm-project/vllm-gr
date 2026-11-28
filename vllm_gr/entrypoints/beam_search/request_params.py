@@ -10,12 +10,12 @@ from vllm.sampling_params import BeamSearchParams as NativeBeamSearchParams
 from vllm_gr.config import GRConfig
 from vllm_gr.config.beam_widths import SUPPORTED_BEAM_WIDTH_SCHEDULE_STEPS
 from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
-from vllm_gr.platforms.beam_requests import uses_retained_candidate_widths
+from vllm_gr.platforms.admission import BeamLimits, beam_limits
 from vllm_gr.sampling_params import BeamSearchParams
 
 
 def resolve_request_widths(
-    config: GRConfig, params: NativeBeamSearchParams, *, device: object = None
+    config: GRConfig, params: NativeBeamSearchParams, *, limits: BeamLimits
 ) -> BeamSearchParams:
     """Keep runtime capacity separate from request length and width schedules."""
     values = asdict(params)
@@ -59,7 +59,7 @@ def resolve_request_widths(
             updates[name] = list(default[:steps])
         else:
             updates[name] = default
-    if "per_parent_beam_widths" in updates and uses_retained_candidate_widths(config, device):
+    if "per_parent_beam_widths" in updates and limits.uses_retained_widths(config):
         widths = updates.get("dynamic_beam_widths", values.get("dynamic_beam_widths"))
         if updates["per_parent_beam_widths"] == widths:
             del updates["per_parent_beam_widths"]
@@ -74,5 +74,5 @@ def apply_beam_request_defaults(
     return resolve_request_widths(
         GRConfig.from_vllm_config(vllm_config),
         params,
-        device=getattr(getattr(vllm_config, "device_config", None), "device", None),
+        limits=beam_limits(vllm_config),
     )

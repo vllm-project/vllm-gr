@@ -91,6 +91,7 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 def prepare(args: argparse.Namespace) -> None:
     import yaml
+    from vllm.platforms import current_platform
 
     module_name = "tools.constraints.build_constraint_table"
     try:
@@ -118,7 +119,10 @@ def prepare(args: argparse.Namespace) -> None:
         "max_decode_steps": args.generated_steps,
         "constraint_mode": "table",
         "constraint_table": {
-            "backend": "cuda",
+            # The constraint backend kind follows the installed platform
+            # (cuda on CUDA hosts, npu on Ascend); the engine rejects a
+            # mismatched kind during admission.
+            "backend": current_platform.device_type,
             "max_top_k": args.beam_width,
             "path": str(artifact.resolve()),
             "format": "constraint_table_v1",

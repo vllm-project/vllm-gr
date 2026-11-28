@@ -10,7 +10,7 @@ rationale for each hook is in [runtime patches](module/runtime_patches.md).
 
 | Field | Meaning |
 | --- | --- |
-| Scope and backend ID | `core` patches are owned by `vllm_gr`; `backend` patches are declared by one provider. |
+| Scope and backend ID | `core` patches are owned by `vllm_gr`; `backend` patches are attributed to the shipped platform class that owns each inventoried hook. |
 | Owner and installer | The module that owns the behavior and the callable that installs it. |
 | Risk | `critical` hooks can change upstream control flow or wire values; `high` hooks change scheduling, loading or device setup; `medium` hooks are bounded adapters. |
 | Process roles | Processes that must install or verify the hook. |
@@ -25,27 +25,12 @@ Owner: `vllm_gr/plugin.py`
 
 Installer: `vllm_gr.plugin.register`
 
+The plugin discovers an independent `current_gr_platform`. A narrow selector
+bridge handles GR CUSTOM for the current engine and delegates to that platform's
+`get_gr_attention_backend_cls`. Native `current_platform` and the CUSTOM
+registry remain unchanged. Engine-dependent selections bypass the native cache.
+
 Risk: `high`; process roles: `main`, `engine_core`, `worker`
-
-### GR-PATCH-001 — CUSTOM Attention Selector Compatibility
-
-Scope: `core`; backend ID: `null`
-
-Owner: `vllm_gr/v1/attention/selector_patch.py`
-
-Installer: `vllm_gr.v1.attention.selector_patch.apply_custom_attention_backend_patch`
-
-Risk: `critical`; process roles: `engine_core`, `worker`
-
-### GR-PATCH-002 — NPUWorker Initialization Hook
-
-Scope: `backend`; backend ID: `ascend`
-
-Owner: `vllm_gr/v1/worker/npu/startup_patch.py`
-
-Installer: `vllm_gr.v1.worker.npu.startup_patch.patch_npu_worker_init_device`
-
-Risk: `high`; process roles: `worker`
 
 ### GR-PATCH-003 — FlatLogprobs Fast Append Override
 
@@ -127,35 +112,35 @@ Installer: `vllm_gr.v1.core.kv_cache_utils.apply_kv_hash_memo_patch`
 
 Risk: `high`; process roles: `engine_core`
 
-### GR-PATCH-011 — GPU ModelRunner V1/V2 Overrides
+### GR-PATCH-011 - CUDA array staging
 
 Scope: `backend`; backend ID: `cuda`
 
-Owner: `vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py and vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py`
+Owner: `vllm_gr/v1/worker/cuda/numpy_staging.py`
 
-Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
+Installer: `vllm_gr.v1.worker.cuda.numpy_staging.install_numpy_staging`
 
-Risk: `critical`; process roles: `gpu_worker`
+`CudaGRWorker` retains native V2 buffer objects and installs bulk NumPy staging.
+The native Worker and Runner execution classes are unchanged; GR execution is
+implemented by subclasses. The staging hook preserves asynchronous transfer
+lifetime and handles received read-only arrays.
 
-### GR-PATCH-012 — NPU ModelRunner Override
+Risk: `high`; process roles: `gpu_worker`
+
+### GR-PATCH-012 - Ascend stage projection updates
 
 Scope: `backend`; backend ID: `ascend`
 
-Owner: `vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/stage_projection.py`
+Owner: `vllm_gr/v1/worker/npu/stage_projection.py`
 
-Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
+Installer: `vllm_gr.v1.worker.npu.stage_projection.install_npu_stage_weight_update_hooks`
 
-Risk: `critical`; process roles: `npu_worker`
+Weight-update wrappers are installed on `AscendGRWorker`. Model loading attaches
+the fixed-address projection to each logits processor instance. Invalidation
+precedes native weight writes; refresh follows finalization and synchronization.
+Native NPU Worker and Runner execution classes are unchanged.
 
-### GR-PATCH-013 — CUSTOM Attention Backend Registration
-
-Scope: `core`; backend ID: `null`
-
-Owner: `vllm_gr/v1/attention/backends/beam_attn.py`
-
-Installer: `vllm_gr.v1.attention.backends.beam_attn register_backend decorator`
-
-Risk: `high`; process roles: `engine_core`, `worker`
+Risk: `high`; process roles: `npu_worker`
 
 ### GR-PATCH-015 — Sliced Vocabulary Projection
 
@@ -218,3 +203,5 @@ installer and no entry in the checked list above.
 | `GR-PATCH-014` | `LMCache RequestTracker, ReqMeta, and LMCacheConnectorV1Impl` | Experimental LMCache integration removed; no supported version pin or vLLM 0.30 validation |
 | `GR-PATCH-017` | `NPUWorker.profile_memory in vllm_ascend.worker.worker or vllm_ascend.worker.worker_v1` | Removal condition met by the 0.30 upgrade; vllm-ascend 0.30.0rc2 replaced profile_memory with log_memory_stats, which reads the two allocator counters directly, and the installer found no native method to wrap on that runtime |
 | `GR-PATCH-020` | `vllm.config.ModelConfig.maybe_untie_word_embeddings` | Model-specific tied-embedding compatibility was retired with its deployment recipe |
+
+| `GR-PATCH-002` | `NPUWorker.init_device` | Replaced by direct initialization in the `AscendGRWorker` subclass |

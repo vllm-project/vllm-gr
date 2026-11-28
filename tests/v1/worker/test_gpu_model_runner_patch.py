@@ -469,21 +469,9 @@ def test_beam_graph_runtime_stats_reports_capture_and_dispatch_state() -> None:
 def test_worker_graph_stats_hook_is_named_and_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vllm.v1.worker.gpu_worker as gpu_worker
+    from vllm_gr.v1.worker.cuda.worker import CudaGRWorker
 
-    from vllm_gr.v1.worker.cuda import runner_installer as cuda
-
-    class FakeWorker:
-        pass
-
-    monkeypatch.setattr(gpu_worker, "Worker", FakeWorker)
-
-    cuda.install_worker_utilities()
-    first = getattr(FakeWorker, "get_gr_beam_graph_runtime_stats")
-    cuda.install_worker_utilities()
-
-    assert first is _gr_context.get_beam_graph_runtime_stats
-    assert getattr(FakeWorker, "get_gr_beam_graph_runtime_stats") is first
+    assert CudaGRWorker.get_gr_beam_graph_runtime_stats is _gr_context.get_beam_graph_runtime_stats
 
 
 def test_patched_determine_active_lora_downgrades_full() -> None:

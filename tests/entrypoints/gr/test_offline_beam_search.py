@@ -85,9 +85,9 @@ def _run_offline_beam_search(
             processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
             runner = llm.collective_rpc("onerec_v1_st_runner")[0]
             expected_runner = (
-                "vllm.v1.worker.gpu.model_runner.GPUModelRunner"
+                "vllm_gr.v1.worker.cuda.v2.model_runner.CudaGRModelRunnerV2"
                 if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0") == "1"
-                else "vllm.v1.worker.gpu_model_runner.GPUModelRunner"
+                else "vllm_gr.v1.worker.cuda.v1.model_runner.CudaGRModelRunnerV1"
             )
             assert runner == expected_runner, runner
             llm.collective_rpc("onerec_v1_st_observe")

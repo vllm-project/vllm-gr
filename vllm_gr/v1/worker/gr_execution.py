@@ -6,14 +6,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
-if TYPE_CHECKING:
-    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import GPUBeamStageRunner
-    from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
-    from vllm_gr.v1.worker.npu.npu_beam_stage_runner import NPUEagerBeamStageRunner
+from vllm_gr.v1.worker.runner import require_gr_runner
 
 
 def _copy_record(value: Any) -> Any:
@@ -94,56 +91,24 @@ def execute_gr_stage(
     scheduled: Any,
     original: Callable[..., Any],
     *args: Any,
-    hooks_type: CudaStageHooksType | None = None,
     **kwargs: Any,
 ) -> Any:
-    local = worker_input(scheduled)
-    device_type = str(worker.device).split(":")[0]
-    stage_runner: GPUBeamStageRunner | NPUEagerBeamStageRunner
-    if device_type == "cuda":
-        from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
-            get_stage_runner,
-        )
-
-        if hooks_type is None:
-            raise ValueError("CUDA GR execution requires explicit stage hooks")
-        stage_runner = get_stage_runner(
-            worker,
-            local,
-            hooks_type=hooks_type,
-        )
-    elif device_type == "npu":
-        from vllm_gr.v1.worker.npu.npu_beam_stage_runner import get_npu_stage_runner
-
-        stage_runner = get_npu_stage_runner(worker, local)
-    else:
-        raise ValueError("beam_search has no execution adapter for this device")
+    require_gr_runner(worker)
+    if worker._gr_pending_stage_sample is not False:
+        raise RuntimeError("GR sampling must consume the previous dispatch")
     try:
-        return stage_runner.execute(local, original, *args, **kwargs)
+        result = worker.execute_gr_stage(worker_input(scheduled), original, *args, **kwargs)
     except Exception as error:
-        # Native BatchQueue consumes sample first. Stale logits must never hide
-        # an execute failure from the corresponding sample Future.
-        stage_runner.execution_error = error
+        worker._gr_pending_stage_sample = error
         raise
+    if result is None:
+        worker._gr_pending_stage_sample = True
+    return result
 
 
 def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
-    local = worker_input(scheduled)
-    device_type = str(worker.device).split(":")[0]
-    if device_type == "cuda":
-        from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
-            execute_gr_retirement as retire,
-        )
-    elif device_type == "npu":
-        from vllm_gr.v1.worker.npu.npu_beam_stage_runner import (
-            execute_npu_gr_retirement,
-        )
-
-        return execute_npu_gr_retirement(worker, local)
-    else:
-        raise ValueError("beam_search has no retirement adapter for this device")
-
-    return retire(worker, local)
+    require_gr_runner(worker)
+    return worker.retire_gr_stage(worker_input(scheduled))
 
 
 def _dispatch_retirement_frame(self: Any, scheduler_output: Any) -> Any:
@@ -164,7 +129,6 @@ def _dispatch_stage_frame(
     scheduler_output: Any,
     orig_execute_model: Callable[..., Any],
     *args: Any,
-    hooks_type: CudaStageHooksType | None = None,
     **kwargs: Any,
 ) -> Any:
     """Handle a persistent GR stage frame (beam_search execution).
@@ -180,9 +144,7 @@ def _dispatch_stage_frame(
 
     if not getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
         return _NOT_A_STAGE_FRAME
-    return execute_gr_stage(
-        self, scheduler_output, orig_execute_model, *args, hooks_type=hooks_type, **kwargs
-    )
+    return execute_gr_stage(self, scheduler_output, orig_execute_model, *args, **kwargs)
 
 
 # Sentinel distinguishing "not a stage frame" from a legitimate None result.

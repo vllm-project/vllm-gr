@@ -26,7 +26,8 @@ from vllm_gr.config.parser import (
     GR_CONFIG_KEY,
     validate_additional_keys,
 )
-from vllm_gr.platforms.config import BackendConfigService, engine_config_service
+from vllm_gr.platforms import get_current_gr_platform
+from vllm_gr.platforms.interface import GRPlatform
 
 origin_create_engine_config = EngineArgs.create_engine_config
 logger = logging.getLogger(__name__)
@@ -40,13 +41,15 @@ def _resolve_constraint_backend(config: GRConfig) -> GRConfig:
         or config.constraint.table.backend is not ConstraintBackendKind.AUTO
     ):
         return config
-    from vllm.platforms import current_platform
+    from vllm_gr.platforms import get_current_gr_platform
 
-    return resolve_constraint_backend(config, current_platform.device_type)
+    return resolve_constraint_backend(
+        config, get_current_gr_platform().canonical_constraint_backend
+    )
 
 
 def _beam_worker_decision_default(
-    service: BackendConfigService,
+    service: GRPlatform,
     *,
     beam_width_configured: bool,
     worker_decision: bool | None,
@@ -79,20 +82,16 @@ def create_engine_config(self, usage_context=None, headless=False):
             native_args.additional_config.pop(GR_CONFIG_KEY), base_dir=Path.cwd()
         )
     else:
-        from vllm_gr.platforms.planning import BACKEND_OPTIONS_KEY
-
-        if BACKEND_OPTIONS_KEY in additional:
-            raise ValueError(
-                'vllm_gr_backend_options requires additional_config["vllm_gr"]. '
-                "Pass gr_config_to_mapping(gr) alongside the backend options. For Beam, set "
-                "async_scheduling=True, enable_chunked_prefill=False, max_num_batched_tokens "
-                "at least as large as max_model_len, and max_logprobs at least as large as "
-                "the effective candidate width. Alternatively, use GRLLM or vllm serve --gr."
-            )
         effective_gr_config = load_gr_config()
+    service = get_current_gr_platform()
+    needs_worker = (
+        effective_gr_config.beam_max_width is not None
+        or effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM
+        or requested_backend_name == "CUSTOM"
+    )
+    if needs_worker and getattr(native_args, "worker_cls", None) in (None, "auto"):
+        native_args.worker_cls = service.get_gr_worker_cls()
     config = origin_create_engine_config(native_args, usage_context, headless)
-    service = engine_config_service()
-    service.apply_native_defaults(config)
     attention = getattr(config, "attention_config", None)
     backend = getattr(attention, "backend", None)
     # Ascend resets the native selector to auto during VllmConfig creation.
@@ -118,26 +117,23 @@ def create_engine_config(self, usage_context=None, headless=False):
         effective_gr_config = replace(effective_gr_config, beam_worker_decision=worker_decision)
     effective_gr_config = _resolve_constraint_backend(effective_gr_config)
 
-    service.validate_engine(config, effective_gr_config)
-
     write_canonical_gr_config(config, effective_gr_config)
 
-    if effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM:
-        attention_config = getattr(config, "attention_config", None)
-        if attention_config is not None and getattr(attention_config, "backend", None) is None:
-            from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-            attention_config.backend = AttentionBackendEnum.CUSTOM
+    # Beam attention is selected by the platform seam from the GR marker in
+    # effective_gr_config: nothing is registered, installed, or restored at
+    # engine construction, and attention_config keeps the value the vendor
+    # runtime left it (vllm-ascend clears an explicit backend during
+    # VllmConfig creation; CUDA configs keep theirs untouched).
+    config.additional_config.pop("vllm_gr_limits", None)
+    service.check_and_update_gr_config(config)
     if effective_gr_config.beam_max_width is not None:
         from vllm_gr.config.execution import validate_gr_execution_config
 
         validate_gr_execution_config(config)
 
-    service.finalize_native_config(config, effective_gr_config)
+    from dataclasses import asdict
 
-    from vllm_gr.platforms.planning import admit_backend_plan
-
-    admit_backend_plan(config)
+    config.additional_config["vllm_gr_limits"] = asdict(service.get_beam_limits(config))
 
     logger.info(
         "Resolved vLLM-GR configuration: %s",

@@ -12,8 +12,7 @@ select V2 explicitly.
 ## Reuse of native vLLM
 
 Native `RequestState` and `BlockTables` own the request and KV data, including
-Prefix Cache and block tables. For an eligible all-new Prefill batch, GR's
-patched `add_requests` registers the batch itself through the same native
+Prefix Cache and block tables. For an eligible all-new Prefill batch, `CudaGRModelRunnerV2.add_requests` registers the batch itself through the same native
 helpers and skips native sampler initialization. Other dispatches fall through
 to native registration. At Decode, GR derives the expanded slot mapping from
 native block IDs.
@@ -81,7 +80,7 @@ GR enforces `ignore_eos=true` on admitted requests.
 | [Worker lifecycle tests](../../../tests/kernels/test_gpu_beam_stage_lifecycle.py) | Completion, cancellation and retirement. |
 | [Multibatch graph tests](../../../tests/kernels/test_v2_multibatch_graphs.py) | Batch switching and replay. |
 | [V2 patch tests](../../../tests/v1/worker/test_gpu_model_runner_v2_patch.py) | Input adaptation and native output completion. |
-| [Stage binding tests](../../../tests/v1/worker/test_model_runner_stage_binding.py) | Admitted plan binding after model load. |
+| [Stage binding tests](../../../tests/v1/worker/test_model_runner_stage_binding.py) | Concrete Runner stage dispatch and execute/sample ownership. |
 
 ## Source map
 
