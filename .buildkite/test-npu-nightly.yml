@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 steps:
-  - label: "System tests (OneRec Video-100 benchmark)"
+  - label: "OneRec Video-100 Perf and Acc Test"
     key: l4-npu-system-tests
     depends_on: upload-npu-nightly-pipeline
     timeout_in_minutes: 90

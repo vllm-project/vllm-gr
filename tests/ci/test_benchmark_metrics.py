@@ -3,6 +3,7 @@
 
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -90,3 +91,50 @@ def test_serving_metrics_reject_invalid_json(
     assert not result.stdout
     assert str(path) in result.stderr
     assert error in result.stderr
+
+
+@pytest.mark.parametrize("device", ["gpu", "npu"])  # type: ignore[misc]
+def test_video_baseline_unknown_model_warns_and_uses_defaults(device: str) -> None:
+    from tests.e2e.test_onerec_video_benchmark import resolve_device_baseline
+
+    with pytest.warns(UserWarning, match="Unknown accelerator.*using the default baseline"):
+        policy = resolve_device_baseline(device, "Unknown accelerator")
+
+    assert policy["BENCHMARK_BOARD_ID"] == "Unknown accelerator"
+    assert policy["BENCHMARK_DEVICE"] == device
+    assert policy["PASS_AT_1_THRESHOLD"] == "0.09"
+    assert policy["PASS_AT_32_THRESHOLD"] == "0.29"
+    assert policy["RECALL_AT_32_THRESHOLD"] == "0.04"
+    assert policy["P99_TTFT_THRESHOLD"] == "300"
+    assert policy["ACCURACY_FAILURE_MODE"] == "blocking"
+    assert policy["ONLINE_NON_ACCURACY_FAILURE_MODE"] == "blocking"
+    assert policy["P99_TTFT_FAILURE_MODE"] == "warning"
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("device", "model", "board", "accuracy", "ttft", "offline_elapsed"),
+    [
+        ("gpu", " nvidia l4 ", "NVIDIA L4", ("0.09", "0.29", "0.04"), "300", "20"),
+        ("npu", " ascend910_9362 ", "Ascend910_9362", ("0.05", "0.21", "0.03"), "280", "25"),
+    ],
+)
+def test_video_baseline_known_model_preserves_overrides(
+    device: str,
+    model: str,
+    board: str,
+    accuracy: tuple[str, str, str],
+    ttft: str,
+    offline_elapsed: str,
+) -> None:
+    from tests.e2e.test_onerec_video_benchmark import resolve_device_baseline
+
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        policy = resolve_device_baseline(device, model)
+
+    assert not emitted
+    assert policy["BENCHMARK_BOARD_ID"] == board
+    accuracy_keys = ("PASS_AT_1_THRESHOLD", "PASS_AT_32_THRESHOLD", "RECALL_AT_32_THRESHOLD")
+    assert tuple(policy[key] for key in accuracy_keys) == accuracy
+    assert policy["P99_TTFT_THRESHOLD"] == ttft
+    assert policy["ELAPSED_TIME_OFFLINE_THRESHOLD"] == offline_elapsed

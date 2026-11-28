@@ -68,14 +68,16 @@ def detect_accelerator() -> tuple[str, str]:
 
 def resolve_device_baseline(device: str, model: str) -> dict[str, str]:
     baseline = load_policy(BASELINE_PATH)
-    boards = baseline["device_overrides"][device]["boards"]
+    boards = baseline["device_overrides"].get(device, {}).get("boards", {})
     names = {name.casefold(): name for name in boards}
     board = names.get(model.strip().casefold())
     if board is None:
-        supported = ", ".join(sorted(boards))
-        pytest.fail(
-            f"No Video-100 baseline for {device} model {model!r}. Supported models: {supported}"
+        warnings.warn(
+            f"No Video-100 baseline for {device} model {model!r}; "
+            "using the default baseline thresholds.",
+            stacklevel=2,
         )
+        board = model.strip()
     return cast("dict[str, str]", resolve_policy(baseline, device, board))
 
 
@@ -194,7 +196,7 @@ def test_onerec_video_benchmark() -> None:
     device, accelerator = detect_accelerator()
     policy = resolve_device_baseline(device, accelerator)
     snapshot = snapshot_download(
-        DATASET_REPO, repo_type="dataset", allow_patterns="benchmark_data/*", token=True
+        DATASET_REPO, repo_type="dataset", allow_patterns="benchmark_data/*"
     )
     dataset = Path(snapshot) / "benchmark_data"
     assert dataset.is_dir(), f"{DATASET_REPO} snapshot has no benchmark_data directory: {snapshot}"

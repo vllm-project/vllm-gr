@@ -8,7 +8,7 @@ workflow.
 | Workload | When it runs | What it checks |
 | --- | --- | --- |
 | [OneRec five-task Recall](#gpu-five-task-recall) | GPU PR validation targeting `main` and eligible manual GPU runs | Per-task SID Recall@32, input identity and graph replay |
-| [OneRec Video-100](#npu-video-100) | Buildkite [CUDA nightly](../../../.buildkite/test-cuda-nightly.yml) and [NPU nightly](../../../.buildkite/test-npu-nightly.yml) | Offline and HTTP accuracy and performance under the resolved policy |
+| [OneRec Video-100](#npu-video-100) | Buildkite [NPU nightly](../../../.buildkite/test-npu-nightly.yml) | Offline and HTTP accuracy and performance under the resolved policy |
 
 The OneRec decode job must succeed for full validation to pass.
 
@@ -23,8 +23,9 @@ Its summary records the tested commit, policy SHA-256 and effective thresholds.
 
 Video-100 reads the model name of the visible accelerator and selects its entry
 in the [JSON baseline](../../../tests/baseline/onerec_video_benchmark.json).
-The test fails if the detected model has no entry. The test log records the
-detected model and selected entry.
+If the detected model has no entry, the test uses the top-level default
+thresholds and emits a warning. The test log records the detected model
+and whether the default baseline was used.
 
 ### GPU five-task Recall
 
@@ -65,10 +66,15 @@ parent-score correction in `0f5018516f82`. Applying the same floors on Ascend
 is an acceptance policy decision. The test log records the thresholds used
 for each measured metric.
 
-The test downloads `benchmark_data` from the gated
-`OpenOneRec/OpenOneRec-RecIF` dataset and uses the Hugging Face cache.
-On a prepared Ascend runner with the model available, authenticate to
-Hugging Face with a token that has access to the dataset and run:
+The test loads `benchmark_data` from the gated `OpenOneRec/OpenOneRec-RecIF`
+dataset through the Hugging Face cache (`HF_HUB_CACHE`, or `$HF_HOME/hub`
+by default). It uses an available Hugging Face token without requiring one
+when the requested data is already cached. Set `HF_HUB_OFFLINE=1` before
+starting pytest to use only cached files; the model and dataset must both
+be available locally. Downloads of uncached gated files require a token
+with access to the dataset.
+
+On a prepared Ascend runner with the model available, run:
 
 ```bash
 python -m pytest -sv --run-slow --strict-test-levels \
