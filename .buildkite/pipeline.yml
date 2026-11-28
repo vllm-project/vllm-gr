@@ -2,33 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 steps:
-  - label: "Build CI image"
-    key: image-build
+  - label: "Check for docs-only PR"
+    key: select-ci-steps
     agents:
       queue: medium_cpu_queue_premerge
-    command: bash .buildkite/common/scripts/build-ci-image.sh
-
-  - label: "Upload ready pipeline"
-    key: upload-ready-pipeline
-    if: >-
-      build.pull_request.id != null &&
-      build.pull_request.base_branch == "main" &&
-      build.pull_request.draft == false &&
-      build.pull_request.labels includes "ready"
-    depends_on: image-build
-    agents:
-      queue: medium_cpu_queue_premerge
-    command: python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/test-ready.yml
-
-  - label: "Upload merge pipeline"
-    key: upload-merge-pipeline
-    if: >-
-      (build.branch == "main" && build.pull_request.id == null) ||
-      (build.pull_request.id != null &&
-       build.pull_request.base_branch == "main" &&
-       build.pull_request.draft == false &&
-       build.pull_request.labels includes "merge-test")
-    depends_on: image-build
-    agents:
-      queue: medium_cpu_queue_premerge
-    command: python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/test-merge.yml
+    command: >-
+      python3 .buildkite/common/scripts/upload_pipeline.py
+      --upload .buildkite/ci-steps.yml

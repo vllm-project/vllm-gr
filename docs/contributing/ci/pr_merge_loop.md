@@ -17,6 +17,14 @@ documentation checks or full validation. The
 their own triggers. Maintainers apply any required labels and arrange
 hardware runs that need shared infrastructure.
 
+[Buildkite](../../../.buildkite/pipeline.yml) checks the diff for PRs targeting
+`main` before building the CI image or uploading the `ready` and `merge-test`
+pipelines. A PR skips those steps if every changed path is under `docs/`,
+ends in `.md`, or is the root `mkdocs.yml`.
+Both paths of a rename must qualify. GitHub still runs the applicable
+documentation and static checks. Buildkite runs its usual steps for mixed
+changes, an unresolved diff, and pushes to `main`.
+
 ### Rerun validation
 
 After pushing a fix, check the results for the new head commit. A rerun
