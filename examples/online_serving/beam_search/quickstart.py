@@ -226,10 +226,9 @@ def main() -> None:
         **os.environ,
         "ONEREC_BASE_URL": f"http://127.0.0.1:{port}",
         "ONEREC_SERVED_MODEL_NAME": workdir.name,
-        "VLLM_USE_V2_MODEL_RUNNER": "0"
-        if args.constraint_backend == "npu"
-        else os.environ.get("VLLM_USE_V2_MODEL_RUNNER") or "1",
     }
+    if args.constraint_backend == "npu":
+        env["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     command = [
         "vllm",
         "serve",

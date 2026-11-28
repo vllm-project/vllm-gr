@@ -18,11 +18,9 @@
 
 ## About
 
-[vLLM](https://github.com/vllm-project/vllm) was originally built to serve
-large language models that generate text autoregressively. vLLM-GR extends
-that foundation to recommendation, where a model uses a person's interaction
-history to predict which items will interest them. vLLM-GR is an independent
-extension of vLLM.
+vLLM-GR is an independent extension of [vLLM](https://github.com/vllm-project/vllm)
+for generative recommendation. A recommendation model uses a person's
+interaction history to predict which items will interest them.
 
 - **Recommendation inputs.** Views, clicks and other interactions describe a
   user's history. A prompt can ask the model to recommend the next item.
@@ -70,7 +68,7 @@ extension of vLLM.
 
 ## Getting Started
 
-- [Installation](docs/getting_started/installation/README.md) — Install vLLM-GR
+- [Installation](docs/getting_started/installation.md) — Install vLLM-GR
   from source on NVIDIA GPUs or Ascend NPUs.
 - [OneRec quickstart](docs/getting_started/quickstart.md) — Generate ranked
   recommendations with OneRec-1.7B offline or serve the model over HTTP.

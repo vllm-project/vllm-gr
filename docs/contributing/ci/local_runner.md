@@ -20,7 +20,7 @@ For multiple assigned devices, pass a comma-separated list such as
 `--device-id 0,2`. Add `--wheel` to run the wheel smoke test after the checks
 succeed. For OneRec tests that use a local checkpoint, set
 `VLLM_GR_TEST_MODEL` to the snapshot directory. See the
-[OneRec CUDA example](../../user_guide/onerec_quickstart.md#5-validate-and-troubleshoot)
+[OneRec checkpoint instructions](../../getting_started/quickstart.md#download-onerec)
 or the [Ascend system tests](../../../tests/e2e/test_onerec_v1_npu_e2e.py).
 
 ## CUDA and Ascend checks
@@ -35,8 +35,8 @@ or the [Ascend system tests](../../../tests/e2e/test_onerec_v1_npu_e2e.py).
 For local NPU validation, use the [Ascend vendor image](../../getting_started/installation/npu.md#prerequisites)
 and build xllm-ops for its CANN version. If the job activates Conda, check
 that `CONDA_PREFIX`, `PATH` and the CANN environment select that runtime.
-An environment built for vLLM 0.22 needs the current vendor stack before
-it can run the tests for vLLM 0.30.0.
+Use the vendor stack listed in the
+[runtime compatibility table](../../getting_started/installation.md#runtime-compatibility).
 
 From the repository root, check the selected Python against the versions
 declared by the checkout before installing the GR developer extras. The
@@ -75,10 +75,11 @@ masks with the available devices and skip devices whose telemetry is missing
 or invalid. CUDA locks verify the physical device UUID. Ascend locks use
 sleep processes as advisory markers.
 
-Buildkite runs L1 CPU and L2 CUDA tests in the Ready pipeline and L3 CUDA
-tests in the Merge pipeline. The GitHub Actions device job uses `pr-device`
-to select L2 and accelerator-marked L1 tests. On CUDA, the GitHub Actions
-test jobs exclude the L2 and L3 GPU cases assigned to Buildkite.
+Buildkite runs L1 CPU and L2 CUDA and Ascend tests in the Ready pipelines,
+and L3 CUDA and Ascend tests in the Merge pipelines. Former L1 Ascend tests
+run as L2 in Buildkite Ready. The GitHub Actions device job prepares and
+checks the accelerator and runs the isolated resource probe for automatic
+runs; the benchmark gates remain in GitHub Actions.
 The separate Pre-commit checks workflow runs static hooks on Ubuntu for
 non-draft PRs without waiting for the `ready` label.
 By default the local test hook runs the full pytest suite with `--run-slow`

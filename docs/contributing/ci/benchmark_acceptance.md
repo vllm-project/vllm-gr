@@ -30,9 +30,16 @@ performance settings. The policy summary records the effective thresholds.
 
 ### GPU five-task Recall
 
-The GPU runner evaluates OneRec-1.7B with ModelRunner V1, batch size 4,
+The CUDA runner evaluates OneRec-1.7B with ModelRunner V1, batch size 4,
 beam width 128, and 1,000 fixed samples per task. Video, ad, label_cond, and
 interactive use SID-to-PID mapping. Product uses SID-to-IID.
+
+V1 in the gate, test and baseline names refers to the native vLLM
+ModelRunner selected with `VLLM_USE_V2_MODEL_RUNNER=0`. The calibrated gate
+uses that runner and batch-four graph replay. This explicit baseline setting
+is separate from the application's automatic runner selection on CUDA. The
+[user guide](../../user_guide/feature_compatibility.md#support-matrix) covers
+the CUDA ModelRunner V2 deployment path.
 
 CI checks SID Recall@32 for each task against the
 [calibrated baseline](../../../benchmarks/beam_search/recall_baseline_batch4.json).
@@ -44,8 +51,9 @@ replay are separate blocking checks.
 #### Reproduce the CUDA gate
 
 The checked-in baseline records the model revision, dataset and artifact
-identities, runtime, and A100 calibration samples used for the vLLM 0.30.0
-floors. Reproduce the check with the pinned snapshot and prepared data on a GPU.
+identities, runtime version and A100 calibration samples used for the floors.
+Reproduce the check with the recorded runtime, pinned snapshot and prepared
+data on CUDA.
 
 ```bash
 V1_RECALL_BASELINE_FILE="$PWD/benchmarks/beam_search/recall_baseline_batch4.json" \

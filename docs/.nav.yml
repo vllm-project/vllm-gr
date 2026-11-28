@@ -3,60 +3,35 @@ nav:
   - User Guide:
     - user_guide/README.md
     - Getting Started:
-      - getting_started/README.md
-      - Installation:
-        - getting_started/installation/README.md
-        - getting_started/installation/gpu.md
-        - getting_started/installation/npu.md
       - getting_started/quickstart.md
+      - Installation:
+        - getting_started/installation.md
+        - CUDA: getting_started/installation/gpu.md
+        - Ascend NPU: getting_started/installation/npu.md
+    - OneRec model: models/onerec.md
     - Serving:
       - serving/README.md
-      - serving/completions.md
-      - serving/grpc.md
     - Deployment & Operations:
-      - HTTP Replicas: serving/replica_deployment.md
       - Weight and Catalog Updates: user_guide/weight_update.md
-      - Serving Metrics: serving/metrics.md
-    - Beam guides:
-      - user_guide/onerec_quickstart.md
-      - user_guide/beam_search_npu.md
     - Features & Compatibility: user_guide/feature_compatibility.md
     - Configuration:
       - configuration/README.md
       - configuration/constraint_tables.md
-    - Models:
-      - models/supported_models.md
-    - Examples:
-      - examples/README.md
-  - Benchmarking:
-    - benchmarking/README.md
-    - benchmarking/common.md
-    - benchmarking/accuracy.md
-    - benchmarking/throughput.md
-  - CLI Reference:
-    - cli/README.md
-    - cli/serve.md
-    - Bench:
-      - Overview: cli/bench.md
-      - cli/bench/open_one_rec.md
-      - cli/bench/beam_performance.md
-      - cli/bench/beam_recall.md
-      - cli/bench/qwen_v1.md
-    - cli/check_env.md
   - Developer Guide:
-    - Contributing:
-      - contributing/README.md
+    - contributing/README.md
+    - General:
       - contributing/development.md
       - contributing/agent_instructions.md
       - contributing/docs_guide.md
       - contributing/pre_commit_setup.md
       - contributing/dependency_policy.md
-      - CI:
-        - Test Levels and Platform Markers: contributing/ci/test_levels.md
-        - contributing/ci/local_runner.md
-        - Benchmark Acceptance and Gates: contributing/ci/benchmark_acceptance.md
-        - contributing/ci/pr_merge_loop.md
-    - Design:
+      - License and Attribution: legal/README.md
+    - CI:
+      - Test Levels and Platform Markers: contributing/ci/test_levels.md
+      - contributing/ci/local_runner.md
+      - Benchmark Acceptance and Gates: contributing/ci/benchmark_acceptance.md
+      - contributing/ci/pr_merge_loop.md
+    - Design Documents:
       - design/index.md
       - design/architecture_overview.md
       - Feature Design:
@@ -76,5 +51,16 @@ nav:
         - design/module/constraint_tables.md
         - design/module/model_runner_v2.md
         - design/module/platform_backend.md
-        - design/module/runtime_patches.md
-  - Legal: legal/README.md
+  - Benchmarking:
+    - benchmarking/README.md
+    - benchmarking/accuracy.md
+    - benchmarking/throughput.md
+  - API Reference:
+    - HTTP Completions: serving/completions.md
+    - gRPC: serving/grpc.md
+  - CLI Reference:
+    - cli/README.md
+    - cli/serve.md
+    - cli/bench.md
+    - cli/check_env.md
+  - Community: https://github.com/JiusiServe/vllm-gr/issues

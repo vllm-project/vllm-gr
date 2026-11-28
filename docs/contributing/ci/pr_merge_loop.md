@@ -32,7 +32,8 @@ not give you that option, ask a maintainer in the PR.
    [baseline and measurements](benchmark_acceptance.md).
 3. Verify that the PR meets the target branch's required checks and review requirements.
 
-After merge, the [test-level workflow](../../../.github/workflows/test-levels.yml)
-selects L3 on pushes to `main`, L4 nightly and L5 weekly. Use those runs to
-follow up on regressions. See [test levels](test_levels.md#running-by-level)
-for device coverage and how to reproduce a run.
+After merge, [Buildkite](../../../.buildkite/pipeline.yml) runs L3 CUDA and
+Ascend tests. The [test-level workflow](../../../.github/workflows/test-levels.yml)
+selects L4 nightly and L5 weekly. Use those runs to follow up on regressions.
+See [test levels](test_levels.md#running-by-level) for device coverage and
+how to reproduce a run.

@@ -71,7 +71,7 @@ instructions for keeping a server running.
 ## Run gRPC
 
 - [Check the CUDA gRPC installation](online_serving/grpc/README.md#check-the-grpc-installation)
-  with two RPCs against a locally generated tiny Llama.
+  with two RPCs against a locally generated test checkpoint.
 - [Serve a real OneRec model over gRPC](online_serving/grpc/README.md#serve-onerec-over-grpc)
   with the same catalog and server configuration as HTTP.
 
@@ -84,10 +84,8 @@ Trie updates for running gRPC instances and check the version on each instance.
 
 | Entry point | Default with `VLLM_USE_V2_MODEL_RUNNER` unset |
 | --- | --- |
-| Library and general CLI | ModelRunner V1 |
-| CUDA direct offline OneRec, HTTP serving and OneRec gRPC examples | ModelRunner V2 |
-| CUDA offline thinking and tiny-model gRPC smoke test | ModelRunner V1 |
-| Ascend Beam examples | ModelRunner V1 |
+| CUDA library, CLI, and examples | Automatic selection. V2 when compatible, with V1 fallback. |
+| Ascend NPU library, CLI, and Beam examples | ModelRunner V1 |
 
 Set `VLLM_USE_V2_MODEL_RUNNER=0` before startup to run a CUDA example with V1.
 
@@ -95,9 +93,9 @@ Set `VLLM_USE_V2_MODEL_RUNNER=0` before startup to run a CUDA example with V1.
 export VLLM_USE_V2_MODEL_RUNNER=0
 ```
 
-The CUDA examples listed under V2 also select V2 for an empty value. Restart
-the process after changing the setting. The Ascend Beam examples and tiny-model
-gRPC smoke test explicitly select V1. See [ModelRunner configuration](../docs/configuration/README.md#modelrunner-selection)
+Restart the process after changing the setting. Ascend Beam examples
+explicitly select V1. See
+[ModelRunner configuration](../docs/configuration/README.md#modelrunner-selection)
 for library and CLI use.
 
 Both runners use the same Beam Search API and `gr` configuration.

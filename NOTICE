@@ -73,18 +73,10 @@ benchmarks/open_one_rec/; paths on the right are under
 benchmarks/benchmark/tasks/v1_0/ upstream:
   base_evaluator.py                     base_evaluator.py
   open_one_rec_loader.py                base_loader.py
-  tasks/item_understand/__init__.py     item_understand/__init__.py
-  tasks/item_understand/config.py       item_understand/config.py
-  tasks/item_understand/evaluator.py    item_understand/evaluator.py
-  tasks/item_understand/utils.py        item_understand/utils.py
   tasks/label_pred/__init__.py          label_pred/__init__.py
   tasks/label_pred/config.py            label_pred/config.py
   tasks/label_pred/evaluator.py         label_pred/evaluator.py
   tasks/label_pred/utils.py             label_pred/utils.py
-  tasks/rec_reason/__init__.py          rec_reason/__init__.py
-  tasks/rec_reason/config.py            rec_reason/config.py
-  tasks/rec_reason/evaluator.py         rec_reason/evaluator.py
-  tasks/rec_reason/utils.py             rec_reason/utils.py
   tasks/recommendation/__init__.py      recommendation/__init__.py
   tasks/recommendation/config.py        recommendation/config.py
   tasks/recommendation/evaluator.py     recommendation/evaluator.py
@@ -96,16 +88,7 @@ is not changed by a source header:
   benchmarks/open_one_rec/qwen3_soft_switch.jinja2
   benchmarks/open_one_rec/qwen3_soft_switch.jinja2.license
 
-The LLM-as-Judge prompts below are the upstream prompt constants moved out of
-the code into data files, each with a separate attribution file. Their text is
-unchanged; only the final space is stored as a newline and restored on load.
-Paths on the left are under benchmarks/open_one_rec/prompts/; the right column
-names the upstream constant under benchmarks/benchmark/tasks/v1_0/:
-  item_understand_wip_extraction.txt    item_understand/utils.py WIP_EXTRACTION_PROMPT
-  item_understand_wip_matching.txt      item_understand/utils.py WIP_MATCHING_PROMPT
-  rec_reason_evaluation.txt             rec_reason/utils.py EVALUATION_PROMPT
-
-These notices concern the imported code, template and prompts; they do not
+These notices concern the imported code and template; they do not
 grant rights to external evaluation datasets referenced by that code.
 
 SMG gRPC schemas and generated bindings

@@ -25,7 +25,6 @@ The offline library, HTTP and gRPC accept Beam requests.
 | --- | --- |
 | `GRLLM.beam_search()` | One logical Beam batch. |
 | HTTP `POST /v1/completions` with `use_beam_search` | One Beam batch for an eligible non-streaming prompt list when its count is in `gr.beam_batch_sizes` and capacity and request checks pass. The fallback opens independent Beam sessions for each prompt. |
-| HTTP `POST /v1/chat/completions` with `use_beam_search` | One conversation per request, submitted as a single-prompt Beam session. |
 | gRPC `VllmEngine.GenerateBatch` | One logical Beam batch. |
 
 A batch may contain several prompts. Each prompt keeps its own candidate
@@ -78,6 +77,28 @@ one token while the worker evaluates multiple beam rows for that request. The
 are legal. The [Beam state design](module/beam_state.md) explains how the CUDA
 worker preserves candidate ancestry across reordering. The
 [update design](feature/weight_update.md) covers the separate management path.
+
+## Configuration lifecycle
+
+The [configuration guide](../configuration/README.md) owns user-facing YAML,
+overrides, and defaults. GR serve and `GRLLM` resolve startup settings on the
+driver and pass a JSON-compatible snapshot in `additional_config["vllm_gr"]`
+through native EngineArgs. The `create_engine_config` hook resolves device
+policy and admits the backend plan. Workers consume the published snapshot
+rather than reloading user configuration. Management listener settings are
+owned by the gRPC frontend and excluded from the worker snapshot.
+
+Step width lists determine runtime capacities when present. A Python
+`GRConfig` can also specify pool and candidate capacities without request
+defaults: the snapshot carries `gr.beam_max_width` and
+`gr.beam_candidate_width` while preserving the absence of a step schedule.
+Conflicting capacities and schedules are rejected at construction.
+
+An unspecified constraint setting omits both constraint keys from the
+snapshot; explicit `constraint_mode: none` selects unconstrained generation.
+The driver resolves `backend: auto` before publishing table configuration.
+On CUDA, workers derive the vocabulary projection window from the loaded
+table's token IDs. Per-parent candidate counts come from `gr.candidate_width`.
 
 <a id="where-cuda-and-ascend-diverge"></a>
 

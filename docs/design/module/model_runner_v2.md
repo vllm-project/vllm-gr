@@ -5,9 +5,10 @@ retains a native request, and the worker produces one `GRWorkerResult` per
 session (batch) carrying the per-item results. The scheduler counts logical
 requests; the worker allocates the expanded Decode rows. See
 [Beam batch execution](../feature/beam_batch_execution.md) for admission,
-widths and generation limits; the [OneRec walkthrough](../../user_guide/onerec_quickstart.md)
-covers engine setup. Set `VLLM_USE_V2_MODEL_RUNNER=1` before importing vLLM to
-select V2 explicitly.
+widths and generation limits; the [constraint-table example](../../configuration/constraint_tables.md#configure-the-engine)
+covers engine setup. See
+[ModelRunner selection](../../configuration/README.md#modelrunner-selection)
+for CUDA defaults, fallback, and explicit overrides.
 
 ## Reuse of native vLLM
 
@@ -68,11 +69,9 @@ The V2 runner also has these limits:
 
 ## Configuration and limits
 
-Admission accepts one to `max_decode_steps` generation steps; the reference
-OneRec workload uses three. The V2 Prefill plan exists only for a single rank
-with no data-parallel ubatching, LoRA, speculative decoding, auxiliary hidden
-states, multimodal input or `enforce_eager`. Chunked Prefill is rejected, and
-GR enforces `ignore_eos=true` on admitted requests.
+Use the shared [Beam admission contract](../feature/beam_batch_execution.md#validation-boundaries)
+and [CUDA Prefill capture requirements](../feature/cuda_prefill_graph.md#capture-shape-selection).
+Select the runner through the [ModelRunner setting](../../configuration/README.md#modelrunner-selection).
 
 ## Validation
 

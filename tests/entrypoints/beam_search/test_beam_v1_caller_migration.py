@@ -118,12 +118,19 @@ def test_accuracy_http_forwards_template_options(
         payloads.append(kwargs["json"])
         return SimpleNamespace(
             raise_for_status=lambda: None,
-            json=lambda: {"choices": [{"message": {"content": "result"}}]},
+            json=lambda: {"choices": [{"text": "result"}]},
         )
 
     monkeypatch.setattr(benchmark.requests, "post", post)
     content = "a question with enough content to satisfy the transcript coverage guard " * 2
     prompt = f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+    messages = [{"role": "user", "content": content}]
+    renders = []
+
+    def render(source: Any, **kwargs: Any) -> str:
+        renders.append((source, kwargs))
+        return "locally rendered prompt"
+
     outputs = benchmark.run_api_inference(
         [prompt],
         "model",
@@ -132,20 +139,28 @@ def test_accuracy_http_forwards_template_options(
         {},
         max_concurrency=1,
         chat_template_kwargs=template_kwargs,
+        samples=[("sample-0", {"chat_messages": messages})],
+        tokenizer=SimpleNamespace(apply_chat_template=render),
     )
     assert outputs[0].outputs[0].text == "result"
-    assert payloads[0]["messages"] == [{"role": "user", "content": content}]
+    assert "messages" not in payloads[0]
+    assert "chat_template_kwargs" not in payloads[0]
+    assert payloads[0]["add_special_tokens"] is False
     if template_kwargs is None:
-        assert "chat_template_kwargs" not in payloads[0]
+        assert payloads[0]["prompt"] == prompt
+        assert renders == []
     else:
-        assert payloads[0]["chat_template_kwargs"] == template_kwargs
+        assert payloads[0]["prompt"] == "locally rendered prompt"
+        assert renders == [
+            (messages, {"tokenize": False, "add_generation_prompt": True, **template_kwargs})
+        ]
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
     "options,message",
     [
-        (["--endpoint", "/v1/chat/completions", "--enforce-eager"], "on the server"),
-        (["--endpoint", "/v1/chat/completions", "--chat-template-kwargs", "[]"], "JSON object"),
+        (["--endpoint", "/v1/completions", "--enforce-eager"], "on the server"),
+        (["--endpoint", "/v1/completions", "--chat-template-kwargs", "[]"], "JSON object"),
         (["--chat-template-kwargs", "{}"], "only to online"),
     ],
 )

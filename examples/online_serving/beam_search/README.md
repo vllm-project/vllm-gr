@@ -84,17 +84,17 @@ client flags configure the request. Library defaults can differ.
 
 ## Start the server
 
-CUDA defaults to ModelRunner V2. See
-[ModelRunner selection](../../README.md#choose-a-modelrunner) to override it.
+CUDA uses automatic
+[ModelRunner selection](../../README.md#choose-a-modelrunner).
 The command forces ModelRunner V1 on Ascend.
 
 ```bash
 export ONEREC_SERVED_MODEL_NAME=onerec
-onerec_runner="${VLLM_USE_V2_MODEL_RUNNER:-1}"
+runner_env=()
 if [ "$ONEREC_BACKEND" = npu ]; then
-  onerec_runner=0
+  runner_env=(VLLM_USE_V2_MODEL_RUNNER=0)
 fi
-VLLM_USE_V2_MODEL_RUNNER="$onerec_runner" vllm serve "$ONEREC_MODEL" --gr \
+env "${runner_env[@]}" vllm serve "$ONEREC_MODEL" --gr \
   --host 127.0.0.1 --port 8000 \
   --served-model-name "$ONEREC_SERVED_MODEL_NAME" \
   --config "$ONEREC_WORKDIR/vllm_gr_config.yaml" \

@@ -17,37 +17,42 @@ surface only.
 ## Command form and installation
 
 <a id="enable-gr-dispatch"></a>
+<a id="enable-vllm-gr-on-vllm-0300"></a>
 
-### Enable `vllm ... --gr` on vLLM 0.30.0
+### Enable GR dispatch
 
-The native `vllm` executable is provided by vLLM. Apply the
-[vLLM 0.30.0 CLI patch](patches/vllm-0.30.0-gr-cli.patch) to enable
-GR dispatch. With the target virtual environment active, set `gr_checkout` to
-the absolute path of this GR checkout. For a wheel installation of vLLM 0.30.0,
-run:
+Apply the [CLI dispatch patch](patches/vllm-0.30.0-gr-cli.patch) to the
+[supported vLLM installation](../getting_started/installation.md#runtime-compatibility).
+Activate the target environment and set `gr_checkout` to the absolute path of
+your vLLM-GR checkout. Use `python -m pip show vllm` to locate the installed
+package.
+
+For a wheel installation, set the patch target to the active interpreter's
+site-packages directory.
 
 ```bash
-python -m pip show vllm
-site_packages=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
-gr_cli_patch="$gr_checkout/docs/cli/patches/vllm-0.30.0-gr-cli.patch"
-patch --dry-run --forward -d "$site_packages" -p1 < "$gr_cli_patch" &&
-  patch --forward -d "$site_packages" -p1 < "$gr_cli_patch"
+patch_target=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
 ```
 
-For an editable vLLM 0.30.0 installation, use the vLLM source root in place of
-`$site_packages`. Reapply the patch after reinstalling vLLM 0.30.0, if needed.
-Commands without the GR switch continue through vLLM's normal CLI.
+For an editable installation, set `patch_target` to the vLLM source root
+shown as the editable project location. With the target set, check and apply
+the patch.
 
-!!! important "GR dispatch and forwarded options"
+```bash
+gr_cli_patch="$gr_checkout/docs/cli/patches/vllm-0.30.0-gr-cli.patch"
+patch --dry-run --forward -d "$patch_target" -p1 < "$gr_cli_patch" &&
+  patch --forward -d "$patch_target" -p1 < "$gr_cli_patch"
+```
 
-    Apply the patch in the active vLLM environment. Put `--gr` after the
-    subcommand and before the optional `--` separator. When upgrading a
-    deployment, update its launch scripts to the forms below.
+Reapply the patch if a vLLM reinstall replaces the patched files. Put
+`--gr` after the subcommand and before the optional `--` separator.
+Commands without `--gr` use the native vLLM CLI.
 
 ## Help, versions, and diagnostics
 
-On Ascend, select ModelRunner V1 with `export VLLM_USE_V2_MODEL_RUNNER=0` before
-running the serve help commands.
+GR commands use the shared [ModelRunner defaults](../configuration/README.md#modelrunner-selection).
+On Ascend NPU, remove any inherited V2 override or explicitly set
+`VLLM_USE_V2_MODEL_RUNNER=0` before running the serve help commands.
 
 ```bash
 vllm --help                                      # Native command list

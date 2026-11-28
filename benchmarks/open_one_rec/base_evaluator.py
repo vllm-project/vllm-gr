@@ -99,15 +99,6 @@ class BaseEval(ABC):
         logger.info("Computing metrics from scratch...")
         return self._compute_metrics_from_scratch()
 
-    def _require_judge_metrics(
-        self, metrics: Dict[str, Any], metric: str, count: str, minimum: float, maximum: float
-    ) -> None:
-        if not metrics.get(count):
-            raise EvaluationError(f"{self.task_name}: Judge produced zero valid scores")
-        value = metrics.get(metric)
-        if type(value) not in (int, float) or not minimum <= value <= maximum:
-            raise EvaluationError(f"{self.task_name}: missing or invalid Judge metric {metric}")
-
     @property
     def required_metrics(self) -> Optional[List[str]]:
         """Define required overall metric keys"""

@@ -143,7 +143,7 @@ def make_patched_execute_model_v2(
         if getattr(scheduler_output, "beam_data", {}):
             raise ValueError(
                 "legacy beam_data frames are not supported under ModelRunnerV2; "
-                "configure gr.beam_width or unset VLLM_USE_V2_MODEL_RUNNER"
+                "configure gr.beam_width or set VLLM_USE_V2_MODEL_RUNNER=0"
             )
 
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)

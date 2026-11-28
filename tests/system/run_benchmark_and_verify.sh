@@ -233,8 +233,6 @@ python -m vllm_gr.entrypoints.cli.main serve --gr "$MODEL_PATH" \
   --no-enable-chunked-prefill \
   --port "$run_port" \
   --seed 123 \
-  --chat-template "$SCRIPT_DIR/../../benchmarks/open_one_rec/qwen3_soft_switch.jinja2" \
-  --default-chat-template-kwargs '{"enable_thinking": false}' \
   --max-logprobs 512 \
   --max_num_seqs 2048 \
   --max_num_batched_tokens 16384 \
@@ -245,8 +243,8 @@ wait_for_server || exit 1
 echo "OneRec server is ready; running warmup."
 warmup_output=$(python -m benchmarks.open_one_rec.one_rec_main \
   bench serve \
-  --endpoint /v1/chat/completions \
-  --backend openai-chat \
+  --endpoint /v1/completions \
+  --backend openai \
   --model "$MODEL_PATH" \
   --dataset-name onerec \
   --dataset-path "$DATASET_PATH" \
@@ -266,8 +264,8 @@ fi
 
 output=$(python -m benchmarks.open_one_rec.one_rec_main \
   bench serve \
-  --endpoint /v1/chat/completions \
-  --backend openai-chat \
+  --endpoint /v1/completions \
+  --backend openai \
   --model "$MODEL_PATH" \
   --dataset-name onerec \
   --dataset-path "$DATASET_PATH" \
@@ -307,9 +305,9 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --num-prompts 100 \
   --max-concurrency 1 \
   --use-beam-search \
-  --backend openai-chat \
+  --backend openai \
   --task-type video \
-  --endpoint /v1/chat/completions \
+  --endpoint /v1/completions \
   --port "$run_port" \
   --n "$beam_width")
 online_accuracy_status=$?

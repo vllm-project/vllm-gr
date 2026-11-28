@@ -10,8 +10,8 @@ VLLM_GR_TARGET_DEVICE=cuda python -m pip install -e ".[grpc]"
 ## Check the gRPC installation
 
 Run the smoke test to exercise the local gRPC server and client on CUDA. It
-creates a tiny random Llama locally and uses ModelRunner V1. You can run it
-before downloading OneRec or preparing a catalog.
+creates a local test checkpoint, so you can run it before downloading OneRec
+or preparing a catalog.
 
 ```bash
 python examples/online_serving/grpc/run_smoke.py --output results/grpc-smoke
@@ -45,12 +45,12 @@ The values below apply to that configuration. Library defaults can differ.
 
 ### Start the server
 
-CUDA defaults to ModelRunner V2. See
-[ModelRunner selection](../../README.md#choose-a-modelrunner) to select V1.
+CUDA uses automatic
+[ModelRunner selection](../../README.md#choose-a-modelrunner).
 
 ```bash
 export ONEREC_SERVED_MODEL_NAME=onerec
-VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}" vllm serve "$ONEREC_MODEL" --gr \
+vllm serve "$ONEREC_MODEL" --gr \
   --grpc --host 127.0.0.1 --port 50051 \
   --served-model-name "$ONEREC_SERVED_MODEL_NAME" \
   --config "$ONEREC_WORKDIR/vllm_gr_config.yaml" \

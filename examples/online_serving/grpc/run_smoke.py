@@ -34,7 +34,7 @@ def main():
         port = reservation.getsockname()[1]
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
-    env.update(VLLM_USE_V2_MODEL_RUNNER="0", HF_HUB_OFFLINE="1")
+    env["HF_HUB_OFFLINE"] = "1"
     command = [
         sys.executable,
         "-m",

@@ -1,9 +1,12 @@
 # Paths are relative to docs/. A page entry redirects the whole old path.
 # Without page, only the listed sections redirect and the source page stays live.
-api/README.md:
-  page: examples/README.md
+serving/completions.md:
   sections:
-    examples/README.md#offline-inference: [python-entrypoint]
+    serving/completions.md#model-prompt-templates: [chat-completions]
+api/README.md:
+  page: user_guide/README.md
+  sections:
+    getting_started/quickstart.md#offline-inference: [python-entrypoint]
     design/feature/beam_batch_execution.md#validation-boundaries: [contract-reference]
     design/feature/async_scheduling.md#completion-and-cancellation: [batches-failures-and-cancellation]
 community/README.md:
@@ -53,10 +56,11 @@ design/main-arch.md:
     design/index.md#feature-design: [feature-map]
     design/module/platform_backend.md: [platform-backend-contract, scope]
     design/module/platform_backend.md#engine-plans: [lifecycle-and-process-model, engine-plans-and-service-binding]
-    design/module/platform_backend.md#registration-and-activation: [platform-identity-and-deterministic-selection, external-provider-entry-points, current-built-in-mappings]
+    design/module/platform_backend.md#registration-and-activation: [platform-identity-and-deterministic-selection, external-provider-entry-points,
+      current-built-in-mappings]
     design/module/platform_backend.md#plugin-startup: [lazy-import-boundary]
     design/module/platform_backend.md#provider-contract: [provider-contract, provider-api-versions, regression-after-removing-the-built-in-npu-provider]
-    design/module/runtime_patches.md: [modelrunner-patch-hooks]
+    design/runtime_patch_inventory.md#activation-and-maintenance: [modelrunner-patch-hooks]
     design/index.md#decode-attention: [beam-attention-execution]
 features/README.md:
   page: user_guide/feature_compatibility.md
@@ -77,7 +81,7 @@ features/attention.md:
     design/feature/npu_prefill_bsnd.md#replay-and-fallback: [execution-and-fallback]
     design/feature/npu_prefill_bsnd.md#validation: [validation]
     design/feature/npu_decode_execution.md#caller-owned-xattention-output: [npu-xattention-output-binding, supported-path-and-fallback]
-    user_guide/beam_search_npu.md#optional-xattention-output-binding: [requirements, build, validate-the-binding]
+    design/feature/npu_decode_execution.md#optional-xattention-output-binding: [requirements, build, validate-the-binding]
 features/beam-search.md:
   page: design/feature/beam_batch_execution.md
   sections:
@@ -126,10 +130,11 @@ features/hot-update.md:
     design/feature/weight_update.md#online-catalog-replacement: [trie-task]
     design/feature/weight_update.md#validation: [validation, validation-entrypoints, unit-and-component-coverage, related-regression-boundaries]
 features/unconstrained-beam-search.md:
-  page: user_guide/beam_search_npu.md
+  page: configuration/README.md
   sections:
-    user_guide/beam_search_npu.md#configuration-and-python-entry-point: [configuration, optional-sid-token-family-restriction]
-    user_guide/beam_search_npu.md#supported-execution-boundaries: [candidate-and-score-semantics, execution-support]
+    configuration/README.md#ascend-npu-execution-limits: ['', configuration, execution-support]
+    configuration/README.md#sid-token-families-without-a-catalog: [optional-sid-token-family-restriction]
+    design/feature/npu_decode_execution.md#candidate-selection: [candidate-and-score-semantics]
     design/feature/npu_decode_execution.md#validation: [validation-entrypoints]
 getting_started/first-inference.md:
   page: getting_started/quickstart.md
@@ -152,7 +157,7 @@ getting_started/troubleshooting.md:
   sections:
     cli/check_env.md#output-and-exit-status: [collect-useful-evidence]
 models/README.md:
-  page: models/supported_models.md
+  page: user_guide/README.md
   sections:
     getting_started/quickstart.md#offline-inference: [prepare-a-reproducible-snapshot, validate-the-workload-you-will-deploy]
 usage/README.md:
@@ -167,8 +172,8 @@ usage/benchmarks/README.md:
 usage/benchmarks/accuracy.md:
   page: benchmarking/accuracy.md
   sections:
-    benchmarking/common.md#prerequisites: [prerequisites]
-    benchmarking/common.md#online-server-mode: [terminal-1-prepare-the-full-catalog-and-start-the-server]
+    benchmarking/README.md#prerequisites: [prerequisites]
+    benchmarking/README.md#online-server-mode: [terminal-1-prepare-the-full-catalog-and-start-the-server]
     benchmarking/accuracy.md#offline-evaluation: [running-the-benchmark, 1-offline-accuracy-mode-simple-local]
     benchmarking/accuracy.md#online-serving: [terminal-2-run-the-accuracy-benchmark-against-the-server]
     benchmarking/accuracy.md#command-line-arguments: [usage]
@@ -189,7 +194,7 @@ usage/benchmarks/parent_score_gate.md:
 usage/benchmarks/throughput.md:
   page: benchmarking/throughput.md
   sections:
-    benchmarking/common.md#prerequisites: [prerequisites]
+    benchmarking/README.md#prerequisites: [prerequisites]
     benchmarking/throughput.md#offline-measurements: [running-the-benchmark, 1-offline-throughput-mode-simple-local]
     benchmarking/throughput.md#run-the-http-client: [terminal-2-run-the-throughput-benchmark-against-the-server]
     benchmarking/throughput.md#command-line-arguments: [usage]
@@ -199,8 +204,6 @@ usage/benchmarks/throughput.md:
     benchmarking/throughput.md#beam-options: [beam-search-parameters-optional]
     benchmarking/throughput.md#online-options: [arguments-for-online-benchmark]
     benchmarking/throughput.md#example-output: [expected-output]
-
-# Old headings on pages that kept their URLs.
 README.md:
   sections:
     README.md#about: [generative-recommendation-with-vllm-gr, what-vllm-gr-adds]
@@ -215,10 +218,10 @@ cli/README.md:
     cli/bench.md#workloads: [benchmarks]
     cli/bench.md#offline-ab: [offline-ab]
     cli/bench.md#command-syntax: [example-benchmark-invocations]
-    cli/bench/open_one_rec.md: [onerec-additions]
-    cli/bench/beam_performance.md: [beam-performance, beam-performance-ab-report]
-    cli/bench/beam_recall.md: [beam-recall]
-    cli/bench/qwen_v1.md: [qwen-v1]
+    benchmarking/throughput.md: [onerec-additions]
+    benchmarking/throughput.md#controlled-beam-latency: [beam-performance, beam-performance-ab-report]
+    benchmarking/accuracy.md#cuda-recall-runner: [beam-recall]
+    cli/bench.md#qwen-beam: [qwen-v1]
 configuration/README.md:
   sections:
     configuration/README.md#load-and-override-a-configuration: [related-guides]
@@ -240,28 +243,35 @@ design/index.md:
 design/runtime_patch_inventory.md:
   sections:
     design/runtime_patch_inventory.md#active-patches: [runtime-patch-and-upstream-dependency-inventory, risk-levels]
+    design/runtime_patch_inventory.md#gr-patch-011-cuda-modelrunner-v1v2-overrides: [gr-patch-011-gpu-modelrunner-v1v2-overrides]
     contributing/dependency_policy.md#runtime-compatibility-and-package-versions: [supported-runtime]
-    design/module/runtime_patches.md: [benchmark-only-runtime-mutations, shared-implicit-contracts, dynamic-attributes, maintenance-rules]
+    design/runtime_patch_inventory.md#activation-and-maintenance: [benchmark-only-runtime-mutations, shared-implicit-contracts,
+      dynamic-attributes, maintenance-rules]
     configuration/README.md#load-and-override-a-configuration: [configuration-keys]
 examples/README.md:
   sections:
-    examples/README.md#offline-inference: [choose-the-right-evidence]
+    getting_started/quickstart.md#offline-inference: [choose-the-right-evidence, offline-inference]
+    user_guide/README.md: ['', examples]
+    serving/README.md: [online-serving]
+  page: user_guide/README.md
 getting_started/README.md:
+  page: getting_started/quickstart.md
   sections:
-    getting_started/installation/README.md#supported-hardware: [choose-your-runtime]
-    getting_started/quickstart.md#offline-inference: [your-first-successful-run]
+    getting_started/installation.md#supported-hardware: [choose-your-runtime]
+    getting_started/quickstart.md#offline-inference: [your-first-successful-run, install-and-run-onerec]
     configuration/README.md#load-and-override-a-configuration: [before-changing-settings]
 getting_started/quickstart.md:
   sections:
-    user_guide/onerec_quickstart.md: [onerec-17b-v1-asynchronous-scheduling-quickstart-cuda]
-    user_guide/onerec_quickstart.md#1-check-the-environment: [1-check-the-environment]
-    user_guide/onerec_quickstart.md#2-prepare-the-constraint-table-inputs: [2-build-the-v1-constraint-table-inputs]
-    user_guide/onerec_quickstart.md#3-run-offline-beam-search: [3-run-the-minimal-v1-reproduction]
-    user_guide/onerec_quickstart.md#4-why-these-values-are-fixed: [4-why-these-values-are-fixed]
-    user_guide/onerec_quickstart.md#batching-several-prompts-in-one-http-request: [batching-several-prompts-in-one-http-request]
-    user_guide/onerec_quickstart.md#ownership: [ownership]
-    user_guide/onerec_quickstart.md#5-validate-and-troubleshoot: [5-validate-and-troubleshoot]
-    user_guide/onerec_quickstart.md#see-also: [further-reading]
+    getting_started/quickstart.md#choose-a-model-and-install: [prerequisites]
+    configuration/constraint_tables.md: [onerec-17b-v1-asynchronous-scheduling-quickstart-cuda]
+    getting_started/quickstart.md#download-onerec: [1-check-the-environment]
+    configuration/constraint_tables.md#build: [2-build-the-v1-constraint-table-inputs]
+    configuration/constraint_tables.md#python: [3-run-the-minimal-v1-reproduction]
+    configuration/README.md#beam-settings: [4-why-these-values-are-fixed]
+    serving/completions.md#batching-several-prompts-in-one-http-request: [batching-several-prompts-in-one-http-request]
+    design/feature/beam_batch_execution.md: [ownership]
+    configuration/constraint_tables.md#validate-and-troubleshoot: [5-validate-and-troubleshoot]
+    models/onerec.md: [further-reading]
 serving/README.md:
   sections:
     serving/README.md#choose-an-endpoint: [serving-binary-transport-and-metrics, choose-an-interface]
@@ -269,12 +279,107 @@ serving/README.md:
     serving/grpc.md#token-inputs: [inputs-and-request-lifecycle]
     serving/grpc.md#start-the-server: [usage-and-tests]
     serving/grpc.md#binary-beam-results: [binary-beam-results]
-    serving/replica_deployment.md: [independent-replicas-and-load-balancing]
-    serving/replica_deployment.md#start-two-replicas: [start-two-replicas]
-    serving/replica_deployment.md#configure-nginx: [configure-nginx]
-    serving/replica_deployment.md#install-nginx: [install-nginx]
-    serving/replica_deployment.md#configure-the-upstream: [configure-the-upstream]
-    serving/replica_deployment.md#test-the-proxy: [test-the-proxy]
-    serving/metrics.md#read-prometheus-metrics: [beam-metrics]
-    serving/metrics.md#measure-beam-latency: [current-v1-measurements]
-    serving/metrics.md#benchmark-compatibility-with-older-servers: [benchmark-compatibility-with-older-servers]
+    serving/README.md#independent-http-replicas: [independent-replicas-and-load-balancing, start-two-replicas, configure-nginx,
+      install-nginx, configure-the-upstream, test-the-proxy]
+    serving/README.md#read-prometheus-metrics: [beam-metrics]
+    benchmarking/throughput.md#controlled-beam-latency: [current-v1-measurements]
+    benchmarking/throughput.md#benchmark-compatibility-with-older-servers: [benchmark-compatibility-with-older-servers]
+serving/metrics.md:
+  page: serving/README.md
+  sections:
+    serving/README.md#read-prometheus-metrics: ['', serving-metrics, read-prometheus-metrics]
+    benchmarking/throughput.md#controlled-beam-latency: [measure-beam-latency]
+    benchmarking/throughput.md#benchmark-compatibility-with-older-servers: [benchmark-compatibility-with-older-servers]
+user_guide/onerec_quickstart.md:
+  page: configuration/constraint_tables.md
+  sections:
+    configuration/constraint_tables.md: ['', catalog-constrained-onerec-on-cuda]
+    getting_started/quickstart.md#download-onerec: [1-check-the-environment]
+    configuration/constraint_tables.md#build: [2-prepare-the-constraint-table-inputs]
+    configuration/constraint_tables.md#python: [3-run-offline-beam-search]
+    configuration/README.md#beam-settings: [4-why-these-values-are-fixed]
+    serving/completions.md#batching-several-prompts-in-one-http-request: [batching-several-prompts-in-one-http-request]
+    design/feature/beam_batch_execution.md: [ownership]
+    configuration/constraint_tables.md#validate-and-troubleshoot: [5-validate-and-troubleshoot]
+    models/onerec.md: [further-reading, see-also]
+serving/replica_deployment.md:
+  page: serving/README.md
+  sections:
+    serving/README.md#independent-http-replicas: ['', scaling-beam-serving-with-nginx, prerequisites, start-two-replicas,
+      configure-nginx, install-nginx, configure-the-upstream, test-the-proxy, independent-http-replicas]
+benchmarking/common.md:
+  page: benchmarking/README.md
+  sections:
+    benchmarking/README.md#setup: ['', common-benchmark-setup]
+    benchmarking/README.md#prerequisites: [prerequisites]
+    benchmarking/README.md#prepare-the-catalog: [prepare-the-catalog]
+    benchmarking/README.md#online-server-mode: [online-server-mode]
+cli/bench/open_one_rec.md:
+  page: benchmarking/throughput.md
+  sections:
+    benchmarking/throughput.md: ['', onerec-workloads]
+    benchmarking/throughput.md#cuda-dataset-throughput: [offline-throughput, example]
+    benchmarking/throughput.md#beam-options: [arguments]
+    benchmarking/throughput.md#online-serving: [online-serving]
+cli/bench/beam_performance.md:
+  page: benchmarking/throughput.md
+  sections:
+    benchmarking/throughput.md#controlled-beam-latency: ['', beam-performance, usage, beam-performance-arguments, measure-a-workload,
+      prepare-inputs-and-record-the-offline-baseline, start-the-http-server, replay-the-requests-online]
+cli/bench/beam_recall.md:
+  page: benchmarking/accuracy.md
+  sections:
+    benchmarking/accuracy.md#cuda-recall-runner: ['', beam-recall, usage, arguments, example]
+cli/bench/qwen_v1.md:
+  page: cli/bench.md
+  sections:
+    cli/bench.md#qwen-beam: ['', qwen-v1, qwen-beam-benchmark, arguments, example]
+design/module/runtime_patches.md:
+  page: design/runtime_patch_inventory.md
+  sections:
+    design/runtime_patch_inventory.md#activation-and-maintenance: ['', runtime-patch-activation, runtime-patches-and-upstream-dependencies]
+    design/runtime_patch_inventory.md#maintaining-a-patch: [maintaining-a-patch, maintenance-rules]
+    design/runtime_patch_inventory.md#gr-patch-000-runtime-plugin-activation: [gr-patch-000-runtime-plugin-activation]
+    design/runtime_patch_inventory.md#gr-patch-001-custom-attention-selector-compatibility: [gr-patch-001-custom-attention-selector-compatibility]
+    design/runtime_patch_inventory.md#gr-patch-002-npuworker-initialization-hook: [gr-patch-002-npuworker-initialization-hook]
+    design/runtime_patch_inventory.md#gr-patch-003-flatlogprobs-fast-append-override: [gr-patch-003-flatlogprobs-fast-append-override]
+    design/runtime_patch_inventory.md#gr-patch-004-openai-beam-serving-override: [gr-patch-004-openai-beam-serving-override]
+    design/runtime_patch_inventory.md#gr-patch-005-engineargs-configuration-override: [gr-patch-005-engineargs-configuration-override]
+    design/runtime_patch_inventory.md#gr-patch-007-enginecore-client-and-asyncllm-extensions: [gr-patch-007-enginecore-client-and-asyncllm-extensions]
+    design/runtime_patch_inventory.md#gr-patch-008-enginecorerequesttype-extension: [gr-patch-008-enginecorerequesttype-extension]
+    design/runtime_patch_inventory.md#gr-patch-009-enginecore-lifecycle-and-socket-processing: [gr-patch-009-enginecore-lifecycle-and-socket-processing]
+    design/runtime_patch_inventory.md#gr-patch-010-scheduler-beam-override: [gr-patch-010-scheduler-beam-override]
+    design/runtime_patch_inventory.md#gr-patch-022-prefix-cache-hash-memoization: [gr-patch-022-prefix-cache-hash-memoization]
+    design/runtime_patch_inventory.md#gr-patch-011-cuda-modelrunner-v1v2-overrides: [gr-patch-011-gpu-modelrunner-v1v2-overrides]
+    design/runtime_patch_inventory.md#gr-patch-012-npu-modelrunner-override: [gr-patch-012-npu-modelrunner-override]
+    design/runtime_patch_inventory.md#gr-patch-013-custom-attention-backend-registration: [gr-patch-013-custom-attention-backend-registration]
+    design/runtime_patch_inventory.md#gr-patch-015-sliced-vocabulary-projection: [gr-patch-015-sliced-vocabulary-projection]
+    design/runtime_patch_inventory.md#gr-patch-016-npu-aware-spawn-start-method: [gr-patch-016-npu-aware-spawn-start-method]
+    design/runtime_patch_inventory.md#gr-patch-018-ascend-penalties-warmup-oom-guard: [gr-patch-018-ascend-penalties-warmup-oom-guard]
+    design/runtime_patch_inventory.md#gr-patch-019-ascend-additional_config-sanitizer: [gr-patch-019-ascend-additional_config-sanitizer]
+    design/runtime_patch_inventory.md#gr-patch-021-contiguous-beam-prefix-kv: [gr-patch-021-contiguous-beam-prefix-kv]
+    design/runtime_patch_inventory.md#retired-patches: [retired-patches]
+models/supported_models.md:
+  page: user_guide/README.md
+  sections:
+    user_guide/README.md#models: ['', supported-models, model-list]
+    models/onerec.md: [onerec-recommendation]
+    getting_started/quickstart.md#choose-a-model-and-install: [download-the-model]
+    serving/README.md: [online-serving]
+benchmarking/throughput.md:
+  sections:
+    benchmarking/throughput.md#controlled-beam-latency: [cpu-simd-and-latency, historical-http-and-grpc-comparison]
+serving/grpc.md:
+  sections:
+    benchmarking/throughput.md#controlled-beam-latency: [historical-http-and-grpc-comparison]
+user_guide/beam_search_npu.md:
+  page: configuration/README.md
+  sections:
+    getting_started/quickstart.md#ascend: [set-up-the-environment, run-the-example]
+    configuration/README.md#ascend-npu-execution-limits: ['', unconstrained-beam-search-on-ascend-npu, unconstrained-beam-search-on-ascend, unconstrained-beam-search-v1-on-npu, configuration-and-python-entry-point, supported-execution-boundaries, batch-and-width]
+    configuration/README.md#full-vocabulary-generation: [generation-length]
+    configuration/README.md#sid-token-families-without-a-catalog: [catalog-free-sasbsc-generation]
+    design/feature/npu_decode_execution.md#candidate-selection: [candidate-scores]
+    design/feature/npu_decode_execution.md#decode-graph-capture: [graph-replay]
+    design/feature/npu_decode_execution.md#validation: [version-and-validation-scope]
+    design/feature/npu_decode_execution.md#optional-xattention-output-binding: [optional-xattention-output-binding]

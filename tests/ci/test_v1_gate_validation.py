@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -114,6 +115,89 @@ def test_recall_shell_checks_baseline_before_data(tmp_path: Path, kind: str) -> 
     else:
         assert f"Missing OneRec accuracy input: {data.as_posix()}/sid2pid.json" in completed.stderr
     assert not output.exists()
+
+
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("inherited_runner", [None, "0", "1"])  # type: ignore[misc]
+@pytest.mark.parametrize("startup_hook", [False, True])  # type: ignore[misc]
+def test_recall_shell_pins_calibrated_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inherited_runner: str | None,
+    startup_hook: bool,
+) -> None:
+    bash = os.environ.get("TEST_BASH") or shutil.which("bash")
+    if bash is None:
+        raise pytest.skip.Exception("Bash is required to test the Recall launcher")
+
+    dataset = tmp_path / "data"
+    dataset.mkdir()
+    for name in ("sid2pid.json", "sid2iid.json"):
+        (dataset / name).write_text("{}", encoding="utf-8")
+    model = tmp_path / "model"
+    model.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls.tsv"
+    # Exercise the actual shell launcher, replacing only external probes and
+    # inference. Shell-only stubs avoid Python site hooks and real Git/GPU probes.
+    stubs = {
+        "python": (
+            '[ "$1" = -m ] || exit 64\n'
+            "printf '%s\\t%s\\t%s\\n' \"$2\" "
+            '"${VLLM_USE_V2_MODEL_RUNNER-unset}" '
+            '"${VLLM_ENABLE_V1_MULTIPROCESSING-unset}" '
+            f">> {shlex.quote(str(calls))}\n"
+        ),
+        "git": '[ "$*" = "rev-parse HEAD" ] || exit 64\nprintf "%040d\\n" 0\n',
+        "nvidia-smi": "exit 0\n",
+    }
+    for name, body in stubs.items():
+        stub = bin_dir / name
+        stub.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        stub.chmod(0o755)
+    if startup_hook:
+        hook = tmp_path / "shell-startup.sh"
+        hook.write_text("exit 97\n", encoding="utf-8")
+        monkeypatch.setenv("BASH_ENV", str(hook))
+        monkeypatch.setenv("ENV", str(hook))
+    env = {
+        **os.environ,
+        "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        "V1_RECALL_BASELINE_FILE": "",
+        "V1_RECALL_DATASET_PATH": str(dataset),
+        "V1_RECALL_OUTPUT_DIR": str(tmp_path / "output"),
+        "V1_RECALL_TRIPLES_PATH": str(dataset / "sid2pid.json"),
+        "V1_RECALL_TRIPLES_IID_PATH": str(dataset / "sid2iid.json"),
+        "V1_RECALL_REPEATS": "1",
+        "V1_RECALL_DIAGNOSTICS": "0",
+        "VLLM_GR_TEST_MODEL": str(model),
+    }
+    # A CI shell startup script may be slow or replace the stub PATH entirely.
+    for name in ("BASH_ENV", "ENV"):
+        env.pop(name, None)
+    if inherited_runner is None:
+        env.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+    else:
+        env["VLLM_USE_V2_MODEL_RUNNER"] = inherited_runner
+    completed = subprocess.run(
+        [bash, str(REPO_ROOT / "tests/system/run_beam_v1_recall.sh")],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    invocations = [line.split("\t") for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert [call[0] for call in invocations] == [
+        "benchmarks.beam_search.measure_onerec_recall",
+        "benchmarks.beam_search.measure_onerec_recall",
+        "benchmarks.beam_search.compare_recall_baseline",
+    ]
+    assert all(call[1:] == ["0", "0"] for call in invocations[:2])
+    assert invocations[-1][1] == (inherited_runner or "unset")
 
 
 @pytest.mark.l1  # type: ignore[misc]

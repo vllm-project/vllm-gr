@@ -1,6 +1,7 @@
 # Authoritative patch ownership inventory. Independent core/provider assertions
-# are checked against it; see docs/design/module/runtime_patches.md for the
-# rationale and docs/design/runtime_patch_inventory.md for the checked index.
+# are checked against it. See docs/design/runtime_patch_inventory.md for the
+# human-readable index and rationale, and vllm_gr/platforms/compat.py for the
+# runtime pins enforced at startup.
 schema_version: 3
 
 pre_upgrade_baseline:

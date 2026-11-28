@@ -93,7 +93,7 @@ windows, ALiBi, softcap or sinks. See the
 
 ## Performance
 
-Measure with the [Beam performance workload](../../cli/bench/beam_performance.md).
+Measure with the [Beam performance workload](../../benchmarking/throughput.md#controlled-beam-latency).
 Keep the model, prompt, batch size, beam width and Prefill mode fixed across
 runs, and record the revision, device, model dtype, runner, decode length,
 warmup count and measured runs with the results. An earlier revision of this

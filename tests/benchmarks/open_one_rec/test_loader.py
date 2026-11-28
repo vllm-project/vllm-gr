@@ -19,6 +19,13 @@ from benchmarks.open_one_rec.open_one_rec_loader import (
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
 
+def test_registered_tasks_match_downloadable_recommendation_tasks() -> None:
+    from tools.AB_Tests.download_onerec_dataset import TASK_FILES
+
+    expected = {"ad", "product", "label_cond", "video", "interactive", "label_pred"}
+    assert set(TASK_REGISTRY) == set(TASK_FILES) == expected
+
+
 @pytest.fixture  # type: ignore[misc]
 def video_parquet(tmp_path: Path) -> tuple[Path, pd.DataFrame, DataLoaderWrapper]:
     source = tmp_path / "video" / "video_test.parquet"

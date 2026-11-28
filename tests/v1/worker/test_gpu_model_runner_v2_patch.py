@@ -173,22 +173,31 @@ def test_sample_tokens_v2_stage_bypass() -> None:
     assert wrapped(runner, None) is sampled
 
 
-def test_configure_model_runner_default_normalizes_opt_in(
+def test_configure_model_runner_default_normalizes_overrides(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     from vllm_gr.engine.startup import configure_model_runner_default
 
-    for value in (None, "0", "false", "no", "off", "1", "true", "yes", "on"):
+    monkeypatch.setattr(
+        "vllm_gr.platforms.identity.current_platform_identity",
+        lambda: SimpleNamespace(platform_enum="CUDA", device_type="cuda"),
+    )
+    for value in (None, "", "0", "false", "no", "off", "1", "true", "yes", "on", " TRUE "):
         caplog.clear()
         if value is None:
             monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
         else:
             monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", value)
-        enabled = value in ("1", "true", "yes", "on")
+        enabled = value in ("1", "true", "yes", "on", " TRUE ")
         with caplog.at_level(logging.WARNING):
             configure_model_runner_default()
-        assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == str(int(enabled))
-        assert ("experimental" in caplog.text) is enabled
+        expected = None if value is None else str(int(enabled))
+        assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == expected
+        assert "experimental" not in caplog.text
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "invalid")
+    configure_model_runner_default()
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "invalid"
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]

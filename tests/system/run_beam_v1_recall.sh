@@ -72,7 +72,8 @@ run_group() {
   mkdir -p "$group_dir"
   echo "Running $group: tasks=$*, B=4, 1000 samples/task, beam width 128"
   local group_start=$SECONDS
-  VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+  # Match the calibrated runner even when the application or parent defaults to V2.
+  VLLM_USE_V2_MODEL_RUNNER=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
     python -m benchmarks.beam_search.measure_onerec_recall \
       --model "$model_path" \
       "${model_revision_args[@]}" \

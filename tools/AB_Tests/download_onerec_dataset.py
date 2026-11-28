@@ -27,11 +27,9 @@ MANIFEST_SCHEMA = "vllm-gr.dataset.v1"
 TASK_FILES = {
     "ad": "benchmark_data/ad/ad_test.parquet",
     "interactive": "benchmark_data/interactive/interactive_test.parquet",
-    "item_understand": "benchmark_data/item_understand/item_understand_test.parquet",
     "label_cond": "benchmark_data/label_cond/label_cond_test.parquet",
     "label_pred": "benchmark_data/label_pred/label_pred_test.parquet",
     "product": "benchmark_data/product/product_test.parquet",
-    "rec_reason": "benchmark_data/rec_reason/rec_reason_test.parquet",
     "video": "benchmark_data/video/video_test.parquet",
 }
 

@@ -23,12 +23,8 @@ from typing import Any, Dict, Optional, Type
 
 import pandas as pd
 
-from .tasks.item_understand.config import ITEM_UNDERSTAND_CONFIG
-from .tasks.item_understand.evaluator import ItemUnderstandEvaluator
 from .tasks.label_pred import LabelPredEvaluator
 from .tasks.label_pred.config import LABEL_PRED_CONFIG
-from .tasks.rec_reason.config import REC_REASON_CONFIG
-from .tasks.rec_reason.evaluator import RecoReasonEvaluator
 from .tasks.recommendation.config import (
     AD_CONFIG,
     INTERACTIVE_CONFIG,
@@ -50,7 +46,7 @@ class TaskRegistration:
     name: str
     config: Dict[str, Any]
     evaluator_class: Type
-    category: str  # "general", "recommendation", "caption"
+    category: str
 
 
 # ========================================
@@ -93,18 +89,6 @@ TASK_REGISTRY: Dict[str, TaskRegistration] = {
         config=LABEL_PRED_CONFIG,
         evaluator_class=LabelPredEvaluator,
         category="recommendation",
-    ),
-    "item_understand": TaskRegistration(
-        name="item_understand",
-        config=ITEM_UNDERSTAND_CONFIG,
-        evaluator_class=ItemUnderstandEvaluator,
-        category="caption",
-    ),
-    "rec_reason": TaskRegistration(
-        name="rec_reason",
-        config=REC_REASON_CONFIG,
-        evaluator_class=RecoReasonEvaluator,
-        category="caption",
     ),
 }
 
