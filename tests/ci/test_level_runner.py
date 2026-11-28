@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import yaml
+from _pytest.mark.expression import Expression
 
 from tests.helpers.paths import REPO_ROOT
 from tools.ci.inproc_test_selection import pytest_collection_modifyitems
@@ -108,6 +111,78 @@ class TestLevelRunner(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("multiproc=unset", calls[0])
         self.assertIn("arg=l1 or l2", calls[0])
+
+    def test_buildkite_covers_all_ready_and_merge_levels(self) -> None:
+        # Exercise the configured runner, rather than duplicating its marker logic.
+        # CPU+accelerator marks must stay in the accelerator lane.
+        platforms = [
+            {"cpu_test"},
+            {"gpu_test"},
+            {"npu_test"},
+            {"gpu_test", "npu_test"},
+            {"cpu_test", "gpu_test"},
+            {"cpu_test", "npu_test"},
+        ]
+        for phase in ("ready", "merge"):
+            expressions = []
+            for device in ("cuda", "npu"):
+                pipeline = yaml.safe_load(
+                    (ROOT / f".buildkite/test-{device}-{phase}.yml").read_text()
+                )
+                for step in pipeline["steps"]:
+                    args = shlex.split(step["command"])
+                    if args[0] == "pytest":
+                        self.assertEqual(args[-1], "tests")
+                        self.assertIn("--run-slow", args)
+                        self.assertIn("--strict-test-levels", args)
+                        expressions.append(args[args.index("-m") + 1])
+                        continue
+                    index = args.index("tools/ci/run_test_level.sh")
+                    level = args[index + 1]
+                    self.assertEqual(level, "pr" if phase == "ready" else "l3")
+                    self.assertFalse(any(arg.startswith("tests/") for arg in args))
+                    self.assertFalse(any(arg.startswith("--ignore") for arg in args))
+                    (self.directory / "calls.log").unlink(missing_ok=True)
+                    env = step["env"]
+                    migration_flag = (
+                        "VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS"
+                        if device == "cuda"
+                        else "VLLM_GR_EXCLUDE_MIGRATED_NPU_TESTS"
+                    )
+                    self.assertEqual(env.get(migration_flag, "0"), "0")
+                    with patch.dict(os.environ, env):
+                        result, calls = self.run_level(
+                            level,
+                            smoke=env.get("VLLM_GR_RUN_MODEL_SMOKE") == "1",
+                            device=env["VLLM_GR_TARGET_DEVICE"],
+                        )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    if device == "cuda":
+                        self.assertEqual(len(calls), 2)
+                        self.assertIn("selection=exclude", calls[0])
+                        self.assertIn("selection=include", calls[1])
+                    for call in calls:
+                        lines = call.splitlines()
+                        self.assertIn("arg=tests", lines)
+                        self.assertIn("arg=--run-slow", lines)
+                        self.assertIn("arg=--strict-test-levels", lines)
+                        marker_index = max(i for i, line in enumerate(lines) if line == "arg=-m")
+                        expressions.append(lines[marker_index + 1][4:])
+            for level in range(1, 6):
+                for platform in platforms:
+                    marks = {f"l{level}", *platform}
+                    selected = any(
+                        Expression.compile(expr).evaluate(marks.__contains__)
+                        for expr in expressions
+                    )
+                    cpu_only = platform == {"cpu_test"}
+                    expected = (
+                        level in (1, 2)
+                        if phase == "ready"
+                        else (level == 3 or (level == 1 and cpu_only))
+                    )
+                    with self.subTest(phase=phase, marks=marks):
+                        self.assertEqual(selected, expected)
 
     def test_platform_selection_combines_levels_and_device_markers(self) -> None:
         sample = self.directory / "test_matrix.py"
@@ -220,7 +295,9 @@ class TestLevelRunner(unittest.TestCase):
             items = source.copy()
             removed = []
             config = SimpleNamespace(
-                hook=SimpleNamespace(pytest_deselected=lambda *, items: removed.extend(items))
+                hook=SimpleNamespace(
+                    pytest_deselected=lambda *, items, removed=removed: removed.extend(items)
+                )
             )
             with patch.dict(os.environ, VLLM_GR_INPROC_TEST_SELECTION=selection):
                 pytest_collection_modifyitems(config, items)

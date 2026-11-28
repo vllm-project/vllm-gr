@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
+# Select by level and platform across every test directory.
 steps:
-  - label: "NPU E2E Test"
-    key: l3-npu-e2e
+  - label: "NPU L3 tests"
+    key: merge-npu-tests
     depends_on: upload-npu-merge-pipeline
-    timeout_in_minutes: 90
+    timeout_in_minutes: 180
     mirror_hardwares: a2b3_npu_1
-    command: >-
-      pytest
-      --run-slow --strict-test-levels --durations=10 -sv -m 'l3 and npu_test'
-      tests/e2e
+    env:
+      VLLM_GR_TARGET_DEVICE: npu
+      VLLM_GR_EXCLUDE_CPU_TESTS: "1"
+      VLLM_GR_EXCLUDE_MIGRATED_NPU_TESTS: "0"
+    command: bash tools/ci/run_test_level.sh l3

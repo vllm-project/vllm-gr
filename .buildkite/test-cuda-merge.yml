@@ -1,59 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
+# Sweep the suite so new directories and CPU integration tests cannot be omitted.
 steps:
-  - label: "Unit tests"
+  - label: "CPU L1/L3 tests"
     key: merge-unit-tests
     depends_on: upload-merge-pipeline
-    timeout_in_minutes: 25
+    timeout_in_minutes: 45
     mirror_hardwares: l4_1
     command: >-
-      pytest
-      -n 4 --durations=10 -sv
-      -m '(l1) and (cpu_test and not gpu_test and not npu_test)' tests
+      pytest -n 4 --run-slow --strict-test-levels --durations=10 -sv
+      -m '(l1 or l3) and (cpu_test and not gpu_test and not npu_test)' tests
 
-  - label: "Kernels Test"
-    key: l3-gpu-kernels
+  - label: "CUDA L3 tests"
+    key: merge-cuda-tests
     depends_on: upload-merge-pipeline
-    timeout_in_minutes: 35
+    timeout_in_minutes: 180
     mirror_hardwares: l4_1
+    env:
+      VLLM_GR_TARGET_DEVICE: cuda
+      VLLM_GR_EXCLUDE_CPU_TESTS: "1"
+      VLLM_GR_EXCLUDE_MIGRATED_GPU_TESTS: "0"
+      VLLM_GR_RUN_MODEL_SMOKE: "1"
+      PYTHONPATH: "."
+      PYTEST_DEBUG_TEMPROOT: "results/merge-cuda"
     command: >-
-      pytest
-      --durations=10 -sv -m 'l3 and gpu_test'
-      tests/kernels
-
-  - group: "E2E Test"
-    key: l3-gpu-system
-    steps:
-      - label: "Engine Entrypoint Startup Test"
-        key: l3-gpu-engine-entrypoint-startup
-        depends_on: upload-merge-pipeline
-        timeout_in_minutes: 30
-        mirror_hardwares: l4_1
-        command: >-
-          pytest
-          --run-slow --durations=10 -sv -m 'l3 and gpu_test'
-          tests/e2e/test_engine_entrypoint_startup.py
-
-      - label: "OneRec V1 Scheduler Test"
-        key: l3-gpu-onerec-v1-scheduler
-        depends_on: upload-merge-pipeline
-        timeout_in_minutes: 30
-        mirror_hardwares: l4_1
-        command: >-
-          mkdir -p results &&
-          pytest
-          --run-slow --durations=10 -sv -m 'l3 and gpu_test'
-          --basetemp=results/onerec-v1-scheduler
-          tests/e2e/test_onerec_v1_scheduler_st.py
-        artifact_paths: "results/onerec-v1-scheduler/**/*.json"
-
-  - label: "Entrypoints Test"
-    key: l3-gpu-entrypoints
-    depends_on: upload-merge-pipeline
-    timeout_in_minutes: 35
-    mirror_hardwares: l4_1
-    command: >-
-      pytest
-      --run-slow --durations=10 -sv -m 'l3 and gpu_test'
-      tests/entrypoints
+      mkdir -p results/merge-cuda &&
+      bash tools/ci/run_test_level.sh l3
+    artifact_paths: "results/merge-cuda/**/*.json"
