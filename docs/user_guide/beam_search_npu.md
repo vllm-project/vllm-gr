@@ -93,8 +93,8 @@ larger batches, use the [offline Beam example](../../examples/offline_inference/
 with `--constraint-backend npu` and `--batch-size`.
 
 Omit the artifact path and digests, vocabulary offset, and vocabulary slice.
-The engine rejects an enabled Constraint Table or a vocabulary slice with
-`constrained_generation=False`.
+The example selects `gr.constraint_mode: none`; the engine rejects a
+`gr.constraint_table` when that mode is `none`.
 
 `output_mode="full"` returns the usual Beam sequence objects, and is also the
 default to keep the upstream vLLM contract. Pass `output_mode="compact"` to
@@ -121,7 +121,7 @@ is not called.
 The existing NPU stage projection owns three weight caches and refreshes them
 through the existing weight-update lifecycle. The ordinary generation and
 startup dummy paths retain the full LM head. This option requires ModelRunner V1,
-worker decisions, `constrained_generation=False`, and at most three generated
+worker decisions, `gr.constraint_mode: none`, and at most three generated
 tokens. It is disabled by default; CUDA and catalog-based behavior are unchanged.
 
 `gr.npu_stage_lm_head: false` disables only the projection optimization. The SID
