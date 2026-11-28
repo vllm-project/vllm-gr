@@ -13,12 +13,18 @@ explicitly targets them; they are not necessarily the imported runtime.
 - For PR review or re-review, use the [GR review skill](.agents/skills/vllm-gr-pr-review/SKILL.md).
 - Before changing runtime behavior, use [development navigation](docs/contributing/development.md)
   to find the owning code and read the relevant linked contract.
+- For configuration implementation changes, use the
+  [configuration change skill](.agents/skills/vllm-gr-config-change/SKILL.md).
+- For performance tuning, benchmark runs, comparisons or result analysis, use the
+  [benchmark skill](.agents/skills/vllm-gr-benchmark/SKILL.md).
 - Before selecting tests, read [validation levels](docs/contributing/ci/test_levels.md#validation-levels)
   and the affected tests' fixtures and device requirements.
 - For documentation-only changes, use the
   [documentation checks](docs/contributing/pre_commit_setup.md#documentation-checks).
 - When changing agent guidance or tool integration, read
   [AI instruction maintenance](docs/contributing/agent_instructions.md).
+
+Read the linked skill directly if the agent does not discover it.
 
 ## Environment
 

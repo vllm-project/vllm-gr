@@ -27,6 +27,11 @@ run `vllm bench --gr --list` and see the
 [CLI benchmark reference](../cli/bench.md) for arguments and backend support.
 For pull request acceptance criteria, see the [CI benchmark gates](../contributing/ci/benchmark_acceptance.md#benchmark-gates).
 
+For tuning Beam performance on CUDA, see the
+[GPU performance tuning guide](../configuration/gpu_tuning.md). For Ascend,
+see the [configuration guide](../configuration/README.md) and
+[Ascend Decode design](../design/feature/npu_decode_execution.md#configuration).
+
 <a id="open-one-rec-benchmark-dataset"></a>
 
 ## OneRec benchmark dataset

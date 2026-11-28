@@ -47,6 +47,9 @@ Both entry points use native vLLM converters for values such as
 Save this example as `scenario.yaml`. It retains eight beams at the first
 step, four at the second and two at the third, and returns one result.
 
+For CUDA workloads, see the [GPU performance tuning guide](gpu_tuning.md)
+to choose settings and device-specific starting points.
+
 ```yaml
 max-model-len: 4096
 gr:

@@ -23,6 +23,7 @@ nav:
     - Features & Compatibility: user_guide/feature_compatibility.md
     - Configuration:
       - configuration/README.md
+      - configuration/gpu_tuning.md
       - configuration/constraint_tables.md
     - Models:
       - models/supported_models.md
