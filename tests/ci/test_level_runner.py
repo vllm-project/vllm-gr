@@ -168,18 +168,18 @@ class TestLevelRunner(unittest.TestCase):
                         self.assertIn("arg=--strict-test-levels", lines)
                         marker_index = max(i for i, line in enumerate(lines) if line == "arg=-m")
                         expressions.append(lines[marker_index + 1][4:])
-            for level in range(1, 6):
+            for test_level in range(1, 6):
                 for platform in platforms:
-                    marks = {f"l{level}", *platform}
+                    marks = {f"l{test_level}", *platform}
                     selected = any(
                         Expression.compile(expr).evaluate(marks.__contains__)
                         for expr in expressions
                     )
                     cpu_only = platform == {"cpu_test"}
                     expected = (
-                        level in (1, 2)
+                        test_level in (1, 2)
                         if phase == "ready"
-                        else (level == 3 or (level == 1 and cpu_only))
+                        else (test_level == 3 or (test_level == 1 and cpu_only))
                     )
                     with self.subTest(phase=phase, marks=marks):
                         self.assertEqual(selected, expected)
@@ -293,7 +293,7 @@ class TestLevelRunner(unittest.TestCase):
         outputs = []
         for selection in ("exclude", "include"):
             items = source.copy()
-            removed = []
+            removed: list[SimpleNamespace] = []
             config = SimpleNamespace(
                 hook=SimpleNamespace(
                     pytest_deselected=lambda *, items, removed=removed: removed.extend(items)
