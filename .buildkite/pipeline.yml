@@ -16,7 +16,8 @@ steps:
        build.pull_request.base_branch == "main" &&
        build.pull_request.draft == false &&
        (build.pull_request.labels includes "ready" ||
-        build.pull_request.labels includes "merge-test"))
+        build.pull_request.labels includes "merge-test" ||
+        build.pull_request.labels includes "nightly-test"))
     agents:
       queue: medium_cpu_queue_premerge
     command: bash .buildkite/common/scripts/build-ci-image.sh npu
@@ -61,3 +62,17 @@ steps:
     agents:
       queue: medium_cpu_queue_premerge
     command: python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/test-npu-merge.yml
+
+  - label: "Upload NPU nightly pipeline"
+    key: upload-npu-nightly-pipeline
+    if: >-
+      (build.branch == "main" && build.pull_request.id == null &&
+       build.env("NIGHTLY") == "1") ||
+      (build.pull_request.id != null &&
+       build.pull_request.base_branch == "main" &&
+       build.pull_request.draft == false &&
+       build.pull_request.labels includes "nightly-test")
+    depends_on: npu-image-build
+    agents:
+      queue: medium_cpu_queue_premerge
+    command: python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/test-npu-nightly.yml

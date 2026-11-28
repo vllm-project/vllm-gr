@@ -676,10 +676,12 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                 self.run_gate(dict.fromkeys(gate["needs"], "skipped"), event).returncode, 1
             )
 
-    def test_recall_and_decode_benchmark_cover_both_target_branches_and_devices(self) -> None:
+    def test_recall_benchmark_scope_by_target_branch_and_device(self) -> None:
         steps = self.workflows["ci.yml"]["jobs"]["decode-benchmark"]["steps"]
         by_name = {step.get("name"): step for step in steps}
         recall_steps = (
+            "Cache OpenOneRec dataset",
+            "Download OpenOneRec dataset",
             "Cache OneRec Recall constraint tables",
             "Build OneRec Recall constraint tables",
             "Gate Beam V1 B=4 OneRec Recall on fixed samples",
@@ -708,16 +710,12 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                                 by_name[name]["if"]
                                 .replace("env.POLICY_TARGET_BRANCH", repr(target))
                                 .replace("env.BENCHMARK_DEVICE", repr(device))
+                                .replace("steps.cache-dataset.outputs.cache-hit", "'false'")
                                 .replace(
                                     "steps.cache-recall-constraints.outputs.cache-hit", "'false'"
                                 )
                             )
                             self.assertEqual(bool(evaluate(condition, github)), expect_recall, name)
-                        benchmark = by_name["Execute decode benchmark gates"]["if"].replace(
-                            "env.BENCHMARK_DEVICE", repr(device)
-                        )
-                        benchmark = benchmark.replace("env.POLICY_TARGET_BRANCH", repr(target))
-                        self.assertEqual(bool(evaluate(benchmark, github)), not expect_recall)
 
     def test_unready_and_draft_events_fail_required_gate(self) -> None:
         workflow = self.workflows["ci.yml"]

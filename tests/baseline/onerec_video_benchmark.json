@@ -1,0 +1,81 @@
+{
+  "version": 2,
+  "name": "development",
+  "thresholds": {
+    "accuracy": {
+      "pass_at_1_min": 0.09,
+      "pass_at_32_min": 0.29,
+      "recall_at_32_min": 0.04
+    },
+    "performance": {
+      "online_elapsed_seconds_max": 20,
+      "offline_elapsed_seconds_max": 20,
+      "p99_ttft_max": 300,
+      "p99_tpot_max": 0.02
+    }
+  },
+  "failure_modes": {
+    "accuracy": "blocking",
+    "performance": {
+      "p99_ttft": "warning",
+      "p99_tpot": "warning",
+      "online_elapsed_seconds": "warning",
+      "offline_elapsed_seconds": "warning"
+    },
+    "online_non_accuracy": "blocking"
+  },
+  "device_overrides": {
+    "gpu": {
+      "boards": {
+        "NVIDIA L4": {
+          "thresholds": {}
+        }
+      }
+    },
+    "npu": {
+      "boards": {
+        "Ascend910B1": {
+          "thresholds": {
+            "accuracy": {
+              "pass_at_1_min": 0.05,
+              "pass_at_32_min": 0.21,
+              "recall_at_32_min": 0.03
+            }
+          }
+        },
+        "Ascend910B3": {
+          "thresholds": {
+            "accuracy": {
+              "pass_at_1_min": 0.05,
+              "pass_at_32_min": 0.21,
+              "recall_at_32_min": 0.03
+            }
+          }
+        },
+        "Ascend910_9362": {
+          "thresholds": {
+            "accuracy": {
+              "pass_at_1_min": 0.05,
+              "pass_at_32_min": 0.21,
+              "recall_at_32_min": 0.03
+            },
+            "performance": {
+              "p99_ttft_max": 280,
+              "online_elapsed_seconds_max": 20,
+              "offline_elapsed_seconds_max": 25
+            }
+          }
+        },
+        "Ascend_9362": {
+          "thresholds": {
+            "accuracy": {
+              "pass_at_1_min": 0.05,
+              "pass_at_32_min": 0.21,
+              "recall_at_32_min": 0.03
+            }
+          }
+        }
+      }
+    }
+  }
+}

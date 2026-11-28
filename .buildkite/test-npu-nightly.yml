@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
+
+steps:
+  - label: "OneRec Video-100 Perf and Acc Test"
+    key: l4-npu-system-tests
+    depends_on: upload-npu-nightly-pipeline
+    timeout_in_minutes: 90
+    mirror_hardwares: a2b3_npu_1
+    artifact_paths:
+      - generated_data/benchmark_v1/onerec-results.*/**/*.json
+    command: >-
+      python -m pytest -sv --run-slow --strict-test-levels
+      -m 'l4 and npu_test' tests/e2e/test_onerec_video_benchmark.py

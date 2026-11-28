@@ -167,7 +167,9 @@ jobs:
         if: steps.accelerator.outputs.run == 'true'
         env:
           VLLM_GR_EXCLUDE_CPU_TESTS: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
-        run: bash tools/ci/run_test_level.sh "$TEST_LEVEL"
+        run: >-
+          bash tools/ci/run_test_level.sh "$TEST_LEVEL"
+          --ignore=tests/e2e/test_onerec_video_benchmark.py
 
       - name: Run L2 resource probe if isolated
         if: steps.accelerator.outputs.run == 'true' && env.TEST_LEVEL == 'l2'
